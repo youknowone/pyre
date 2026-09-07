@@ -394,6 +394,21 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "majit_metainterp.jit.we_are_jitted",
         majit_metainterp_bool_flag,
     );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.we_are_jitted",
+        majit_metainterp_bool_flag,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.isconstant",
+        majit_metainterp_bool_flag,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.isvirtual",
+        majit_metainterp_bool_flag,
+    );
     // `rlib/jit.py` — the `hint` ExtRegistryEntry's
     // `compute_result_annotation`, the one place upstream MINTS
     // `access_directly` onto an annotation. Upstream spells the kwargs on a

@@ -8845,6 +8845,15 @@ fn remap_op(
 /// un-annotatable `SpecTag` out of `Bookkeeper.immutablevalue` (which
 /// has no symbolic branch — in RPython the symbolic is likewise
 /// introduced only post-annotation, at rtype).
+/// `rlib/jit.py we_are_jitted` — both the metainterp hook and the
+/// `majit_rlib` interpreter-facing spelling `look_inside_iff` emits.
+fn is_we_are_jitted_path(segments: &[String], args: &[crate::flowspace::model::Variable]) -> bool {
+    args.is_empty()
+        && segments.len() >= 2
+        && segments[segments.len() - 2] == "jit"
+        && segments[segments.len() - 1] == "we_are_jitted"
+}
+
 fn fold_we_are_jitted_calls(graph: &mut crate::model::FunctionGraph) {
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
@@ -8856,12 +8865,7 @@ fn fold_we_are_jitted_calls(graph: &mut crate::model::FunctionGraph) {
             else {
                 continue;
             };
-            if !args.is_empty()
-                || segments.len() != 3
-                || segments[0] != "majit_metainterp"
-                || segments[1] != "jit"
-                || segments[2] != "we_are_jitted"
-            {
+            if !is_we_are_jitted_path(segments, args) {
                 continue;
             }
             op.kind = OpKind::ConstSymbolic {
@@ -14928,6 +14932,40 @@ mod tests {
         let mut graph = FunctionGraph::new("we_are_jitted_specialize");
         let entry = graph.startblock;
         let target = CallTarget::function_path(["majit_metainterp", "jit", "we_are_jitted"]);
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target,
+                    args: vec![],
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result_var.clone()));
+        fold_we_are_jitted_calls(&mut graph);
+        let op = graph.blocks[0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&result_var))
+            .expect("we_are_jitted op present");
+        match &op.kind {
+            OpKind::ConstSymbolic { tag, .. } => assert_eq!(
+                *tag,
+                crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID
+            ),
+            other => panic!("expected ConstSymbolic, got {other:?}"),
+        }
+    }
+
+    /// `look_inside_iff` emits `majit_rlib::jit::we_are_jitted`; the
+    /// fold must recognise that spelling too (`rlib/jit.py we_are_jitted`).
+    #[test]
+    fn we_are_jitted_rlib_path_specializes_to_symbolic() {
+        let mut graph = FunctionGraph::new("we_are_jitted_rlib_specialize");
+        let entry = graph.startblock;
+        let target = CallTarget::function_path(["majit_rlib", "jit", "we_are_jitted"]);
         let result_var = graph
             .push_op_var(
                 entry,

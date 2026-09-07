@@ -291,20 +291,17 @@ impl crate::rordereddict::Equivalent<ObjectKey> for StrLookupKey<'_> {
 /// has produced `hash` — `celldict.py getitem_str`'s single
 /// `self.unerase(w_dict.dstorage).get(key)`.
 ///
-/// Residualise the probe alone (`@dont_look_inside`, `rlib/jit.py`), the
-/// twin of [`w_dict_lookup_int_strategy`] and
-/// [`w_module_dict_lookup_object_entries`]: the `IndexMap::get` it wraps is an
-/// external-crate heap lookup the tracer cannot model — the oopspec'd residual
-/// arm of `rordereddict.ll_dict_getitem` (traced only for a virtual dict).  The
-/// user `__eq__` a str-subclass key can run sits inside the same probe upstream
-/// (`rdict.py ll_dict_lookup` carries `@jit.oopspec('dict.lookup')` over
-/// the whole `keyeq` loop), so it does not argue for a narrower boundary.  The
-/// enclosing [`dict_entries_get_str`] keeps its hook gate and its allocating
-/// fallback visible.
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rordereddict.py`).  The trampoline is the residual
+/// arm when the dict is not virtual.
 ///
 /// # Safety
 /// `entries` must be a live entry table whose keys are valid `ObjectKey`s.
-#[majit_macros::dont_look_inside]
+fn dict_entries_probe_str_iff(entries: &ObjectDictStorage, _hash: i64, key: &str) -> bool {
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(key)
+}
+
+#[majit_macros::look_inside_iff(dict_entries_probe_str_iff)]
 pub unsafe fn dict_entries_probe_str(
     entries: &ObjectDictStorage,
     hash: i64,
@@ -322,7 +319,12 @@ pub unsafe fn dict_entries_probe_str(
 ///
 /// # Safety
 /// Same as [`dict_entries_probe_str`]; `key` must be a valid PyObjectRef.
-#[majit_macros::dont_look_inside]
+fn dict_entries_probe_object_iff(entries: &ObjectDictStorage, key: PyObjectRef) -> bool {
+    // rordereddict.py ll_dict_lookup: isvirtual(d) and isconstant(key)
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(dict_entries_probe_object_iff)]
 pub unsafe fn dict_entries_probe_object(
     entries: &ObjectDictStorage,
     key: PyObjectRef,
@@ -333,19 +335,19 @@ pub unsafe fn dict_entries_probe_object(
 /// The object-keyed remove side of the same table — `dictmultiobject.py:1081
 /// delitem`'s `del self.unerase(w_dict.dstorage)[self.unwrap(w_key)]`.
 ///
-/// Residualised (`@dont_look_inside`, `rlib/jit.py`) because upstream's
-/// `_ll_dict_del` (`rordereddict.py`) carries
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))`, and an
-/// `IndexMap` can never be virtual to this front end, so the predicate is
-/// permanently false and the residual arm is the only reachable one.  Every
-/// arm that reaches the remove must go through here: leaving one traced keeps
-/// the enclosing graph blocked no matter what the others do
-/// ([`dict_entries_probe_object`]'s lesson).  The `bool` result is a single
-/// word, and the strategy / keys-version bumps stay traced.
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))` on
+/// `_ll_dict_del` (`rordereddict.py`).  The storage is an `RDict` now, so
+/// the predicate is spelled; when it is false the trampoline is the same
+/// residual as the former `dont_look_inside`.
 ///
 /// # Safety
 /// Same as [`dict_entries_probe_object`].
-#[majit_macros::dont_look_inside]
+fn dict_entries_remove_object_iff(entries: &mut ObjectDictStorage, key: PyObjectRef) -> bool {
+    // rordereddict.py _ll_dict_del: isvirtual(d) and isconstant(i)
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(dict_entries_remove_object_iff)]
 pub unsafe fn dict_entries_remove_object(
     entries: &mut ObjectDictStorage,
     key: PyObjectRef,
@@ -365,7 +367,16 @@ pub unsafe fn dict_entries_remove_object(
 /// # Safety
 /// Same as [`dict_entries_probe_object`]; `hash` must be the digest
 /// [`object_key_for_checked`] produced for `obj`.
-#[majit_macros::dont_look_inside]
+fn dict_entries_probe_hashed_iff(
+    entries: &ObjectDictStorage,
+    _hash: i64,
+    obj: PyObjectRef,
+) -> bool {
+    // rordereddict.py ll_dict_lookup: isvirtual(d) and isconstant(key)
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&obj)
+}
+
+#[majit_macros::look_inside_iff(dict_entries_probe_hashed_iff)]
 pub unsafe fn dict_entries_probe_hashed(
     entries: &ObjectDictStorage,
     hash: i64,
@@ -387,7 +398,17 @@ pub unsafe fn dict_entries_probe_hashed(
 ///
 /// # Safety
 /// Same as [`dict_entries_probe_hashed`].
-#[majit_macros::dont_look_inside]
+fn dict_entries_insert_hashed_iff(
+    entries: &mut ObjectDictStorage,
+    _hash: i64,
+    obj: PyObjectRef,
+    _value: PyObjectRef,
+) -> bool {
+    // rordereddict.py _ll_dict_setitem_lookup_done: isvirtual(d) and isconstant(key)
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&obj)
+}
+
+#[majit_macros::look_inside_iff(dict_entries_insert_hashed_iff)]
 pub unsafe fn dict_entries_insert_hashed(
     entries: &mut ObjectDictStorage,
     hash: i64,
@@ -401,14 +422,12 @@ pub unsafe fn dict_entries_insert_hashed(
 /// `rordereddict.py ll_dict_getitem`'s `d.entries[i].value` after
 /// `ll_dict_lookup` returned the slot.
 ///
-/// Residualised for [`dict_entries_probe_hashed`]'s reason: `IndexMap` has no
-/// lowering, so `get_index` is the last modellable point.  No comparison runs
-/// here — the index is already known, so this is a pure slot read and the
-/// residual boundary swallows no user code at all.
+/// `d.entries[i].value` after `ll_dict_lookup` returned the slot
+/// (`rordereddict.py ll_dict_getitem`).  A positional field read, so
+/// the body stays look-inside.
 ///
 /// # Safety
 /// Same as [`dict_entries_probe_hashed`]; `index` must be a live entry index.
-#[majit_macros::dont_look_inside]
 pub unsafe fn dict_entries_value_at(entries: &ObjectDictStorage, index: usize) -> PyObjectRef {
     *entries.get_slot(index).unwrap().1
 }
@@ -417,13 +436,10 @@ pub unsafe fn dict_entries_value_at(entries: &ObjectDictStorage, index: usize) -
 /// `dictmultiobject.py setitem_str`'s in-place update, which reuses
 /// the stored key rather than re-inserting.
 ///
-/// Residualised for [`dict_entries_value_at`]'s reason, and the store twin of
-/// it: the index is already known, so the boundary swallows a slot write and
-/// no comparison.
+/// In-place update of `d.entries[i].value` (`dictmultiobject.py setitem_str`).
 ///
 /// # Safety
 /// Same as [`dict_entries_value_at`].
-#[majit_macros::dont_look_inside]
 pub unsafe fn dict_entries_value_set_at(
     entries: &mut ObjectDictStorage,
     index: usize,
@@ -435,14 +451,20 @@ pub unsafe fn dict_entries_value_set_at(
 /// The owned-key store — [`dict_entries_probe_object`]'s twin, hashing `key`
 /// through [`object_key_for`] the way `dict_entries_remove_object` does.
 ///
-/// Residualised for [`dict_entries_insert_hashed`]'s reason: `IndexMap` has no
-/// lowering, and upstream's `_ll_dict_setitem_lookup_done`
-/// (`rordereddict.py:674`) is `@jit.look_inside_iff(jit.isvirtual(d) and
-/// jit.isconstant(key))`, neither conjunct of which can hold here.
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `_ll_dict_setitem_lookup_done` (`rordereddict.py`).
 ///
 /// # Safety
 /// Same as [`dict_entries_probe_object`].
-#[majit_macros::dont_look_inside]
+fn dict_entries_insert_object_iff(
+    entries: &mut ObjectDictStorage,
+    key: PyObjectRef,
+    _value: PyObjectRef,
+) -> bool {
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(dict_entries_insert_object_iff)]
 pub unsafe fn dict_entries_insert_object(
     entries: &mut ObjectDictStorage,
     key: PyObjectRef,
@@ -462,16 +484,11 @@ pub unsafe fn dict_entries_insert_object(
 /// passed the last entry — `rordereddict.py ll_dict_lookup`'s
 /// `entries[i].key` plus the bound that ends its scan.
 ///
-/// Residualised for [`dict_entries_value_at`]'s reason: a positional slot read
-/// runs no comparison, so the boundary swallows no user code.  It is the read
-/// [`scan_dict_key_reentrant`] performs per step; the scan's `keyeq` loop and
-/// its paranoia restart stay traced around it, which is what
-/// `ll_dict_lookup`'s own `@jit.look_inside_iff(jit.isvirtual(d))` keeps
-/// visible for a dict the tracer can see.
+/// `entries[i].key` (`rordereddict.py ll_dict_lookup`).  A positional
+/// field read, so the body stays look-inside.
 ///
 /// # Safety
 /// Same as [`dict_entries_value_at`].
-#[majit_macros::dont_look_inside]
 pub unsafe fn dict_entries_key_obj_at(
     entries: &ObjectDictStorage,
     index: usize,
@@ -488,7 +505,6 @@ pub unsafe fn dict_entries_key_obj_at(
 ///
 /// # Safety
 /// Same as [`dict_entries_value_at`].
-#[majit_macros::dont_look_inside]
 pub unsafe fn dict_entries_key_hash_at(entries: &ObjectDictStorage, index: usize) -> i64 {
     entries.get_slot(index).unwrap().0.hash
 }
@@ -498,7 +514,6 @@ pub unsafe fn dict_entries_key_hash_at(entries: &ObjectDictStorage, index: usize
 ///
 /// # Safety
 /// Same as [`dict_entries_value_at`].
-#[majit_macros::dont_look_inside]
 pub unsafe fn dict_entries_slot_count(entries: &ObjectDictStorage) -> usize {
     entries.entry_slots()
 }
@@ -510,7 +525,6 @@ pub unsafe fn dict_entries_slot_count(entries: &ObjectDictStorage) -> usize {
 ///
 /// # Safety
 /// Same as [`dict_entries_value_at`].
-#[majit_macros::dont_look_inside]
 pub unsafe fn dict_entries_key_is_at(
     entries: &ObjectDictStorage,
     index: usize,
@@ -533,7 +547,6 @@ pub unsafe fn dict_entries_key_is_at(
 ///
 /// # Safety
 /// Same as [`dict_entries_value_at`].
-#[majit_macros::dont_look_inside]
 pub unsafe fn dict_entries_generation(entries: &ObjectDictStorage) -> u32 {
     entries.generation()
 }
@@ -541,12 +554,11 @@ pub unsafe fn dict_entries_generation(entries: &ObjectDictStorage) -> u32 {
 /// Drop the last entry — the undo the checked store runs when a user `__eq__`
 /// raised mid-probe and `insert` therefore appended a spurious entry.
 ///
-/// Residual for the same reason its `insert` twin is; separating it keeps the
-/// error test itself traced.
+/// Undo a checked store that appended a spurious entry after a raising
+/// `__eq__`.  A slot pop, so the body stays look-inside.
 ///
 /// # Safety
 /// Same as [`dict_entries_probe_hashed`].
-#[majit_macros::dont_look_inside]
 pub unsafe fn dict_entries_pop_last(entries: &mut ObjectDictStorage) {
     entries.pop();
 }
@@ -618,16 +630,21 @@ unsafe fn dict_entries_index_of_str(
 /// str hash hook has produced `hash` — [`dict_entries_probe_str`]'s twin,
 /// returning the entry index instead of the value.
 ///
-/// Residualised for [`dict_entries_probe_str`]'s reason: the
-/// `IndexMap::get_index_of` it wraps is the same external-crate heap lookup,
-/// and the user `__eq__` a str-subclass key can run sits inside the probe
-/// upstream too (`rdict.py ll_dict_lookup` carries
-/// `@jit.oopspec('dict.lookup')` over the whole `keyeq` loop).  The enclosing
-/// router keeps its hook gate and its allocating fallback visible.
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rordereddict.py`), the index-returning twin of
+/// [`dict_entries_probe_str`].
 ///
 /// # Safety
 /// Same as [`dict_entries_probe_str`].
-#[majit_macros::dont_look_inside]
+fn dict_entries_index_of_str_hashed_iff(
+    entries: &ObjectDictStorage,
+    _hash: i64,
+    key: &str,
+) -> bool {
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(key)
+}
+
+#[majit_macros::look_inside_iff(dict_entries_index_of_str_hashed_iff)]
 pub unsafe fn dict_entries_index_of_str_hashed(
     entries: &ObjectDictStorage,
     hash: i64,
@@ -639,13 +656,15 @@ pub unsafe fn dict_entries_index_of_str_hashed(
 /// The owned-key membership probe [`dict_entries_index_of_str`]'s no-hook arm
 /// runs — [`dict_entries_probe_object`]'s twin.
 ///
-/// Residualised for [`dict_entries_probe_object`]'s reason: a body that
-/// reaches either `get_index_of` stops there, so leaving one arm traced keeps
-/// the enclosing graph blocked no matter what the other arm does.
+/// Same predicate as [`dict_entries_probe_object`].
 ///
 /// # Safety
 /// Same as [`dict_entries_probe_object`].
-#[majit_macros::dont_look_inside]
+fn dict_entries_index_of_object_iff(entries: &ObjectDictStorage, key: PyObjectRef) -> bool {
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(dict_entries_index_of_object_iff)]
 pub unsafe fn dict_entries_index_of_object(
     entries: &ObjectDictStorage,
     key: PyObjectRef,
@@ -2908,20 +2927,21 @@ pub unsafe fn w_module_dict_lookup_inner(
 /// perform — `celldict.py:139 self.unerase(w_dict.dstorage).get(w_key)` once
 /// the module dict has been promoted to object storage.
 ///
-/// Residualise the probe alone (`@dont_look_inside`, `rlib/jit.py`), the
-/// twin of [`w_dict_lookup_int_strategy`]: the `IndexMap::get` it wraps is an
-/// external-crate heap-lookup the tracer cannot model — the oopspec'd residual
-/// arm of `rordereddict.ll_dict_getitem` (traced only for a virtual dict).
-/// The enclosing router keeps its str fast path, its never-equal shortcut and
-/// its strategy promotion visible, because `celldict.py:131-141` carries no
-/// residual marker of its own.
-///
-/// Returns `None` when the dict is not on object storage, matching the `?` the
-/// second call site used to spell.
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rordereddict.py`).  Returns `None` when the dict is
+/// not on object storage, matching the `?` the second call site used to spell.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
-#[majit_macros::dont_look_inside]
+fn w_module_dict_lookup_object_entries_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    // The storage box is what `ll_dict_lookup` sees as `d`.
+    let entries = unsafe { w_module_dict_object_storage(obj) };
+    entries.is_some_and(|entries| {
+        majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+    })
+}
+
+#[majit_macros::look_inside_iff(w_module_dict_lookup_object_entries_iff)]
 pub unsafe fn w_module_dict_lookup_object_entries(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -4697,15 +4717,19 @@ pub unsafe fn w_dict_copy(obj: PyObjectRef) -> PyObjectRef {
 /// have already verified `is_correct_type(w_key)`.
 ///
 /// Residualise the int-storage setitem leaf (`@dont_look_inside`,
-/// `rlib/jit.py:139`): the `IndexMap::insert` it wraps is an external-crate
-/// heap-store the tracer cannot model — the oopspec'd residual arm of
-/// `rordereddict.ll_dict_setitem` (traced only for a virtual dict).
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `_ll_dict_setitem_lookup_done` (`rordereddict.py`).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::INT_DICT_STRATEGY`]; `key` must be a
 /// plain `W_IntObject` (not bool).
-#[majit_macros::dont_look_inside]
+fn w_dict_store_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef, _value: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_int_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_store_int_strategy_iff)]
 pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     lock_dict_refs!(_dict_guard, obj, key, value);
     let dict = &mut *(obj as *mut W_DictObject);
@@ -4721,14 +4745,17 @@ pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, valu
 /// `dictmultiobject.py self.unerase(w_dict.dstorage).get(self.unwrap(w_key), None)`.
 /// Caller must have already verified `is_correct_type(w_key)`.
 ///
-/// Residualise the int-storage getitem leaf (`@dont_look_inside`,
-/// `rlib/jit.py:139`): the `IndexMap::get` it wraps is an external-crate
-/// heap-lookup the tracer cannot model — the oopspec'd residual arm of
-/// `rordereddict.ll_dict_getitem` (traced only for a virtual dict).
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rordereddict.py`).
 ///
 /// # Safety
 /// Same as [`w_dict_store_int_strategy`].
-#[majit_macros::dont_look_inside]
+fn w_dict_lookup_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_int_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_lookup_int_strategy_iff)]
 pub unsafe fn w_dict_lookup_int_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -4741,12 +4768,16 @@ pub unsafe fn w_dict_lookup_int_strategy(
 
 /// Return the insertion-order index selected by an int-strategy lookup.
 ///
-/// Residualise the native table probe for the same reason as
-/// [`w_dict_lookup_int_strategy`] (`rdict.py:576`).
+/// Same predicate as [`w_dict_lookup_int_strategy`].
 ///
 /// # Safety
 /// Same as [`w_dict_lookup_int_strategy`].
-#[majit_macros::dont_look_inside]
+fn w_dict_index_of_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_int_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_index_of_int_strategy_iff)]
 pub unsafe fn w_dict_index_of_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> Option<usize> {
     lock_dict_refs!(_dict_guard, obj, key);
     w_dict_index_of_int_locked(obj, key)
@@ -4768,15 +4799,16 @@ unsafe fn w_dict_index_of_int_locked(obj: PyObjectRef, key: PyObjectRef) -> Opti
 
 /// Return the live value selected by an int-strategy lookup.
 ///
-/// Residualise the native table probe for the same reason as
-/// [`w_dict_lookup_int_strategy`] (`rdict.py:576`). The index lookup and value
-/// read share one dict lock so the insertion-order index cannot be invalidated
-/// between the two operations — this guard is that lock, and both steps run
-/// under it directly rather than through helpers that take one each.
+/// Same predicate as [`w_dict_lookup_int_strategy`].
 ///
 /// # Safety
 /// Same as [`w_dict_lookup_int_strategy`].
-#[majit_macros::dont_look_inside]
+fn w_dict_lookup_or_null_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_int_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_lookup_or_null_int_strategy_iff)]
 pub unsafe fn w_dict_lookup_or_null_int_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -4798,7 +4830,12 @@ pub unsafe fn w_dict_lookup_or_null_int_strategy(
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::UNICODE_DICT_STRATEGY`].
-#[majit_macros::dont_look_inside]
+fn w_dict_index_of_unicode_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_object_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_index_of_unicode_strategy_iff)]
 pub unsafe fn w_dict_index_of_unicode_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -4863,7 +4900,12 @@ unsafe fn w_str_memoized_hash(key: PyObjectRef, key_str: &str) -> Option<i64> {
 ///
 /// # Safety
 /// Same as [`w_dict_index_of_unicode_strategy`].
-#[majit_macros::dont_look_inside]
+fn w_dict_lookup_or_null_unicode_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_object_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_lookup_or_null_unicode_strategy_iff)]
 pub unsafe fn w_dict_lookup_or_null_unicode_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -5048,16 +5090,23 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
 /// `dictmultiobject.py:1061-1064` direct typed-storage write.  Caller
 /// must have already verified `is_correct_type(w_key)`.
 ///
-/// Residualise the bytes-storage setitem leaf (`@dont_look_inside`,
-/// `rlib/jit.py:139`): the `IndexMap::insert` it wraps is an external-crate
-/// heap-store the tracer cannot model — the oopspec'd residual arm of
-/// `rordereddict.ll_dict_setitem` (traced only for a virtual dict).
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `_ll_dict_setitem_lookup_done` (`rordereddict.py`).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::BYTES_DICT_STRATEGY`]; `key` must be a
 /// `W_BytesObject`.
-#[majit_macros::dont_look_inside]
+fn w_dict_store_bytes_strategy_iff(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    _value: PyObjectRef,
+) -> bool {
+    let entries = unsafe { w_dict_bytes_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_store_bytes_strategy_iff)]
 pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     lock_dict_refs!(_dict_guard, obj, key, value);
     let dict = &mut *(obj as *mut W_DictObject);
@@ -5073,14 +5122,17 @@ pub unsafe fn w_dict_store_bytes_strategy(obj: PyObjectRef, key: PyObjectRef, va
 /// `dictmultiobject.py:1098`.  Caller must have already verified
 /// `is_correct_type(w_key)`.
 ///
-/// Residualise the bytes-storage getitem leaf (`@dont_look_inside`,
-/// `rlib/jit.py:139`): the `IndexMap::get` it wraps is an external-crate
-/// heap-lookup the tracer cannot model — the oopspec'd residual arm of
-/// `rordereddict.ll_dict_getitem` (traced only for a virtual dict).
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rordereddict.py`).
 ///
 /// # Safety
 /// Same as [`w_dict_store_bytes_strategy`].
-#[majit_macros::dont_look_inside]
+fn w_dict_lookup_bytes_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_bytes_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_lookup_bytes_strategy_iff)]
 pub unsafe fn w_dict_lookup_bytes_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,

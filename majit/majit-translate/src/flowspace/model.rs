@@ -2154,6 +2154,19 @@ impl HostEnv {
             "we_are_jitted",
             HostObject::new_builtin_callable("majit_metainterp.jit.we_are_jitted"),
         );
+        let majit_rlib_jit = HostObject::new_module("majit_rlib.jit");
+        majit_rlib_jit.module_set(
+            "we_are_jitted",
+            HostObject::new_builtin_callable("majit_rlib.jit.we_are_jitted"),
+        );
+        majit_rlib_jit.module_set(
+            "isconstant",
+            HostObject::new_builtin_callable("majit_rlib.jit.isconstant"),
+        );
+        majit_rlib_jit.module_set(
+            "isvirtual",
+            HostObject::new_builtin_callable("majit_rlib.jit.isvirtual"),
+        );
 
         // Container constructors emitted as `[Type, "new"]` 2-segment
         // FunctionPath callsites by pyre-source helpers.  Same shape
@@ -2430,6 +2443,7 @@ impl HostEnv {
         mods.insert("longlong2float".into(), longlong2float);
         mods.insert("majit_metainterp".into(), majit_metainterp);
         mods.insert("majit_metainterp.jit".into(), majit_metainterp_jit);
+        mods.insert("majit_rlib.jit".into(), majit_rlib_jit);
         mods.insert("u32".into(), primitive_u32);
         mods.insert("i64".into(), primitive_i64);
         mods.insert("usize".into(), primitive_usize);

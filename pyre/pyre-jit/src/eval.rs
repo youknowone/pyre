@@ -7932,6 +7932,10 @@ fn drive_unpack_iterable_trace(
 /// before its first JIT-traced bytecode still routes through to the
 /// real `WarmState::set_param("trace_limit", 10000)`.
 pub fn init_jit_hooks() {
+    // `rlib/jit.py we_are_jitted` lives in majit-rlib so `look_inside_iff`
+    // dispatch (object crate included) can read it without depending on
+    // the metainterp.
+    majit_rlib::jit::install_we_are_jitted(majit_backend::we_are_jitted);
     // Phase A: build the GC and install it into the backend + pyre-object
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).

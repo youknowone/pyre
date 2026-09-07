@@ -75,18 +75,19 @@ unsafe fn identity_storage<'a>(obj: PyObjectRef) -> &'a IdentityDictStorage {
 /// Internal helper: `IdentityDictStrategy::getitem` body.  Caller must have
 /// already verified `is_correct_type(w_key)`.
 ///
-/// Residualise the identity-storage getitem leaf (`@dont_look_inside`,
-/// `rlib/jit.py:139`), the twin of `dictmultiobject::w_dict_lookup_int_strategy`:
-/// the `IndexMap::get` it wraps is an external-crate heap-lookup the tracer
-/// cannot model — the oopspec'd residual arm of
-/// `rordereddict.ll_dict_getitem` (traced only for a virtual dict).
-/// [`IdentityKey`] hashes and compares by address, so the probe runs no user
-/// Python code at all.
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rordereddict.py`).  [`IdentityKey`] hashes and
+/// compares by address, so the probe runs no user Python code.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`IDENTITY_DICT_STRATEGY`].
-#[majit_macros::dont_look_inside]
+fn w_dict_lookup_identity_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let storage = unsafe { identity_storage(obj) };
+    majit_rlib::jit::isvirtual(storage) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_lookup_identity_strategy_iff)]
 pub unsafe fn w_dict_lookup_identity_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -97,17 +98,17 @@ pub unsafe fn w_dict_lookup_identity_strategy(
 /// `dictmultiobject.py delitem`'s identity-keyed remove — drop the
 /// entry for `key` and report whether one was there.
 ///
-/// Residualise the storage remove alone (`@dont_look_inside`,
-/// `rlib/jit.py:139`), the delete twin of [`w_dict_lookup_identity_strategy`]:
-/// upstream's `_ll_dict_del` (`rordereddict.py`) carries
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))`, and the
-/// storage can never be virtual to this front end, so the predicate is
-/// permanently false and the residual arm is the only one reachable.  The
-/// keys-version bump stays traced.
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))` on
+/// `_ll_dict_del` (`rordereddict.py`).  The keys-version bump stays traced.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
-#[majit_macros::dont_look_inside]
+fn w_dict_delete_identity_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let storage = unsafe { identity_storage(obj) };
+    majit_rlib::jit::isvirtual(storage) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_delete_identity_strategy_iff)]
 pub unsafe fn w_dict_delete_identity_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
     identity_storage_mut(obj)
         .remove(&IdentityKey(key))
@@ -118,18 +119,23 @@ pub unsafe fn w_dict_delete_identity_strategy(obj: PyObjectRef, key: PyObjectRef
 /// `value` under the address-identity of `key`, reporting whether the slot was
 /// newly filled so the caller bumps the keys-version only on a real insert.
 ///
-/// Residualise the storage insert alone (`@dont_look_inside`,
-/// `rlib/jit.py:139`), the store twin of [`w_dict_lookup_identity_strategy`]:
-/// upstream's `_ll_dict_setitem_lookup_done` (`rordereddict.py`) is
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))`, and an
-/// `IndexMap` can never be virtual to this front end, so neither conjunct can
-/// hold and the residual arm is the only one reachable.  [`IdentityKey`]
-/// hashes and compares by address, so the store runs no user Python code at
-/// all; the keys-version bump and the GC write barrier stay traced.
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `_ll_dict_setitem_lookup_done` (`rordereddict.py`).  [`IdentityKey`]
+/// hashes and compares by address; the keys-version bump and write barrier
+/// stay traced.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
-#[majit_macros::dont_look_inside]
+fn w_dict_store_identity_strategy_iff(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    _value: PyObjectRef,
+) -> bool {
+    let storage = unsafe { identity_storage(obj) };
+    majit_rlib::jit::isvirtual(storage) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_store_identity_strategy_iff)]
 pub unsafe fn w_dict_store_identity_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,

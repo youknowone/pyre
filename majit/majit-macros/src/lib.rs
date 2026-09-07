@@ -2547,6 +2547,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let fn_name = &sig.ident;
+    let unsafety = &sig.unsafety;
     // rlib/jit.py — func = unroll_safe(func)
     let orig_name = format_ident!("_orig_{}", fn_name);
     // rlib/jit.py — trampoline.__name__ = func.__name__ + "_trampoline"
@@ -2573,27 +2574,40 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // rlib/jit.py — func = unroll_safe(func); trampoline = dont_look_inside.
+    // `front/llbc_hints` harvests these sibling / body-local markers the
+    // same way `#[unroll_safe]` / `#[dont_look_inside]` do.
+    let orig_unroll_marker = format_ident!("_jit_unroll_safe_{}", orig_name);
+    let trampoline_opaque_marker = format_ident!("_jit_look_inside_{}", trampoline_name);
+
     let expanded = quote! {
         // rlib/jit.py — func = unroll_safe(func)
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
-        fn #orig_name(#(#full_params),*) #output {
+        #unsafety fn #orig_name(#(#full_params),*) #output {
             #[doc(hidden)]
-            #[allow(dead_code)]
-            const _MAJIT_UNROLL_SAFE: bool = true;
+            #[allow(non_upper_case_globals, dead_code)]
+            const #orig_unroll_marker: bool = true;
             #block
         }
 
-        // rlib/jit.py — @dont_look_inside def trampoline(...): return func(...)
-        #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
-        fn #trampoline_name(#(#full_params),*) #output {
+        const #orig_unroll_marker: bool = true;
+
+        // rlib/jit.py — @dont_look_inside def trampoline(...): return func(...)
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #unsafety fn #trampoline_name(#(#full_params),*) #output {
             #[doc(hidden)]
-            #[allow(dead_code)]
-            const _MAJIT_OPAQUE: bool = true;
+            #[allow(non_upper_case_globals, dead_code)]
+            const #trampoline_opaque_marker: bool = false;
             #orig_name(#(#call_args),*)
         }
+
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        const #trampoline_opaque_marker: bool = false;
 
         // rlib/jit.py:240-244 — the decorated name becomes the dispatch wrapper
         // def f(*args):
@@ -2602,8 +2616,8 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
         //     else:
         //         return trampoline(*args)
         #(#attrs)*
-        #vis fn #fn_name(#(#full_params),*) #output {
-            if !majit_metainterp::jit::we_are_jitted() || #predicate_path(#(#call_args),*) {
+        #vis #unsafety fn #fn_name(#(#full_params),*) #output {
+            if !majit_rlib::jit::we_are_jitted() || #predicate_path(#(#call_args),*) {
                 #orig_name(#(#call_args),*)
             } else {
                 #trampoline_name(#(#call_args),*)
