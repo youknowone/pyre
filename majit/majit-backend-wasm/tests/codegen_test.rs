@@ -6274,6 +6274,41 @@ fn raw_load_f_loads_a_double() {
     assert_eq!(f64_loads, 1, "the float raw load is an f64.load");
 }
 
+#[test]
+fn raw_load_const_offset_uses_memarg_displacement() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    const OFFSET: u64 = 24;
+    let descr = Arc::new(SimpleArrayDescr::new(1, 0, 8, 55, Type::Int));
+    let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+    let load = make_op(
+        OpCode::RawLoadI,
+        &[OpRef::input_arg_ref(0), OpRef::const_int(OFFSET as i64)],
+        OpRef::int_op(1),
+    );
+    load.setdescr(descr);
+    let ops = vec![load, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut adds = 0;
+    let mut displaced = 0;
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I32Add => adds += 1,
+        wasmparser::Operator::I64Load { memarg } | wasmparser::Operator::I64Load32U { memarg }
+            if memarg.offset == OFFSET =>
+        {
+            displaced += 1;
+        }
+        _ => {}
+    });
+    assert_eq!(displaced, 1, "the constant offset rides in MemArg");
+    assert_eq!(
+        adds, 0,
+        "a nonnegative constant offset must not emit i32.add"
+    );
+}
+
 /// resoperation.py `int_between(a, b, c)` is `a <= b < c`, signed.
 #[test]
 fn int_between_is_two_signed_comparisons() {
@@ -7094,28 +7129,12 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
     }
 }
 
-#[test]
-fn consecutive_new_ops_keep_their_collecting_boundaries() {
-    use majit_ir::descr::SimpleSizeDescr;
-    use std::sync::Arc;
-
-    let size_descr = || {
-        let descr = SimpleSizeDescr::new(0, 16, 53);
-        descr.set_non_moving(false);
-        Arc::new(descr)
-    };
-    let new1 = make_op(OpCode::New, &[], OpRef::ref_op(1));
-    new1.setdescr(size_descr());
-    let new2 = make_op(OpCode::New, &[], OpRef::ref_op(2));
-    new2.setdescr(size_descr());
-    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
-    finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
-
+fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInputs {
     let mut plain_tids = std::collections::HashSet::new();
-    plain_tids.insert(53);
-    let inputs = codegen::ModuleBuildInputs {
+    plain_tids.insert(plain_tid);
+    codegen::ModuleBuildInputs {
         inputargs: vec![InputArg::from_type(Type::Int, 0)],
-        ops: vec![new1, new2, finish],
+        ops,
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
@@ -7148,19 +7167,192 @@ fn consecutive_new_ops_keep_their_collecting_boundaries() {
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
-    };
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
-    validate_wasm(&bytes);
+    }
+}
 
+fn nursery_top_compare_count(bytes: &[u8]) -> usize {
     let mut nursery_top_compares = 0;
-    count_operators(&bytes, |op| {
+    count_operators(bytes, |op| {
         if matches!(op, wasmparser::Operator::I32GtU) {
             nursery_top_compares += 1;
         }
     });
+    nursery_top_compares
+}
+
+fn finish_int_arg0() -> Op {
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+    finish
+}
+
+fn plain_new(result: u32, type_id: u32) -> Op {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+    let descr = SimpleSizeDescr::new(0, 16, type_id);
+    descr.set_non_moving(false);
+    let op = make_op(OpCode::New, &[], OpRef::ref_op(result));
+    op.setdescr(Arc::new(descr));
+    op
+}
+
+fn plain_new_array(result: u32, type_id: u32, length: i64) -> Op {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+    let descr = SimpleArrayDescr::new(1, 16, 8, type_id, Type::Int);
+    let op = make_op(
+        OpCode::NewArray,
+        &[OpRef::const_int(length)],
+        OpRef::ref_op(result),
+    );
+    op.setdescr(Arc::new(descr));
+    op
+}
+
+#[test]
+fn consecutive_new_ops_share_one_nursery_bump() {
+    let inputs = nursery_new_inputs(
+        vec![plain_new(1, 53), plain_new(2, 53), finish_int_arg0()],
+        53,
+    );
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
     assert_eq!(
-        nursery_top_compares, 2,
-        "typed allocation helpers must run at their original GC boundaries"
+        nursery_top_compare_count(&bytes),
+        1,
+        "gen_malloc_nursery merges consecutive New ops into one bump"
+    );
+}
+
+#[test]
+fn collecting_op_between_news_keeps_separate_nursery_bumps() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let call = Op::new(OpCode::CallN, &[rb(OpRef::const_int(0x99))]);
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0x5300_0000,
+        Vec::new(),
+        Type::Void,
+        true,
+        0,
+        EffectInfo::default(),
+    )));
+    let inputs = nursery_new_inputs(
+        vec![plain_new(1, 53), call, plain_new(2, 53), finish_int_arg0()],
+        53,
+    );
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        2,
+        "a collecting op flushes the pending nursery batch"
+    );
+}
+
+#[test]
+fn setfield_between_news_keeps_one_nursery_bump() {
+    use majit_ir::descr::SimpleFieldDescr;
+    use std::sync::Arc;
+
+    let store = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::ref_op(1)), rb(OpRef::input_arg_ref(0))],
+    );
+    store.setdescr(Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Ref, false)));
+    let mut inputs = nursery_new_inputs(
+        vec![plain_new(1, 53), store, plain_new(2, 53), finish_int_arg0()],
+        53,
+    );
+    inputs.inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    inputs.frame = codegen::FrameGeometry::compact(5, 2, 0);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_int(1))]);
+    inputs.ops[3] = finish;
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        1,
+        "non-collecting stores must not flush gen_malloc_nursery"
+    );
+}
+
+#[test]
+fn new_and_const_newarray_share_one_nursery_bump() {
+    let mut inputs = nursery_new_inputs(
+        vec![
+            plain_new(1, 53),
+            plain_new_array(2, 55, 3),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    if let Some(na) = inputs.nursery.as_mut() {
+        na.plain_tids.insert(55);
+    }
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        1,
+        "constant-size NewArray joins gen_malloc_nursery with New"
+    );
+}
+
+#[test]
+fn consecutive_const_newarrays_share_one_nursery_bump() {
+    let inputs = nursery_new_inputs(
+        vec![
+            plain_new_array(1, 55, 2),
+            plain_new_array(2, 55, 4),
+            finish_int_arg0(),
+        ],
+        55,
+    );
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        1,
+        "consecutive constant-size NewArray ops share one bump"
+    );
+}
+
+#[test]
+fn runtime_newarray_flushes_the_nursery_batch() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let descr = SimpleArrayDescr::new(1, 16, 8, 55, Type::Int);
+    let runtime = make_op(
+        OpCode::NewArray,
+        &[OpRef::input_arg_int(0)],
+        OpRef::ref_op(2),
+    );
+    runtime.setdescr(Arc::new(descr));
+    let mut inputs = nursery_new_inputs(
+        vec![
+            plain_new(1, 53),
+            runtime,
+            plain_new(3, 53),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    if let Some(na) = inputs.nursery.as_mut() {
+        na.plain_tids.insert(55);
+    }
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        3,
+        "a runtime-length NewArray stays on the varsize path and flushes"
     );
 }
 
