@@ -12,7 +12,7 @@ use majit_ir::operand::Operand;
 use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::info::{
-    ArrayStructInfo, PtrInfo, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
+    ArrayStructInfo, PtrInfo, PtrInfoExt, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
     VirtualizableFieldState, w_class_value_is_covered_by_alloc,
 };
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -870,7 +870,12 @@ impl OptVirtualize {
                         // (jtransform.py:908-911 parity in helpers.rs), so this
                         // branch should not observe a typeptr op. Defensively
                         // capture known_class if a typeptr setfield still arrives.
-                        if is_typeptr {
+                        // `is_typeptr` matches on the field's NAME, and
+                        // `CPyObject.ob_type` carries that name at offset 24
+                        // while the class word this seeds answers for is the
+                        // header at offset 0.  Seeding from the mirror's field
+                        // would hand a later header read the wrong class.
+                        if is_typeptr && field_descr.offset() == 0 {
                             if vinfo.known_class.is_none()
                                 && let Some(class_val) = value_as_constant {
                                     vinfo.known_class = Some(class_val as i64);
@@ -1031,11 +1036,21 @@ impl OptVirtualize {
             // info.py getfield: return _fields[fielddescr.get_index()].
             // For Virtual, ob_type (typeptr) is not in fields — fold from
             // known_class (info.py get_known_class).
-            if let PtrInfo::Virtual(ref vinfo) = info
-                && is_typeptr
+            // `is_typeptr` matches on the field's NAME, and `CPyObject.ob_type`
+            // carries that name at offset 24 while every consumer here reads the
+            // header word at offset 0.  Require the offset the predicate's own
+            // doc states.
+            if is_typeptr
+                && field_descr.offset() == 0
+                // `get_known_class` answers for a virtual, for an allocation the
+                // trace has already forced, and for a constant — the three ways
+                // `info.py get_known_class` knows a class.  Restricting this to
+                // `PtrInfo::Virtual` left a forced allocation's typeptr read in
+                // the loop: `force_box_impl` carries `known_class` across the
+                // force, so the answer was in hand and nothing asked for it.
                 // A stored class of 0 means the allocation's vtable address was unavailable at
                 // build time, so the value reads as no known class while the flag stays valid.
-                && let Some(class_val) = vinfo.known_class.filter(|&c| c != 0)
+                && let Some(class_val) = info.get_known_class(ctx.cpu.as_ref())
             {
                 let b = ctx.materialize_operand_at(op.pos.get());
                 // PyPy's `handle_getfield_typeptr` removes this load before
@@ -1205,7 +1220,12 @@ impl OptVirtualize {
             // virtual fields but can be resolved from the SizeDescr vtable.
             // RPython doesn't need this because GUARD_CLASS reads the class
             // directly from the object, not via a separate field read.
-            let is_typeptr = op.with_field_descr(|fd| fd.is_typeptr()).unwrap_or(false);
+            // The vtable answers for the header word at offset 0.  `is_typeptr`
+            // matches on the field's NAME, which `CPyObject.ob_type` also
+            // carries at offset 24, so the offset decides which read this is.
+            let is_typeptr = op
+                .with_field_descr(|fd| fd.is_typeptr() && fd.offset() == 0)
+                .unwrap_or(false);
             if field_val.is_none()
                 && matches!(op.opcode, majit_ir::OpCode::GetfieldGcI)
                 && is_typeptr

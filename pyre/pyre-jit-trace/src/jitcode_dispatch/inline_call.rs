@@ -738,7 +738,7 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// summary a cycle produces belongs to the occurrence that opened it, not to
 /// the body, so [`summarize_descent_blockers`] caches nothing.
 fn descent_decline(jitcode_index: usize) -> Option<DescentDecline> {
-    if !descent_unlowered_helper_scan_enabled() {
+    if !descent_static_decline_enabled() {
         return None;
     }
     let summary = descent_blocker_summary(jitcode_index);
@@ -772,20 +772,18 @@ impl std::fmt::Display for DescentDecline {
 /// descent run into the symbolic call and abort there instead of declining
 /// before it starts.
 ///
-/// The same shape and the same reason as `PYRE_WALKABORT_OFF` in
-/// `trace.rs`: the scan decides, for every builtin the walker might descend
-/// into, whether the descent happens at all, and its cost is invisible in
-/// output — a declined descent is a correct answer that is merely slower.
-/// One binary and one env var is the only way to weigh what the
-/// conservatism buys against what it costs.
+/// The scan is conservative — over the 561 `__pyre_wrap_*` gateway wrappers,
+/// 448 of the 487 it declines block on a call no complete path through the
+/// descent executes — but the attempted-descent rollback is not observationally
+/// neutral.  It compiles `test_pickle` writes to an empty payload and changes
+/// `test_hashlib`'s bytes argument into a string.  Keep the proven-safe answer
+/// as the default until the rollback has true MIFrame-per-frame state.
 ///
-/// Graded over the 561 `__pyre_wrap_*` gateway wrappers, 448 of the 487 the
-/// scan declines block on a call no complete path through the descent
-/// executes, so what this switch measures is mostly the price of a static
-/// answer to a dynamic question. It is a diagnostic, not a tuning knob:
-/// the scan is on unless it is explicitly turned off, because the rewind it
-/// prevents is a wrong answer and not a slow one.
-fn descent_unlowered_helper_scan_enabled() -> bool {
+/// The same shape and the same reason as `PYRE_WALKABORT_OFF` in `trace.rs`:
+/// which descents happen is invisible in output — a refused descent is a
+/// correct answer that is merely slower — so weighing the two answers against
+/// each other needs one binary and one variable.
+fn descent_static_decline_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DESCENT_SCAN_OFF").is_none())
 }
@@ -909,6 +907,7 @@ fn collect_descent_effect_aware_blockers(
             here.push((blocker, effect));
             false
         },
+        &effect_free_residual_fnaddr,
     );
     for (blocker, effect) in here {
         record_reachable_blocker(out, blocker, entry_effect || effect);
@@ -1034,6 +1033,42 @@ struct DescentPoint {
     /// `allocate_callee_register_banks` uses: the slots at and above
     /// `num_regs_i` are pre-filled from `constants_i`.
     known_i: Vec<Option<i64>>,
+    /// The Ref-bank slots holding an object allocated by this body, on every
+    /// path reaching here.  A write into one is not an effect a rewind has to
+    /// undo: the allocation itself is discarded with the trace, so nothing
+    /// outside it can read what the write left.
+    ///
+    /// A register index is one byte, so 256 bits address the whole bank.
+    fresh_r: [u64; 4],
+}
+
+/// Whether `slot` holds an object this body allocated.
+fn is_fresh_ref(fresh_r: &[u64; 4], slot: u8) -> bool {
+    fresh_r[usize::from(slot) >> 6] & (1u64 << (slot & 63)) != 0
+}
+
+/// Record whether `slot` holds an object this body allocated.
+fn set_fresh_ref(fresh_r: &mut [u64; 4], slot: u8, fresh: bool) {
+    let (word, bit) = (usize::from(slot) >> 6, 1u64 << (slot & 63));
+    if fresh {
+        fresh_r[word] |= bit;
+    } else {
+        fresh_r[word] &= !bit;
+    }
+}
+
+/// True when a funcbox constant names a residual the walk's odometer does not
+/// count.
+///
+/// The union of the two families `do_residual_call`'s
+/// `provably_side_effect_free` already spares by address: the re-runnable
+/// bookkeeping helpers and the root bracket's own.  The scan asks this of a
+/// constant where the walk asks it of an executed call, and the two have to
+/// agree — a body the scan calls effectful and the walk does not is a descent
+/// refused for an effect that never happens.
+fn effect_free_residual_fnaddr(fnaddr: i64) -> bool {
+    pyre_interpreter::is_rewindable_root_bracket_residual_i64(fnaddr)
+        || pyre_interpreter::is_rerunnable_bookkeeping_residual(fnaddr as usize)
 }
 
 /// Whether stepping `opname` applies an effect the walk would have to undo.
@@ -1045,6 +1080,12 @@ struct DescentPoint {
 /// and add the direct heap writes, which the odometer reaches only through a
 /// journal.  Both directions are conservative: the scan may call a body
 /// effectful where the walk would not, never the reverse.
+///
+/// Two of those the caller spares, because the odometer spares them too: a
+/// residual the walk would not count ([`effect_free_residual_fnaddr`], or a
+/// calldescr reporting an elidable / loop-invariant / not-in-trace call) and a
+/// store into an object this same body allocated.  Calling either effectful
+/// here refuses a descent for an effect that never happens.
 fn descent_op_applies_effect(opname: &str) -> bool {
     opname.starts_with("residual_call")
         || opname.starts_with("setfield_gc")
@@ -1054,6 +1095,62 @@ fn descent_op_applies_effect(opname: &str) -> bool {
         || opname.starts_with("setinteriorfield_gc")
         || opname.starts_with("strsetitem")
         || opname.starts_with("unicodesetitem")
+}
+
+/// The two-byte descriptor-pool index an op's first `d` operand holds, or
+/// `None` when it carries none.
+///
+/// The descr twin of [`label_operand_offset`], and it reads the code bytes for
+/// the same reason `read_ref_var_list` does: a varlist is a count byte
+/// followed by that many register bytes, so its width is only in the body.
+fn descr_index_at(code: &[u8], d: &crate::jitcode_runtime::DecodedOp) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut chars = d.argcodes.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            'd' => {
+                let lo = usize::from(*code.get(d.pc + 1 + offset)?);
+                let hi = usize::from(*code.get(d.pc + 2 + offset)?);
+                return Some(lo | (hi << 8));
+            }
+            'i' | 'c' | 'r' | 'f' => offset += 1,
+            'j' => offset += 2,
+            'I' | 'R' | 'F' => offset += 1 + usize::from(*code.get(d.pc + 1 + offset)?),
+            '>' => {
+                chars.next()?;
+                offset += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether the calldescr at `descr_index` describes a call the walk's odometer
+/// does not count.
+///
+/// `provably_side_effect_free` reads the same `EffectInfo`: an elidable call
+/// has no effect to undo by its own contract, a loop-invariant one is called
+/// for a value that does not change, and `NotInTrace` names a helper the trace
+/// is not supposed to see at all.  A descr that does not resolve answers
+/// `false`, which is the reading the scan had before it asked.
+fn descr_call_is_effect_free(descr_index: usize) -> bool {
+    crate::jitcode_runtime::descr_ref_table()
+        .at(descr_index)
+        .and_then(|descr| {
+            descr.as_call_descr().map(|call| {
+                let ei = call.get_extra_info();
+                ei.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace
+                    || matches!(
+                        ei.extraeffect,
+                        majit_ir::descr::ExtraEffect::ElidableCannotRaise
+                            | majit_ir::descr::ExtraEffect::ElidableCanRaise
+                            | majit_ir::descr::ExtraEffect::ElidableOrMemoryError
+                            | majit_ir::descr::ExtraEffect::LoopInvariant
+                    )
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Byte offset of an op's first `L` operand, counted from the byte after the
@@ -1145,6 +1242,7 @@ pub(crate) fn summarize_body_blockers(
         constants_i,
         |descr_index, _caller_effect| callee_summary(descr_index),
         &mut |_blocker, _effect| true,
+        &effect_free_residual_fnaddr,
     )
 }
 
@@ -1167,6 +1265,7 @@ fn summarize_body_blockers_with(
     constants_i: &[i64],
     mut callee_summary: impl FnMut(usize, bool) -> Option<DescentBlockerSummary>,
     on_blocker: &mut dyn FnMut(i64, bool) -> bool,
+    is_effect_free_residual: &dyn Fn(i64) -> bool,
 ) -> DescentBlockerSummary {
     let mut summary = DescentBlockerSummary::default();
 
@@ -1214,6 +1313,8 @@ fn summarize_body_blockers_with(
         DescentPoint {
             effect: false,
             known_i: entry_known,
+            // Nothing this body allocated exists at its entry.
+            fresh_r: [0; 4],
         },
     );
     let mut work = std::collections::VecDeque::from([0usize]);
@@ -1242,6 +1343,16 @@ fn summarize_body_blockers_with(
                                 widened = true;
                             }
                         }
+                        // A slot holds an allocation of this body only if it
+                        // does on every path reaching here, so the join is the
+                        // intersection and losing a bit is a widening.
+                        for (word, incoming) in existing.fresh_r.iter_mut().zip(&state.fresh_r) {
+                            let joined = *word & *incoming;
+                            if joined != *word {
+                                *word = joined;
+                                widened = true;
+                            }
+                        }
                         if widened {
                             $work.push_back(target);
                         }
@@ -1264,11 +1375,23 @@ fn summarize_body_blockers_with(
         };
         let mut effect = point.effect;
         let mut known_i = point.known_i;
+        let mut fresh_r = point.fresh_r;
 
+        // Set by a `residual_call` the walk's odometer would not count: one
+        // whose funcbox names a helper a rewind may re-run, or whose calldescr
+        // reports an effect the trace does not have to undo.
+        let mut effect_free_residual = false;
         if d.opname.starts_with("residual_call") {
             // Every `residual_call_*` argcode string opens with the `i` funcbox
             // operand, so it is the byte right after the opcode.
             let funcbox = code.get(d.pc + 1).copied().unwrap_or(0) as usize;
+            if let Some(Some(fnaddr)) = known_i.get(funcbox)
+                && !majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
+            {
+                effect_free_residual = is_effect_free_residual(*fnaddr);
+            }
+            effect_free_residual = effect_free_residual
+                || descr_index_at(code, &d).is_some_and(descr_call_is_effect_free);
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
                 && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
             {
@@ -1319,7 +1442,55 @@ fn summarize_body_blockers_with(
                 effect = true;
             }
         }
-        if descent_op_applies_effect(d.opname) {
+        // A store into an object this body allocated is not an effect: the
+        // allocation goes with the trace, so a rewind leaves nothing that could
+        // read what the store wrote.  The three `_gc` store families all put
+        // the written object in their first operand.
+        let writes_into_fresh = (d.opname.starts_with("setfield_gc")
+            || d.opname.starts_with("setarrayitem_gc")
+            || d.opname.starts_with("setinteriorfield_gc"))
+            && d.argcodes.starts_with('r')
+            && code
+                .get(d.pc + 1)
+                .is_some_and(|&slot| is_fresh_ref(&fresh_r, slot));
+        let applies_effect =
+            descent_op_applies_effect(d.opname) && !effect_free_residual && !writes_into_fresh;
+        // Every blocker a body reports reads as `after_effect` once one early
+        // op arms the flag, so the reachable set alone does not say what to
+        // repair.  Name each op that arms it — with the helper a residual's
+        // funcbox resolves to, and the field a store writes — so the first one
+        // on the entry path is readable.
+        if !effect && applies_effect && fbw_inline_diag_enabled() {
+            let funcbox = d
+                .opname
+                .starts_with("residual_call")
+                .then(|| code.get(d.pc + 1).copied())
+                .flatten()
+                .and_then(|slot| known_i.get(slot as usize).copied())
+                .flatten();
+            let field = descr_index_at(code, &d).and_then(|index| {
+                crate::jitcode_runtime::descr_ref_table()
+                    .at(index)
+                    .and_then(|descr| descr.as_field_descr().map(|f| f.field_name().to_string()))
+            });
+            // A bare address names nothing on its own, and the registry that
+            // resolves it is the same one the funcbox constant came from.
+            let helper = funcbox.and_then(|addr| {
+                pyre_interpreter::jit_trace_fnaddrs()
+                    .iter()
+                    .find(|(_, registered)| *registered == addr)
+                    .map(|(path, _)| (*path).to_string())
+            });
+            eprintln!(
+                "[descent-effect-origin] pc={} op={} funcbox={} field={} helper={}",
+                d.pc,
+                d.opname,
+                funcbox.map_or_else(|| "-".to_string(), |addr| format!("{addr:#x}")),
+                field.as_deref().unwrap_or("-"),
+                helper.as_deref().unwrap_or("-"),
+            );
+        }
+        if applies_effect {
             effect = true;
         }
         if effect {
@@ -1345,9 +1516,27 @@ fn summarize_body_blockers_with(
             }
         }
 
+        // The Ref-bank twin of the write above.  `new*` is what mints an
+        // object this body owns, `ref_copy` carries that ownership to a second
+        // slot, and every other write leaves the destination holding something
+        // this body did not allocate.
+        if d.argcodes
+            .split_once('>')
+            .is_some_and(|(_, dst)| dst == "r")
+            && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
+        {
+            let fresh = d.opname.starts_with("new")
+                || (d.key == "ref_copy/r>r"
+                    && code
+                        .get(d.pc + 1)
+                        .is_some_and(|&src| is_fresh_ref(&fresh_r, src)));
+            set_fresh_ref(&mut fresh_r, dst, fresh);
+        }
+
         let state = DescentPoint {
             effect,
             known_i: known_i.clone(),
+            fresh_r,
         };
         let label = label_operand_offset(d.argcodes).map(|off| read_label(code, &d, off));
         match d.opname {
@@ -1377,6 +1566,7 @@ fn summarize_body_blockers_with(
                         DescentPoint {
                             effect: true,
                             known_i: handler_known.clone(),
+                            fresh_r: [0; 4],
                         }
                     );
                 }
@@ -1406,6 +1596,7 @@ fn summarize_body_blockers_with(
                         DescentPoint {
                             effect: true,
                             known_i: handler_known.clone(),
+                            fresh_r: [0; 4],
                         }
                     );
                 }
@@ -1413,10 +1604,38 @@ fn summarize_body_blockers_with(
             }
             "switch" => {
                 // The arm table hangs off the descr rather than the code
-                // bytes, so name every instruction start as a successor.  That
-                // is a superset of the arms, which keeps the answer sound.
-                for &target in &starts {
-                    push!(points, work, target, state.clone());
+                // bytes.  Read it: naming every instruction start instead is a
+                // superset of the arms, and while that keeps the answer sound
+                // it also carries the state at this switch into arms no edge
+                // reaches, which reports one arm's effect on another.
+                //
+                // `bhimpl_switch` falls through when the value is not a key, so
+                // the fallthrough is an arm too.  A descr that does not resolve
+                // to a switch table leaves the superset, which is what the scan
+                // did before it asked.
+                let arms = descr_index_at(code, &d)
+                    .and_then(|index| crate::jitcode_runtime::descr_ref_table().at(index))
+                    .and_then(|descr| {
+                        descr.as_switch_descr().map(|switch| {
+                            switch
+                                .const_keys_in_order()
+                                .iter()
+                                .filter_map(|&key| switch.lookup(key))
+                                .collect::<Vec<_>>()
+                        })
+                    });
+                match arms {
+                    Some(targets) => {
+                        for target in targets {
+                            push!(points, work, target, state.clone());
+                        }
+                        push!(points, work, d.next_pc, state);
+                    }
+                    None => {
+                        for &target in &starts {
+                            push!(points, work, target, state.clone());
+                        }
+                    }
                 }
             }
             _ => {
@@ -3978,8 +4197,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // member, so print it.
     //
     // Every bail between here and the descent below names itself for the same
-    // reason.  With the tail of this function silent, a `PYRE_FBW_DESCENT_SCAN_OFF=1`
-    // run of `abc_instancecheck_weak_cache` printed no builtin-inline line at
+    // reason.  With the tail of this function silent, a run of
+    // `abc_instancecheck_weak_cache` with the scan's decline withdrawn printed
+    // no builtin-inline line at
     // all and recorded the same 69 ops as the gated run, which reads as "the
     // descent scan is the wall" when the scan had already been switched off and
     // something downstream refused instead.

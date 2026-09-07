@@ -4430,7 +4430,15 @@ impl PyFrame {
     /// above the live depth.
     pub fn clear_stack_above(&mut self, depth: usize) {
         let arr = locals_w_mut!(self).as_mut_slice();
-        for slot in arr.iter_mut().skip(depth) {
+        // `valuestackdepth` is an absolute index. A resume or residual can
+        // publish a depth below `stack_base()`; trimming from there would
+        // NULL live locals/cells. Operand slots start at the base.
+        let start = if self.pycode.is_null() {
+            depth
+        } else {
+            depth.max(self.stack_base())
+        };
+        for slot in arr.iter_mut().skip(start) {
             *slot = PY_NULL;
         }
     }

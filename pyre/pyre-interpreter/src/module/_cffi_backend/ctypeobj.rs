@@ -90,13 +90,34 @@ pub const F_WITH_PACKED_CHANGE: i64 = 1 << 15;
 /// `W_CTypePointer._array_types`).  Thus a derived ctype dies with its last
 /// user while a repeated constructor still returns the live memoized object.
 #[crate::pyre_class("_cffi_backend.CType")]
-// `W_CTypePtrOrArray._immutable_fields_` names `ctitem`, and
-// `W_CTypeFunc._immutable_fields_` names `fargs[*]`, `abi` and `cif_descr`:
-// each is written once, when the type is created, and every later reader only
-// reads it.  The `cif_descr` declaration is what lets a call through a
-// constant function type fold `exchange_size` / `exchange_args[i]` /
-// `exchange_result` to trace constants.
-#[majit_macros::jit_immutable_fields("ctitem", "fargs", "abi", "cif_descr")]
+// The `_immutable_fields_` the RPython hierarchy spreads over its subclasses,
+// restricted to the ones this flattened struct still writes only while a ctype
+// is being constructed: `W_CType` names `name_position`, `W_CTypePtrOrArray`
+// names `ctitem` and `length`, `W_CTypeArray` names `ctptr`, and `W_CTypeFunc`
+// names `fargs[*]`, `abi` and `cif_descr`.  The `cif_descr` declaration is what
+// lets a call through a constant function type fold `exchange_size` /
+// `exchange_args[i]` / `exchange_result` to trace constants.
+//
+// `kind` has no upstream entry to quote because the hierarchy spells the
+// subclass identity as the class pointer, which is immutable by construction.
+// It is this flattening's stand-in for that pointer, so declaring it is what
+// turns a `match ct.kind` dispatcher on a promoted ctype back into the static
+// overload resolution the subclasses get for free.
+//
+// `size`, `align` and `flags` are absent deliberately: `complete_struct_or_union`
+// writes all three after the ctype is reachable — which is why `W_CType` spells
+// the first `size?` — and `flags` carries `_custom_field_pos` and
+// `_with_var_array`, the two that completion sets.
+#[majit_macros::jit_immutable_fields(
+    "kind",
+    "name_position",
+    "ctitem",
+    "ctptr",
+    "length",
+    "fargs",
+    "abi",
+    "cif_descr"
+)]
 pub struct W_CType {
     /// `W_CType.size` — the size of an instance, or -1 when unknown.
     pub size: i64,

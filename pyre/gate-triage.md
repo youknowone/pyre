@@ -290,7 +290,7 @@ enters at pc 0 with the portal's declared arguments.  The numeric
 probe passes before firing; it defaults to zero.  Neither has an effect unless
 the probe in §6c is enabled.
 
-### §6c — Default-OFF diagnostics, censuses and probes (76): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (77): keep, cost nothing
 
 Deleting one of these environment reads does not change behavior when the
 variable is unset. They remain listed so diagnostics are not mistaken for dead
@@ -337,13 +337,12 @@ compile that `compile_ms` and `compile_bytes` measure slower than it is in a
 production run; `nofuel` is how those two fields are read. `wasm_ops` is the
 fuel subtraction and reports -1 under it.
 
-`PYRE_FBW_DESCENT_SCAN_OFF` turns off the descent's un-lowered-helper scan
-(`descent_unlowered_helper_scan_enabled`), so the walker descends into a
-builtin body that holds a symbolic-fnaddr residual call and aborts at the call
-instead of declining before the descent starts. Same shape and same reason as
-`PYRE_WALKABORT_OFF`: the scan decides whether a descent happens at all and its
-cost is invisible in output, so weighing the conservatism against its price
-needs one binary and one variable. It retires when the scan does.
+`PYRE_FBW_DESCENT_SCAN_OFF` disables the descent's un-lowered-helper scan
+(`descent_static_decline_enabled`), so a builtin body holding a symbolic-fnaddr
+residual call is attempted rather than refused before the descent starts.  The
+attempted rollback is currently observable in `test_pickle` and `test_hashlib`,
+so the scan remains the correctness default.  Same shape and same reason as
+`PYRE_WALKABORT_OFF`: the switch keeps the unsafe arm available for diagnosis.
 
 `PYRE_GC_SIZE_AUDIT` makes `finish_alloc_in_oldgen` panic, with a captured
 backtrace, when the block it just carved is smaller than the declared size of

@@ -1424,13 +1424,13 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         return Err(crate::PyError::type_error("sub requires self, repl, string"));
     }
     let pat = args[0];
-    // `pat` is `malloc_typed` and held in the process-wide pattern table, so it
-    // is immortal and needs no root of its own.  The replacement and the
-    // subject are ordinary objects, and everything below runs Python -- an
-    // `__index__` on `count`, the template parse, and the filter once per
-    // match.  A match object stamps the subject and its buffer into traced
-    // fields, so a stale word here is one the collector follows on its next
-    // walk rather than one that is merely read back wrong.
+    // `pat` is a non-moving old-gen `W_SRE_Pattern`. The receiver stays live
+    // on the caller frame, so the address is stable without a pin of its own.
+    // The replacement and the subject are ordinary objects, and everything
+    // below runs Python -- an `__index__` on `count`, the template parse, and
+    // the filter once per match.  A match object stamps the subject and its
+    // buffer into traced fields, so a stale word here is one the collector
+    // follows on its next walk rather than one that is merely read back wrong.
     let base = pyre_object::gc_roots::pin_roots(&[args[1], args[2]]);
     let w_repl = || pyre_object::gc_roots::shadow_stack_get(base);
     let string = || pyre_object::gc_roots::shadow_stack_get(base + 1);

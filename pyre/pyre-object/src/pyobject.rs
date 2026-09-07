@@ -62,7 +62,26 @@ pub struct PyType {
 ///
 /// `w_class` is set at allocation time when the type registry is available,
 /// or populated lazily by `init_typeobjects()` for static singletons.
+///
+/// `ob_type` is declared immutable and `w_class` is not, which is the split
+/// upstream draws between the two.  `typeptr` is stamped by `new` and the
+/// codewriter refuses to let a trace observe it as a field at all:
+/// `jtransform.py rewrite_op_setfield` drops a `typeptr` store
+/// ("ignore the operation completely -- instead, it's done by 'new'"), and
+/// `handle_getfield_typeptr` answers a constant container with a
+/// `Constant` and any other with `guard_class`.  The Python-level class is a
+/// separate word for the same reason `mapdict.py` keeps it in `map`:
+/// `__class__ =` rewrites it (`baseobjspace.rs instance_setclass`), so it stays
+/// mutable.
+///
+/// Descriptor retags finish construction before publication:
+/// `stamp_method_owners` runs before `new_builtin_typeobject`, and
+/// `stamp_new_descr_self` before `w_type_ready`. Module carriers likewise pass
+/// through `demote_module_function_to_builtin` before module publication.
+/// These writes cannot change an already-observed JIT typeptr.
+/// `classmethod_retag_descriptor` changes only the mutable `w_class` word.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("ob_type")]
 pub struct PyObject {
     pub ob_type: *const PyType,
     pub w_class: *mut PyObject,

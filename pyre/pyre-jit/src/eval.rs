@@ -48,6 +48,26 @@ unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut
                 update(slot_ptr as *mut majit_ir::GcRef);
             },
         );
+        // jitframe.py `jitframe_trace` forwards the slots above. A traced Ref
+        // here may be a `malloc_typed`-immortal object, whose managed
+        // children the visit above does not reach — the same hole the shadow
+        // stack closes in `pyre_object_root_walker_area`, asked here of the
+        // other channel that roots a live reference.
+        //
+        // Only the gcmap half is walked.  The header slots the full trace also
+        // visits name the frame's own bookkeeping objects, which are not
+        // `PyObjectRef`s, and the walk reads `ob_type` off what it is handed.
+        //
+        // Read each slot AFTER the pass above so a relocated value is the one
+        // followed.
+        majit_backend::jitframe::jitframe_trace_gcmap(
+            obj_addr as *mut majit_backend::jitframe::JitFrame,
+            |slot_ptr| {
+                let value = *(slot_ptr as *const pyre_object::PyObjectRef);
+                let mut child = |c: &mut majit_ir::GcRef| update(c as *mut majit_ir::GcRef);
+                pyre_interpreter::eval::walk_raw_immortal_roots(value, &mut child);
+            },
+        );
     }
 }
 
@@ -5095,15 +5115,13 @@ fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// process-global rather than per-mutator for the same reason: each outlives
 /// the thread that filled it. `w_globals` (`pycode.py:159-165
 /// frame_stores_global`) is first-store-wins, `_mapdict_caches[i].w_method`
-/// (mapdict.py:1418) is filled once, and a compiled `W_SRE_Pattern` outlives
-/// its compiling thread — as per-mutator areas their slots would lose their
+/// (mapdict.py:1418) is filled once — as per-mutator areas their slots would lose their
 /// root at that thread's `unregister_mutator` while the holder stayed live.
 fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_rbigint_parts_cache(visitor);
     pyre_interpreter::module::_io::walk_autoflusher_roots(|slot| {
         visit_pyobject_root(slot, visitor)
     });
-    sre_pattern_root_walker(visitor);
     w_globals_stamped_code_root_walker(visitor);
     mapdict_method_cache_root_walker(visitor);
 }
@@ -5868,8 +5886,37 @@ unsafe fn active_trace_root_walker_area(
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
-        pair.0.walk_active_trace_refs(visitor);
+        // A recorded ref is rooted here the way a compiled one is rooted through
+        // the jitframe gcmap, so it owes the same forwarding of a
+        // `malloc_typed`-immortal value's managed children — see
+        // `pyre_libc_jitframe_tracer`.  Read the value back after the visitor so
+        // a relocated one is what the walk follows.
+        let mut with_immortal_children = |gcref: &mut majit_ir::GcRef| {
+            unsafe { walk_active_trace_ref(gcref, visitor) };
+        };
+        pair.0.walk_active_trace_refs(&mut with_immortal_children);
     }
+}
+
+/// Forward a recorded reference and the managed children of an immortal value.
+///
+/// # Safety
+/// Apart from `NO_CONCRETE`, the slot must satisfy `walk_raw_immortal_roots`'s
+/// reference contract before and after forwarding.
+unsafe fn walk_active_trace_ref(
+    gcref: &mut majit_ir::GcRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    // resoperation.py RefOp.forget_value clears the concrete reference to
+    // null. Our recorder/virtualizable shadow distinguishes an unknown value
+    // with NO_CONCRETE; that marker is not a root or a PyObjectRef. Decode it
+    // at this boundary before either visiting or inspecting an object header.
+    if *gcref == majit_ir::GcRef::NO_CONCRETE {
+        return;
+    }
+    visitor(gcref);
+    let value = gcref.0 as pyre_object::PyObjectRef;
+    unsafe { pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor) };
 }
 
 /// GC walker for ConstPtr GcRefs extracted from snapshot maps
@@ -6157,12 +6204,6 @@ fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir
 #[allow(dead_code)]
 fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
-        visit_pyobject_root(slot, visitor);
-    });
-}
-
-fn sre_pattern_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_object::interp_sre::walk_sre_pattern_roots(|slot| {
         visit_pyobject_root(slot, visitor);
     });
 }
@@ -13909,10 +13950,18 @@ pub(crate) fn decode_and_restore_guard_failure(
                     pyre_jit_trace::state::depth_based_vsd_for_wcode(code, resume_pc)
                 {
                     jit_state.set_valuestackdepth(corrected_vsd);
-                    jit_state.clear_stack_above(corrected_vsd);
                 }
             }
         }
+        // `write_from_resume_data_partial` writes the whole
+        // `locals_cells_stack_w` from the vable boxes, including slots
+        // above `valuestackdepth`. A popped box can still hold a young
+        // pointer; the type-9 walker traces every allocated slot, so
+        // leave those words NULL. The vsd-correction arm above already
+        // trimmed when it rewrote the depth; this covers the single-frame
+        // resume that keeps the restored vsd (`test_complex_newobj_ex`
+        // after a hot `Unpickler.load`).
+        jit_state.clear_stack_above(jit_state.valuestackdepth());
         // Outermost-first `(w_code, py_pc)` per resumed section. The caller
         // needs them to ask each frame's own exception table whether it
         // catches at its own resume pc — `resume_pc` alone only addresses the
@@ -14215,6 +14264,8 @@ fn sync_virtualizable_after_guard_failure(
 
     unsafe {
         vinfo.write_boxes_to_heap(frame_u8, &boxes);
+        let frame = &mut *(frame_u8 as *mut PyFrame);
+        frame.clear_stack_above(frame.valuestackdepth);
     }
 }
 
@@ -15194,6 +15245,22 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_trace_root_walk_skips_unknown_concrete_values() {
+        let mut unknown = majit_ir::GcRef::NO_CONCRETE;
+        unsafe {
+            walk_active_trace_ref(&mut unknown, &mut |_| {
+                panic!("an unknown concrete value is not a GC root")
+            });
+        }
+        assert_eq!(unknown, majit_ir::GcRef::NO_CONCRETE);
+
+        let mut null = majit_ir::GcRef::NULL;
+        let mut visits = 0;
+        unsafe { walk_active_trace_ref(&mut null, &mut |_| visits += 1) };
+        assert_eq!(visits, 1, "a known null remains distinct from unknown");
+    }
 
     #[test]
     fn bridge_descr_storage_replays_pending_field_and_array_writes() {

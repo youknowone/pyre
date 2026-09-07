@@ -563,17 +563,31 @@ impl RootScope {
 }
 
 impl Drop for RootScope {
-    /// Truncate the shadow stack to the length captured at
-    /// construction time, mirroring `pop_roots`'s discard of the
-    /// bracketed `livevars` slots.
     #[inline]
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        // `truncate` is a no-op if `save_point >= len()`, which is
-        // the steady-state case for an empty bracket.
-        shadow_stack_cell_truncate(self.stack_slot, self.save_point);
+        root_scope_close(self);
     }
+}
+
+/// Truncate the shadow stack to the length captured at construction time,
+/// mirroring `pop_roots`'s discard of the bracketed `livevars` slots.
+///
+/// This is the bracket's close spelled as a call taking the guard by
+/// reference. A crate that sees `RootScope` only as an opaque cross-crate
+/// stub cannot read `save_point` and `stack_slot` to close a bracket inline,
+/// but it can name this function; the two field reads then happen behind it.
+///
+/// A residual for the same reason `pin_root` and `shadow_stack_cell_truncate`
+/// are: the bracket's helpers are named by the runtime rather than looked
+/// inside, and only a named helper resolves from a crate that carries no
+/// declaration of it.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn root_scope_close(scope: &RootScope) {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    // `truncate` is a no-op if `save_point >= len()`, which is
+    // the steady-state case for an empty bracket.
+    shadow_stack_cell_truncate(scope.stack_slot, scope.save_point);
 }
 
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to

@@ -3409,6 +3409,14 @@ struct Lowering<'a> {
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
     block_live_in: Vec<bit_set::BitSet>,
+    /// MIR locals this body moves out of.  A root-bracket guard among them is
+    /// dropped under an initialisation flag the artefact does not carry, so
+    /// its bracket is left open rather than closed on a path that may not own
+    /// it (see [`moved_out_locals`]).
+    root_scope_moved_locals: bit_set::BitSet,
+    /// Root brackets this body keeps out of its jitcode entirely
+    /// (see [`RootBracketPlan`]).
+    root_bracket: RootBracketPlan,
     block_entry_local_var: Vec<PackedLocalRow>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
@@ -3855,9 +3863,49 @@ impl<'a> Lowering<'a> {
         for _ in 1..body.body.len() {
             block_id.push(graph.create_block());
         }
-        let index_write_extra_live = compute_index_write_extra_live(body, llbc);
+        let mut extra_live = compute_index_write_extra_live(body, llbc);
         let glue_call_drops = glue_call_drop_blocks(body, llbc);
-        let block_live_in = compute_mir_liveness(body, &index_write_extra_live, &glue_call_drops);
+        // A root-bracket guard's `Drop` lowers to a call that takes the guard
+        // by reference, so the dropping block reads it.  Every other drop is
+        // pure control flow as far as liveness is concerned; without this the
+        // guard reaches no drop block's inputargs and the close has no place
+        // to name.  `glue_call_drops` is the same fact for the `drop_in_place`
+        // spelling #1689 already keeps live.
+        let root_scope_moved_locals = moved_out_locals(body);
+        let root_bracket = analyze_root_brackets(body, llbc, &root_scope_moved_locals);
+        if extra_live.len() < body.body.len() {
+            extra_live.resize(body.body.len(), Vec::new());
+        }
+        for (bb_idx, local) in root_scope_drop_sites(body, llbc, &root_scope_moved_locals) {
+            // An erased bracket emits no close, so its guard is not read at
+            // the drop and must not be kept live for one.
+            if root_bracket.is_erased_scope(local) {
+                continue;
+            }
+            extra_live[bb_idx].push(local);
+        }
+        // A `get` this pass answers with the pinned value is a use of that
+        // value the MIR never spells, the same synthetic-use shape
+        // `compute_index_write_extra_live` handles for a deferred array write.
+        for (bb_idx, value_local) in &root_bracket.get_sites {
+            extra_live[*bb_idx].push(*value_local);
+        }
+        let mut block_live_in = compute_mir_liveness(body, &extra_live, &glue_call_drops);
+        // The erased guard, its borrows and its `base()` results bind no
+        // Variable, so no block may ask a predecessor to pass one.
+        if root_bracket.enabled {
+            for live in &mut block_live_in {
+                for scope in root_bracket.scopes.iter() {
+                    live.remove(scope);
+                }
+                for alias in root_bracket.aliases.keys() {
+                    live.remove(*alias);
+                }
+                for base in root_bracket.base_results.keys() {
+                    live.remove(*base);
+                }
+            }
+        }
         let mut block_entry_local_var = vec![
             PackedLocalRow {
                 len: n_locals,
@@ -3939,6 +3987,8 @@ impl<'a> Lowering<'a> {
             is_none_sites: Vec::new(),
             closure_select_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),
+            root_scope_moved_locals,
+            root_bracket,
         })
     }
 
@@ -4760,6 +4810,30 @@ impl<'a> Lowering<'a> {
         // The destination place's post-projection type is the rvalue's
         // result type (for both a `Local` slot and a `place.field`
         // write).  `build_rvalue` reads it to pick a cast's result bank.
+        // `_a = &_scope` for a bracket [`RootBracketPlan`] erased: the borrow
+        // has no reader left, so it mints no Variable and the guard stays
+        // unbound for the rest of the body.
+        if let PlaceKind::Local(alias) = dest.kind
+            && let Some(scope) = self.root_bracket.aliases.get(&(alias as usize)).copied()
+            && self.root_bracket.is_erased_scope(scope)
+            && matches!(&rvalue, Rvalue::Ref { place, .. } if matches!(place.kind, PlaceKind::Local(l) if l as usize == scope))
+        {
+            return Ok(());
+        }
+        // `_t = copy _slot` for an erased bracket's `base()` result: the index
+        // has no reader left either, since every `get` it fed is answered by
+        // the pinned value, so the temporary mints no Variable.
+        if let PlaceKind::Local(index) = dest.kind
+            && let Some(scope) = self
+                .root_bracket
+                .base_results
+                .get(&(index as usize))
+                .copied()
+            && self.root_bracket.is_erased_scope(scope)
+            && matches!(&rvalue, Rvalue::Use(_))
+        {
+            return Ok(());
+        }
         let dest_ty = clone_tyref(&dest.ty);
         match dest.kind {
             PlaceKind::Local(i) => {
@@ -7471,6 +7545,72 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// Close a root bracket at the guard's `Drop`, by calling the same rewind
+    /// the destructor body calls. A non-guard drop is a no-op.
+    ///
+    /// The call takes the guard by reference rather than the two words the
+    /// rewind needs, so this arm reads no field of it. A crate that only
+    /// imports the guard sees an opaque stub with no fields, and a
+    /// field-keyed close would silently confine itself to the crate that
+    /// defines one.
+    fn emit_root_scope_close(&mut self, mir_bb: usize, place: &Place) {
+        let Some(class_root) = self.tyref_adt_class_root(&place.ty) else {
+            return;
+        };
+        if !gc_root_scope_type_path(&class_root) {
+            return;
+        }
+        // Charon stamps a drop `Conditional` when the destructor runs only if
+        // the place still holds a value.  The flag that decides it is not in
+        // the artefact, so a guard the body moves out of keeps its bracket
+        // open: closing one the moved-to owner still holds would rewind a
+        // shadow stack that owner is using.
+        if let PlaceKind::Local(local) = place.kind
+            && self.root_scope_moved_locals.contains(local as usize)
+        {
+            self.decline_root_scope_close("guard-moved");
+            return;
+        }
+        // An erased bracket published nothing, so there is nothing to rewind.
+        if let PlaceKind::Local(local) = place.kind
+            && self.root_bracket.is_erased_scope(local as usize)
+        {
+            return;
+        }
+        // A drop can still name a local no block lowered so far has assigned.
+        // Leaving that bracket open is what every drop did before this arm
+        // existed, so the graph stays lowerable and the gap is counted rather
+        // than turned into a refused function.
+        let Ok(base) = self.resolve_place(mir_bb, clone_place(place)) else {
+            self.decline_root_scope_close("guard-place-unresolved");
+            return;
+        };
+        // The helper is a sibling of the guard's own type, so its path is the
+        // guard's with the leaf replaced. Nothing here names an owning crate.
+        let mut segments: Vec<String> = class_root.split("::").map(str::to_string).collect();
+        segments.pop();
+        segments.push(ROOT_SCOPE_CLOSE.to_string());
+        let bb_id = self.block_id[mir_bb];
+        let void = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(void),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args: vec![base],
+                result_ty: ValueType::Void,
+            },
+        });
+    }
+
+    /// Count a bracket this pass left open, against the graph that holds it.
+    /// The rewind is what the guard's destructor does, so a skipped one is a
+    /// retention the census has to be able to name.
+    fn decline_root_scope_close(&self, reason: &'static str) {
+        crate::decline::record_named("root_bracket_close", reason, &self.graph.name);
+    }
+
     /// For a struct the owner_root is the LLBC TypeDecl's leaf name
     /// (`PyFrame` from `pyre_interpreter::pyframe::PyFrame`) so the
     /// downstream `struct_fields` registry resolves with the same leaf
@@ -8287,7 +8427,11 @@ impl<'a> Lowering<'a> {
                 on_unwind,
             } => self.lower_call(mir_bb, call, target as usize, on_unwind as usize),
             // RootScope drop closes the shadow-stack bracket opened by
-            // `push_roots`; erasing it made traced loops retain every pin.
+            // `push_roots`.  #1689 spells that as the Charon `drop_in_place`
+            // glue call; this branch spells the same rewind as the named
+            // `root_scope_close` residual so a crate that only imports the
+            // opaque guard can still name it.  Emit the named residual, not
+            // both — a second close would truncate an already-rewound stack.
             // Other drops keep the legacy goto until their glue bodies and
             // residual callees are available to the translator.
             TermKind::Drop {
@@ -8296,14 +8440,9 @@ impl<'a> Lowering<'a> {
                 target,
                 on_unwind,
             } => {
+                let _ = on_unwind;
                 if drop_lowers_as_glue_call(&place, &fn_ptr, self.llbc) {
-                    return self.lower_drop_as_glue_call(
-                        mir_bb,
-                        place,
-                        fn_ptr,
-                        target as usize,
-                        on_unwind as usize,
-                    );
+                    self.emit_root_scope_close(mir_bb, &place);
                 }
                 let target_bb = self.block_id[target as usize];
                 let args = self.edge_args(mir_bb, target as usize)?;
@@ -8317,6 +8456,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Lower a local `Drop` as the glue call named by its MIR terminator.
+    #[allow(dead_code)]
     fn lower_drop_as_glue_call(
         &mut self,
         mir_bb: usize,
@@ -8340,6 +8480,88 @@ impl<'a> Lowering<'a> {
             },
         };
         self.lower_call(mir_bb, call, target, on_unwind)
+    }
+
+    /// Lower one call of a bracket [`RootBracketPlan`] erased, and report
+    /// whether it did.
+    ///
+    /// `push_roots` binds nothing: the guard has no reader left.  `base()`
+    /// binds nothing either -- its result only ever indexed the read-backs
+    /// below.  `pin_root` is the identity on the value it publishes, the same
+    /// statement `try_gc_current_object_address` makes about the read half:
+    /// the translated graph already carries that reference in a slot the
+    /// backend root map rewrites when the object moves.  `get` answers with
+    /// the pinned value for the same reason.
+    fn lower_erased_root_bracket_call(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !self.root_bracket.enabled {
+            return Ok(false);
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        let Some(path) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        if !path.split("::").any(|s| s == "gc_roots") {
+            return Ok(false);
+        }
+        let leaf = path.rsplit("::").next().unwrap_or("");
+        let receiver_scope = operand_local(call.args.first())
+            .and_then(|local| self.root_bracket.scope_of_receiver(local));
+        let bound = match leaf {
+            _ if gc_root_scope_open_path(&path) => {
+                if !self.root_bracket.is_erased_scope(dest_local) {
+                    return Ok(false);
+                }
+                None
+            }
+            "base" if receiver_scope.is_some() => None,
+            "pin_root" if receiver_scope.is_some() => {
+                let value = operand_local(call.args.get(1)).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased pin_root without a plain-local value operand"
+                    ))
+                })?;
+                Some(self.local_var[value].clone().ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased pin_root reads unbound MIR local {value}"
+                    ))
+                })?)
+            }
+            "get" => {
+                let Some(scope) = receiver_scope else {
+                    return Ok(false);
+                };
+                let value = self
+                    .root_bracket
+                    .pinned
+                    .get(&scope)
+                    .copied()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased root read has no pinned value for guard {scope}"
+                        ))
+                    })?;
+                Some(self.local_var[value].clone().ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
+                    ))
+                })?)
+            }
+            _ => return Ok(false),
+        };
+        self.local_var[dest_local] = bound;
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     fn lower_call(
@@ -8368,6 +8590,14 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
+
+        // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
+        // `base()` and the read-back all leave the jitcode here, before any
+        // operand is resolved -- the guard and its borrow bind no Variable,
+        // so resolving the receiver would fail.
+        if self.lower_erased_root_bracket_call(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
 
         // The call result kind is the MIR-declared type of the
         // destination place. RPython `call.py:222` reads `FUNC.RESULT`
@@ -19138,6 +19368,21 @@ fn gc_root_pin_path(name: &str) -> bool {
     segments.last() == Some(&"pin_root") && segments.iter().any(|s| *s == "gc_roots")
 }
 
+/// The root-bracket guard type and the call that closes one.
+/// Every spelling here is a leaf or module segment: the owning crate comes
+/// from the dropped value's own resolved path, so nothing below names one.
+const ROOT_SCOPE_MODULE: &str = "gc_roots";
+const ROOT_SCOPE_TYPE: &str = "RootScope";
+/// The shadow-stack rewind the guard's destructor performs, spelled as a call
+/// that takes the guard by reference.
+pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
+
+/// True for the root-bracket guard's own type path.
+fn gc_root_scope_type_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
+}
+
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
@@ -19155,6 +19400,10 @@ fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) ->
 }
 
 /// Match the lowered RootScope close used by result/exception rewrites.
+///
+/// #1689 hoists Charon's `drop_in_place` glue; this branch emits the named
+/// `root_scope_close` residual.  Both rewind the same stack, so a rewrite
+/// that walks a close has to see either spelling.
 pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments },
@@ -19163,9 +19412,10 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     else {
         return false;
     };
-    segments.last().map(String::as_str) == Some("drop_in_place")
-        && segments.iter().any(|s| s == "gc_roots")
-        && segments.iter().any(|s| s == "RootScope")
+    let leaf = segments.last().map(String::as_str);
+    let in_gc_roots = segments.iter().any(|s| s == "gc_roots");
+    (leaf == Some("drop_in_place") && in_gc_roots && segments.iter().any(|s| s == "RootScope"))
+        || (leaf == Some(ROOT_SCOPE_CLOSE) && in_gc_roots)
 }
 
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
@@ -19194,7 +19444,6 @@ fn unit_tyref() -> TyRef {
         }
     }))
 }
-
 /// Root-stack operations whose PyObjectRef return is the physical spelling
 /// of `llmemory.GCREF`, not a W_Root instance.  Upstream's GC transformer
 /// gives such a helper call a GCREF result and casts it back to the concrete
@@ -19635,6 +19884,826 @@ fn deref_write_base_local(place: &Place) -> Option<usize> {
         PlaceKind::Local(i) => Some(i as usize),
         _ => None,
     }
+}
+
+/// A root bracket this pass takes out of the jitcode altogether.
+///
+/// Upstream never puts one there.  `gc_push_roots` / `gc_pop_roots` are
+/// genop'd by the shadow-stack transformer (`memory/gctransform/
+/// shadowstack.py:31-38`, reached from `framework.py:789-792`), and that
+/// transformer runs out of the C backend's database (`translator/c/
+/// database.py:64`, per graph from `translator/c/funcgen.py:52-59`), long
+/// after `warmspot.py:281 make_jitcodes` has already read the graphs.  A
+/// jitcode therefore never carries a bracket, and `rg 'gc_push_roots'
+/// rpython/jit/` finds nothing.
+///
+/// pyre spells the same bracket in interpreter source, so its jitcodes read
+/// it back in.  Each of the three consumers of a jitcode already has its own
+/// root set for the references the bracket republishes:
+///
+/// * the compiled trace — the jitframe gcmap the backend writes around every
+///   call whose effect info says it can collect (`regalloc.rs get_gcmap`,
+///   read back by `majit-gc/src/shadow_stack.rs walk_jf_roots`);
+/// * the blackhole — `push_bh_regs` roots the whole `registers_r` bank of the
+///   running frame and every pending caller for the length of `run()`;
+/// * the recording walk — every value it computes is stamped onto the op
+///   recorded for it, and `walk_active_trace_refs` forwards those cells, so
+///   the recorder is the root set (`fbw_state.rs FBW_FINISH_CONCRETE`).
+///
+/// The native Rust build has none of those, and keeps executing the source
+/// bracket unchanged: this pass rewrites what a jitcode says, never what
+/// rustc compiled.
+///
+/// The erasure is confined to the shape whose read-backs can be answered
+/// without the shadow stack: one `pin_root`, and every `get` indexed by that
+/// scope's own `base()`.  Then `get` is the pinned value and nothing else
+/// observes the guard.  A bracket that pins in a loop, or reads a slot this
+/// pass cannot name, keeps every op it has.
+#[derive(Default)]
+struct RootBracketPlan {
+    /// Whether the pass runs at all (`MAJIT_ROOT_BRACKET_ERASE`).
+    enabled: bool,
+    /// Guard locals whose whole bracket is erased.
+    scopes: bit_set::BitSet,
+    /// `_a = &_scope` temporaries, mapped to the guard they borrow.
+    aliases: std::collections::HashMap<usize, usize>,
+    /// Guard local -> the local holding its single pinned value.
+    pinned: std::collections::HashMap<usize, usize>,
+    /// `RootScope::base` result locals, mapped to their guard.
+    base_results: std::collections::HashMap<usize, usize>,
+    /// `(block, pinned local)` for every erased `get`, so the pinned value
+    /// stays live up to the read it now answers.
+    get_sites: Vec<(usize, usize)>,
+}
+
+impl RootBracketPlan {
+    fn is_erased_scope(&self, local: usize) -> bool {
+        self.enabled && self.scopes.contains(local)
+    }
+
+    /// The guard an erased-bracket call's receiver operand names.
+    fn scope_of_receiver(&self, local: usize) -> Option<usize> {
+        if !self.enabled {
+            return None;
+        }
+        let scope = self.aliases.get(&local).copied()?;
+        self.scopes.contains(scope).then_some(scope)
+    }
+}
+
+/// `MAJIT_ROOT_BRACKET_ERASE` — on by default; `0` / `false` keeps every
+/// root-bracket op in the jitcode, which is the shape that shipped before
+/// [`RootBracketPlan`] existed.
+fn root_bracket_erase_enabled() -> bool {
+    !matches!(
+        std::env::var("MAJIT_ROOT_BRACKET_ERASE").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
+/// Successors of a block, unwind edges included: a wider predecessor set can
+/// only shrink the dominator sets this feeds, so an unwind edge that is not
+/// really taken costs an erasure rather than licensing one.
+fn block_successors(body: &Unstructured, bb: usize) -> Vec<usize> {
+    let n = body.body.len();
+    let mut out = Vec::new();
+    let mut push = |target: u64| {
+        let target = target as usize;
+        if target < n {
+            out.push(target);
+        }
+    };
+    match body.body[bb].term() {
+        Ok(TermKind::Goto { target }) => push(target),
+        Ok(TermKind::Switch { targets, .. }) => match targets {
+            SwitchTargets::If(a, b) => {
+                push(a);
+                push(b);
+            }
+            SwitchTargets::SwitchInt(_, arms, default) => {
+                for (_, target) in arms {
+                    push(target);
+                }
+                push(default);
+            }
+        },
+        Ok(TermKind::Call {
+            target, on_unwind, ..
+        })
+        | Ok(TermKind::Assert {
+            target, on_unwind, ..
+        })
+        | Ok(TermKind::Drop {
+            target, on_unwind, ..
+        }) => {
+            push(target);
+            push(on_unwind);
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Per-block dominator sets, by the textbook iterative intersection.
+fn block_dominators(body: &Unstructured) -> Vec<bit_set::BitSet> {
+    let n = body.body.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for bb in 0..n {
+        for succ in block_successors(body, bb) {
+            preds[succ].push(bb);
+        }
+    }
+    let all: bit_set::BitSet = (0..n).collect();
+    let mut dom: Vec<bit_set::BitSet> = vec![all; n];
+    if n > 0 {
+        dom[0] = std::iter::once(0).collect();
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in 1..n {
+            let mut next: Option<bit_set::BitSet> = None;
+            for &pred in &preds[bb] {
+                next = Some(match next {
+                    None => dom[pred].clone(),
+                    Some(mut acc) => {
+                        acc.intersect_with(&dom[pred]);
+                        acc
+                    }
+                });
+            }
+            let mut next = next.unwrap_or_default();
+            next.insert(bb);
+            if next != dom[bb] {
+                dom[bb] = next;
+                changed = true;
+            }
+        }
+    }
+    dom
+}
+
+/// Prove that a pin is the first push after its own scope opened and is
+/// executed at most once per opening. `ShadowStackFrameworkGCTransformer`
+/// `push_roots` and `shadowcolor.expand_one_pop_roots` pair a particular
+/// live value with a particular slot; static call counts cannot prove that
+/// pairing when a nested bracket or a backedge changes the stack depth.
+fn root_pin_is_first_and_single(
+    body: &Unstructured,
+    opener: usize,
+    pin: usize,
+    scope: usize,
+    aliases: &std::collections::HashMap<usize, usize>,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> bool {
+    // A path back to the pin must first open a new scope. Otherwise one
+    // syntactic pin can append arbitrarily many slots under the same base.
+    let mut seen = bit_set::BitSet::new();
+    let mut work = block_successors(body, pin);
+    while let Some(bb) = work.pop() {
+        if bb == opener || !seen.insert(bb) {
+            continue;
+        }
+        if bb == pin {
+            return false;
+        }
+        work.extend(block_successors(body, bb));
+    }
+
+    // Before the pin, only the scope's own base read may run as a call.
+    // In particular, another scope's pin may occupy this scope's base even
+    // though neither operation mentions the other guard's MIR local.
+    seen.make_empty();
+    let mut work = block_successors(body, opener);
+    while let Some(bb) = work.pop() {
+        if bb == pin || !seen.insert(bb) {
+            continue;
+        }
+        match body.body[bb].term() {
+            Ok(TermKind::Call { call, .. }) => {
+                let CallFunc::Regular(reg) = &call.func else {
+                    return false;
+                };
+                if !name_of(reg).is_some_and(|path| gc_root_scope_base_path(&path))
+                    || operand_local(call.args.first())
+                        .and_then(|receiver| aliases.get(&receiver).copied())
+                        != Some(scope)
+                {
+                    return false;
+                }
+            }
+            Ok(TermKind::Drop { .. }) => return false,
+            _ => {}
+        }
+        work.extend(block_successors(body, bb));
+    }
+    true
+}
+
+/// Whether a MIR local denotes one immutable value throughout this body.
+/// Arguments have an entry definition; call destinations count as writes too.
+/// Taking the address of the local could write it indirectly, so that shape
+/// cannot stand in for the saved SSA value in `expand_one_pop_roots`.
+fn root_pin_value_is_stable(body: &Unstructured, local: usize) -> bool {
+    let mut definitions = usize::from(local > 0 && local <= body.locals.arg_count as usize);
+    let watched: bit_set::BitSet = std::iter::once(local).collect();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() {
+                if matches!(place.kind, PlaceKind::Local(dest) if dest as usize == local) {
+                    definitions += 1;
+                }
+                if matches!(value, Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
+                    && mentions_local(&stmt.kind, &watched)
+                {
+                    return false;
+                }
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term()
+            && matches!(call.dest.kind, PlaceKind::Local(dest) if dest as usize == local)
+        {
+            definitions += 1;
+        }
+    }
+    definitions == 1
+}
+
+/// Prove the whole bracket's stack effects, not just uses of its guard.
+/// `ShadowStackFrameworkGCTransformer.push_roots/pop_roots` owns every saved
+/// slot. A free `pin_root` or a callee can also change our source stack without
+/// mentioning the guard, so absence from the receiver map does not prove an
+/// empty bracket. Keep such brackets until interprocedural stack effects are
+/// known; otherwise erasing the close leaks their pins or changes a later get.
+fn root_bracket_stack_effects_are_known(
+    body: &Unstructured,
+    opener: usize,
+    scope: usize,
+    aliases: &std::collections::HashMap<usize, usize>,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> bool {
+    let mut seen = bit_set::BitSet::new();
+    let mut work = block_successors(body, opener);
+    while let Some(bb) = work.pop() {
+        if !seen.insert(bb) {
+            continue;
+        }
+        for stmt in &body.body[bb].statements {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_)) => {}
+                Ok(StmtKind::Assign(place, _)) if matches!(place.kind, PlaceKind::Local(_)) => {}
+                // An indirect write could overwrite a saved slot too.
+                _ => return false,
+            }
+        }
+        match body.body[bb].term() {
+            Ok(TermKind::Drop { place, .. }) if matches!(place.kind, PlaceKind::Local(local) if local as usize == scope) =>
+            {
+                continue;
+            }
+            Ok(TermKind::Call { call, .. }) => {
+                let CallFunc::Regular(reg) = &call.func else {
+                    return false;
+                };
+                let own_leaf = name_of(reg).is_some_and(|path| {
+                    path.split("::").any(|part| part == "gc_roots")
+                        && matches!(path.rsplit("::").next(), Some("base" | "pin_root" | "get"))
+                }) && operand_local(call.args.first())
+                    .and_then(|receiver| aliases.get(&receiver).copied())
+                    == Some(scope);
+                if !own_leaf {
+                    return false;
+                }
+            }
+            Ok(TermKind::Goto { .. } | TermKind::Switch { .. } | TermKind::Abort(_)) => {}
+            _ => return false,
+        }
+        work.extend(block_successors(body, bb));
+    }
+    true
+}
+
+/// Every MIR local a statement or terminator names, however deeply.
+fn mentions_local(v: &serde_json::Value, wanted: &bit_set::BitSet) -> bool {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(local) = map.get("Local").and_then(serde_json::Value::as_u64)
+                && wanted.contains(local as usize)
+            {
+                return true;
+            }
+            map.values().any(|nested| mentions_local(nested, wanted))
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().any(|nested| mentions_local(nested, wanted))
+        }
+        _ => false,
+    }
+}
+
+/// Build the erasure plan for one body.  Everything it does not recognise
+/// leaves the bracket alone, so a body this returns nothing for lowers
+/// exactly as it did before.
+fn analyze_root_brackets(
+    body: &Unstructured,
+    llbc: &Llbc,
+    moved: &bit_set::BitSet,
+) -> RootBracketPlan {
+    analyze_root_brackets_with(body, moved, |reg| regular_call_name_path(reg, llbc))
+}
+
+/// The root-bracket guards [`lower_fun_decl`] takes out of this body, as MIR
+/// locals.
+///
+/// An erased bracket publishes nothing, so it owes no rewind and lowers no
+/// close.  A test that counts closes needs this to tell that case from a close
+/// the lowering dropped on the floor.
+pub fn erased_root_bracket_guards(llbc: &Llbc, body: &Unstructured) -> Vec<usize> {
+    let moved = moved_out_locals(body);
+    analyze_root_brackets(body, llbc, &moved)
+        .scopes
+        .iter()
+        .collect()
+}
+
+/// [`analyze_root_brackets`] with the callee-name lookup supplied, so the
+/// accept/reject decisions can be exercised without an `Llbc`.
+fn analyze_root_brackets_with(
+    body: &Unstructured,
+    moved: &bit_set::BitSet,
+    name_of: impl Fn(&RegularCall) -> Option<String>,
+) -> RootBracketPlan {
+    let mut plan = RootBracketPlan {
+        enabled: root_bracket_erase_enabled(),
+        ..RootBracketPlan::default()
+    };
+    if !plan.enabled {
+        return plan;
+    }
+    // (1) Candidate guards: the destination of a bracket opener.
+    let mut candidates = bit_set::BitSet::new();
+    let mut opener_block: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        let Ok(TermKind::Call { call, .. }) = bb.term() else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let Some(path) = name_of(reg) else {
+            continue;
+        };
+        if !gc_root_scope_open_path(&path) {
+            continue;
+        }
+        let PlaceKind::Local(dest) = call.dest.kind else {
+            continue;
+        };
+        if moved.contains(dest as usize) || opener_block.contains_key(&(dest as usize)) {
+            // A guard opened twice in one body, or moved out of it, is not a
+            // shape this pass models.
+            candidates.remove(dest as usize);
+            continue;
+        }
+        candidates.insert(dest as usize);
+        opener_block.insert(dest as usize, bb_idx);
+    }
+    if candidates.is_empty() {
+        return plan;
+    }
+    // (2) Borrow temporaries, so a receiver operand names its guard.
+    let mut aliases: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. })) = stmt.stmt_kind()
+            else {
+                continue;
+            };
+            let (PlaceKind::Local(dest), PlaceKind::Local(scope)) = (place.kind, src.kind) else {
+                continue;
+            };
+            if !candidates.contains(scope as usize) {
+                continue;
+            }
+            if let Some(previous) = aliases.insert(dest as usize, scope as usize) {
+                // One temporary borrowing two guards: give up on both.
+                candidates.remove(previous);
+                candidates.remove(scope as usize);
+            }
+        }
+    }
+    // (2.5) `base()` results, and the copies a call argument is passed
+    //     through.  MIR moves an argument into a fresh temporary rather than
+    //     naming the callee's own destination, so `roots.get(ob_slot)` reads
+    //     `_t` where `_t = copy _ob_slot`; without the closure below every
+    //     read-back looks like an index this pass cannot name.
+    let mut assigned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind()
+                && let PlaceKind::Local(dest) = place.kind
+            {
+                *assigned.entry(dest as usize).or_default() += 1;
+            }
+        }
+    }
+    let mut bases: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term() else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let Some(path) = name_of(reg) else {
+            continue;
+        };
+        if !gc_root_scope_base_path(&path) || call.args.len() != 1 {
+            continue;
+        }
+        let (Some(receiver), PlaceKind::Local(dest)) =
+            (operand_local(call.args.first()), call.dest.kind)
+        else {
+            continue;
+        };
+        let Some(scope) = aliases.get(&receiver).copied() else {
+            continue;
+        };
+        bases.insert(dest as usize, scope);
+    }
+    // A copy of a `base()` result answers for the same slot, provided nothing
+    // else ever writes the temporary that holds it.
+    let mut copies: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, Rvalue::Use(operand))) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let (PlaceKind::Local(dest), Some(src)) =
+                    (place.kind, operand_local(Some(&operand)))
+                else {
+                    continue;
+                };
+                let dest = dest as usize;
+                if bases.contains_key(&dest) || !bases.contains_key(&src) {
+                    continue;
+                }
+                if assigned.get(&dest) != Some(&1)
+                    || candidates.contains(dest)
+                    || aliases.contains_key(&dest)
+                {
+                    continue;
+                }
+                bases.insert(dest, bases[&src]);
+                copies.insert(dest, src);
+                changed = true;
+            }
+        }
+    }
+    // (3) Classify every mention of a guard, one of its borrows, or one of its
+    //     slot indices.  Anything this loop does not account for retires the
+    //     guard.
+    let guards = {
+        let mut set = candidates.clone();
+        for local in aliases.keys() {
+            set.insert(*local);
+        }
+        set
+    };
+    let mut watched = guards.clone();
+    for local in bases.keys() {
+        watched.insert(*local);
+    }
+    // Every watched local that is not a guard names the guard it belongs to,
+    // so a mention this pass does not model retires the right bracket.
+    let mut owner = aliases.clone();
+    owner.extend(bases.iter().map(|(local, scope)| (*local, *scope)));
+    let mut pins: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    let mut gets: Vec<(usize, usize, usize)> = Vec::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        for stmt in &bb.statements {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::StorageLive(_)) | Ok(StmtKind::StorageDead(_)) => continue,
+                Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. }))
+                    if matches!(place.kind, PlaceKind::Local(d) if aliases.contains_key(&(d as usize)))
+                        && matches!(src.kind, PlaceKind::Local(s) if candidates.contains(s as usize)) =>
+                {
+                    continue;
+                }
+                // `_t = copy _slot`, the argument temporary (2.5) recorded.
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == operand_local(Some(&operand))) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+            if mentions_local(&stmt.kind, &watched) {
+                retire_mentioned(&stmt.kind, &watched, &owner, &mut candidates);
+            }
+        }
+        let term_kind = &body.body[bb_idx].terminator.kind;
+        match bb.term() {
+            Ok(TermKind::Drop {
+                place:
+                    Place {
+                        kind: PlaceKind::Local(local),
+                        ..
+                    },
+                ..
+            }) if candidates.contains(local as usize) => continue,
+            Ok(TermKind::Call { call, .. }) => {
+                // The opener names its guard as the call destination, which is
+                // the one mention of a guard that is not a use of one.
+                let opens_candidate = matches!(call.dest.kind, PlaceKind::Local(d) if opener_block.get(&(d as usize)) == Some(&bb_idx))
+                    && !call
+                        .args
+                        .iter()
+                        .any(|op| operand_local(Some(op)).is_some_and(|l| guards.contains(l)));
+                if opens_candidate {
+                    continue;
+                }
+                let leaf_scope = match &call.func {
+                    CallFunc::Regular(reg) => name_of(reg)
+                        .filter(|path| path.split("::").any(|s| s == "gc_roots"))
+                        .and_then(|path| {
+                            let leaf = path.rsplit("::").next().unwrap_or("").to_string();
+                            let receiver = operand_local(call.args.first())?;
+                            let scope = aliases.get(&receiver).copied()?;
+                            Some((leaf, scope))
+                        }),
+                    _ => None,
+                };
+                let handled = match &leaf_scope {
+                    Some((leaf, scope)) if candidates.contains(*scope) => {
+                        let dest = match call.dest.kind {
+                            PlaceKind::Local(d) => Some(d as usize),
+                            _ => None,
+                        };
+                        let names_guard_elsewhere = dest.is_some_and(|d| guards.contains(d))
+                            || call.args.iter().skip(1).any(|op| {
+                                operand_local(Some(op)).is_some_and(|l| guards.contains(l))
+                            });
+                        if names_guard_elsewhere {
+                            false
+                        } else {
+                            match (leaf.as_str(), dest) {
+                                ("pin_root", Some(_)) => match operand_local(call.args.get(1)) {
+                                    Some(value) if call.args.len() == 2 => {
+                                        pins.entry(*scope).or_default().push((bb_idx, value));
+                                        true
+                                    }
+                                    _ => false,
+                                },
+                                // (2.5) already recorded the slot this answers.
+                                ("base", Some(dest)) if call.args.len() == 1 => {
+                                    bases.get(&dest) == Some(scope)
+                                }
+                                ("get", Some(_)) if call.args.len() == 2 => {
+                                    match operand_local(call.args.get(1)) {
+                                        Some(index) => {
+                                            gets.push((bb_idx, *scope, index));
+                                            true
+                                        }
+                                        None => false,
+                                    }
+                                }
+                                _ => false,
+                            }
+                        }
+                    }
+                    _ => false,
+                };
+                if !handled && mentions_local(term_kind, &watched) {
+                    retire_mentioned(term_kind, &watched, &owner, &mut candidates);
+                }
+            }
+            _ => {
+                if mentions_local(term_kind, &watched) {
+                    retire_mentioned(term_kind, &watched, &owner, &mut candidates);
+                }
+            }
+        }
+    }
+    // (4) Keep only the guards whose reads this pass can answer.
+    let dom = block_dominators(body);
+    let mut base_results: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    let mut pinned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut get_sites: Vec<(usize, usize)> = Vec::new();
+    let surviving: Vec<usize> = candidates.iter().collect();
+    for scope in surviving {
+        if !root_bracket_stack_effects_are_known(
+            body,
+            opener_block[&scope],
+            scope,
+            &aliases,
+            &name_of,
+        ) {
+            continue;
+        }
+        match pins.get(&scope) {
+            // No receiver pin, and the whole-bracket proof excluded free pins
+            // and unknown callees too: nothing was published.
+            None => {
+                if gets.iter().any(|(_, s, _)| *s == scope) {
+                    continue;
+                }
+            }
+            Some(scope_pins) if scope_pins.len() == 1 => {
+                let (pin_bb, value_local) = scope_pins[0];
+                if !root_pin_value_is_stable(body, value_local)
+                    || !root_pin_is_first_and_single(
+                        body,
+                        opener_block[&scope],
+                        pin_bb,
+                        scope,
+                        &aliases,
+                        &name_of,
+                    )
+                {
+                    continue;
+                }
+                let mut sites = Vec::new();
+                let mut ok = true;
+                for (get_bb, get_scope, index_local) in &gets {
+                    if *get_scope != scope {
+                        continue;
+                    }
+                    // The index has to be this guard's own `base()`, and the
+                    // pin has to have run on every path reaching the read.
+                    if bases.get(index_local) != Some(&scope) || !dom[*get_bb].contains(pin_bb) {
+                        ok = false;
+                        break;
+                    }
+                    sites.push((*get_bb, value_local));
+                }
+                if !ok {
+                    continue;
+                }
+                pinned.insert(scope, value_local);
+                get_sites.extend(sites);
+            }
+            // Two or more pins number their slots by execution order, which
+            // this pass does not model.
+            Some(_) => continue,
+        }
+        plan.scopes.insert(scope);
+        for (base_local, base_scope) in &bases {
+            if *base_scope == scope {
+                base_results.insert(*base_local, scope);
+            }
+        }
+    }
+    plan.aliases = aliases
+        .into_iter()
+        .filter(|(_, scope)| plan.scopes.contains(*scope))
+        .collect();
+    plan.base_results = base_results;
+    plan.pinned = pinned;
+    plan.get_sites = get_sites;
+    plan
+}
+
+/// Retire every guard a statement or terminator names in a way
+/// [`analyze_root_brackets`] does not model.  `owner` maps a borrow or a slot
+/// index back to the guard it belongs to, so naming one of those retires the
+/// bracket it would have read.
+fn retire_mentioned(
+    kind: &serde_json::Value,
+    watched: &bit_set::BitSet,
+    owner: &std::collections::HashMap<usize, usize>,
+    candidates: &mut bit_set::BitSet,
+) {
+    let mut named = bit_set::BitSet::new();
+    collect_locals(kind, watched, &mut named);
+    for local in named.iter() {
+        candidates.remove(local);
+        if let Some(scope) = owner.get(&local) {
+            candidates.remove(*scope);
+        }
+    }
+}
+
+fn collect_locals(v: &serde_json::Value, wanted: &bit_set::BitSet, out: &mut bit_set::BitSet) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(local) = map.get("Local").and_then(serde_json::Value::as_u64)
+                && wanted.contains(local as usize)
+            {
+                out.insert(local as usize);
+            }
+            for nested in map.values() {
+                collect_locals(nested, wanted, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                collect_locals(nested, wanted, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True for the two spellings that open a root bracket: the free function and
+/// the guard's own constructor.
+fn gc_root_scope_open_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    if !segments.iter().any(|s| *s == "gc_roots") {
+        return false;
+    }
+    matches!(segments.last(), Some(&"push_roots"))
+        || (matches!(segments.last(), Some(&"new"))
+            && segments.iter().any(|s| s.contains(ROOT_SCOPE_TYPE)))
+}
+
+/// True for the read that answers a bracket's own first slot index.
+fn gc_root_scope_base_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    matches!(segments.last(), Some(&"base")) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
+}
+
+/// The MIR locals this body moves out of.
+///
+/// Charon stamps almost every `Drop` `Conditional`: the destructor runs only
+/// if the place still holds a value, and the initialisation flag that decides
+/// it is not in the artefact.  For a local nothing moves, that flag is always
+/// set and the drop is unconditional in fact; for a local something moves, it
+/// is not, and a bracket close emitted there would rewind a shadow stack the
+/// moved-to owner is still using.
+///
+/// A guard is never partially moved — it owns no droppable field and its own
+/// fields are private — so a direct `Local` operand is the whole move set.
+fn moved_out_locals(body: &Unstructured) -> bit_set::BitSet {
+    fn scan(v: &serde_json::Value, out: &mut bit_set::BitSet) {
+        match v {
+            serde_json::Value::Object(map) => {
+                if let Some(local) = map
+                    .get("Move")
+                    .and_then(|place| place.get("kind"))
+                    .and_then(|kind| kind.get("Local"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    out.insert(local as usize);
+                }
+                for nested in map.values() {
+                    scan(nested, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for nested in items {
+                    scan(nested, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = bit_set::BitSet::new();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            scan(&stmt.kind, &mut out);
+        }
+        scan(&bb.terminator.kind, &mut out);
+    }
+    out
+}
+
+/// `(block, local)` for every drop of a root-bracket guard whose close this
+/// pass can emit — the guard's local, in the block that drops it.
+///
+/// A guard the body moves out of is left out: see [`moved_out_locals`].
+fn root_scope_drop_sites(
+    body: &Unstructured,
+    llbc: &Llbc,
+    moved: &bit_set::BitSet,
+) -> Vec<(usize, usize)> {
+    let mut sites = Vec::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        let Ok(TermKind::Drop { place, .. }) = bb.term() else {
+            continue;
+        };
+        let PlaceKind::Local(local) = place.kind else {
+            continue;
+        };
+        if moved.contains(local as usize) {
+            continue;
+        }
+        let Some(def_id) = output_adt_def_id_free(&place.ty, llbc) else {
+            continue;
+        };
+        let Some(decl) = llbc.type_by_id(def_id) else {
+            continue;
+        };
+        if gc_root_scope_type_path(&decl.item_meta.name_path()) {
+            sites.push((bb_idx, local as usize));
+        }
+    }
+    sites
 }
 
 /// Per-block extra-live MIR locals for the deferred array-write base /
@@ -33437,6 +34506,253 @@ mod tests {
         assert!(
             !live[1].contains(3),
             "temp _3 is block-local, not live-in at bb1"
+        );
+    }
+
+    #[test]
+    fn root_bracket_erasure_accepts_a_single_pin_read_back_through_base() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // The `W_CTypePrimitiveSigned.convert_from_object` shape:
+        //
+        //   bb0: _2 = push_roots()          -> bb1
+        //   bb1: _3 = &_2; _4 = base(_3)    -> bb2
+        //   bb2: _5 = &_2; _6 = pin_root(_5, _1)  -> bb3
+        //   bb3: _7 = &_2; _8 = get(_7, _4) -> bb4
+        //   bb4: drop(_2)                   -> bb5
+        //   bb5: return
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let borrow = |dest: u64, src: u64| {
+            stmt(serde_json::json!({
+                "Assign": [place(dest), {"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}]
+            }))
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": {"Regular": id}}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        // `TermKind::Drop` requires Charon's drop-glue `fn_ptr` (#1689).
+        // Without it `term()` fails and the analyzer treats the raw JSON as
+        // an unmodelled mention of the guard, retiring the bracket.
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": {"Regular": 0}}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        // Callee ids: 1 = push_roots, 2 = base, 3 = pin_root, 4 = get,
+        // 5 = an unrelated function, 6 = the receiver-free pin_root.
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    2 => "pyre_object::gc_roots::{impl RootScope}::base",
+                    3 => "pyre_object::gc_roots::{impl RootScope}::pin_root",
+                    4 => "pyre_object::gc_roots::{impl RootScope}::get",
+                    6 => "pyre_object::gc_roots::pin_root",
+                    _ => "pyre_interpreter::misc::as_long",
+                }
+                .to_string(),
+            )
+        };
+        let body_of = |get_index: u64, last_callee: u64| -> Unstructured {
+            let body_json = serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+                "body": [
+                    block(vec![], call(1, vec![], 2, 1)),
+                    block(vec![borrow(3, 2)], call(2, vec![copy(3)], 4, 2)),
+                    block(vec![borrow(5, 2)], call(3, vec![copy(5), copy(1)], 6, 3)),
+                    block(vec![borrow(7, 2)], call(last_callee, vec![copy(7), copy(get_index)], 8, 4)),
+                    block(vec![], drop_guard(2, 5)),
+                    block(vec![], serde_json::json!("Return")),
+                ]
+            });
+            serde_json::from_value(body_json).expect("fixture Unstructured parses")
+        };
+
+        // Read back through the guard's own `base()`: erased, and the read
+        // is answered with the pinned local `_1`.
+        let paired = body_of(4, 4);
+        let plan = super::analyze_root_brackets_with(&paired, &bit_set::BitSet::new(), name_of);
+        assert!(plan.scopes.contains(2), "the guard `_2` must be erased");
+        assert_eq!(plan.pinned.get(&2), Some(&1));
+        assert_eq!(plan.aliases.get(&3), Some(&2));
+        assert_eq!(plan.base_results.get(&4), Some(&2));
+        assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
+
+        // A free pin does not name the guard, but its slot still belongs to
+        // that guard's rewind. This is the real unpackiterable drain shape.
+        let free_pin: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 2, 1)),
+                block(vec![], call(6, vec![copy(1)], 6, 2)),
+                block(vec![], drop_guard(2, 3)),
+                block(vec![], serde_json::json!("Return")),
+            ]
+        }))
+        .unwrap();
+        let plan = super::analyze_root_brackets_with(&free_pin, &bit_set::BitSet::new(), name_of);
+        assert!(!plan.scopes.contains(2), "a free pin still needs its close");
+
+        // The same problem can follow a known method pin. An unmodelled
+        // callee may append or overwrite a slot without borrowing this guard.
+        for callee in [5, 6] {
+            let mut foreign = body_of(4, 4);
+            foreign.body[2].terminator.kind = call(3, vec![copy(5), copy(1)], 6, 6);
+            foreign.body.push(
+                serde_json::from_value(block(vec![], call(callee, vec![copy(1)], 9, 3))).unwrap(),
+            );
+            let plan =
+                super::analyze_root_brackets_with(&foreign, &bit_set::BitSet::new(), name_of);
+            assert!(
+                !plan.scopes.contains(2),
+                "unknown stack effects keep the bracket"
+            );
+        }
+
+        // The shape the real MIR has: a call argument is a fresh temporary,
+        // so the index `get` names is `_9 = copy _4` rather than `_4`.
+        let through_copy: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 2, 1)),
+                block(vec![borrow(3, 2)], call(2, vec![copy(3)], 4, 2)),
+                block(vec![borrow(5, 2)], call(3, vec![copy(5), copy(1)], 6, 3)),
+                block(
+                    vec![
+                        borrow(7, 2),
+                        stmt(serde_json::json!({"Assign": [place(9), {"Use": copy(4)}]})),
+                    ],
+                    call(4, vec![copy(7), copy(9)], 8, 4),
+                ),
+                block(vec![], drop_guard(2, 5)),
+                block(vec![], serde_json::json!("Return")),
+            ]
+        }))
+        .expect("fixture Unstructured parses");
+        let plan =
+            super::analyze_root_brackets_with(&through_copy, &bit_set::BitSet::new(), name_of);
+        assert!(
+            plan.scopes.contains(2),
+            "an index reached through a copy temporary must still pair"
+        );
+        assert_eq!(plan.base_results.get(&9), Some(&2));
+        assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
+
+        // A pin saves the value, not the mutable MIR carrier that supplied
+        // it. An assignment after the pin must not change get(base).
+        let mut reassigned = body_of(4, 4);
+        reassigned.body[2].terminator.kind = call(3, vec![copy(5), copy(1)], 6, 6);
+        reassigned
+            .body
+            .push(serde_json::from_value(block(vec![], call(5, vec![], 1, 3))).unwrap());
+        let plan = super::analyze_root_brackets_with(&reassigned, &bit_set::BitSet::new(), name_of);
+        assert!(
+            !plan.scopes.contains(2),
+            "pin input must retain its saved value"
+        );
+
+        // One call site in a loop is several runtime pushes. The first slot
+        // stays the first value even as the pin's local receives later ones.
+        let mut repeated = body_of(4, 4);
+        repeated.locals.arg_count = 0;
+        // The loop's producer returns a new value into _1 each iteration.
+        // It is one static definition, so definition counting alone cannot
+        // distinguish the first saved value from later ones.
+        repeated.body[1].terminator.kind = call(2, vec![copy(3)], 4, 6);
+        repeated.body[3].terminator.kind = call(4, vec![copy(7), copy(4)], 8, 6);
+        repeated
+            .body
+            .push(serde_json::from_value(block(vec![], call(5, vec![], 1, 2))).unwrap());
+        let plan = super::analyze_root_brackets_with(&repeated, &bit_set::BitSet::new(), name_of);
+        assert!(
+            !plan.scopes.contains(2),
+            "a pin may not repeat under one base"
+        );
+
+        // An inner pin before the outer pin occupies the outer base. Each
+        // guard has exactly one static pin, but outer.get(base) reads the
+        // inner value. The actual drops still run in LIFO order.
+        let mut nested = body_of(4, 4);
+        nested
+            .locals
+            .locals
+            .push(serde_json::from_value(local(10)).unwrap());
+        nested
+            .locals
+            .locals
+            .push(serde_json::from_value(local(11)).unwrap());
+        let pin_outer = std::mem::replace(
+            &mut nested.body[2],
+            serde_json::from_value(block(vec![], call(1, vec![], 9, 6))).unwrap(),
+        );
+        nested.body.push(
+            serde_json::from_value(block(
+                vec![borrow(10, 9)],
+                call(3, vec![copy(10), copy(0)], 11, 7),
+            ))
+            .unwrap(),
+        );
+        nested.body.push(pin_outer);
+        nested.body[4].terminator.kind = drop_guard(9, 8);
+        nested
+            .body
+            .push(serde_json::from_value(block(vec![], drop_guard(2, 5))).unwrap());
+        // Produce the inner value before either scope opens, so _0 is a
+        // defined pointer distinct from the outer pin's input _1.
+        let open_outer = std::mem::replace(
+            &mut nested.body[0],
+            serde_json::from_value(block(vec![], call(5, vec![], 0, 9))).unwrap(),
+        );
+        nested.body.push(open_outer);
+        let plan = super::analyze_root_brackets_with(&nested, &bit_set::BitSet::new(), name_of);
+        assert!(
+            !plan.scopes.contains(2),
+            "outer base may already hold an inner pin"
+        );
+
+        // Read back through a slot this pass cannot name: the whole bracket
+        // stays.
+        let unpaired = body_of(9, 4);
+        let plan = super::analyze_root_brackets_with(&unpaired, &bit_set::BitSet::new(), name_of);
+        assert!(
+            !plan.scopes.contains(2),
+            "a read at an unnameable slot must keep its bracket"
+        );
+
+        // The guard reaching any other callee is an escape.
+        let escaped = body_of(4, 5);
+        let plan = super::analyze_root_brackets_with(&escaped, &bit_set::BitSet::new(), name_of);
+        assert!(
+            !plan.scopes.contains(2),
+            "a guard handed to an unmodelled callee must keep its bracket"
         );
     }
 

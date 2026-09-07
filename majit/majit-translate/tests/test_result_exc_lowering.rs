@@ -55,8 +55,9 @@ fn interp() -> &'static Llbc {
 fn is_root_scope_close(op: &OpKind) -> bool {
     matches!(op,
         OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-            if segments.last().map(String::as_str) == Some("drop_in_place")
-                && segments.iter().any(|s| s == "RootScope"))
+            if segments.last().map(String::as_str) == Some("root_scope_close")
+                || (segments.last().map(String::as_str) == Some("drop_in_place")
+                    && segments.iter().any(|s| s == "RootScope")))
 }
 
 #[test]

@@ -1856,6 +1856,39 @@ fn proxy_viewed_frame(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyOb
     viewed_frame(receiver)
 }
 
+/// Whether a residual's Ref-bank operands may hold something other than an
+/// object, so reading a type off one is not sound.
+///
+/// The operand list carries one word per `arg_types()` entry, which is a list
+/// of objects only where every parameter is one machine word wide.  Two
+/// families break that, and neither call is executed by the walk:
+///
+/// * a helper published with a parameter wider than a slot, which
+///   [`pyre_interpreter::is_abi_unsound_argument_residual`] names;
+/// * an un-lowered helper, whose funcbox is a symbolic hash rather than an
+///   address and whose Rust signature nothing checked — `get_and_call_function`
+///   takes `args_w: &[PyObjectRef]`, so its fourth Ref slot holds half of a
+///   slice rather than an object.
+///
+/// Reached only through a descent into a translated body, where the second
+/// family's operand faulted `deque.__len__`'s wrapper on the first `len(d)`
+/// past the compile point.
+fn residual_operands_are_not_all_objects<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) -> bool {
+    let Some(&funcbox) = allboxes.first() else {
+        return false;
+    };
+    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcbox) else {
+        // A funcbox the walk cannot read is one it cannot classify, and the
+        // executor declines on the same condition.
+        return true;
+    };
+    majit_translate::codewriter::call::is_symbolic_fnaddr(addr)
+        || pyre_interpreter::is_abi_unsound_argument_residual(addr as usize)
+}
+
 /// Write the traced frame's locals region out before a residual that reads it
 /// through a live `FrameLocalsProxy`.
 ///
@@ -1908,6 +1941,9 @@ fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
     ) else {
         return;
     };
+    if residual_operands_are_not_all_objects(ctx, allboxes) {
+        return;
+    }
     let mut reads_traced_frame = false;
     for &arg in allboxes {
         let Some(obj) = walker_concrete_ref_object(ctx, arg) else {
@@ -8177,6 +8213,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     } else {
         code[op.pc + 1 + descr_offset + 2] as usize
     };
+
+    // RootScope::get remains a residual unless the translator proves its
+    // slot/value pairing. `shadowcolor.expand_one_pop_roots` reconstructs a
+    // specific live value from its root slot; equality of an input-dependent
+    // index with a slot observed while tracing is not that proof.
 
     // Flat argboxes = i_args ++ r_args (`boxes2` argcode order).
     // Parallel argbox_types stamps each entry with its source bank so

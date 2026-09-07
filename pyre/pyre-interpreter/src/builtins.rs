@@ -16884,8 +16884,8 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// first `getarrayitem_gc_r` after the first `arraylen_gc` in the wrapper's own
 /// body; a no-argument wrapper has neither, so the descent declines with
 /// `wrapper args item descriptor unresolved` even though the key it wants would
-/// seed an empty item list.  With the un-lowered-helper scan on, that decline
-/// comes second — `PYRE_FBW_DESCENT_SCAN_OFF=1` is what shows it.
+/// seed an empty item list.  Under `PYRE_FBW_DESCENT_SCAN_STATIC=1` that
+/// decline comes second, behind the un-lowered-helper scan's own.
 ///
 /// So what this buys is reach, not a descent: the chain below is codewritten,
 /// which is what lets `rewrite_op_jit_force_virtualizable` delete the force in

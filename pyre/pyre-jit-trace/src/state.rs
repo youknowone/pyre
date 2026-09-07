@@ -7887,11 +7887,8 @@ impl PyreJitState {
     /// trim).  Used after a vsd correction so a GC scan before the next
     /// push does not observe a stale operand pointer above the live depth.
     pub fn clear_stack_above(&mut self, depth: usize) {
-        if let Some(arr) = self.locals_cells_stack_array_mut() {
-            let slice = arr.as_mut_slice();
-            for slot in slice.iter_mut().skip(depth) {
-                *slot = pyre_object::PY_NULL;
-            }
+        if let Some(frame) = self.frame_ptr() {
+            unsafe { (*(frame as *mut PyFrame)).clear_stack_above(depth) };
         }
     }
 
