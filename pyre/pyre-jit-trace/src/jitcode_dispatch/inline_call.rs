@@ -12385,7 +12385,12 @@ pub(crate) fn try_finish_replayed_call_subreturn<Sym: WalkSym>(
     code: &[u8],
     op: &crate::jitcode_runtime::DecodedOp,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
-    if !(op.opname.starts_with("inline_call_") || op.opname.starts_with("residual_call_")) {
+    // `pyjitpl.py finishframe` writes dest for `inline_call_*` only.
+    // A `residual_call_*` that suspended for a nested helper still has
+    // its Rust continuation to run (`try_walker_orthodox_descent`,
+    // `orthodox_list_append_commit` journal/apply).  Consuming that
+    // `SubReturn` here skips those epilogues.
+    if !op.opname.starts_with("inline_call_") {
         return None;
     }
     let Some((dst_bank, dst, next_pc)) = call_opcode_result_dst(code, op.pc) else {
