@@ -5795,6 +5795,31 @@ impl<M: Clone> MetaInterp<M> {
             &dyn Fn(&JitCellToken, &[Value]) -> Option<()>,
         ) -> R,
     ) -> Option<R> {
+        self.with_trace_ctx_and_framestack(
+            |ctx, _framestack, resolve, target, decision, exec_i, exec_r, exec_f, exec_v| {
+                f(ctx, resolve, target, decision, exec_i, exec_r, exec_f, exec_v)
+            },
+        )
+    }
+
+    /// Split the borrows of `MetaInterp`'s history, frame stack and warmstate.
+    /// `pyjitpl.py MetaInterp._interpret` keeps all three on the metainterp;
+    /// passing the disjoint fields preserves that owner while allowing the
+    /// recursive-call resolver to borrow warmstate during a frame step.
+    fn with_trace_ctx_and_framestack<R>(
+        &mut self,
+        f: impl FnOnce(
+            &mut TraceCtx,
+            &mut crate::pyjitpl::MIFrameStack,
+            &dyn Fn(u64) -> Option<Arc<JitCellToken>>,
+            &dyn Fn(usize, &[i64]) -> Option<(Arc<JitCellToken>, u64)>,
+            &dyn Fn(usize, &[i64], usize, usize) -> InlineDecision,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
+            &dyn Fn(&JitCellToken, &[Value]) -> Option<()>,
+        ) -> R,
+    ) -> Option<R> {
         // Move the trace out while the runtime closures run.  RPython's
         // MetaInterp owns both history and warmrunnerstate and can mutate the
         // latter from `do_recursive_call`; keeping `self.tracing` borrowed in
@@ -5977,6 +6002,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         let result = f(
             &mut tracing,
+            &mut self.framestack,
             &resolver,
             &recursive_target,
             &recursive_decision,
@@ -5987,6 +6013,108 @@ impl<M: Clone> MetaInterp<M> {
         );
         self.tracing = Some(tracing);
         Some(result)
+    }
+
+    /// `pyjitpl.py MetaInterp._interpret`: execute the metainterp-owned
+    /// frames until a terminal tracing action. In particular an abort leaves
+    /// the whole stack alive for `convert_and_run_from_pyjitpl`; popping a
+    /// frame here would lose the remainder of its partially executed opcode.
+    pub fn interpret<S: crate::pyjitpl::JitCodeSym>(
+        &mut self,
+        sym: &mut S,
+        portal_pc: usize,
+    ) -> crate::TraceAction {
+        let cpu = self.cpu.clone();
+        let issubclass = self.issubclass;
+        let pending_exc_box = self.last_exc_box;
+        let pending_exc_value = self.last_exc_value;
+        let (action, last_exc_box, last_exc_value) = self
+            .with_trace_ctx_and_framestack(
+                |ctx, framestack, resolve, target, decision, exec_i, exec_r, exec_f, exec_v| {
+                    let runtime = crate::pyjitpl::ClosureRuntimeWithResolver::new(
+                        |pc| pc,
+                        resolve,
+                        target,
+                        decision,
+                        exec_i,
+                        exec_r,
+                        exec_f,
+                        exec_v,
+                    );
+                    let mut machine = crate::pyjitpl::JitCodeMachine::with_framestack(
+                        framestack, &[], &[],
+                    );
+                    machine.set_cpu(cpu);
+                    machine.set_issubclass(issubclass);
+                    machine.last_exception_box = pending_exc_box;
+                    machine.last_exception_value = pending_exc_value;
+                    machine.set_outer_program_pc(portal_pc);
+                    let action = machine.run_to_end(ctx, sym, &runtime);
+                    (action, machine.last_exception_box, machine.last_exception_value)
+                },
+            )
+            .expect("MetaInterp.interpret requires an active trace");
+        self.last_exc_box = last_exc_box;
+        self.last_exc_value = last_exc_value;
+        action
+    }
+
+    /// `pyjitpl.py MetaInterp.run_blackhole_interp_to_cancel_tracing`.
+    /// Finish the live interpreter-function frames before returning a portal
+    /// control-flow exception. Their registers already have the JitCode ABI;
+    /// no source-PC mapping or state-field register reconstruction is needed.
+    pub fn run_blackhole_interp_to_cancel_tracing(
+        &mut self,
+        builder: &mut crate::blackhole::BlackholeInterpBuilder,
+    ) -> crate::jitexc::JitException {
+        let ctx = self.tracing.as_mut().expect("cancelling a live trace");
+        assert!(
+            !ctx.abort_after_panic && !ctx.symbolic_residual_abort,
+            "a failed JitCode instruction has no executable blackhole continuation"
+        );
+        // `MIFrame.pc` upstream is the next instruction after operand decode.
+        // Our walker keeps that cursor separately; callers below the top
+        // already published it when pushing their callees.
+        let top = self.framestack.frames.last_mut().expect("live portal frame");
+        top.pc = top.code_cursor;
+        let switch = ctx.pending_switch_to_blackhole.take();
+        let reason = switch.as_ref().map_or_else(
+            || {
+                if ctx.is_too_long() {
+                    crate::counters::ABORT_TOO_LONG
+                } else {
+                    crate::counters::ABORT_BAD_LOOP
+                }
+            },
+            |switch| switch.reason,
+        );
+        let raising_exception = switch.is_some_and(|switch| switch.raising_exception);
+        ctx.synchronize_virtualizable_after_guard_failure();
+        let vable = ctx.virtualizable_heap_ptr().map_or(0, |ptr| ptr as i64);
+        if reason == crate::counters::ABORT_TOO_LONG {
+            self.blackhole_if_trace_too_long();
+        }
+        let vinfo = self.virtualizable_info().cloned();
+        let last_exc_value = self.last_exc_value;
+        self.stage_abort_reason(reason);
+        self.abort_trace(false);
+        builder.set_cpu(self.blackhole_cpu());
+        let result = crate::jitdriver::drive_multi_frame_blackhole(
+            builder,
+            &mut self.framestack,
+            crate::blackhole::StateFieldLayout::default(),
+            vinfo.as_ref().map_or(std::ptr::null(), Arc::as_ptr),
+            vable,
+            0,
+            &self.staticdata,
+            last_exc_value,
+            raising_exception,
+            None,
+            None,
+            None,
+        );
+        self.framestack.frames.clear();
+        result.outcome
     }
 
     pub fn force_finish_trace_enabled(&self) -> bool {
@@ -16833,72 +16961,6 @@ impl<M: Clone> MetaInterp<M> {
         self.cpu.cls_of_box(&const_box)
     }
 
-    /// Run `JitCodeMachine` against `MetaInterp::framestack` per the
-    /// upstream `pyjitpl.py:self.framestack` single-stack invariant.
-    ///
-    /// Pushes the root MIFrame onto `self.framestack`, hands the
-    /// borrow to a `JitCodeMachine`, and pops the root after the
-    /// machine returns.  Mirrors RPython's `MetaInterp.interpret`
-    /// shape where `MIFrame.run_one_step` operates on
-    /// `self.framestack[-1]`.
-    ///
-    /// Reaches into `self.tracing` for the active `TraceCtx` so the
-    /// caller does not need a second `&mut TraceCtx` borrow that would
-    /// conflict with `&mut self`.  Panics when called outside an
-    /// active trace.
-    pub fn trace_jitcode_with_framestack<S, R>(
-        &mut self,
-        sym: &mut S,
-        jitcode: std::sync::Arc<crate::jitcode::JitCode>,
-        pc: usize,
-        runtime: &R,
-    ) -> crate::TraceAction
-    where
-        S: crate::pyjitpl::JitCodeSym,
-        R: crate::pyjitpl::JitCodeRuntime,
-    {
-        // pyjitpl.py:2451: self.framestack.append(f) — push the root.
-        let root_frame = crate::pyjitpl::MIFrame::setup(
-            jitcode,
-            pc,
-            None,
-            Some(
-                self.tracing
-                    .as_mut()
-                    .expect("trace_jitcode_with_framestack requires an active trace"),
-            ),
-        );
-        self.framestack.push(root_frame);
-        let cpu = self.cpu.clone();
-        let issubclass = self.issubclass;
-        let action = {
-            // Split the &mut borrow so the trace context and framestack
-            // can be passed to the machine simultaneously.  `tracing`
-            // and `framestack` are independent fields on MetaInterp.
-            let ctx = self
-                .tracing
-                .as_mut()
-                .expect("trace_jitcode_with_framestack requires an active trace");
-            // Sub-jitcode and fn-ptr pools now live on each JitCode's
-            // `exec.descrs` / `exec.fn_ptrs` (see RPython `blackhole.py:150-157`
-            // `j`/`d` argcode resolution), so the machine no longer
-            // needs parallel slice borrows at construction time.
-            let mut machine = crate::pyjitpl::JitCodeMachine::<S, _>::with_framestack(
-                &mut self.framestack,
-                &[],
-                &[],
-            );
-            machine.set_cpu(cpu);
-            machine.set_issubclass(issubclass);
-            machine.run_to_end(ctx, sym, runtime)
-        };
-        // RPython's interpret loop drains framestack via popframe; pyre
-        // mirrors the post-condition explicitly so this entry point is
-        // re-entrant — leave the stack in the same shape it came in.
-        let _ = self.framestack.pop();
-        action
-    }
-
     /// pyjitpl.py `MetaInterp.find_biggest_function`.
     ///
     /// `portal_trace_positions` is a flat log, not a stack: `newframe`
@@ -21411,6 +21473,106 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn portal_trace_abort_finishes_each_live_frame_without_replaying() {
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        use crate::jitexc::JitException;
+
+        // The first addition executes while tracing. Cancellation must finish
+        // the second addition and return through the caller's own register
+        // bank: 40 + 1 + 1 + 100 = 142. Restarting the callee repeats an effect;
+        // dropping it loses its return and the caller's continuation.
+        let mut callee = JitCodeBuilder::new();
+        callee.record_binop_i(0, OpCode::IntAdd, 0, 1);
+        callee.record_binop_i(0, OpCode::IntAdd, 0, 1);
+        callee.int_return(0);
+        let mut portal = JitCodeBuilder::new();
+        let callee = callee.finish();
+        callee.set_index(1);
+        let callee_index = portal.add_sub_jitcode(callee);
+        portal.inline_call_ir_i(callee_index, &[(1, 0), (2, 1)], &[], Some(3));
+        portal.record_binop_i(3, OpCode::IntAdd, 3, 0);
+        portal.int_return(3);
+        let portal = portal.finish();
+        portal.set_index(0);
+        portal.set_jitdriver_sd(0);
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.force_start_tracing(0, (0, 0), None, &[Value::Int(100), Value::Int(40), Value::Int(1)]);
+        meta.initialize_state_from_start(
+            Arc::new(portal),
+            &[
+                (JitArgKind::Int, OpRef::input_arg_int(0), 100),
+                (JitArgKind::Int, OpRef::input_arg_int(1), 40),
+                (JitArgKind::Int, OpRef::input_arg_int(2), 1),
+            ],
+        );
+        meta.trace_ctx().unwrap().set_trace_limit(0);
+        struct Sym;
+        impl crate::JitCodeSym for Sym {
+            fn total_slots(&self) -> usize { 0 }
+            fn loop_header_pc(&self) -> usize { 0 }
+            fn fail_args(&self) -> Option<Vec<OpRef>> { None }
+        }
+        assert!(matches!(meta.interpret(&mut Sym, 0), crate::TraceAction::Abort));
+        assert_eq!(meta.framestack.len(), 2);
+        assert_eq!(meta.framestack.current_mut().int_values[0], Some(41));
+        let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
+        assert_eq!(
+            meta.run_blackhole_interp_to_cancel_tracing(&mut builder),
+            JitException::DoneWithThisFrameInt(142),
+        );
+        assert!(meta.framestack.is_empty());
+        assert!(!meta.is_tracing());
+        assert_eq!(meta.stats.loops_aborted, 1);
+    }
+
+    #[test]
+    fn portal_trace_abort_preserves_pending_exception() {
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        use crate::jitexc::JitException;
+        // blackhole.py convert_and_run_from_pyjitpl distinguishes a caught
+        // last exception from one that SwitchToBlackhole is still raising.
+        for raising_exception in [false, true] {
+            let mut portal = JitCodeBuilder::new();
+            portal.record_binop_i(0, OpCode::IntAdd, 0, 1);
+            portal.last_exc_value(0);
+            portal.ref_return(0);
+            let portal = portal.finish();
+            portal.set_index(0);
+            portal.set_jitdriver_sd(0);
+            let mut meta = MetaInterp::<()>::new(0);
+            meta.finish_setup_descrs_for_jitdrivers();
+            meta.force_start_tracing(0, (0, 0), None, &[Value::Int(40), Value::Int(2)]);
+            meta.initialize_state_from_start(Arc::new(portal), &[
+                (JitArgKind::Int, OpRef::input_arg_int(0), 40),
+                (JitArgKind::Int, OpRef::input_arg_int(1), 2),
+            ]);
+            meta.last_exc_value = 0xfeed;
+            meta.last_exc_box = Some(OpRef::const_ptr(majit_ir::GcRef(0xfeed)));
+            meta.trace_ctx().unwrap().set_trace_limit(0);
+            struct Sym;
+            impl crate::JitCodeSym for Sym {
+                fn total_slots(&self) -> usize { 0 }
+                fn loop_header_pc(&self) -> usize { 0 }
+                fn fail_args(&self) -> Option<Vec<OpRef>> { None }
+            }
+            assert!(matches!(meta.interpret(&mut Sym, 0), crate::TraceAction::Abort));
+            meta.trace_ctx().unwrap().pending_switch_to_blackhole = Some(SwitchToBlackhole {
+                reason: counters::ABORT_ESCAPE, raising_exception,
+            });
+            let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
+            let outcome = meta.run_blackhole_interp_to_cancel_tracing(&mut builder);
+            let exception = majit_ir::GcRef(0xfeed);
+            assert_eq!(outcome, if raising_exception {
+                JitException::ExitFrameWithExceptionRef(exception)
+            } else {
+                JitException::DoneWithThisFrameRef(exception)
+            });
+        }
+    }
+
+    #[test]
     fn initialize_state_from_start_clears_and_seeds_framestack() {
         // pyjitpl.py:3266-3275 — start a fresh portal: framestack reset,
         // mainjitcode pushed, original_boxes copied via setup_call.
@@ -21468,37 +21630,6 @@ mod metainterp_static_data_tests {
             .and_then(|ctx| ctx.collect_virtualizable_boxes())
             .expect("greenfield box");
         assert_eq!(boxes, vec![box_ref]);
-    }
-
-    #[test]
-    fn trace_jitcode_with_framestack_pushes_root_then_pops() {
-        // pyjitpl.py self.framestack invariant: trace entry pushes the
-        // root frame, runs the jitcode interp, and the stack is empty
-        // again on return.
-        use crate::BackEdgeAction;
-        use crate::jitcode::JitCodeBuilder;
-        let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
-
-        let mut meta = MetaInterp::<()>::new(0);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
-        assert!(matches!(action, BackEdgeAction::StartedTracing));
-
-        struct NoopSym;
-        impl crate::JitCodeSym for NoopSym {
-            fn total_slots(&self) -> usize {
-                0
-            }
-            fn loop_header_pc(&self) -> usize {
-                0
-            }
-        }
-        let mut sym = NoopSym;
-        let runtime = crate::ClosureRuntime::new(|_| 0);
-
-        let action = meta.trace_jitcode_with_framestack(&mut sym, jitcode, 0, &runtime);
-        assert!(matches!(action, crate::TraceAction::Continue));
-        assert_eq!(meta.framestack.len(), 0);
     }
 
     #[test]

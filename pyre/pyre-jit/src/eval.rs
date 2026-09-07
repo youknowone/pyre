@@ -6296,6 +6296,15 @@ impl PyPyJitDriver {
         // The translated marker signature retains the red `frame` name; the
         // untranslated warm-state path reloads it through the shadow-stack
         // root below after possible collection points.
+        // `interp_jit.py PyFrame.jump_absolute` emits the backward-edge marker
+        // without consulting a user-bytecode graph. The legacy runtime
+        // codewriter's admission check belongs in this untranslated warm
+        // entry: jtransform rewrites the call itself to `loop_header`.
+        // Remove this check with the per-code runtime codewriter consumer.
+        let code = unsafe { &*(pycode as *const pyre_interpreter::CodeObject) };
+        if !cached_loop_header_pcs(code).contains(&next_instr) {
+            return false;
+        }
         let env = PyreEnv;
         let (driver, info) = driver_pair();
         let loop_pycode = pycode as *const ();
@@ -6312,18 +6321,16 @@ impl PyPyJitDriver {
                 >= portal_metatrace_skip()
             && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            drive_portal_metatrace(
-                driver,
-                info,
-                &env,
-                green_key_hash,
-                next_instr,
-                frame as *mut PyFrame,
-            );
+            if let Some(result) = drive_portal_metatrace(
+                driver, info, &env, green_key, next_instr, frame as *mut PyFrame,
+            ) {
+                set_pending_loop_exit(ec, result);
+                portal_diag_bump(1);
+                return true;
+            }
         }
-        // The Stage-0 drive records IR and executes residuals concretely, so it
-        // is a collection point; reload the same shadow-stack root before the
-        // compile path reads the frame.
+        // Admission and portal setup may collect; reload the caller-owned
+        // root before the legacy compile path reads the frame.
         let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
         let Some(loop_result) = maybe_compile_and_run(
             unsafe { &mut *f },
@@ -7073,17 +7080,12 @@ fn jd1_experiment_enabled() -> bool {
 /// body is safe for the opposite reason: `jtransform` rewrites the call into
 /// the `loop_header` operation, so the body is never traced.
 ///
-/// That rules out the sites the arm's own decisions would need. The two
-/// filters sit in the arm itself, and `portal_activation_bracketed` is reached
-/// from `funccall_valuestack` with no `dont_look_inside` or may-force boundary
-/// in between, so none of them is provably outside a traced graph. This line
-/// counts what it can count safely rather than what would read most directly.
+/// `portal_activation_bracketed` is reached from `funccall_valuestack`
+/// within a traced graph, so the counter stays in the untranslated marker
+/// body, after the legacy codewriter admission check.
 pub const PORTAL_DIAG_LABELS: &[&str] = &[
-    // `can_enter_jit` was reached (warmspot.py:446).  Only `eval_loop_jit`'s
-    // `StepResult::CloseLoop` arm calls it, and only after both of that arm's
-    // filters passed, so a run with back edges and `can_enter_jit=0` says the
-    // arm never completed — which is what a clobbered `StepResult` discriminant
-    // looks like from outside the trace.
+    // An admitted native warm entry. The CloseLoop arm checks the execution
+    // context; can_enter_jit checks the legacy loop-header eligibility.
     "can_enter_jit",
     // …and it answered true: the driver took the trace or ran compiled code.
     "can_enter_jit_taken",
@@ -7116,20 +7118,6 @@ pub fn portal_diag(slot: usize) -> u64 {
 fn portal_metatrace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE").as_deref() == Ok("1"))
-}
-
-/// Where the Stage-0 probe enters the portal jitcode.
-///
-/// `merge` (default) starts the walk AT the `jit_merge_point`, seeding only
-/// the registers that op declares. `start` is the faithful shape:
-/// `initialize_state_from_start` is `f = self.newframe(mainjitcode);
-/// f.setup_call(original_boxes)` — entry at pc 0 with the portal's own
-/// arguments, so the prologue runs and the walk reaches the merge point on its
-/// own. A split portal declares greens followed by reds; an unsplit portal
-/// keeps `eval_loop_jit`'s single `frame` argument.
-fn portal_metatrace_entry_at_start() -> bool {
-    static AT_START: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AT_START.get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE_ENTRY").as_deref() == Ok("start"))
 }
 
 static PORTAL_METATRACE_FIRED: std::sync::atomic::AtomicBool =
@@ -7166,10 +7154,9 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
     }
 }
 
-/// Stage-0 diagnostic drive of the build-time jd0 portal jitcode. Set
-/// `MAJIT_OPTRACE=1` for `[optrace] depth=… cursor=… pc=… opcode=… jitcode=…`
-/// per step, and `MAJIT_TLDBG=1` for `run_to_end end action=… step_count=…
-/// num_recorded_ops=…` alongside this summary.
+/// Walk the build-time portal with metainterp-owned frames. Cancellation
+/// finishes those frames in the blackhole before handing control back to the
+/// native portal (`pyjitpl.py run_blackhole_interp_to_cancel_tracing`).
 fn drive_portal_metatrace(
     driver: &mut JitDriver<PyreJitState>,
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -7177,333 +7164,103 @@ fn drive_portal_metatrace(
     green_key: u64,
     loop_header_pc: usize,
     frame: *mut PyFrame,
-) {
+) -> Option<LoopResult> {
+    use majit_metainterp::{JitArgKind, TraceAction};
+    use majit_metainterp::jitexc::JitException;
+
+    if driver.meta_interp_mut().is_tracing() {
+        return None;
+    }
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode() {
-            Some(jitcode) => jitcode,
-            None => {
-                eprintln!("[jd0-mt] portal jitcode unresolved");
-                return;
-            }
-        };
-        let portal_index = canonical
-            .try_index()
-            .map(|index| index.to_string())
-            .unwrap_or_else(|| "none".to_owned());
-        eprintln!(
-            "[jd0-mt] portal jitcode name={} index={} code_len={}",
-            canonical.name,
-            portal_index,
-            canonical.code.len(),
-        );
-        let portal_arg_classes = canonical.calldescr().arg_classes.clone();
-        let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
-
-        let header_pc = match pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
-            .find(|op| op.opname == "jit_merge_point")
-            .map(|op| op.pc)
-        {
-            Some(pc) => pc,
-            None => {
-                eprintln!("[jd0-mt] jit_merge_point not found");
-                return;
-            }
-        };
-
-        // Decode the six register lists of the `jit_merge_point` op:
-        // opcode(1) + jdindex(1), then `[len:u8][reg:u8 * len]` in green
-        // I/R/F, red I/R/F order, matching `trace_jitcode_from_merge_point`.
-        let mut slot_regs: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
-        {
-            let code = &canonical.code;
-            let mut cur = header_pc + 2;
-            for regs in slot_regs.iter_mut() {
-                let len = code[cur] as usize;
-                cur += 1;
-                for _ in 0..len {
-                    regs.push(code[cur] as usize);
-                    cur += 1;
-                }
-            }
-        }
-        eprintln!(
-            "[jd0-mt] header_pc={} merge-point regs greenI={:?} greenR={:?} greenF={:?} redI={:?} redR={:?} redF={:?}",
-            header_pc,
-            slot_regs[0],
-            slot_regs[1],
-            slot_regs[2],
-            slot_regs[3],
-            slot_regs[4],
-            slot_regs[5],
-        );
-
-        let meta = driver.meta_interp_mut();
-        if meta.is_tracing() {
-            eprintln!("[jd0-mt] bail: already tracing");
-            return;
-        }
-
-        // Everything above can allocate.  Reload the caller-owned shadow-stack
-        // root only after those calls, immediately before the concrete portal
-        // inputs are captured; never trust a raw frame pointer supplied by the
-        // caller across a collection point.
-        let live_frame = FrameView::reload(frame);
-        let next_instr = loop_header_pc as i64;
-        let is_being_profiled = i64::from(unsafe { &*live_frame }.get_is_being_profiled());
-        let pycode = unsafe { &*live_frame }.pycode as pyre_object::PyObjectRef;
-        let ec = pyre_interpreter::call::getexecutioncontext();
-        eprintln!(
-            "[jd0-mt] greens next_instr={} is_being_profiled={} pycode=0x{:x}",
-            next_instr, is_being_profiled, pycode as usize,
-        );
-        eprintln!(
-            "[jd0-mt] reds frame=0x{:x} ec=0x{:x}",
-            live_frame as usize, ec as usize,
-        );
-
-        // Start the trace through `JitDriver::force_start_tracing`, the entry
-        // the production function-entry path uses: it publishes the
-        // virtualizable heap pointer (`set_vable_ptr`) and the expanded live
-        // values through the jit state, so `initialize_virtualizable` binds
-        // the frame's `VirtualizableInfo` to the trace.  Starting on the
-        // `MetaInterp` alone leaves the trace without that info and the
-        // first `setfield_vable` aborts the walk.
-        let mut jit_state = build_jit_state(unsafe { &*live_frame }, info);
-        driver.force_start_tracing(green_key, loop_header_pc, &mut jit_state, env);
-        let meta = driver.meta_interp_mut();
-        let started = meta.is_tracing();
-        eprintln!(
-            "[jd0-mt] force_start_tracing -> {}",
-            if started {
-                "StartedTracing"
+    let canonical = pyre_jit_trace::jitcode_runtime::portal_jitcode()
+        .expect("jd0 portal jitcode must resolve");
+    // warmspot.py split_graph_and_record_jitdriver: setup_call takes greens
+    // followed by reds, and starts at pc 0. Entering an unsplit prologue or
+    // manually seeding only the merge-point registers is not this ABI.
+    assert_eq!(canonical.calldescr().arg_classes, "iirrr",
+        "portal metatracing requires a PYRE_PORTAL_SPLIT=1 build");
+    let header_pc = pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
+        .find(|op| op.opname == "jit_merge_point")
+        .expect("jd0 portal must contain its merge point").pc;
+    eprintln!("[jd0-mt] portal jitcode name={} code_len={} entry=start pc=0 header_pc={}",
+        canonical.name, canonical.code.len(), header_pc);
+    let jitcode = std::sync::Arc::new(
+        majit_metainterp::JitCode::from_canonical((*canonical).clone()));
+    let live_frame = FrameView::reload(frame);
+    let profiled = i64::from(unsafe { &*live_frame }.get_is_being_profiled());
+    let pycode = unsafe { &*live_frame }.pycode as usize as i64;
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    let mut jit_state = build_jit_state(unsafe { &*live_frame }, info);
+    driver.force_start_tracing(green_key, loop_header_pc, &mut jit_state, env);
+    let meta = driver.meta_interp_mut();
+    if !meta.is_tracing() {
+        return None;
+    }
+    let args = {
+        let ctx = meta.trace_ctx().unwrap();
+        [
+            (JitArgKind::Int, ctx.const_int(loop_header_pc as i64), loop_header_pc as i64),
+            (JitArgKind::Int, ctx.const_int(profiled), profiled),
+            (JitArgKind::Ref, ctx.const_ref(pycode), pycode),
+            (JitArgKind::Ref, majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref), live_frame as i64),
+            (JitArgKind::Ref, majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref), ec as i64),
+        ]
+    };
+    meta.initialize_state_from_start(jitcode, &args);
+    let action = meta.interpret(&mut PortalMetatraceSym { header_pc }, loop_header_pc);
+    let depth = meta.framestack.len();
+    let top = meta.framestack.frames.last();
+    eprintln!("[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={} stop_cursor={}",
+        top.map_or("<empty>", |f| f.jitcode.name()),
+        top.map_or(0, |f| f.code_cursor));
+    let outcome = match action {
+        TraceAction::Finish { finish_args, exit_with_exception, exc_value, .. } => {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.synchronize_virtualizable_after_guard_failure();
+            let outcome = if exit_with_exception {
+                JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(exc_value as usize))
             } else {
-                "NotTracing"
-            }
-        );
-        if !started {
-            return;
-        }
-
-        let mut sym = PortalMetatraceSym { header_pc };
-        let walked = meta.with_trace_ctx_and_token_resolver(
-            |ctx,
-             resolve_token,
-             recursive_target,
-             recursive_decision,
-             recursive_exec,
-             recursive_exec_ref,
-             recursive_exec_float,
-             recursive_exec_void| {
-                let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
-                    |_pc: usize| 0usize,
-                    resolve_token,
-                    recursive_target,
-                    recursive_decision,
-                    recursive_exec,
-                    recursive_exec_ref,
-                    recursive_exec_float,
-                    recursive_exec_void,
-                );
-
-                let jitcode_arc = std::sync::Arc::new(jitcode.clone());
-                let mut frame =
-                    majit_metainterp::MIFrame::setup(jitcode_arc, header_pc, None, Some(ctx));
-
-                let next_instr_opref = ctx.const_int(next_instr);
-                let is_being_profiled_opref = ctx.const_int(is_being_profiled);
-                let pycode_opref = ctx.const_ref(pycode as usize as i64);
-                let frame_opref = majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref);
-                let ec_opref = majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref);
-
-                let green_int_values = [
-                    (next_instr_opref, next_instr),
-                    (is_being_profiled_opref, is_being_profiled),
-                ];
-                for (&reg, &(opref, value)) in slot_regs[0].iter().zip(green_int_values.iter()) {
-                    if reg < frame.int_regs.len() && reg < frame.int_values.len() {
-                        frame.int_regs[reg] = Some(opref);
-                        frame.int_values[reg] = Some(value);
-                    } else {
-                        eprintln!(
-                            "[jd0-mt] skipped seed greenI reg={} regs_len={} values_len={}",
-                            reg,
-                            frame.int_regs.len(),
-                            frame.int_values.len(),
-                        );
-                    }
-                }
-                let green_ref_values = [(pycode_opref, pycode as usize as i64)];
-                for (&reg, &(opref, value)) in slot_regs[1].iter().zip(green_ref_values.iter()) {
-                    if reg < frame.ref_regs.len() && reg < frame.ref_values.len() {
-                        frame.ref_regs[reg] = Some(opref);
-                        frame.ref_values[reg] = Some(value);
-                    } else {
-                        eprintln!(
-                            "[jd0-mt] skipped seed greenR reg={} regs_len={} values_len={}",
-                            reg,
-                            frame.ref_regs.len(),
-                            frame.ref_values.len(),
-                        );
-                    }
-                }
-                let red_ref_values = [
-                    (frame_opref, live_frame as usize as i64),
-                    (ec_opref, ec as usize as i64),
-                ];
-                for (&reg, &(opref, value)) in slot_regs[4].iter().zip(red_ref_values.iter()) {
-                    if reg < frame.ref_regs.len() && reg < frame.ref_values.len() {
-                        frame.ref_regs[reg] = Some(opref);
-                        frame.ref_values[reg] = Some(value);
-                    } else {
-                        eprintln!(
-                            "[jd0-mt] skipped seed redR reg={} regs_len={} values_len={}",
-                            reg,
-                            frame.ref_regs.len(),
-                            frame.ref_values.len(),
-                        );
-                    }
-                }
-                frame.code_cursor = header_pc;
-                frame.pc = header_pc;
-
-                // `pyjitpl.py initialize_state_from_start`:
-                //   f = self.newframe(self.jitdriver_sd.mainjitcode)
-                //   f.setup_call(original_boxes)
-                // `setup_call` packs argboxes into the typed banks in
-                // declaration order. The split portal takes its greens then
-                // reds; the unsplit portal takes the live `PyFrame` at r0.
-                //
-                // The merge-point seeds above are left standing: every
-                // register they write is re-written by the prologue before the
-                // marker, and `setup_call` overwrites r0 at entry.
-                let entry_pc = if portal_metatrace_entry_at_start() {
-                    let declared_kinds = portal_arg_classes
-                        .chars()
-                        .map(|class| match class {
-                            'i' | 'S' => majit_metainterp::JitArgKind::Int,
-                            'r' => majit_metainterp::JitArgKind::Ref,
-                            'f' | 'L' => majit_metainterp::JitArgKind::Float,
-                            other => panic!("unsupported portal argument class {other:?}"),
-                        })
-                        .collect::<Vec<_>>();
-                    let start_args = match declared_kinds.as_slice() {
-                        [frame_kind] => {
-                            assert_eq!(*frame_kind, majit_metainterp::JitArgKind::Ref);
-                            vec![(*frame_kind, frame_opref, live_frame as usize as i64)]
-                        }
-                        [
-                            next_instr_kind,
-                            profiled_kind,
-                            pycode_kind,
-                            frame_kind,
-                            ec_kind,
-                        ] => vec![
-                            (*next_instr_kind, next_instr_opref, next_instr),
-                            (*profiled_kind, is_being_profiled_opref, is_being_profiled),
-                            (*pycode_kind, pycode_opref, pycode as usize as i64),
-                            (*frame_kind, frame_opref, live_frame as usize as i64),
-                            (*ec_kind, ec_opref, ec as usize as i64),
-                        ],
-                        _ => panic!(
-                            "portal start expected one or five arguments, got {:?}",
-                            portal_arg_classes
-                        ),
-                    };
-                    let seeded_arg_classes = start_args
-                        .iter()
-                        .map(|(kind, _, _)| match kind {
-                            majit_metainterp::JitArgKind::Int => 'i',
-                            majit_metainterp::JitArgKind::Ref => 'r',
-                            majit_metainterp::JitArgKind::Float => 'f',
-                        })
-                        .collect::<String>();
-                    let seeded_values = start_args
-                        .iter()
-                        .map(|(_, _, value)| *value)
-                        .collect::<Vec<_>>();
-                    frame.setup_call(&start_args);
-                    // `setup_call` sets `pc = 0`; the walker reads
-                    // `code_cursor`, which it does not touch.
-                    frame.code_cursor = 0;
-                    eprintln!(
-                        "[jd0-mt] entry=start pc=0 setup_call arg_classes=\"{}\" args={:?}",
-                        seeded_arg_classes, seeded_values,
-                    );
-                    0
-                } else {
-                    header_pc
+                let value = ctx.lookup_opref_concrete(finish_args[0])
+                    .expect("finished portal must carry its concrete result");
+                let majit_ir::Value::Ref(value) = value else {
+                    panic!("Python portal returned a non-reference: {value:?}");
                 };
-
-                let mut standalone = majit_metainterp::StandaloneFrameStack::new();
-                standalone.frames.push(frame);
-                let before = ctx.num_recorded_ops();
-                let mut machine =
-                    majit_metainterp::JitCodeMachine::<PortalMetatraceSym, _>::with_framestack(
-                        &mut standalone.frames,
-                        &[],
-                        &[],
-                    );
-                machine.set_outer_program_pc(entry_pc);
-                let action = machine.run_to_end(ctx, &mut sym, &runtime);
-                drop(machine);
-                let after = ctx.num_recorded_ops();
-                let depth = standalone.frames.len();
-                let (stop_jitcode, stop_cursor, stop_pc) = if standalone.frames.is_empty() {
-                    ("<empty>".to_owned(), 0, 0)
-                } else {
-                    let stopped = standalone.frames.current_mut();
-                    (
-                        stopped.jitcode.name().to_owned(),
-                        stopped.code_cursor,
-                        stopped.pc,
-                    )
-                };
-                (
-                    action,
-                    before,
-                    after,
-                    depth,
-                    stop_jitcode,
-                    stop_cursor,
-                    stop_pc,
-                )
-            },
-        );
-
-        driver.abort_current_trace(false);
-
-        match walked {
-            Some((action, before, after, depth, stop_jitcode, stop_cursor, stop_pc)) => {
-                eprintln!(
-                    "[jd0-mt] walk action={:?} recorded_ops={} depth={} stop_jitcode={} stop_cursor={} stop_pc={}",
-                    action,
-                    after.saturating_sub(before),
-                    depth,
-                    stop_jitcode,
-                    stop_cursor,
-                    stop_pc,
-                );
-            }
-            None => {
-                eprintln!(
-                    "[jd0-mt] walk action=unavailable recorded_ops=0 depth=0 stop_jitcode=<none> stop_cursor=0 stop_pc=0"
-                );
-            }
+                JitException::DoneWithThisFrameRef(value)
+            };
+            // This diagnostic records and executes, but does not compile.
+            // The language frame has returned, so there is no continuation
+            // left to blackhole and no Python opcode to replay.
+            meta.finish_trace_live();
+            outcome
         }
-    }));
-
-    if let Err(payload) = result {
-        driver.abort_current_trace(false);
-        let message = if let Some(message) = payload.downcast_ref::<&str>() {
-            (*message).to_owned()
-        } else if let Some(message) = payload.downcast_ref::<String>() {
-            message.clone()
-        } else {
-            "<non-string panic payload>".to_owned()
-        };
-        eprintln!("[jd0-mt] walk panicked: {message}");
+        TraceAction::Abort | TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
+            let mut builder = pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder();
+            meta.run_blackhole_interp_to_cancel_tracing(&mut builder)
+        }
+        other => panic!("unexpected portal tracing action: {other:?}"),
+    };
+    eprintln!("[jd0-mt] blackhole outcome={outcome:?}");
+    match outcome {
+        JitException::ContinueRunningNormally(args) => {
+            // warmspot.py handle_jitexception forwards the portal's own reds.
+            // The blackhole already performed the remaining frame mutations;
+            // only the carried green next_instr becomes the native loop PC.
+            let resumed = args.red_ref[0] as *mut PyFrame;
+            assert_eq!(resumed, FrameView::reload(frame));
+            unsafe { &mut *resumed }.set_last_instr_from_next_instr(args.green_int[0] as usize);
+            Some(LoopResult::ContinueRunningNormally)
+        }
+        JitException::DoneWithThisFrameRef(value) => {
+            Some(LoopResult::Done(Ok(value.0 as pyre_object::PyObjectRef)))
+        }
+        JitException::ExitFrameWithExceptionRef(value) => {
+            // The generated portal/blackhole has already unwound this frame's
+            // exception handlers. Return its exception to the Python caller.
+            Some(LoopResult::Done(Err(unsafe {
+                pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
+            })))
+        }
+        other => panic!("incomplete portal blackhole continuation: {other:?}"),
     }
 }
 
@@ -9704,48 +9461,25 @@ fn unpackiterable_portal_runner(
     }
 }
 
-/// warmspot.py handle_jitexception.
+/// Native portal entry, corresponding to warmspot.py handle_jitexception.
 ///
-/// RPython: CRN → portal_ptr(*args) re-invokes the interpreter.
-/// Pyre's portal ABI is frame-backed: each CRN producer applies its carried
-/// `next_instr` and reconstructed red state to that same live frame before it
-/// returns this outcome.  Re-looping `eval_loop_jit(frame)` is therefore the
-/// direct `portal_ptr(*args)` body call; it deliberately does not call
-/// `maybe_compile_and_run` again (`warmspot.py ll_portal_runner` owns that
-/// activation-entry step, while `handle_jitexception` does not).
+/// RPython: CRN → portal_ptr(*args) re-invokes the interpreter. The dispatch
+/// function returns the language result directly, as interp_jit.py
+/// PyFrame.dispatch does. Its native warm-entry branch consumes
+/// ContinueRunningNormally inside the dispatch loop; jtransform removes that
+/// branch with the can_enter_jit marker when generating the traced portal.
+/// Re-looping `eval_loop_jit(frame)` is the direct `portal_ptr(*args)` body
+/// call; it does not call `maybe_compile_and_run` again
+/// (`warmspot.py ll_portal_runner` owns that activation-entry step).
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
-    loop {
-        let loop_outcome = eval_loop_jit(frame_root.frame());
-        // Drain pyre's call-error stash (see `pyre_interpreter::call::set_call_error`).
-        // Several PY_NULL-returning helpers (e.g. `call_args_and_c_profile`,
-        // `c_call_trace` / `c_return_trace` / `c_exception_trace` callbacks)
-        // park their `PyError` here when their signature cannot carry one.
-        if let Some(err) = pyre_interpreter::call::take_call_error() {
-            return Err(err);
-        }
-        match loop_outcome {
-            LoopResult::Done(result) => return result,
-            // `eval_loop_jit` consumes `ExitFrameWithException` at its
-            // `maybe_compile_and_run` site (offers it to the frame's exception
-            // table, then re-loops or returns `Done`), so it never surfaces
-            // here; make the same offer should that invariant change, rather
-            // than propagating past a handler this frame has.
-            LoopResult::ExitFrameWithException(err) => {
-                return deliver_exit_frame_exception(frame_root.frame(), err);
-            }
-            LoopResult::ContinueRunningNormally => {
-                // RPython warmspot.py:976-978: result = portal_ptr(*args).
-                // The blackhole has already written back the merge point
-                // state to the frame (`call_jit.rs`'s
-                // `handle_blackhole_result`). Re-enter eval_loop_jit with
-                // that state — do NOT reset to entry.
-                frame_root.frame().fix_array_ptrs();
-                continue;
-            }
-        }
+    let result = eval_loop_jit(frame_root.frame());
+    // Helpers with a raw-pointer ABI publish their exception in this stash.
+    if let Some(err) = pyre_interpreter::call::take_call_error() {
+        return Err(err);
     }
+    result
 }
 
 /// Resume the interpreter body of an already-active portal.
@@ -10098,7 +9832,7 @@ fn cached_function_entry_trace_is_jit_safe(code: &pyre_interpreter::CodeObject) 
 /// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
-fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
+fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // The caller's root is the top of the shadow stack and names this frame;
     // every reload below goes through that root (`FrameView::reload`).
     debug_assert!(
@@ -10138,13 +9872,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // above the loop is a second, independent read: the marker's green is then
     // promoted by `ref_guard_value` and never used, while the dispatch runs on
     // an unpromoted copy that no guard makes constant. See the loop body.
-    // `semantic_loop_headers` is consumed only on the `CloseLoop` arm below (a
-    // back-edge event).  Loopless frames — the overwhelming majority during
-    // cold startup, where every called helper / class body / module top level
-    // runs once and never takes a back-edge — never reach it, so computing it
-    // eagerly here scanned the whole bytecode and built a successor map for
-    // every frame entry to produce a set no one read.  Compute it lazily at
-    // the first back-edge instead (kept per graph on `CallControl`).
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
@@ -10230,7 +9957,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                 continue;
             }
-            return LoopResult::Done(Err(err));
+            return Err(err);
         }
 
         let pc = unsafe { &*f }.next_instr();
@@ -10260,7 +9987,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // actually consumes.
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(marker_pycode) };
         if code_ptr.is_null() {
-            return LoopResult::Done(Err(pyre_interpreter::pycode::BytecodeCorruption.into()));
+            return Err(pyre_interpreter::pycode::BytecodeCorruption.into());
         }
         let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
 
@@ -10270,13 +9997,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // the code object is precisely the second, unpromoted read this
         // ordering exists to remove.
         if pc >= pyre_interpreter::code_instructions_len(code) {
-            return LoopResult::Done(Ok(w_none()));
+            return Ok(w_none());
         }
 
         let opcode_pc = decode_instruction_forward_pc(code, pc);
         let packed_instruction = decode_instruction_forward_packed(code, pc);
         if opcode_pc == usize::MAX || packed_instruction == u64::MAX {
-            return LoopResult::Done(Err(pyre_interpreter::pycode::BytecodeCorruption.into()));
+            return Err(pyre_interpreter::pycode::BytecodeCorruption.into());
         }
         let opcode = (packed_instruction & 0xff) as u8;
         // SAFETY: the packed opcode came from a live `CodeUnit`, whose opcode
@@ -10365,7 +10092,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                         unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                         continue;
                     }
-                    return LoopResult::Done(Err(err));
+                    return Err(err);
                 }
                 // bytecode_trace may allocate (tracer callback) → the frame may
                 // have moved; re-seed before reading it again.
@@ -10423,7 +10150,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
-                        return LoopResult::Done(Err(err));
+                        return Err(err);
                     }
                 }
             }
@@ -10452,9 +10179,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             // bound_reached`), so the outer attempt's history is untouchable.
             Ok(StepResult::Continue) => {}
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
-                if !cached_loop_header_pcs(code).contains(&loop_header_pc) {
-                    continue;
-                }
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer for the compile path.
                 f = FrameView::reload(f);
@@ -10485,14 +10209,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     // exit is re-raised into the interpreter loop.  Offer it to
                     // this frame's exception table first (mirroring the
                     // per-opcode `Err` arm below); resume at the handler pc when
-                    // caught, otherwise propagate it out as a plain `Done(Err)`.
+                    // caught, otherwise propagate the language exception.
                     if let LoopResult::ExitFrameWithException(mut err) = loop_result {
                         let refused = !screen_exit_frame_delivery(f, &mut err);
                         if exit_frame_diag_enabled() {
                             report_exit_frame_delivery("eval_loop", unsafe { &*f }, refused);
                         }
                         if refused {
-                            return LoopResult::Done(Err(err));
+                            return Err(err);
                         }
                         if pyre_interpreter::eval::handle_exception(
                             unsafe { &mut *f },
@@ -10504,12 +10228,19 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
-                        return LoopResult::Done(Err(err));
+                        return Err(err);
                     }
-                    return loop_result;
+                    match loop_result {
+                        LoopResult::Done(result) => return result,
+                        LoopResult::ContinueRunningNormally => {
+                            unsafe { &mut *f }.fix_array_ptrs();
+                            continue;
+                        }
+                        LoopResult::ExitFrameWithException(_) => unreachable!(),
+                    }
                 }
             }
-            Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
+            Ok(StepResult::Return(result)) => return Ok(result),
             Ok(StepResult::Yield(result)) => {
                 // `pypyjit.interp_jit.PyFrame.dispatch`: a suspended
                 // generator keeps its frame alive after leaving the portal,
@@ -10517,7 +10248,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // remains lazy through FORCE_TOKEN + GUARD_NOT_FORCED_2.
                 f = FrameView::reload(f);
                 let _ = majit_metainterp::jit::hint_force_virtualizable(unsafe { &mut *f });
-                return LoopResult::Done(Ok(result));
+                return Ok(result);
             }
             Err(mut err) => {
                 // execute_opcode_step (above) is a collection point and this arm
@@ -10533,7 +10264,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                     continue;
                 }
-                return LoopResult::Done(Err(err));
+                return Err(err);
             }
         }
     }

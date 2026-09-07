@@ -1246,7 +1246,7 @@ where
 /// `JitCodeRuntime` carrying the `label_at` /
 /// `jitcell_token_arc_for_number` closures plus the recursive-call recursive-call
 /// seams (inline decision, green-key target resolver, concrete loop
-/// executor).  Used by `MetaInterp::trace_jitcode_with_framestack` so the
+/// executor).  Used by `MetaInterp::interpret` so the
 /// dispatcher resolves CALL_ASSEMBLER targets to their production Arcs via
 /// `MetaInterp::jitcell_token_by_number` and routes recursive portal calls
 /// through the production warmstate / backend.  All closures are built by
@@ -1398,8 +1398,8 @@ where
 /// points (`trace_jitcode`, test fixtures) take that path.
 pub struct JitCodeMachine<'mi, S, R> {
     frames: &'mi mut MIFrameStack,
-    last_exception_box: Option<OpRef>,
-    last_exception_value: i64,
+    pub(super) last_exception_box: Option<OpRef>,
+    pub(super) last_exception_value: i64,
     class_of_last_exc_is_const: bool,
     cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     issubclass: Option<fn(i64, i64) -> bool>,
@@ -2618,7 +2618,7 @@ where
 
     /// Construct a `JitCodeMachine` over an existing framestack borrow.
     ///
-    /// The caller — typically `MetaInterp::trace_jitcode_with_framestack`
+    /// The caller — typically `MetaInterp::interpret`
     /// or a [`StandaloneFrameStack`] wrapper — pushes the root MIFrame
     /// before calling and pops it after the machine returns.
     pub fn with_framestack(
