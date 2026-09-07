@@ -12292,10 +12292,16 @@ mod tests {
             },
         );
         assert_eq!(result.vable_rewrites, 0);
+        // `simplify.py join_blocks` absorbs a single-entry successor into
+        // startblock and empties it in place.  The rematerialized FieldWrite
+        // still has to survive on whichever block remains.
+        let surviving = if result.graph.block(consumer).operations.is_empty() {
+            result.graph.block(graph.startblock)
+        } else {
+            result.graph.block(consumer)
+        };
         assert!(
-            result
-                .graph
-                .block(consumer)
+            surviving
                 .operations
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::FieldWrite { .. }))
