@@ -11474,13 +11474,15 @@ fn goto_if_not_branch_on<Sym: WalkSym>(
     switchcase: i64,
     target: usize,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // pyjitpl.py `opimpl_goto_if_not` requires a boolean switchcase.
-    assert!(
-        switchcase == 0 || switchcase == 1,
-        "opimpl_goto_if_not: switchcase must be 0 or 1, got {} (pc={})",
-        switchcase,
-        op.pc
-    );
+    // pyjitpl.py `opimpl_goto_if_not`: `switchcase = box.getint()` then
+    // `if switchcase: assert switchcase == 1`.  A non-0/1 value means the
+    // box is not a Bool; abort the walk instead of killing the process.
+    if switchcase != 0 && switchcase != 1 {
+        return Err(DispatchError::GotoIfNotValueNotConcrete {
+            pc: op.pc,
+            value: condbox,
+        });
+    }
     let (guard_opcode, taken_pc, other_pc) = if switchcase != 0 {
         (OpCode::GuardTrue, op.next_pc, target)
     } else {
