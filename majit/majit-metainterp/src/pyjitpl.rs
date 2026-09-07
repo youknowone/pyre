@@ -4313,6 +4313,19 @@ impl<M: Clone> MetaInterp<M> {
             if !self.vable_ptr.is_null() {
                 self.vable_ptr = virtualizable_ptr;
             }
+            // `initial_inputarg_consts` was copied from `live_values` before
+            // this force. `ctx` is not in `self.tracing` yet, so
+            // `walk_active_trace_refs` cannot forward those ConstPtrs.
+            // `orig_vable_ptr_from_trace_ctx` reads that slot first.
+            let vable_const_index = ctx
+                .driver_descriptor()
+                .and_then(|driver| driver.virtualizable_arg_index())
+                .unwrap_or(index_of_virtualizable);
+            if let Some(OpRef::ConstPtr(gcref)) =
+                ctx.initial_inputarg_consts.get_mut(vable_const_index)
+            {
+                *gcref = majit_ir::GcRef(virtualizable_ptr as usize);
+            }
         }
 
         let num_static = info.num_static_extra_boxes;
@@ -26253,7 +26266,12 @@ mod tests {
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert_eq!(obj.token, 0);
         assert_ne!(meta.vable_ptr as usize, old as usize);
+        let forwarded = meta.vable_ptr as usize;
         let ctx = meta.trace_ctx().expect("expected active trace context");
+        assert_eq!(
+            ctx.initial_inputarg_consts.first().copied(),
+            Some(OpRef::ConstPtr(majit_ir::GcRef(forwarded)))
+        );
         assert_eq!(
             ctx.virtualizable_entry_at(0),
             Some((OpRef::input_arg_int(1), Value::Int(41)))
