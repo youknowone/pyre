@@ -871,8 +871,16 @@ fn fget(w_self: PyObjectRef, attrchar: char) -> Result<PyObjectRef, PyError> {
         }),
         // `W_CTypeStructOrUnion._fget('f')`.
         'f' if ct.is_struct_or_union() => super::ctypestruct::fget_fields(ct),
-        // `W_CTypeFunc._fget`.
-        'a' if ct.kind == KIND_FUNC => Ok(ct.fargs),
+        // `W_CTypeFunc._fget('a')` — a fresh tuple of the declared argument
+        // ctypes (`ctypefunc.py` `_fget`). The stored `fargs` stays the
+        // internal list; the attribute is not that object.
+        'a' if ct.kind == KIND_FUNC => Ok(if ct.fargs.is_null() {
+            pyre_object::tupleobject::w_tuple_new(Vec::new())
+        } else {
+            pyre_object::tupleobject::w_tuple_new(unsafe {
+                pyre_object::tupleobject::w_tuple_items_copy_as_vec(ct.fargs)
+            })
+        }),
         'r' if ct.kind == KIND_FUNC => Ok(ct.ctitem),
         'E' if ct.kind == KIND_FUNC => Ok(pyre_object::boolobject::w_bool_from(
             ct.has(CTypeFlags::ELLIPSIS),
