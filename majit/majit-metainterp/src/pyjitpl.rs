@@ -7192,6 +7192,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:221: call_pure_results = metainterp.call_pure_results
         let call_pure_results = ctx.take_call_pure_results();
 
+        let snapshots = ctx.take_snapshots();
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED. This allows external invalidation
@@ -7209,7 +7210,7 @@ impl<M: Clone> MetaInterp<M> {
         // captured resumedata. `recorder.get_trace()` on its own returns
         // a snapshot-less TreeLoop.
         let mut trace = recorder.get_trace();
-        trace.snapshots = std::mem::take(&mut ctx.snapshots);
+        trace.snapshots = snapshots;
 
         // compile.py:269-270: cut trace at cross-loop merge point.
         // When the trace was retargeted to a different loop header, record
@@ -10299,9 +10300,10 @@ impl<M: Clone> MetaInterp<M> {
         // walk_active_trace_refs coverage; `compile_snapshot_refs` picks
         // up the snapshot ConstPtrs a few lines below.
         let mut ctx = self.compile_tracing.take().unwrap();
+        let snapshots = ctx.take_snapshots();
         let recorder = ctx.recorder;
         let mut trace = recorder.get_trace();
-        trace.snapshots = std::mem::take(&mut ctx.snapshots);
+        trace.snapshots = snapshots;
         let SimpleCompileViews {
             data: simple_data,
             trace_snapshots,
@@ -10783,13 +10785,14 @@ impl<M: Clone> MetaInterp<M> {
             self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
 
         let call_pure_results = ctx.take_call_pure_results();
+        let snapshots = ctx.take_snapshots();
         let recorder = ctx.recorder;
         // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
         // downstream consumers (`trace.snapshots`) still observe the
         // captured resumedata. `recorder.get_trace()` on its own returns
         // a snapshot-less TreeLoop.
         let mut trace = recorder.get_trace();
-        trace.snapshots = std::mem::take(&mut ctx.snapshots);
+        trace.snapshots = snapshots;
         let SimpleCompileViews {
             data: simple_data,
             trace_snapshots,

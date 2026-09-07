@@ -2605,7 +2605,11 @@ impl TraceCtx {
     /// full opencoder.py:567-568 5-tuple.
     pub fn get_trace_position(&self) -> TracePosition {
         let mut pos = self.recorder.get_position();
-        pos.snapshot_data_len = self.snapshots.len();
+        pos.snapshot_data_len = if self.recorder.has_byte_buffer() {
+            self.recorder.snapshot_offset_count()
+        } else {
+            self.snapshots.len()
+        };
         pos
     }
 
@@ -2628,7 +2632,13 @@ impl TraceCtx {
     /// optimizer remaps every published snapshot.
     pub fn cut_trace_with_snapshots(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
-        self.snapshots.truncate(pos.snapshot_data_len);
+        if self.recorder.has_byte_buffer() {
+            self.recorder
+                .truncate_snapshot_offsets(pos.snapshot_data_len);
+            self.snapshots.clear();
+        } else {
+            self.snapshots.truncate(pos.snapshot_data_len);
+        }
     }
 
     /// pyjitpl.py `MetaInterp.replace_box(oldbox, newbox)` —
@@ -2725,6 +2735,9 @@ impl TraceCtx {
     /// opencoder.py:819 parity: capture a snapshot of the interpreter
     /// frame state. Returns a snapshot_id for use as rd_resume_position.
     pub fn capture_resumedata(&mut self, snapshot: crate::recorder::Snapshot) -> i32 {
+        if self.recorder.has_byte_buffer() {
+            return self.recorder.encode_captured_snapshot(&snapshot);
+        }
         let id = self.snapshots.len() as i32;
         self.snapshots.push(snapshot);
         id
@@ -2737,6 +2750,23 @@ impl TraceCtx {
         } else {
             None
         }
+    }
+
+    /// Decode `_snapshot_data` into `self.snapshots` when the live
+    /// recorder wrote bytes instead of retaining `Vec<Snapshot>`.
+    pub fn ensure_snapshots_materialized(&mut self) {
+        if !self.snapshots.is_empty() {
+            return;
+        }
+        if let Some(decoded) = self.recorder.decode_captured_snapshots() {
+            self.snapshots = decoded;
+        }
+    }
+
+    /// Materialize then take the snapshot side table.
+    pub fn take_snapshots(&mut self) -> Vec<crate::recorder::Snapshot> {
+        self.ensure_snapshots_materialized();
+        std::mem::take(&mut self.snapshots)
     }
 
     /// Set rd_resume_position on the last recorded guard.
@@ -3206,16 +3236,18 @@ impl TraceCtx {
     /// the loop as `TreeLoop { inputargs, ops, snapshots }`. Snapshots
     /// come from the TraceCtx-owned side table (moved them off
     /// `recorder::Trace`); the recorder contributes only inputargs + ops.
-    pub fn into_tree_loop(self) -> crate::history::TreeLoop {
+    pub fn into_tree_loop(mut self) -> crate::history::TreeLoop {
         // `ops` is already `Vec<OpRc>`; `from_oprc` preserves the recorder's
         // shared `Rc<Op>` identity.
+        self.ensure_snapshots_materialized();
         let (inputargs, ops) = self.recorder.into_parts();
         crate::history::TreeLoop::from_oprc(inputargs, ops, self.snapshots)
     }
 
     /// Snapshot slice accessor — Pyre-level parity with
     /// `MetaInterp.history.trace.snapshots()`.
-    pub fn snapshots(&self) -> &[crate::recorder::Snapshot] {
+    pub fn snapshots(&mut self) -> &[crate::recorder::Snapshot] {
+        self.ensure_snapshots_materialized();
         &self.snapshots
     }
 
@@ -3508,8 +3540,8 @@ impl TraceCtx {
         args: &[OpRef],
         num_live: usize,
     ) -> OpRef {
-        let snapshot_idx = self.snapshots.len() as i32;
-        self.snapshots.push(crate::recorder::Snapshot {
+        let opref = self.record_guard(opcode, args, num_live);
+        let snapshot_idx = self.capture_resumedata(crate::recorder::Snapshot {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: crate::recorder::UNSTAMPED_JITCODE_INDEX,
                 pc: self.last_traced_pc as u32,
@@ -3519,7 +3551,6 @@ impl TraceCtx {
             vable_boxes: Vec::new(),
             vref_boxes: Vec::new(),
         });
-        let opref = self.record_guard(opcode, args, num_live);
         self.recorder.set_last_op_resume_position(snapshot_idx);
         opref
     }
