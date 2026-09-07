@@ -9235,9 +9235,9 @@ pub struct CraneliftBackend {
     /// `-live-` decoder for the `rd_numb` reads below.
     next_frame_value_count_fn: Option<fn(i32, i32) -> usize>,
     /// Whether a bridge that closes onto its owner is re-emitted into the
-    /// owner's own function. On by default; `MAJIT_CL_NO_BRIDGE_MERGE`
-    /// turns it off. Read once here rather than per compile so a test can
-    /// drive the route without an environment the rest of the process shares.
+    /// owner's own function (`MAJIT_CL_BRIDGE_MERGE`). Read once here rather
+    /// than per compile so a test can drive the route without an environment
+    /// the rest of the process shares.
     bridge_merge: bool,
     registered_call_assembler_tokens: IndexSet<u64>,
     registered_call_assembler_bridge_traces: IndexSet<u64>,
@@ -9497,10 +9497,11 @@ impl CraneliftBackend {
             next_trace_id: None,
             next_header_pc: None,
             next_frame_value_count_fn: None,
-            // On by default. The owner re-emission keeps the rewritten
-            // stream and the GcTable GC forwards; `MAJIT_CL_NO_BRIDGE_MERGE`
-            // restores the out-of-line bridge.
-            bridge_merge: std::env::var_os("MAJIT_CL_NO_BRIDGE_MERGE").is_none(),
+            // Opt-in: `MAJIT_CL_BRIDGE_MERGE`. Default-on raised
+            // fannkuch `bridges_compiled` 24 → 93 and `guard_failures`
+            // 5450 → 19549 with the same printed result; that is a
+            // deopt-volume regression, not a new baseline.
+            bridge_merge: std::env::var_os("MAJIT_CL_BRIDGE_MERGE").is_some(),
             registered_call_assembler_tokens: IndexSet::new(),
             registered_call_assembler_bridge_traces: IndexSet::new(),
             // llmodel.py:64-69: vtable_offset is None when gcremovetypeptr is
@@ -18477,10 +18478,9 @@ impl majit_backend::Backend for CraneliftBackend {
         // faster route to the same guard when the bridge closes back onto the
         // loop it came from. A declined merge leaves it as the only route.
         //
-        // On by default. The owner re-emission keeps the rewritten stream
-        // and the GcTable GC forwards, so a later collection cannot
-        // resurrect the nursery ConstPtrs the first compile replaced.
-        // `MAJIT_CL_NO_BRIDGE_MERGE` turns this back off.
+        // Opt-in: `MAJIT_CL_BRIDGE_MERGE`. The owner re-emission keeps
+        // the rewritten stream and the GcTable GC forwards, but fannkuch
+        // still compiles four times as many bridges once a merge fires.
         if self.bridge_merge {
             let fail_index = fail_descr.fail_index_per_trace();
             let merged = self.merge_bridge_into_owner(
@@ -20951,8 +20951,7 @@ mod tests {
     #[test]
     fn bridge_closing_onto_its_owner_merges_into_the_loop() {
         let mut backend = CraneliftBackend::new();
-        // Force the route on so an ambient `MAJIT_CL_NO_BRIDGE_MERGE` cannot
-        // skip the merge this test is asserting.
+        // Force the route on; the production default is still opt-in.
         backend.bridge_merge = true;
         let loop_descr = make_label_descr(1_500_290);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
