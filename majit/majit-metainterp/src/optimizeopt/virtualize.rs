@@ -3695,9 +3695,8 @@ mod tests {
         // `variant_inherits_enum_tag` requires (`StructId::from_canonical_spelling`).
         let descr = |size: usize, owner: &str, key: &str| {
             let mut size_descr = majit_ir::descr::SimpleSizeDescr::new(0, size, 1);
-            size_descr.set_cache_key(
-                majit_ir::descr::StructId::from_canonical_spelling(owner).as_u64(),
-            );
+            size_descr
+                .set_cache_key(majit_ir::descr::StructId::from_canonical_spelling(owner).as_u64());
             let parent = Arc::new(size_descr) as DescrRef;
             let field = majit_ir::SimpleFieldDescr::new_with_name(
                 0,
@@ -3725,7 +3724,8 @@ mod tests {
         // is a different `(STRUCT, fieldname)` and must not match.
         let (payload_slot, _payload_parent) =
             descr(24, "pyopcode::StepResult::CloseLoop", "payload");
-        let (base_owned_payload, _base_payload_parent) = descr(8, "pyopcode::StepResult", "payload");
+        let (base_owned_payload, _base_payload_parent) =
+            descr(8, "pyopcode::StepResult", "payload");
         assert!(
             !slot_holds_field(&payload_slot, &base_owned_payload),
             "a non-tag field must not be admitted across the inheritance edge"

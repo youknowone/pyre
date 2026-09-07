@@ -6301,7 +6301,11 @@ impl PyPyJitDriver {
         // codewriter's admission check belongs in this untranslated warm
         // entry: jtransform rewrites the call itself to `loop_header`.
         // Remove this check with the per-code runtime codewriter consumer.
-        let code = unsafe { &*(pycode as *const pyre_interpreter::CodeObject) };
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(pycode) };
+        if code_ptr.is_null() {
+            return false;
+        }
+        let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
         if !cached_loop_header_pcs(code).contains(&next_instr) {
             return false;
         }
@@ -6322,7 +6326,12 @@ impl PyPyJitDriver {
             && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             if let Some(result) = drive_portal_metatrace(
-                driver, info, &env, green_key, next_instr, frame as *mut PyFrame,
+                driver,
+                info,
+                &env,
+                green_key,
+                next_instr,
+                frame as *mut PyFrame,
             ) {
                 set_pending_loop_exit(ec, result);
                 portal_diag_bump(1);
@@ -7165,27 +7174,36 @@ fn drive_portal_metatrace(
     loop_header_pc: usize,
     frame: *mut PyFrame,
 ) -> Option<LoopResult> {
-    use majit_metainterp::{JitArgKind, TraceAction};
     use majit_metainterp::jitexc::JitException;
+    use majit_metainterp::{JitArgKind, TraceAction};
 
     if driver.meta_interp_mut().is_tracing() {
         return None;
     }
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
-    let canonical = pyre_jit_trace::jitcode_runtime::portal_jitcode()
-        .expect("jd0 portal jitcode must resolve");
+    let canonical =
+        pyre_jit_trace::jitcode_runtime::portal_jitcode().expect("jd0 portal jitcode must resolve");
     // warmspot.py split_graph_and_record_jitdriver: setup_call takes greens
     // followed by reds, and starts at pc 0. Entering an unsplit prologue or
     // manually seeding only the merge-point registers is not this ABI.
-    assert_eq!(canonical.calldescr().arg_classes, "iirrr",
-        "portal metatracing requires a PYRE_PORTAL_SPLIT=1 build");
+    assert_eq!(
+        canonical.calldescr().arg_classes,
+        "iirrr",
+        "portal metatracing requires a PYRE_PORTAL_SPLIT=1 build"
+    );
     let header_pc = pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
         .find(|op| op.opname == "jit_merge_point")
-        .expect("jd0 portal must contain its merge point").pc;
-    eprintln!("[jd0-mt] portal jitcode name={} code_len={} entry=start pc=0 header_pc={}",
-        canonical.name, canonical.code.len(), header_pc);
-    let jitcode = std::sync::Arc::new(
-        majit_metainterp::JitCode::from_canonical((*canonical).clone()));
+        .expect("jd0 portal must contain its merge point")
+        .pc;
+    eprintln!(
+        "[jd0-mt] portal jitcode name={} code_len={} entry=start pc=0 header_pc={}",
+        canonical.name,
+        canonical.code.len(),
+        header_pc
+    );
+    let jitcode = std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
+        (*canonical).clone(),
+    ));
     let live_frame = FrameView::reload(frame);
     let profiled = i64::from(unsafe { &*live_frame }.get_is_being_profiled());
     let pycode = unsafe { &*live_frame }.pycode as usize as i64;
@@ -7199,28 +7217,48 @@ fn drive_portal_metatrace(
     let args = {
         let ctx = meta.trace_ctx().unwrap();
         [
-            (JitArgKind::Int, ctx.const_int(loop_header_pc as i64), loop_header_pc as i64),
+            (
+                JitArgKind::Int,
+                ctx.const_int(loop_header_pc as i64),
+                loop_header_pc as i64,
+            ),
             (JitArgKind::Int, ctx.const_int(profiled), profiled),
             (JitArgKind::Ref, ctx.const_ref(pycode), pycode),
-            (JitArgKind::Ref, majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref), live_frame as i64),
-            (JitArgKind::Ref, majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref), ec as i64),
+            (
+                JitArgKind::Ref,
+                majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+                live_frame as i64,
+            ),
+            (
+                JitArgKind::Ref,
+                majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+                ec as i64,
+            ),
         ]
     };
     meta.initialize_state_from_start(jitcode, &args);
     let action = meta.interpret(&mut PortalMetatraceSym { header_pc }, loop_header_pc);
     let depth = meta.framestack.len();
     let top = meta.framestack.frames.last();
-    eprintln!("[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={} stop_cursor={}",
+    eprintln!(
+        "[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={} stop_cursor={}",
         top.map_or("<empty>", |f| f.jitcode.name()),
-        top.map_or(0, |f| f.code_cursor));
+        top.map_or(0, |f| f.code_cursor)
+    );
     let outcome = match action {
-        TraceAction::Finish { finish_args, exit_with_exception, exc_value, .. } => {
+        TraceAction::Finish {
+            finish_args,
+            exit_with_exception,
+            exc_value,
+            ..
+        } => {
             let ctx = meta.trace_ctx().unwrap();
             ctx.synchronize_virtualizable_after_guard_failure();
             let outcome = if exit_with_exception {
                 JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(exc_value as usize))
             } else {
-                let value = ctx.lookup_opref_concrete(finish_args[0])
+                let value = ctx
+                    .lookup_opref_concrete(finish_args[0])
                     .expect("finished portal must carry its concrete result");
                 let majit_ir::Value::Ref(value) = value else {
                     panic!("Python portal returned a non-reference: {value:?}");

@@ -5797,7 +5797,9 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<R> {
         self.with_trace_ctx_and_framestack(
             |ctx, _framestack, resolve, target, decision, exec_i, exec_r, exec_f, exec_v| {
-                f(ctx, resolve, target, decision, exec_i, exec_r, exec_f, exec_v)
+                f(
+                    ctx, resolve, target, decision, exec_i, exec_r, exec_f, exec_v,
+                )
             },
         )
     }
@@ -6041,16 +6043,19 @@ impl<M: Clone> MetaInterp<M> {
                         exec_f,
                         exec_v,
                     );
-                    let mut machine = crate::pyjitpl::JitCodeMachine::with_framestack(
-                        framestack, &[], &[],
-                    );
+                    let mut machine =
+                        crate::pyjitpl::JitCodeMachine::with_framestack(framestack, &[], &[]);
                     machine.set_cpu(cpu);
                     machine.set_issubclass(issubclass);
                     machine.last_exception_box = pending_exc_box;
                     machine.last_exception_value = pending_exc_value;
                     machine.set_outer_program_pc(portal_pc);
                     let action = machine.run_to_end(ctx, sym, &runtime);
-                    (action, machine.last_exception_box, machine.last_exception_value)
+                    (
+                        action,
+                        machine.last_exception_box,
+                        machine.last_exception_value,
+                    )
                 },
             )
             .expect("MetaInterp.interpret requires an active trace");
@@ -6075,7 +6080,11 @@ impl<M: Clone> MetaInterp<M> {
         // `MIFrame.pc` upstream is the next instruction after operand decode.
         // Our walker keeps that cursor separately; callers below the top
         // already published it when pushing their callees.
-        let top = self.framestack.frames.last_mut().expect("live portal frame");
+        let top = self
+            .framestack
+            .frames
+            .last_mut()
+            .expect("live portal frame");
         top.pc = top.code_cursor;
         let switch = ctx.pending_switch_to_blackhole.take();
         let reason = switch.as_ref().map_or_else(
@@ -21498,7 +21507,12 @@ mod metainterp_static_data_tests {
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        meta.force_start_tracing(0, (0, 0), None, &[Value::Int(100), Value::Int(40), Value::Int(1)]);
+        meta.force_start_tracing(
+            0,
+            (0, 0),
+            None,
+            &[Value::Int(100), Value::Int(40), Value::Int(1)],
+        );
         meta.initialize_state_from_start(
             Arc::new(portal),
             &[
@@ -21510,11 +21524,20 @@ mod metainterp_static_data_tests {
         meta.trace_ctx().unwrap().set_trace_limit(0);
         struct Sym;
         impl crate::JitCodeSym for Sym {
-            fn total_slots(&self) -> usize { 0 }
-            fn loop_header_pc(&self) -> usize { 0 }
-            fn fail_args(&self) -> Option<Vec<OpRef>> { None }
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+            fn fail_args(&self) -> Option<Vec<OpRef>> {
+                None
+            }
         }
-        assert!(matches!(meta.interpret(&mut Sym, 0), crate::TraceAction::Abort));
+        assert!(matches!(
+            meta.interpret(&mut Sym, 0),
+            crate::TraceAction::Abort
+        ));
         assert_eq!(meta.framestack.len(), 2);
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(41));
         let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
@@ -21544,31 +21567,47 @@ mod metainterp_static_data_tests {
             let mut meta = MetaInterp::<()>::new(0);
             meta.finish_setup_descrs_for_jitdrivers();
             meta.force_start_tracing(0, (0, 0), None, &[Value::Int(40), Value::Int(2)]);
-            meta.initialize_state_from_start(Arc::new(portal), &[
-                (JitArgKind::Int, OpRef::input_arg_int(0), 40),
-                (JitArgKind::Int, OpRef::input_arg_int(1), 2),
-            ]);
+            meta.initialize_state_from_start(
+                Arc::new(portal),
+                &[
+                    (JitArgKind::Int, OpRef::input_arg_int(0), 40),
+                    (JitArgKind::Int, OpRef::input_arg_int(1), 2),
+                ],
+            );
             meta.last_exc_value = 0xfeed;
             meta.last_exc_box = Some(OpRef::const_ptr(majit_ir::GcRef(0xfeed)));
             meta.trace_ctx().unwrap().set_trace_limit(0);
             struct Sym;
             impl crate::JitCodeSym for Sym {
-                fn total_slots(&self) -> usize { 0 }
-                fn loop_header_pc(&self) -> usize { 0 }
-                fn fail_args(&self) -> Option<Vec<OpRef>> { None }
+                fn total_slots(&self) -> usize {
+                    0
+                }
+                fn loop_header_pc(&self) -> usize {
+                    0
+                }
+                fn fail_args(&self) -> Option<Vec<OpRef>> {
+                    None
+                }
             }
-            assert!(matches!(meta.interpret(&mut Sym, 0), crate::TraceAction::Abort));
+            assert!(matches!(
+                meta.interpret(&mut Sym, 0),
+                crate::TraceAction::Abort
+            ));
             meta.trace_ctx().unwrap().pending_switch_to_blackhole = Some(SwitchToBlackhole {
-                reason: counters::ABORT_ESCAPE, raising_exception,
+                reason: counters::ABORT_ESCAPE,
+                raising_exception,
             });
             let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
             let outcome = meta.run_blackhole_interp_to_cancel_tracing(&mut builder);
             let exception = majit_ir::GcRef(0xfeed);
-            assert_eq!(outcome, if raising_exception {
-                JitException::ExitFrameWithExceptionRef(exception)
-            } else {
-                JitException::DoneWithThisFrameRef(exception)
-            });
+            assert_eq!(
+                outcome,
+                if raising_exception {
+                    JitException::ExitFrameWithExceptionRef(exception)
+                } else {
+                    JitException::DoneWithThisFrameRef(exception)
+                }
+            );
         }
     }
 
