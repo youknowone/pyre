@@ -7178,7 +7178,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // instance, so neither route above sees it and the residual advances
         // it by calling back into the interpreter.
         if let Some(resumed) = spec_gate(SpecFold::GeneratorNext, || {
-            try_walker_specialize_generator_next(ctx, op, &r_args, dst_bank)
+            try_walker_specialize_generator_next(ctx, op, &r_args, dst, dst_bank)
         })? {
             return Ok(resumed);
         }
