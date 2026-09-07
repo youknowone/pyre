@@ -590,7 +590,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                     );
                 }
                 fbw_publish_exit_last_instr(&mut wc, position);
-                fbw_force_virtualizable_before_return(&mut wc);
+                fbw_store_token_in_vable(&mut wc, position)?;
                 fbw_terminate_with_raise(seed.exc, seed.exc_concrete);
                 carrier_raise_escapes = true;
                 position

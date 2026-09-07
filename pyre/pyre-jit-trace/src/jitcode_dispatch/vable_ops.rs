@@ -10,6 +10,273 @@
 
 use super::*;
 
+/// Register-bank half of `pyjitpl.MetaInterp.replace_box`, owned by a live
+/// walker frame. Rust cannot borrow a paused caller's banks while its child
+/// is using the same TraceCtx. Queue the replacement on each frame owner and
+/// apply it before that frame executes again; its resume boxes are rewritten
+/// immediately below, before any descendant can capture a guard.
+///
+/// Weak registration neither extends a frame's lifetime nor leaks aliases
+/// into a nested trace session. Heap-owned SubWalkFrames keep this owner
+/// across suspension; recursive callers keep it for precisely the child call.
+/// Delivery must precede the caller continuation, not the next opcode: trace
+/// rollback can reuse an OpRef id, and a later delivery could rewrite a new
+/// value that was never present in the paused caller.
+pub(super) struct FrameBoxReplacements(std::rc::Rc<FrameBoxReplacementInbox>);
+
+pub(crate) struct FrameBoxReplacementInbox {
+    pending: std::cell::RefCell<Vec<(OpRef, OpRef)>>,
+    listening: std::cell::Cell<bool>,
+}
+
+impl FrameBoxReplacements {
+    pub(super) fn new(session: &std::cell::RefCell<WalkSession>) -> Self {
+        let pending = std::rc::Rc::new(FrameBoxReplacementInbox {
+            pending: std::cell::RefCell::new(Vec::new()),
+            listening: std::cell::Cell::new(true),
+        });
+        let mut session = session.borrow_mut();
+        session
+            .box_replacement_frames
+            .retain(|frame| frame.strong_count() != 0);
+        session
+            .box_replacement_frames
+            .push(std::rc::Rc::downgrade(&pending));
+        Self(pending)
+    }
+
+    pub(super) fn apply<Sym: WalkSym>(&self, ctx: &mut WalkContext<'_, '_, Sym>) {
+        for (oldbox, newbox) in self.0.pending.borrow_mut().drain(..) {
+            replace_box_in_walk_frame(ctx, oldbox, newbox);
+        }
+    }
+
+    pub(super) fn set_listening(&self, listening: bool) {
+        self.0.listening.set(listening);
+    }
+}
+
+fn replace_slots(slots: &mut [OpRef], oldbox: OpRef, newbox: OpRef) {
+    for slot in slots {
+        if *slot == oldbox {
+            *slot = newbox;
+        }
+    }
+}
+
+fn replace_box_in_walk_frame<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    oldbox: OpRef,
+    newbox: OpRef,
+) {
+    replace_slots(ctx.registers_r, oldbox, newbox);
+    replace_slots(ctx.registers_i, oldbox, newbox);
+    replace_slots(ctx.registers_f, oldbox, newbox);
+    replace_slots(&mut ctx.outer_active_boxes, oldbox, newbox);
+    replace_slots(&mut ctx.vstack_boxes, oldbox, newbox);
+    replace_slots(
+        std::slice::from_mut(&mut ctx.vstack_last_ref),
+        oldbox,
+        newbox,
+    );
+    if let Some((_, _, boxes, _)) = ctx.vstack_reorder_saved.as_mut() {
+        replace_slots(boxes, oldbox, newbox);
+    }
+    if let Some(shadow) = ctx.callee_shadow.as_mut() {
+        replace_slots(std::slice::from_mut(&mut shadow.frame_box), oldbox, newbox);
+        for value in shadow.opref.values_mut() {
+            replace_slots(std::slice::from_mut(value), oldbox, newbox);
+        }
+    }
+    if ctx.fbw_mode.current_exception_seed == Some(oldbox) {
+        ctx.fbw_mode.current_exception_seed = Some(newbox);
+    }
+}
+
+fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox: OpRef) {
+    session.box_replacement_frames.retain(|frame| {
+        if let Some(frame) = frame.upgrade() {
+            if frame.listening.get() {
+                frame.pending.borrow_mut().push((oldbox, newbox));
+            }
+            true
+        } else {
+            false
+        }
+    });
+    for frame in &mut session.framestack {
+        for parent in &mut frame.parents {
+            replace_slots(&mut parent.boxes, oldbox, newbox);
+            if let Some(blackhole) = parent.blackhole.as_mut() {
+                for (_, value) in &mut blackhole.float_values {
+                    replace_slots(std::slice::from_mut(value), oldbox, newbox);
+                }
+            }
+        }
+    }
+    if session.last_exc_value == Some(oldbox) {
+        session.last_exc_value = Some(newbox);
+    }
+    for slot in [
+        &mut session.tmpreg_r,
+        &mut session.tmpreg_i,
+        &mut session.tmpreg_f,
+    ] {
+        replace_slots(std::slice::from_mut(slot), oldbox, newbox);
+    }
+}
+
+/// `pyjitpl.py MetaInterp.replace_box` framestack half for the walker.
+///
+/// `_nonstandard_virtualizable` Step 4 already rewrote the TraceCtx
+/// records. The live register banks are this walk's `MIFrame` analogue.
+pub(super) fn apply_pending_vable_box_replace<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    let Some((oldbox, newbox)) = ctx.trace_ctx.take_pending_box_replace() else {
+        return;
+    };
+    replace_box_in_paused_frames(&mut ctx.session.borrow_mut(), oldbox, newbox);
+    replace_box_in_walk_frame(ctx, oldbox, newbox);
+}
+
+#[cfg(test)]
+mod frame_replacement_tests {
+    use super::*;
+
+    #[test]
+    fn descendants_replace_paused_registers_and_resume_boxes() {
+        let old = OpRef::input_arg_ref(0);
+        let middle = OpRef::input_arg_ref(1);
+        let standard = OpRef::input_arg_ref(2);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let parent = FrameBoxReplacements::new(&session);
+        let suspended = FrameBoxReplacements::new(&session);
+        let active = FrameBoxReplacements::new(&session);
+        active.set_listening(false);
+        session.borrow_mut().framestack.push(InlineFrame {
+            w_code: 1,
+            recursion_greenkey: true,
+            call_id: 1,
+            debug_merge_point_py_pc: None,
+            parents: vec![InlineParentFrame {
+                jitcode_index: 0,
+                call_jitcode_pc: Some(0),
+                call_stack_overrides: Vec::new(),
+                blackhole: None,
+                resume_coord: ParentResumeCoord::Backxlat(0),
+                resume_marker_jit_pc: None,
+                boxes: vec![old],
+            }],
+            entry_executed_effects: 0,
+        });
+        replace_box_in_paused_frames(&mut session.borrow_mut(), old, middle);
+        replace_box_in_paused_frames(&mut session.borrow_mut(), middle, standard);
+        // The active frame is rewritten directly, never on a later replay
+        // where the trace could have reused one of these operation ids.
+        assert!(active.0.pending.borrow().is_empty());
+        drop(active);
+        // Guard capture in the child already sees the rewritten caller.
+        assert_eq!(
+            session.borrow().framestack[0].parents[0].boxes,
+            vec![standard]
+        );
+        // Consuming one frame's mailbox must not consume another's.
+        for owner in [parent, suspended] {
+            let mut trace = TraceCtx::for_test_types(&[Type::Ref; 3]);
+            let mut regs = vec![old];
+            let mut ints = Vec::new();
+            let mut floats = Vec::new();
+            let mut concrete_r = Vec::new();
+            let mut concrete_i = Vec::new();
+            let mut ctx = WalkContext {
+                callee_shadow: Some(CalleeLocalsShadow {
+                    frame_box: old,
+                    ..Default::default()
+                }),
+                inline_callee_consts: None,
+                inline_poison_pcs: None,
+                fbw_mode: FbwWalkMode::<crate::state::PyreSym>::default(),
+                session: &session,
+                registers_r: &mut regs,
+                registers_i: &mut ints,
+                registers_f: &mut floats,
+                concrete_registers_r: &mut concrete_r,
+                concrete_registers_i: &mut concrete_i,
+                descr_refs: &[],
+                raw_descrs: RawDescrPool::Global,
+                is_authoritative_executor: false,
+                trace_ctx: &mut trace,
+                is_top_level: false,
+                sub_jitcode_lookup: &|_| None,
+                entry_py_pc: EntryPyPc::Py(0),
+                outer_resume_marker_jit_pc: None,
+                outer_jitcode_index: 0,
+                outer_active_boxes: vec![old],
+                pending_guard_snapshot_error: None,
+                vstack_boxes: vec![old],
+                vstack_depth: 1,
+                vstack_cur_pypc: 0,
+                vstack_valid: true,
+                vstack_last_ref: old,
+                vstack_reorder_ceiling: u32::MAX,
+                vstack_reorder_saved: None,
+                vstack_handler_landing_py: None,
+                live_before_jit_pc: usize::MAX,
+                live_after_jit_pc: usize::MAX,
+            };
+            owner.apply(&mut ctx);
+            assert_eq!(ctx.registers_r, &[standard]);
+            assert_eq!(ctx.outer_active_boxes, vec![standard]);
+            assert_eq!(ctx.vstack_boxes, vec![standard]);
+            assert_eq!(ctx.callee_shadow.as_ref().unwrap().frame_box, standard);
+            assert!(owner.0.pending.borrow().is_empty());
+
+            // The traceback emitter is another vable writer, outside the
+            // bytecode arms. An alias promoted there must rewrite registers
+            // before the next writer can replace the single pending slot.
+            owner.set_listening(false);
+            ctx.registers_r[0] = old;
+            ctx.vstack_boxes[0] = old;
+            let mut info =
+                majit_metainterp::virtualizable::VirtualizableInfo::without_vable_token();
+            info.add_field("last_instr", Type::Int, 0);
+            info.set_parent_descr(majit_ir::descr::make_size_descr(8));
+            let initial = ctx.trace_ctx.const_int(0);
+            let pointer = Value::Ref(majit_ir::GcRef(0x1000));
+            ctx.trace_ctx.set_opref_concrete(old, pointer);
+            ctx.trace_ctx.set_virtualizable_boxes_with_info(
+                vec![initial, standard],
+                vec![Value::Int(0), pointer],
+                &info,
+                &[],
+            );
+            let site = TracebackNodeSite {
+                frame: old,
+                w_code: 0,
+                last_instruction: 7,
+                lineno: 8,
+            };
+            let tail = ctx.trace_ctx.const_ref(0);
+            let guards_before = ctx.trace_ctx.num_guards();
+            emit_traceback_node(
+                &mut ctx,
+                middle,
+                pyre_object::interp_exceptions::ExcKind::ValueError,
+                &site,
+                tail,
+                0,
+            )
+            .unwrap();
+            assert!(ctx.trace_ctx.num_guards() > guards_before);
+            assert_eq!(ctx.registers_r, &[standard]);
+            assert_eq!(ctx.vstack_boxes, vec![standard]);
+            assert!(ctx.trace_ctx.take_pending_box_replace().is_none());
+        }
+        // Re-entering after the frames die does not retain their aliases.
+        let _next = FrameBoxReplacements::new(&session);
+        assert_eq!(session.borrow().box_replacement_frames.len(), 1);
+    }
+}
+
 /// Resolve the concrete half of a JitCode register operand.
 ///
 /// RPython's MIFrame banks hold Box objects, so assigning a valuebox to
@@ -205,6 +472,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
             .vable_getfield_float(cpu.as_ref(), pc, obj, vable_struct_ptr, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
+    apply_pending_vable_box_replace(ctx);
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     // RPython `opimpl_getfield_vable_{i,r,f}` returns
     // `virtualizable_boxes[index]` (`pyjitpl.py`) — a Box whose
@@ -358,6 +626,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     let write = ctx
         .trace_ctx
         .vable_setfield(op.pc, obj, descr, value, concrete);
+    apply_pending_vable_box_replace(ctx);
     // `MIFrame` owns one red frame per inlined call.  The trace shadow remains
     // authoritative for optimization, while the matching concrete frame is
     // its blackhole-resume image; mirror only own-frame standard-vable writes,
@@ -582,6 +851,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let nonstandard = ctx
         .trace_ctx
         .nonstandard_virtualizable(op.pc, vable, &fdescr);
+    apply_pending_vable_box_replace(ctx);
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
     let index = if nonstandard {
         index
@@ -872,6 +1142,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let nonstandard = ctx
         .trace_ctx
         .nonstandard_virtualizable(op.pc, vable, &fdescr);
+    apply_pending_vable_box_replace(ctx);
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
     let index = if nonstandard {
         index
@@ -1053,6 +1324,7 @@ pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
         fdescr,
         adescr,
     );
+    apply_pending_vable_box_replace(ctx);
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     let dst = code[op.pc + 6] as usize;
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);

@@ -209,6 +209,22 @@ impl Default for GraphTransformConfig {
     }
 }
 
+impl GraphTransformConfig {
+    fn virtualizable_field(
+        &self,
+        field: &FieldDescriptor,
+    ) -> Option<&VirtualizableFieldDescriptor> {
+        self.vable_fields.iter().find(|item| item.matches(field))
+    }
+
+    fn virtualizable_array(
+        &self,
+        field: &FieldDescriptor,
+    ) -> Option<&VirtualizableFieldDescriptor> {
+        self.vable_arrays.iter().find(|item| item.matches(field))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructStorageDescriptor {
     pub owner: String,
@@ -1367,6 +1383,7 @@ impl<'a> Transformer<'a> {
         let mut count_before_last_operation = None;
         for original_op in &original_ops {
             let op = remap_op(original_op, &self.aliases);
+            self.rematerialize_vable_flags_for_access(original_op, &op);
             // `jtransform.py` binds `_rewrite_symmetric` as the whole
             // `rewrite_op_<name>` for the symmetric ops, so it runs before
             // any other rewriting can look at the operands.
@@ -1510,20 +1527,10 @@ impl<'a> Transformer<'a> {
     /// lower to `getfield_vable_*` / `setfield_vable_*`, and an array
     /// field read must not enter `vable_array_vars`.
     ///
-    /// Upstream reads `self.vable_flags[op.args[0]]` with a bare
-    /// subscript because `rvirtualizable.py hook_access_field`
-    /// emits a `jit_force_virtualizable` carrying the instance's
-    /// annotator flags in front of *every* redirected-field access, so
-    /// the entry always exists by the time this runs.  Pyre has no
-    /// `hook_access_field`; the flag arrives from the
-    /// `hint(x, fresh_virtualizable=True)` call itself
-    /// (`rlib/jit.py:321-322`), so an absent entry is the ordinary
-    /// "not fresh" case rather than a missing preceding op.
-    ///
-    /// It can also mean "hinted, but not in this block": the hint files
-    /// one entry in the block it sits in, and `vable_flags` is rebuilt
-    /// per block.  See `rewrite_op_hint`'s `FreshVirtualizable` arm for
-    /// why upstream does not have that constraint.
+    /// `rematerialize_vable_flags_for_access` is the
+    /// `VirtualizableInstanceRepr.hook_access_field` step: it reads the
+    /// base Variable's `SomeInstance.flags` annotation and repopulates this
+    /// per-block table immediately before every redirected access.
     ///
     /// The two frame constructors call the hint (`pyre-interpreter`
     /// `pyframe.rs` `PyFrame::new` and `createframe_obj`, mirroring
@@ -1553,6 +1560,43 @@ impl<'a> Transformer<'a> {
     /// shape here; they simply want it for different reasons.
     fn is_fresh_virtualizable(&self, base: &crate::flowspace::model::Variable) -> bool {
         self.vable_flags.get(base) == Some(&VableFlag::FreshVirtualizable)
+    }
+
+    /// The codewriter half of
+    /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`.
+    /// Consult the pre-renaming SSA value for its annotator flag, then file
+    /// the flag under the renamed operand exactly as
+    /// `rewrite_op_jit_force_virtualizable` does upstream.
+    fn rematerialize_vable_flags_for_access(
+        &mut self,
+        original_op: &SpaceOperation,
+        renamed_op: &SpaceOperation,
+    ) {
+        let (original_base, field) = match &original_op.kind {
+            OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
+                (base, field)
+            }
+            _ => return,
+        };
+        let is_fresh = original_base.annotation.borrow().as_ref().is_some_and(|s| {
+            matches!(
+                s.as_ref(),
+                crate::annotator::model::SomeValue::Instance(instance)
+                    if instance.flags.get("fresh_virtualizable") == Some(&true)
+            )
+        });
+        if !is_fresh
+            || (self.config.virtualizable_field(field).is_none()
+                && self.config.virtualizable_array(field).is_none())
+        {
+            return;
+        }
+        let renamed_base = match &renamed_op.kind {
+            OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. } => base,
+            _ => unreachable!("renaming preserves field-access kind"),
+        };
+        self.vable_flags
+            .insert(renamed_base.clone(), VableFlag::FreshVirtualizable);
     }
 
     /// `jtransform.py _check_no_vable_array`.
@@ -3399,11 +3443,10 @@ impl<'a> Transformer<'a> {
     /// `jtransform.py rewrite_op_jit_force_virtualizable`.
     ///
     /// Upstream files `vable_flags[v_inst]` from the injected op's third
-    /// argument (the annotator flags) and returns `[]`.  Pyre's stand-in
-    /// helper takes only the instance — it is the residual-path force,
-    /// not a flag carrier — so there is nothing to file.  Deleting the
-    /// call is the whole rewrite: the interpreter copy of the helper
-    /// still runs when the graph is residualized.
+    /// argument and returns `[]`. The source-level residual marker carries
+    /// only the instance; `rematerialize_vable_flags_for_access` reads the
+    /// same flags from `Variable.annotation` at each access. This rewrite
+    /// therefore only deletes the marker from looked-inside code.
     fn rewrite_op_jit_force_virtualizable(
         &mut self,
         _args: &[crate::flowspace::model::Variable],
@@ -3435,32 +3478,10 @@ impl<'a> Transformer<'a> {
                 // or hints.get('access_directly'): return` — both are
                 // consumed without emitting an operation.
                 //
-                // `fresh_virtualizable` additionally has to be remembered:
-                // upstream carries it as an annotator flag on the instance
-                // (`rlib/jit.py:321-322`), which `rvirtualizable.py:49-53
-                // hook_access_field` re-materialises as the third argument
-                // of a `jit_force_virtualizable` in front of every
-                // redirected-field access, and `jtransform.py:2171
-                // rewrite_op_jit_force_virtualizable` files under
-                // `vable_flags[v_inst]`.  Pyre has neither the instance
-                // flag nor `hook_access_field`, so the hint call is the
-                // only carrier and files the flag directly against the
-                // virtualizable it names.
-                //
-                // That substitution is weaker than what it replaces, and
-                // the gap is per-block.  `vable_flags` is rebuilt at the
-                // top of every block (`jtransform.py:76-77`); upstream
-                // tolerates that because it re-materialises the entry in
-                // front of *each* redirected access, so its flag holds
-                // wherever the access happens to sit.  A single hint call
-                // cannot: it covers only the accesses in its own block.
-                // A redirected field access on the same instance in any
-                // other block — the far side of a branch, a loop body, an
-                // assertion guarded by a null test — still lowers to
-                // `getfield_vable_*` / `setfield_vable_*` and still admits
-                // an array field to `vable_array_vars`.  The fix for a
-                // surviving access is another hint call in the block that
-                // holds it, not a change here.
+                // The direct table write covers compatibility graphs that
+                // have not run the annotator. Production graphs additionally
+                // carry the flag on `Variable.annotation`; the access hook
+                // re-materializes it after CFG links and block boundaries.
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
                     detail: format!("rewrite: {label}(...) → identity"),
@@ -3757,9 +3778,7 @@ impl<'a> Transformer<'a> {
         // Track virtualizable array field reads
         if let Some(array_field) = self
             .config
-            .vable_arrays
-            .iter()
-            .find(|c| c.matches(field))
+            .virtualizable_array(field)
             .filter(|_| lower_vable)
             && let Some(result) = op.result.clone()
         {
@@ -3791,9 +3810,7 @@ impl<'a> Transformer<'a> {
         // Virtualizable scalar field → VableFieldRead
         if let Some(vable_field) = self
             .config
-            .vable_fields
-            .iter()
-            .find(|c| c.matches(field))
+            .virtualizable_field(field)
             .filter(|_| lower_vable)
         {
             self.notes.push(GraphTransformNote {
@@ -3966,9 +3983,7 @@ impl<'a> Transformer<'a> {
         let fresh_virtualizable = fresh_virtualizable || field.base_is_local_aggregate();
         if let Some(vable_field) = self
             .config
-            .vable_fields
-            .iter()
-            .find(|c| c.matches(field))
+            .virtualizable_field(field)
             .filter(|_| !fresh_virtualizable)
         {
             self.notes.push(GraphTransformNote {
@@ -8790,9 +8805,10 @@ fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
 }
 
 /// The rtyper op `jit_force_virtualizable`, not `hint_force_virtualizable`.
-/// Matched on the leaf so both a free helper and a method spelling rewrite.
+/// A method with the same name is not the rtyper primitive.
 fn is_jit_force_virtualizable_target(target: &CallTarget) -> bool {
-    target.path_segments().and_then(|segs| segs.last().copied()) == Some("jit_force_virtualizable")
+    matches!(target, CallTarget::FunctionPath { segments }
+        if segments.last().is_some_and(|name| name == "jit_force_virtualizable"))
 }
 
 /// Match a `CallEffectOverride` pattern against a call target.
@@ -9224,6 +9240,17 @@ mod tests {
     use super::*;
     use crate::codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+
+    fn mark_fresh_virtualizable(variable: &crate::flowspace::model::Variable) {
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("access_directly".to_string(), true);
+        flags.insert("fresh_virtualizable".to_string(), true);
+        *variable.annotation.borrow_mut() = Some(std::rc::Rc::new(
+            crate::annotator::model::SomeValue::Instance(
+                crate::annotator::model::SomeInstance::new(None, false, flags),
+            ),
+        ));
+    }
 
     #[test]
     fn integer_bounds_matches_rpython_helper() {
@@ -11345,6 +11372,7 @@ mod tests {
         let mut graph = FunctionGraph::new("fresh_vable_array");
         let frame_var = graph.alloc_value_var();
         let hinted_var = graph.alloc_value_var();
+        mark_fresh_virtualizable(&hinted_var);
         graph.push_inputarg_var(graph.startblock, frame_var.clone());
         graph.push_op_var(
             graph.startblock,
@@ -11488,6 +11516,7 @@ mod tests {
         let mut graph = FunctionGraph::new("fresh_vable_field");
         let frame_var = graph.alloc_value_var();
         let hinted_var = graph.alloc_value_var();
+        mark_fresh_virtualizable(&hinted_var);
         graph.push_inputarg_var(graph.startblock, frame_var.clone());
         graph.push_op_var(
             graph.startblock,
@@ -11692,6 +11721,7 @@ mod tests {
         let mut graph = FunctionGraph::new("fresh_vable_write");
         let frame_var = graph.alloc_value_var();
         let hinted_var = graph.alloc_value_var();
+        mark_fresh_virtualizable(&hinted_var);
         let value_var = graph.alloc_value_var();
         graph.push_inputarg_var(graph.startblock, frame_var.clone());
         graph.push_inputarg_var(graph.startblock, value_var.clone());
@@ -11740,6 +11770,86 @@ mod tests {
             !ops.iter()
                 .any(|op| matches!(op.kind, OpKind::VableFieldWrite { .. })),
             "a fresh virtualizable must not lower to VableFieldWrite, got {ops:?}"
+        );
+    }
+
+    /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`
+    /// carries the annotator flags into every redirected access, even after
+    /// the hinted value crossed a CFG link into another block.
+    #[test]
+    fn fresh_virtualizable_flag_is_rematerialized_after_a_block_link() {
+        use crate::model::Link;
+
+        let mut graph = FunctionGraph::new("fresh_vable_across_link");
+        let frame = graph.alloc_value_var();
+        let hinted = graph.alloc_value_var();
+        let value = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame.clone());
+        graph.push_inputarg_var(graph.startblock, value.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["hint_fresh_virtualizable"]),
+                args: vec![frame],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(hinted.clone());
+
+        let consumer = graph.create_block();
+        let frame_phi = graph.alloc_value_var();
+        mark_fresh_virtualizable(&frame_phi);
+        let value_phi = graph.alloc_value_var();
+        graph.push_inputarg_var(consumer, frame_phi.clone());
+        graph.push_inputarg_var(consumer, value_phi.clone());
+        graph.push_op_var(
+            consumer,
+            OpKind::FieldWrite {
+                base: frame_phi,
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into()))
+                    .with_base_is_deref(true),
+                value: LinkArg::Value(value_phi),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(consumer, None);
+        graph.set_control_flow_metadata(
+            graph.startblock,
+            None,
+            vec![Link::from_variables(
+                &graph,
+                vec![hinted, value],
+                consumer,
+                None,
+            )],
+        );
+
+        let result = transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.vable_rewrites, 0);
+        assert!(
+            result
+                .graph
+                .block(consumer)
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::FieldWrite { .. }))
         );
     }
 
@@ -12626,6 +12736,19 @@ mod tests {
         assert!(matches!(
             ops[2].kind,
             OpKind::VableFieldRead { field_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn force_virtualizable_method_is_not_deleted_as_a_primitive() {
+        let method = CallTarget::Method {
+            name: "jit_force_virtualizable".to_string(),
+            receiver_root: Some("Unrelated".to_string()),
+            resolved_path: None,
+        };
+        assert!(!is_jit_force_virtualizable_target(&method));
+        assert!(is_jit_force_virtualizable_target(
+            &CallTarget::function_path(["executioncontext", "jit_force_virtualizable",])
         ));
     }
 

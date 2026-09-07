@@ -48,6 +48,43 @@ fn test_just_finish() {
 }
 
 #[test]
+fn guard_not_forced_2_arms_returned_force_token_and_preserves_failargs() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(101);
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let i0 = inputargs[0].opref();
+
+    let force_token = Op::new(OpCode::ForceToken, &[]);
+    force_token.pos.set(OpRef::ref_op(1));
+
+    let guard = Op::new(OpCode::GuardNotForced2, &[]);
+    guard.pos.set(OpRef::void_op(2));
+    guard.setdescr(make_resume_guard_descr_typed(vec![Type::Int]));
+    guard.set_fail_arg_types(vec![Type::Int]);
+    guard.setfailargs(vec![rb(i0)].into());
+
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::ref_op(1))]);
+    finish.pos.set(OpRef::void_op(3));
+    finish.set_fail_arg_types(vec![Type::Ref]);
+    finish.setfailargs(vec![rb(OpRef::ref_op(1))].into());
+
+    let ops: Vec<Rc<Op>> = vec![force_token, guard, finish]
+        .into_iter()
+        .map(Rc::new)
+        .collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .expect("compile loop with GUARD_NOT_FORCED_2");
+
+    let returned = backend.execute_token(&token, &[Value::Int(42)]);
+    let raw_token = backend.get_ref_value(&returned, 0);
+    assert!(backend.is_force_token_armed(raw_token));
+    let forced = backend.force(raw_token).expect("armed force token");
+    assert_eq!(backend.get_int_value(&forced, 0), 42);
+}
+
+#[test]
 fn test_simple_int_add() {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();

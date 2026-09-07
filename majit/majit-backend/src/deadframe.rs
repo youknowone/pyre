@@ -510,13 +510,6 @@ pub struct JitFrameDeadFrame {
     /// Keeps the frame memory alive for non-GC allocations, and decides where
     /// it goes when this deadframe dies. See [`FrameHeapOwner`].
     _heap_owner: Option<FrameHeapOwner>,
-    /// Whether dropping this deadframe should release the frame's `jf_gcmap`.
-    ///
-    /// True for the deadframe a compiled run returns — the exit established
-    /// that map and the frame is off the JF shadow stack by then.  False for a
-    /// deadframe built over a frame that is still executing, whose map belongs
-    /// to the call site that pushed it.
-    owns_gcmap: bool,
 }
 
 impl JitFrameDeadFrame {
@@ -544,7 +537,6 @@ impl JitFrameDeadFrame {
             latest_descr,
             call_assembler_caller_layout: None,
             _heap_owner: heap_owner,
-            owns_gcmap: true,
         }
     }
 
@@ -569,7 +561,6 @@ impl JitFrameDeadFrame {
             latest_descr,
             call_assembler_caller_layout: None,
             _heap_owner: None,
-            owns_gcmap: false,
         }
     }
 
@@ -656,35 +647,6 @@ impl JitFrameDeadFrame {
     }
 }
 
-impl Drop for JitFrameDeadFrame {
-    /// Release the frame's `jf_gcmap` before the root slot goes, for the
-    /// deadframe that owns it.
-    ///
-    /// Releasing the root does not take the frame out of the collector's
-    /// remembered set, so the frame stays reachable there after this owner is
-    /// gone — and `jitframe_trace` (`jitframe.py`) would keep walking
-    /// the exiting guard's map over `jf_frame` items nothing owns any more.
-    /// A null `jf_gcmap` traces no items (`jitframe.py:115-116`) while the
-    /// fixed header GCREFs stay traceable, which is what the frame needs once
-    /// its values have been read out (`llmodel.py:437-451`).
-    ///
-    /// Only the rooted arm: an `Unrooted` frame is not a GC object, so nothing
-    /// traces it at all — and only an owning deadframe, because a `borrowing`
-    /// one stands for a frame whose compiled run is still inside the residual
-    /// call that pushed the map.
-    ///
-    /// The write is into the collector's heap, so it holds the same rule the
-    /// accessors above hold: this deadframe must not outlive the collector that
-    /// allocated its frame (see [`crate::DeadFrame`]).
-    fn drop(&mut self) {
-        if let JitFrameRoot::Slot(guard) = &self.jf_root {
-            if self.owns_gcmap {
-                unsafe { (*(guard.get().0 as *mut JitFrame)).jf_gcmap = std::ptr::null() };
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,10 +660,11 @@ mod tests {
         Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 8, 0))
     }
 
-    /// The deadframe a compiled run returns owns the map its exit established;
-    /// the one `force()` builds over a frame that is still executing does not.
+    /// `llmodel.py` returns the JITFRAME itself as the deadframe. Dropping the
+    /// host wrapper must not mutate its gcmap: a virtualizable token can keep
+    /// that same frame alive and force it later, after the wrapper is gone.
     #[test]
-    fn only_an_owning_deadframe_releases_the_frames_gcmap() {
+    fn dropping_a_deadframe_preserves_the_frames_gcmap() {
         let frame = alloc_off_gc_jitframe(JitFrame::alloc_size(8));
         assert!(!frame.is_null());
         let sentinel = 0x1234usize as *const u8;
@@ -725,9 +688,10 @@ mod tests {
             None,
             None,
         ));
-        assert!(
-            unsafe { (*frame).jf_gcmap }.is_null(),
-            "an owning deadframe releases the map once its values are read out"
+        assert_eq!(
+            unsafe { (*frame).jf_gcmap },
+            sentinel,
+            "a returned JITFRAME may still be owned by a virtualizable token"
         );
 
         unsafe { free_off_gc_jitframe(frame) };

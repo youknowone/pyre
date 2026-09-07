@@ -2692,6 +2692,13 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     op_pc: usize,
 ) -> Option<(OpRef, u32)> {
+    // A traceback can expose an inline frame after exception propagation has
+    // finished it while the enclosing sub-walk guard is still live.  PyPy no
+    // longer has an executing MIFrame coordinate for that object: `f_lasti`
+    // reads the value `handle_operation_error` left on the finished frame.
+    if unsafe { &*(concrete_obj as *const pyre_interpreter::PyFrame) }.frame_finished_execution() {
+        return None;
+    }
     let (frame_box, frame_ptr) = walker_executing_frame_box(ctx)?;
     if frame_ptr != concrete_obj as usize {
         return None;

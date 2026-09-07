@@ -1219,6 +1219,25 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Preserve the instruction that raised when a residual-call traceback hook
+/// has finalized the currently published frame.  On PyPy the dispatch loop's
+/// `last_instr` store precedes `handle_operation_error`, so there is no older
+/// resume coordinate to restore after that exception leaves the frame.
+pub(super) fn finalize_published_last_instr(frame: usize, last_instr: isize) {
+    PUBLISHED_LAST_INSTR.with(|slot| {
+        if matches!(slot.get(), Some((published, _)) if published == frame) {
+            slot.set(Some((frame, last_instr)));
+        }
+    });
+    ESCAPE_FLUSH_UNDO.with(|slot| {
+        if let Some(undo) = slot.borrow_mut().as_mut()
+            && undo.frame == frame
+        {
+            undo.last_instr = last_instr;
+        }
+    });
+}
+
 /// `_opimpl_setfield_vable`'s heap half for the recording walk.  While a
 /// residual runs concretely the live frame must name the EXECUTING opcode, so
 /// that a frame reader inside the callee reports the line the opcode is on —
@@ -1281,7 +1300,12 @@ impl LiveLastInstrGuard {
 
 impl Drop for LiveLastInstrGuard {
     fn drop(&mut self) {
-        PUBLISHED_LAST_INSTR.with(|slot| slot.set(self.prev));
+        let restore = PUBLISHED_LAST_INSTR.with(|slot| {
+            let current = slot.replace(self.prev);
+            current
+                .filter(|(frame, _)| *frame == self.frame as usize)
+                .map_or(self.saved, |(_, saved)| saved)
+        });
         // A flush that committed onto this frame wrote the resume coordinate
         // itself and is authoritative.  Its undo capture holds the value this
         // guard displaced (see [`capture_escape_flush_undo`]), so a later
@@ -1297,7 +1321,7 @@ impl Drop for LiveLastInstrGuard {
             slot.borrow().as_ref().map(|undo| undo.frame) == Some(self.frame as usize)
         });
         if !flushed {
-            unsafe { (*self.frame).last_instr = self.saved };
+            unsafe { (*self.frame).last_instr = restore };
         }
     }
 }
@@ -8552,9 +8576,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             (i_args.first(), r_args.first(), r_args.get(1))
         {
             // The live frame operand (r_args[2]) is needed for the builtins
-            // fallback (`frame.get_builtin()`); it may be absent/unseeded
-            // (an inlined callee's `portal_frame_reg`), in which case only
-            // the module-dict cell path is attempted.
+            // fallback (`frame.get_builtin()`). Admitted inline callees carry
+            // their own seeded portal frame; synthetic walkers may still omit
+            // it, in which case only the module-dict cell path is attempted.
             let frame_ptr = r_args
                 .get(2)
                 .and_then(|&f| ctx.trace_ctx.box_value(f))
@@ -9129,10 +9153,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // Defer the arg-bound check past the short-circuiting LoadConst /
     // LoadGlobal folds above: each resolves the call to a constant from
     // `i_args`/`r_args` without recording it, so an unbound *trailing* arg
-    // is irrelevant when the call folds away.  In particular an inlined
-    // callee's `load_global` passes its OWN unseeded `portal_frame_reg`
-    // (Path-1, #68); the fold elides that call, so the frame box never
-    // needs binding.  Only a call that survives to a genuine record
+    // is irrelevant when the call folds away. Synthetic walkers can still
+    // present an unbound trailing frame operand; the fold elides that call,
+    // so the frame box never needs binding. Only a call that survives to a genuine record
     // (BoxInt exec, generic residual below) requires every box bound.
     ensure_residual_call_args_bound(&allboxes, op.pc)?;
 

@@ -3810,6 +3810,28 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let list = &mut *(obj as *mut W_ListObject);
+    let length = list.live_len();
+    // Keep the empty check in the descended body as well as the mutation:
+    // listobject.py W_ListObject.descr_pop checks length before pop_end.
+    let w_item = w_list_pop_end_inner(obj)?;
+    // The inner body can allocate. Reload the rooted list before accounting.
+    let list = &mut *(crate::gc_roots::shadow_stack_get(root_base) as *mut W_ListObject);
+    list.sync_allocated(length);
+    Some(w_item)
+}
+
+/// [`w_list_pop_end`]'s checked body, run with the list's guard already held.
+///
+/// The generated pop descent must include `W_ListObject.descr_pop`'s empty
+/// check, not just `AbstractUnwrappedStrategy.pop_end`'s unchecked mutation.
+/// `None` is the existing low-level error result consumed by list_method_pop;
+/// a guard on the non-empty branch resumes that caller before the pop.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject` and the caller must hold
+/// `w_list_lock(obj)`.
+pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let list = &mut *(obj as *mut W_ListObject);
     let length = match list.strategy {
         ListStrategy::Empty | ListStrategy::Size => 0,
         ListStrategy::SimpleRange | ListStrategy::Range => range_list_length(list),
@@ -3821,30 +3843,9 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
         ListStrategy::Ascii => list.ascii_items.len(),
     };
     if length == 0 {
-        None
-    } else {
-        // `length` is the pre-pop `live_len`, so it is the `old_size`
-        // `list_resize` shrinks from.  The metadata stays out here, as it does
-        // for `w_list_append`, because the inner body is descended by the fold.
-        let w_item = w_list_pop_end_inner(obj);
-        // The inner body allocates the popped item, so the list can have moved
-        // under the `&mut` taken above.  Reload from the bracket's slot before
-        // the accounting write, as `w_list_pop` and every `w_list_insert` arm
-        // do.
-        let list = &mut *(crate::gc_roots::shadow_stack_get(root_base) as *mut W_ListObject);
-        list.sync_allocated(length);
-        Some(w_item)
+        return None;
     }
-}
-
-/// [`w_list_pop_end`]'s body, run with the list's guard already held.
-///
-/// # Safety
-/// `obj` must point to a valid non-empty `W_ListObject`, the caller must hold
-/// `w_list_lock(obj)`, and the list's length must be greater than zero.
-pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> PyObjectRef {
-    let list = &mut *(obj as *mut W_ListObject);
-    match list.strategy {
+    Some(match list.strategy {
         // EmptyListStrategy.pop is unreachable after descr_pop's length check
         // (pypy/objspace/std/listobject.py).
         ListStrategy::Empty | ListStrategy::Size => PY_NULL,
@@ -3880,6 +3881,9 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> PyObjectRef {
         }
         ListStrategy::Integer => {
             let length = ll_list_int_length(list);
+            // rpython/rtyper/rlist.py ll_pop_default's internal precondition,
+            // separate from the checked empty branch above.
+            assert!(length > 0, "pop from empty list");
             let index = length - 1;
             let item = ll_list_int_getitem_fast(list, index);
             ll_list_int_set_len(list, index);
@@ -3900,6 +3904,8 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> PyObjectRef {
         // the Integer arm, so the orthodox pop fold can descend it.
         ListStrategy::Object => {
             let length = ll_list_obj_length(list);
+            // rpython/rtyper/rlist.py ll_pop_default's internal precondition.
+            assert!(length > 0, "pop from empty list");
             let index = length - 1;
             let item = ll_list_obj_getitem_fast(list, index);
             ll_list_obj_setitem_fast(list, index, PY_NULL);
@@ -3908,7 +3914,7 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> PyObjectRef {
         }
         ListStrategy::Bytes => w_bytes_from_block(list.bytes_items.pop()),
         ListStrategy::Ascii => w_str_from_storage(list.ascii_items.pop() as *mut _),
-    }
+    })
 }
 
 /// The unwrapped Integer-strategy storage `IntegerListStrategy.sort`

@@ -117,6 +117,16 @@ pub fn hint_fresh_virtualizable<T>(x: T) -> T {
     hint(x)
 }
 
+/// Force a virtualizable before it escapes the portal while remaining live.
+///
+/// This is the Rust spelling of `hint(x, force_virtualizable=True)`.  The
+/// interpreter observes the identity function; `jtransform.rewrite_op_hint`
+/// turns it into `hint_force_virtualizable/r` in looked-inside JIT graphs.
+#[inline(always)]
+pub fn hint_force_virtualizable<T>(x: T) -> T {
+    hint(x)
+}
+
 // ── promote ──
 // rlib/jit.py:100-124
 

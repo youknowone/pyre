@@ -6198,6 +6198,23 @@ impl CallControl {
             for op in &block.operations {
                 match &op.kind {
                     // RPython: jit_force_virtualizable / jit_force_virtual
+                    // The analyzer runs over the rtyped graph, before
+                    // `jtransform.rewrite_op_jit_force_virtualizable` deletes
+                    // this marker from looked-inside code.  Match the upstream
+                    // opname leaf directly; `VableForce` is retained only for
+                    // already-transformed compatibility graphs.
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().is_some_and(|leaf| {
+                        matches!(
+                            leaf.as_str(),
+                            "jit_force_virtualizable" | "jit_force_virtual"
+                        )
+                    }) =>
+                    {
+                        return true;
+                    }
                     OpKind::VableForce { .. } => return true,
                     OpKind::Call { target, .. } => {
                         let callee_path = match self.target_to_path(target) {
@@ -10528,6 +10545,67 @@ mod tests {
             descriptor.extra_info.extraeffect,
             ExtraEffect::ForcesVirtualOrVirtualizable
         );
+    }
+
+    #[test]
+    fn test_getcalldescr_sees_rtyper_force_virtualizable_marker() {
+        // `effectinfo.VirtualizableAnalyzer.analyze_simple_operation` runs
+        // before jtransform and keys on the primitive opname itself.
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("forcer");
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_force_virtualizable"]),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        let path = CallPath::from_segments(["forcer"]);
+        cc.register_function_graph(path, graph);
+        cc.find_all_graphs_for_tests();
+
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["forcer"])),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ForcesVirtualOrVirtualizable
+        );
+    }
+
+    #[test]
+    fn test_force_marker_name_on_method_is_not_a_primitive() {
+        for name in ["jit_force_virtualizable", "jit_force_virtual"] {
+            let mut cc = CallControl::new();
+            let mut graph = FunctionGraph::new("entry");
+            graph.push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::Method {
+                        name: name.to_string(),
+                        receiver_root: Some("Unrelated".to_string()),
+                        resolved_path: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Void,
+                },
+                false,
+            );
+            graph.set_return(graph.startblock, None);
+            let path = CallPath::from_segments(["entry"]);
+            cc.register_function_graph(path.clone(), graph);
+            assert!(!cc.analyze_forces_virtualizable(&path, &mut HashSet::new()));
+        }
     }
 
     #[test]

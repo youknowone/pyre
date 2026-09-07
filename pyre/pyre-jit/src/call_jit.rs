@@ -249,6 +249,24 @@ mod tests {
         assert_eq!(descrs.jf_frame_baseitemofs, FIRST_ITEM_OFFSET);
         assert_eq!(descrs.jf_frame_lengthofs, JF_FRAME_OFS);
     }
+
+    #[test]
+    fn blackhole_leave_rejects_a_red_outside_the_open_frame_scope() {
+        std::thread::spawn(|| {
+            let mut ec = pyre_interpreter::PyExecutionContext::default();
+            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
+            // A malformed recovered red must never be dereferenced merely
+            // because it is nonzero. There is no matching execution scope.
+            bh.virtualizable_ptr = 2;
+            super::leave_resumed_blackhole_frame(&bh, false);
+            super::leave_resumed_blackhole_frame(&bh, true);
+            assert!(ec.topframeref.is_null());
+            pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
+        })
+        .join()
+        .unwrap();
+    }
 }
 
 #[cfg(feature = "cranelift")]
@@ -649,60 +667,6 @@ pub(crate) fn clear_residual_call_exception() {
     drain_backend_jit_exc();
 }
 
-/// #73 measurement gate. When `PYRE_M73_LASTINSTR_AUDIT` is set, the three
-/// blackhole traceback sites compare the production inversion
-/// `containing_py_pc_for_jitcode_pc_public(last_opcode_position)` (= `orgpc`, the
-/// raising op's python pc) against the forward candidate `frame.last_instr + 1`
-/// (the JIT-vable resume convention normalized to `orgpc`). Divergence means the
-/// forward datum is stale/off-by-one and cannot yet replace the inversion; a
-/// clean corpus (zero divergences) would mean the forward carry is already
-/// exact. Pure telemetry — never changes production output.
-fn m73_lastinstr_audit_enabled() -> bool {
-    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("PYRE_M73_LASTINSTR_AUDIT").is_some())
-}
-
-fn m73_lastinstr_audit(
-    site: &str,
-    jitcode_index: Option<i32>,
-    opcode_position: i32,
-    frame_ptr: *const PyFrame,
-) {
-    if !m73_lastinstr_audit_enabled() || frame_ptr.is_null() {
-        return;
-    }
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static HITS: AtomicU64 = AtomicU64::new(0);
-    static DIVERGE: AtomicU64 = AtomicU64::new(0);
-    static NONE: AtomicU64 = AtomicU64::new(0);
-    let inv = jitcode_index.and_then(|index| {
-        pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(index, opcode_position)
-    });
-    let fwd = unsafe { (*frame_ptr).last_instr as i64 } + 1;
-    let hits = HITS.fetch_add(1, Ordering::Relaxed) + 1;
-    if hits == 1 {
-        // Per-process heartbeat: confirms the site was exercised even when no
-        // divergence prints (each check.py test is a fresh process).
-        eprintln!("[M73-LASTINSTR] first-hit site={site}");
-    }
-    match inv {
-        Some(iv) => {
-            let iv = iv as i64;
-            if iv != fwd {
-                let d = DIVERGE.fetch_add(1, Ordering::Relaxed) + 1;
-                eprintln!(
-                    "[M73-LASTINSTR] diverge site={site} inv={iv} fwd={fwd} delta={} (proc hits={hits} diverge={d} none={})",
-                    iv - fwd,
-                    NONE.load(Ordering::Relaxed)
-                );
-            }
-        }
-        None => {
-            NONE.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
 /// `quasiimmut.py make_invalidation_function._invalidate_now` for the hidden
 /// mutate field at `field_addr`: unlink the instance and flip every loop flag
 /// it recorded.
@@ -751,14 +715,27 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     // check preserves `pyopcode.py handle_operation_error` as the
     // one-node-per-frame-per-delivery authority.
     if forwards_existing {
-        let owns_head = unsafe {
+        let (owns_head, head_lasti) = unsafe {
             let head =
                 pyre_object::interp_exceptions::w_exception_get_traceback(exc_value as PyObjectRef);
-            !head.is_null()
+            let owns = !head.is_null()
                 && pyre_interpreter::pytraceback::is_pytraceback(head)
-                && pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) == frame_ptr
+                && pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) == frame_ptr;
+            let lasti =
+                owns.then(|| pyre_interpreter::pytraceback::w_pytraceback_get_lasti(head) / 2);
+            (owns, lasti)
         };
         if owns_head {
+            // A forwarding raise keeps the existing node, but PyPy's frame
+            // still carries the instruction recorded by that node.  Repair a
+            // resume/escape rollback that ran between the original attach and
+            // this duplicate recorder before returning early.
+            let last_instr = head_lasti.expect("owned traceback head has a lasti");
+            unsafe { (*frame_ptr).last_instr = last_instr as isize };
+            pyre_jit_trace::jitcode_dispatch::finalize_published_last_instr(
+                frame_ptr as usize,
+                last_instr as isize,
+            );
             return;
         }
     }
@@ -771,6 +748,19 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     let last_instruction = exact
         .or(resolved)
         .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
+    // `dispatch_bytecode` (pyopcode.py) stamps `self.last_instr` before both
+    // `handle_operation_error` and its traceback attach.  Do the same before
+    // the duplicate-node check below: a first recorder can be followed by an
+    // escape rollback that restores only the old resume coordinate, and the
+    // second recorder must still repair the frame even when it need not add a
+    // second node.
+    unsafe {
+        (*frame_ptr).last_instr = last_instruction as isize;
+        pyre_jit_trace::jitcode_dispatch::finalize_published_last_instr(
+            frame_ptr as usize,
+            last_instruction as isize,
+        );
+    }
     // One catch can be reached by two recorders: this hook, emitted into the
     // loop trace by the in-trace handler-entry arm, and the IR-virtual node the
     // bridge handler-entry arm builds when the exception edge deopts into a
@@ -792,73 +782,6 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
             && pyre_interpreter::pytraceback::w_pytraceback_get_lasti(head) == last_instruction * 2
         {
             return;
-        }
-    }
-    m73_lastinstr_audit("caught", Some(jitcode_index), opcode_position, frame_ptr);
-    // `dispatch_bytecode` (pyopcode.py) stamps `self.last_instr` before every
-    // opcode, so `pyopcode.py handle_operation_error` always records its
-    // node while the frame holds the instruction that raised, and every later
-    // `tb_frame.f_lasti` / `f_lineno` read answers for that instruction.  Two
-    // pyre paths already reproduce the store — the recording walk before its own
-    // `record_application_traceback` (`jitcode_dispatch/mod.rs`) and
-    // [`record_inline_traceback_for_recording`] on the frame it fabricates — and
-    // the blackhole reproduces it per replayed instruction in
-    // `publish_last_instr_at_live_marker`.  None of them covers this one: a
-    // frame the walker seeded for an inlined callee takes no per-opcode store
-    // (it is not the virtualizable), so it arrives still holding the `-1` its
-    // constructor wrote.  `tb_lasti` was right; `f_lasti` read `-2`.
-    //
-    // `last_instr` is read back under two conventions — the executing
-    // coordinate this hook resolves, and the `pc - 1` a resume path leaves for
-    // the frame to CONTINUE from (`next_instr` = `last_instr + 1`) — and they
-    // are not interchangeable: stamping the executing coordinate over a resume
-    // coordinate restarts the frame at an instruction its value stack does not
-    // match.  Both conditions below exclude one way that happens.
-    //
-    // The sentinel test excludes a frame stopped mid-body: on
-    // `exception_reused_object_tb_not_doubled` the unconditional store moved
-    // one such frame from 12 to 31.
-    //
-    // The recording-walk test excludes the one frame a walk owns the resume
-    // coordinate of.  `-1` is not the absence of a coordinate — it is the
-    // coordinate that resumes at pc 0 — and a walk that declines its end state
-    // hands its own live frame back holding exactly that.  On
-    // `test.test_userstring` the sentinel test alone let the store through onto
-    // that frame, which then re-entered one opcode past its own CALL and popped
-    // an empty operand stack.  The frames this hook exists for are the OTHER
-    // ones a walk materializes — the seeded inline-callee levels, which take no
-    // per-opcode store and are never resumed.  Measured on
-    // `traceback_inlined_callee_lasti_regression`, where the level the
-    // exception passes through reads `active_walk_live_frame() != frame` on
-    // every iteration that fixture asserts.
-    //
-    // Both died with `stack underflow during interpreter opcode`.
-    //
-    // The execution context's top frame does NOT answer this: `topframeref`
-    // holds a vref, and forcing it materializes the inlined callee, so the
-    // already-left level reads as the top one.
-    //
-    // SAFETY: `frame_ptr` was null-checked above and the callers resolve it from
-    // a blackhole level's own `virtualizable_ptr` / portal red.
-    unsafe {
-        let walk_owns_resume =
-            pyre_jit_trace::trace::active_walk_live_frame() == frame_ptr as usize;
-        let live = (*frame_ptr).last_instr;
-        if live < 0 && !walk_owns_resume {
-            (*frame_ptr).last_instr = last_instruction as isize;
-        } else if m73_lastinstr_audit_enabled() && live != last_instruction as isize {
-            // The frame keeps a coordinate the node about to be minted does not
-            // carry, which is precisely the shape a later `tb.tb_frame.f_lasti`
-            // disagrees with `tb.tb_lasti` in.  Both values are doubled the way
-            // the two getters report them, and `walk` names which of the two
-            // conditions above declined the stamp.  This is the only record site
-            // that can diverge: every other one passes the frame's own
-            // `last_instr` or builds the frame it records.
-            eprintln!(
-                "[M73-LASTINSTR] mint-diverge frame={frame_ptr:p} f_lasti={} tb_lasti={} walk={walk_owns_resume}",
-                live * 2,
-                (last_instruction as isize) * 2,
-            );
         }
     }
     unsafe {
@@ -2566,6 +2489,10 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
     // resume-data frame chain itself is not the application frame chain, and
     // releasing a BlackholeInterpreter does not restore `topframeref`.
     unsafe {
+        // `PyFrame.dispatch_bytecode` / `handle_operation_error` marks the leaving
+        // frame finished. Only dereference the recovered red after proving
+        // that it names this execution context's still-open frame scope.
+        (*frame_ptr).set_frame_finished_execution(true);
         (*ec).topframeref = (*frame_ptr).f_backref;
         if (*frame_ptr).escaped() || got_exception {
             // `f_back = frame.f_backref()` — with the parens, so an inlined
@@ -3035,21 +2962,13 @@ pub fn blackhole_resume_via_rd_numb(
                                 i64::from(jitcode_index),
                                 last_opcode_position as i64,
                             ),
-                            None => {
-                                m73_lastinstr_audit(
-                                    "exit_guard_exc",
-                                    jitcode_index,
-                                    last_opcode_position as i32,
+                            None => unsafe {
+                                pyre_interpreter::pytraceback::record_application_traceback(
+                                    err.exc_object,
                                     frame_ptr,
+                                    (*frame_ptr).last_instr as i64,
                                 );
-                                unsafe {
-                                    pyre_interpreter::pytraceback::record_application_traceback(
-                                        err.exc_object,
-                                        frame_ptr,
-                                        (*frame_ptr).last_instr as i64,
-                                    );
-                                }
-                            }
+                            },
                         }
                     }
                     // `guard_exc` is now owned by the typed
@@ -3326,16 +3245,23 @@ pub fn blackhole_resume_via_rd_numb(
         let caller = next;
         if caller.is_none() {
             // blackhole.py _done_with_this_frame
+            // The terminal level has no caller branch below to close its
+            // execution scope. Root the result across ExecutionContext.leave,
+            // whose caller-vref force can collect.
+            let roots = pyre_object::gc_roots::push_roots();
+            if matches!(rt, BhReturnType::Ref) {
+                let _ = roots.pin_root(bh.get_tmpreg_r() as PyObjectRef);
+            }
+            leave_resumed_blackhole_frame(&bh, false);
             let result = match rt {
                 BhReturnType::Void => BlackholeResult::DoneWithThisFrameVoid,
                 BhReturnType::Int => BlackholeResult::DoneWithThisFrameInt(bh.get_tmpreg_i()),
-                BhReturnType::Ref => {
-                    BlackholeResult::DoneWithThisFrameRef(bh.get_tmpreg_r() as PyObjectRef)
-                }
+                BhReturnType::Ref => BlackholeResult::DoneWithThisFrameRef(roots.get(roots.base())),
                 BhReturnType::Float => BlackholeResult::DoneWithThisFrameFloat(f64::from_bits(
                     bh.get_tmpreg_f() as u64,
                 )),
             };
+            release_bh_rd(bh);
             return result;
         }
         let mut caller_bh = caller.unwrap();

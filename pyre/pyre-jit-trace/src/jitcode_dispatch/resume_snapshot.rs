@@ -153,8 +153,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
 /// yet points at the same frame, so the PTR_EQ reads equal. Nothing mints one
 /// today: `lower_vable_field_read` and its siblings lower a field access to a
 /// vable op only when the base is literally the declared virtualizable
-/// variable, and `run_perfn_walk`, `fbw_force_virtualizable_before_return` and
-/// `fbw_publish_exit_last_instr` all seed that variable from
+/// variable, and `run_perfn_walk` plus `fbw_publish_exit_last_instr` seed that
+/// variable from
 /// `standard_virtualizable_box()` itself, so an aliasing box returns early on
 /// the identity check. A new seeding site, or a base other than the declared
 /// variable reaching a vable op, makes both live at once.
@@ -697,8 +697,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // guard resume at the loop header instead of the guard's own
             // opcode, re-running loop iterations and corrupting the result.
             // Mirror of `MIFrame::publish_last_instr_to_vable`.
+            // `store_token_in_vable` emits GUARD_NOT_FORCED_2 only after the
+            // exit path has stored the frame's final virtualizable image.
+            // Unlike an ordinary guard it does not resume by re-executing the
+            // current opcode: async forcing materializes that already-final
+            // image.  Keep the `last_instr`/`valuestackdepth` values published
+            // by `fbw_publish_exit_last_instr` instead of applying the generic
+            // `resume py_pc - 1` rewrite below.  This is the direct shape of
+            // PyPy `MetaInterp.store_token_in_vable` followed by
+            // `generate_guard(GUARD_NOT_FORCED_2)`.
             let mut async_force_vable_boxes = None;
-            if sym.owns_virtualizable_shadow() {
+            if sym.owns_virtualizable_shadow()
+                && ctx.trace_ctx.last_guard_opcode() != Some(OpCode::GuardNotForced2)
+            {
                 let last_instr_value = py_pc as i64 - 1;
                 let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
                 crate::trace_opcode::mirror_vable_static_to_boxes(

@@ -14,6 +14,14 @@ pub struct WasmFailDescr {
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
+    /// Byte offset of GUARD_NOT_FORCED(_2)'s force-only spill area. Native
+    /// backends carry these coordinates in their fail locations; keeping a
+    /// disjoint area is essential because a following FINISH overwrites the
+    /// ordinary exit slots and CALL_ASSEMBLER owns the dispatch-key slot.
+    pub force_args_offset: u32,
+    /// Compile-time guard gcmap retained for FINISH after a
+    /// GUARD_NOT_FORCED_2, matching `assembler._finish_gcmap`.
+    pub force_gcmap_ptr: usize,
     /// `history.py:125 id(descr)` parity — when the optimizer
     /// (`store_final_boxes_in_guard` / `make_and_attach_done_descrs`)
     /// stamps a metainterp `ResumeGuardDescr` / `DoneWithThisFrame*` /
@@ -222,6 +230,8 @@ mod tests {
             trace_id: 0,
             fail_arg_types,
             is_finish: false,
+            force_args_offset: 8,
+            force_gcmap_ptr: 0,
             meta_descr: None,
         })
     }
@@ -277,6 +287,8 @@ mod tests {
                     trace_id: 0,
                     fail_arg_types: vec![Type::Ref],
                     is_finish: false,
+                    force_args_offset: 8,
+                    force_gcmap_ptr: 0,
                     meta_descr: None,
                 })
             })
@@ -309,6 +321,8 @@ mod tests {
                                 trace_id: trace_id as u64,
                                 fail_arg_types: vec![Type::Int],
                                 is_finish: false,
+                                force_args_offset: 8,
+                                force_gcmap_ptr: 0,
                                 meta_descr: None,
                             })
                         })
@@ -509,6 +523,8 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
         trace_id: 0,
         fail_arg_types: reserved_fail_arg_types(exit_index),
         is_finish: true,
+        force_args_offset: 0,
+        force_gcmap_ptr: 0,
         meta_descr,
     })
 }
@@ -899,6 +915,10 @@ pub struct CompiledWasmLoop {
     /// Geometry frozen when this token was first compiled. Every bridge
     /// chained onto it is emitted against this exact layout.
     pub frame: crate::codegen::FrameGeometry,
+    /// Per-loop `jf_gcmap` for the Ref-home region.  Like RPython's assembler
+    /// gcmap allocation, this remains valid after `execute_token` returns: a
+    /// virtualizable token can keep that JITFRAME alive and force it later.
+    pub home_gcmap_ptr: usize,
     /// Base address (shared linear memory) of this loop's per-guard bridge-slot
     /// cell array — one i32 per `fail_index`, `0` = no bridge. The trace's
     /// epilogue reads `cells[fail_index]` and `compile_bridge` writes a bridge's

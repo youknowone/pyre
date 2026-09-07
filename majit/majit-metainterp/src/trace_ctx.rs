@@ -685,6 +685,14 @@ pub struct TraceCtx {
     /// `None` outside the brief window between the dispatch-site stash
     /// and the jitdriver-side drain.
     pub(crate) pending_switch_to_blackhole: Option<crate::pyjitpl::SwitchToBlackhole>,
+    /// `pyjitpl.py _nonstandard_virtualizable` Step 4 calls
+    /// `self.metainterp.replace_box`, which rewrites every `MIFrame`
+    /// register bank before the vref / vable / heapcache walks.
+    /// `TraceCtx::replace_box` owns only those three walks; the
+    /// framestack lives on the jitcode machine / walker. Step 4 stashes
+    /// the alias here so the caller that owns the frames can finish the
+    /// same `replace_box` after the vable op returns.
+    pending_box_replace: Option<(OpRef, OpRef)>,
 
     /// `pyjitpl.py MetaInterp.virtualref_boxes`: pairs of `[virtualbox,
     /// vrefbox]` for every `opimpl_virtual_ref` ↔ `opimpl_virtual_ref_finish`
@@ -1257,6 +1265,11 @@ impl TraceCtx {
     /// AbstractValue.getXXX()` / `history.py *FrontendOp(pos,
     /// value)` parity).
     pub fn heapcache_getfield_cached(&mut self, obj: OpRef, field_index: u32) -> Option<OpRef> {
+        // PyPy keys by descriptor identity. An unnumbered Rust descriptor
+        // has no such key: u32::MAX is shared by unrelated fallback fields.
+        if field_index == u32::MAX {
+            return None;
+        }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache.getfield_cached(obj, field_index, oracle)
     }
@@ -1271,6 +1284,9 @@ impl TraceCtx {
     /// covering the const pool, standard-virtualizable shadow, and
     /// `Box::value: Cell<Option<Value>>` field in one call.
     pub fn heapcache_setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+        if field_index == u32::MAX {
+            return;
+        }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .setfield_cached(obj, field_index, value, oracle)
@@ -1282,6 +1298,9 @@ impl TraceCtx {
     /// the cache-hit sanity check resolves later via
     /// `lookup_opref_concrete`.
     pub fn heapcache_getfield_now_known(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+        if field_index == u32::MAX {
+            return;
+        }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .getfield_now_known(obj, field_index, value, oracle)
@@ -1346,6 +1365,15 @@ impl TraceCtx {
     /// Set pending quasi-immut guard with the field read's orgpc.
     pub fn set_pending_guard_not_invalidated(&mut self, pc: Option<usize>) {
         self.pending_guard_not_invalidated_pc = pc;
+    }
+
+    /// The framestack half of `pyjitpl.py MetaInterp.replace_box`.
+    ///
+    /// `_nonstandard_virtualizable` Step 4 records the alias after
+    /// `TraceCtx::replace_box`. The owner of the live `MIFrame` /
+    /// walker register banks drains it and rewrites those banks.
+    pub fn take_pending_box_replace(&mut self) -> Option<(OpRef, OpRef)> {
+        self.pending_box_replace.take()
     }
 
     /// pyjitpl.py:1776-1780: jit.isvirtual(obj) — check if an object
@@ -1801,6 +1829,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             pending_switch_to_blackhole: None,
+            pending_box_replace: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
@@ -1900,6 +1929,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             pending_switch_to_blackhole: None,
+            pending_box_replace: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
@@ -3974,14 +4004,11 @@ impl TraceCtx {
             }
         }
 
-        // Final token-null store (`record2`, so it records no profiler
-        // counters). The token slot holds a raw force marker, and this
-        // store resets it to zero. Use an integer-zero null rather than a
-        // Ref `const_null`: introducing a Ref constant here routes the
-        // store through the ref-const path, which miscompiles on backends
-        // that bake ref consts as raw addresses (wasm) or emit a GC write
-        // barrier under a differing calling convention.
-        let null = self.const_int(0);
+        // virtualizable.py `vable_token` is llmemory.GCREF.  Use the same
+        // ConstPtr null here so the descriptor remains a pointer field for GC
+        // rewriting; wasm in particular must barrier the preceding non-null
+        // FORCE_TOKEN store into an old PyFrame.
+        let null = self.const_null();
         self.record_op_with_descr(
             OpCode::SetfieldGc,
             &[vable_opref, null],
@@ -4310,17 +4337,13 @@ impl TraceCtx {
                 // owns, so an alias of `vable_opref` sitting in a register
                 // would keep naming the nonstandard box.
                 //
-                // That gap is unreachable rather than tolerated: this arm
-                // needs a vable op whose base is an OpRef other than the
-                // declared virtualizable variable but pointing at the same
-                // frame, and no lowering mints one — a field access becomes
-                // a vable op only for the declared variable, and every
-                // seeding site takes it from the standard box itself, so
-                // the identity check above returns first. A NEW SEEDING
-                // SITE ARMS THIS ARM, and closing the register half then
-                // has to come with it: `TraceCtx` owns no frame registers,
-                // so the pair has to reach whichever walker does.
+                // `self.metainterp.replace_box` also walks every
+                // `MIFrame` register bank. This method owns only the
+                // vref / vable / heapcache half; the jitcode machine
+                // and the walker drain `take_pending_box_replace` to
+                // finish the same walk on the frames they own.
                 self.replace_box(vable_opref, standard_box);
+                self.pending_box_replace = Some((vable_opref, standard_box));
                 return false;
             }
         }
@@ -4511,7 +4534,8 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_i(box, fielddescr) →
             // _opimpl_getfield_gc_any_pureornot (pyjitpl.py).
-            let field_index = fielddescr.index();
+            let record_descr = self.vable_static_record_descr(&fielddescr);
+            let field_index = record_descr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:934-945 sanity check: run the live field
                 // load (`executor.execute`) and assert equality against
@@ -4547,7 +4571,6 @@ impl TraceCtx {
                 );
                 return (cached, cached_value);
             }
-            let record_descr = self.vable_static_record_descr(&fielddescr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox).  `resbox`
             // in RPython carries the loaded value via `BoxInt.value`;
             // pyre stamps the frontend value slot for `op` with the live
@@ -4798,7 +4821,7 @@ impl TraceCtx {
             // parent-struct-layout `FieldDescr`; a non-static-field descr passes
             // through unchanged.
             let record_descr = self.vable_static_record_descr(&fielddescr);
-            let field_index = fielddescr.index();
+            let field_index = record_descr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index)
                 && cached == value
             {
@@ -4846,13 +4869,6 @@ impl TraceCtx {
         let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef::NO_CONCRETE));
         let overwritten = VableEntryWrite::of(self, index);
         self.set_virtualizable_entry_at(index, value, stored);
-        // Keep the heapcache consistent: if a prior nonstandard getfield
-        // cached a value for this field (e.g., before a replace_box made
-        // the OpRef match the standard_box), updating the virtualizable
-        // shadow without clearing the heapcache leaves a stale entry
-        // that the next nonstandard getfield would hit.
-        let field_index = fielddescr.index();
-        self.heapcache_setfield_cached(vable_opref, field_index, value);
         // pyjitpl.py:3446 write_boxes parity: mirror the updated
         // shadow slot back into the live virtualizable.
         self.synchronize_virtualizable();
@@ -4886,7 +4902,8 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_r(box, fielddescr) →
             // _opimpl_getfield_gc_any_pureornot (pyjitpl.py).
-            let field_index = fielddescr.index();
+            let record_descr = self.vable_static_record_descr(&fielddescr);
+            let field_index = record_descr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:934-945 + :938-939 sanity check (ref arm):
                 //     resvalue = executor.execute(cpu, mi, opnum, fielddescr, box)
@@ -4920,7 +4937,6 @@ impl TraceCtx {
                 );
                 return (cached, cached_value);
             }
-            let record_descr = self.vable_static_record_descr(&fielddescr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — `resbox`
             // carries `.getref_base()` payload; pair it with the
             // recorded opref so subsequent `box_value(op)` matches
@@ -5002,7 +5018,8 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_f(box, fielddescr) →
             // _opimpl_getfield_gc_any_pureornot (pyjitpl.py).
-            let field_index = fielddescr.index();
+            let record_descr = self.vable_static_record_descr(&fielddescr);
+            let field_index = record_descr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:941-945 sanity check (float arm):
                 //     resvalue = executor.execute(cpu, mi, opnum, fielddescr, box)
@@ -5038,7 +5055,6 @@ impl TraceCtx {
                 );
                 return (cached, cached_value);
             }
-            let record_descr = self.vable_static_record_descr(&fielddescr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — pair the
             // float payload with the recorded opref so subsequent
             // `box_value(op)` matches RPython's executor-returned Box.  It is
@@ -6222,6 +6238,22 @@ mod tests {
         assert_eq!(ctx.opref_to_box(add), OcBox::ResOp(add.raw()));
     }
 
+    #[test]
+    fn replace_box_does_not_by_itself_queue_a_framestack_rewrite() {
+        // `pyjitpl.py replace_box` always walks frames, but
+        // `TraceCtx::replace_box` is only the vref/vable/heapcache half.
+        // The framestack pending is armed only by `_nonstandard_virtualizable`
+        // Step 4, which is the one caller that used to skip the walk.
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let old = OpRef::input_arg_ref(0);
+        let new = OpRef::input_arg_ref(1);
+        ctx.replace_box(old, new);
+        assert!(
+            ctx.take_pending_box_replace().is_none(),
+            "a bare replace_box must not invent a framestack alias"
+        );
+    }
+
     /// `heapcache.py is_nullity_known` answers truthy for a non-`Const` box
     /// whatever its nullity — `nullity_now_known` sets one flag for both — and
     /// falsy for a null `Const`, whose answer is `bool(box.getref_base())`.
@@ -6356,7 +6388,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         ctx.set_cpu(Some(&cpu));
-        let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
+        let fd = majit_ir::make_field_descr_full(1, 0, 8, Type::Int, false);
         let cached = ctx.const_int(42);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
@@ -6367,6 +6399,27 @@ mod tests {
             0xCAFE_BABE,
             fd,
         );
+    }
+
+    #[test]
+    fn unnumbered_field_descriptors_do_not_share_a_heapcache_entry() {
+        let mut recorder = Trace::new();
+        let obj = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let a = majit_ir::make_field_descr_full(u32::MAX, 0, 8, Type::Int, false);
+        let b = majit_ir::make_field_descr_full(u32::MAX, 8, 8, Type::Int, false);
+        let value = ctx.const_int(42);
+        ctx.heapcache_getfield_now_known(obj, a.index(), value);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, b.index()), None);
+        ctx.heapcache_setfield_cached(obj, a.index(), value);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, b.index()), None);
+        // A genuine descriptor identity still supports forwarding.
+        ctx.heapcache_getfield_now_known(obj, 1, value);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, 1), Some(value));
     }
 
     /// `test_pyjitpl.py test_remove_consts_and_duplicates` — the upstream
@@ -6518,7 +6571,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         ctx.set_cpu(Some(&cpu));
-        let fd = majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Signed);
+        let fd = majit_ir::make_field_descr_full(1, 0, 8, Type::Ref, false);
         let cached = ctx.const_ref(0xAAAA_BBBB);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
@@ -6549,7 +6602,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         ctx.set_cpu(Some(&cpu));
-        let fd = majit_ir::make_field_descr(0, 8, Type::Float, majit_ir::ArrayFlag::Signed);
+        let fd = majit_ir::make_field_descr_full(1, 0, 8, Type::Float, false);
         let cached = ctx.const_float((1.5_f64).to_bits() as i64);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
@@ -6623,7 +6676,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         ctx.set_cpu(Some(&cpu));
-        let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
+        let fd = majit_ir::make_field_descr_full(1, 0, 8, Type::Int, false);
         let cached = ctx.const_int(7);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
