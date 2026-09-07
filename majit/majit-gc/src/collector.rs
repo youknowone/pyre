@@ -6263,6 +6263,13 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots(|gcref| {
             self.seed_major_root(*gcref, "rescan_extra_root");
         });
+        // TLS exception cells live on the per-mutator frame area for the
+        // first pass. Upstream's second `collect_nonstack_roots` still
+        // repeats the non-stack carriers that can be written after the
+        // snapshot; the rescan-only walkers are those three cells.
+        crate::shadow_stack::walk_rescan_roots(|gcref| {
+            self.seed_major_root(*gcref, "rescan_tls_exception");
+        });
         let pending: Vec<usize> = self
             .finalizer_handlers
             .iter()

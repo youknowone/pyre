@@ -1674,6 +1674,11 @@ pub struct MetaInterp<M: Clone> {
     /// interpreter-origin entry bridge at that key.
     pub(crate) speculative_cut_owned_key: Option<u64>,
     pub(crate) tracing: Option<TraceCtx>,
+    /// Taken recorder parked for the compile window. `walk_active_trace_refs`
+    /// still forwards its ConstPtrs until intern / drop; `tracing.take()`
+    /// alone would leave those ops unrooted for the whole optimize/compile
+    /// allocation storm.
+    pub(crate) compile_tracing: Option<TraceCtx>,
     /// Single-pass tracing: the `(walk_final_pc, walk_final_reds)` snapshot
     /// copied off the active `TraceCtx` at the CloseLoop point BEFORE
     /// `compile_loop` drains the ctx, so the merge-point hook can read it
@@ -2786,7 +2791,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        let Some(trace_ctx) = self.tracing.as_mut() else {
+        let Some(trace_ctx) = self.tracing.as_mut().or(self.compile_tracing.as_mut()) else {
             return;
         };
         trace_ctx.recorder.walk_const_ptr_refs(&mut visitor);
@@ -3524,6 +3529,7 @@ impl<M: Clone> MetaInterp<M> {
             cut_compiled_keys: indexmap::IndexSet::new(),
             speculative_cut_owned_key: None,
             tracing: None,
+            compile_tracing: None,
             single_pass_outcome: None,
             single_pass_finish: false,
             single_pass_finish_values: None,
@@ -10022,24 +10028,44 @@ impl<M: Clone> MetaInterp<M> {
             .and_then(|ctx| ctx.driver_descriptor())
             .cloned();
         self.force_finish_trace = false;
-        let mut ctx = self.tracing.take().unwrap();
+        // Park the recorder here so `walk_active_trace_refs` still forwards
+        // its ConstPtrs while `finish` (and any collection it triggers) runs.
+        // Taking it out of `tracing` stops a re-entrant record; dropping it
+        // before compile intern would reopen the nursery-ConstPtr window.
+        self.compile_tracing = self.tracing.take();
+        let compile_tracing_slot = &raw mut self.compile_tracing;
+        struct CompileTracingGuard(*mut Option<TraceCtx>);
+        impl Drop for CompileTracingGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    *self.0 = None;
+                }
+            }
+        }
+        let _compile_tracing_guard = CompileTracingGuard(compile_tracing_slot);
         // compile.py:510 `vable = orig_inpargs[index_of_virtualizable].getref_base()`.
         // Resolve the constant Ref that the tracer stashed for the
         // virtualizable inputarg at trace-start so
         // `patch_new_loop_to_load_virtualizable_fields` below can read the
         // heap object via `vinfo.get_array_length(vable, i)` without
         // consulting a separate trace-start cache.
-        let orig_vable_ptr = self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
+        let orig_vable_ptr = {
+            let ctx = self.compile_tracing.as_ref().unwrap();
+            self.orig_vable_ptr_from_trace_ctx(ctx, driver_descriptor.as_ref())
+        };
         // pyjitpl.py compile_done_with_this_frame parity:
         // `store_token_in_vable` (SetfieldGc on vable_token + the
         // accompanying GUARD_NOT_FORCED_2) is recorded by the pyre
         // frontend right before TraceAction::Finish is emitted, so the
         // guard captures fresh resumedata via the proper
         // `MIFrame::generate_guard` path.
-        let green_key = ctx.green_key;
+        let green_key = self.compile_tracing.as_ref().unwrap().green_key;
 
-        let call_pure_results = ctx.take_call_pure_results();
-        let mut recorder = ctx.recorder;
+        let call_pure_results = self
+            .compile_tracing
+            .as_mut()
+            .unwrap()
+            .take_call_pure_results();
         // `pyjitpl.py:3216-3217` / `pyjitpl.py:3241`:
         //   `token = sd.done_with_this_frame_descr_<type>` (normal) or
         //   `token = sd.exit_frame_with_exception_descr_ref` (raising),
@@ -10062,11 +10088,19 @@ impl<M: Clone> MetaInterp<M> {
                     crate::make_finish_fail_descr_typed(finish_arg_types.clone(), false)
                 })
         };
-        recorder.finish(finish_args, finish_descr);
+        self.compile_tracing
+            .as_mut()
+            .unwrap()
+            .recorder
+            .finish(finish_args, finish_descr);
         // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
         // downstream consumers (`trace.snapshots`) still observe the
         // captured resumedata. `recorder.get_trace()` on its own returns
-        // a snapshot-less TreeLoop.
+        // a snapshot-less TreeLoop. Taking the parked ctx here ends the
+        // walk_active_trace_refs coverage; `compile_snapshot_refs` picks
+        // up the snapshot ConstPtrs a few lines below.
+        let mut ctx = self.compile_tracing.take().unwrap();
+        let recorder = ctx.recorder;
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
         let SimpleCompileViews {

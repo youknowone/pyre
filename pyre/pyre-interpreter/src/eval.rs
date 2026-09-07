@@ -2628,13 +2628,18 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
 /// popped a finalizable receiver, an otherwise-unreferenced temporary runs its
 /// finalizer before the surrounding exception handler continues. This is
 /// observable in `test_io.test_error_through_destructor` for both native and
-/// `_pyio` streams. A reachability pass, rather than an IO/type shortcut,
-/// decides whether the receiver is actually dead.
+/// `_pyio` streams.
+///
+/// PyPy's `UserDelAction` only drains the queue; the collect that discovers a
+/// just-popped temporary is the 3.14 adaptation. Arm only when this object is
+/// itself registered for a finalizer. An MRO `__del__` lookup is the wrong
+/// predicate: many types expose `__del__` without `register_finalizer` ever
+/// seeing the instance, and a collect then finds nothing to run. A live
+/// registered receiver (`f.xyzzy`) still triggers the collect, but stays
+/// reachable so its finalizer does not run.
 #[majit_macros::dont_look_inside]
 pub(crate) fn finalize_failed_attr_receiver_now(obj: PyObjectRef) -> bool {
-    crate::typedef::r#type(obj).is_some_and(|w_type| unsafe {
-        crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__del__").is_some()
-    })
+    !obj.is_null() && majit_gc::gc_object_finalizer_pending(obj as usize)
 }
 
 impl SharedOpcodeHandler for PyFrame {
