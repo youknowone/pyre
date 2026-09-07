@@ -322,6 +322,13 @@ pub const BC_INT_INVERT: u8 = 141;
 /// byte here `insn_byte` panicked on the key instead.  Takes the next
 /// byte above `BC_RAW_STORE_F` (235).
 pub const BC_INT_IS_ZERO: u8 = 236;
+// `blackhole.py bhimpl_ref_isconstant` / `bhimpl_ref_isvirtual`
+// (`@arguments("r", returns="i")`).  `look_inside_iff` folds
+// `jit.isconstant` / `jit.isvirtual` to these ops
+// (`jtransform.py rewrite_op_direct_call` `jit.isconstant` /
+// `jit.isvirtual`).
+pub const BC_REF_ISCONSTANT: u8 = 237;
+pub const BC_REF_ISVIRTUAL: u8 = 238;
 pub const BC_UINT_RSHIFT: u8 = 142;
 pub const BC_UINT_MUL_HIGH: u8 = 143;
 pub const BC_UINT_LT: u8 = 144;
@@ -1079,6 +1086,8 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // The `/ri` suffix matches `blackhole.py:616`; tracing reboxes a
     // constant int class pointer as a ConstPtr before recording.
     m.insert("assert_not_none/r", BC_ASSERT_NOT_NONE);
+    m.insert("ref_isconstant/r>i", BC_REF_ISCONSTANT);
+    m.insert("ref_isvirtual/r>i", BC_REF_ISVIRTUAL);
     m.insert("record_exact_class/ri", BC_RECORD_EXACT_CLASS);
 
     // Float comparisons — `blackhole.py:721-746`
