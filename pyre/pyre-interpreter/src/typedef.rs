@@ -8462,13 +8462,24 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             type_name_of(w_frame)
         )));
     }
-    let frame = w_frame as *mut crate::pyframe::PyFrame;
-
-    // tb_lasti / tb_lineno: both are declared `int` in the signature, so the
-    // converter Argument Clinic emits is `PyLong_AsInt` — it reduces through
-    // `__index__` and refuses a value the C `int` cannot hold.
-    let lasti = traceback_c_int_arg(w_lasti)?;
-    let lineno = traceback_c_int_arg(w_lineno)?;
+    // `PyTraceback.descr_new` keeps `w_next` / `w_frame` as GC locals across
+    // the `unwrap_spec(lasti=int, lineno=int)` conversions (`space.index_w`
+    // / `__index__` can collect).  Pin the remaining wrapped args and reload
+    // the frame out of the anchor after the conversions, the way gctransform
+    // reloads those locals.
+    let _tb_roots = pyre_object::gc_roots::push_roots();
+    let next_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(next);
+    let lasti_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_lasti);
+    let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_lineno);
+    let frame_anchor =
+        unsafe { crate::eval::FrameAnchor::from_raw(w_frame as *mut crate::pyframe::PyFrame) };
+    let lasti = traceback_c_int_arg(pyre_object::gc_roots::shadow_stack_get(lasti_slot))?;
+    let lineno = traceback_c_int_arg(pyre_object::gc_roots::shadow_stack_get(lineno_slot))?;
+    let frame = frame_anchor.live();
+    let next = pyre_object::gc_roots::shadow_stack_get(next_slot);
     let w_code = unsafe { (*frame).fget_f_code() };
 
     Ok(crate::pytraceback::w_pytraceback_new(

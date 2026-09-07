@@ -1501,6 +1501,10 @@ fn call_function_ex_impl(
     kwargs_or_null: PyObjectRef,
     profile_frame: *mut PyFrame,
 ) -> PyResult {
+    // `pyopcode.py CALL_FUNCTION_EX` keeps `self` across `argument_factory`
+    // and `call_args_and_c_profile`.  Reload that frame after each collecting
+    // unpack, the way gctransform reloads the executing `PyFrame`.
+    let profile_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     // Unpacking `*` already runs Python — a generator body, or a subtype's
     // `__iter__` — so `callable`, the mapping and the prepended receiver are
     // stale by the time the `**` merge and the dispatch read them.  Publish
@@ -1601,7 +1605,7 @@ fn call_function_ex_impl(
                 &args(),
                 &entries,
                 true,
-                profile_frame,
+                profile_anchor.live(),
             );
         }
     }
@@ -1611,7 +1615,7 @@ fn call_function_ex_impl(
         callable(),
         &args(),
         CallMode::Jit,
-        profile_frame,
+        profile_anchor.live(),
     )
 }
 
@@ -2123,6 +2127,10 @@ fn call_non_function_callable_with_mode(
     mode: CallMode,
     profile_frame: *mut PyFrame,
 ) -> PyResult {
+    // `call_args_and_c_profile` keeps `frame` across `c_call_trace` /
+    // `call_args`.  Override binding (`space.get`) can collect, so reload
+    // the profile frame after those lookups.
+    let profile_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     // Binding an override below runs `baseobjspace::get`, whose property and
     // general `__get__` arms execute Python.  Root the arguments first and
     // dispatch each bound call from the forwarded roots — this native slice is
@@ -2245,7 +2253,13 @@ fn call_non_function_callable_with_mode(
         return Ok(result);
     }
 
-    call_function_carrier_with_mode(execution_context, callable, args, mode, profile_frame)
+    call_function_carrier_with_mode(
+        execution_context,
+        callable,
+        args,
+        mode,
+        profile_anchor.live(),
+    )
 }
 
 pub fn call_user_function(
@@ -3049,6 +3063,10 @@ fn call_with_kwargs_in_ctx_impl(
     dispatch_metaclass_call: bool,
     profile_frame: *mut crate::pyframe::PyFrame,
 ) -> PyResult {
+    // `call_args_and_c_profile` / `CALL_FUNCTION_KW` keep `frame` across
+    // override binding and argument marshalling.  Reload it after each
+    // collecting lookup rather than passing the entry copy on.
+    let profile_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     // RPython's `Arguments` is GC-traced for the whole call. Mirror the GC
     // transform explicitly: keyword binding below allocates tuples, dicts,
     // and keyword-name strings before the callee frame owns these values.
@@ -3145,7 +3163,7 @@ fn call_with_kwargs_in_ctx_impl(
             &full_args,
             kwargs,
             dispatch_metaclass_call,
-            profile_frame,
+            profile_anchor.live(),
         );
     }
 
@@ -3216,7 +3234,7 @@ fn call_with_kwargs_in_ctx_impl(
                 // `c_call_trace` / `c_return_trace`, so route the bound flat
                 // slice through the profile-aware path like the marker branch
                 // below rather than invoking the builtin directly.
-                let frame_ptr = c_profile_frame(profile_frame);
+                let frame_ptr = c_profile_frame(profile_anchor.live());
                 if !frame_ptr.is_null() {
                     // The argument marshalling below allocates before the frame
                     // is handed to the profiling call, so the profiled frame is
@@ -3322,7 +3340,7 @@ fn call_with_kwargs_in_ctx_impl(
                 // breaking the FunctionWithFixedCode rebinding's
                 // firstarg() (`argument.py` returns `None`
                 // when positional count is zero, not the kwargs dict).
-                let frame_ptr = c_profile_frame(profile_frame);
+                let frame_ptr = c_profile_frame(profile_anchor.live());
                 if !frame_ptr.is_null() {
                     // The argument marshalling below allocates before the frame
                     // is handed to the profiling call, so the profiled frame is
@@ -3837,7 +3855,7 @@ fn call_with_kwargs_in_ctx_impl(
             &full_args,
             kwargs,
             dispatch_metaclass_call,
-            profile_frame,
+            profile_anchor.live(),
         );
     }
 
@@ -4960,7 +4978,15 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     } else {
         None
     };
-    let extra_roots = kwds_dict.map(|_| pyre_object::gc_roots::push_roots());
+    // Open the keyword-dict bracket in this function, not in a `map`
+    // closure: `compiling.py build_class` roots `kwds_w` on `build_class`
+    // itself, and a generated `FnOnce` would own a `push_roots` that cannot
+    // see the collections below.
+    let extra_roots = if kwds_dict.is_some() {
+        Some(pyre_object::gc_roots::push_roots())
+    } else {
+        None
+    };
     let (base_args, metaclass, extra_kwargs) = if let Some(last) = kwds_dict {
         {
             let extra_roots = extra_roots.as_ref().expect("opened for a kwargs dict");
@@ -5132,12 +5158,16 @@ fn build_class_inner(
     // sites that consume it. A class statement without keywords opens no
     // scope: `pin_root` is `dont_look_inside`, so an unconditional one would
     // residualise in every traced class body.
-    let kwds_roots = extra_kwargs.map(|kw| {
+    // Same as `build_class`: the keyword mapping is a local of this
+    // function, so the bracket lives here rather than on a `map` closure.
+    let kwds_roots = if let Some(kw) = extra_kwargs {
         let scope = pyre_object::gc_roots::push_roots();
         let slot = scope.base();
         let _ = scope.pin_root(kw);
-        (scope, slot)
-    });
+        Some((scope, slot))
+    } else {
+        None
+    };
     let current_kwds = || kwds_roots.as_ref().map(|(scope, slot)| scope.get(*slot));
 
     // `bases` and `w_orig_bases` are raw copies taken before `__prepare__` and

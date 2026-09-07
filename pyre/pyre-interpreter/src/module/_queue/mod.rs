@@ -112,9 +112,13 @@ fn empty_error() -> crate::PyError {
 }
 
 fn simplequeue_put(queue: &W_SimpleQueue, item: PyObjectRef) -> PyObjectRef {
-    // Taking the lock can drop the GIL and rooting is itself a collection
-    // point, so `item` is read back out of its shadow-stack slot rather than
-    // from the argument, which a move would have left stale.
+    // `_PySimpleQueue.put` keeps `item` as a frame local across the append.
+    // There is no `pypy/module/_queue`; this native `put` is the same live
+    // word.  `queue_lock` can take `before_external_block` (`rffi.aroundstate
+    // .before` / `_RPyGilRelease`), which leaves the census so another
+    // mutator can collect before `push_back`.  Same-thread reachability
+    // cannot see that collect, so the bracket is kept even when the
+    // intra-function scan reports none.
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(item);
