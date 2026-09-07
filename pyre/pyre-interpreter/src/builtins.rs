@@ -14982,8 +14982,17 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             // exactly `invalid syntax`, and a keyword typo reaches the parser
             // as a name opening a second statement on the line.
             ParseErrorType::SimpleStatementsOnSameLine
-            | ParseErrorType::SimpleAndCompoundStatementOnSameLine
-            | ParseErrorType::ExpectedToken { .. } => "invalid syntax".to_owned(),
+            | ParseErrorType::SimpleAndCompoundStatementOnSameLine => "invalid syntax".to_owned(),
+            // `try`/`if`/`def`/… without `:` is `invalid_colon` in the 3.14
+            // grammar (`Parser/parser.c`) and pypy3 reports the same
+            // `expected ':'`.  Other unmet token expectations stay the
+            // generic spelling; `traceback._find_keyword_typos` still sees
+            // those as `invalid syntax`.
+            ParseErrorType::ExpectedToken {
+                expected: rustpython_compiler::ast::token::TokenKind::Colon,
+                ..
+            } => "expected ':'".to_owned(),
+            ParseErrorType::ExpectedToken { .. } => "invalid syntax".to_owned(),
             ParseErrorType::OtherError(message) if message == "Expected a statement" => {
                 "invalid syntax".to_owned()
             }
