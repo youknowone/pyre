@@ -5538,6 +5538,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // driver this process installs a Rust-side runner for; a second driver
     // registers its own under its own index.
     majit_metainterp::blackhole::register_portal_runner_hook(0, pyre_portal_runner);
+    majit_metainterp::blackhole::register_portal_runner_hook(1, unpackiterable_portal_runner);
     // pypy/module/pypyjit/interp_jit.py PyPyJitDriver(..., is_recursive=True).
     // Drives MetaInterp.is_main_jitcode() / is_portal_jitcode dispatch
     // — without this flag the recursive-portal bookkeeping stays
@@ -5557,10 +5558,12 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd.result_type = majit_ir::Type::Ref;
     jd.virtualizable_info = Some(info.clone());
     jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
+    // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
+    jd.get_unique_id = Some(portal_unique_id_from_greens);
     d.meta_interp_mut().register_jitdriver_sd(jd);
     // baseobjspace.py `unpackiterable_driver = JitDriver(greens=['greenkey'],
     // reds='auto', ...)` — the second portal driver (jd1) for the
-    // unknown-length unpack loop `_unpackiterable_unknown_length`. Registered
+    // unknown-length unpack loop `unpackiterable_portal`. Registered
     // here, right after jd0, so it lands at `jitdrivers_sd[1]` and inherits the
     // same `portal_finishtoken` / `propagate_exc_descr` via the
     // `finish_setup_descrs_for_jitdrivers` tail. jd1 is novable
@@ -5568,7 +5571,13 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // vinfo-scan would elect jd0 for a jd1 trace; what keeps that from
     // happening is `drive_unpack_iterable_trace` handing the door this
     // registration's own slot.
-    let jd1 = pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
+    let mut jd1 = pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
+    jd1.result_type = majit_ir::Type::Ref;
+    // warmspot.py `jd.portal_runner_adr = adr_of(ll_portal_runner)` — every
+    // driver gets one, even a non-recursive autoreds portal. `get_portal_runner`
+    // / `compile_tmp_callback` read it; unpackiterable is not recursive so
+    // `do_recursive_call` will not jump here.
+    jd1.portal_runner_adr = ll_unpackiterable_portal_runner_shim as *const () as i64;
     d.meta_interp_mut().register_jitdriver_sd(jd1);
     // `warmspot.py metainterp_sd.finish_setup(codewriter)` always installs
     // the assembler's opcode ids and liveness stream before either tracing or
@@ -6617,6 +6626,21 @@ pub fn get_unique_id(
     unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) as usize }
 }
 
+/// warmstate.py `get_unique_id(greenkey)` for the Python portal.
+///
+/// Greens are `['next_instr', 'is_being_profiled', 'pycode']`. The hook
+/// itself ignores the first two and answers the code object's unique id.
+fn portal_unique_id_from_greens(greens: &[i64]) -> i64 {
+    match greens {
+        [next_instr, is_being_profiled, pycode] => get_unique_id(
+            *next_instr as usize,
+            *is_being_profiled != 0,
+            *pycode as pyre_object::PyObjectRef,
+        ) as i64,
+        _ => 0,
+    }
+}
+
 /// RPython interp_jit.py helper: get_location.
 pub fn get_location(
     next_instr: usize,
@@ -7113,15 +7137,13 @@ fn set_jit_param_string_via_warmstate(text: &str) -> Result<(), ()> {
 }
 
 /// Gate for jd1 (`unpackiterable_driver`): the merge-point hook drives a
-/// `JitCodeMachine` trace of `_unpackiterable_unknown_length` on hot unpack
+/// `JitCodeMachine` trace of `unpackiterable_portal` on hot unpack
 /// sites, closing and compiling the drain loop. This remains opt-in with
-/// `PYRE_JD1=1`: unlike RPython, pyre currently drives jd1 through the same
-/// `MetaInterp.tracing` slot as the bytecode portal. A residual `next()` on a
-/// generator can run an arbitrarily large Python computation before yielding;
-/// while that happens the jd1 trace consists only of the opaque `next()` call,
-/// but the shared tracing flag suppresses every jd0 merge point reached by the
-/// generator body. Keep the incomplete second-driver experiment dormant until
-/// it has RPython's independent recursive-portal behavior. It also follows the
+/// `PYRE_JD1=1`. `maybe_compile_and_run` skips only the cell that carries
+/// `JC_TRACING` for those greens (`warmstate.py`), so a jd1 session does
+/// not suppress jd0 compiled-loop entry. Starting a second MetaInterp
+/// while one session occupies `tracing` is still refused — pyre has one
+/// MetaInterp object. It also follows the
 /// master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) so "no JIT" means no
 /// jd1.
 ///
@@ -7664,7 +7686,7 @@ fn jd1_counter_tick(green_key: u64) -> bool {
 
 /// jd1 (`unpackiterable_driver`) merge-point hook body. On the hot iterator
 /// type, drives one `JitCodeMachine` trace of the extracted
-/// `_unpackiterable_unknown_length` loop with `w_iterator`/`items` as the two
+/// `unpackiterable_portal` loop with `w_iterator`/`items` as the two
 /// `reds='auto'` values. Inert when jd1 is disabled (see
 /// [`jd1_experiment_enabled`]).
 fn unpack_merge_point_jit(
@@ -7724,7 +7746,7 @@ fn drain_error_from_exc_ref(exc: i64) -> Option<pyre_interpreter::error::PyError
     (!err.matches_stop_iteration()).then_some(err)
 }
 
-/// Drive one jd1 trace of `_unpackiterable_unknown_length`. The tracer executes
+/// Drive one jd1 trace of `unpackiterable_portal`. The tracer executes
 /// each residual (`self.next`, `items.append`) concretely on the shared reds,
 /// so this advances the live iterator and grows the live list in place; the
 /// Rust caller loop then resumes from the advanced state (cooperative drain).
@@ -7756,7 +7778,7 @@ fn drive_unpack_iterable_trace(
     let _exc_scope = crate::call_jit::ResidualExceptionScope::park(dbg);
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
-        "baseobjspace::_unpackiterable_unknown_length",
+        "baseobjspace::unpackiterable_portal",
     ) {
         Some(jc) => jc,
         None => {
@@ -8246,6 +8268,7 @@ pub fn init_jit_hooks() {
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
     pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
+    pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
     // Install the dict key `eq_w` / `hash_w` / `compares_by_identity`
     // trampolines here, at boot, before any user statement runs. They are
     // also registered inside the `JIT_DRIVER` initializer for the
@@ -9424,6 +9447,8 @@ fn eval_with_jit_inner(
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
     pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
+    pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
+    pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
     // The backend-agnostic registrations here — notably the JIT exception
     // raiser (`register_jit_exc_raiser`) that `jit_publish_exception` routes
     // residual-call raises through — are required on every backend; the
@@ -9725,6 +9750,78 @@ pub(crate) fn pyre_portal_runner(
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
         // Never a `BailToInterpreter`: the re-entered portal body either
         // returns or raises, so no terminal blackhole image is in flight here.
+        Err(mut err) => Err(PortalRunnerFailure::jit(
+            JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(err.to_exc_object() as usize)),
+        )),
+    }
+}
+
+/// `warmspot.py ll_portal_runner` for `unpackiterable_driver`.
+///
+/// `rewrite_jit_merge_point` makes the original `_unpackiterable_unknown_length`
+/// return this runner. Function-entry `maybe_compile_and_run` is the loop-entry
+/// hook already installed on the portal's `jit_merge_point`; this wrapper
+/// owns only the activation call to `portal_ptr(*args)`.
+fn unpackiterable_ll_portal_runner(
+    greenkey: pyre_object::PyObjectRef,
+    w_iterator: pyre_object::PyObjectRef,
+    items: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError> {
+    pyre_interpreter::unpackiterable_portal(greenkey, w_iterator, items)
+}
+
+/// C ABI of [`unpackiterable_ll_portal_runner`]. `warmspot.py` stores
+/// `llmemory.cast_ptr_to_adr(portal_runner_ptr)` on the driver.
+#[majit_macros::jit_may_force]
+pub extern "C" fn ll_unpackiterable_portal_runner_shim(
+    greenkey: i64,
+    w_iterator: i64,
+    items: i64,
+) -> i64 {
+    match unpackiterable_ll_portal_runner(
+        greenkey as pyre_object::PyObjectRef,
+        w_iterator as pyre_object::PyObjectRef,
+        items as pyre_object::PyObjectRef,
+    ) {
+        Ok(result) => result as i64,
+        Err(mut err) => {
+            pyre_interpreter::stack_check::park_jit_pending_error(err);
+            0
+        }
+    }
+}
+
+/// `warmspot.py handle_jitexception` for `unpackiterable_driver`.
+///
+/// Greens are `['greenkey']`; reds are auto `w_iterator`, `items`.
+/// `portal_ptr(*args)` is the split-portal loop, not the `newlist_hint`
+/// prologue and not the bytecode portal's frame runner.
+fn unpackiterable_portal_runner(
+    exc: &majit_metainterp::jitexc::JitException,
+) -> Result<
+    (majit_metainterp::blackhole::BhReturnType, i64),
+    majit_metainterp::blackhole::PortalRunnerFailure,
+> {
+    use majit_metainterp::blackhole::{BhReturnType, PortalRunnerFailure};
+    use majit_metainterp::jitexc::JitException;
+
+    let JitException::ContinueRunningNormally(args) = exc else {
+        return Ok((BhReturnType::Void, 0));
+    };
+    let mut all_r = args.green_ref.clone();
+    all_r.extend(&args.red_ref);
+    let greenkey = all_r.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let w_iterator = all_r.get(1).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let items = all_r.get(2).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    assert!(
+        !w_iterator.is_null() && !items.is_null(),
+        "unpackiterable portal runner: ContinueRunningNormally missing reds \
+         (iterator/items); greens={} reds={}",
+        args.green_ref.len(),
+        args.red_ref.len(),
+    );
+    match pyre_interpreter::unpackiterable_portal(greenkey, w_iterator, items) {
+        Ok(result) => Ok((BhReturnType::Ref, result as i64)),
         Err(mut err) => Err(PortalRunnerFailure::jit(
             JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(err.to_exc_object() as usize)),
         )),
@@ -10791,8 +10888,10 @@ fn maybe_compile_and_run(
             return None;
         }
     }
-    // warmstate.py: JC_TRACING → skip entirely (no counter tick)
-    if driver.is_tracing() {
+    // warmstate.py: `cell.flags & JC_TRACING` → skip this key only.
+    // A live session on another key or driver must not suppress enter
+    // or the counter tick here.
+    if driver.cell_is_tracing(green_key) {
         return None;
     }
     // warmstate.py: procedure_token exists → EnterJitAssembler.

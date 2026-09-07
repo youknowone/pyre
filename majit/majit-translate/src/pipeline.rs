@@ -66,8 +66,10 @@ pub struct JitDriverSpec {
     /// before its `jit_merge_point`, instead of against the graph that
     /// contains the marker.
     ///
-    /// Off by default: with it off `register_configured_jitdrivers` passes
-    /// the configured path through unchanged and no graph copy is made.
+    /// Default true for a declared-reds portal: `register_configured_jitdrivers`
+    /// copies the graph and splits it before `jit_merge_point`. Autoreds
+    /// drivers run `autodetect_jit_markers_redvars` first so the split has
+    /// a fixed `numreds`, matching `warmspot.py find_portals`.
     #[serde(default)]
     pub split_portal: bool,
 }

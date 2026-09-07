@@ -222,12 +222,10 @@ defaults.  Bridge inlining reaches module replacement on its own, so
 `PYRE_WASM_REEMIT` adds only the one-shot rebuild-with-unchanged-content that
 exercises the replacement machinery by itself.
 
-`PYRE_JD1` is off for a third reason: the arm is incomplete rather than
-wrong or unproven.  pyre drives jd1 through the same `MetaInterp.tracing`
-slot as the bytecode portal, so while a residual `next()` runs an
-arbitrarily large Python computation the shared tracing flag suppresses
-every jd0 merge point the generator body reaches.  It stays dormant until
-it has RPython's independent recursive-portal behavior.
+`PYRE_JD1` is off because starting a second MetaInterp while one session
+occupies `tracing` is still refused. Compiled-loop entry for another
+driver is no longer suppressed: `maybe_compile_and_run` reads
+`cell.flags & JC_TRACING` for that green key.
 
 `PYRE_FBW_INLINE_POISON` is off because its ON arm is known wrong, not merely
 unproven: the replay scan reports the pcs it objects to instead of collapsing
@@ -243,7 +241,7 @@ build.
 |---|---|---|
 | PYRE_WASM_REEMIT | re-emits a compiled loop's wasm module into its own table slot once, on the first bridge installed against it | when the replacement path no longer needs an isolated arm |
 | PYRE_GUARD_RESUME_PC | prints the coordinate every walker-emitted guard resumes at (`resume_snapshot.rs guard_resume_pc_probe_enabled`); a guard whose `py_pc` is not the opcode it was emitted under re-executes the wrong bytecode on deopt, which reads as a livelock or a corrupted local rather than as a crash | the resume coordinate is covered by an ordinary test |
-| PYRE_PORTAL_SPLIT | registers jd0 against the `warmspot.py split_graph_and_record_jitdriver` copy split immediately before `jit_merge_point`, instead of the unsplit `eval_loop_jit` graph; `=1` arms it and the prepass cache key includes the value | when the split portal path is the default and the unsplit registration arm is deleted |
+| PYRE_PORTAL_SPLIT | default ON: jd0 registers against the `warmspot.py split_graph_and_record_jitdriver` copy split immediately before `jit_merge_point`; `=0`/`off`/`false` restores the unsplit `eval_loop_jit` graph | when the unsplit registration arm is deleted |
 | PYRE_WASM_INLINE_NONHEADER | admits an inlined region whose closing JUMP names a resumable LABEL other than the loop header AND whose source guard is in the LOOP BODY (`lib.rs inline_nonheader_enabled`); `=1`/`true`/`on` arms it.  The preamble-sourced half of that class takes a different placement — blocks outside the header `loop`, body past its `end` — and is admitted unconditionally, so this flag now covers only the body-sourced half.  Arming it removes 49.4M of the 257.3M cross-module crossings on the 81 fixtures that reach the decline and buys 0.74x/0.67x on two of them.  The `spectral_norm` loss the retirement condition below was written against no longer reproduces: its two regions are deferred and their bridges never reach the trip count, so the flag leaves its crossings and its merges alike untouched.  Across 536 bench fixtures, priced at the measured 0.67 ms per module + 0.493 ms/KB of cranelift and 4.3 ns per crossing, arming it models as 105.7 ms cheaper — four fixtures worth 188.6 ms against twenty-odd worth 83 ms, the worst being `kept_stack_deep_var_shortcircuit` at 53KB of added module for 40k crossings | the +18 ops per non-failing iteration it levies on the owner's fall-through is paid back on the fixtures it admits, measured on a machine quiet enough to grade wall clock rather than modelled |
 | PYRE_WASM_COMPILE_CENSUS | reports every cranelift compile of a trace module separately (`main.rs jit_compile_trace`) — the bytes handed over, the wall time it took, and whether the request was a first compile or the re-emission of an owner that took a merge.  The stats line carries only the run's totals, which cannot separate a re-emission's cost from a first compile's nor say whether the per-module cost is linear in the bytes | trace compilation stops being on the critical path, or the two questions are answered and the answers stop moving |
 | PYRE_WASM_INLINE_EAGER_MAX_BYTES | `=N` declines the eager inline merge arm once the owner module it would re-emit is larger than N bytes (`lib.rs INLINE_EAGER_MAX_BYTES`, tally `inline_decl_eager_too_large`); unset leaves the built-in `DEFAULT_INLINE_EAGER_MAX_BYTES`, and `=4294967295` restores the unpriced arm.  That arm merges before the compile returns so a quasi-immutable fold's dependencies attach to the owner's flag instead of a temporary bridge's, which is why no entry counter can reach it and `PYRE_WASM_INLINE_TRIP_BYTES` leaves it untouched — the owner's size is the only thing it can read.  Set so the ceiling can be swept on ONE binary, the guest having no environment to read it from | the swept value becomes the built-in default, at which point this exists only to re-measure it |

@@ -2437,12 +2437,11 @@ fn register_configured_jitdrivers(
              must share one JitDriverStaticData",
             spec.portal.canonical_key(),
         );
-        // `spec.autoreds`: `support.py decode_hp_hint_args` requires a fixed
-        // numreds; `warmspot.py find_portals` obtains it from
-        // `support.autodetect_jit_markers_redvars` before splitting, while
-        // majit currently discovers autoreds later in
-        // `jtransform.py try_handle_jit_marker`.
-        let portal_path = if !spec.split_portal || spec.autoreds {
+        // `warmspot.py find_portals` runs `autodetect_jit_markers_redvars`
+        // before `split_graph_and_record_jitdriver`, so an autoreds portal
+        // splits once numreds is known. `jtransform.py try_handle_jit_marker`
+        // still rediscovers those reds when emitting the merge-point op.
+        let portal_path = if !spec.split_portal {
             spec.portal.clone()
         } else {
             // Ends the `call_control` borrow the `register_function_graph`
@@ -2475,12 +2474,46 @@ fn register_configured_jitdrivers(
             let (marker_block, marker_index) =
                 crate::codewriter::support::find_jit_merge_point(&portal, driver_roots)
                     .expect("no jit_merge_point found in configured portal graph");
+            // `support.py autodetect_jit_markers_redvars` before
+            // `split_before_jit_merge_point`: declared reds stay as written,
+            // autoreds learn the live set at the marker.
+            let numreds = if spec.autoreds {
+                let greens = match &portal
+                    .block(marker_block)
+                    .operations
+                    .get(marker_index)
+                    .expect("find_jit_merge_point returned a live marker")
+                    .kind
+                {
+                    crate::model::OpKind::Call { args, .. } => args
+                        .iter()
+                        .skip(1)
+                        .take(spec.greens.len())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    _ => panic!("jit_merge_point must be a call"),
+                };
+                let reds = crate::codewriter::jtransform::autodetect_jit_markers_redvars(
+                    &portal,
+                    &greens,
+                    driver_roots,
+                );
+                // support.py autodetect_jit_markers_redvars: `op.args.extend(reds_v)`
+                // so `decode_hp_hint_args` can split greens/reds off the marker.
+                match &mut portal.block_mut(marker_block).operations[marker_index].kind {
+                    crate::model::OpKind::Call { args, .. } => args.extend(reds.iter().cloned()),
+                    _ => panic!("jit_merge_point must be a call"),
+                }
+                reds.len()
+            } else {
+                spec.reds.len()
+            };
             portal.startblock = crate::codewriter::support::split_before_jit_merge_point(
                 &mut portal,
                 marker_block,
                 marker_index,
                 spec.greens.len(),
-                spec.reds.len(),
+                numreds,
                 driver_roots,
             );
             // `warmspot.py WarmRunnerDesc.split_graph_and_record_jitdriver`:
@@ -3048,5 +3081,80 @@ mod portal_driver_tests {
         let jd0 = &call_control.jitdrivers_sd()[0];
         assert!(!jd0.autoreds);
         assert_eq!(jd0.numreds, Some(2));
+    }
+
+    #[test]
+    fn splits_an_autoreds_portal_after_autodetect() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::flowspace::model::Variable;
+        use crate::model::Link;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "unpackiterable"]);
+        let mut graph = FunctionGraph::new("unpackiterable");
+        let receiver = Variable::named("driver");
+        let green = Variable::named("greenkey");
+        let w_iterator = Variable::named("w_iterator");
+        let items = Variable::named("items");
+        for variable in [&receiver, &green, &w_iterator, &items] {
+            FunctionGraph::set_concretetype_of_inline(variable, ConcreteType::GcRef);
+        }
+        graph.block_mut(graph.startblock).inputargs =
+            vec![green.clone(), w_iterator.clone(), items.clone()];
+        // RPython's marker receiver is a JitDriver Constant. Rematerialize it
+        // after the split the way `unsimplify.split_block` does for a
+        // const-produced driver singleton.
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(receiver.clone()),
+                kind: OpKind::ConstRefNull,
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method(
+                        "jit_merge_point",
+                        Some("UnpackIterableJitDriver".into()),
+                    ),
+                    args: vec![receiver, green.clone()],
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.block_mut(graph.startblock).exits = vec![Link::from_variables(
+            &graph,
+            vec![green, w_iterator, items],
+            graph.startblock,
+            None,
+        )];
+        call_control.register_function_graph(portal.clone(), graph);
+
+        let mut spec = driver(portal);
+        spec.greens = vec!["greenkey".into()];
+        spec.autoreds = true;
+        spec.split_portal = true;
+        register_configured_jitdrivers(
+            &mut call_control,
+            &[spec],
+            &GraphTransformConfig::default().jitdriver_receiver_roots,
+        );
+        let split = CallPath::from_segments(["fixture", "unpackiterable_portal"]);
+        assert_eq!(call_control.jitdrivers_sd()[0].portal_graph, split);
+        let split_graph = call_control
+            .function_graphs()
+            .get(&split)
+            .expect("autoreds split registers the cut portal");
+        assert!(split_graph.func.dont_inline);
+        assert!(
+            crate::codewriter::support::find_jit_merge_point(
+                split_graph,
+                &GraphTransformConfig::default().jitdriver_receiver_roots,
+            )
+            .is_some()
+        );
     }
 }

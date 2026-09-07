@@ -841,7 +841,7 @@ pub fn install_jitcode_for(
 ///
 /// Unlike [`install_jitcode_for`] (which appends at `len()` and stamps a fresh
 /// slot), this honours the jitcode's baked absolute `JitCode::index` — a
-/// build-time interpreter portal (jd1's `_unpackiterable_unknown_length`,
+/// build-time interpreter portal (jd1's `unpackiterable_portal`,
 /// index 0) carries that index in its serialized `OnceLock`, and a resume frame
 /// records it verbatim (`dispatch.rs` `frame.jitcode.try_index()`).  For the
 /// resume decoders to resolve `sd.jitcodes[index]` to the portal, it must sit
@@ -3070,10 +3070,10 @@ pub struct PyreMeta {
     /// This stays separate from `valuestackdepth`, which is the live depth
     /// (`pyframe.py:111`) in the RPython model.
     pub array_capacity: usize,
-    /// Temporary staging count for extra portal reds that sit between the
-    /// frame red and the expanded virtualizable payload. Root portal traces
-    /// now carry `ec` here; guard-resume bridge traces still use 0 until the
-    /// resumedata path is migrated to the same contract.
+    /// Extra portal reds between the frame red and the virtualizable
+    /// payload. The Python portal carries `ec` here (`interp_jit.py`
+    /// `reds = ['frame', 'ec']`). Guard-resume rebuilds the same
+    /// contract in `rebuild_from_resumedata`.
     pub trace_extra_reds: usize,
     pub has_virtualizable: bool,
     #[vable(slot_types)]
@@ -3984,25 +3984,14 @@ pub(crate) fn note_root_trace_too_long(
     // ever do here.
     let huge_fn = crate::driver::try_driver_pair().and_then(|(driver, _)| {
         let meta = driver.meta_interp_mut();
-        // pyjitpl.py:2831 `raise SwitchToBlackhole(ABORT_TOO_LONG)`: the raise
-        // carries the reason from here to the `_interpret` catch, and the catch
-        // never re-runs the check that produced it.  The walker's counterpart of
-        // that raise is the `DispatchError::TraceTooLong` the caller returns,
-        // which has no room for a `Counters.ABORT_*`, so the reason travels in
-        // the staging slot the abort handler consults FIRST.  Staging it is
-        // therefore not only accounting: it is what stops the handler falling
-        // through to `MetaInterp::blackhole_if_trace_too_long`, whose bookkeeping
-        // this function has just performed.  A second run reads the log this one
-        // retires below, so `find_biggest_function` answers `None` however the
-        // trace overflowed and the root takes `prepare_trace_segmenting`'s
-        // permanent `JC_FORCE_FINISH` + `JC_DONT_TRACE_HERE` even when an inlined
-        // callee was named here and disabled on its own.
-        meta.stage_abort_reason(majit_metainterp::counters::ABORT_TOO_LONG);
+        // pyjitpl.py `raise SwitchToBlackhole(ABORT_TOO_LONG)`: the caller's
+        // DispatchError::TraceTooLong becomes TraceAction::SwitchToBlackhole.
+        // The reason travels with the unwind, never in MetaInterp staging.
         // pyjitpl.py `jd_sd, greenkey_of_huge_function = self.find_biggest_function()`.
         let huge_fn = meta.find_biggest_function();
         // pyjitpl.py `self.portal_trace_positions = None` — the log's `_pos`
         // cursors index the recorder this abort is discarding.
-        meta.portal_trace_positions = None;
+        meta.retire_portal_trace_positions();
         if let Some((jd_no, huge_key)) = huge_fn.clone() {
             // pyjitpl.py:2821-2822 `jd_sd.warmstate.disable_noninlinable_function(
             // greenkey_of_huge_function)`. Upstream's `dont_trace_here`
@@ -4085,18 +4074,30 @@ pub(crate) fn note_root_trace_too_long(
 /// and passed in — the driver is reached separately, exactly as
 /// [`note_root_trace_too_long`] does.
 ///
-/// Returns whether an entry was appended; the caller must call
-/// [`note_inline_subwalk_end`] if and only if it did, or the start/end walk
-/// goes out of step.
+/// Returns the owning driver when this is a recursive portal activation.
+/// The caller pairs every such decision with [`note_inline_subwalk_end`],
+/// including an abort that retires the log before the close.
 pub(crate) fn note_inline_subwalk_start(
     green_key: majit_metainterp::PortalGreenKey,
     pos: majit_metainterp::recorder::TracePosition,
 ) -> Option<usize> {
     let (driver, _) = crate::driver::try_driver_pair()?;
+    // Every Python callee re-enters the Python driver's declared portal.
+    // eval.rs registers that driver in slot 0; portal_jitcode resolves its
+    // actual mainjitcode from CompiledJitDriver, including a split portal.
+    // Read that JitCode's owner as pyjitpl.py `MetaInterp.newframe` does,
+    // rather than choosing the first recursive driver in the process.
+    let jitcode = crate::jitcode_runtime::portal_jitcode()?;
     let meta = driver.meta_interp_mut();
-    // `is_main_jitcode(jitcode)` in its jitcode-free form: no recursive portal
-    // driver means upstream would not have logged this frame either.
-    let jd_no = meta.main_jitdriver_index()?;
+    if !meta.is_main_jitcode(&jitcode) {
+        return None;
+    }
+    let jd_no = jitcode.jitdriver_sd()?;
+    // pyjitpl.py `newframe`: ENTER_PORTAL_FRAME sits on the same greenkey
+    // path as the log append. The walker never builds an MIFrame, so this
+    // is the counterpart of that record.
+    let unique_id = meta.unique_id_for_greenkey(jd_no, &green_key);
+    meta.enter_portal_frame(jd_no, unique_id);
     meta.push_portal_trace_position(jd_no, Some(green_key), pos);
     // Counted HERE, not where the entry is appended: an abort retires the log
     // mid-sub-walk, so counting appends would read `push` far above `pop` for a
@@ -4112,17 +4113,18 @@ pub(crate) fn note_inline_subwalk_end(
     jd_no: usize,
     pos: majit_metainterp::recorder::TracePosition,
 ) {
-    // Below the driver lookup, matching where `note_inline_subwalk_start`
-    // bumps 58: both counters then measure an APPENDED ENTRY, so an unclosed
-    // entry left by a driverless call shows up as `ptp_push != ptp_pop` rather
-    // than hiding behind equal counts.
+    // Like note_inline_subwalk_start, count the activation decision even
+    // when the abort has retired the log. These are not append counters.
     let Some((driver, _)) = crate::driver::try_driver_pair() else {
         return;
     };
     majit_metainterp::mc_diag_bump(59);
-    driver
-        .meta_interp_mut()
-        .push_portal_trace_position(jd_no, None, pos);
+    let meta = driver.meta_interp_mut();
+    // pyjitpl.py `popframe(leave_portal_frame=True)`: the walker close is
+    // a normal return, so LEAVE is recorded even when the abort has
+    // already retired the log.
+    meta.leave_portal_frame(jd_no);
+    meta.push_portal_trace_position(jd_no, None, pos);
 }
 
 /// Stage `reason` as the abort the walker is returning, so the single

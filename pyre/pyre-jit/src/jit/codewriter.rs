@@ -9514,10 +9514,9 @@ impl CodeWriter {
                             // frame (r2) feeds `get_builtin()`.
                             //
                             // This placeholder-plus-frame form is portal-only.
-                            // In a non-portal callee the frame register aliases
-                            // the outermost frame on a chained / inlined-callee
-                            // resume, so the residual's frame operand names the
-                            // wrong activation.  A
+                            // A non-portal callee graph declares its own
+                            // frame/ec inputs; `frame_var` is that callee red,
+                            // not the outermost portal frame. A
                             // non-portal callee instead keeps the
                             // `flowcontext.py find_global` const-fold,
                             // which the inliner needs as a foldable constant call
@@ -13174,83 +13173,28 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // Both are frame methods whose only operand is the
-                        // receiver, so both take the `emit_frontend_load_name`
-                        // shape: `bh_load_locals_fn(frame)` /
-                        // `bh_load_build_class_fn(frame)`.
-                        //
-                        // They occur only in a class body, which runs once per
-                        // class definition, and that is why this arm used to
-                        // emit `abort_permanent` instead. Execution frequency
-                        // is the wrong measure: the full-body walk covers a
-                        // frame statically, so one unlowerable op anywhere in
-                        // the reachable region retires the whole frame, and a
-                        // class body reached by the tracer at all — every one
-                        // of them, once `threshold` is low — costs a
-                        // `loops_aborted`.
-                        //
-                        // The two split on whether the receiver's identity can
-                        // change the answer, because in a non-portal callee
-                        // `frame_var` aliases the OUTERMOST frame (the same
-                        // aliasing the LoadGlobal namespace split above
-                        // describes, where it resolved the caller's `names`
-                        // table). Threading the callee's own frame is not an
-                        // option: an inlined callee has no materialised frame
-                        // at all (`frame_ptr == 0`, `portal_frame_reg`
-                        // unseeded), which is what inlining a virtualizable
-                        // means.
-                        //
-                        // `load_locals` returns THIS frame's `w_locals`
-                        // (`get_or_create_w_locals`), so an aliased receiver is
-                        // a wrong value with no guard able to catch it, and
-                        // there is no frame-free way to compute it. Portal
-                        // only; the non-portal side keeps the permanent
-                        // decline.
-                        //
-                        // `load_build_class` reads `frame.get_builtin()`, which
-                        // under `objspace.honor__builtins__` false is
-                        // `space.builtin` for every frame
-                        // (`baseobjspace::frame_builtin_obj`), so the answer
-                        // does not depend on which frame asks and the aliasing
-                        // is harmless. That is a property of the flag, not of
-                        // this arm, so assert it here: flipping the flag makes
-                        // the receiver significant and turns this into exactly
-                        // the LoadGlobal miscompile.
+                        // pyopcode.py `PyFrame.LOAD_LOCALS` and
+                        // `PyFrame.LOAD_BUILD_CLASS` read the live receiver.
+                        // Every graph declares its own frame/ec inputs, and
+                        // recursive call setup seeds the callee's own red frame
+                        // even when this code was not registered as a portal.
                         Instruction::LoadLocals | Instruction::LoadBuildClass => {
-                            const _: () = assert!(
-                                !pyre_interpreter::baseobjspace::HONOR_BUILTINS,
-                                "honor__builtins__ makes frame.get_builtin() frame-specific, so \
-                                 load_build_class can no longer take the portal-aliased frame in \
-                                 a non-portal callee — gate it on is_true_portal like load_locals",
-                            );
-                            let is_locals = matches!(instruction, Instruction::LoadLocals);
-                            if is_locals && !is_true_portal {
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
-                                emit_abort_permanent!(py_pc);
+                            let opname = if matches!(instruction, Instruction::LoadLocals) {
+                                "load_locals"
                             } else {
-                                let opname = if is_locals {
-                                    "load_locals"
-                                } else {
-                                    "load_build_class"
-                                };
-                                let loaded_dst_reg = stack_base + current_depth;
-                                let result_value = emit_frontend_frame_only_ref(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    opname,
-                                    frame_var.into(),
-                                    py_pc as i64,
-                                );
-                                let result_fv: super::flow::FlowValue = result_value.into();
-                                current_state.stack.push(result_fv.clone());
-                                emit_pushvalue_ref!(
-                                    current_depth,
-                                    loaded_dst_reg,
-                                    result_fv,
-                                    py_pc
-                                );
-                            }
+                                "load_build_class"
+                            };
+                            let loaded_dst_reg = stack_base + current_depth;
+                            let result_value = emit_frontend_frame_only_ref(
+                                &mut graph,
+                                &current_block.block(),
+                                opname,
+                                frame_var.into(),
+                                py_pc as i64,
+                            );
+                            let result_fv: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(result_fv.clone());
+                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_fv, py_pc);
                         }
 
                         // FormatSimple: pops value, pushes str(value). Net 0.
@@ -16632,6 +16576,71 @@ mod tests {
                 _ => None,
             })
             .expect("expected nested function code object")
+    }
+
+    #[test]
+    fn non_portal_frame_loads_keep_their_receiver_after_lowering() {
+        use pyre_interpreter::bytecode::{CodeUnit, CodeUnits, OpArgByte};
+        for instruction in [Instruction::LoadLocals, Instruction::LoadBuildClass] {
+            let mut code = first_nested_function_code("def f():\n    return None\n");
+            code.instructions = CodeUnits::from([
+                CodeUnit::new(instruction, OpArgByte::new(0)),
+                CodeUnit::new(Instruction::ReturnValue, OpArgByte::new(0)),
+            ]);
+            let w_code = pyre_interpreter::box_code_constant(&code);
+            let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code) as *const CodeObject) };
+            let writer = CodeWriter::new();
+            // No setup_jitdriver: this is a callee graph that still declares
+            // frame/ec inputs, not a portal registration.
+            let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
+            assert!(pyjit.jitcode.jitdriver_sd().is_none());
+            assert!(
+                !pyjit.has_abort,
+                "{instruction:?} must use the callee frame"
+            );
+            assert_ne!(pyjit.metadata.portal_frame_reg, u16::MAX);
+            let calls: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+                .filter(|op| op.key == "residual_call_r_r/iRd>r")
+                .collect();
+            assert!(!calls.is_empty(), "the frame method must survive lowering");
+            // R-list follows the function Int register in this opcode. Each
+            // frame method takes precisely the graph's own frame red.
+            assert!(
+                calls.iter().any(|op| {
+                    let code = &pyjit.jitcode.code;
+                    code[op.pc + 2] == 1
+                        && code[op.pc + 3] as u16 == pyjit.metadata.portal_frame_reg
+                }),
+                "the residual must read this callee's frame register"
+            );
+        }
+    }
+
+    #[test]
+    fn non_portal_load_global_residual_reads_this_graph_frame() {
+        let code = first_nested_function_code("def f():\n    return x\n");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code) as *const CodeObject) };
+        let writer = CodeWriter::new();
+        let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
+        assert!(pyjit.jitcode.jitdriver_sd().is_none());
+        assert!(!pyjit.has_abort);
+        assert_ne!(pyjit.metadata.portal_frame_reg, u16::MAX);
+        let calls: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .filter(|op| op.key.contains("residual_call"))
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "a non-foldable global must stay a residual"
+        );
+        assert!(
+            calls.iter().any(|op| {
+                let code = &pyjit.jitcode.code;
+                (op.pc + 3..op.pc + 8)
+                    .any(|i| code.get(i).copied() == Some(pyjit.metadata.portal_frame_reg as u8))
+            }),
+            "the residual must name this callee's frame register"
+        );
     }
 
     #[test]

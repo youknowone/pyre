@@ -102,6 +102,10 @@ pub struct MIFrame {
     /// that record no ENTER and must record no LEAVE. The merge-point cut is the
     /// sole `leave_portal_frame=False` site and re-emits LEAVE itself.
     pub portal_entered: bool,
+    /// True when the matching `portal_trace_positions` open entry was
+    /// recorded. Leave must push a close only then, or find_biggest_function
+    /// sees an unmatched close.
+    pub portal_trace_logged: bool,
     /// \[FR\] The jd_index carried in this frame's `LEAVE_PORTAL_FRAME` op, set at
     /// the same push that set `portal_entered`. Unused when `portal_entered` is
     /// false.
@@ -185,6 +189,7 @@ impl MIFrame {
             inline_frame: false,
             portal_scalar_state: None,
             portal_entered: false,
+            portal_trace_logged: false,
             portal_jd: 0,
             return_i: None,
             return_r: None,
@@ -293,6 +298,7 @@ impl MIFrame {
         self.inline_frame = false;
         self.portal_scalar_state = None;
         self.portal_entered = false;
+        self.portal_trace_logged = false;
         self.portal_jd = 0;
         self.return_i = None;
         self.return_r = None;

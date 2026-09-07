@@ -1044,6 +1044,13 @@ pub trait JitCodeRuntime {
         None
     }
 
+    /// pyjitpl.py `is_main_jitcode` for a recursive portal this runtime
+    /// is about to inline. Default false so fixture runtimes that never
+    /// overflow keep an empty log.
+    fn is_main_portal(&self, _jd_index: usize) -> bool {
+        false
+    }
+
     /// Resolve the CALL_ASSEMBLER target for a `BC_RECURSIVE_CALL_*`
     /// opcode whose inline decision came back `CallAssembler`
     /// (pyjitpl.py → `do_recursive_call(assembler_call=True)`).  The
@@ -1371,6 +1378,10 @@ where
         reds: &[Value],
     ) -> Option<()> {
         (self.recursive_exec_void)(token, reds)
+    }
+
+    fn is_main_portal(&self, _jd_index: usize) -> bool {
+        true
     }
 }
 
@@ -2740,6 +2751,9 @@ where
             if frame.portal_entered {
                 let jd_box = ctx.const_int(frame.portal_jd as i64);
                 ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
+                if frame.portal_trace_logged {
+                    ctx.push_portal_trace_event(frame.portal_jd, None, ctx.get_trace_position());
+                }
             }
             let portal_scalar_state = frame.portal_scalar_state.take();
             self.frames.recycle_frame(frame);
@@ -3374,34 +3388,18 @@ where
             let jd_box = ctx.const_int(jd_index as i64);
             let uid_box = ctx.const_int(green_pc as i64);
             ctx.record_op(OpCode::EnterPortalFrame, &[jd_box, uid_box]);
-            // `newframe` records ENTER_PORTAL_FRAME and appends a
-            // `portal_trace_positions` entry on adjacent lines; this arm does
-            // only the first half.  `push_portal_trace_position` lives on
-            // `MetaInterp`, and a `JitCodeMachine` reaches its host only
-            // through the `Runtime` trait, which carries no channel to it.
-            // Both LEAVE pops (`pop_exception_frame` and the finished-frame
-            // pop in `run_one_step`) omit the closing entry symmetrically, so
-            // the log stays BALANCED — `find_biggest_function` pairs entries
-            // off a stack, and dropping one half alone would mis-size every
-            // frame after it.  What the omission costs is that a
-            // `TraceTooLong` taken inside an inlined portal finds no candidate
-            // to disable and falls to `prepare_trace_segmenting`.
-            //
-            // A defaulted `Runtime` hook would not close this: the trait's
-            // `begin_portal_op` / `commit_portal_op` / `abort_portal_op` seams
-            // already have no implementor anywhere in the workspace, so a
-            // fourth would leave every runtime's log as empty as it is now.
-            // The entry has to come from a host that owns the `MetaInterp`,
-            // and pyre's walker is such a host: `note_inline_subwalk_start`
-            // (`pyre-jit-trace/src/state.rs`, called from `inline_call.rs`)
-            // reaches the driver through `try_driver_pair()` and calls
-            // `push_portal_trace_position`, while the too-long handler beside
-            // it reads the result back through `find_biggest_function` before
-            // retiring the log.  So the omission does NOT mean the log is
-            // empty wherever a recursive portal overflows — on the walker path
-            // it is filled and consumed.  What this arm leaves out is confined
-            // to runtimes that inline through HERE, which in this workspace is
-            // the `dispatch.rs` fixtures alone.
+            // pyjitpl.py `newframe`: ENTER_PORTAL_FRAME and the
+            // `portal_trace_positions` append sit on adjacent lines.
+            // The machine cannot reach MetaInterp, so the log half
+            // lives on TraceCtx and `find_biggest_function` reads both.
+            if runtime.is_main_portal(jd_index) {
+                ctx.push_portal_trace_event(
+                    jd_index,
+                    Some((green_pc as u64, None)),
+                    ctx.get_trace_position(),
+                );
+                portal_frame.portal_trace_logged = true;
+            }
             portal_frame.inline_frame = true;
             // pyjitpl.py:2461-2492 pairing: this push recorded ENTER_PORTAL_FRAME,
             // so the frame's normal-return / exception-return pop records the
@@ -3791,6 +3789,13 @@ where
             if finished_frame.portal_entered {
                 let jd_box = ctx.const_int(finished_frame.portal_jd as i64);
                 ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
+                if finished_frame.portal_trace_logged {
+                    ctx.push_portal_trace_event(
+                        finished_frame.portal_jd,
+                        None,
+                        ctx.get_trace_position(),
+                    );
+                }
             }
             // [FR] Restore the caller's sym scalar/fixed-array state that this
             // inline recursive-portal frame overwrote.
@@ -6516,6 +6521,15 @@ where
                         let mut popped = self.frames.pop().expect("recursive-cut: framestack < 2");
                         if popped.inline_frame {
                             ctx.pop_inline_frame();
+                        }
+                        // popframe still appends the log close when greenkey
+                        // is set, even with leave_portal_frame=False.
+                        if popped.portal_trace_logged {
+                            ctx.push_portal_trace_event(
+                                popped.portal_jd,
+                                None,
+                                ctx.get_trace_position(),
+                            );
                         }
                         if let Some(snapshot) = popped.portal_scalar_state.take() {
                             sym.restore_inline_scalar_state(snapshot);
@@ -12010,6 +12024,10 @@ mod tests {
         fn portal_jitcode(&self, _jd_index: usize) -> Option<std::sync::Arc<JitCode>> {
             Some(self.portal.clone())
         }
+
+        fn is_main_portal(&self, _jd_index: usize) -> bool {
+            true
+        }
     }
 
     /// recursive-call SLICE 0 — a `BC_RECURSIVE_CALL_INT` whose runtime inlines the
@@ -12683,6 +12701,10 @@ mod tests {
 
         fn portal_jitcode(&self, _jd_index: usize) -> Option<std::sync::Arc<JitCode>> {
             Some(self.portal.clone())
+        }
+
+        fn is_main_portal(&self, _jd_index: usize) -> bool {
+            true
         }
 
         fn recursive_call_assembler_target(

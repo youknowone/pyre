@@ -270,6 +270,15 @@ pub struct TraceCtx {
     /// doing tuple-equality comparisons in [`recursive_depth`] and
     /// [`is_tracing_key`].
     pub(crate) inline_frames: Vec<(usize, usize)>,
+    /// `portal_trace_positions` entries recorded by `JitCodeMachine`
+    /// while it cannot reach `MetaInterp`. `find_biggest_function`
+    /// walks these after the MetaInterp log. Retired together with
+    /// `MetaInterp.portal_trace_positions`.
+    pub(crate) portal_trace_events: Vec<(
+        usize,
+        Option<crate::pyjitpl::PortalGreenKey>,
+        crate::recorder::TracePosition,
+    )>,
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
@@ -875,6 +884,21 @@ impl TraceCtx {
     /// Mutable access to the tracing-time heap cache.
     pub fn heap_cache_mut(&mut self) -> &mut HeapCache {
         &mut self.heap_cache
+    }
+
+    /// pyjitpl.py `newframe` / `popframe` log half for a JitCodeMachine
+    /// that cannot reach `MetaInterp.portal_trace_positions`.
+    pub fn push_portal_trace_event(
+        &mut self,
+        jd_no: usize,
+        green_key: Option<crate::pyjitpl::PortalGreenKey>,
+        pos: crate::recorder::TracePosition,
+    ) {
+        self.portal_trace_events.push((jd_no, green_key, pos));
+    }
+
+    pub fn clear_portal_trace_events(&mut self) {
+        self.portal_trace_events.clear();
     }
 
     /// Install the `self.metainterp.cpu` analog for the cache-hit
@@ -1738,6 +1762,7 @@ impl TraceCtx {
             green_key_raw: (0, 0),
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
+            portal_trace_events: Vec::new(),
             green_key_values: None,
             driver_descriptor: None,
             virtualizable_boxes: None,
@@ -1836,6 +1861,7 @@ impl TraceCtx {
             green_key_raw: (0, 0),
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
+            portal_trace_events: Vec::new(),
             green_key_values: Some(green_key_values),
             driver_descriptor: None,
             virtualizable_boxes: None,
@@ -2496,6 +2522,13 @@ impl TraceCtx {
     /// Attach declarative JitDriver metadata to the active trace.
     pub fn set_driver_descriptor(&mut self, descriptor: JitDriverStaticData) {
         self.driver_descriptor = Some(descriptor);
+    }
+
+    /// pyjitpl.py `initialize_withgreenfields`: the single red that owns
+    /// the green fields is the whole virtualizable box list.
+    pub fn set_greenfield_virtualizable_box(&mut self, box_ref: OpRef, value: Value) {
+        self.virtualizable_boxes = Some(vec![box_ref]);
+        self.virtualizable_values = Some(vec![value]);
     }
 
     /// Initialize standard virtualizable boxes from input args.

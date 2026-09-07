@@ -6234,7 +6234,7 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py: `self.portal_trace_positions = None` marks the
         // abort boundary so post-abort consumers (e.g. test inspections
         // at pyjitpl.py:3547) can detect a terminated trace session.
-        self.portal_trace_positions = None;
+        self.retire_portal_trace_positions();
         if let Some((huge_fn_jd_no, huge_fn_key)) = huge_fn {
             // pyjitpl.py:2821-2822 `jd_sd.warmstate.disable_noninlinable_function(
             // greenkey_of_huge_function)` disables through `jd_sd.warmstate`,
@@ -14979,10 +14979,24 @@ impl<M: Clone> MetaInterp<M> {
         // greenkey-side JC_FORCE_FINISH (warmstate.py reads that flag at
         // loop entry, not bridge entry).
         let source_jct = majit_backend::descr_owning_jct(fail_descr);
+        // compile.py `ResumeGuardDescr._trace_and_compile_from_bridge`:
+        // jitdriver_sd is the source loop's outermost driver, including when
+        // this guard was recorded while inlining another recursive portal.
+        let source_jitdriver_index = source_jct
+            .as_ref()
+            .and_then(|token| token.outermost_jitdriver_index);
         self.force_finish_trace = source_jct.as_ref().is_some_and(|jct| {
             jct.retraced_count.get() & majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING != 0
         });
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, green_key, self.staticdata.clone());
+        if let Some(index) = source_jitdriver_index {
+            let descriptor = self
+                .staticdata
+                .jitdrivers_sd
+                .get(index)
+                .expect("bridge source token must name a registered jitdriver");
+            ctx.set_driver_descriptor(descriptor.clone());
+        }
         ctx.set_force_finish(self.force_finish_trace);
         // pyjitpl.py:929-947 `self.metainterp.cpu` analog — see
         // `setup_tracing` for the contract on raw-pointer lifetime
@@ -15000,12 +15014,13 @@ impl<M: Clone> MetaInterp<M> {
         ctx.callinfocollection = self.callinfocollection.clone();
         self.tracing = Some(ctx);
         self.arm_portal_trace_positions();
-        // pyjitpl.py `self.jitdriver_sd = jitdriver_sd`: bridges
-        // inherit the parent's driver. The bridge entry path does not
-        // thread `driver_descriptor`, so fall back to scanning for the
-        // vinfo-bearing slot — a no-op for single-portal pyre and the
-        // same shape `virtualizable_info()` already used.
-        self.active_jitdriver_sd = self.elect_active_jitdriver_sd(None);
+        // pyjitpl.py `MetaInterp.__init__` binds the driver passed by the
+        // bridge caller. The source guard's token retains that identity even
+        // after the warm cell has been redirected to a newer loop token.
+        // Descriptor-less host fixtures retain their implicit-driver entry;
+        // a registered source driver never falls back to a sibling's vinfo.
+        self.active_jitdriver_sd =
+            source_jitdriver_index.or_else(|| self.elect_active_jitdriver_sd(None));
 
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
@@ -15800,11 +15815,9 @@ impl<M: Clone> MetaInterp<M> {
     /// ```
     ///
     /// Resets `framestack` to empty, pushes the portal `mainjitcode`
-    /// frame, and seeds it with the original argboxes.  Other branches
-    /// of the upstream method (`initialize_withgreenfields`,
-    /// `initialize_virtualizable`) live behind pyre's portal-runner
-    /// shim and are not yet wired through this entry — they remain
-    /// driven by the existing per-driver setup paths.
+    /// frame, and seeds it with the original argboxes. Then runs
+    /// `initialize_withgreenfields` and, when a trace is live,
+    /// `initialize_virtualizable` — the same tail as pyjitpl.py.
     pub fn initialize_state_from_start(
         &mut self,
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
@@ -15823,6 +15836,64 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py `self.virtualref_boxes = []` is implicit: the
         // backing vector lives on `TraceCtx`, which is fresh for every
         // `MetaInterp::setup_tracing` cycle.
+        self.initialize_withgreenfields(original_boxes);
+        let live: Vec<majit_ir::Value> = original_boxes
+            .iter()
+            .map(|(kind, _, concrete)| match kind {
+                crate::jitcode::JitArgKind::Int => majit_ir::Value::Int(*concrete),
+                crate::jitcode::JitArgKind::Ref => {
+                    majit_ir::Value::Ref(majit_ir::GcRef(*concrete as usize))
+                }
+                crate::jitcode::JitArgKind::Float => {
+                    majit_ir::Value::Float(f64::from_bits(*concrete as u64))
+                }
+            })
+            .collect();
+        if let Some(mut ctx) = self.tracing.take() {
+            self.initialize_virtualizable(&mut ctx, &live);
+            self.tracing = Some(ctx);
+        }
+    }
+
+    /// pyjitpl.py `MetaInterp.initialize_withgreenfields(original_boxes)`.
+    pub(crate) fn initialize_withgreenfields(
+        &mut self,
+        original_boxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
+    ) {
+        let Some(idx) = self.active_jitdriver_sd else {
+            return;
+        };
+        let (num_greens, red_index, has_vinfo) = {
+            let Some(jd) = self.staticdata.jitdrivers_sd.get(idx) else {
+                return;
+            };
+            let Some(ginfo) = jd.greenfield_info.as_ref() else {
+                return;
+            };
+            (
+                jd.num_greens(),
+                ginfo.red_index,
+                jd.virtualizable_info.is_some(),
+            )
+        };
+        debug_assert!(!has_vinfo, "greenfield + virtualizable on the same driver");
+        let index = num_greens + red_index;
+        let Some((kind, opref, concrete)) = original_boxes.get(index) else {
+            return;
+        };
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        let value = match kind {
+            crate::jitcode::JitArgKind::Int => majit_ir::Value::Int(*concrete),
+            crate::jitcode::JitArgKind::Ref => {
+                majit_ir::Value::Ref(majit_ir::GcRef(*concrete as usize))
+            }
+            crate::jitcode::JitArgKind::Float => {
+                majit_ir::Value::Float(f64::from_bits(*concrete as u64))
+            }
+        };
+        ctx.set_greenfield_virtualizable_box(*opref, value);
     }
 
     /// pyjitpl.py `MetaInterp.rebuild_state_after_failure` —
@@ -16567,39 +16638,46 @@ impl<M: Clone> MetaInterp<M> {
     /// falls through to `prepare_trace_segmenting`.
     pub fn find_biggest_function(&self) -> Option<(usize, PortalGreenKey)> {
         let positions = self.portal_trace_positions.as_ref()?;
+        let machine_events = self
+            .tracing
+            .as_ref()
+            .map(|ctx| ctx.portal_trace_events.as_slice())
+            .unwrap_or(&[]);
         let mut start_stack: Vec<(usize, PortalGreenKey, usize)> = Vec::new();
-        let mut max_size = 0usize;
+        let mut max_size = 0isize;
         let mut max_key = None;
-        for (jd_no, key, pos) in positions.iter().cloned() {
+        for (jd_no, key, pos) in positions
+            .iter()
+            .cloned()
+            .chain(machine_events.iter().cloned())
+        {
             match key {
                 // pyjitpl.py:3547-3548 `if key is not None: start_stack.append`.
                 Some(key) => start_stack.push((jd_no, key, pos._pos)),
-                // pyjitpl.py:3549-3559 the closing entry sizes the frame it
-                // closes. An unmatched close cannot happen while `newframe` /
-                // `popframe` are the only writers, so it is left to `pop`'s
-                // `None` rather than given a recovery path.
+                // pyjitpl.py `MetaInterp.find_biggest_function`: an unmatched
+                // close is an invalid frame stack, not an empty candidate.
                 None => {
-                    if let Some((jd_no, green_key, start_pos)) = start_stack.pop() {
-                        let size = pos._pos.saturating_sub(start_pos);
-                        if size > max_size {
-                            max_size = size;
-                            max_key = Some((jd_no, green_key));
-                        }
+                    let (start_jd_no, green_key, start_pos) = start_stack
+                        .pop()
+                        .expect("portal trace close without an opening frame");
+                    let size = pos._pos as isize - start_pos as isize;
+                    if size > max_size {
+                        max_size = size;
+                        max_key = Some((start_jd_no, green_key));
                     }
                 }
             }
         }
-        // pyjitpl.py `if start_stack:` — one frame, the outermost,
-        // measured against where the trace stopped.  Upstream reads
-        // `self.history` there unconditionally; pyre's recorder is an `Option`,
-        // and a `?` on it would return `None` for the whole function and throw
-        // away a `max_key` the closed frames above already produced.  Only the
-        // open frame is unmeasurable without a recorder, so only it is skipped.
-        if let Some((jd_no, green_key, start_pos)) = start_stack.first().cloned()
-            && let Some(tracing) = self.tracing.as_ref()
-        {
+        // pyjitpl.py `MetaInterp.find_biggest_function` measures the outermost
+        // open frame against the live history unconditionally.
+        if let Some((jd_no, green_key, start_pos)) = start_stack.first().cloned() {
+            let tracing = self
+                .tracing
+                .as_ref()
+                .expect("an open portal trace frame requires its live history");
             let current = tracing.get_trace_position()._pos;
-            if current.saturating_sub(start_pos) > max_size {
+            let size = current as isize - start_pos as isize;
+            if size > max_size {
                 max_key = Some((jd_no, green_key));
             }
         }
@@ -16617,6 +16695,17 @@ impl<M: Clone> MetaInterp<M> {
     /// rest of the process after the first overflow.
     fn arm_portal_trace_positions(&mut self) {
         self.portal_trace_positions = Some(Vec::new());
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.clear_portal_trace_events();
+        }
+    }
+
+    /// pyjitpl.py `self.portal_trace_positions = None`.
+    pub fn retire_portal_trace_positions(&mut self) {
+        self.portal_trace_positions = None;
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.clear_portal_trace_events();
+        }
     }
 
     /// pyjitpl.py `MetaInterp.is_main_jitcode(jitcode)`.
@@ -16631,7 +16720,7 @@ impl<M: Clone> MetaInterp<M> {
     /// upstream's `jitcode.jitdriver_sd.jitdriver.is_recursive`. Falls
     /// back to `false` when the jitcode does not point at a registered
     /// driver slot — matches the `jitdriver_sd is not None` guard.
-    pub fn is_main_jitcode(&self, jitcode: &crate::jitcode::JitCode) -> bool {
+    pub fn is_main_jitcode(&self, jitcode: &crate::jitcode::CanonicalJitCode) -> bool {
         match jitcode.jitdriver_sd() {
             Some(idx) => self
                 .staticdata
@@ -16641,23 +16730,6 @@ impl<M: Clone> MetaInterp<M> {
                 .unwrap_or(false),
             None => false,
         }
-    }
-
-    /// The driver [`Self::is_main_jitcode`] would answer `true` for, named
-    /// without a jitcode.
-    ///
-    /// `newframe` reaches the log through a `JitCode`, which every caller
-    /// building an `MIFrame` has.  A tracer that inlines a callee WITHOUT
-    /// building one — pyre's FBW walker walks the callee body directly — has
-    /// the same question to answer and no jitcode to answer it with, so the
-    /// predicate is offered here in its jitcode-free form: the index of the
-    /// recursive portal driver. `None` when none is registered, which is the
-    /// `is_main_jitcode` = false case and must equally leave the log alone.
-    pub fn main_jitdriver_index(&self) -> Option<usize> {
-        self.staticdata
-            .jitdrivers_sd
-            .iter()
-            .position(|jd| jd.is_recursive)
     }
 
     /// Append one `portal_trace_positions` entry, `newframe`'s
@@ -16720,9 +16792,10 @@ impl<M: Clone> MetaInterp<M> {
             self.portal_call_depth += 1;
             // pyjitpl.py:2435: self.call_ids.append(self.current_call_id)
             self.call_ids.push(self.current_call_id);
-            // pyjitpl.py: enter_portal_frame(jitdriver_sd.index, unique_id)
-            if let Some((unique_id, _)) = greenkey.as_ref() {
-                self.enter_portal_frame(jd_no, *unique_id);
+            // pyjitpl.py: unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)
+            //             enter_portal_frame(jitdriver_sd.index, unique_id)
+            if let Some(gk) = greenkey.as_ref() {
+                self.enter_portal_frame(jd_no, self.unique_id_for_greenkey(jd_no, gk));
             }
             // pyjitpl.py:2442: self.current_call_id += 1
             self.current_call_id += 1;
@@ -16756,6 +16829,24 @@ impl<M: Clone> MetaInterp<M> {
         };
         self.framestack.push(frame);
         self.framestack.len() - 1
+    }
+
+    /// warmstate.py `WarmEnterState.get_unique_id(greenkey)`.
+    ///
+    /// The typed greens go to the driver's hook when both are present.
+    /// A missing hook or a hash-only key keeps the previous unique id,
+    /// the greenkey hash `newframe` used to record verbatim.
+    pub fn unique_id_for_greenkey(&self, jd_no: usize, greenkey: &PortalGreenKey) -> u64 {
+        if let Some(hook) = self
+            .staticdata
+            .jitdrivers_sd
+            .get(jd_no)
+            .and_then(|jd| jd.get_unique_id)
+            && let Some(typed) = greenkey.1.as_ref()
+        {
+            return hook(&typed.values) as u64;
+        }
+        greenkey.0
     }
 
     /// pyjitpl.py `MetaInterp.enter_portal_frame(jd_no, unique_id)`.
@@ -20891,6 +20982,7 @@ mod metainterp_static_data_tests {
             assembler_helper_adr: 0,
             vable_token_descr: None,
             frame_value_count_fn: None,
+            get_unique_id: None,
         };
         {
             let MetaInterp {
@@ -21066,6 +21158,30 @@ mod metainterp_static_data_tests {
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(7));
         // pyjitpl.py:3272 assert.
         assert_eq!(meta.portal_call_depth, 0);
+    }
+
+    #[test]
+    fn initialize_state_from_start_seeds_greenfield_virtualizable_box() {
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let mut jd =
+            crate::jitdriver::JitDriverStaticData::new(vec![], vec![("obj", majit_ir::Type::Ref)]);
+        jd.greenfield_info = Some(crate::greenfield::GreenFieldInfo::new(
+            0,
+            vec![("G".into(), "field".into())],
+        ));
+        let idx = meta.register_jitdriver_sd(jd);
+        meta.active_jitdriver_sd = Some(idx);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
+        let box_ref = OpRef::ref_op(3);
+        meta.initialize_withgreenfields(&[(JitArgKind::Ref, box_ref, 0xabc)]);
+        let boxes = meta
+            .trace_ctx()
+            .and_then(|ctx| ctx.collect_virtualizable_boxes())
+            .expect("greenfield box");
+        assert_eq!(boxes, vec![box_ref]);
     }
 
     #[test]
@@ -22971,55 +23087,66 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn main_jitdriver_index_answers_is_main_jitcode_without_a_jitcode() {
-        // The walker inlines a callee without building an `MIFrame`, so it asks
-        // the `is_main_jitcode` question through this accessor instead. The two
-        // must agree, or the walker would log frames upstream would not (or
-        // skip ones it would).
+    fn portal_log_uses_the_jitcode_owner_with_two_recursive_drivers() {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        assert_eq!(meta.main_jitdriver_index(), None);
-
-        // A non-recursive driver is not the main one, exactly as
-        // `is_main_jitcode` reads it.
-        let mut plain = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
-        plain.is_recursive = false;
-        let mut recursive = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
-        recursive.is_recursive = true;
-        let (plain_idx, recursive_idx) = {
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.is_recursive = true;
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.is_recursive = true;
+        let second_index = {
             let MetaInterp {
                 staticdata,
                 backend,
                 ..
             } = &mut meta;
             let sd = std::sync::Arc::get_mut(staticdata).unwrap();
-            let plain_idx = sd.register_jitdriver_sd(plain, backend);
-            let recursive_idx = sd.register_jitdriver_sd(recursive, backend);
-            (plain_idx, recursive_idx)
+            sd.register_jitdriver_sd(first, backend);
+            sd.register_jitdriver_sd(second, backend)
         };
-        assert_ne!(plain_idx, recursive_idx);
-        assert_eq!(meta.main_jitdriver_index(), Some(recursive_idx));
-
-        let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
-        jc.replace_jitdriver_sd(Some(plain_idx));
-        assert!(!meta.is_main_jitcode(&jc));
-        jc.replace_jitdriver_sd(Some(recursive_idx));
-        assert!(meta.is_main_jitcode(&jc));
+        assert_ne!(second_index, 0);
+        let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
+        jitcode.replace_jitdriver_sd(Some(second_index));
+        assert!(meta.is_main_jitcode(&jitcode));
+        start_tracing(&mut meta);
+        meta.newframe(std::sync::Arc::new(jitcode), Some((0xa11, None)));
+        record_ops(&mut meta, 5);
+        meta.popframe(true);
+        assert_eq!(
+            meta.find_biggest_function(),
+            Some((second_index, (0xa11, None)))
+        );
     }
 
     #[test]
     fn push_portal_trace_position_pairs_are_sized_by_find_biggest_function() {
         // The walker's two calls land as one balanced start/end pair, which is
         // the shape `find_biggest_function` walks. A retired log drops both.
-        let (mut meta, _jc) = meta_with_recursive_portal();
+        let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
-        let jd_no = meta.main_jitdriver_index().expect("recursive portal");
+        let jd_no = jc.jitdriver_sd().expect("recursive portal");
         let start = meta.trace_ctx().expect("tracing").get_trace_position();
         meta.push_portal_trace_position(jd_no, Some((0xBEEF, None)), start);
         record_ops(&mut meta, 5);
         let end = meta.trace_ctx().expect("tracing").get_trace_position();
         meta.push_portal_trace_position(jd_no, None, end);
         assert_eq!(meta.find_biggest_function(), Some((jd_no, (0xBEEF, None))));
+
+        // JitCodeMachine records the same pairs on TraceCtx; the walker
+        // of find_biggest_function concatenates both logs.
+        meta.portal_trace_positions = Some(Vec::new());
+        let start = meta.trace_ctx().expect("tracing").get_trace_position();
+        meta.tracing
+            .as_mut()
+            .unwrap()
+            .push_portal_trace_event(jd_no, Some((0xCAFE, None)), start);
+        record_ops(&mut meta, 3);
+        let end = meta.trace_ctx().expect("tracing").get_trace_position();
+        meta.tracing
+            .as_mut()
+            .unwrap()
+            .push_portal_trace_event(jd_no, None, end);
+        assert_eq!(meta.find_biggest_function(), Some((jd_no, (0xCAFE, None))));
 
         // pyjitpl.py `self.portal_trace_positions = None` — after the
         // abort boundary nothing is logged and nothing is found.
@@ -23056,6 +23183,36 @@ mod metainterp_static_data_tests {
             .constants_get_value(op.arg(1).to_opref())
             .expect("unique_id constant");
         assert_eq!(jd_no, majit_ir::Value::Int(3));
+        assert_eq!(unique_id, majit_ir::Value::Int(0xfeed));
+    }
+
+    #[test]
+    fn newframe_records_unique_id_from_the_driver_hook() {
+        // warmstate.py get_unique_id(greenkey) unwraps the greens; the hash
+        // is not the unique id.
+        fn hook(greens: &[i64]) -> i64 {
+            assert_eq!(greens, &[1, 0, 0xabc]);
+            0xfeed
+        }
+        let (mut meta, jc) = meta_with_recursive_portal();
+        let jd_no = jc.jitdriver_sd().expect("recursive portal");
+        std::sync::Arc::get_mut(&mut meta.staticdata)
+            .unwrap()
+            .jitdrivers_sd[jd_no]
+            .get_unique_id = Some(hook);
+        start_tracing(&mut meta);
+        let typed = majit_ir::GreenKey::new(vec![1, 0, 0xabc]);
+        meta.newframe(jc, Some((0xbadd, Some(typed))));
+        let ctx = meta.trace_ctx().expect("tracing");
+        let op = ctx
+            .recorder
+            .ops()
+            .iter()
+            .find(|op| op.opcode == OpCode::EnterPortalFrame)
+            .expect("EnterPortalFrame");
+        let unique_id = ctx
+            .constants_get_value(op.arg(1).to_opref())
+            .expect("unique_id");
         assert_eq!(unique_id, majit_ir::Value::Int(0xfeed));
     }
 
@@ -23349,11 +23506,10 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn find_biggest_function_keeps_a_closed_frame_when_the_recorder_is_gone() {
-        // pyjitpl.py:3560-3570 reads `self.history` unconditionally, so a
-        // closed frame's size always survives to the return. pyre's recorder is
-        // an `Option`: an unmatched open entry plus `tracing = None` must skip
-        // only the open frame's measurement, not discard `max_key`.
+    #[should_panic(expected = "an open portal trace frame requires its live history")]
+    fn find_biggest_function_requires_history_for_an_open_frame() {
+        // pyjitpl.py `MetaInterp.find_biggest_function` cannot measure an
+        // open frame after its recorder has been discarded.
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
@@ -23367,11 +23523,17 @@ mod metainterp_static_data_tests {
         // Left open, and the recorder retired under it.
         meta.tracing = None;
 
-        assert_eq!(
-            meta.find_biggest_function(),
-            Some((0, (0xa11, None))),
-            "the closed frame's size survives a missing recorder"
-        );
+        meta.find_biggest_function();
+    }
+
+    #[test]
+    #[should_panic(expected = "portal trace close without an opening frame")]
+    fn find_biggest_function_rejects_an_unmatched_close() {
+        let (mut meta, _) = meta_with_recursive_portal();
+        start_tracing(&mut meta);
+        let pos = meta.trace_ctx().unwrap().get_trace_position();
+        meta.push_portal_trace_position(0, None, pos);
+        meta.find_biggest_function();
     }
 
     #[test]
@@ -23382,72 +23544,6 @@ mod metainterp_static_data_tests {
         start_tracing(&mut meta);
         record_ops(&mut meta, 5);
         assert_eq!(meta.find_biggest_function(), None);
-    }
-
-    /// pyjitpl.py:2817-2831 runs the too-long bookkeeping once per abort: the
-    /// reason travels on the `SwitchToBlackhole` instance and the `_interpret`
-    /// catch never re-enters the check that raised it.  This pins what a second
-    /// entry costs, because pyre reaches the same handler through a
-    /// `DispatchError` that carries no reason and so had a path back into it.
-    ///
-    /// The first run names the oversized callee and disables just that callee,
-    /// deliberately leaving the root un-marked so it can retrace without it.
-    /// It also retires the log it read, so a second run can name nothing and
-    /// takes `prepare_trace_segmenting` instead — which stamps the root with
-    /// `JC_FORCE_FINISH` + `JC_DONT_TRACE_HERE`, neither of which is ever
-    /// cleared.  The callee's size is what overflowed the trace; the root pays
-    /// for it permanently.
-    #[test]
-    fn a_second_too_long_run_segments_a_root_the_first_one_spared() {
-        // `start_tracing` opens the loop header this walk is rooted at, and
-        // its green key is the one the segmenting arm would mark.
-        const ROOT: u64 = 0;
-        const CALLEE: u64 = 0xa11;
-
-        let (mut meta, jc) = meta_with_recursive_portal();
-        start_tracing(&mut meta);
-        // One inlined callee, sized by the ops recorded between its entries.
-        meta.perform_call(jc, &[], Some((CALLEE, None)))
-            .unwrap_err();
-        record_ops(&mut meta, 5);
-        meta.popframe(true);
-        meta.tracing
-            .as_mut()
-            .expect("tracing is Some")
-            .set_trace_limit(0);
-
-        assert_eq!(
-            meta.blackhole_if_trace_too_long(),
-            Some(AbortReason::TooLong)
-        );
-        assert!(
-            !meta.warm_state_mut().can_inline_callable(CALLEE),
-            "the named callee is the one that gets disabled"
-        );
-        assert!(
-            !meta.warm_state_mut().should_force_finish_tracing(ROOT),
-            "the root is only asked to retrace, so it must not be force-finished"
-        );
-        assert!(
-            meta.warm_state_mut().can_inline_callable(ROOT),
-            "the root is only asked to retrace, so it must stay inlinable"
-        );
-
-        // Exactly what a second entry sees: the same over-budget trace, and a
-        // log this abort already retired.
-        assert_eq!(meta.find_biggest_function(), None);
-        assert_eq!(
-            meta.blackhole_if_trace_too_long(),
-            Some(AbortReason::TooLong)
-        );
-        assert!(
-            meta.warm_state_mut().should_force_finish_tracing(ROOT),
-            "a second run has no callee to name and segments the root instead"
-        );
-        assert!(
-            !meta.warm_state_mut().can_inline_callable(ROOT),
-            "and stamps it dont-trace-here, which nothing clears"
-        );
     }
 
     #[test]
@@ -25355,6 +25451,7 @@ mod tests {
     ) {
         meta.backend.set_constants_pool(constants_typed.clone());
         let mut token = JitCellToken::new(green_key + 1000);
+        token.outermost_jitdriver_index = meta.active_jitdriver_sd;
         let trace_id = meta.alloc_trace_id();
         meta.backend.set_next_trace_id(trace_id);
         meta.backend
@@ -25408,6 +25505,7 @@ mod tests {
         );
 
         let token_arc = std::sync::Arc::new(token);
+        compile::wire_clt_loop_token_wref(&token_arc);
         // Mirror production attach: warmstate.py:339-348
         // `attach_procedure_to_interp` writes `cell.loop_token` so the
         // green_key → token canonical lookup (warmstate.py:188-202) is
@@ -25634,6 +25732,12 @@ mod tests {
     fn test_start_retrace_from_guard_uses_previous_token_backend_resume_data() {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
+        let first_driver = meta
+            .register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
+        let source_driver = meta
+            .register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
+        assert_ne!(first_driver, source_driver);
+        meta.active_jitdriver_sd = Some(source_driver);
         let green_key = 89;
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(
@@ -25672,6 +25776,13 @@ mod tests {
                 .get(&fail_index)
                 .and_then(|layout| layout.descr.clone())
                 .expect("test fixture guard should carry a ResumeGuardDescr");
+            // compile.py `record_loop_or_bridge` installs this on each
+            // ResumeDescr after backend compilation.
+            let source_token = entry.token.upgrade().expect("live source token");
+            descr_arc
+                .as_fail_descr()
+                .unwrap()
+                .set_rd_loop_token_clt(source_token.compiled_loop_token_expect());
             (trace_id, fail_index, descr_arc)
         };
 
@@ -25696,6 +25807,7 @@ mod tests {
                 vec![],
             );
             let mut fresh_token = JitCellToken::new(9004);
+            fresh_token.outermost_jitdriver_index = Some(first_driver);
             fresh_token.green_key = std::cell::Cell::new(green_key);
             let fresh_arc = std::sync::Arc::new(fresh_token);
             let old_token =
@@ -25710,11 +25822,21 @@ mod tests {
             fresh_arc
         };
 
+        // Neither the most recent trace nor the replacement token owns this
+        // guard. Its original token must supply the bridge's driver.
+        meta.active_jitdriver_sd = Some(first_driver);
         let retrace = meta
             .start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, &[42])
             .expect("retrace should use previous token backend resume data");
 
         assert_eq!(retrace.fail_types, vec![Type::Int]);
+        assert_eq!(meta.active_jitdriver_sd, Some(source_driver));
+        assert_eq!(
+            meta.trace_ctx()
+                .and_then(|ctx| ctx.driver_descriptor())
+                .and_then(|descriptor| descriptor.index),
+            Some(source_driver),
+        );
         let storage = retrace
             .storage
             .as_ref()

@@ -3758,9 +3758,9 @@ pub fn walk<Sym: WalkSym>(
         // `note_root_trace_too_long` performs it instead — the
         // `find_biggest_function` → `disable_noninlinable_function` half as well
         // as the loop and bridge arms `prepare_trace_segmenting` (pyjitpl.py)
-        // keeps apart — and stages `ABORT_TOO_LONG` so the abort handler takes
-        // the staged reason rather than running that bookkeeping a second time
-        // against the log this one has already retired.
+        // keeps apart. `DispatchError::TraceTooLong` becomes the explicit
+        // `TraceAction::SwitchToBlackhole(ABORT_TOO_LONG)` unwind, so the catch
+        // consumes the reason without running this decision again.
         //
         // `blackhole_if_trace_too_long` raises AFTER `run_one_step`, so the
         // forward image must carry `pc`, the already-advanced `next_pc`, rather

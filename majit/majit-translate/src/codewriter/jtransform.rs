@@ -783,7 +783,7 @@ fn reversed_comparison_binop(name: &str) -> &str {
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-fn autodetect_jit_markers_redvars(
+pub(crate) fn autodetect_jit_markers_redvars(
     graph: &FunctionGraph,
     greens: &[crate::flowspace::model::Variable],
     driver_roots: &[String],
