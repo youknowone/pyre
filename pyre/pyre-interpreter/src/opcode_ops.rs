@@ -256,13 +256,6 @@ pub fn compare_value_from_tag(
         };
         return Ok(w_bool_from(result));
     }
-    // IS_OP: tag 8 = `is`, tag 9 = `is not`. `space.is_w`, not raw pointer
-    // identity — same contract as `bh_compare_fn`. Infallible.
-    if op_tag == 8 || op_tag == 9 {
-        let same = crate::baseobjspace::is_w(a, b);
-        let result = if op_tag == 9 { !same } else { same };
-        return Ok(w_bool_from(result));
-    }
     let op = match op_tag {
         0 => CompareOp::Lt,
         1 => CompareOp::Le,
