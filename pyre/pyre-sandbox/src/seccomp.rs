@@ -324,6 +324,10 @@ pub fn install_runtime_filter() -> io::Result<()> {
         let t: libc::time_t = 0;
         let mut tm: libc::tm = core::mem::zeroed();
         libc::gmtime_r(&t, &mut tm);
+        // `gmtime_r` is UTC and does not load `/etc/localtime`. `localtime_r`
+        // and `mktime` do; rustpython_host_env's calendar helpers call them,
+        // and a first use after lockdown is an `openat` the filter refuses.
+        libc::localtime_r(&t, &mut tm);
     }
 
     // mimalloc defers its NUMA detection to the first thread it builds a TLD

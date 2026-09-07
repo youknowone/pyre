@@ -4,10 +4,12 @@
 //! shared `stat_result_type` helper is carried in here too; `init_posix`
 //! is renamed to `register_module`.
 
-use crate::importing::host::{fs as host_fs, os as host_os};
+#[cfg(not(feature = "sandbox"))]
+use crate::importing::host::fs as host_fs;
+use crate::importing::host::os as host_os;
+use parking_lot::Mutex;
 use pyre_object::PyObjectRef;
 use std::sync::LazyLock;
-use parking_lot::Mutex;
 // Under sandbox, name libc through the seam facade so any direct syscall call
 // in this module is a compile error (only types/constants/pure fns resolve).
 #[cfg(feature = "sandbox")]
@@ -1256,7 +1258,8 @@ mod win_nt {
             if path.is_fd {
                 host_nt::test_file_type_by_handle(host_nt::handle_from_fd(path.as_fd), tested, true)
             } else {
-                tested_wide(&path).is_some_and(|wide| host_nt::test_file_type_by_name(&wide, tested))
+                tested_wide(&path)
+                    .is_some_and(|wide| host_nt::test_file_type_by_name(&wide, tested))
             }
         };
         Ok(pyre_object::w_bool_from(result))
@@ -1715,9 +1718,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         /// `set_var` / `remove_var` panic on such a key rather than returning,
         /// so it is spelled here instead of reaching them.
         fn refused_by_host(name: &[u8]) -> Option<crate::PyError> {
-            (name.is_empty() || name.contains(&b'=')).then(|| {
-                crate::PyError::os_error_syscall(libc::EINVAL, pyre_object::PY_NULL)
-            })
+            (name.is_empty() || name.contains(&b'='))
+                .then(|| crate::PyError::os_error_syscall(libc::EINVAL, pyre_object::PY_NULL))
         }
         /// `win32_putenv` measures the whole `NAME=VALUE` entry it is about to
         /// hand the block and turns away one longer than `_MAX_ENV`, which is
@@ -4589,8 +4591,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let mut buf = crate::builtins::try_vec_zeroed(n)?;
                     // Report entropy failures: absorbing one would return
                     // predictable bytes.
-                    getrandom::fill(&mut buf)
-                        .map_err(|e| io_err(std::io::Error::from(e), ""))?;
+                    getrandom::fill(&mut buf).map_err(|e| io_err(std::io::Error::from(e), ""))?;
                     buf
                 };
                 // Route host entropy through the trusted controller instead of
@@ -4712,11 +4713,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             if rc == 0 { st.st_flags } else { 0 }
         }
     }
-    #[cfg(all(
-        target_os = "macos",
-        feature = "host_env",
-        not(feature = "sandbox")
-    ))]
+    #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
     fn macos_fd_st_flags(fd: i32) -> u32 {
         let fd = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
         rustpython_host_env::fileutils::fstat(fd)
@@ -5594,7 +5591,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// `argument_unavailable` (`interp_posix.py`) — a modifier this
     /// platform has no call to apply, named together with the entry point that
     /// was asked to apply it.
-    #[cfg(feature = "host_env")]
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
     fn argument_unavailable(funcname: &str, arg: &str) -> crate::PyError {
         crate::PyError::not_implemented(format!("{funcname}: {arg} unavailable on this platform"))
     }
@@ -5843,11 +5840,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
             }
         }
+        #[cfg(feature = "sandbox")]
+        {
+            let _ = (w_path, path, follow);
+            return Err(crate::host_seam::stub("posix.DirEntry"));
+        }
+        #[cfg(not(feature = "sandbox"))]
         let meta = if follow {
             host_fs::metadata(path_from_bytes(&path).as_ref())
         } else {
             host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
         };
+        #[cfg(not(feature = "sandbox"))]
         match meta {
             Ok(m) => {
                 let ft = m.file_type();
@@ -5940,7 +5944,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 win_stat_fields(&path, false).map_err(|e| fs_err_with_filename(e, w_path))?;
             return Ok(w_ino(fields.ino));
         }
-        #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
+        #[cfg(feature = "sandbox")]
+        {
+            let _ = (w_path, path);
+            return Err(crate::host_seam::stub("posix.DirEntry"));
+        }
+        #[cfg(not(any(feature = "sandbox", all(windows, feature = "host_env"))))]
         {
             let meta = host_fs::symlink_metadata(path_from_bytes(&path).as_ref())
                 .map_err(|e| fs_err_with_filename(e, w_path))?;
@@ -5991,7 +6000,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Err(e) => Err(fs_err_with_filename(e, w_path)),
             };
         }
-        #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
+        #[cfg(feature = "sandbox")]
+        {
+            let _ = (w_path, path, follow);
+            return Err(crate::host_seam::stub("posix.DirEntry"));
+        }
+        #[cfg(not(any(feature = "sandbox", all(windows, feature = "host_env"))))]
         {
             let meta = if follow {
                 host_fs::metadata(path_from_bytes(path).as_ref())
@@ -6227,8 +6241,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         self_obj: PyObjectRef,
         body: impl FnOnce(&mut W_ScandirIterator) -> R,
     ) -> Option<R> {
-        let _serialized = SCANDIR_IN_NEXT_SERIALIZER
-            .lock();
+        let _serialized = SCANDIR_IN_NEXT_SERIALIZER.lock();
         W_ScandirIterator::from_obj(self_obj).map(body)
     }
 
@@ -6559,7 +6572,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // No raw `readdir` to read the dirent from (wasm, the sandbox seam,
             // or a build without `host_env`), so `d_type` is unknown and
             // `is_dir` stats; the inode is still free from the dirent on unix.
-            #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+            #[cfg(feature = "sandbox")]
+            _ => {
+                return Err(crate::host_seam::stub("posix.scandir"));
+            }
+            #[cfg(all(
+                not(feature = "sandbox"),
+                not(all(any(unix, windows), feature = "host_env"))
+            ))]
             _ => {
                 let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
                     .map_err(|e| fs_err_with_filename(e, w_path()))?;
@@ -6979,7 +6999,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // both shadowed and counted twice through the star-import.
     // ── host_env::posix-backed real implementations (override the noop
     //    placeholders registered above) ───────────────────────────────
-    #[cfg(all(unix, feature = "host_env"))]
+    // `sandbox` implies `host_env`, but these bodies are real host syscalls.
+    // The sandbox overwrite below can only stub names it lists; keep the
+    // real implementations out of that build so a missed name cannot openat.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
         use rustpython_host_env::posix as host_posix;
 
@@ -7830,8 +7853,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         )?;
                     }
                     let blocked = crate::module::thread::before_external_block();
-                    let fork_serial = FORK_SERIALIZER
-                        .lock();
+                    let fork_serial = FORK_SERIALIZER.lock();
                     drop(blocked);
                     run_fork_callbacks("before");
                     // pypy/module/imp/moduledef.py:45-47 registers the import
@@ -7904,8 +7926,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         )?;
                     }
                     let blocked = crate::module::thread::before_external_block();
-                    let fork_serial = FORK_SERIALIZER
-                        .lock();
+                    let fork_serial = FORK_SERIALIZER.lock();
                     drop(blocked);
                     run_fork_callbacks("before");
                     let mut master_fd = -1;
@@ -8619,10 +8640,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 if result.is_ok() {
                     return Ok(());
                 }
-                let errno = result
-                    .unwrap_err()
-                    .raw_os_error()
-                    .unwrap_or(0);
+                let errno = result.unwrap_err().raw_os_error().unwrap_or(0);
                 crate::builtins::eintr_retry_with(std::io::Error::from_raw_os_error(errno), |e| {
                     wrap(e.raw_os_error().unwrap_or(0))
                 })?;
@@ -10171,11 +10189,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             not(feature = "sandbox")
         ))]
         {
-            #[cfg(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "musl")))]
+            #[cfg(all(
+                any(target_os = "linux", target_os = "freebsd"),
+                not(target_env = "musl")
+            ))]
             use rustpython_host_env::posix::PosixSpawnScheduler as SpawnScheduler;
-            #[cfg(not(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "musl"))))]
+            #[cfg(not(all(
+                any(target_os = "linux", target_os = "freebsd"),
+                not(target_env = "musl")
+            )))]
             type SpawnScheduler = ();
-
 
             fn build_posix_spawn(
                 args: &[pyre_object::PyObjectRef],
@@ -10290,7 +10313,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     resetids,
                     setsid,
                     setsigmask: setsigmask.as_deref(),
-                    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "musl")))]
+                    #[cfg(all(
+                        any(target_os = "linux", target_os = "freebsd"),
+                        not(target_env = "musl")
+                    ))]
                     scheduler: _scheduler,
                     spawnp,
                 };
@@ -10298,8 +10324,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let _blocked = crate::module::thread::before_external_block();
                     host_posix::posix_spawn(config)
                 };
-                let pid = result
-                    .map_err(|e| io_err_with_filename(e, path.w_path()))?;
+                let pid = result.map_err(|e| io_err_with_filename(e, path.w_path()))?;
                 Ok(pyre_object::w_int_new(pid as i64))
             }
             fn collect_spawn_env(
@@ -12044,17 +12069,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             use windows_sys::Win32::{
                 Foundation::{ERROR_INVALID_PARAMETER, GetLastError},
                 Storage::FileSystem::{
-                    CreateSymbolicLinkW, FILE_ATTRIBUTE_DIRECTORY,
-                    GetFileAttributesExW, GetFileExInfoStandard,
-                    SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+                    CreateSymbolicLinkW, FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesExW,
+                    GetFileExInfoStandard, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
                     SYMBOLIC_LINK_FLAG_DIRECTORY, WIN32_FILE_ATTRIBUTE_DATA,
                 },
             };
 
-            fn check_dir(
-                src: &widestring::WideCString,
-                dst: &widestring::WideCString,
-            ) -> bool {
+            fn check_dir(src: &widestring::WideCString, dst: &widestring::WideCString) -> bool {
                 let src = src.as_slice();
                 let dst = dst.as_slice();
                 let max_path = host_nt::MAX_PATH_USIZE;
@@ -12069,10 +12090,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .rposition(|&unit| unit == b'\\' as u16 || unit == b'/' as u16)
                     .unwrap_or(0);
                 let parent = &dst[..parent_len];
-                let absolute = src.first().is_some_and(|&unit| {
-                    unit == b'\\' as u16 || unit == b'/' as u16
-                }) || (src.first().is_some_and(|&unit| unit != 0)
-                    && src.get(1) == Some(&(b':' as u16)));
+                let absolute = src
+                    .first()
+                    .is_some_and(|&unit| unit == b'\\' as u16 || unit == b'/' as u16)
+                    || (src.first().is_some_and(|&unit| unit != 0)
+                        && src.get(1) == Some(&(b':' as u16)));
 
                 let mut resolved = Vec::with_capacity(max_path);
                 if absolute {
@@ -12171,7 +12193,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 let (wide_src, wide_dst) = (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);
                 win_symlink(&wide_src, &wide_dst, target_is_directory)
-                .map_err(|e| fs_err_with_filename2(e, 0, src.w_path(), dst.w_path()))?;
+                    .map_err(|e| fs_err_with_filename2(e, 0, src.w_path(), dst.w_path()))?;
                 Ok(pyre_object::w_none())
             }),
         );
