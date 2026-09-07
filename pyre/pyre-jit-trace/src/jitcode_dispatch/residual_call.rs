@@ -3826,6 +3826,37 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             let operand = args[2] as pyre_object::PyObjectRef;
             !operand.is_null() && unsafe { pyre_object::pyobject::is_int_or_long(operand) }
         };
+    // `do_residual_call` (`pyjitpl.py`) runs at any framestack depth.
+    // Exact-int `BINARY_OP` / `COMPARE_OP` has no user dunder and is not
+    // the self-recursive `CALL_ASSEMBLER` trampoline the nested-decline
+    // hazard names.  Refusing it inside `rec` aborted the inline before
+    // `sys._getframe` could force a multi-frame carrier.
+    let observed_exact_int_binop = matches!(
+        helper,
+        majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
+    ) && args.len() >= 2
+        && {
+            let lhs = args[0] as pyre_object::PyObjectRef;
+            let rhs = args[1] as pyre_object::PyObjectRef;
+            !lhs.is_null()
+                && !rhs.is_null()
+                && unsafe {
+                    pyre_object::is_int(lhs)
+                        && !pyre_object::is_bool(lhs)
+                        && pyre_object::is_exact_builtin_instance(lhs)
+                        && pyre_object::is_int(rhs)
+                        && !pyre_object::is_bool(rhs)
+                        && pyre_object::is_exact_builtin_instance(rhs)
+                }
+        };
+    // Flatten residual fallback is tagged `BinaryOp` / `CompareOp`.  A
+    // codewriter residual of the same helper can arrive with
+    // `RuntimeHelperKind::None`; match the published fnaddr so
+    // `do_residual_call` still runs at this framestack depth.
+    let opcode_binop_or_compare = pyre_interpreter::jit_trace_fnaddrs().iter().any(|(n, a)| {
+        *a == func_ptr as i64
+            && (n.ends_with("binary_value_from_tag") || n.ends_with("compare_value_from_tag"))
+    });
     // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
     // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
     // cannot mutate an object visible before the call.  Upstream records list
@@ -3852,7 +3883,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         || observed_replay_safe_isinstance
         || replay_safe_fresh_allocation
         || replay_safe_tuple_from_list
-        || observed_exact_int_index;
+        || observed_exact_int_index
+        || observed_exact_int_binop
+        || opcode_binop_or_compare;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
         || (helper == majit_ir::RuntimeHelperKind::CallFn && !replay_safe_tuple_from_list)
         || helper_kind_writes_live_heap(helper);
