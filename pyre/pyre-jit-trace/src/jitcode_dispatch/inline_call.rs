@@ -12141,12 +12141,23 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<DispatchOutcome, DispatchError> {
+    // `pyjitpl.py MIFrame.setup` walks the *callee* jitcode with that
+    // jitcode's own descrs.  Build-time helpers (`from_canonical`)
+    // resolve `d`/`j` through the process-wide table.  The caller's
+    // per-fn pool is the wrong namespace: a switch/id inside
+    // `binary_value_from_tag` then jumps to the wrong arm and the
+    // portal guard snapshot misses live locals (`checksum += i // d`).
+    // Production full-body walks always have `snapshot_sym`, so they
+    // take the orthodox helper entry even when the per-fn descr slot
+    // does not carry the `uses_global_descr_pool` flag.
     let uses_global_descr_pool = ctx
         .raw_descrs
         .runtime_jitcode_at(descr_index)
-        .is_some_and(|jitcode| jitcode.uses_global_descr_pool());
-    if !uses_global_descr_pool {
-        return run_sub_jitcode_walk(
+        .is_some_and(|jitcode| jitcode.uses_global_descr_pool())
+        || !ctx.fbw_mode.snapshot_sym.is_null();
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let walk = if !uses_global_descr_pool {
+        run_sub_jitcode_walk(
             ctx,
             pc,
             sub_body,
@@ -12155,19 +12166,184 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             ref_args,
             ref_arg_concretes,
             float_args,
-        );
+        )
+    } else {
+        super::specialize::run_codewriter_helper_inline_call(
+            ctx,
+            pc,
+            sub_body,
+            int_args,
+            int_arg_concretes,
+            ref_args,
+            ref_arg_concretes,
+            float_args,
+        )
+    };
+    match walk {
+        // Same cut as `try_walker_orthodox_descent`: an un-lowered helper
+        // inside the callee is not a portal abort.  Residualize through
+        // `jitcode.fnaddr` (`blackhole.py bhimpl_inline_call_*`).
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            cut_declined_subwalk(ctx, pre_fold_pos);
+            residualize_inline_call_via_fnaddr(ctx, pc, descr_index, int_args, ref_args, float_args)
+        }
+        other => other,
     }
+}
 
-    super::specialize::run_codewriter_helper_inline_call(
+struct InlineFnaddrCall {
+    fnaddr: i64,
+    allboxes: Vec<OpRef>,
+    descr: majit_ir::DescrRef,
+}
+
+fn inline_fnaddr_call_setup<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    descr_index: usize,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+    float_args: &[OpRef],
+) -> Result<InlineFnaddrCall, DispatchError> {
+    let Some(jc) = ctx.raw_descrs.runtime_jitcode_at(descr_index) else {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
+    };
+    let fnaddr = jc.fnaddr;
+    if fnaddr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(fnaddr) {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc,
+            symbolic: fnaddr,
+        });
+    }
+    let calldescr = jc.calldescr().clone();
+    let descr = crate::descr::make_descr_from_bh(&majit_translate::jitcode::BhDescr::Call {
+        calldescr: calldescr.clone(),
+    });
+    let funcbox = ctx.trace_ctx.const_int(fnaddr);
+    let mut allboxes = Vec::with_capacity(1 + calldescr.arg_classes.len());
+    allboxes.push(funcbox);
+    let mut i_cur = 0usize;
+    let mut r_cur = 0usize;
+    let mut f_cur = 0usize;
+    for ch in calldescr.arg_classes.chars() {
+        let arg =
+            match ch {
+                'i' => {
+                    let arg = *int_args.get(i_cur).ok_or(
+                        DispatchError::OrthodoxSubWalkTraceUnsupported {
+                            pc,
+                            symbolic: fnaddr,
+                        },
+                    )?;
+                    i_cur += 1;
+                    arg
+                }
+                'r' => {
+                    let arg = *ref_args.get(r_cur).ok_or(
+                        DispatchError::OrthodoxSubWalkTraceUnsupported {
+                            pc,
+                            symbolic: fnaddr,
+                        },
+                    )?;
+                    r_cur += 1;
+                    arg
+                }
+                'f' => {
+                    let arg = *float_args.get(f_cur).ok_or(
+                        DispatchError::OrthodoxSubWalkTraceUnsupported {
+                            pc,
+                            symbolic: fnaddr,
+                        },
+                    )?;
+                    f_cur += 1;
+                    arg
+                }
+                _ => {
+                    return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                        pc,
+                        symbolic: fnaddr,
+                    });
+                }
+            };
+        allboxes.push(arg);
+    }
+    Ok(InlineFnaddrCall {
+        fnaddr,
+        allboxes,
+        descr,
+    })
+}
+
+/// `cpu.bh_call_*(jitcode.fnaddr, ...)` for a helper body the walker
+/// could not record.  The codewriter already required a callable
+/// `fnaddr` (`fully_bound_callee_body`); blackhole uses the same
+/// address on guard-failure resume.
+fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    descr_index: usize,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+    float_args: &[OpRef],
+) -> Result<DispatchOutcome, DispatchError> {
+    let InlineFnaddrCall {
+        fnaddr,
+        allboxes,
+        descr,
+    } = inline_fnaddr_call_setup(ctx, pc, descr_index, int_args, ref_args, float_args)?;
+    let Some(call_descr) = descr.as_call_descr() else {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc,
+            symbolic: fnaddr,
+        });
+    };
+    let recorded = ctx.trace_ctx.record_op_with_descr(
+        majit_ir::OpCode::CallMayForceR,
+        &allboxes,
+        descr.clone(),
+    );
+    let resid = super::residual_call::try_execute_residual_call_via_executor(
         ctx,
+        majit_ir::OpCode::CallMayForceR,
+        &allboxes,
+        call_descr,
+        recorded,
         pc,
-        sub_body,
-        int_args,
-        int_arg_concretes,
-        ref_args,
-        ref_arg_concretes,
-        float_args,
-    )
+        None,
+    )?;
+    match resid {
+        super::ResidualExecOutcome::Executed(Ok(ptr)) => {
+            ctx.trace_ctx.set_opref_concrete(
+                recorded,
+                majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)),
+            );
+            ctx.trace_ctx
+                .record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, pc)?;
+            Ok(DispatchOutcome::SubReturn {
+                result: Some(recorded),
+            })
+        }
+        super::ResidualExecOutcome::Executed(Err(_)) => {
+            walker_record_guard_exception(ctx, pc);
+            let exc =
+                ctx.last_exc_value()
+                    .ok_or(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                        pc,
+                        symbolic: fnaddr,
+                    })?;
+            Ok(DispatchOutcome::SubRaise {
+                exc,
+                exc_concrete: ctx.last_exc_value_concrete(),
+            })
+        }
+        super::ResidualExecOutcome::Declined(_) => {
+            Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                pc,
+                symbolic: fnaddr,
+            })
+        }
+    }
 }
 
 thread_local! {

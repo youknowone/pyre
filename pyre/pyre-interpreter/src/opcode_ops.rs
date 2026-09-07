@@ -226,6 +226,13 @@ pub fn compare_value_from_tag(
     b: PyObjectRef,
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
+    // Same contract as `bh_compare_fn`: a compiled force that has not
+    // written a local yet hands a NULL here.  Residual compare published
+    // TypeError; this helper must too, or the inlined path returns a
+    // NULL result without an exception (`ValueError: call failed`).
+    if a.is_null() || b.is_null() {
+        return Err(PyError::type_error("comparison on null operand"));
+    }
     // CONTAINS_OP routes through the compare-residual machinery: tag 6 =
     // `in`, tag 7 = `not in`. `a` is the needle, `b` the container (flatten
     // lowers the args as `[item, container]`).
@@ -1427,6 +1434,13 @@ mod tests {
             assert!(w_bool_get_value(is_not_same));
             assert!(!w_bool_get_value(is_diff));
         }
+    }
+
+    #[test]
+    fn test_compare_value_from_tag_rejects_null_operands() {
+        let err = compare_value_from_tag(std::ptr::null_mut(), w_int_new(1), 5).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert!(err.to_string().contains("comparison on null operand"));
     }
 
     #[test]
