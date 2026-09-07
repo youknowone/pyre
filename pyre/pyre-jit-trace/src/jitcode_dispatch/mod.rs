@@ -8171,7 +8171,10 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
 /// the residual call op stays in the trace and the optimizer's
 /// per-call guard-emission still catches exception divergence at
 /// replay, just without the class pin.
-fn walker_record_guard_exception<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, pc: usize) {
+pub(crate) fn walker_record_guard_exception<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) {
     let exc_obj = match ctx.last_exc_value_concrete() {
         ConcreteValue::Ref(p) if !p.is_null() => p,
         _ => {
@@ -11808,13 +11811,27 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
         return Ok(());
     }
     let ec = pyre_interpreter::call::getexecutioncontext();
-    if ec.is_null() || !unsafe { (*ec).w_tracefunc }.is_null() {
+    if ec.is_null() {
         return Ok(());
+    }
+    // A hook installed after the loop was recorded fails `GuardIsnull`
+    // (or `GUARD_NOT_INVALIDATED`).  The bridge out of that guard
+    // resumes in the body with the hook already live; this walker
+    // cannot record `ec.call_trace`, so compiling that bridge would
+    // silence the tail.  Decline, same as `w_f_trace` above, and
+    // leave the events to the interpreter.
+    if !unsafe { (*ec).w_tracefunc }.is_null() {
+        return Err(DispatchError::PortalFrameTracerArmed { pc: op_pc });
     }
     let Some(ec_box) = walker_ensure_execution_context(ctx) else {
         return Ok(());
     };
     let descr = crate::descr::ec_w_tracefunc_descr();
+    // `_immutable_fields_ = ['w_tracefunc?']`: `gettrace` is
+    // `jit.promote(self.w_tracefunc)`.  The `?` is the invalidation
+    // half — `settrace` notifies, `GUARD_NOT_INVALIDATED` fails, and
+    // the loop is not re-entered with the folded NULL.
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
     let descr_index = descr.index();
     if ctx
         .trace_ctx
