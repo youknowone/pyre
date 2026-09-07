@@ -3869,11 +3869,18 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
-    // BINARY stays residual so the walker uses specialize +
-    // `finishframe` / `finishframe_exception` on the portal frame
-    // (`pyjitpl.py`).  Flatten `inline_call` walks the helper, and a
-    // raise dest-writes NULL / an object into the caller's slot
-    // (`keys() & None`, `[0] * 2**63`, `acc //= 0`).
+    // `jtransform.py handle_regular_call`: a bound helper is
+    // `inline_call_ir_r`.  A raise publishes and returns NULL;
+    // the walker promotes that to `finishframe_exception` instead
+    // of dest-writing the NULL.
+    if let Some(insn) = build_orthodox_inline_call_ir_r(
+        "pyre_interpreter::opcode_ops::binary_value_from_tag",
+        vec![Operand::ConstInt(op_val)],
+        vec![lhs_operand.clone(), rhs_operand.clone()],
+        result_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_ir_r_insn_from_operands(
         ctx.binary_op_fn_idx,
         op_val,
@@ -4029,10 +4036,10 @@ fn compare_op_tag_for_opname(opname: &str) -> Option<i64> {
         "ge" => 3,
         "eq" => 4,
         "ne" => 5,
-        "contains" => 6,
-        "not_contains" => 7,
-        "is" => 8,
-        "is_not" => 9,
+        "contains" => pyre_interpreter::runtime_ops::COMPARE_OP_CONTAINS,
+        "not_contains" => pyre_interpreter::runtime_ops::COMPARE_OP_NOT_CONTAINS,
+        "is" => pyre_interpreter::runtime_ops::COMPARE_OP_IS,
+        "is_not" => pyre_interpreter::runtime_ops::COMPARE_OP_IS_NOT,
         _ => return None,
     })
 }
@@ -4071,10 +4078,10 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
-    // `is` / `is_not` (tags 8/9) can inline: they do not raise.
+    // `is` / `is_not` can inline: they do not raise.
     // Other COMPARE tags stay residual so `CompareOpDescent` and
     // `finishframe_exception` own the portal-frame raise.
-    if matches!(op_val, 8 | 9)
+    if pyre_interpreter::runtime_ops::compare_op_tag_is_identity(op_val)
         && let Some(insn) = build_orthodox_inline_call_ir_r(
             "pyre_interpreter::opcode_ops::compare_value_from_tag",
             vec![Operand::ConstInt(op_val)],
@@ -9814,8 +9821,7 @@ mod tests {
     #[test]
     fn lower_binary_op_hlop_emits_inline_call_when_body_is_bound() {
         // `binary_value_from_tag` is fully bound, so the HLOp lowers to
-        // `jtransform.py handle_regular_call`'s `inline_call_ir_r` rather
-        // than the MayForce residual the walker used to re-recognise.
+        // `jtransform.py handle_regular_call`'s `inline_call_ir_r`.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);
@@ -9996,7 +10002,13 @@ mod tests {
                 };
                 match tag_list {
                     Operand::ListOfKind(list) => match &list.content[0] {
-                        Operand::ConstInt(v) => assert_eq!(*v, 8, "is → tag 8"),
+                        Operand::ConstInt(v) => {
+                            assert_eq!(
+                                *v,
+                                pyre_interpreter::runtime_ops::COMPARE_OP_IS,
+                                "is → COMPARE_OP_IS"
+                            )
+                        }
                         other => panic!("expected ConstInt(8) in ListI, got {other:?}"),
                     },
                     other => panic!("expected ListOfKind(Int, 1), got {other:?}"),
