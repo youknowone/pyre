@@ -6827,6 +6827,12 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 );
             }
             match e {
+                DE::TraceTooLong { .. } => TraceAction::SwitchToBlackhole(
+                    majit_metainterp::SwitchToBlackhole {
+                        reason: majit_metainterp::counters::ABORT_TOO_LONG,
+                        raising_exception: false,
+                    },
+                ),
                 // A kept-stack branch guard whose not-taken arm reads an
                 // unrestorable boxed Ref register is a structural abort.
                 // Keeping the permanent mapping is behavior-neutral: a plain

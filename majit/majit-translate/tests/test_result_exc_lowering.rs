@@ -316,7 +316,7 @@ fn execute_wrapper_family_lowers_to_raise_links() {
 
 /// Facet A firing guard — the jd1 drain-loop `match next()` fusion.
 ///
-/// `_unpackiterable_unknown_length`'s StopIteration drain loop is a
+/// `unpackiterable_portal`'s StopIteration drain loop is a
 /// hand-written `match next() { Ok(w) => append, Err(e) if
 /// e.matches_stop_iteration() => break, Err(e) => return Err(e) }`. Lowered
 /// naively it materialises a `Result` shell and leaves the PyError predicate
@@ -337,9 +337,9 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
     let llbc = interp();
     let graph = lower_function(
         llbc,
-        "pyre_interpreter::baseobjspace::_unpackiterable_unknown_length",
+        "pyre_interpreter::baseobjspace::unpackiterable_portal",
     )
-    .expect("lower _unpackiterable_unknown_length");
+    .expect("lower unpackiterable_portal");
 
     // Positive firing signal: only the fusion emits this object-level helper
     // FunctionPath, so its presence proves `try_fuse_drain_match` fired rather
