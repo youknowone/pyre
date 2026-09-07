@@ -3420,6 +3420,13 @@ fn emit_call_footer_shadowstack(
 /// it, so they keep the full `_call_header_with_stack_check` prologue.
 const IN_CODE_ENTRY_KEY_FLAG: i32 = 1 << 30;
 
+/// Words a label-parameter entry accepts after `(jf_ptr, dispatch_key)`.
+/// Same freeze as wasm `FROZEN_LABEL_PARAM_ARITY`: one Tail signature
+/// must cover every LABEL arity so `return_call_indirect` type-checks
+/// across loops.  `llgraph execute_jump(*args)` / wasm wide entry
+/// carry JUMP values as parameters instead of a jitframe round-trip.
+const FROZEN_LABEL_PARAM_ARITY: usize = 16;
+
 /// `x86/assembler.py:182-184 _build_frame_realloc_slowpath` parity:
 /// `_load_shadowstack_top_in_ebx(mc, gcrootmap)` followed by
 /// `MOV_mr((ebx.value, -WORD), eax.value)`.
@@ -7100,6 +7107,28 @@ fn emit_attached_bridge_dispatch(
     builder.seal_block(miss_block);
 }
 
+/// Tail signature of a compiled loop body: `(jf_ptr, dispatch_key, v0..vK)`.
+fn body_tail_signature(ptr_type: cranelift_codegen::ir::Type) -> Signature {
+    let mut sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
+    sig.params.push(AbiParam::new(ptr_type));
+    sig.params.push(AbiParam::new(cl_types::I32));
+    for _ in 0..FROZEN_LABEL_PARAM_ARITY {
+        sig.params.push(AbiParam::new(cl_types::I64));
+    }
+    sig.returns.push(AbiParam::new(ptr_type));
+    sig
+}
+
+/// Pad JUMP SSA values to [`FROZEN_LABEL_PARAM_ARITY`] with zero.
+fn pad_wide_args(builder: &mut FunctionBuilder, vals: &[CValue]) -> Vec<CValue> {
+    let zero = builder.ins().iconst(cl_types::I64, 0);
+    let mut out = Vec::with_capacity(FROZEN_LABEL_PARAM_ARITY);
+    for i in 0..FROZEN_LABEL_PARAM_ARITY {
+        out.push(vals.get(i).copied().unwrap_or(zero));
+    }
+    out
+}
+
 /// `assembler.py closing_jump` parity for cranelift.
 ///
 /// PyPy's x86 backend emits a raw `JMP imm(target_token._ll_loop_code)` at
@@ -7126,6 +7155,7 @@ fn emit_attached_loop_dispatch(
     target_frame_depth_addr: usize,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
+    wide_vals: &[CValue],
 ) {
     // `LoopTargetDescr::set_dispatch_target` (descr.rs)
     // releases `target_frame_depth` and `label_block_id` BEFORE
@@ -7292,10 +7322,7 @@ fn emit_attached_loop_dispatch(
     // hard-code `Tail` here so this matches the body's signature
     // regardless of which call_conv the enclosing emit_guard_exit
     // received for its non-tail helper calls.
-    let mut target_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
-    target_sig.params.push(AbiParam::new(ptr_type));
-    target_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-    target_sig.returns.push(AbiParam::new(ptr_type));
+    let target_sig = body_tail_signature(ptr_type);
     let target_sig_ref = builder.import_signature(target_sig);
     // x86/regalloc.py:1397 per-TargetToken `_ll_loop_code` parity: re-enter the
     // target at the LABEL the JUMP names, not always the first.  The target
@@ -7305,11 +7332,14 @@ fn emit_attached_loop_dispatch(
     let dispatch_key = builder
         .ins()
         .bor_imm_u(label_selector, IN_CODE_ENTRY_KEY_FLAG as i64);
-    builder.ins().return_call_indirect(
-        target_sig_ref,
-        target_code_ptr,
-        &[dispatch_jf_ptr, dispatch_key],
-    );
+    let wide = pad_wide_args(builder, wide_vals);
+    let mut call_args = Vec::with_capacity(2 + FROZEN_LABEL_PARAM_ARITY);
+    call_args.push(dispatch_jf_ptr);
+    call_args.push(dispatch_key);
+    call_args.extend(wide);
+    builder
+        .ins()
+        .return_call_indirect(target_sig_ref, target_code_ptr, &call_args);
 
     builder.switch_to_block(miss_block);
     builder.seal_block(miss_block);
@@ -7563,6 +7593,26 @@ fn emit_guard_exit(
         let enabled = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
             && std::env::var_os("MAJIT_CL_NO_CLOSING_JUMP").is_none();
         if enabled {
+            let mut wide_vals = Vec::new();
+            for &arg_ref in &info.fail_arg_refs {
+                if wide_vals.len() == FROZEN_LABEL_PARAM_ARITY {
+                    break;
+                }
+                if arg_ref.is_none() {
+                    wide_vals.push(builder.ins().iconst(cl_types::I64, 0));
+                    continue;
+                }
+                wide_vals.push(resolve_failarg_opref(
+                    builder,
+                    constants,
+                    jf_ptr,
+                    ref_root_slots,
+                    stale_ref_vars,
+                    demoted_failarg_slots,
+                    ref_root_base_ofs,
+                    arg_ref,
+                ));
+            }
             emit_attached_loop_dispatch(
                 builder,
                 jf_ptr,
@@ -7571,6 +7621,7 @@ fn emit_guard_exit(
                 target_frame_depth_addr,
                 ptr_type,
                 call_conv,
+                &wide_vals,
             );
         }
     }
@@ -9719,20 +9770,10 @@ impl CraneliftBackend {
         // an upper bound on a superscalar core and not a measured cost, but it
         // bounds this entry at a few nanoseconds — not somewhere to look for
         // entry overhead.  `MAJIT_DUMP_CLIF` prints it as `[jit][disasm-entry]`.
-        let body_call_conv = cranelift_codegen::isa::CallConv::Tail;
-
-        let mut sig = Signature::new(body_call_conv);
-        sig.params.push(AbiParam::new(ptr_type)); // jf_ptr (read inputs, write outputs)
-        // x86/regalloc.py:1397 per-TargetToken `_ll_loop_code` parity: a JUMP
-        // re-enters the target at a SPECIFIC LABEL, not always the first.
-        // PyPy exposes one code address per LABEL; cranelift has a single
-        // function entry, so the target LABEL is selected by a `dispatch_key`
-        // argument that the entry block `br_table`s on.  The host wrapper
-        // passes 0 for the preamble; an in-code closing-jump passes the target
-        // descr's `label_block_id + 1`.
-        sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-        // RPython _call_footer (assembler.py:1097): mov eax, ebp; ret
-        sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
+        // `(jf_ptr, dispatch_key, v0..vK)` — wasm wide entry / llgraph
+        // `execute_jump(*args)`: JUMP values ride Tail params so a
+        // closing_jump does not store+load them through jitframe slots.
+        let sig = body_tail_signature(ptr_type);
 
         let body_name = format!("trace_{}_body", self.func_counter);
         let entry_name = format!("trace_{}_entry", self.func_counter);
@@ -10710,14 +10751,25 @@ impl CraneliftBackend {
             let preamble_block = builder.create_block();
             let loaders: Vec<cranelift_codegen::ir::Block> = label_blocks
                 .iter()
-                .map(|_| builder.create_block())
+                .map(|_| {
+                    let b = builder.create_block();
+                    for _ in 0..FROZEN_LABEL_PARAM_ARITY {
+                        builder.append_block_param(b, cl_types::I64);
+                    }
+                    b
+                })
                 .collect();
+            let entry_wide: Vec<CValue> = (0..FROZEN_LABEL_PARAM_ARITY)
+                .map(|i| builder.block_params(entry_block)[2 + i])
+                .collect();
+            let wide_block_args: Vec<BlockArg> =
+                entry_wide.iter().copied().map(BlockArg::from).collect();
             // table = [preamble, loader_0, loader_1, ...]; default = preamble.
             let mut targets: Vec<cranelift_codegen::ir::BlockCall> =
                 Vec::with_capacity(loaders.len() + 1);
             targets.push(builder.func.dfg.block_call(preamble_block, &[]));
             for &b in &loaders {
-                targets.push(builder.func.dfg.block_call(b, &[]));
+                targets.push(builder.func.dfg.block_call(b, &wide_block_args));
             }
             let default_call = builder.func.dfg.block_call(preamble_block, &[]);
             let jt = builder.create_jump_table(cranelift_codegen::ir::JumpTableData::new(
@@ -10777,11 +10829,21 @@ impl CraneliftBackend {
                         demoted_root_syncs.push((v, home_ofs));
                     }
                 }
-                let carried_offsets: Vec<i32> = (0..arity)
+                let kept: Vec<usize> = (0..arity)
                     .filter(|&i| loop_phi_keep.is_none_or(|keep| keep[i]))
-                    .map(|i| JF_FRAME_ITEM0_OFS + (i as i32) * 8)
                     .collect();
-                let vals = load_frame_slot_run(&mut builder, cur_jf, &carried_offsets);
+                let vals = if kept.len() <= FROZEN_LABEL_PARAM_ARITY {
+                    // Wide entry: JUMP values arrived as Tail params
+                    // (`llgraph execute_jump` / wasm label-param entry).
+                    let wide = builder.block_params(loader);
+                    kept.iter().map(|&i| wide[i]).collect()
+                } else {
+                    let carried_offsets: Vec<i32> = kept
+                        .iter()
+                        .map(|&i| JF_FRAME_ITEM0_OFS + (i as i32) * 8)
+                        .collect();
+                    load_frame_slot_run(&mut builder, cur_jf, &carried_offsets)
+                };
                 // Ref-root re-syncs go after every dense carried-slot load:
                 // when `max_output_slots < arity` the ref-root region aliases
                 // the tail of the dense slots, and a store emitted before the
@@ -15964,6 +16026,10 @@ impl CraneliftBackend {
             wb.seal_block(eb);
             let jf_ptr_in = wb.block_params(eb)[0];
             let dispatch_key_in = wb.block_params(eb)[1];
+            // Host shim of the wasm narrow entry: load the dense carried
+            // slots so a LABEL re-entry through `execute_token` still
+            // feeds the body's wide parameters.  In-code dispatch never
+            // enters this wrapper.
             // The body/bridges keep the jitframe base in the pinned register,
             // which `enable_pinned_reg` makes NOT callee-saved in Cranelift.
             // This wrapper is the host(Rust, SystemV/AAPCS — the pinned reg IS
@@ -15981,7 +16047,18 @@ impl CraneliftBackend {
             // external-JUMP host re-entry (including the first LABEL),
             // matching assembler.py:990-993 per-LABEL `_ll_loop_code`: a
             // JUMP branches straight to the target LABEL.
-            let call_inst = wb.ins().call(body_ref, &[jf_ptr_in, dispatch_key_in]);
+            let mut body_args = Vec::with_capacity(2 + FROZEN_LABEL_PARAM_ARITY);
+            body_args.push(jf_ptr_in);
+            body_args.push(dispatch_key_in);
+            for i in 0..FROZEN_LABEL_PARAM_ARITY {
+                body_args.push(wb.ins().load(
+                    cl_types::I64,
+                    MemFlagsData::trusted(),
+                    jf_ptr_in,
+                    JF_FRAME_ITEM0_OFS + (i as i32) * 8,
+                ));
+            }
+            let call_inst = wb.ins().call(body_ref, &body_args);
             let ret = wb.inst_results(call_inst)[0];
             wb.ins().set_pinned_reg(host_pinned);
             wb.ins().return_(&[ret]);
