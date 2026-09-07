@@ -3,8 +3,9 @@
 //! Verifies the singleton dispatch JitCode emitted by `__dispatch_jitcode_*`
 //! contains the expected portal IR (BC_JIT_MERGE_POINT, BC_LOOP_HEADER) +
 //! pre-dispatch ops in source order + opcode fetch + dispatch chain
-//! (BC_GOTO_IF_NOT_INT_EQ_CONST chain) + arm BC_INLINE_CALL emissions +
-//! loop close.
+//! (BC_GOTO_IF_NOT_INT_EQ_CONST chain) + Lowerable arm bodies force-inlined
+//! into the dispatch JitCode (`try_inline_dispatch_arm`) + residual
+//! `BC_INLINE_CALL` only for Nop/Halt/abort stubs + loop close.
 
 use majit_metainterp::jitcode::insns::{
     BC_ABORT, BC_GETARRAYITEM_GC_I_PURE, BC_GOTO_IF_NOT_INT_EQ, BC_INLINE_CALL, BC_INT_ADD,
@@ -75,6 +76,25 @@ fn build_dispatch_minimal() -> JitCode {
         .expect("dispatch lower must succeed for fixture")
 }
 
+/// Dispatch JitCode plus every registered arm sub-JitCode. Lowerable red-pc
+/// arms land in the dispatch body (`try_inline_dispatch_arm`); Nop/Halt/abort
+/// stubs stay as `BC_INLINE_CALL` targets. Shape assertions that only care
+/// that an op was emitted must scan both.
+fn dispatch_tree(jc: &JitCode) -> impl Iterator<Item = &JitCode> {
+    std::iter::once(jc).chain(
+        jc.exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode().map(|sub| sub.as_ref())),
+    )
+}
+
+fn count_op_in_dispatch_tree(jc: &JitCode, op: u8) -> usize {
+    dispatch_tree(jc)
+        .map(|code| code.code.iter().filter(|&&b| b == op).count())
+        .sum()
+}
+
 #[test]
 fn dispatch_jitcode_emits_portal_markers() {
     let dispatch_jc = build_dispatch_minimal();
@@ -101,9 +121,11 @@ fn dispatch_jitcode_contains_inline_call_per_arm() {
     let dispatch_jc = build_dispatch_minimal();
     let code = &dispatch_jc.code;
     let inline_call_count = code.iter().filter(|&&b| b == BC_INLINE_CALL).count();
+    // OP_NOP is ArmPattern::Nop and stays a residual empty INLINE_CALL.
+    // OP_INC_A is Lowerable and is force-inlined into the dispatch body.
     assert_eq!(
-        inline_call_count, 2,
-        "dispatch JitCode must emit one BC_INLINE_CALL per non-default arm; got {}",
+        inline_call_count, 1,
+        "dispatch JitCode must emit one BC_INLINE_CALL for the residual Nop arm; got {}",
         inline_call_count
     );
 }
@@ -120,18 +142,13 @@ fn dispatch_arm_subjitcode_lowers_state_field_write() {
 
     assert_eq!(
         sub_jitcodes.len(),
-        2,
-        "dispatch JitCode must register one sub-JitCode per non-default arm"
+        1,
+        "only the residual Nop arm registers a sub-JitCode; Lowerable OP_INC_A is inlined"
     );
     assert!(
-        sub_jitcodes
-            .iter()
-            .any(|sub| sub.code.contains(&BC_STORE_STATE_FIELD)),
-        "state.a += 1 arm must lower to store_state_field in the dispatch inline-call target; sub codes: {:?}",
-        sub_jitcodes
-            .iter()
-            .map(|sub| sub.code.clone())
-            .collect::<Vec<_>>()
+        dispatch_jc.code.contains(&BC_STORE_STATE_FIELD),
+        "state.a += 1 arm must lower to store_state_field in the dispatch body; dispatch={:?}",
+        dispatch_jc.code
     );
     assert!(
         sub_jitcodes.iter().all(|sub| !sub.code.contains(&BC_ABORT)),
@@ -195,29 +212,11 @@ mod literal_for_unroll {
     #[test]
     fn dispatch_arm_unrolls_literal_range_for_loop() {
         let dispatch_jc = build_literal_for_unroll();
-        let sub_jitcodes = dispatch_jc
-            .exec
-            .descrs
-            .iter()
-            .filter_map(|descr| descr.as_jitcode())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            sub_jitcodes.len(),
-            1,
-            "fixture must register exactly one non-default arm sub-JitCode"
-        );
-
-        let body = sub_jitcodes[0];
-        let store_count = body
-            .code
-            .iter()
-            .filter(|&&b| b == BC_STORE_STATE_FIELD)
-            .count();
+        let store_count = super::count_op_in_dispatch_tree(&dispatch_jc, BC_STORE_STATE_FIELD);
         assert_eq!(
             store_count, 4,
-            "for k in 0..4 body must be unrolled to four straight-line state writes; bytes: {:?}",
-            body.code
+            "for k in 0..4 body must be unrolled to four straight-line state writes; dispatch={:?}",
+            dispatch_jc.code
         );
     }
 }
@@ -270,28 +269,17 @@ mod float_state_field_shape {
         let _ = asm.ensure_canonical_liveness_offset();
         let dispatch_jc = __dispatch_jitcode_dispatch_float_field(&mut asm, 0i64)
             .expect("float dispatch lower must succeed");
-        let sub_jitcodes = dispatch_jc
-            .exec
-            .descrs
-            .iter()
-            .filter_map(|descr| descr.as_jitcode())
-            .collect::<Vec<_>>();
         assert!(
-            sub_jitcodes
-                .iter()
-                .any(|sub| sub.code.contains(&BC_STORE_STATE_FIELD_FLOAT)),
-            "state.f update must lower to store_state_field_float; sub codes: {:?}",
-            sub_jitcodes
-                .iter()
-                .map(|sub| sub.code.clone())
-                .collect::<Vec<_>>()
+            super::count_op_in_dispatch_tree(&dispatch_jc, BC_STORE_STATE_FIELD_FLOAT) >= 1,
+            "state.f update must lower to store_state_field_float; dispatch={:?}",
+            dispatch_jc.code
         );
     }
 }
 
 mod or_pattern {
     use super::{Bytecode, OP_INC_A, OP_NOP};
-    use majit_metainterp::jitcode::insns::BC_INLINE_CALL;
+    use majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD;
     use majit_metainterp::{Assembler, BC_GOTO, JitDriver};
 
     struct OrDispatchState {
@@ -336,19 +324,19 @@ mod or_pattern {
         let dispatch_jc = __dispatch_jitcode_dispatch_or_pattern(&mut asm, 0i64)
             .expect("dispatch lower must succeed for fixture");
         let code = &dispatch_jc.code;
-        let first_inline = code
+        let first_body = code
             .iter()
-            .position(|&b| b == BC_INLINE_CALL)
-            .expect("missing inline_call for OR-pattern arm");
+            .position(|&b| b == BC_STORE_STATE_FIELD)
+            .expect("missing inlined store for OR-pattern arm");
         let first_goto = code
             .iter()
             .position(|&b| b == BC_GOTO)
             .expect("missing successful-alternative jump for OR pattern");
 
         assert!(
-            first_goto < first_inline,
+            first_goto < first_body,
             "OR-pattern dispatch must jump from a successful early alternative \
-             to the shared matched body before inline_call; otherwise A | B is \
+             to the shared matched body before the inlined arm; otherwise A | B is \
              lowered as an accidental conjunction"
         );
     }
@@ -948,26 +936,27 @@ mod oparg_minimal {
             .expect("missing JIT_MERGE_POINT");
         let post_mp = &code[mp_idx..];
 
-        let store_count = post_mp
+        let first_getarr = post_mp
+            .iter()
+            .position(|&b| b == BC_GETARRAYITEM_GC_I_PURE)
+            .expect("BC_GETARRAYITEM_GC_I_PURE missing");
+        let prelude_store_count = post_mp[..first_getarr]
             .iter()
             .filter(|&&b| b == BC_STORE_STATE_FIELD)
             .count();
         assert_eq!(
-            store_count, 1,
-            "A.2.4: dispatch JitCode body must emit exactly one \
+            prelude_store_count, 1,
+            "A.2.4: prelude before opcode fetch must emit exactly one \
              BC_STORE_STATE_FIELD for `state.last_instr = pc as i64` \
-             (pyopcode.py:172); got {}",
-            store_count
+             (pyopcode.py:172); later stores belong to inlined Lowerable \
+             arms. got {}",
+            prelude_store_count
         );
 
         let store_pos = post_mp
             .iter()
             .position(|&b| b == BC_STORE_STATE_FIELD)
             .expect("BC_STORE_STATE_FIELD missing");
-        let first_getarr = post_mp
-            .iter()
-            .position(|&b| b == BC_GETARRAYITEM_GC_I_PURE)
-            .expect("BC_GETARRAYITEM_GC_I_PURE missing");
         assert!(
             store_pos < first_getarr,
             "A.2.4: last_instr store must precede opcode fetch \
@@ -1149,8 +1138,8 @@ mod oparg_minimal {
         );
     }
 
-    /// A.3.4: `BC_LOOP_HEADER` jdindex wire — call-site emission inside
-    /// the OP_JUMP_BACK arm sub-JitCode.
+    /// A.3.4: `BC_LOOP_HEADER` jdindex wire — call-site emission for the
+    /// force-inlined OP_JUMP_BACK arm.
     ///
     /// `jtransform.py` `handle_jit_marker__loop_header` emits
     /// `SpaceOperation('loop_header', [c_index], None)` with `c_index =
@@ -1160,62 +1149,54 @@ mod oparg_minimal {
     /// path early-returns at `interp_jit.py:104 if jumpto >= next_instr:
     /// return jumpto`).  Pyre's parity is achieved by recognising
     /// `can_enter_jit!(...)` as a `Stmt::Macro` inside `Lowerer::lower_stmt`
-    /// (`jitcode_lower/lower_stmt.rs`) and emitting the LH op INSIDE the
-    /// arm body sub-JitCode at that exact stmt position.  No post-INLINE_CALL
-    /// emission appears at the dispatch-JitCode level — that would over-emit
-    /// on every arm execution including forward-progress arms.
+    /// (`jitcode_lower/lower_stmt.rs`) and emitting the LH op at that exact
+    /// stmt position. The OP_JUMP_BACK arm is Lowerable, so
+    /// `try_inline_dispatch_arm` places that call-site LH in the dispatch
+    /// JitCode rather than a sub-JitCode. Forward-progress arms still must
+    /// not emit their own LH.
     ///
     /// The test pins:
-    ///   1. `BC_LOOP_HEADER` appears in the OP_JUMP_BACK arm sub-JitCode
-    ///      (the one whose body contains `can_enter_jit!()`); OP_NOP and
-    ///      OP_ADD_I arms must NOT emit it.
+    ///   1. Exactly one const-pool-anchored `BC_LOOP_HEADER` in the dispatch
+    ///      body (the inlined `can_enter_jit!()`).
     ///   2. The byte immediately after the LH opcode is in valid const-pool
     ///      range and stores the jdindex constant (`0i64` for this invocation).
-    ///   3. ZERO `BC_LOOP_HEADER` opcodes appear in the dispatch JitCode
-    ///      body itself — strict parity with PyPy where the LH lives at
-    ///      the user's source-level `can_enter_jit()` call site, NOT at
-    ///      arm boundaries.
+    ///   3. No residual Nop/Halt sub-JitCode emits LH of its own.
     #[test]
     fn dispatch_oparg_minimal_pins_loop_header_jdindex() {
-        use majit_metainterp::BC_GOTO;
         use majit_metainterp::jitcode::insns::BC_LOOP_HEADER;
 
         let dispatch_jc = build_oparg_minimal();
         let dispatch_code = &dispatch_jc.code;
 
-        // Step 3 (negative parity at dispatch level): the dispatch JitCode
-        // body must NOT contain any [BC_LOOP_HEADER, slot_in_pool, BC_GOTO]
-        // 3-byte triple — the previous per-arm-back-edge emit always
-        // produced this exact triple at every arm's loop-back location.
-        // Anchoring on the trailing BC_GOTO disambiguates payload-byte
-        // coincidences (a const-pool slot byte that happens to equal
-        // BC_LOOP_HEADER is not a real op start).
         let dispatch_num_regs_i = dispatch_jc.c_num_regs_i as usize;
         let dispatch_const_start = dispatch_num_regs_i;
         let dispatch_const_end = dispatch_num_regs_i + dispatch_jc.constants_i.len();
-        let dispatch_lh_at_back_edge_count = (0..dispatch_code.len().saturating_sub(2))
+        let dispatch_lh_positions: Vec<usize> = (0..dispatch_code.len().saturating_sub(1))
             .filter(|&i| {
                 dispatch_code[i] == BC_LOOP_HEADER
                     && (dispatch_code[i + 1] as usize) >= dispatch_const_start
                     && (dispatch_code[i + 1] as usize) < dispatch_const_end
-                    && dispatch_code[i + 2] == BC_GOTO
             })
-            .count();
+            .collect();
         assert_eq!(
-            dispatch_lh_at_back_edge_count, 0,
-            "A.3.4: dispatch JitCode body must contain ZERO \
-             [BC_LOOP_HEADER, slot, BC_GOTO] triples — LH lives at the \
-             source-level can_enter_jit!() call site INSIDE the arm body \
-             sub-JitCode, mirroring `interp_jit.py:118` placement inside \
-             `jump_absolute()`'s backward-branch only.  Got {} occurrences.",
-            dispatch_lh_at_back_edge_count
+            dispatch_lh_positions.len(),
+            1,
+            "A.3.4: dispatch JitCode body must contain exactly one \
+             const-pool-anchored BC_LOOP_HEADER from the inlined \
+             OP_JUMP_BACK can_enter_jit!() site; got {}",
+            dispatch_lh_positions.len()
+        );
+        let lh_pos = dispatch_lh_positions[0];
+        let slot_byte = dispatch_code[lh_pos + 1] as usize;
+        let const_idx = slot_byte - dispatch_num_regs_i;
+        let stored_jdindex = dispatch_jc.constants_i[const_idx];
+        assert_eq!(
+            stored_jdindex, 0i64,
+            "A.3.4: BC_LOOP_HEADER const-pool slot must store jdindex=0; got {}",
+            stored_jdindex
         );
 
-        // Step 1 (positive parity): EXACTLY ONE arm sub-JitCode contains
-        // exactly one BC_LOOP_HEADER op (the OP_JUMP_BACK arm whose body
-        // is `can_enter_jit!(...)`).  Forward-progress arms (OP_NOP /
-        // OP_ADD_I) emit no LH.
-        let arm_lh_emitting: Vec<_> = dispatch_jc
+        let arm_lh_emitting = dispatch_jc
             .exec
             .descrs
             .iter()
@@ -1230,53 +1211,11 @@ mod oparg_minimal {
                         && (sub.code[i + 1] as usize) < cend
                 })
             })
-            .collect();
+            .count();
         assert_eq!(
-            arm_lh_emitting.len(),
-            1,
-            "A.3.4: exactly one arm sub-JitCode must emit BC_LOOP_HEADER \
-             (the OP_JUMP_BACK arm carrying can_enter_jit!()); got {}",
-            arm_lh_emitting.len()
-        );
-        let jump_back_jc = arm_lh_emitting[0];
-
-        // Locate BC_LOOP_HEADER inside the OP_JUMP_BACK sub-JitCode and
-        // verify the slot byte addresses the const-pool entry that
-        // stores the jdindex value.  Anchor on slot-in-const-pool to
-        // disambiguate payload coincidences inside the sub-JitCode.
-        let sub_num_regs_i = jump_back_jc.c_num_regs_i as usize;
-        let sub_const_start = sub_num_regs_i;
-        let sub_const_end = sub_num_regs_i + jump_back_jc.constants_i.len();
-        let sub_lh_pos = (0..jump_back_jc.code.len().saturating_sub(1))
-            .find(|&i| {
-                jump_back_jc.code[i] == BC_LOOP_HEADER
-                    && (jump_back_jc.code[i + 1] as usize) >= sub_const_start
-                    && (jump_back_jc.code[i + 1] as usize) < sub_const_end
-            })
-            .expect(
-                "A.3.4: BC_LOOP_HEADER must appear in OP_JUMP_BACK arm sub-JitCode \
-                 (lower_stmt Stmt::Macro recognition emit-site)",
-            );
-
-        // Step 2: the byte immediately after BC_LOOP_HEADER is the const-pool
-        // slot byte; valid range already enforced by the anchor.
-        let sub_slot_byte = jump_back_jc.code[sub_lh_pos + 1] as usize;
-
-        // Step 2 (cont.): the constant value at that slot equals jdindex (0i64).
-        let sub_const_idx = sub_slot_byte - sub_num_regs_i;
-        let stored_jdindex = jump_back_jc.constants_i[sub_const_idx];
-        assert_eq!(
-            stored_jdindex, 0i64,
-            "A.3.4: BC_LOOP_HEADER const-pool slot must store jdindex=0; got {}",
-            stored_jdindex
-        );
-
-        let _ = (
-            dispatch_lh_at_back_edge_count,
-            sub_lh_pos,
-            sub_slot_byte,
-            sub_const_idx,
-            stored_jdindex,
+            arm_lh_emitting, 0,
+            "A.3.4: residual Nop/Halt sub-JitCodes must not emit BC_LOOP_HEADER; got {}",
+            arm_lh_emitting
         );
     }
 
@@ -2633,18 +2572,7 @@ mod residual_call_not_dropped {
         let _ = asm.ensure_canonical_liveness_offset();
         let dispatch_jc = __dispatch_jitcode_dispatch_residual_call(&mut asm, 0i64)
             .expect("dispatch lower must succeed");
-        let store_count: usize = dispatch_jc
-            .exec
-            .descrs
-            .iter()
-            .filter_map(|descr| descr.as_jitcode())
-            .map(|sub| {
-                sub.code
-                    .iter()
-                    .filter(|&&b| b == BC_STORE_STATE_FIELD)
-                    .count()
-            })
-            .sum();
+        let store_count = super::count_op_in_dispatch_tree(&dispatch_jc, BC_STORE_STATE_FIELD);
         // Only `OP_PURE` contributes one state-field store.  `OP_LOOP_CALL`
         // holds an unregistered qualified call, so its whole body must abort
         // lowering (interpreter fallback) instead of unrolling with the call
@@ -2739,49 +2667,13 @@ mod float_compare_branch_gate {
         let _ = asm.ensure_canonical_liveness_offset();
         let dispatch_jc = __dispatch_jitcode_dispatch_float_cmp(&mut asm, 0i64)
             .expect("dispatch lower must succeed");
-        let ge_count: usize = dispatch_jc
-            .exec
-            .descrs
-            .iter()
-            .filter_map(|descr| descr.as_jitcode())
-            .map(|sub| sub.code.iter().filter(|&&b| b == BC_FLOAT_GE).count())
-            .sum();
-        let guard_ge_count: usize = dispatch_jc
-            .exec
-            .descrs
-            .iter()
-            .filter_map(|descr| descr.as_jitcode())
-            .map(|sub| {
-                sub.code
-                    .iter()
-                    .filter(|&&b| b == BC_GOTO_IF_NOT_FLOAT_GE)
-                    .count()
-            })
-            .sum();
-        let int_guard_ge_count: usize = dispatch_jc
-            .exec
-            .descrs
-            .iter()
-            .filter_map(|descr| descr.as_jitcode())
-            .map(|sub| {
-                sub.code
-                    .iter()
-                    .filter(|&&b| b == BC_GOTO_IF_NOT_INT_GE)
-                    .count()
-            })
-            .sum();
-        let negated_guard_count: usize = dispatch_jc
-            .exec
-            .descrs
-            .iter()
-            .filter_map(|descr| descr.as_jitcode())
-            .map(|sub| {
-                sub.code
-                    .iter()
-                    .filter(|&&b| b == BC_GOTO_IF_NOT_INT_IS_ZERO)
-                    .count()
-            })
-            .sum();
+        let ge_count = super::count_op_in_dispatch_tree(&dispatch_jc, BC_FLOAT_GE);
+        let guard_ge_count =
+            super::count_op_in_dispatch_tree(&dispatch_jc, BC_GOTO_IF_NOT_FLOAT_GE);
+        let int_guard_ge_count =
+            super::count_op_in_dispatch_tree(&dispatch_jc, BC_GOTO_IF_NOT_INT_GE);
+        let negated_guard_count =
+            super::count_op_in_dispatch_tree(&dispatch_jc, BC_GOTO_IF_NOT_INT_IS_ZERO);
         // The value and odd-negation arms retain float_ge/ff>i. The direct
         // branch arm has no materialized boolean and emits the fused ffL
         // exitswitch instead.
@@ -2865,18 +2757,7 @@ mod huge_range_for_loop_falls_back {
         let _ = asm.ensure_canonical_liveness_offset();
         let dispatch_jc = __dispatch_jitcode_dispatch_huge_range(&mut asm, 0i64)
             .expect("dispatch lower must succeed");
-        let store_count: usize = dispatch_jc
-            .exec
-            .descrs
-            .iter()
-            .filter_map(|descr| descr.as_jitcode())
-            .map(|sub| {
-                sub.code
-                    .iter()
-                    .filter(|&&b| b == BC_STORE_STATE_FIELD)
-                    .count()
-            })
-            .sum();
+        let store_count = super::count_op_in_dispatch_tree(&dispatch_jc, BC_STORE_STATE_FIELD);
         // Only the `OP_PURE` arm inlines its single store; the oversized
         // `OP_HUGE` loop exceeds the unroll cap and aborts the arm.
         assert_eq!(

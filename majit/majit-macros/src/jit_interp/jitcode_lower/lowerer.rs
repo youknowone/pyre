@@ -405,7 +405,7 @@ impl<'c> Lowerer<'c> {
     }
 
     pub(super) fn emit_conditional_guard(&mut self, cond_reg: u16, target: &Ident) {
-        self.emit_conditional_guard_negatable(cond_reg, target, false);
+        self.emit_conditional_guard_negatable(cond_reg, target, false, false);
     }
 
     /// The branch RPython writes as `goto_if_not_<opname>`: fall through
@@ -416,16 +416,22 @@ impl<'c> Lowerer<'c> {
     /// `int_is_zero`, and `optimize_goto_if_not` folds that operation into
     /// the block's exitswitch rather than materialising its result, so the
     /// negation costs a different branch opname and nothing else.
+    ///
+    /// `int_is_true` is the integer `!= 0` rewrite. A Rust `if`/`while`
+    /// condition is otherwise `bool`, so flatten emits plain `goto_if_not`.
     pub(super) fn emit_conditional_guard_negatable(
         &mut self,
         cond_reg: u16,
         target: &Ident,
         negated: bool,
+        int_is_true: bool,
     ) {
         let branch = if negated {
             format_ident!("goto_if_not_int_is_zero")
-        } else {
+        } else if int_is_true {
             format_ident!("goto_if_not_int_is_true")
+        } else {
+            format_ident!("goto_if_not")
         };
         // Both forms read an int-banked register: `assembler.py write_insn`
         // takes a `Register` operand's argcode from `x.kind[0]`, which is
@@ -445,8 +451,12 @@ impl<'c> Lowerer<'c> {
         target: &Ident,
     ) {
         match condition {
-            LoweredCondition::Value { binding, negated } => {
-                self.emit_conditional_guard_negatable(binding.reg, target, *negated);
+            LoweredCondition::Value {
+                binding,
+                negated,
+                int_is_true,
+            } => {
+                self.emit_conditional_guard_negatable(binding.reg, target, *negated, *int_is_true);
             }
             LoweredCondition::Compare { lhs, rhs, branch } => {
                 let lhs_reg = Register::new(lhs.kind, lhs.reg);

@@ -13915,7 +13915,7 @@ mod tests {
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.load_const_i_value(0, 0);
-        builder.goto_if_not_int_is_true(0, target);
+        builder.goto_if_not(0, target);
         builder.load_const_i_value(1, 10);
         builder.int_return(1);
         builder.mark_label(target);
@@ -14489,7 +14489,7 @@ mod tests {
         // again after the branch is what shows the rebind.
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
-        builder.goto_if_not_int_is_true(0, target);
+        builder.goto_if_not(0, target);
         builder.record_binop_i(1, OpCode::IntAdd, 0, 0);
         builder.mark_label(target);
         let jitcode = builder.finish();
@@ -14508,9 +14508,7 @@ mod tests {
 
     /// `MIFrame.opimpl_goto_if_not_int_is_true` re-executes the `INT_IS_TRUE`
     /// that `jtransform.py optimize_goto_if_not` folded into the exitswitch,
-    /// then branches with `replace=False`. No majit front end emits this byte
-    /// today — every condition it lowers is already a Rust `bool` — so the
-    /// jitcode is patched to it directly.
+    /// then branches with `replace=False`.
     #[test]
     fn goto_if_not_int_is_true_records_the_folded_int_is_true() {
         let mut builder = JitCodeBuilder::new();
@@ -14518,13 +14516,7 @@ mod tests {
         builder.goto_if_not_int_is_true(0, target);
         builder.record_binop_i(1, OpCode::IntAdd, 0, 0);
         builder.mark_label(target);
-        let mut jitcode = builder.finish();
-        let code = &mut jitcode.core_mut().body_mut().code;
-        let at = code
-            .iter()
-            .position(|&b| b == jitcode::insns::BC_GOTO_IF_NOT)
-            .expect("the builder writes the canonical goto_if_not byte");
-        code[at] = jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE;
+        let jitcode = builder.finish();
 
         let recorded = traced_opcodes(
             &[majit_ir::Type::Int],

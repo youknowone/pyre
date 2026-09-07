@@ -931,6 +931,259 @@ fn variable_has_declared_unsigned_type(
         })
 }
 
+/// Whether `variable` carries RPython's `BoolRepr`, before the codewriter's
+/// `getkind(Bool) == 'int'` projection erases that distinction.
+///
+/// Production still feeds jtransform the rich model graph rather than the
+/// rtyper-rewritten flowspace graph. Read the rich result declaration just
+/// as [`variable_has_declared_unsigned_type`] does; retain the raw
+/// `Variable.concretetype == lltype.Bool` check for graphs that did pass
+/// through the rtyper. This is the representation test behind
+/// `rbool.py BoolRepr.rtype_bool`: a Bool from an input, field, call,
+/// comparison, CFG phi, nested `bool`, or JIT query has the same identity
+/// rule. Comparison semantics outrank the rich storage carrier because a few
+/// front rewrites retain `Int`/`Unsigned` there.
+fn variable_has_bool_repr(
+    graph: &FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+) -> bool {
+    use crate::flowspace::model::ConstValue;
+    use crate::model::BlockId;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+    // One linear pass builds the producer / phi / predecessor indexes.
+    // `classify` then answers in the size of the reachable DAG: a memoized
+    // walk that used to re-enter every diamond (and every `bool()` query
+    // rebuilt the walk from scratch) exploded the prepass into a multi-hour
+    // hang on interpreter graphs.
+    let mut producer: std::collections::HashMap<u64, &crate::model::SpaceOperation> =
+        std::collections::HashMap::new();
+    let mut inputarg: std::collections::HashMap<u64, (BlockId, usize)> =
+        std::collections::HashMap::new();
+    let mut incoming: std::collections::HashMap<BlockId, Vec<&crate::model::Link>> =
+        std::collections::HashMap::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(result) = op.result.as_ref() {
+                producer.insert(result.id(), op);
+            }
+        }
+        for (slot, arg) in block.inputargs.iter().enumerate() {
+            inputarg.insert(arg.id(), (block.id, slot));
+        }
+        for link in &block.exits {
+            incoming.entry(link.target).or_default().push(link);
+        }
+    }
+
+    fn op_result_has_bool_repr(kind: &OpKind) -> bool {
+        if matches!(
+            kind,
+            OpKind::ConstBool(_)
+                | OpKind::ConstSymbolic {
+                    ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::Input {
+                    ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::FieldRead {
+                    ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::VableFieldRead {
+                    ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::ArrayRead {
+                    item_ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::InteriorFieldRead {
+                    item_ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::VableArrayRead {
+                    item_ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::RawLoad {
+                    item_ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::Call {
+                    result_ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::IndirectCall {
+                    result_ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::BinOp {
+                    result_ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::UnaryOp {
+                    result_ty: ValueType::Bool,
+                    ..
+                }
+                | OpKind::IsConstant { .. }
+                | OpKind::IsVirtual { .. }
+                | OpKind::IsInstance { .. }
+                | OpKind::LoadStatic {
+                    ty: ValueType::Bool,
+                    ..
+                }
+        ) {
+            return true;
+        }
+
+        // Several front rewrites retain the source storage carrier on a
+        // comparison (`Int` in slice_get, `Unsigned` in saturating_sub).
+        // RPython's annotator/rtyper still gives every comparison result
+        // BoolRepr. Read the operation semantics before the carrier so these
+        // take the same `rtype_bool` identity path.
+        match kind {
+            OpKind::BinOp { op, .. } => matches!(
+                op.as_str(),
+                "is_"
+                    | "lt"
+                    | "le"
+                    | "eq"
+                    | "ne"
+                    | "gt"
+                    | "ge"
+                    | "int_lt"
+                    | "int_le"
+                    | "int_eq"
+                    | "int_ne"
+                    | "int_gt"
+                    | "int_ge"
+                    | "uint_lt"
+                    | "uint_le"
+                    | "uint_eq"
+                    | "uint_ne"
+                    | "uint_gt"
+                    | "uint_ge"
+                    | "float_lt"
+                    | "float_le"
+                    | "float_eq"
+                    | "float_ne"
+                    | "float_gt"
+                    | "float_ge"
+                    | "ptr_eq"
+                    | "ptr_ne"
+            ),
+            OpKind::UnaryOp { op, .. } => matches!(
+                op.as_str(),
+                "bool" | "int_is_zero" | "int_is_true" | "ptr_iszero" | "ptr_nonzero"
+            ),
+            _ => false,
+        }
+    }
+
+    struct BoolReprIndex<'g> {
+        producer: std::collections::HashMap<u64, &'g crate::model::SpaceOperation>,
+        inputarg: std::collections::HashMap<u64, (BlockId, usize)>,
+        incoming: std::collections::HashMap<BlockId, Vec<&'g crate::model::Link>>,
+    }
+
+    fn classify(
+        index: &BoolReprIndex<'_>,
+        variable: &crate::flowspace::model::Variable,
+        cache: &mut std::collections::HashMap<u64, Option<bool>>,
+        visiting: &mut std::collections::HashSet<u64>,
+    ) -> Option<bool> {
+        if matches!(
+            variable.concretetype.borrow().as_ref(),
+            Some(LowLevelType::Bool)
+        ) {
+            return Some(true);
+        }
+        if let Some(&cached) = cache.get(&variable.id()) {
+            return cached;
+        }
+        if !visiting.insert(variable.id()) {
+            // A loop-carried phi may point back to itself. The other incoming
+            // roots decide its representation; a pure cycle has no evidence.
+            return None;
+        }
+
+        let classified = if let Some(op) = index.producer.get(&variable.id()) {
+            match &op.kind {
+                // These operations preserve their operand representation.
+                OpKind::Hint { value, .. } => classify(index, value, cache, visiting),
+                OpKind::UnaryOp { op, operand, .. }
+                    if matches!(op.as_str(), "same_as" | "deref") =>
+                {
+                    classify(index, operand, cache, visiting)
+                }
+                kind => Some(op_result_has_bool_repr(kind)),
+            }
+        } else if let Some(&(target, slot)) = index.inputarg.get(&variable.id()) {
+            // RPythonAnnotator.follow_link/mergeinputargs unions each link
+            // argument with the matching Block.inputarg. Recover that
+            // relation from the graph: every non-cyclic incoming root must
+            // be Bool, and at least one root must provide positive evidence.
+            // This admits loop-carried Bool phis without treating an
+            // evidence-free cycle as Bool.
+            let mut saw_incoming = false;
+            let mut saw_bool_root = false;
+            let mut contradicted = false;
+            let empty: [&crate::model::Link; 0] = [];
+            let links = index
+                .incoming
+                .get(&target)
+                .map(|links| links.as_slice())
+                .unwrap_or(&empty);
+            for link in links {
+                saw_incoming = true;
+                let incoming = match link.args.get(slot) {
+                    Some(LinkArg::Value(value)) => classify(index, value, cache, visiting),
+                    Some(LinkArg::Const(constant)) => Some(
+                        constant.concretetype.as_ref() == Some(&LowLevelType::Bool)
+                            || matches!(&constant.value, ConstValue::Bool(_)),
+                    ),
+                    None => Some(false),
+                };
+                match incoming {
+                    Some(true) => saw_bool_root = true,
+                    Some(false) => {
+                        contradicted = true;
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            if contradicted || !saw_incoming {
+                Some(false)
+            } else if saw_bool_root {
+                Some(true)
+            } else {
+                None
+            }
+        } else {
+            Some(false)
+        };
+        visiting.remove(&variable.id());
+        cache.insert(variable.id(), classified);
+        classified
+    }
+
+    let index = BoolReprIndex {
+        producer,
+        inputarg,
+        incoming,
+    };
+    classify(
+        &index,
+        variable,
+        &mut std::collections::HashMap::new(),
+        &mut std::collections::HashSet::new(),
+    ) == Some(true)
+}
+
 /// Preserve the MIR distinction between reading a by-value field and taking
 /// the address of an inline substructure. RPython receives distinct
 /// `getfield`/`getsubstruct` operations from its rtyper; Rust references are
@@ -1175,10 +1428,9 @@ impl<'a> Transformer<'a> {
         // (`ExitSwitch::Fused`), eliding the standalone compare op.  Runs
         // after the exitswitch/exits remap is committed; it never alters
         // link targets, so the exceptblock note below is unaffected.
-        // `rbool.py BoolRepr.rtype_bool` — erase the identity `bool` hop
-        // `set_branch` wrapped the condition in, so the scan below sees
-        // the comparison the post-rtyper graph upstream fuses carries.
-        rtype_bool_identity(graph, block_idx);
+        // The ordinary identity rewrite above has already applied
+        // `rbool.py BoolRepr.rtype_bool`, so a branch truthification over a
+        // Bool comparison reaches this scan as the comparison itself.
         optimize_goto_if_not(graph, block_idx);
 
         // `jtransform.py:124-127` — a virtualizable array read must be
@@ -1834,6 +2086,25 @@ impl<'a> Transformer<'a> {
                         result_ty: result_ty.clone(),
                     },
                 }])
+            }
+            // `rbool.py BoolRepr.rtype_bool`:
+            //
+            //     vlist = hop.inputargs(bool_repr)
+            //     return vlist[0]
+            //
+            // The returned input replaces the result everywhere. Route the
+            // identity through the same alias machinery as `same_as`: later
+            // operations are remapped while the block is rewritten, and the
+            // exitswitch plus every link argument are remapped when the block
+            // is committed. In particular this handles shared results and
+            // nested `bool(bool(x))`; neither requires a special branch-only
+            // substitution.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "bool" && variable_has_bool_repr(graph, operand) => {
+                RewriteResult::Identity(operand.clone())
             }
             OpKind::UnaryOp {
                 op: unop_name,
@@ -7297,105 +7568,6 @@ fn sum_variant_ctor(target: &CallTarget) -> Option<SumVariantCtor> {
     })
 }
 
-/// `rbool.py BoolRepr.rtype_bool` — the identity `bool` over an operand
-/// that is already Bool.
-///
-/// ```python
-/// class BoolRepr(IntegerRepr):
-///     lowleveltype = Bool
-///     def rtype_bool(_, hop):
-///         vlist = hop.inputargs(bool_repr)
-///         return vlist[0]
-/// ```
-///
-/// [`crate::model::FunctionGraph::set_branch`] wraps every branch
-/// condition in the `bool` hop `flowcontext.py` applies unconditionally
-/// before `guessbool`, which is why a block's `exitswitch` always names a
-/// `bool` result.  Upstream then specialises that hop per repr in the
-/// rtyper, and `BoolRepr` returns the operand itself — no operation is
-/// emitted — so the post-rtyper `block.exitswitch` names the
-/// *comparison*, and that is the graph shape
-/// [`optimize_goto_if_not`] was written against.
-///
-/// Pyre's MIR front end does not run the rtyper over these graphs, so the
-/// hop survives.  [`optimize_goto_if_not`]'s backward scan stops at the
-/// first op producing the exitswitch, so it fuses the truthify
-/// (`goto_if_not_int_is_true` over the compare's *result*) where upstream
-/// fuses the compare (`goto_if_not_int_lt` over its *operands*).  Both
-/// answer the same branch; the second is one jitcode instruction and one
-/// recorded trace op shorter, and it is the only thing that makes the
-/// `goto_if_not_{int,float,ptr}_*` keys reachable at all — every one of
-/// them is registered in `insns`, `blackhole`, the pyjitpl dispatch and
-/// the walker, and none of them can be produced while the hop stands.
-///
-/// The identity is applied only when the operand is produced, in this
-/// same block, by an op [`goto_if_not_fusable`] already names — i.e. one
-/// whose result is a Bool, which is what makes `bool(u) == u` true.  Over
-/// anything else `bool` is a real `u != 0` test
-/// (`rint.py IntegerRepr.rtype_bool` → `int_is_true`) and has to stay.
-fn rtype_bool_identity(graph: &mut FunctionGraph, block_idx: usize) -> bool {
-    use crate::model::ExitSwitch;
-
-    let Some(ExitSwitch::Value(v)) = graph.blocks[block_idx].exitswitch.clone() else {
-        return false;
-    };
-    let Some(hop_idx) = graph.blocks[block_idx]
-        .operations
-        .iter()
-        .position(|op| op.result.as_ref() == Some(&v))
-    else {
-        return false;
-    };
-    let OpKind::UnaryOp { op, operand, .. } = &graph.blocks[block_idx].operations[hop_idx].kind
-    else {
-        return false;
-    };
-    if op != "bool" {
-        return false;
-    }
-    let u = operand.clone();
-
-    // `hop.inputargs(bool_repr)` — the operand's repr has to be Bool for
-    // `BoolRepr` to be the one that answers.  Pyre carries no repr on the
-    // Variable (`concretetype_of` collapses Bool into `Signed`, the
-    // `getkind` projection), so the producing op stands in for it: the
-    // ops upstream lists as fusable are exactly the Bool-producing ones.
-    // A `bool` hop over another `bool` hop is left alone; it is already
-    // an identity and folding it changes nothing this pass reads.
-    let operand_is_bool = graph.blocks[block_idx].operations.iter().any(|cand| {
-        cand.result.as_ref() == Some(&u)
-            && !matches!(&cand.kind, OpKind::UnaryOp { op, .. } if op == "bool")
-            && goto_if_not_fusable(&cand.kind).is_some()
-    });
-    if !operand_is_bool {
-        return false;
-    }
-
-    // Dropping the hop retires `v`, so no other op in the block may read
-    // it.  Link arguments that carry it are rewritten to `u`, which holds
-    // the same value — the substitution upstream never has to make
-    // because its `v` was never a distinct Variable in the first place.
-    let read_elsewhere = graph.blocks[block_idx]
-        .operations
-        .iter()
-        .enumerate()
-        .any(|(i, cand)| i != hop_idx && crate::inline::op_variable_refs(&cand.kind).contains(&v));
-    if read_elsewhere {
-        return false;
-    }
-
-    graph.blocks[block_idx].operations.remove(hop_idx);
-    graph.blocks[block_idx].exitswitch = Some(ExitSwitch::Value(u.clone()));
-    for link in graph.blocks[block_idx].exits.iter_mut() {
-        for arg in link.args.iter_mut() {
-            if arg.as_variable() == Some(&v) {
-                *arg = LinkArg::Value(u.clone());
-            }
-        }
-    }
-    true
-}
-
 /// `jtransform.py Transformer.optimize_goto_if_not` — fuse a
 /// comparison op into the block's `exitswitch`.
 ///
@@ -9238,7 +9410,7 @@ mod tests {
     #[test]
     fn a_truthify_condition_over_an_unresolved_operand_declines() {
         let (mut graph, _cond, _operand, start) = {
-            let (mut g, c, o, s) = truthify_fixture(LlType::Signed, LlType::Signed);
+            let (g, c, o, s) = truthify_fixture(LlType::Signed, LlType::Signed);
             o.set_concretetype(None);
             (g.clone(), c, o, s)
         };
@@ -9294,78 +9466,148 @@ mod tests {
     fn a_truthify_over_a_comparison_folds_to_the_comparison() {
         use crate::model::{ExitCase, ExitSwitch, Link};
 
-        let mut graph = FunctionGraph::new("truthify_over_compare");
-        let a = graph.alloc_value_var();
-        let b = graph.alloc_value_var();
-        // `front::mir::canonical_binop_label` leaves the comparison bare;
-        // the `int_` prefix is applied by the assembler, after flatten.
-        a.set_concretetype(Some(LlType::Signed));
-        b.set_concretetype(Some(LlType::Signed));
-        let t = graph
-            .push_op_var(
+        // Some front rewrites retain the comparison's storage carrier rather
+        // than its semantic result type. Both still rtype to Bool upstream.
+        for (comparison_carrier, operand_type) in [
+            (ValueType::Int, LlType::Signed),
+            (ValueType::Unsigned, LlType::Unsigned),
+        ] {
+            let mut graph = FunctionGraph::new("truthify_over_compare");
+            let a = graph.alloc_value_var();
+            let b = graph.alloc_value_var();
+            // `front::mir::canonical_binop_label` leaves the comparison bare;
+            // the `int_` prefix is applied by the assembler, after flatten.
+            a.set_concretetype(Some(operand_type.clone()));
+            b.set_concretetype(Some(operand_type));
+            let t = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "lt".to_string(),
+                        lhs: a.clone(),
+                        rhs: b.clone(),
+                        result_ty: comparison_carrier.clone(),
+                    },
+                    true,
+                )
+                .unwrap();
+            t.set_concretetype(Some(LlType::Signed));
+            // `set_branch`'s unconditional `op.bool(w_value)` hop.
+            let cond = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::UnaryOp {
+                        op: "bool".to_string(),
+                        operand: t.clone(),
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            cond.set_concretetype(Some(LlType::Signed));
+            let if_false = graph.create_block();
+            let if_true = graph.create_block();
+            let start = graph.startblock.0;
+            graph.set_control_flow_metadata(
                 graph.startblock,
-                OpKind::BinOp {
-                    op: "lt".to_string(),
-                    lhs: a.clone(),
-                    rhs: b.clone(),
-                    result_ty: ValueType::Bool,
-                },
-                true,
-            )
-            .unwrap();
-        t.set_concretetype(Some(LlType::Signed));
-        // `set_branch`'s unconditional `op.bool(w_value)` hop.
-        let cond = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::UnaryOp {
-                    op: "bool".to_string(),
-                    operand: t.clone(),
-                    result_ty: ValueType::Bool,
-                },
-                true,
-            )
-            .unwrap();
-        cond.set_concretetype(Some(LlType::Signed));
-        let if_false = graph.create_block();
-        let if_true = graph.create_block();
-        let start = graph.startblock.0;
-        graph.set_control_flow_metadata(
-            graph.startblock,
-            Some(ExitSwitch::Value(cond.clone())),
-            vec![
-                Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
-                Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true))),
-            ],
-        );
+                Some(ExitSwitch::Value(cond.clone())),
+                vec![
+                    Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
+                    Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true))),
+                ],
+            );
 
-        assert!(
-            super::rtype_bool_identity(&mut graph, start),
-            "a `bool` over a comparison result must fold to the comparison"
-        );
-        assert!(
-            !graph.blocks[start]
-                .operations
-                .iter()
-                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "bool")),
-            "the identity hop must be removed"
-        );
-        assert_eq!(
-            graph.blocks[start].exitswitch,
-            Some(ExitSwitch::Value(t.clone())),
-            "the exitswitch must name the comparison result"
-        );
-
-        assert!(
-            super::optimize_goto_if_not(&mut graph, start),
-            "the comparison must then fuse"
-        );
-        match &graph.blocks[start].exitswitch {
-            Some(ExitSwitch::Fused { opname, args }) => {
-                assert_eq!(opname, "int_lt");
-                assert_eq!(args, &vec![a.clone(), b.clone()]);
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let block = &transformed.graph.blocks[start];
+            assert!(
+                !block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "bool")),
+                "the identity hop must be removed"
+            );
+            match &block.exitswitch {
+                Some(ExitSwitch::Fused { opname, args }) => {
+                    assert_eq!(opname, "int_lt");
+                    assert_eq!(args, &vec![a.clone(), b.clone()]);
+                }
+                other => panic!("expected a Fused int_lt exitswitch, got {other:?}"),
             }
-            other => panic!("expected a Fused int_lt exitswitch, got {other:?}"),
+        }
+    }
+
+    /// `uint_*` and rich-graph `is_` comparisons have no direct fused
+    /// `goto_if_not` form. They still produce BoolRepr, so only the redundant
+    /// truthification is removed and the comparison remains as the
+    /// exitswitch value.
+    #[test]
+    fn a_truthify_over_an_unfused_comparison_is_identity() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+
+        for (opname, operand_type, comparison_carrier) in [
+            ("uint_lt", LlType::Unsigned, ValueType::Int),
+            (
+                "is_",
+                crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+                ValueType::Int,
+            ),
+        ] {
+            let mut graph = FunctionGraph::new(format!("truthify_over_{opname}"));
+            let a = graph.alloc_value_var();
+            let b = graph.alloc_value_var();
+            a.set_concretetype(Some(operand_type.clone()));
+            b.set_concretetype(Some(operand_type));
+            let comparison = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: opname.into(),
+                        lhs: a,
+                        rhs: b,
+                        result_ty: comparison_carrier,
+                    },
+                    true,
+                )
+                .unwrap();
+            comparison.set_concretetype(Some(LlType::Signed));
+            let truthified = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::UnaryOp {
+                        op: "bool".into(),
+                        operand: comparison.clone(),
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            truthified.set_concretetype(Some(LlType::Signed));
+            let if_false = graph.create_block();
+            let if_true = graph.create_block();
+            let start = graph.startblock.0;
+            graph.set_control_flow_metadata(
+                graph.startblock,
+                Some(ExitSwitch::Value(truthified.clone())),
+                vec![
+                    Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
+                    Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true))),
+                ],
+            );
+
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let block = &transformed.graph.blocks[start];
+            assert!(
+                !block
+                    .operations
+                    .iter()
+                    .any(|op| op.result.as_ref() == Some(&truthified)),
+                "the Bool identity operation must be removed for {opname}"
+            );
+            assert_eq!(
+                block.exitswitch,
+                Some(ExitSwitch::Value(comparison)),
+                "the unfused {opname} comparison must become the branch value directly"
+            );
         }
     }
 
@@ -9419,15 +9661,8 @@ mod tests {
             ],
         );
 
-        assert!(
-            !super::rtype_bool_identity(&mut graph, start),
-            "a `bool` over an arithmetic result is a real int_is_true test"
-        );
-        assert!(
-            super::optimize_goto_if_not(&mut graph, start),
-            "the truthify itself still fuses"
-        );
-        match &graph.blocks[start].exitswitch {
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        match &transformed.graph.blocks[start].exitswitch {
             Some(ExitSwitch::Fused { opname, args }) => {
                 assert_eq!(opname, "int_is_true");
                 assert_eq!(args, &vec![t.clone()]);
@@ -9436,11 +9671,10 @@ mod tests {
         }
     }
 
-    /// Dropping the hop retires its result, so a second reader of that
-    /// result declines: nothing else may be left naming a Variable no op
-    /// produces.
+    /// `BoolRepr.rtype_bool` returns the input Variable, so every reader of
+    /// the result is renamed to that input just like upstream's rtyper graph.
     #[test]
-    fn a_truthify_whose_result_has_another_reader_declines() {
+    fn a_truthify_whose_result_has_another_reader_renames_it() {
         use crate::model::{ExitCase, ExitSwitch, Link};
 
         let mut graph = FunctionGraph::new("truthify_second_reader");
@@ -9474,7 +9708,7 @@ mod tests {
             .unwrap();
         cond.set_concretetype(Some(LlType::Signed));
         // A second consumer of the truthify result.
-        graph
+        let negated = graph
             .push_op_var(
                 graph.startblock,
                 OpKind::UnaryOp {
@@ -9487,19 +9721,335 @@ mod tests {
             .unwrap();
         let if_false = graph.create_block();
         let if_true = graph.create_block();
+        let carried = graph.alloc_value_var();
+        graph.push_inputarg_var(if_true, carried);
         let start = graph.startblock.0;
         graph.set_control_flow_metadata(
             graph.startblock,
             Some(ExitSwitch::Value(cond.clone())),
             vec![
                 Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
-                Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true))),
+                Link::new_mixed(
+                    vec![LinkArg::Value(cond.clone())],
+                    if_true,
+                    Some(ExitCase::Bool(true)),
+                ),
             ],
         );
 
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let block = &transformed.graph.blocks[start];
         assert!(
-            !super::rtype_bool_identity(&mut graph, start),
-            "a second reader of the truthify result must decline the fold"
+            !block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&cond)),
+            "the identity result must have no defining operation"
+        );
+        let negated_op = block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&negated))
+            .expect("the second consumer must survive");
+        assert!(
+            matches!(&negated_op.kind, OpKind::UnaryOp { operand, .. } if operand == &t),
+            "the second consumer must read the Bool input directly"
+        );
+        assert_eq!(
+            block.exitswitch,
+            Some(ExitSwitch::Value(t.clone())),
+            "the branch must read the Bool input; the comparison stays separate because its second reader prevents fusion"
+        );
+        assert_eq!(
+            block.exits[1].args[0].as_variable(),
+            Some(&t),
+            "an outgoing link must carry the Bool input rather than the removed identity result"
+        );
+    }
+
+    /// A Bool input is not one of `optimize_goto_if_not`'s comparison
+    /// producers, but `BoolRepr.rtype_bool` is still identity. This guards
+    /// the representation-based rule rather than the old fusion whitelist.
+    #[test]
+    fn a_truthify_over_a_non_fusable_bool_input_is_identity() {
+        let mut graph = FunctionGraph::new("truthify_bool_input");
+        let source = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "flag".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        source.set_concretetype(Some(LlType::Signed));
+        let truthified = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: source.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        truthified.set_concretetype(Some(LlType::Signed));
+        let negated = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "int_neg".into(),
+                    operand: truthified.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(negated.clone()));
+
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let block = transformed.graph.block(graph.startblock);
+        assert!(
+            !block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&truthified)),
+            "the Bool identity operation must be removed"
+        );
+        let negated_op = block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&negated))
+            .expect("the consumer must survive");
+        assert!(
+            matches!(&negated_op.kind, OpKind::UnaryOp { operand, .. } if operand == &source),
+            "the consumer must read the original Bool input"
+        );
+        assert_eq!(
+            block.exits[0].args[0].as_variable(),
+            Some(&negated),
+            "the return link remains well formed"
+        );
+    }
+
+    /// A block inputarg has no operation producer of its own. RPython types
+    /// the phi by unioning the matching incoming link arguments, so a Bool
+    /// source must retain BoolRepr after crossing the edge.
+    #[test]
+    fn a_truthify_over_a_bool_phi_is_identity() {
+        let mut graph = FunctionGraph::new("truthify_bool_phi");
+        let source = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "flag".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        source.set_concretetype(Some(LlType::Signed));
+
+        let (join, inputargs) = graph.create_block_with_arg_vars(1);
+        let phi = inputargs[0].clone();
+        phi.set_concretetype(Some(LlType::Signed));
+        graph.set_goto(graph.startblock, join, vec![source.clone()]);
+
+        let truthified = graph
+            .push_op_var(
+                join,
+                OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: phi.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        truthified.set_concretetype(Some(LlType::Signed));
+        let negated = graph
+            .push_op_var(
+                join,
+                OpKind::UnaryOp {
+                    op: "int_neg".into(),
+                    operand: truthified.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(join, Some(negated.clone()));
+
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let block = transformed.graph.block(join);
+        assert!(
+            !block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&truthified)),
+            "the Bool identity operation must be removed after the CFG edge"
+        );
+        let negated_op = block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&negated))
+            .expect("the consumer must survive");
+        assert!(
+            matches!(&negated_op.kind, OpKind::UnaryOp { operand, .. } if operand == &phi),
+            "the consumer must read the Bool phi directly"
+        );
+    }
+
+    /// A loop-header inputarg has its own backedge as one incoming value.
+    /// Classification must use the entry Bool as positive evidence without
+    /// recursing forever on the loop-carried edge.
+    #[test]
+    fn a_truthify_over_a_loop_carried_bool_phi_is_identity() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+
+        let mut graph = FunctionGraph::new("truthify_loop_bool_phi");
+        let source = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "flag".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        source.set_concretetype(Some(LlType::Signed));
+
+        let (header, inputargs) = graph.create_block_with_arg_vars(1);
+        let phi = inputargs[0].clone();
+        phi.set_concretetype(Some(LlType::Signed));
+        graph.set_goto(graph.startblock, header, vec![source]);
+
+        let truthified = graph
+            .push_op_var(
+                header,
+                OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: phi.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        truthified.set_concretetype(Some(LlType::Signed));
+
+        let (body, body_inputs) = graph.create_block_with_arg_vars(1);
+        let body_phi = body_inputs[0].clone();
+        body_phi.set_concretetype(Some(LlType::Signed));
+        let done = graph.create_block();
+        graph.set_control_flow_metadata(
+            header,
+            Some(ExitSwitch::Value(truthified.clone())),
+            vec![
+                Link::new_mixed(vec![], done, Some(ExitCase::Bool(false))),
+                Link::new_mixed(
+                    vec![LinkArg::Value(phi.clone())],
+                    body,
+                    Some(ExitCase::Bool(true)),
+                ),
+            ],
+        );
+        graph.set_goto(body, header, vec![body_phi]);
+        graph.set_return(done, None);
+
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let block = transformed.graph.block(header);
+        assert!(
+            !block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&truthified)),
+            "the loop-header Bool identity operation must be removed"
+        );
+        assert_eq!(
+            block.exitswitch,
+            Some(ExitSwitch::Value(phi)),
+            "the loop header must branch on its Bool inputarg directly"
+        );
+    }
+
+    /// A chain of two-predecessor phis is a DAG, not a cycle. Without a
+    /// memo the BoolRepr walk re-enters every diamond, which is what hung
+    /// the pyre-jit-trace prepass on interpreter graphs.
+    #[test]
+    fn bool_repr_on_a_phi_diamond_chain_does_not_explode() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+
+        let mut graph = FunctionGraph::new("bool_repr_phi_diamonds");
+        let mut current = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "flag".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        current.set_concretetype(Some(LlType::Signed));
+        let mut pred = graph.startblock;
+        for _ in 0..32 {
+            let (left, left_args) = graph.create_block_with_arg_vars(1);
+            let (right, right_args) = graph.create_block_with_arg_vars(1);
+            let (join, join_args) = graph.create_block_with_arg_vars(1);
+            left_args[0].set_concretetype(Some(LlType::Signed));
+            right_args[0].set_concretetype(Some(LlType::Signed));
+            let phi = join_args[0].clone();
+            phi.set_concretetype(Some(LlType::Signed));
+            graph.set_control_flow_metadata(
+                pred,
+                Some(ExitSwitch::Value(current.clone())),
+                vec![
+                    Link::new_mixed(
+                        vec![LinkArg::Value(current.clone())],
+                        left,
+                        Some(ExitCase::Bool(false)),
+                    ),
+                    Link::new_mixed(
+                        vec![LinkArg::Value(current.clone())],
+                        right,
+                        Some(ExitCase::Bool(true)),
+                    ),
+                ],
+            );
+            graph.set_goto(left, join, vec![left_args[0].clone()]);
+            graph.set_goto(right, join, vec![right_args[0].clone()]);
+            current = phi;
+            pred = join;
+        }
+        let truthified = graph
+            .push_op_var(
+                pred,
+                OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: current.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        truthified.set_concretetype(Some(LlType::Signed));
+        graph.set_return(pred, Some(truthified.clone()));
+
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let block = transformed.graph.block(pred);
+        assert!(
+            !block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&truthified)),
+            "the Bool identity over the phi chain must still fold"
         );
     }
 

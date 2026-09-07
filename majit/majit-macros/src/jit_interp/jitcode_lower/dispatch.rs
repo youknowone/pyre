@@ -2247,24 +2247,28 @@ impl<'c> Lowerer<'c> {
     /// caller by the split path below.
     pub(super) fn arm_body_has_infer_call(&self, body: &Expr) -> bool {
         use syn::visit::Visit;
-        struct InferCallProbe<'a, 'c> {
+        struct LateRejectCallProbe<'a, 'c> {
             lowerer: &'a Lowerer<'c>,
             hit: bool,
         }
-        impl<'ast, 'a, 'c> Visit<'ast> for InferCallProbe<'a, 'c> {
+        impl<'ast, 'a, 'c> Visit<'ast> for LateRejectCallProbe<'a, 'c> {
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-                if !self.hit
-                    && matches!(
-                        self.lowerer.resolve_call_policy(&call.func),
-                        Some(CallPolicySpec::Infer)
-                    )
-                {
-                    self.hit = true;
+                if !self.hit {
+                    match self.lowerer.resolve_call_policy(&call.func) {
+                        Some(CallPolicySpec::Infer) => self.hit = true,
+                        Some(CallPolicySpec::Explicit(
+                            crate::jit_interp::CallPolicyKind::InlinePipelineInt
+                            | crate::jit_interp::CallPolicyKind::InlinePipelineRef
+                            | crate::jit_interp::CallPolicyKind::InlinePipelineFloat
+                            | crate::jit_interp::CallPolicyKind::InlinePipelineVoid,
+                        )) => self.hit = true,
+                        _ => {}
+                    }
                 }
                 syn::visit::visit_expr_call(self, call);
             }
         }
-        let mut probe = InferCallProbe {
+        let mut probe = LateRejectCallProbe {
             lowerer: self,
             hit: false,
         };
@@ -2732,9 +2736,14 @@ pub(super) fn lower_dispatch_chain(
         // transactional sub-lowerer returns an abort stub; if it can, dropping
         // the green return would resume at the old opcode. RPython keeps `pc`
         // in the caller frame across either call shape.
-        // Inferred residual calls also use this split even without the size
-        // opt-in: their resume guards belong to the callee frame, while the
-        // caller still owns green `pc`.
+        // Infer and `inline_pipeline_*` calls stay on the sub-JitCode path
+        // even without the size opt-in. Infer resume guards belong to the
+        // callee frame while the caller still owns green `pc`. Pipeline
+        // callees are resolved at install (`trailing_return_info`); a
+        // missing typed return emits `return None` via
+        // `inference_failure_tokens`, and that `None` must stay inside the
+        // per-arm IIFE so only that arm degrades. Force-inlining would
+        // make the same `return None` abort the whole dispatch JitCode.
         let has_infer_call = lowerer.arm_body_has_infer_call(&arm.original_body);
         let pc_return_increment = if (config.split_dispatch || has_infer_call)
             && pc_is_green(config)
@@ -2747,13 +2756,18 @@ pub(super) fn lower_dispatch_chain(
             None
         };
         let inline_outcome = if pc_return_increment.is_none()
-            && pc_is_green(config)
             && matches!(
                 arm.pattern,
                 crate::jit_interp::classify::ArmPattern::Lowerable
             )
             && !has_infer_call
         {
+            // Red `pc` still lives in the merge-point register file. A
+            // sub-JitCode `pc += N` never writes that slot back
+            // (`BC_INLINE_CALL` is caller→callee only), so the next
+            // merge point rereads a stale pc. Inline with `pc_pinned`
+            // is the same Variable-in-place write RPython's flatten
+            // keeps for `next_instr`.
             lowerer.try_inline_dispatch_arm(&arm.original_body)
         } else {
             InlineArmOutcome::Rejected
@@ -3350,7 +3364,22 @@ pub(super) fn resolve_reds(
 
     let owned_red_names: Vec<String>;
     let reds_names: Vec<&str> = if !explicit_red_names.is_empty() {
-        owned_red_names = explicit_red_names;
+        // `promote_greens` only walks `jitdriver.greens`. A name that is
+        // also listed in `reds` would be both guarded and passed as a
+        // red — `handle_jit_marker__jit_merge_point` keeps the two lists
+        // disjoint (`args[2:2+num_green]` vs the tail).
+        let green_names: HashSet<String> = config
+            .greens
+            .iter()
+            .filter_map(|expr| match expr {
+                syn::Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
+                _ => None,
+            })
+            .collect();
+        owned_red_names = explicit_red_names
+            .into_iter()
+            .filter(|name| !green_names.contains(name))
+            .collect();
         owned_red_names.iter().map(|s| s.as_str()).collect()
     } else {
         // Issue 2.2 (support.py:121 _kind2count = {'int':1,'ref':2,'float':3}):
@@ -3851,8 +3880,15 @@ pub(crate) fn lower_dispatch_body(
     let reds_i_lit: Vec<_> = reds_i.iter().map(|b| quote::quote!(#b)).collect();
     let reds_r_lit: Vec<_> = reds_r.iter().map(|b| quote::quote!(#b)).collect();
     let reds_f_lit: Vec<_> = reds_f.iter().map(|b| quote::quote!(#b)).collect();
+    let mut merge_reads: Vec<Register> = Vec::new();
+    merge_reads.extend(greens_i.iter().map(|&b| Register::int(u16::from(b))));
+    merge_reads.extend(greens_r.iter().map(|&b| Register::ref_(u16::from(b))));
+    merge_reads.extend(greens_f.iter().map(|&b| Register::float(u16::from(b))));
+    merge_reads.extend(reds_i.iter().map(|&b| Register::int(u16::from(b))));
+    merge_reads.extend(reds_r.iter().map(|&b| Register::ref_(u16::from(b))));
+    merge_reads.extend(reds_f.iter().map(|&b| Register::float(u16::from(b))));
     lowerer.emit_op(
-        OpMeta::linear(OpKind::JitMergePoint, vec![], vec![]),
+        OpMeta::linear(OpKind::JitMergePoint, merge_reads, vec![]),
         quote::quote! {
             // __jdindex: jtransform.py:1704 portal_jd.index threaded as runtime param.
             __builder.jit_merge_point(

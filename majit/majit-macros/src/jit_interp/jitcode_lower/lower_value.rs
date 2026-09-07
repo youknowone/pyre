@@ -282,11 +282,16 @@ impl<'c> Lowerer<'c> {
                 })
             }
             Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_float_type(ty) => {
+                let unsigned = expr_is_unsigned_int(expr);
                 let binding = self.lower_value_expr(expr)?;
-                if !matches!(binding.kind, BindingKind::Int) {
-                    return None;
+                match binding.kind {
+                    // Same-type force_cast is a no-op (`rewrite_op_force_cast`
+                    // when `v_arg.concretetype == v_result.concretetype`).
+                    BindingKind::Float => Some(binding),
+                    BindingKind::Int if unsigned => self.lower_uint_to_float_cast(binding),
+                    BindingKind::Int => self.lower_int_to_float_cast(binding),
+                    BindingKind::Ref => None,
                 }
-                self.lower_int_to_float_cast(binding)
             }
             Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_int_cast(ty) => {
                 let binding = self.lower_value_expr(expr)?;
@@ -298,7 +303,11 @@ impl<'c> Lowerer<'c> {
                     // is `127`, which a float->i64 followed by an int narrowing
                     // (`44`) would not reproduce.
                     BindingKind::Float if is_word_width_int(ty) => {
-                        self.lower_float_to_int_cast(binding)
+                        if type_is_unsigned_int(ty) {
+                            self.lower_float_to_uint_cast(binding)
+                        } else {
+                            self.lower_float_to_int_cast(binding)
+                        }
                     }
                     _ => None,
                 }
@@ -603,6 +612,9 @@ impl<'c> Lowerer<'c> {
         }
         let base = self.lower_value_expr(&call.args[0])?;
         let ea = self.lower_value_expr(&call.args[1])?;
+        if !matches!(base.kind, BindingKind::Int) || !matches!(ea.kind, BindingKind::Int) {
+            return None;
+        }
         let (base_reg, ea_reg) = (base.reg, ea.reg);
         let dst = self.alloc_reg();
         self.emit_op(
@@ -785,6 +797,9 @@ impl<'c> Lowerer<'c> {
         if !self.bindings.contains_key(&lhs_ident) {
             return None;
         }
+        if lhs_ident == "pc" && !self.pc_pinned {
+            return None;
+        }
         let binding = self.lower_value_expr(&assign.right)?;
         self.bindings.insert(lhs_ident, binding);
         Some(())
@@ -807,6 +822,14 @@ impl<'c> Lowerer<'c> {
             return None;
         };
         let lhs_ident = lhs_path.path.get_ident()?.to_string();
+        // An unpinned `pc` write in a sub-JitCode updates the callee copy
+        // and never reaches the merge-point register (`BC_INLINE_CALL`
+        // copies caller→callee only). Refuse so the arm degrades instead
+        // of compiling a stale-pc loop. `pc_pinned` (inline dispatch)
+        // intercepts these writes first.
+        if lhs_ident == "pc" && !self.pc_pinned {
+            return None;
+        }
         // `lower_expr_stmt` reaches this before `lower_stmt_fallback`, so the
         // green-write refusal there never sees the statement.  A green is a
         // caller local threaded through the merge point: writing it into this
@@ -2384,6 +2407,27 @@ impl<'c> Lowerer<'c> {
         })
     }
 
+    /// `rewrite_op_force_cast` when the source is unsigned and the
+    /// destination is float: residual `cast_uint_to_float`.
+    fn lower_uint_to_float_cast(&mut self, binding: Binding) -> Option<Binding> {
+        let src_reg = binding.reg;
+        let reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::UnaryI,
+                Register::ints(&[src_reg]),
+                vec![Register::float(reg)],
+            ),
+            quote! { __builder.record_cast_uint_to_float(#reg, #src_reg); },
+        );
+        Some(Binding {
+            reg,
+            kind: BindingKind::Float,
+            depends_on_stack: binding.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
     /// Lower a `<float> as i64` cast to RPython's `cast_float_to_int`
     /// (`bhimpl_cast_float_to_int`), the inverse of
     /// [`Self::lower_int_to_float_cast`]. The operand is read from the float
@@ -2402,6 +2446,27 @@ impl<'c> Lowerer<'c> {
                 vec![Register::int(reg)],
             ),
             quote! { __builder.record_cast_float_to_int(#reg, #src_reg); },
+        );
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: binding.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// `rewrite_op_force_cast` float → unsigned word: residual
+    /// `cast_float_to_uint`.
+    fn lower_float_to_uint_cast(&mut self, binding: Binding) -> Option<Binding> {
+        let src_reg = binding.reg;
+        let reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::UnaryI,
+                vec![Register::float(src_reg)],
+                vec![Register::int(reg)],
+            ),
+            quote! { __builder.record_cast_float_to_uint(#reg, #src_reg); },
         );
         Some(Binding {
             reg,
@@ -2434,18 +2499,51 @@ impl<'c> Lowerer<'c> {
             "u8" => (false, 8),
             "u16" => (false, 16),
             "u32" => (false, 32),
-            // 64-bit / pointer-width targets keep the full machine word.
-            "i64" | "u64" | "isize" | "usize" => return Some(binding),
+            // `_int_to_int_cast` to Bool is `int_is_true`.
+            "bool" => {
+                let src_reg = binding.reg;
+                let reg = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::UnaryI,
+                        Register::ints(&[src_reg]),
+                        vec![Register::int(reg)],
+                    ),
+                    quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::IntIsTrue, #src_reg); },
+                );
+                return Some(Binding {
+                    reg,
+                    kind: BindingKind::Int,
+                    depends_on_stack: binding.depends_on_stack,
+                    struct_type: None,
+                });
+            }
+            // 64-bit targets keep the full machine word. Pointer-width
+            // targets are the host crate's `usize`, which is 32 bits on
+            // wasm32 — emit a shift/mask whose count is computed there.
+            "i64" | "u64" => return Some(binding),
+            "isize" => (true, 0),
+            "usize" => (false, 0),
             _ => return None,
         };
         let depends_on_stack = binding.depends_on_stack;
         let x_reg = binding.reg;
         let result_reg = if signed {
-            let shift = (64 - bits) as i64;
             let shift_reg = self.alloc_reg();
+            let shift_tokens = if bits == 0 {
+                quote! {
+                    __builder.load_const_i_value(
+                        #shift_reg,
+                        (64 - ::core::mem::size_of::<usize>() * 8) as i64,
+                    );
+                }
+            } else {
+                let shift = (64 - bits) as i64;
+                quote! { __builder.load_const_i_value(#shift_reg, #shift); }
+            };
             self.emit_op(
                 OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(shift_reg)]),
-                quote! { __builder.load_const_i_value(#shift_reg, #shift); },
+                shift_tokens,
             );
             let shl_reg = self.alloc_reg();
             let lshift = syn::Ident::new("IntLshift", proc_macro2::Span::call_site());
@@ -2469,11 +2567,28 @@ impl<'c> Lowerer<'c> {
             );
             res_reg
         } else {
-            let mask = ((1u64 << bits) - 1) as i64;
             let mask_reg = self.alloc_reg();
+            let mask_tokens = if bits == 0 {
+                quote! {
+                    __builder.load_const_i_value(
+                        #mask_reg,
+                        {
+                            let bits = ::core::mem::size_of::<usize>() * 8;
+                            if bits >= 64 {
+                                -1i64
+                            } else {
+                                ((1u64 << bits) - 1) as i64
+                            }
+                        },
+                    );
+                }
+            } else {
+                let mask = ((1u64 << bits) - 1) as i64;
+                quote! { __builder.load_const_i_value(#mask_reg, #mask); }
+            };
             self.emit_op(
                 OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(mask_reg)]),
-                quote! { __builder.load_const_i_value(#mask_reg, #mask); },
+                mask_tokens,
             );
             let res_reg = self.alloc_reg();
             let and = syn::Ident::new("IntAnd", proc_macro2::Span::call_site());
@@ -3097,6 +3212,24 @@ mod tests {
             assert!(
                 emitted(&lowerer).contains("IntIsZero"),
                 "`0 == n` is `_rewrite_symmetric` then the same fold"
+            );
+        }
+
+        #[test]
+        fn rust_div_records_c_truncating_floordiv() {
+            let (lowerer, out) = lower("a / b", |l| {
+                l.bindings.insert("a".into(), binding(1, BindingKind::Int));
+                l.bindings.insert("b".into(), binding(2, BindingKind::Int));
+            });
+            assert!(out.is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("record_int_floordiv"),
+                "Rust `/` is `_ll_2_int_floordiv`, got:\n{text}"
+            );
+            assert!(
+                !text.contains("record_int_py_div"),
+                "must not emit Python-floor `ll_int_py_div`:\n{text}"
             );
         }
 

@@ -37,16 +37,17 @@ mod reexports {
     };
     pub(super) use super::helpers::{
         binding_kind_for_inline_policy, binop_f_emit_tokens, binop_i_emit_tokens,
-        binop_is_symmetric, block_has_loop_control, expr_has_loop_control, extract_block_tail_int,
-        extract_bool_branch_values, extract_branch_int, extract_pat_switch_case_tokens,
-        extract_pat_value_tokens, extract_stmts, inline_call_tokens, inline_call_tokens_void,
-        inline_float_arg_tokens, inline_int_arg_tokens, inline_prebuild_path,
-        inline_ref_arg_tokens, inline_shared_path, int_arg_regs, int_literal_value,
-        is_lowercase_binding_pat, is_supported_float_type, is_supported_int_cast,
-        is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens, mirrored_compare_binop,
-        opcode_for_assign_binop, opcode_for_assign_binop_f, opcode_for_binop, opcode_for_binop_f,
-        opcode_for_compare_f, stmt_has_loop_control, typed_call_arg_tokens,
-        word_result_addr_for_kind, word_result_addr_tokens, word_void_addr_tokens,
+        binop_is_symmetric, block_has_loop_control, expr_has_loop_control, expr_is_unsigned_int,
+        extract_block_tail_int, extract_bool_branch_values, extract_branch_int,
+        extract_pat_switch_case_tokens, extract_pat_value_tokens, extract_stmts,
+        inline_call_tokens, inline_call_tokens_void, inline_float_arg_tokens,
+        inline_int_arg_tokens, inline_prebuild_path, inline_ref_arg_tokens, inline_shared_path,
+        int_arg_regs, int_literal_value, is_lowercase_binding_pat, is_supported_float_type,
+        is_supported_int_cast, is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens,
+        mirrored_compare_binop, opcode_for_assign_binop, opcode_for_assign_binop_f,
+        opcode_for_binop, opcode_for_binop_f, opcode_for_compare_f, stmt_has_loop_control,
+        type_is_unsigned_int, typed_call_arg_tokens, word_result_addr_for_kind,
+        word_result_addr_tokens, word_void_addr_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -1654,6 +1655,10 @@ pub(super) enum LoweredCondition {
     Value {
         binding: Binding,
         negated: bool,
+        /// `true` when this value is an integer `== 0` / `!= 0` compare
+        /// rewritten as a truth test. Rust `if`/`while` conditions are
+        /// otherwise `bool`, which flatten emits as `goto_if_not`.
+        int_is_true: bool,
     },
     Compare {
         lhs: Binding,

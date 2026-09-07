@@ -221,30 +221,17 @@ fn factory_does_not_grow_asm_after_prebuild() {
 
 #[test]
 fn distinct_arms_emit_distinct_bc_live_offsets() {
-    // The polymorphism core has two layers:
+    // The four Lowerable arms (OP_GUARD_A / OP_SUM_AB / OP_SUM_ABC /
+    // OP_SUM_ABCD) are force-inlined into the dispatch JitCode
+    // (`try_inline_dispatch_arm`). Survival and polymorphism therefore
+    // live in the dispatch body:
     //
-    // (1) Per-arm survival: every lowerable arm's sub-JitCode embedded
-    //     under the dispatch JitCode (`BC_INLINE_CALL` target,
-    //     `jitcode_lower/dispatch.rs`'s `lower_dispatch_chain`) must emit at least one
-    //     per-pc BC_LIVE marker past the leading canonical.  If the
-    //     dispatch arm lowerer fell to `__sub_builder.abort()` at
-    //     `jitcode_lower/dispatch.rs`'s `lower_dispatch_chain` for one of the four
-    //     `SUM`/`GUARD_A` arms, the resulting sub-JitCode body is a
-    //     single `BC_ABORT` byte with zero BC_LIVE markers — the
-    //     per-arm assertion below catches that regression.  The
-    //     Polymorphic4State fixture has four lowerable arms, so at
-    //     least four sub-JitCodes must satisfy this guarantee.
-    //
-    // (2) Polymorphism: the union of all per-pc offsets across the
-    //     lowerable sub-JitCodes must contain at least two distinct
-    //     values.  A regression to "every arm uses the canonical
-    //     triple" would collapse this set to size 1.
-    //
-    // The dispatch JitCode body itself emits only the canonical
-    // `live_placeholder()` markers (jit_merge_point pre/post + the
-    // trailing -live- after each inline_call_*), so the per-pc
-    // distinctness signal lives in the embedded sub-JitCodes — one
-    // per arm — rather than the parent dispatch body.
+    // (1) Each arm writes `state.a`, so four `BC_STORE_STATE_FIELD`s
+    //     prove none of them fell to `__sub_builder.abort()`.
+    // (2) The union of per-pc BC_LIVE offsets in that same body (past
+    //     the leading canonical marker) must contain at least two
+    //     distinct values. A regression to "every arm uses the
+    //     canonical triple" would collapse this set to size 1.
     let mut asm = Assembler::new();
     let canonical: Vec<u8> = (0..4u8).collect();
     install_canonical_for_test(&mut asm, &canonical);
@@ -252,66 +239,30 @@ fn distinct_arms_emit_distinct_bc_live_offsets() {
     let dispatch = __dispatch_jitcode_polymorphic_mainloop(&mut asm, 0i64)
         .expect("dispatch lower must succeed for fixture");
 
-    // Identify lowerable arm sub-JitCodes by the leading
-    // `__sub_builder.live_placeholder()` (`jitcode_lower/dispatch.rs`'s
-    // `lower_dispatch_chain`):
-    // a lowerable sub-JitCode body starts with BC_LIVE at offset 0.
-    // Halt/Nop arms produce an empty body (no BC_LIVE); the
-    // abort-fallback path in the same function produces a single BC_ABORT byte
-    // (also no BC_LIVE) — both shapes collapse to "no BC_LIVE markers"
-    // and are filtered out here.  An abort-fallback regression on a
-    // *lowerable* arm therefore reduces the count of qualifying
-    // sub-JitCodes, which the lowerable-count assertion below catches.
-    let mut per_arm_offsets: Vec<Vec<u16>> = Vec::new();
-    for d in dispatch.exec.descrs.iter() {
-        if let majit_metainterp::jitcode::RuntimeBhDescr::JitCode(jc) = d {
-            let offs = collect_bc_live_offsets(jc);
-            if offs.is_empty() {
-                // Halt/Nop arm (empty body) or abort-fallback (`BC_ABORT`
-                // only).  Skip — not a lowerable arm sub-JitCode.
-                continue;
-            }
-            // The first offset is the canonical marker; the rest are per-pc
-            // liveness markers emitted inside the arm body.
-            let per_pc: Vec<u16> = offs.into_iter().skip(1).collect();
-            assert!(
-                !per_pc.is_empty(),
-                "lowerable arm sub-JitCode must emit at least one per-pc \
-                 BC_LIVE marker past the leading canonical; got none — \
-                 the dispatch arm lowerer at \
-                 jitcode_lower/dispatch.rs:1874 may have dropped a real \
-                 per-pc -live- entry, or the body emitted only the \
-                 leading `live_placeholder()`"
-            );
-            per_arm_offsets.push(per_pc);
-        }
-    }
-
-    // Polymorphic4State fixture: four lowerable arms (OP_GUARD_A /
-    // OP_SUM_AB / OP_SUM_ABC / OP_SUM_ABCD).  Fewer than four
-    // qualifying sub-JitCodes means at least one lowerable arm fell to
-    // the abort-fallback in `jitcode_lower/dispatch.rs`'s `lower_dispatch_chain`.
+    let store_count = dispatch
+        .code
+        .iter()
+        .filter(|&&b| b == majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD)
+        .count();
     assert!(
-        per_arm_offsets.len() >= 4,
-        "expected at least 4 lowerable arm sub-JitCodes (one per \
-         OP_GUARD_A/OP_SUM_AB/OP_SUM_ABC/OP_SUM_ABCD); got {} — the \
-         dispatch arm lowerer dropped one or more lowerable bodies to \
-         `__sub_builder.abort()` at jitcode_lower/dispatch.rs:1874",
-        per_arm_offsets.len()
+        store_count >= 4,
+        "expected at least 4 inlined state-field stores (one per \
+         OP_GUARD_A/OP_SUM_AB/OP_SUM_ABC/OP_SUM_ABCD); got {store_count} — \
+         a lowerable arm fell to abort instead of try_inline_dispatch_arm"
     );
 
-    // Polymorphism: the union of all per-pc marker offsets across the
-    // lowerable sub-JitCodes must contain at least two distinct values.
-    let all_offsets: std::collections::BTreeSet<u16> = per_arm_offsets
-        .iter()
-        .flat_map(|offs| offs.iter().copied())
-        .collect();
+    let offs = collect_bc_live_offsets(&dispatch);
+    let per_pc: Vec<u16> = offs.into_iter().skip(1).collect();
+    assert!(
+        !per_pc.is_empty(),
+        "inlined lowerable arms must emit at least one per-pc BC_LIVE \
+         marker past the leading canonical; got none"
+    );
+    let all_offsets: std::collections::BTreeSet<u16> = per_pc.iter().copied().collect();
     assert!(
         all_offsets.len() >= 2,
         "polymorphic per-pc liveness regressed: every per-pc BC_LIVE marker \
-         across embedded sub-JitCodes points at the same offset — saw \
-         {all_offsets:?} across {} arms",
-        per_arm_offsets.len()
+         in the dispatch body points at the same offset — saw {all_offsets:?}"
     );
 }
 
@@ -363,26 +314,16 @@ fn dispatch_inline_call_descrs_have_jitcode_entries() {
     let dispatch = __dispatch_jitcode_polymorphic_mainloop(&mut asm, 0i64)
         .expect("dispatch lower must succeed for fixture");
 
-    let mut jitcode_count = 0;
+    // Every Lowerable arm is force-inlined; `_ => break` is the default
+    // label, not a residual INLINE_CALL. Residual Nop/Halt/abort stubs,
+    // if any remain, must still be non-empty JitCode descrs — never
+    // fnaddr wrappers (`pyjitpl/dispatch.rs` `run_one_step`).
     for d in dispatch.exec.descrs.iter() {
         if let majit_metainterp::jitcode::RuntimeBhDescr::JitCode(jc) = d {
-            jitcode_count += 1;
-            // Each sub-jitcode body is at least 1 byte. Cross-scope arms
-            // fall back to a single abort byte
-            // (`jitcode_lower/dispatch.rs`'s `lower_dispatch_chain`),
-            // which is intentional — but a zero-byte body would mean the
-            // build pipeline silently dropped the sub-jitcode entirely.
             assert!(
                 !jc.code.is_empty(),
                 "BC_INLINE_CALL target sub-jitcode body must be non-empty"
             );
         }
     }
-    assert!(
-        jitcode_count >= 1,
-        "dispatch must emit at least one BC_INLINE_CALL JitCode descr; \
-         a fnaddr-only descr table would mean the lowerer wired native \
-         call targets instead of frame-chain sub-jitcodes, regressing \
-         the dispatch.rs:1690-1692 contract"
-    );
 }

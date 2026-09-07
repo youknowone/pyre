@@ -430,6 +430,32 @@ pub(super) fn is_word_width_int(ty: &Type) -> bool {
     }
 }
 
+pub(super) fn type_is_unsigned_int(ty: &Type) -> bool {
+    match ty {
+        Type::Path(type_path) => {
+            type_path.path.is_ident("u8")
+                || type_path.path.is_ident("u16")
+                || type_path.path.is_ident("u32")
+                || type_path.path.is_ident("u64")
+                || type_path.path.is_ident("usize")
+        }
+        _ => false,
+    }
+}
+
+/// Whether a source expression is already an unsigned integer value.
+/// Covers `x as u64` / `(x as u32)` so `as f64` can pick
+/// `cast_uint_to_float` the way `rewrite_op_force_cast` uses
+/// `rffi.size_and_sign`.
+pub(super) fn expr_is_unsigned_int(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(paren) => expr_is_unsigned_int(&paren.expr),
+        Expr::Group(group) => expr_is_unsigned_int(&group.expr),
+        Expr::Cast(cast) => type_is_unsigned_int(&cast.ty),
+        _ => false,
+    }
+}
+
 pub(super) fn is_supported_float_type(ty: &Type) -> bool {
     match ty {
         Type::Path(type_path) => type_path.path.is_ident("f64"),
@@ -551,11 +577,11 @@ pub(crate) fn helper_policy_path(expr: &Expr) -> Option<Path> {
 
 /// Emit the int-binop recording call for `dst = lhs <op> rhs`.
 ///
-/// `jtransform.py` rewrites `int_floordiv` / `int_mod` to the
-/// `int.py_div` / `int.py_mod` oopspec builtin call (no `bhimpl_int_*`
-/// primitive exists), so those route to `record_int_py_div` /
-/// `record_int_py_mod` (residual call to `ll_int_py_div` / `ll_int_py_mod`);
-/// every other int binop keeps the bare-primitive `record_binop_i`.
+/// `jtransform.py` `rewrite_op_int_floordiv` / `rewrite_op_int_mod` are
+/// `_do_builtin_call`, which residual-calls `support.py`
+/// `_ll_2_int_floordiv` / `_ll_2_int_mod` (C-truncating). Rust `/` and
+/// `%` are the same truncation. `int.py_div` / `int.py_mod` are a
+/// different rewrite (`_handle_int_special`) for Python-floor `//`.
 pub(super) fn binop_i_emit_tokens(
     dst: u16,
     opcode: &Ident,
@@ -563,8 +589,8 @@ pub(super) fn binop_i_emit_tokens(
     rhs: u16,
 ) -> proc_macro2::TokenStream {
     match opcode.to_string().as_str() {
-        "IntFloorDiv" => quote! { __builder.record_int_py_div(#dst, #lhs, #rhs); },
-        "IntMod" => quote! { __builder.record_int_py_mod(#dst, #lhs, #rhs); },
+        "IntFloorDiv" => quote! { __builder.record_int_floordiv(#dst, #lhs, #rhs); },
+        "IntMod" => quote! { __builder.record_int_mod(#dst, #lhs, #rhs); },
         _ => quote! { __builder.record_binop_i(#dst, majit_ir::OpCode::#opcode, #lhs, #rhs); },
     }
 }
