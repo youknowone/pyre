@@ -4220,7 +4220,7 @@ impl<M: Clone> MetaInterp<M> {
     /// The local `original_boxes = greens ++ reds` shape is restored
     /// (greens prepended as positional placeholders), matching RPython's
     /// `original_boxes[num_green_args + index_of_virtualizable]` read.
-    fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
+    fn initialize_virtualizable(&mut self, ctx: &mut TraceCtx, live_values: &[Value]) {
         // pyjitpl.py:3315: vinfo = self.jitdriver_sd.virtualizable_info
         // Prefer the trace-bound `active_jitdriver_sd` (RPython
         // `self.jitdriver_sd`); fall back to scanning when an
@@ -4290,7 +4290,7 @@ impl<M: Clone> MetaInterp<M> {
         // token-none precondition.  The blackhole helper implements the same
         // two force_now arms and reaches the host's ResumeGuardForcedDescr
         // force hook for an Active token.
-        let virtualizable_ptr = if !self.vable_ptr.is_null() {
+        let mut virtualizable_ptr = if !self.vable_ptr.is_null() {
             self.vable_ptr as *mut u8
         } else {
             match original_boxes.get(index) {
@@ -4300,8 +4300,18 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         if !virtualizable_ptr.is_null() {
+            // RPython's `virtualizable` local is a GC pointer: `clear_vable_token`
+            // can allocate in `force_now`, and the collector forwards the local
+            // before `read_boxes`. Root the same way and reload before any heap
+            // read (`initialize_virtualizable` / `clear_vable_token`).
+            let root = majit_gc::shadow_stack::push(majit_ir::GcRef(virtualizable_ptr as usize));
             unsafe {
                 crate::virtualizable::bh_clear_vable_token(info, virtualizable_ptr);
+            }
+            virtualizable_ptr = majit_gc::shadow_stack::get(root).0 as *mut u8;
+            majit_gc::shadow_stack::pop_to(root);
+            if !self.vable_ptr.is_null() {
+                self.vable_ptr = virtualizable_ptr;
             }
         }
 
@@ -26195,6 +26205,54 @@ mod tests {
 
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert_eq!(obj.token, 0);
+        let ctx = meta.trace_ctx().expect("expected active trace context");
+        assert_eq!(
+            ctx.virtualizable_entry_at(0),
+            Some((OpRef::input_arg_int(1), Value::Int(41)))
+        );
+    }
+
+    extern "C" fn test_clear_vable_token_forwards(obj: i64) {
+        let old = obj as *mut ResidualCallVableObj;
+        unsafe {
+            (*old).token = 0;
+            let moved = Box::into_raw(Box::new(ResidualCallVableObj::new(0, (*old).pc)));
+            majit_gc::shadow_stack::walk_roots(|root| {
+                if root.0 == old as usize {
+                    *root = majit_ir::GcRef(moved as usize);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn initialize_virtualizable_reloads_a_forced_forwarded_object() {
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        info.set_clear_vable(
+            test_clear_vable_token_forwards as *const (),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
+        meta.set_virtualizable_info(std::sync::Arc::new(info));
+
+        let mut obj = ResidualCallVableObj::new(0x100, 41);
+        let old = &mut obj as *mut ResidualCallVableObj;
+        meta.set_vable_ptr(old.cast());
+        let descriptor = JitDriverStaticData::with_virtualizable(
+            vec![],
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        );
+        let frame = Value::Ref(majit_ir::GcRef(old as usize));
+
+        let action = meta.force_start_tracing(779, (0, 0), Some(descriptor), &[frame]);
+
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        assert_eq!(obj.token, 0);
+        assert_ne!(meta.vable_ptr as usize, old as usize);
         let ctx = meta.trace_ctx().expect("expected active trace context");
         assert_eq!(
             ctx.virtualizable_entry_at(0),
