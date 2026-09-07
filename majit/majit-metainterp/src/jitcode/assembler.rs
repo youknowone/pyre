@@ -3816,22 +3816,26 @@ impl JitCodeBuilder {
             self.push_reg_u8(caller_src, "inline_call caller argument");
             self.push_reg_u8(callee_dst, "inline_call callee argument");
         }
-        self.push_return_slot(return_i);
-        self.push_return_slot(return_r);
-        self.push_return_slot(return_f);
-        // RPython `assembler.py:217-219` — record the result kind at
-        // end-of-instruction position.  Inline-call's typed result
-        // (consumed by `MIFrame::make_result_of_lastop` at the caller
-        // frame after the callee's `finishframe_*_return`,
-        // `pyjitpl.rs`) is determined by which
-        // `return_{i,r,f}` slot the helper received.  At most one is
-        // `Some` for a typed variant; all `None` for the void
-        // variant (no record).
+        // One result register as the last operand, the same shape
+        // `rewrite_call` gives `inline_call_*_* >i/>r/>f`.  Void emits
+        // `NO_RETURN_REG` so `_setup_return_value_*` is never asked to
+        // read it; a typed call's last byte is the destination
+        // `blackhole.py _setup_return_value_*` recovers as
+        // `code[position-1]`.
         match (return_i, return_r, return_f) {
-            (Some(_), None, None) => self.record_resulttype('i'),
-            (None, Some(_), None) => self.record_resulttype('r'),
-            (None, None, Some(_)) => self.record_resulttype('f'),
-            (None, None, None) => {} // _v variant — no result
+            (Some(dst), None, None) => {
+                self.push_return_slot(Some(dst));
+                self.record_resulttype('i');
+            }
+            (None, Some(dst), None) => {
+                self.push_return_slot(Some(dst));
+                self.record_resulttype('r');
+            }
+            (None, None, Some(dst)) => {
+                self.push_return_slot(Some(dst));
+                self.record_resulttype('f');
+            }
+            (None, None, None) => self.push_return_slot(None),
             slots => {
                 panic!("inline_call_typed: at most one return slot may be Some, got {slots:?}")
             }
@@ -6972,7 +6976,7 @@ mod tests {
                     "return slot for {args_r:?} args, bank {bank:?}",
                 );
                 // The width formula the search solves for.
-                assert_eq!(end - start, 8 + 3 * args_r.len(), "encoded width");
+                assert_eq!(end - start, 6 + 3 * args_r.len(), "encoded width");
                 // A position one byte off is not the far side of this call,
                 // and answering there would be a wrong frame rebuild rather
                 // than a decline.

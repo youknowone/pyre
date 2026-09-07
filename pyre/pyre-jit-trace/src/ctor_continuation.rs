@@ -73,10 +73,10 @@
 //! `blackhole_from_resumedata` sets each level's `position` from its resume
 //! section, and `run_this_frame` dispatches forward from there.  The
 //! `inline_call` before the anchor therefore never decodes — it exists because
-//! `call_result_reg` resolves the `BC_INLINE_CALL` ending at `position` to find
-//! where a returning callee's value goes. Its callee operand is a placeholder
-//! for the same reason: the instruction is never executed, and the real callee
-//! varies per class while this jitcode is shared.
+//! `_setup_return_value_r` reads `code[position-1]`, the call's result
+//! register. Its callee operand is a placeholder for the same reason: the
+//! instruction is never executed, and the real callee varies per class while
+//! this jitcode is shared.
 
 use crate::PyJitCode;
 use majit_metainterp::jitcode::{JitCallArg, JitCodeBuilder};
@@ -92,8 +92,8 @@ pub(crate) const INSTANCE_REG: u16 = 0;
 /// register is exactly that slot.
 pub(crate) const INIT_RESULT_REG: u16 = 1;
 
-/// Callee operand of the never-decoded `inline_call`.  See the module doc: the
-/// byte is only ever stepped over backwards by `call_result_reg`.
+/// Callee operand of the never-decoded `inline_call`.  See the module doc:
+/// `_setup_return_value_r` only reads the last operand as the dest register.
 const PLACEHOLDER_CALLEE: u16 = 0;
 
 /// `typeobject.py descr_call`: `if not space.is_w(w_result, space.w_None):
@@ -153,8 +153,8 @@ fn build() -> Option<(i32, usize)> {
     let mut builder = JitCodeBuilder::new();
     builder.set_name("descr_call_tail");
 
-    // Never decoded; present so `call_result_reg` finds the complete
-    // `BC_INLINE_CALL` ending at the anchor. See the module doc.
+    // Never decoded; present so `_setup_return_value_r` can read
+    // `code[position-1]` as the dest register. See the module doc.
     builder.inline_call_r_r(
         PLACEHOLDER_CALLEE,
         &[(INSTANCE_REG, INSTANCE_REG)],
@@ -211,7 +211,7 @@ mod tests {
     use super::*;
 
     /// The anchor must sit immediately behind the complete `inline_call`, so
-    /// `call_result_reg` can resolve the exact instruction ending there.
+    /// `_setup_return_value_r` can read `code[position-1]` as the dest.
     #[test]
     fn resume_anchor_sits_behind_the_inline_call_return_tail() {
         let Some((index, resume_pc)) = level() else {
@@ -221,18 +221,13 @@ mod tests {
             .expect("the tail was just installed at this index");
         let code = payload.jitcode.code.as_slice();
         assert!(
-            resume_pc >= 5,
-            "no room for the call header and its return tail"
+            resume_pc >= 3,
+            "no room for the call header and its return register"
         );
         assert_eq!(
-            code[resume_pc - 1],
-            majit_metainterp::jitcode::NO_RETURN_REG,
-            "the synthetic Ref-returning call has no float return slot",
-        );
-        assert_eq!(
-            code[resume_pc - 2] as u16,
+            code[resume_pc - 1] as u16,
             INIT_RESULT_REG,
-            "the ref return slot must name the register the None check reads",
+            "the last operand is the ref result register",
         );
         assert_eq!(
             code[resume_pc],

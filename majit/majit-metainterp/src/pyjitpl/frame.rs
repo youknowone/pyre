@@ -127,7 +127,7 @@ pub struct MIFrame {
     /// RPython encodes the result register as the last byte before the
     /// post-call LIVE marker, so `get_list_of_active_boxes(in_a_call=True)`
     /// can recover it from `self.pc - 1`.  pyre's grouped inline-call
-    /// encoding stores three optional return slots (`i/r/f`) as u16 values,
+    /// encoding stores one result register as the last operand,
     /// so the exact result index is carried here while preserving
     /// `_result_argcode` for the line-by-line clear logic.
     pub result_arg_index: Option<usize>,
@@ -1370,6 +1370,27 @@ mod tests {
         let mut jitcode = builder.finish();
         jitcode.body_mut().resulttypes = Some([(0, 'i'), (1, 'r'), (2, 'f')].into_iter().collect());
         Arc::new(jitcode)
+    }
+
+    #[test]
+    fn ref_value_for_blackhole_prefers_forwarded_constptr_over_stale_mirror() {
+        let jitcode = make_jitcode_with_regs(0, 2, 0);
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.ref_regs[0] = Some(OpRef::const_ptr(majit_ir::GcRef(0xBEEF)));
+        frame.ref_values[0] = Some(0xDEAD);
+        frame.ref_regs[1] = Some(OpRef::ref_op(7));
+        frame.ref_values[1] = Some(0xCAFE);
+
+        assert_eq!(frame.ref_value_for_blackhole(0), Some(0xBEEF));
+        assert_eq!(frame.ref_value_for_blackhole(1), Some(0xCAFE));
+
+        frame.set_forwarded_ref_value(0, 0xF00D);
+        assert_eq!(frame.ref_values[0], Some(0xF00D));
+        assert_eq!(
+            frame.ref_regs[0],
+            Some(OpRef::const_ptr(majit_ir::GcRef(0xF00D)))
+        );
+        assert_eq!(frame.ref_value_for_blackhole(0), Some(0xF00D));
     }
 
     #[test]

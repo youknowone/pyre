@@ -922,12 +922,18 @@ impl BlackholeInterpreter {
     }
 
     /// Set a reference register value.
+    ///
+    /// Same constant-table bound as [`Self::setarg_i`]: a write at or past
+    /// `num_regs_r` replaces a jitcode constant the instruction stream still
+    /// reads as one.
     pub fn setarg_r(&mut self, index: usize, value: i64) {
+        debug_assert_constant_slot_untouched(index, self.jitcode.num_regs_r(), "setarg_r");
         self.registers_r[index] = value;
     }
 
     /// Set a float register value.
     pub fn setarg_f(&mut self, index: usize, value: i64) {
+        debug_assert_constant_slot_untouched(index, self.jitcode.num_regs_f(), "setarg_f");
         self.registers_f[index] = value;
     }
 
@@ -1020,68 +1026,14 @@ impl BlackholeInterpreter {
 
     /// Result register of the call this frame is resuming after.
     ///
-    /// `_setup_return_value_*` connects a returning callee's value to the
-    /// caller's `xxx_call_yyy` result register, read as `code[position-1]`
-    /// (the byte right before the resume position).  The portal codewriter
-    /// emits a per-push valuestackdepth sync (`setfield_vable_i` of the
-    /// valuestackdepth field) immediately after a call result push, so in
-    /// portal jitcode that 5-byte sync lands between the call's result
-    /// register byte and the next opcode's `-live-` resume anchor that
-    /// `position` points at.  When such a sync precedes the anchor, step
-    /// back over it to reach the result register; otherwise `position-1`
-    /// holds it directly.
-    ///
-    /// `BC_INLINE_CALL` is the one caller shape that does NOT end in a single
-    /// result register: `JitCodeBuilder::inline_call_typed` closes every
-    /// variant with three typed return slots.  Resolve that instruction with
-    /// [`JitCode::inline_call_ending_at`] rather than guessing from a sentinel
-    /// byte: the parser checks the opcode start, payload width and recorded
-    /// result type, so an unrelated operand byte cannot be mistaken for a
-    /// return layout.
-    fn call_result_reg(&self, kind: BhReturnType) -> usize {
-        // setfield_vable_i: op + struct_reg + value_reg + descr(2 bytes).
-        const VSD_SYNC_LEN: usize = 5;
-        // valuestackdepth static-field index (codewriter
-        // VABLE_VALUESTACKDEPTH_FIELD_IDX).
-        const VSD_FIELD_IDX: usize = 2;
-        let code = &self.jitcode.code;
-        let pos = self.position;
-
-        let inline_result = |end_pc: usize| {
-            self.jitcode.inline_call_ending_at(end_pc).map(|site| {
-                let slot = match kind {
-                    BhReturnType::Int => site.return_i,
-                    BhReturnType::Ref => site.return_r,
-                    BhReturnType::Float => site.return_f,
-                    BhReturnType::Void => None,
-                };
-                slot.unwrap_or_else(|| {
-                    panic!(
-                        "call_result_reg: inline call ending at {end_pc} has no {kind:?} result slot"
-                    )
-                })
-            })
-        };
-
-        if let Some(slot) = inline_result(pos) {
-            return slot;
-        }
-
-        if pos > VSD_SYNC_LEN
-            && self
-                .jitcode
-                .startpoints
-                .as_ref()
-                .is_some_and(|starts| starts.contains(&(pos - VSD_SYNC_LEN)))
-            && code[pos - VSD_SYNC_LEN] == majit_translate::insns::BC_SETFIELD_VABLE_I
-            && let Some(descr_idx) = self.peek_u16_at(pos - 2)
-            && let Some(BhDescr::VableField { index }) = self.runtime_bh_descr(descr_idx as usize)
-            && *index == VSD_FIELD_IDX
-        {
-            let call_end = pos - VSD_SYNC_LEN;
-            return inline_result(call_end).unwrap_or(code[call_end - 1] as usize);
-        }
-        code[pos - 1] as usize
+    /// `blackhole.py _setup_return_value_*` reads `code[position-1]`, the
+    /// result operand of the `xxx_call_yyy` that the resume `-live-`
+    /// follows.  Flatten emits that `-live-` immediately after every
+    /// `inline_call` and every can-raise `residual_call`
+    /// (`jtransform.py handle_regular_call` / `handle_residual_call`),
+    /// and `inline_call_typed` closes on the destination byte.
+    fn call_result_reg(&self, _kind: BhReturnType) -> usize {
+        self.jitcode.code[self.position - 1] as usize
     }
 
     /// blackhole.py _setup_return_value_i
@@ -2506,10 +2458,9 @@ impl BlackholeInterpBuilder {
     ///     self.op_rvmprof_code = insns.get('rvmprof_code/ii', -1)
     /// ```
     ///
-    /// Builds the reverse opcode table and dispatch function table from the
-    /// assembler's `insns` dict. For now, all dispatch table entries are
-    /// placeholder handlers — real `bhimpl_*` methods are wired in
-    /// incrementally as Phase D progresses.
+    /// Builds the reverse opcode table and a same-sized dispatch table of
+    /// placeholders. [`wire_bhimpl_handlers`] then binds each key to its
+    /// handler, the two-phase split of RPython `setup_insns` + `_get_method`.
     pub fn setup_insns(&mut self, insns: &indexmap::IndexMap<String, u8>) {
         assert!(insns.len() <= 256, "too many instructions!");
         // RPython blackhole.py:68-71: build reverse table.
@@ -4277,17 +4228,8 @@ mod tests {
             let _ = convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
         }
 
-        /// `_setup_return_value_i` must read `BC_INLINE_CALL`'s `return_i` slot,
-        /// not the byte before the resume position.
-        ///
-        /// `JitCodeBuilder::inline_call_typed` closes every inline call with
-        /// three return slots (`return_i`, `return_r`, `return_f`), so a call
-        /// whose result is an int leaves `NO_RETURN_REG` in the last two.
-        /// Reading `code[position - 1]` — RPython's single-slot
-        /// `blackhole.py:1655` convention — picks up that sentinel and indexes
-        /// `registers_i` out of bounds.  Observed as an index-out-of-bounds
-        /// panic when a tracing-abort blackhole chain returned an int into the
-        /// dispatch jitcode that had inlined it.
+        /// `_setup_return_value_i` reads `code[position-1]`, the single
+        /// result register `inline_call_typed` now closes on.
         #[test]
         fn setup_return_value_i_reads_inline_calls_int_return_slot() {
             let mut b = JitCodeBuilder::default();
@@ -4298,8 +4240,8 @@ mod tests {
             let resume_pos = jitcode.code.len();
             assert_eq!(
                 jitcode.code[resume_pos - 1],
-                crate::jitcode::NO_RETURN_REG,
-                "inline call should end on the unused return_f slot",
+                7,
+                "inline call must end on the int result register",
             );
 
             let mut builder = build_test_bh_builder();
@@ -4466,6 +4408,38 @@ mod tests {
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[2], 42);
+        }
+
+        #[test]
+        #[should_panic(expected = "setarg_r: register index")]
+        fn setarg_r_refuses_constant_table_slot() {
+            let mut b = JitCodeBuilder::default();
+            b.load_const_r_value(0, 0);
+            b.add_const_r(0x11);
+            b.ref_return(0);
+            let jitcode = b.finish();
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            assert_eq!(bh.jitcode.num_regs_r(), 1);
+            bh.setarg_r(1, 0x22);
+        }
+
+        #[test]
+        #[should_panic(expected = "setarg_f: register index")]
+        fn setarg_f_refuses_constant_table_slot() {
+            let mut b = JitCodeBuilder::default();
+            b.load_const_f_value(0, 0);
+            b.add_const_f(0);
+            b.float_return(0);
+            let jitcode = b.finish();
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            assert_eq!(bh.jitcode.num_regs_f(), 1);
+            bh.setarg_f(1, 0);
         }
 
         #[test]
@@ -11519,9 +11493,8 @@ bhhandler_self_v_r!(handler_last_exc_value, bhimpl_last_exc_value);
 ///     else:
 ///         return target  # mismatch → jump
 /// ```
-/// Uses `cpu.bh_classof` to get the exception's typeptr and compares
-/// against the bounding class vtable. For now uses pointer equality
-/// (correct for exact match; subclass check needs rclass infrastructure).
+/// Uses `cpu.bh_classof` for the exception typeptr and
+/// `cpu.bh_issubclass` for `rclass.ll_issubclass`.
 fn handler_goto_if_exception_mismatch(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -13073,11 +13046,13 @@ fn handler_record_known_result_ref_ext(
 ///
 /// This handler is the pyre nested-bytecode `inline_call` adapter under
 /// the `(bh, code, position) -> Result<usize, _>` signature.  Operand
-/// payload (pyre-only):
+/// payload:
 ///   `sub_idx: u16`, `num_args: u16`,
 ///   `num_args × (kind: u8, caller_src: u8, callee_dst: u8)`,
-///   `return_i: u8`, `return_r: u8`, `return_f: u8`
-/// `NO_RETURN_REG` in any return slot encodes "no caller destination".
+///   `dest: u8`
+/// The last byte is the single result register, matching
+/// `blackhole.py _setup_return_value_*`'s `code[position-1]`.
+/// `NO_RETURN_REG` encodes a void call.
 ///
 /// Registered via the pyre-only opname `inline_call_nested_ext/P`
 /// in `extension_insns()`.  Canonical `inline_call_{r,ir,irf}_*`
@@ -13163,9 +13138,7 @@ fn handler_inline_call_nested_ext(
         }
     }
 
-    let return_i = decode_return_slot_at(code, &mut p);
-    let return_r = decode_return_slot_at(code, &mut p);
-    let return_f = decode_return_slot_at(code, &mut p);
+    let dest = decode_return_slot_at(code, &mut p);
 
     // RPython `bhimpl_inline_call_*` calls `cpu.bh_call_*(jitcode.fnaddr,
     // ...)` directly, so any `JitException` (`ContinueRunningNormally`,
@@ -13233,38 +13206,28 @@ fn handler_inline_call_nested_ext(
 
         let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() else {
             // No trailing return opcode means the callee produced no value.
-            // The caller's three slots are all `NO_RETURN_REG` in that case —
-            // `inline_call_typed` emits a real register only for the kind the
-            // callee returns — so a slot that IS a register here names a
-            // destination nothing will write, and the caller goes on to read
-            // whatever the previous occupant of that register left.  Upstream
-            // cannot reach the state: `bhimpl_inline_call_*` gets its value
-            // from `cpu.bh_call_*`, whose result kind is the calldescr's.
+            // The caller emitted `NO_RETURN_REG` as the single dest byte
+            // (`inline_call_*_v`).  A real dest here names a register
+            // nothing will write.
             assert!(
-                return_i.is_none() && return_r.is_none() && return_f.is_none(),
+                dest.is_none(),
                 "inline_call: callee jitcode {:?} index {:?} ends without a \
-                 typed return opcode, but the caller declared result slots \
-                 (i={return_i:?} r={return_r:?} f={return_f:?})",
+                 typed return opcode, but the caller declared dest {dest:?}",
                 callee.jitcode.name,
                 callee.jitcode.try_index(),
             );
             break 'callee Ok(p);
         };
         {
+            let caller_dst = dest.expect("inline return missing caller destination");
             match return_kind {
                 JitArgKind::Int => {
-                    let caller_dst =
-                        return_i.expect("inline int return missing caller destination");
                     bh.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
                 }
                 JitArgKind::Ref => {
-                    let caller_dst =
-                        return_r.expect("inline ref return missing caller destination");
                     bh.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
                 }
                 JitArgKind::Float => {
-                    let caller_dst =
-                        return_f.expect("inline float return missing caller destination");
                     bh.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
                 }
             }
@@ -13351,9 +13314,7 @@ fn inline_call_native(
     args_r.truncate(len_r);
     args_f.truncate(len_f);
 
-    let return_i = decode_return_slot_at(code, &mut p);
-    let return_r = decode_return_slot_at(code, &mut p);
-    let return_f = decode_return_slot_at(code, &mut p);
+    let dest = decode_return_slot_at(code, &mut p);
 
     // A raise inside the callee reaches this side through the cell, exactly as
     // it does for a residual call and for the canonical `inline_call_*`
@@ -13376,7 +13337,7 @@ fn inline_call_native(
             let result = bh.bhimpl_inline_call_irf_i(fnaddr, &args_i, &args_r, &args_f, calldescr);
             let outcome = check_residual_call_exception_after(bh, p);
             if outcome.is_ok() {
-                if let Some(dst) = return_i {
+                if let Some(dst) = dest {
                     bh.registers_i[dst] = result;
                 }
             }
@@ -13386,7 +13347,7 @@ fn inline_call_native(
             let result = bh.bhimpl_inline_call_irf_r(fnaddr, &args_i, &args_r, &args_f, calldescr);
             let outcome = check_residual_call_exception_after(bh, p);
             if outcome.is_ok() {
-                if let Some(dst) = return_r {
+                if let Some(dst) = dest {
                     bh.registers_r[dst] = result.0 as i64;
                 }
             }
@@ -13396,7 +13357,7 @@ fn inline_call_native(
             let result = bh.bhimpl_inline_call_irf_f(fnaddr, &args_i, &args_r, &args_f, calldescr);
             let outcome = check_residual_call_exception_after(bh, p);
             if outcome.is_ok() {
-                if let Some(dst) = return_f {
+                if let Some(dst) = dest {
                     bh.registers_f[dst] = result.to_bits() as i64;
                 }
             }

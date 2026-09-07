@@ -903,14 +903,15 @@ impl JitCode {
     ///
     /// The instruction cannot be decoded backwards, so it is decoded forwards
     /// from the only start position that can produce it.  Its width is
-    /// `1 + 2 + 2 + 3 * num_args + 3` — opcode, sub-JitCode index, argument
+    /// `1 + 2 + 2 + 3 * num_args + 1` — opcode, sub-JitCode index, argument
     /// count, one `(kind, caller_src, callee_dst)` triple per argument, then
-    /// the three optional return slots — so each candidate `num_args` names
-    /// exactly one start, and that start is the real one only when the opcode
-    /// byte is there AND the count it encodes is the count that was assumed.
-    /// A position satisfying both while still ending at `end_pc` has decoded
-    /// itself; requiring the match to be unique is what turns a coincidence
-    /// into a decline rather than into a wrong answer.
+    /// the single result-register byte (`NO_RETURN_REG` when the call is
+    /// void).  Each candidate `num_args` names exactly one start, and that
+    /// start is the real one only when the opcode byte is there AND the
+    /// count it encodes is the count that was assumed.  A position
+    /// satisfying both while still ending at `end_pc` has decoded itself;
+    /// requiring the match to be unique is what turns a coincidence into a
+    /// decline rather than into a wrong answer.
     ///
     /// `None` means `end_pc` is not the far side of a `BC_INLINE_CALL` in this
     /// jitcode — including when it is one of the typed `BC_INLINE_CALL_*`
@@ -936,25 +937,48 @@ impl JitCode {
                 continue;
             }
             cursor += 3 * num_args;
-            let return_slot = |cursor: &mut usize| match read_reg(code, cursor) {
+            let dest = match read_reg(code, &mut cursor) {
                 NO_RETURN_REG => None,
                 reg => Some(reg as usize),
-            };
-            let site = InlineCallSite {
-                sub_idx,
-                return_i: return_slot(&mut cursor),
-                return_r: return_slot(&mut cursor),
-                return_f: return_slot(&mut cursor),
             };
             debug_assert_eq!(
                 cursor, end_pc,
                 "the inline-call width formula disagrees with the decode",
             );
-            // `inline_call_typed` refuses to emit more than one filled slot,
-            // so a decode holding two has not landed on a real instruction.
-            if site.filled_return_slots() > 1 {
-                continue;
-            }
+            // The last operand is the single result register;
+            // `_resulttypes[end_pc]` says which bank, the same witness
+            // `make_result_of_lastop` reads.
+            let kind = body
+                .resulttypes
+                .as_ref()
+                .and_then(|types| types.get(&end_pc).copied());
+            let site = match (kind, dest) {
+                (Some('i'), dest) => InlineCallSite {
+                    sub_idx,
+                    return_i: dest,
+                    return_r: None,
+                    return_f: None,
+                },
+                (Some('r'), dest) => InlineCallSite {
+                    sub_idx,
+                    return_i: None,
+                    return_r: dest,
+                    return_f: None,
+                },
+                (Some('f'), dest) => InlineCallSite {
+                    sub_idx,
+                    return_i: None,
+                    return_r: None,
+                    return_f: dest,
+                },
+                (None, None) => InlineCallSite {
+                    sub_idx,
+                    return_i: None,
+                    return_r: None,
+                    return_f: None,
+                },
+                _ => continue,
+            };
             if found.replace(site).is_some() {
                 // Two start positions both decode into an instruction ending
                 // here, so the bytes do not name one call.
@@ -962,6 +986,7 @@ impl JitCode {
             }
         }
         let site = found?;
+        debug_assert!(site.filled_return_slots() <= 1);
         // `pyjitpl.py make_result_of_lastop`'s own check, in its own place:
         //
         //     assert typeof[self.jitcode._resulttypes[self.pc]] == got_type
@@ -969,7 +994,12 @@ impl JitCode {
         // The writer records the kind at end-of-instruction position
         // (`record_resulttype`, `assembler.py`), which makes it an independent
         // witness of which return slot this call filled.
-        if body.resulttypes.as_ref()?.get(&end_pc).copied() != site.recorded_resulttype() {
+        if body
+            .resulttypes
+            .as_ref()
+            .and_then(|types| types.get(&end_pc).copied())
+            != site.recorded_resulttype()
+        {
             return None;
         }
         Some(site)
@@ -977,10 +1007,10 @@ impl JitCode {
 }
 
 /// The encoded width of a `BC_INLINE_CALL` that passes no arguments: the
-/// opcode byte, the `u16` sub-JitCode index, the `u16` argument count, and the
-/// three return-slot register bytes.  Each argument adds a
+/// opcode byte, the `u16` sub-JitCode index, the `u16` argument count, and
+/// the single result-register byte.  Each argument adds a
 /// `(kind, caller_src, callee_dst)` triple of one byte each.
-const INLINE_CALL_FIXED_WIDTH: usize = 1 + 2 + 2 + 3;
+const INLINE_CALL_FIXED_WIDTH: usize = 1 + 2 + 2 + 1;
 
 /// The operands of one `BC_INLINE_CALL`, as [`JitCode::inline_call_ending_at`]
 /// recovers them from the instruction's far side.
@@ -1001,7 +1031,7 @@ impl InlineCallSite {
     /// The caller-side result register and the bank it lands in.
     ///
     /// `None` for a call whose result is discarded, which is the `_v` shape:
-    /// all three slots hold [`NO_RETURN_REG`].
+    /// the dest operand is [`NO_RETURN_REG`].
     pub fn result_slot(&self) -> Option<(JitArgKind, usize)> {
         match (self.return_i, self.return_r, self.return_f) {
             (Some(dst), None, None) => Some((JitArgKind::Int, dst)),
@@ -1011,7 +1041,7 @@ impl InlineCallSite {
         }
     }
 
-    /// How many of the three return slots name a register.  A real
+    /// How many of the typed return banks name a register.  A real
     /// `BC_INLINE_CALL` has at most one.
     fn filled_return_slots(&self) -> usize {
         [self.return_i, self.return_r, self.return_f]

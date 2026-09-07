@@ -1455,22 +1455,14 @@ impl<'a> GraphFlattener<'a> {
         //   handle_residual_call: `op1 = [op1, ('-live-', [], None)]`
         //     emitted iff `may_call_jitcodes or calldescr_canraise(...)`.
         //   handle_regular_call:  `[op0, ('-live-', [], None)]` — always.
-        // The walker covers this point incidentally via its per-PC `-live-`;
-        // the canonical driver must emit it explicitly so the encoder's
-        // FALLTHROUGH_pc read (`handle_possible_exception` ->
-        // `guard_no_exception`, trace_opcode.rs) and the resume reader
-        // find a marker at the post-call position.  Gated on `lowering_ctx`
-        // so the production walker stream is untouched.  `may_call_jitcodes`
-        // has no analogue at this site: the canonical lowering emits only
-        // direct `residual_call_*` to fixed helper indices for the retired
-        // HLOp families, never the indirect call that is upstream's sole
-        // `may_call_jitcodes=True` caller — so the residual gate reduces to
-        // `calldescr_canraise`, read off each Insn's `CallDescrStub` operand
-        // (`insn_needs_trailing_live`).  Most retired families carry
-        // `EF_CAN_RAISE` / `EF_FORCES_*` so they keep the marker; the
-        // `get_current_exception` helper (`EF_CANNOT_RAISE`) does not, so it
-        // gets no trailing `-live-` — matching upstream's per-call gate.
-        let trailing_live = self.lowering_ctx.is_some() && insn_needs_trailing_live(&insn);
+        // Both drivers emit it here so `_setup_return_value_*` can read
+        // `code[position-1]` as the call's result register.  The walker
+        // also records a Live SpaceOp via `record_graph_op`; an adjacent
+        // pair folds in `remove_repeated_live`.  `may_call_jitcodes` has
+        // no analogue at this site: residual calls are direct helpers,
+        // so the residual gate is `calldescr_canraise`
+        // (`insn_needs_trailing_live`).
+        let trailing_live = insn_needs_trailing_live(&insn);
         self.emitline(insn);
         if trailing_live {
             self.emitline(Insn::live(Vec::new()));
@@ -8942,11 +8934,9 @@ mod tests {
         // `jtransform.py handle_residual_call` pairs a
         // `residual_call_*` with a trailing `('-live-', [], None)` so the
         // metainterp can snapshot the post-call `guard_no_exception`
-        // resume state.  The canonical driver (`serialize_op` under
-        // `lowering_ctx`) must emit that marker immediately AFTER the
-        // lowered call; the production walker covers the same point via
-        // its per-PC `-live-`.  A single `add` HLOp lowers to one
-        // `residual_call_ir_r` that must be followed by a `-live-`.
+        // resume state.  `serialize_op` emits that marker immediately
+        // AFTER the call on both drivers.  A single `add` HLOp lowers
+        // to one `residual_call_ir_r` that must be followed by a `-live-`.
         use crate::jit::flow::{Block, FunctionGraph};
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
@@ -8987,6 +8977,45 @@ mod tests {
         assert!(
             ssarepr.insns[call_pos + 1].is_live(),
             "residual_call must be followed by a `-live-` marker, got {:?}",
+            &ssarepr.insns[call_pos..]
+        );
+    }
+
+    #[test]
+    fn walker_path_emits_trailing_live_after_inline_call() {
+        // `jtransform.py handle_regular_call` always appends `-live-`
+        // after `inline_call`.  The walker flatten (no `lowering_ctx`)
+        // must do the same so `_setup_return_value_*` can read
+        // `code[position-1]`.
+        use crate::jit::flow::{Block, FunctionGraph};
+        let arg = Variable::new(VariableId(0), Kind::Ref);
+        let result = Variable::new(VariableId(1), Kind::Ref);
+        let start = Block::shared(vec![arg.into()]);
+        let graph = FunctionGraph::new("walker_inline_live", start.clone(), None);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("inline_call_r_r", vec![arg.into()], Some(result.into()), 0),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![result.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let mut ssarepr = SSARepr::new("walker_inline_live");
+        flatten_graph_for_test(&graph, &mut ssarepr);
+
+        let call_pos = ssarepr
+            .insns
+            .iter()
+            .position(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "inline_call_r_r"))
+            .unwrap_or_else(|| panic!("expected inline_call_r_r: {:?}", ssarepr.insns));
+        assert!(
+            ssarepr.insns[call_pos + 1].is_live(),
+            "walker inline_call must be followed by a `-live-` marker, got {:?}",
             &ssarepr.insns[call_pos..]
         );
     }

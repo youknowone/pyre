@@ -7147,42 +7147,30 @@ where
                         let callee_dst = frame.next_reg() as usize;
                         arg_triples.push((kind, caller_src, callee_dst));
                     }
-                    let decode_return_slot = |f: &mut MIFrame| {
-                        let dst = f.next_reg() as usize;
+                    let dest = {
+                        let dst = frame.next_reg() as usize;
                         if dst == crate::jitcode::NO_RETURN_REG as usize {
                             None
                         } else {
                             Some(dst)
                         }
                     };
-                    let return_i = decode_return_slot(frame);
-                    let return_r = decode_return_slot(frame);
-                    let return_f = decode_return_slot(frame);
-                    let mut result_slots = 0usize;
-                    let mut result_argcode = b'v';
-                    let mut result_arg_index = None;
-                    if let Some(dst) = return_i {
-                        result_slots += 1;
-                        result_argcode = b'i';
-                        result_arg_index = Some(dst);
-                    }
-                    if let Some(dst) = return_r {
-                        result_slots += 1;
-                        result_argcode = b'r';
-                        result_arg_index = Some(dst);
-                    }
-                    if let Some(dst) = return_f {
-                        result_slots += 1;
-                        result_argcode = b'f';
-                        result_arg_index = Some(dst);
-                    }
-                    assert!(
-                        result_slots <= 1,
-                        "BC_INLINE_CALL encodes more than one return slot; RPython call snapshots support one result"
-                    );
-                    frame._result_argcode = result_argcode;
-                    frame.result_arg_index = result_arg_index;
                     frame.pc = frame.code_cursor;
+                    let resulttype = frame
+                        .jitcode
+                        .core()
+                        .body()
+                        .resulttypes
+                        .as_ref()
+                        .and_then(|types| types.get(&frame.pc).copied());
+                    let (return_i, return_r, return_f, result_argcode) = match resulttype {
+                        Some('i') => (dest, None, None, b'i'),
+                        Some('r') => (None, dest, None, b'r'),
+                        Some('f') => (None, None, dest, b'f'),
+                        _ => (None, None, None, b'v'),
+                    };
+                    frame._result_argcode = result_argcode;
+                    frame.result_arg_index = dest;
                     (sub_idx, arg_triples, return_i, return_r, return_f)
                 };
                 let pc = self.frames.current_mut().pc;
@@ -10314,9 +10302,9 @@ where
 /// suffix and the callee's terminator are ONE decision taken once, from the
 /// callee's own result type.
 ///
-/// Pyre encodes the three destinations explicitly (`NO_RETURN_REG` sentinel,
-/// decoded at the `BC_INLINE_CALL`) instead of re-reading the caller's operand
-/// at return time, which is what makes the disagreement representable here.
+/// Pyre records the destination as the last operand of `BC_INLINE_CALL`
+/// (`NO_RETURN_REG` for void) and recovers its kind from `_resulttypes`.
+/// Reaching a typed return with `NO_RETURN_REG` is the disagreement.
 /// Reaching this means an encoder minted `inline_call_*_v` for a callee that
 /// ends in a typed return: the value has nowhere to go, and continuing would
 /// drop it in silence and leave the caller reading a stale register — the same
