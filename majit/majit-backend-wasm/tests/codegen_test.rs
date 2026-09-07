@@ -1947,15 +1947,15 @@ fn terminal_force_descriptor_and_failargs_survive_finish() {
             &mut ptr_bytes,
         )
         .unwrap();
+    // x86 `store_force_descr` keeps the descriptor in `jf_force_descr`.
+    // wasm stores `index + 1`; zero remains the unarmed sentinel.
     assert_eq!(
         u32::from_le_bytes(ptr_bytes),
-        std::sync::Arc::as_ptr(force) as usize as u32
+        force.fail_index.wrapping_add(1)
     );
-    let location = usize::from(force.rd_locs.as_ref().unwrap()[0]);
-    assert_eq!(
-        read_i64(items + location * std::mem::size_of::<usize>()),
-        30
-    );
+    // x86/regalloc.py `consider_guard_not_forced_2`: force failargs sit
+    // in the dedicated spill, not in FINISH's return slot.
+    assert_eq!(read_i64(items + force.force_args_offset as usize), 30);
 }
 
 #[test]
