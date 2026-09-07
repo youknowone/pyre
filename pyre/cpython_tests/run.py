@@ -150,11 +150,10 @@ KNOWN_SKIPS = {
     "test.test_xxtestfuzz": "CPython internal details",
     "test.test_android": "Android-only",
     "test.test_zstd": "no PyPy owner for the _zstd accelerator",
-    # Display / Tk, same class as test_tk / test_ttk / test_idle.
+    # Display-backed Tk.  Headless `test_tcl` / `test_ttk_textonly` /
+    # `test_turtle` stay off this table: PyPy runs them, and they do not
+    # need a screen.
     "test.test_tkinter": "needs display",
-    "test.test_tcl": "needs display",
-    "test.test_ttk_textonly": "needs display",
-    "test.test_turtle": "needs display",
 }
 
 # Whole modules that CPython skips at import on some platforms. Off-platform

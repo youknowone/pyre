@@ -104,8 +104,8 @@ before any test, a denied resource, or a suite whose every case was skipped).
 
 ## Current state and backlog (Phase 0)
 
-The baseline records **263 `PASS`**, 29 `IMPORTERROR`, 65 `SKIP`,
-68 `FAIL`, 7 `CRASH`, and 7 `TIMEOUT` (439 recorded rows, stdlib 3.14.6). These are a
+The baseline records **262 `PASS`**, 32 `IMPORTERROR`, 62 `SKIP`,
+69 `FAIL`, 7 `CRASH`, and 7 `TIMEOUT` (439 recorded rows, stdlib 3.14.6). These are a
 snapshot counted from `baseline.json`, which is the authority when they disagree.
 `IMPORTERROR` here means unittest never printed a summary — many of those
 labels are stale (the modules now import and run). Re-measure with

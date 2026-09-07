@@ -1168,8 +1168,7 @@
       "dynasm": "TIMEOUT"
     },
     "test.test_tcl": {
-      "dynasm": "SKIP",
-      "reason": "needs display"
+      "dynasm": "IMPORTERROR"
     },
     "test.test_tempfile": {
       "dynasm": "PASS"
@@ -1243,8 +1242,7 @@
       "reason": "needs display"
     },
     "test.test_ttk_textonly": {
-      "dynasm": "SKIP",
-      "reason": "needs display"
+      "dynasm": "IMPORTERROR"
     },
     "test.test_tty": {
       "dynasm": "PASS"
@@ -1253,8 +1251,7 @@
       "dynasm": "PASS"
     },
     "test.test_turtle": {
-      "dynasm": "SKIP",
-      "reason": "needs display"
+      "dynasm": "IMPORTERROR"
     },
     "test.test_type_aliases": {
       "cranelift": "FAIL",
@@ -1354,7 +1351,8 @@
       "dynasm": "PASS"
     },
     "test.test_utf8_mode": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL",
+      "reason": "linux C/POSIX locale argv uses surrogateescape; a macOS survey recorded PASS and the shared gate then failed on ubuntu"
     },
     "test.test_utf8source": {
       "cranelift": "PASS",

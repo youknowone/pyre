@@ -702,13 +702,13 @@ impl<'a> MiniXmlParser<'a> {
                 self.set_event_position(event_pos);
                 let w_name = self.intern_string(&name);
                 self.call_handler("StartElementHandler", &[w_name, roots.get(attrs_slot)])?;
-                // Report the empty end at the same `<` as the start.  The
-                // feed/close path reparses pending input and suppresses events
-                // whose index is already below `_pyre_emit_upto`; positioning
-                // the end after `/>` put it *at* that watermark, so close()
-                // re-fired EndElementHandler alone and TreeBuilder popped an
-                // empty stack (`test_xml_etree` self-closing tags).
-                self.set_event_position(event_pos);
+                // Publish the end after `/>` (`test_pyexpat.PositionTest`
+                // reads CurrentByteIndex on the empty end).  Keep the
+                // suppress bit from the opening `<`: feed/close reparses
+                // pending input and would otherwise re-fire only the end
+                // (its index sits *at* `_pyre_emit_upto`) and pop an empty
+                // TreeBuilder stack.
+                self.publish_event_position(self.pos);
                 self.call_handler("EndElementHandler", &[self.intern_string(&name)])?;
                 self.end_namespace_scope(ns_declared)?;
                 if self.stack.is_empty() {
@@ -957,6 +957,10 @@ impl<'a> MiniXmlParser<'a> {
 
     fn set_event_position(&mut self, pos: XmlPos) {
         self.suppress_current = pos.index < self.suppress_until;
+        self.publish_event_position(pos);
+    }
+
+    fn publish_event_position(&mut self, pos: XmlPos) {
         crate::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentLineNumber",
