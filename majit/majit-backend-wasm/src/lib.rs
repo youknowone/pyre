@@ -3327,9 +3327,9 @@ impl WasmBackend {
         let code_size = wasm_bytes.len();
         let descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
-            .zip(module_data.fail_descrs)
+            .zip(&module_data.fail_descrs)
             .enumerate()
-            .map(|(index, (g, d))| {
+            .map(|(index, (g, descr))| {
                 let mut region_start = own_guard_count;
                 let trace_id = inputs
                     .inlined_bridges
@@ -3345,7 +3345,7 @@ impl WasmBackend {
                     fail_index: g.fail_index,
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
-                    rd_locs: d.rd_locs.clone(),
+                    rd_locs: descr.rd_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: inputs.frame.force_slot_base as u32,
                     force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
@@ -4068,7 +4068,7 @@ fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame 
         .collect();
     let mut data = WasmFrameData::boxed(raw_values, fail_descr, 0);
     unsafe {
-        data.attach_forced_jitframe(GcRef(jf as usize));
+        data.attach_forced_jitframe(GcRef(frame_ptr));
     }
     DeadFrame::Boxed(data)
 }
@@ -4482,13 +4482,13 @@ impl majit_backend::Backend for WasmBackend {
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
-            .zip(module_data.fail_descrs)
-            .map(|(g, d)| {
+            .zip(&module_data.fail_descrs)
+            .map(|(g, descr)| {
                 Arc::new(WasmFailDescr {
                     fail_index: g.fail_index,
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
-                    rd_locs: d.rd_locs.clone(),
+                    rd_locs: descr.rd_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: frame.force_slot_base as u32,
                     force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
@@ -5538,13 +5538,13 @@ impl majit_backend::Backend for WasmBackend {
         // Bridge exit descrs (fail_index already base-offset by build_wasm_module).
         let bridge_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
-            .zip(module_data.fail_descrs)
-            .map(|(g, d)| {
+            .zip(&module_data.fail_descrs)
+            .map(|(g, descr)| {
                 Arc::new(WasmFailDescr {
                     fail_index: g.fail_index,
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
-                    rd_locs: d.rd_locs.clone(),
+                    rd_locs: descr.rd_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: source_frame.force_slot_base as u32,
                     force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
@@ -6009,7 +6009,7 @@ impl majit_backend::Backend for WasmBackend {
                 install_post_finish_force_gcmap(jf);
                 remember_and_drop_execution_frame(jf, saved);
 
-                return DeadFrame::Boxed(data);
+                return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
             }
 
             // Host-buffer frame path, for an embedder that registered no
@@ -6036,8 +6036,10 @@ impl majit_backend::Backend for WasmBackend {
             let sign = std::mem::size_of::<isize>();
             let depth = frame_size * 8 / sign;
             let alloc_size = majit_backend::jitframe::JitFrame::alloc_size(depth);
-            let jf = majit_backend::jitframe::alloc_off_gc_jitframe(alloc_size);
-            assert!(!jf.is_null(), "wasm host JITFRAME allocation failed");
+            // An `i64` element type for the alignment a `JitFrame` needs and
+            // for the zero fill `JitFrame::init` requires.
+            let mut backing = vec![0i64; alloc_size.div_ceil(8)];
+            let jf = backing.as_mut_ptr() as *mut majit_backend::jitframe::JitFrame;
             unsafe { majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth) };
             unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
             let items = (jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET) as *mut i64;
@@ -6062,6 +6064,10 @@ impl majit_backend::Backend for WasmBackend {
                 glue::execute(func_handle, items as usize as u32);
             }
             majit_gc::shadow_stack::pop_jf_to(saved);
+            majit_gc::shadow_stack::unregister_libc_jitframe(jf as usize);
+            // Nothing reads the frame's interior through the gcmap any more,
+            // and the gcmap is about to go out of scope.
+            unsafe { (*jf).jf_gcmap = std::ptr::null() };
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);

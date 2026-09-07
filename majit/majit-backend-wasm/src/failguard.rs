@@ -321,11 +321,21 @@ mod tests {
         use majit_backend::{Backend, DeadFrame};
         let roots = install_root_counting_gc();
         let backend = crate::WasmBackend::new();
+        // x86 `store_force_descr`: `jf_force_descr` holds `index + 1`. The
+        // force spill sits past FINISH's result slots so `_decode_pos` still
+        // sees the armed values after the exit adapter overwrites items[0..2].
+        let fail_index = reserve_fail_descrs(1);
         let mut forced_descr = fail_descr(vec![Type::Int, Type::Float]);
-        Arc::get_mut(&mut forced_descr).unwrap().rd_locs = Some(vec![
-            (16 / std::mem::size_of::<usize>()) as u16,
-            (24 / std::mem::size_of::<usize>()) as u16,
-        ]);
+        {
+            let descr = Arc::get_mut(&mut forced_descr).unwrap();
+            descr.fail_index = fail_index;
+            descr.force_args_offset = 16;
+            descr.rd_locs = Some(vec![
+                (16 / std::mem::size_of::<usize>()) as u16,
+                (24 / std::mem::size_of::<usize>()) as u16,
+            ]);
+        }
+        register_fail_descrs(std::slice::from_ref(&forced_descr));
         let depth = 32 / std::mem::size_of::<usize>();
         let jf = alloc_off_gc_jitframe(JitFrame::alloc_size(depth));
         assert!(!jf.is_null());
@@ -333,7 +343,7 @@ mod tests {
         majit_gc::shadow_stack::register_libc_jitframe(jf as usize);
         let items = (jf as usize + FIRST_ITEM_OFFSET) as *mut i64;
         unsafe {
-            (*jf).jf_force_descr = Arc::as_ptr(&forced_descr) as usize;
+            (*jf).jf_force_descr = fail_index as usize + 1;
             *items = 99; // FINISH's normal exit index
             *items.add(1) = jf as usize as i64; // FINISH's returned token
             *items.add(2) = 1i64 << 40; // must remain i64 on wasm32
@@ -360,9 +370,10 @@ mod tests {
         let forced = backend.force(token).unwrap();
         assert_eq!(backend.get_int_value(&forced, 0), 1i64 << 40);
         assert_eq!(backend.get_float_value(&forced, 1), 1.25);
-        assert_eq!(
-            unsafe { (*jf).jf_descr },
-            Arc::as_ptr(&forced_descr) as usize
+        assert_ne!(
+            unsafe { *items } & crate::codegen::FORCE_TAKEN_BIT,
+            0,
+            "force marks frame[0] so GUARD_NOT_FORCED deopts"
         );
         drop(forced);
         assert!(majit_gc::shadow_stack::is_libc_jitframe(jf as usize));

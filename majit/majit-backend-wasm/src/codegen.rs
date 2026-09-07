@@ -5610,6 +5610,8 @@ pub fn build_wasm_module(
                 fail_arg_types: guard.fail_arg_types.clone(),
                 rd_locs,
                 is_finish: guard.is_finish,
+                force_args_offset: frame.force_slot_base as u32,
+                force_gcmap_ptr: 0,
                 meta_descr: guard.meta_descr.clone(),
             })
         })
@@ -9847,6 +9849,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -10203,6 +10206,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -12032,6 +12036,7 @@ fn emit_force_arm(
     descr: &Arc<crate::failguard::WasmFailDescr>,
     undefined: Option<u32>,
 ) {
+    let exit_idx = descr.fail_index;
     let force_args = exit_fail_args(guard_op);
     let locs = descr.rd_locs.as_ref().expect("force guard has rd_locs");
     for (i, (&arg_ref, &loc)) in force_args.iter().zip(locs).enumerate() {
