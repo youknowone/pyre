@@ -97,6 +97,16 @@ pub struct PipelineConfig {
     /// disposition; a consumer opts its own traits in by name.
     #[serde(default)]
     pub register_trait_families: Vec<String>,
+    /// Graphs seeded into the `find_all_graphs` BFS beside the portals.
+    ///
+    /// `call.py` seeds `support.inline_calls_to`: helper graphs the
+    /// portal never calls in source because the codewriter lowers an
+    /// operation straight to a residual call of that helper.  A host that
+    /// lowers an opcode to a residual the same way names the residual's
+    /// body here, so the graph exists for a trace to descend
+    /// (`CallControl::register_helper_graph`).
+    #[serde(default)]
+    pub helper_graphs: Vec<CallPath>,
 }
 
 /// Result of running the full pipeline on a single function.
@@ -313,6 +323,7 @@ mod tests {
     fn serialized_pipeline_config_requires_explicit_jit_drivers() {
         let config = PipelineConfig {
             transform: GraphTransformConfig::default(),
+            helper_graphs: Vec::new(),
             jit_drivers: vec![JitDriverSpec {
                 portal: CallPath::from_segments(["engine", "mainloop"]),
                 portal_runner: None,

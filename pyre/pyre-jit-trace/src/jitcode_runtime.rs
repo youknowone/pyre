@@ -160,6 +160,41 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
     get_jitcode_ref_by_index(index).cloned()
 }
 
+/// Runtime wrappers for canonical source-translator JitCodes embedded as
+/// `AbstractDescr` operands in per-Python-function bytecode.  RPython owns
+/// these in the process-wide `CallControl.jitcodes[graph]` map, so this cache
+/// is process-wide too rather than another copy in each thread.  The slots are
+/// index-aligned with the canonical JitCode table.
+static RUNTIME_JITCODE_CELLS: std::sync::OnceLock<
+    Box<[std::sync::OnceLock<Arc<majit_metainterp::jitcode::JitCode>>]>,
+> = std::sync::OnceLock::new();
+
+fn runtime_jitcode_cells() -> &'static [std::sync::OnceLock<Arc<majit_metainterp::jitcode::JitCode>>]
+{
+    RUNTIME_JITCODE_CELLS.get_or_init(|| {
+        (0..jitcode_count())
+            .map(|_| std::sync::OnceLock::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
+}
+
+pub fn get_runtime_jitcode_by_index(
+    index: usize,
+) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    let cell = runtime_jitcode_cells().get(index)?;
+    Some(
+        cell.get_or_init(|| {
+            let canonical = get_jitcode_by_index(index)
+                .expect("runtime JitCode cell index must resolve canonically");
+            Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
+                (*canonical).clone(),
+            ))
+        })
+        .clone(),
+    )
+}
+
 /// The source translator's exact `Assembler.indirectcalltargets` set as
 /// references into `all_jitcodes`.
 ///
@@ -356,16 +391,6 @@ static LIST_POP_END_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_tuple_getitem`, resolved by graph key
 /// rather than by name -- see [`compute_pathed_jitcode_index`].
 static TUPLE_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
-/// Cached `ALL_JITCODES` index of `invert_inner`, resolved by graph key: `neg`
-/// and `invert` held indices 2798/2809 in only two of eight observed cache
-/// generations, so an index is not stable across builds and a path is.
-static INVERT_INNER_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
-/// Cached `ALL_JITCODES` index of `neg_inner`, resolved by graph key for the
-/// reason given above.
-static NEG_INNER_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
-/// Cached `ALL_JITCODES` index of `pos_inner`, resolved by graph key for the
-/// reason given above.
-static POS_INNER_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of the interpreter-source
 /// `load_super_attr_value_w` body. The fused opcode reaches this ordinary
 /// graph so `_super_check` and `W_Super.getattribute` are traced from their
@@ -416,17 +441,59 @@ pub(crate) fn compute_pathed_jitcode_index(canonical_path: &str) -> Option<usize
     if canonical_path.is_empty() {
         return None;
     }
-    jitcode_index()
-        .paths
-        .iter()
-        .position(|path| path == canonical_path)
+    PATHED_JITCODE_INDEX.get(canonical_path).copied()
 }
+
+/// Process-wide `CallControl.jitcodes` keyed by `CallPath::canonical_key`.
+///
+/// RPython keeps one dict on `CallControl` (`call.py get_jitcode`); pyre's
+/// frozen `jitcode_index().paths` is that dict's key column, allocation-aligned
+/// with `ALL_JITCODES`. This map is the reverse lookup, built once, shared by
+/// every thread. Empty paths are omitted: those jitcodes were minted without a
+/// graph key. A duplicate path is a broken `IndexMap<CallPath, _>` invariant.
+static PATHED_JITCODE_INDEX: LazyLock<indexmap::IndexMap<&'static str, usize>> =
+    LazyLock::new(|| {
+        let paths = &jitcode_index().paths;
+        let mut by_path = indexmap::IndexMap::with_capacity(paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            if path.is_empty() {
+                continue;
+            }
+            match by_path.entry(path.as_str()) {
+                indexmap::map::Entry::Vacant(slot) => {
+                    slot.insert(index);
+                }
+                indexmap::map::Entry::Occupied(_) => panic!(
+                    "pyre-jit-trace: build-time pipeline has more than one jitcode \
+                     under path `{path}`; CallControl.jitcodes keys each graph once"
+                ),
+            }
+        }
+        by_path
+    });
 
 /// The JitCode allocated under `canonical_path`, or `None` when the build-time
 /// pipeline does not contain that graph. See [`compute_pathed_jitcode_index`].
 #[allow(dead_code)]
 pub(crate) fn pathed_jitcode(canonical_path: &str) -> Option<Arc<JitCode>> {
     get_jitcode_by_index(compute_pathed_jitcode_index(canonical_path)?)
+}
+
+/// [`pathed_jitcode`] for a descent's fixed target.  The descents this
+/// serves are rows of a table (`specialize.rs UnaryDescent`); the path
+/// is a literal and [`PATHED_JITCODE_INDEX`] is the process-wide dict.
+pub(crate) fn pathed_jitcode_cached(canonical_path: &str) -> Option<Arc<JitCode>> {
+    pathed_jitcode(canonical_path)
+}
+
+/// Runtime-wrapper sibling of [`pathed_jitcode_cached`], for a codewriter
+/// `inline_call_*` operand.  RPython's JitCode is both the body and its
+/// `AbstractDescr`; pyre keeps the serializable canonical body separate from
+/// the runtime descr pool, so this is the single identity-preserving join.
+pub fn pathed_runtime_jitcode_cached(
+    canonical_path: &str,
+) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    get_runtime_jitcode_by_index(compute_pathed_jitcode_index(canonical_path)?)
 }
 
 /// Resolve an ordinary portal-closure JitCode by its unique graph leaf name.
@@ -458,6 +525,15 @@ pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
+/// The wrapped-name interpreter-source value half of `LOAD_SUPER_ATTR`, resolved by the
+/// graph key the codewriter allocated it under and cached process-wide.
+pub fn load_super_attr_value_jitcode() -> Option<Arc<JitCode>> {
+    let idx = (*LOAD_SUPER_ATTR_VALUE_JITCODE_INDEX.get_or_init(|| {
+        compute_pathed_jitcode_index("pyre_interpreter::eval::load_super_attr_value_w")
+    }))?;
+    get_jitcode_by_index(idx)
+}
+
 /// The charon `w_tuple_getitem` body in `ALL_JITCODES`, resolved by the graph
 /// key the codewriter allocated it under and cached process-wide. `None` if the
 /// helper is absent from the build-time pipeline.
@@ -474,71 +550,6 @@ pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
 /// `_known` reader is what keeps the length test in the trace: the caller's
 /// trace-time range check proves only that THIS receiver is long enough, while
 /// the recorded `arraylen` guard is what holds for the next one.
-/// The charon `invert_inner` body in `ALL_JITCODES`, resolved by the graph key
-/// the codewriter allocated it under and cached process-wide. `None` if the
-/// helper is absent from the build-time pipeline.
-///
-/// This is `descroperation.rs` `invert` past its `__invert__` override probe
-/// and its bool slot -- the two arms a descent cannot take. What is left is the
-/// `int` arm, the `long` arm, the instance fallback and the terminal
-/// `TypeError`, so a caller that has pinned an exact `int` or `long` receiver
-/// records one of the first two and nothing else.
-pub fn invert_inner_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*INVERT_INNER_JITCODE_INDEX.get_or_init(|| {
-        compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::invert_inner")
-    }))?;
-    get_jitcode_by_index(idx)
-}
-
-/// The charon `neg_inner` body in `ALL_JITCODES`, resolved by the graph key the
-/// codewriter allocated it under and cached process-wide. `None` if the helper is
-/// absent from the build-time pipeline.
-///
-/// This is `descroperation.rs` `neg` past its `__neg__` override probe -- the
-/// one arm a descent cannot take. What is left is the integer arm (including
-/// the `checked_neg` promotion of `INT_MIN`), the `long`, `float` and `complex`
-/// arms, the instance fallback and the terminal `TypeError`, so a caller that
-/// has pinned an exact `int` or `long` receiver records one of the first two
-/// and nothing else.
-pub fn neg_inner_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*NEG_INNER_JITCODE_INDEX.get_or_init(|| {
-        compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::neg_inner")
-    }))?;
-    get_jitcode_by_index(idx)
-}
-
-/// The charon `pos_inner` body in `ALL_JITCODES`, resolved by the graph key the
-/// codewriter allocated it under and cached process-wide. `None` if the helper is
-/// absent from the build-time pipeline.
-///
-/// This is `descroperation.rs` `pos` past its `__pos__` override probe -- the
-/// one arm a descent cannot take. What is left is the exact-int identity, the
-/// bool/int rewrap, the long/float/complex arms, the instance fallback and the
-/// terminal `TypeError`, so a caller that has pinned an exact `int` or `long`
-/// receiver records one of the identity arms and nothing else.
-///
-/// `+x` is `CALL_INTRINSIC_1`, so the only route to this body runs through
-/// `OpcodeStepExecutor::unary_positive`, which is declared without a body for
-/// that reason: a default there is the graph the walker takes, and `PyFrame`'s
-/// implementation -- and with it `pos` and `pos_inner` -- is never reached.
-/// `None` here is the helper's absence from the build-time pipeline, and the
-/// identity fold behind the descent still serves exact-int `+x`.
-pub fn pos_inner_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*POS_INNER_JITCODE_INDEX.get_or_init(|| {
-        compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::pos_inner")
-    }))?;
-    get_jitcode_by_index(idx)
-}
-
-/// The wrapped-name interpreter-source value half of `LOAD_SUPER_ATTR`, resolved by the
-/// graph key the codewriter allocated it under and cached process-wide.
-pub fn load_super_attr_value_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*LOAD_SUPER_ATTR_VALUE_JITCODE_INDEX.get_or_init(|| {
-        compute_pathed_jitcode_index("pyre_interpreter::eval::load_super_attr_value_w")
-    }))?;
-    get_jitcode_by_index(idx)
-}
-
 pub fn tuple_getitem_jitcode() -> Option<Arc<JitCode>> {
     let idx = (*TUPLE_GETITEM_JITCODE_INDEX.get_or_init(|| {
         compute_pathed_jitcode_index("pyre_object::tupleobject::w_tuple_getitem")
@@ -3101,6 +3112,45 @@ mod tests {
     }
 
     #[test]
+    fn canonical_runtime_wrapper_identity_is_shared_across_threads() {
+        let first = get_runtime_jitcode_by_index(0).expect("first canonical runtime JitCode");
+        let second = std::thread::spawn(|| {
+            get_runtime_jitcode_by_index(0).expect("first canonical runtime JitCode on child")
+        })
+        .join()
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn pathed_lookup_is_the_process_wide_callcontrol_dict() {
+        let path: &'static str = jitcode_index()
+            .paths
+            .iter()
+            .find(|path| !path.is_empty())
+            .expect("at least one graph-backed JitCode")
+            .as_str();
+        let first = pathed_runtime_jitcode_cached(path).expect("canonical path");
+        let again = pathed_runtime_jitcode_cached(path).expect("same path again");
+        let other = std::thread::spawn(move || {
+            pathed_runtime_jitcode_cached(path).expect("canonical path on another thread")
+        })
+        .join()
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(Arc::ptr_eq(&first, &other));
+        assert_eq!(
+            compute_pathed_jitcode_index(path),
+            jitcode_index()
+                .paths
+                .iter()
+                .position(|candidate| candidate == path)
+        );
+        assert!(pathed_runtime_jitcode_cached("__missing_jitcode_path__").is_none());
+        assert!(compute_pathed_jitcode_index("").is_none());
+    }
+
+    #[test]
     fn indirect_target_lookup_decodes_only_the_matched_jitcode() {
         let (&fnaddr, &index) = INDIRECTCALLTARGET_BY_FNADDR
             .iter()
@@ -3609,6 +3659,7 @@ mod tests {
             "getlistitem_gc_f/ridd>f",
             "getlistitem_gc_i/ridd>i",
             "getlistitem_gc_r/ridd>r",
+            "guard_class/r>i",
             "int_between/iii>i",
             "newlist/idddd>r",
             "newlist_clear/idddd>r",

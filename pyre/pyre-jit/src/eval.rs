@@ -9989,6 +9989,24 @@ pub(crate) fn portal_activation_result(frame: &mut PyFrame) -> PyResult {
     enter_portal(frame, bracketed_without_resume)
 }
 
+/// `execute_frame`'s activation entry for an interpreter/blackhole portal
+/// door: the logical half of the stack check `pyframe.py` marks with
+/// `insert_stack_check_here`, and then the activation unit that check bounds.
+///
+/// The ordinary door runs the same pair in [`eval_with_jit`].  A portal door
+/// reached by `bhimpl_recursive_call_*` does not pass through it. On a guard
+/// exit, the compiled activation seam charged the depth ahead of the failing
+/// guard and deliberately did not give it back, so the depth read here is the
+/// one that charge produced. On an uncompiled recursive portal call, this
+/// check/charge order is the same as [`eval_with_jit`]. The backend's fragment
+/// prologue already owns the independent native-stack check.
+fn enter_portal_activation(
+    frame: &mut PyFrame,
+) -> Result<pyre_interpreter::call::RecursionDepthGuard, pyre_interpreter::PyError> {
+    pyre_interpreter::stack_check::check_recursion_depth()?;
+    Ok(pyre_interpreter::call::enter_recursive_frame(frame))
+}
+
 /// Activation whose execution-context vref bracket is emitted by compiled
 /// code around CALL_ASSEMBLER.
 ///
@@ -9998,6 +10016,9 @@ pub(crate) fn portal_activation_result(frame: &mut PyFrame) -> PyResult {
 /// `execute_frame`'s hook bracket.  The compiled continuation records the
 /// matching chain restore after the call returns.
 pub(crate) fn portal_traced_activation_result(frame: &mut PyFrame) -> PyResult {
+    // `record_activation_charge` already emitted this door's logical depth
+    // check into the compiled trace. Only a guard exit that re-enters through
+    // `portal_activation_result` needs to repeat the check in Rust.
     let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
@@ -10020,7 +10041,7 @@ pub(crate) fn portal_traced_activation_result(frame: &mut PyFrame) -> PyResult {
 /// Account before constructing `FrameRoot`, because a moving GC may change the
 /// frame's address while the activation remains the same.
 fn enter_portal(frame: &mut PyFrame, body: fn(&mut FrameRoot) -> PyResult) -> PyResult {
-    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
+    let _recursion_depth = enter_portal_activation(frame)?;
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());

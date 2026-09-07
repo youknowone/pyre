@@ -17,6 +17,7 @@
 //! that appears inside a tuple.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use majit_ir::Descr;
 use majit_translate::codewriter::flatten::reorder_renaming_list;
@@ -403,6 +404,12 @@ impl SwitchDictDescr {
 /// `_labels` and the assembler sees a finalised runtime descr.
 #[derive(Debug, Clone)]
 pub enum DescrOperand {
+    /// `call.py CallControl.get_jitcode`'s `JitCode`, which is itself an
+    /// `AbstractDescr` in RPython and is therefore the leading `d` operand of
+    /// every `inline_call_*` emitted by `jtransform.py
+    /// handle_regular_call`.  The runtime wrapper owns the per-body descr
+    /// pool needed when a Python-code JitCode embeds a translated helper.
+    JitCode(Arc<majit_metainterp::jitcode::JitCode>),
     /// Runtime descr already materialised as `BhDescr`.
     Bh(BhDescr),
     /// SSARepr-side `SwitchDictDescr` before `attach()`; liveness reads
@@ -3642,26 +3649,23 @@ pub struct LoweringContext {
     /// codewriter pushes back onto the stack.  `jit_set_function_attribute`
     /// stamps a typed field (`Plain` — runs no user code, never raises).
     pub set_function_attribute_fn_idx: u16,
-    /// `unary_negative_fn` descrs-pool index.  UNARY_NEGATIVE records the
-    /// flowspace `neg(value)` op (operation.py) lowered to
-    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
-    /// [`lower_unary_negative_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
-    /// shape); `bh_unary_negative_fn` computes `-value` (a user `__neg__`
-    /// may force virtualizables → `MayForce`).
+    /// `unary_negative_fn` descrs-pool index.  It is the fallback used only
+    /// when the source-translator body for flowspace `neg(value)` is absent;
+    /// [`lower_unary_negative_hlop_to_insn`] normally emits the canonical
+    /// `inline_call_r_r` to that body.  The fallback may invoke user `__neg__`
+    /// and therefore remains `MayForce`.
     pub unary_negative_fn_idx: u16,
-    /// `unary_invert_fn` descrs-pool index.  UNARY_INVERT records the
-    /// object-space `invert(value)` op (pyopcode.py:653) lowered to
-    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
-    /// [`lower_unary_invert_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
-    /// shape); `bh_unary_invert_fn` computes `~value` (a user `__invert__`
-    /// may force virtualizables → `MayForce`).
+    /// `unary_invert_fn` descrs-pool index.  It is the fallback used only when
+    /// the source-translator body for object-space `invert(value)` is absent;
+    /// [`lower_unary_invert_hlop_to_insn`] normally emits the canonical
+    /// `inline_call_r_r` to that body.  The fallback may invoke user
+    /// `__invert__` and therefore remains `MayForce`.
     pub unary_invert_fn_idx: u16,
-    /// `unary_positive_fn` descrs-pool index.  UNARY_POSITIVE records the
-    /// object-space `pos(value)` op (pyopcode.py:649) lowered to
-    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
-    /// [`lower_unary_positive_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
-    /// shape); `bh_unary_positive_fn` computes `+value` (a user `__pos__`
-    /// may force virtualizables → `MayForce`).
+    /// `unary_positive_fn` descrs-pool index.  It is the fallback used only
+    /// when the source-translator body for object-space `pos(value)` is absent;
+    /// [`lower_unary_positive_hlop_to_insn`] normally emits the canonical
+    /// `inline_call_r_r` to that body.  The fallback may invoke user `__pos__`
+    /// and therefore remains `MayForce`.
     pub unary_positive_fn_idx: u16,
     /// `load_common_constant_fn` descrs-pool index.  LOAD_COMMON_CONSTANT
     /// records the `load_common_constant(disc)` HLOp lowered to
@@ -3865,6 +3869,32 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    // `jtransform.py handle_regular_call` emits `inline_call` when the
+    // callee jitcode is bound.  Raising tags stay residual so the walker
+    // can use the same specialize + `finishframe` path residual_call
+    // already ports from `pyjitpl.py`:
+    //
+    // * 3/4 (`//`, `%`): `try_walker_specialize_binary_op_int_zero_div`
+    //   records the raise on the *portal* frame.  Flatten `inline_call`
+    //   walks the helper instead, and a later divisor flip
+    //   (`checksum += i // d`) resumes without that local.
+    // * 6 (`getitem`): the helper arm hits an un-lowered residual
+    //   (`OrthodoxSubWalkTraceUnsupported`); `fully_bound_callee_body`
+    //   cannot see it because the funcptr is a register.
+    // * 5 (`/`): float zero-div raise trips a green-key bucket mismatch
+    //   when the helper is inlined (`typed decision key must bucket`).
+    // * 8/9 (`<<`, `>>`): negative-count raise after a prior bigint
+    //   residual poisons `PyError.message` on the inlined helper path.
+    if !matches!(op_val, 3 | 4 | 5 | 6 | 8 | 9)
+        && let Some(insn) = build_orthodox_inline_call_ir_r(
+            "pyre_interpreter::opcode_ops::binary_value_from_tag",
+            vec![Operand::ConstInt(op_val)],
+            vec![lhs_operand.clone(), rhs_operand.clone()],
+            result_reg,
+        )
+    {
+        return Some(insn);
+    }
     Some(build_residual_call_ir_r_insn_from_operands(
         ctx.binary_op_fn_idx,
         op_val,
@@ -4062,6 +4092,14 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    if let Some(insn) = build_orthodox_inline_call_ir_r(
+        "pyre_interpreter::opcode_ops::compare_value_from_tag",
+        vec![Operand::ConstInt(op_val)],
+        vec![lhs_operand.clone(), rhs_operand.clone()],
+        result_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_ir_r_insn_from_operands(
         ctx.compare_op_fn_idx,
         op_val,
@@ -6435,11 +6473,104 @@ where
     ))
 }
 
+/// The body of a fixed callee path whose host addresses this build has fully
+/// bound — what an `inline_call_*` may name — or `None` for the residual-call
+/// case.
+///
+/// Three conditions answer `None`.  The path may resolve to no JitCode at all,
+/// in a build whose translation pipeline never assembled that graph.  The
+/// resolved body may carry no `startpoints`, the record of which byte offsets
+/// begin an instruction; without it the scan below cannot tell an opcode byte
+/// from an operand byte of equal value, and so inspects nothing.  Or the body
+/// may still hold a `symbolic_fnaddr_for_path` placeholder — transitively,
+/// through the `inline_call_*` callees it names — standing for a call this
+/// build never bound to a host address.
+///
+/// That last condition is pyre's own admission rule and has no upstream
+/// counterpart: after translation every graph has a real `getfunctionptr`
+/// address, so an unbound placeholder cannot exist there.  Upstream's nearest
+/// gate is about something else and is not transitive — `call.py
+/// CallControl.is_candidate` is `graph in self.candidate_graphs`, and
+/// `policy.py JitPolicy.look_inside_graph`, which seeds that set, reads one
+/// graph's own operations, its own back-edges and its own
+/// `_jit_look_inside_` / `_elidable_function_` flags.
+///
+/// What is upstream is that the decision belongs here, before emission:
+/// `jtransform.py handle_regular_call` emits `inline_call_*` only for a graph
+/// `graphs_from` returned, and `pyjitpl.py _opimpl_inline_call1`/`2`/`3`
+/// accordingly have no decline path
+/// — nor does pyre's walker route for the op (`specialize.rs
+/// run_codewriter_helper_inline_call`).  A walk that meets an unbound symbolic
+/// target aborts the whole trace, not just the callee, whereas the residual
+/// fallback the caller keeps executes it.
+///
+/// The transitive scan is `JitCode::reachable_symbolic_residuals`, memoized on
+/// the JitCode, so a body walk costs O(body) once per callee rather than once
+/// per lowered site.  It follows each `inline_call_*` through the shared
+/// build-time descr pool, which a body assembled at build time does not carry
+/// per-jitcode; the pool is installed first because a scan that resolves no
+/// callee also reports no target, which would read here as a clean body.
+fn fully_bound_callee_body(
+    canonical_path: &'static str,
+) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+    let jitcode = pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path)?;
+    jitcode.startpoints.as_ref()?;
+    if !jitcode.reachable_symbolic_residuals().targets.is_empty() {
+        return None;
+    }
+    // `blackhole.py bhimpl_inline_call_*` calls `jitcode.fnaddr`.  A
+    // fully-bound body with no host address aborts the frame on every
+    // guard-failure resume (`reject_unresolved_inline_call`).
+    if jitcode.fnaddr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(jitcode.fnaddr)
+    {
+        return None;
+    }
+    Some(jitcode)
+}
+
+fn build_orthodox_inline_call_r_r(
+    canonical_path: &'static str,
+    value: Operand,
+    dst_reg: Register,
+) -> Option<Insn> {
+    let jitcode = fully_bound_callee_body(canonical_path)?;
+    Some(Insn::op_with_result(
+        "inline_call_r_r",
+        vec![
+            Operand::descr(DescrOperand::JitCode(jitcode)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![value])),
+        ],
+        dst_reg,
+    ))
+}
+
+/// `jtransform.py handle_regular_call` for a `(Ref, Ref, Int) → Ref` body:
+/// `inline_call_ir_r(JitCode, ListI(ints), ListR(refs)) → reg`.
+fn build_orthodox_inline_call_ir_r(
+    canonical_path: &'static str,
+    ints: Vec<Operand>,
+    refs: Vec<Operand>,
+    dst_reg: Register,
+) -> Option<Insn> {
+    let jitcode = fully_bound_callee_body(canonical_path)?;
+    Some(Insn::op_with_result(
+        "inline_call_ir_r",
+        vec![
+            Operand::descr(DescrOperand::JitCode(jitcode)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, ints)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, refs)),
+        ],
+        dst_reg,
+    ))
+}
+
 /// Lower the UNARY_NEGATIVE flowspace op `neg(value)` → `result: Ref`
-/// (operation.py:466) to `residual_call_r_r(ConstInt(unary_negative_fn_idx),
-/// ListR([value]), Descr) → reg`, the single-Ref
-/// [`lower_format_simple_hlop_to_insn`] shape. `bh_unary_negative_fn`
-/// computes `-value`; a user `__neg__` may force virtualizables → `MayForce`.
+/// (operation.py `neg`) to the canonical
+/// `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by RPython's
+/// `jtransform.py handle_regular_call`.  A build whose `descroperation::neg`
+/// body `fully_bound_callee_body` declines retains the MayForce residual
+/// fallback.
 ///
 /// Returns `None` for non-`neg` opnames so the caller can fall through to
 /// other lowering arms.
@@ -6461,6 +6592,13 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if let Some(insn) = build_orthodox_inline_call_r_r(
+        "pyre_interpreter::objspace::descroperation::neg",
+        value.clone(),
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.unary_negative_fn_idx,
         vec![value],
@@ -6472,10 +6610,12 @@ where
 
 /// Lower the UNARY_INVERT object-space op `invert(value)` → `result: Ref`
 /// (pyopcode.py `unaryoperation("invert")`) to
-/// `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
-/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
-/// `bh_unary_invert_fn` computes `~value`; a user `__invert__` may force
-/// virtualizables → `MayForce`.
+/// the canonical `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by
+/// RPython's `jtransform.py handle_regular_call`.  This lets the ordinary
+/// inline-call dispatcher trace `descroperation::invert` rather than asking a
+/// residual-call specialization to rediscover it.  A build whose body
+/// `fully_bound_callee_body` declines retains the `bh_unary_invert_fn`
+/// MayForce fallback.
 ///
 /// Returns `None` for non-`invert` opnames so the caller can fall
 /// through to other lowering arms.
@@ -6497,6 +6637,13 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if let Some(insn) = build_orthodox_inline_call_r_r(
+        "pyre_interpreter::objspace::descroperation::invert",
+        value.clone(),
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.unary_invert_fn_idx,
         vec![value],
@@ -6508,10 +6655,10 @@ where
 
 /// Lower the UNARY_POSITIVE object-space op `pos(value)` → `result: Ref`
 /// (pyopcode.py `unaryoperation("pos")`) to
-/// `residual_call_r_r(ConstInt(unary_positive_fn_idx), ListR([value]),
-/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
-/// `bh_unary_positive_fn` computes `+value`; a user `__pos__` may force
-/// virtualizables → `MayForce`.
+/// the canonical `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by
+/// RPython's `jtransform.py handle_regular_call`.  A build whose
+/// `descroperation::pos` body `fully_bound_callee_body` declines retains the
+/// MayForce residual fallback.
 ///
 /// Returns `None` for non-`pos` opnames so the caller can fall through
 /// to other lowering arms.
@@ -6533,6 +6680,13 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if let Some(insn) = build_orthodox_inline_call_r_r(
+        "pyre_interpreter::objspace::descroperation::pos",
+        value.clone(),
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.unary_positive_fn_idx,
         vec![value],
@@ -8800,6 +8954,36 @@ mod tests {
         assert_eq!(ref_alloc.num_colors, 2);
     }
 
+    fn is_inline_ir_r_named(insn: &Insn, name: &str) -> bool {
+        matches!(
+            insn,
+            Insn::Op { opname, args, .. }
+                if opname == "inline_call_ir_r"
+                    && matches!(
+                        args.first(),
+                        Some(Operand::Descr(descr))
+                            if matches!(&**descr, DescrOperand::JitCode(jc) if jc.name() == name)
+                    )
+        )
+    }
+
+    fn is_residual_ir_r_fn(insn: &Insn, fn_idx: i64) -> bool {
+        matches!(
+            insn,
+            Insn::Op { opname, args, .. }
+                if opname == "residual_call_ir_r"
+                    && matches!(args.first(), Some(Operand::ConstInt(v)) if *v == fn_idx)
+        )
+    }
+
+    fn is_lowered_binary_op(insn: &Insn) -> bool {
+        is_inline_ir_r_named(insn, "binary_value_from_tag") || is_residual_ir_r_fn(insn, 11)
+    }
+
+    fn is_lowered_compare_op(insn: &Insn) -> bool {
+        is_inline_ir_r_named(insn, "compare_value_from_tag") || is_residual_ir_r_fn(insn, 13)
+    }
+
     #[test]
     fn flatten_graph_with_lowering_lowers_retired_family_hlops() {
         // a graph carrying one HLOp from each of the four
@@ -8853,33 +9037,24 @@ mod tests {
         let mut ssarepr = SSARepr::new("retired_families");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
 
-        // BINARY_OP `add` → residual_call_ir_r with fn_idx=11.
-        let binary = ssarepr.insns.iter().find(|insn| {
-            matches!(
-                insn,
-                Insn::Op { opname, args, .. }
-                    if opname == "residual_call_ir_r"
-                        && matches!(args.first(), Some(Operand::ConstInt(11)))
-            )
-        });
+        // BINARY_OP `add` → inline_call_ir_r when the body is bound,
+        // otherwise residual_call_ir_r with fn_idx=11.
+        let binary = ssarepr.insns.iter().find(|insn| is_lowered_binary_op(insn));
         assert!(
             binary.is_some(),
-            "expected BINARY_OP residual_call: {:?}",
+            "expected BINARY_OP inline_call or residual_call: {:?}",
             ssarepr.insns
         );
 
-        // COMPARE_OP `lt` → residual_call_ir_r with fn_idx=13.
-        let compare = ssarepr.insns.iter().find(|insn| {
-            matches!(
-                insn,
-                Insn::Op { opname, args, .. }
-                    if opname == "residual_call_ir_r"
-                        && matches!(args.first(), Some(Operand::ConstInt(13)))
-            )
-        });
+        // COMPARE_OP `lt` → inline_call_ir_r when the body is bound,
+        // otherwise residual_call_ir_r with fn_idx=13.
+        let compare = ssarepr
+            .insns
+            .iter()
+            .find(|insn| is_lowered_compare_op(insn));
         assert!(
             compare.is_some(),
-            "expected COMPARE_OP residual_call: {:?}",
+            "expected COMPARE_OP inline_call or residual_call: {:?}",
             ssarepr.insns
         );
 
@@ -8970,13 +9145,16 @@ mod tests {
         let call_pos = ssarepr
             .insns
             .iter()
-            .position(
-                |insn| matches!(insn, Insn::Op { opname, .. } if opname == "residual_call_ir_r"),
-            )
-            .unwrap_or_else(|| panic!("expected residual_call_ir_r: {:?}", ssarepr.insns));
+            .position(|insn| is_lowered_binary_op(insn))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected BINARY_OP inline_call or residual_call: {:?}",
+                    ssarepr.insns
+                )
+            });
         assert!(
             ssarepr.insns[call_pos + 1].is_live(),
-            "residual_call must be followed by a `-live-` marker, got {:?}",
+            "lowered BINARY_OP call must be followed by a `-live-` marker, got {:?}",
             &ssarepr.insns[call_pos..]
         );
     }
@@ -9085,44 +9263,29 @@ mod tests {
         let mut ssarepr = SSARepr::new("multi_block_lowering");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
 
-        // Filter the SSARepr by `(opname, fn_idx)` mirroring the
-        // probe's per-family report.  Both families share the
-        // `residual_call_ir_r` opname, so the leading ConstInt
-        // arg distinguishes them.
+        // Filter the SSARepr by family.  A bound body emits
+        // `inline_call_ir_r` named after the helper; the unbound
+        // fallback keeps `residual_call_ir_r` and the fn_idx.
         let binary: Vec<&Insn> = ssarepr
             .insns
             .iter()
-            .filter(|insn| {
-                matches!(
-                    insn,
-                    Insn::Op { opname, args, .. }
-                        if opname == "residual_call_ir_r"
-                            && matches!(args.first(), Some(Operand::ConstInt(11)))
-                )
-            })
+            .filter(|insn| is_lowered_binary_op(insn))
             .collect();
         let compare: Vec<&Insn> = ssarepr
             .insns
             .iter()
-            .filter(|insn| {
-                matches!(
-                    insn,
-                    Insn::Op { opname, args, .. }
-                        if opname == "residual_call_ir_r"
-                            && matches!(args.first(), Some(Operand::ConstInt(13)))
-                )
-            })
+            .filter(|insn| is_lowered_compare_op(insn))
             .collect();
         assert_eq!(
             binary.len(),
             1,
-            "expected exactly one BINARY_OP residual_call across the 2-block graph: {:?}",
+            "expected exactly one BINARY_OP lowered call across the 2-block graph: {:?}",
             ssarepr.insns
         );
         assert_eq!(
             compare.len(),
             1,
-            "expected exactly one COMPARE_OP residual_call across the 2-block graph: {:?}",
+            "expected exactly one COMPARE_OP lowered call across the 2-block graph: {:?}",
             ssarepr.insns
         );
 
@@ -9132,27 +9295,13 @@ mod tests {
         let binary_pos = ssarepr
             .insns
             .iter()
-            .position(|insn| {
-                matches!(
-                    insn,
-                    Insn::Op { opname, args, .. }
-                        if opname == "residual_call_ir_r"
-                            && matches!(args.first(), Some(Operand::ConstInt(11)))
-                )
-            })
-            .expect("BINARY_OP residual_call must exist");
+            .position(|insn| is_lowered_binary_op(insn))
+            .expect("BINARY_OP lowered call must exist");
         let compare_pos = ssarepr
             .insns
             .iter()
-            .position(|insn| {
-                matches!(
-                    insn,
-                    Insn::Op { opname, args, .. }
-                        if opname == "residual_call_ir_r"
-                            && matches!(args.first(), Some(Operand::ConstInt(13)))
-                )
-            })
-            .expect("COMPARE_OP residual_call must exist");
+            .position(|insn| is_lowered_compare_op(insn))
+            .expect("COMPARE_OP lowered call must exist");
         assert!(
             binary_pos < compare_pos,
             "BINARY_OP must precede COMPARE_OP across block boundaries: pos {} vs {}",
@@ -9376,14 +9525,7 @@ mod tests {
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
 
-        let has_binary_op_lowered = ssarepr.insns.iter().any(|insn| {
-            matches!(
-                insn,
-                Insn::Op { opname, args, .. }
-                    if opname == "residual_call_ir_r"
-                        && matches!(args.first(), Some(Operand::ConstInt(11)))
-            )
-        });
+        let has_binary_op_lowered = ssarepr.insns.iter().any(|insn| is_lowered_binary_op(insn));
         let has_raw_add = ssarepr
             .insns
             .iter()
@@ -9391,7 +9533,7 @@ mod tests {
         assert!(
             has_binary_op_lowered,
             "canonical flatten_graph with cpu.lowering_ctx must lower BINARY_OP \
-             `add` HLOp to residual_call_ir_r(fn_idx=11, ...): {:?}",
+             `add` HLOp to inline_call_ir_r or residual_call_ir_r(fn_idx=11, ...): {:?}",
             ssarepr.insns
         );
         assert!(
@@ -9600,6 +9742,14 @@ mod tests {
                 opname,
                 args,
                 result: Some(reg),
+            } if opname == "inline_call_ir_r" => {
+                assert_eq!(reg, Register::new(Kind::Ref, 2));
+                assert_eq!(args.len(), 3);
+            }
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
             } => {
                 assert_eq!(opname, "residual_call_ir_r");
                 assert_eq!(reg, Register::new(Kind::Ref, 2));
@@ -9678,13 +9828,10 @@ mod tests {
     }
 
     #[test]
-    fn lower_binary_op_hlop_matches_dual_write_residual_call_shape() {
-        // Byte-equivalence cross-check: the Insn produced from the
-        // BINARY_OP HLOp via `lower_binary_op_hlop_to_insn` must match
-        // the Insn produced by feeding the equivalent dual-write
-        // `residual_call_ir_r` SpaceOperation through
-        // `flatten_op_to_insn`.  This is the foundational invariant
-        // for retiring the dual-write + inline emit.
+    fn lower_binary_op_hlop_emits_inline_call_when_body_is_bound() {
+        // `binary_value_from_tag` is fully bound, so the HLOp lowers to
+        // `jtransform.py handle_regular_call`'s `inline_call_ir_r` rather
+        // than the MayForce residual the walker used to re-recognise.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);
@@ -9700,47 +9847,32 @@ mod tests {
             lower_binary_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("BINARY_OP HLOp must lower");
 
-        // Build the equivalent dual-write residual_call SpaceOperation
-        // by hand — same shape as `record_residual_call_graph_op`
-        // produces in codewriter.rs's `Instruction::BinaryOp` arm for `sub`:
-        //   `[ConstInt(fn_idx), ListI([ConstInt(op_val)]),
-        //     ListR([lhs, rhs]), Descr]`.
-        // (`record_residual_call_graph_op` in codewriter.rs
-        // pushes `args_i` before `args_r` per the upstream
-        // `i,r,f` order; the `op_val` is bucketed into args_i because
-        // its `Kind` is `Int` per arg_kinds.)
-        // BINARY_OP helper carries the `BinaryOp` oopspec so the
-        // full-body walker can recognize + specialize it (#57); the
-        // hand-built dual-write descr must mirror that tag.
-        let mut may_force_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
-        may_force_ei.runtime_helper = majit_ir::RuntimeHelperKind::BinaryOp;
-        let descr = intern_call_descr_stub(
-            may_force_ei,
-            vec![Kind::Ref, Kind::Ref, Kind::Int],
-            Some(Kind::Ref),
-        );
-        let dual_op = SpaceOperation::new(
-            "residual_call_ir_r",
-            vec![
-                Constant::signed(11).into(),
-                FlowListOfKind::new(Kind::Int, vec![Constant::signed(1).into()]).into(),
-                FlowListOfKind::new(Kind::Ref, vec![lhs.into(), rhs.into()]).into(),
-                descr.into(),
-            ],
-            Some(result.into()),
-            0,
-        );
-        let dual = flatten_op_to_insn(
-            &dual_op,
-            &mut get_register,
-            &mut flatten_constant_operand_for_test,
-        )
-        .expect("residual_call SpaceOperation must lower");
-
-        // Compare via Debug formatting — Insn does not derive Eq, but
-        // the Debug output is structurally faithful for the variants
-        // we touch (Op, Operand::*, Register).
-        assert_eq!(format!("{lowered:?}"), format!("{dual:?}"));
+        match lowered {
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
+            } => {
+                assert_eq!(opname, "inline_call_ir_r");
+                assert_eq!(reg, Register::new(Kind::Ref, 2));
+                assert_eq!(args.len(), 3);
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(matches!(list.content.as_slice(), [Operand::ConstInt(1)]));
+                    }
+                    other => panic!("expected ListI([1]), got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 2);
+                    }
+                    other => panic!("expected ListR([lhs, rhs]), got {other:?}"),
+                }
+            }
+            other => panic!("expected inline_call_ir_r, got {other:?}"),
+        }
     }
 
     #[test]
@@ -9804,6 +9936,14 @@ mod tests {
                 opname,
                 args,
                 result: Some(reg),
+            } if opname == "inline_call_ir_r" => {
+                assert_eq!(reg, Register::new(Kind::Ref, 2));
+                assert_eq!(args.len(), 3);
+            }
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
             } => {
                 assert_eq!(opname, "residual_call_ir_r");
                 assert_eq!(reg, Register::new(Kind::Ref, 2));
@@ -9842,8 +9982,9 @@ mod tests {
 
     #[test]
     fn lower_compare_op_hlop_to_insn_emits_is_op_tag() {
-        // IS_OP routes through the same compare residual as COMPARE_OP;
-        // `is` lowers to op_val tag 8 (`is_not` → 9, bh_compare_fn).
+        // IS_OP routes through the same compare helper as COMPARE_OP;
+        // `is` lowers to op_val tag 8 (`is_not` → 9). `compare_value_from_tag`
+        // handles those tags via `is_w`, matching `bh_compare_fn`.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);
@@ -9860,8 +10001,16 @@ mod tests {
 
         match insn {
             Insn::Op { opname, args, .. } => {
-                assert_eq!(opname, "residual_call_ir_r");
-                match &args[1] {
+                assert!(
+                    opname == "inline_call_ir_r" || opname == "residual_call_ir_r",
+                    "unexpected compare lowering {opname}"
+                );
+                let tag_list = if opname == "inline_call_ir_r" {
+                    &args[1]
+                } else {
+                    &args[1]
+                };
+                match tag_list {
                     Operand::ListOfKind(list) => match &list.content[0] {
                         Operand::ConstInt(v) => assert_eq!(*v, 8, "is → tag 8"),
                         other => panic!("expected ConstInt(8) in ListI, got {other:?}"),
@@ -9911,8 +10060,13 @@ mod tests {
         let lowered =
             lower_compare_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("COMPARE_OP HLOp must lower");
-        let prod = build_compare_op_residual_call_ir_r_insn(17, 4, 0, 1, 2);
-        assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
+        match &lowered {
+            Insn::Op { opname, .. } if opname == "inline_call_ir_r" => {}
+            _ => {
+                let prod = build_compare_op_residual_call_ir_r_insn(17, 4, 0, 1, 2);
+                assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
+            }
+        }
     }
 
     #[test]
@@ -13346,20 +13500,19 @@ mod tests {
         }
     }
 
-    /// Shared body for the single-Ref unary HLOp lowerings (`invert`, `pos`,
-    /// `not_`): each records `<op_name>(value)` and lowers to
-    /// `residual_call_r_r(ConstInt(expected_fn_idx), ListR([value]), Descr)`
-    /// returning reg. `lower` selects the specific `lower_unary_*_hlop_to_insn`.
-    fn assert_unary_lowering_emits_residual(
+    /// Lower the shared single-Ref unary HLOp fixture — `value` in Ref
+    /// register 101, result in Ref register 102 — and return the emitted
+    /// `Insn::Op` parts.  Every unary lowering below is handed the same
+    /// fixture, so the two expectations differ only in `opname` and `args[0]`.
+    fn lower_unary_hlop_fixture(
         op_name: &str,
-        expected_fn_idx: i64,
         lower: impl FnOnce(
             &super::super::flow::SpaceOperation,
             &LoweringContext,
             &mut dyn FnMut(Variable) -> Register,
             &mut dyn FnMut(&Constant) -> Operand,
         ) -> Option<Insn>,
-    ) {
+    ) -> (String, Vec<Operand>, Option<Register>) {
         let value_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();
@@ -13388,50 +13541,139 @@ mod tests {
                 opname,
                 args,
                 result,
-            } => {
-                assert_eq!(opname, "residual_call_r_r");
-                assert!(
-                    matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
-                    "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
-                    args[0]
-                );
-                match &args[1] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
-                        assert!(
-                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
-                            "ListR = [value], got {:?}",
-                            list.content
-                        );
-                    }
-                    other => panic!("expected ListR, got {other:?}"),
-                }
-                assert_eq!(
-                    result,
-                    Some(Register {
-                        kind: Kind::Ref,
-                        index: 102
-                    }),
-                );
-            }
-            _ => panic!("expected Insn::Op, got {insn:?}"),
+            } => (opname, args, result),
+            other => panic!("expected Insn::Op, got {other:?}"),
         }
     }
 
-    #[test]
-    fn lower_unary_invert_hlop_emits_unary_invert_fn_residual() {
-        // MayForce — a user `__invert__` may run Python.
-        assert_unary_lowering_emits_residual("invert", 109, |op, ctx, gr, lc| {
-            super::lower_unary_invert_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
-        });
+    /// Assert the operand tail every single-Ref unary lowering shares,
+    /// whichever call shape it chose: `ListR([value])` and the Ref result
+    /// register the fixture asked for.
+    fn assert_unary_hlop_call_tail(op_name: &str, args: &[Operand], result: Option<Register>) {
+        match &args[1] {
+            Operand::ListOfKind(list) => {
+                assert_eq!(list.kind, Kind::Ref);
+                assert!(
+                    matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
+                    "{op_name} ListR = [value], got {:?}",
+                    list.content
+                );
+            }
+            other => panic!("expected ListR, got {other:?}"),
+        }
+        assert_eq!(
+            result,
+            Some(Register {
+                kind: Kind::Ref,
+                index: 102
+            }),
+        );
+    }
+
+    /// A single-Ref unary HLOp with no inline target emits the residual call
+    /// on its `_fn` pool index.  Pinned outright: no callee path is consulted.
+    fn assert_unary_lowering_emits_residual(
+        op_name: &str,
+        expected_fn_idx: i64,
+        lower: impl FnOnce(
+            &super::super::flow::SpaceOperation,
+            &LoweringContext,
+            &mut dyn FnMut(Variable) -> Register,
+            &mut dyn FnMut(&Constant) -> Operand,
+        ) -> Option<Insn>,
+    ) {
+        let (opname, args, result) = lower_unary_hlop_fixture(op_name, lower);
+        assert_eq!(opname, "residual_call_r_r");
+        assert!(
+            matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
+            "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
+            args[0]
+        );
+        assert_unary_hlop_call_tail(op_name, &args, result);
+    }
+
+    /// A single-Ref unary HLOp whose callee body this build carries fully
+    /// bound emits the canonical `inline_call_r_r` naming that body; one whose
+    /// body is absent or still unbound keeps the residual fallback.
+    ///
+    /// Which of the two the build offers is a property of the build, so the
+    /// expectation is read from the callee registry and the body scan rather
+    /// than from `fully_bound_callee_body`: asking the gate itself would agree
+    /// with any answer it gave.  Read this way, a gate that declines a body
+    /// that resolves and names no unbound symbolic residual fails here.
+    fn assert_unary_lowering_inlines_bound_body(
+        op_name: &str,
+        canonical_path: &'static str,
+        expected_fn_idx: i64,
+        lower: impl FnOnce(
+            &super::super::flow::SpaceOperation,
+            &LoweringContext,
+            &mut dyn FnMut(Variable) -> Register,
+            &mut dyn FnMut(&Constant) -> Operand,
+        ) -> Option<Insn>,
+    ) {
+        let (opname, args, result) = lower_unary_hlop_fixture(op_name, lower);
+        // The scan follows `inline_call_*` through the shared build-time descr
+        // pool, so this read needs the same installed pool the gate does.
+        pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+        let body_is_bound =
+            pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path)
+                .is_some_and(|jitcode| {
+                    jitcode.startpoints.is_some()
+                        && jitcode.reachable_symbolic_residuals().targets.is_empty()
+                });
+        if body_is_bound {
+            assert_eq!(opname, "inline_call_r_r");
+            assert!(
+                matches!(args[0], Operand::Descr(ref descr) if matches!(&**descr, DescrOperand::JitCode(_))),
+                "{op_name} inline target, got {:?}",
+                args[0]
+            );
+        } else {
+            assert_eq!(opname, "residual_call_r_r");
+            assert!(
+                matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
+                "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
+                args[0]
+            );
+        }
+        assert_unary_hlop_call_tail(op_name, &args, result);
     }
 
     #[test]
-    fn lower_unary_positive_hlop_emits_unary_positive_fn_residual() {
-        // MayForce — a user `__pos__` may run Python.
-        assert_unary_lowering_emits_residual("pos", 118, |op, ctx, gr, lc| {
-            super::lower_unary_positive_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
-        });
+    fn lower_unary_negative_hlop_emits_inline_call_or_residual_fallback() {
+        assert_unary_lowering_inlines_bound_body(
+            "neg",
+            "pyre_interpreter::objspace::descroperation::neg",
+            112,
+            |op, ctx, gr, lc| {
+                super::lower_unary_negative_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+            },
+        );
+    }
+
+    #[test]
+    fn lower_unary_invert_hlop_emits_inline_call_or_residual_fallback() {
+        assert_unary_lowering_inlines_bound_body(
+            "invert",
+            "pyre_interpreter::objspace::descroperation::invert",
+            109,
+            |op, ctx, gr, lc| {
+                super::lower_unary_invert_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+            },
+        );
+    }
+
+    #[test]
+    fn lower_unary_positive_hlop_emits_inline_call_or_residual_fallback() {
+        assert_unary_lowering_inlines_bound_body(
+            "pos",
+            "pyre_interpreter::objspace::descroperation::pos",
+            118,
+            |op, ctx, gr, lc| {
+                super::lower_unary_positive_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+            },
+        );
     }
 
     #[test]

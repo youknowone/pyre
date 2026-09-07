@@ -174,6 +174,20 @@ fn void_return() -> Vec<u8> {
     ]
 }
 
+fn int_copy_const(src: u8, dst: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("int_copy/c>i")
+        .expect("`int_copy/c>i` must be in insns table");
+    vec![byte, src, dst]
+}
+
+fn arraylen_gc(array: u8, descr: u16, dst: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("arraylen_gc/rd>i")
+        .expect("`arraylen_gc/rd>i` must be in insns table");
+    vec![byte, array, descr as u8, (descr >> 8) as u8, dst]
+}
+
 /// The generated `__majit_wrap_*` gateways all put their un-lowerable call — the
 /// `#[dont_look_inside]` arity-error formatter — on the arm the argument-count
 /// check rejects into.  The walk is execution-driven, so a call with the right
@@ -224,6 +238,198 @@ fn a_blocker_behind_an_executed_call_is_a_decline() {
     );
     assert!(summary.may_execute_effect);
     assert!(!summary.body_not_walked);
+}
+
+/// A constant condition is the same condition the generated walk reads.  The
+/// scan must follow only its executed successor; joining the dead fallthrough
+/// would turn an effect and blocker that cannot execute into a false decline.
+#[test]
+fn a_known_goto_condition_does_not_scan_the_dead_arm() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+
+    // 0: i0 = const <src>; 3: goto_if_not i0 -> 20
+    // 7: residual(real); 13: residual(symbolic); 19: return; 20: return
+    //
+    // `int_copy/c>i` carries its source inline as one signed byte, so the
+    // condition is spelled by that byte and there is no `constants_i` slot to
+    // vary: the two bodies differ only in it.
+    let body = |src: u8| {
+        let mut code = int_copy_const(src, 0);
+        code.extend(goto_if_not(0, 20));
+        code.extend(residual_call_with_funcbox(2));
+        code.extend(residual_call_with_funcbox(3));
+        code.extend(void_return());
+        code.extend(void_return());
+        assert_eq!(code.len(), 21);
+        code
+    };
+
+    let summary =
+        super::inline_call::summarize_body_blockers(&body(0), 1, &[0, real, symbolic], |_| None);
+    assert_eq!(summary.blocker_after_effect, None);
+    assert_eq!(summary.blocker_effect_free, None);
+    assert!(!summary.may_execute_effect);
+
+    // Flip only the condition.  The same body now executes the fallthrough,
+    // and the blocker after the real residual call must remain a decline.
+    let executed =
+        super::inline_call::summarize_body_blockers(&body(1), 1, &[0, real, symbolic], |_| None);
+    assert_eq!(executed.blocker_after_effect, Some(symbolic));
+    assert!(executed.may_execute_effect);
+}
+
+/// Generated builtin gateways receive an argument slice in r0 and branch on
+/// its length before entering the typed body.  The call site knows that length,
+/// so the path-sensitive scan must not join the arity-error arm back in.
+#[test]
+fn a_known_wrapper_array_length_selects_only_the_executed_arity_arm() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+
+    // 0: i0 = arraylen(r0); 5: goto_if_not i0 -> 22
+    // 9: residual(real); 15: residual(symbolic); 21: return; 22: return
+    let mut code = arraylen_gc(0, 0, 0);
+    code.extend(goto_if_not(0, 22));
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+    code.extend(void_return());
+    assert_eq!(code.len(), 23);
+
+    let scan = |len| {
+        super::inline_call::summarize_body_blockers_with(
+            &code,
+            1,
+            &[real, symbolic],
+            |_, _| None,
+            &mut |_, _| true,
+            &mut |_| false,
+            &mut |_| None,
+            &[(0, len)],
+        )
+    };
+    let empty = scan(0);
+    assert_eq!(empty.blocker_after_effect, None);
+    assert!(!empty.may_execute_effect);
+
+    let nonempty = scan(1);
+    assert_eq!(nonempty.blocker_after_effect, Some(symbolic));
+    assert!(nonempty.may_execute_effect);
+}
+
+/// An executed residual call the effectinfo names effect-free -- elidable,
+/// loop-invariant, or `not_in_trace` -- applies nothing a rollback would have
+/// to undo, so a blocker behind it stays on the rewind leg.  The scan asks
+/// through the `call_effect_free` hook; the helper without the hook keeps the
+/// conservative reading.
+#[test]
+fn a_blocker_behind_an_effect_free_call_is_not_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+
+    let mut code = residual_call_with_funcbox(1);
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+
+    let mut asked = Vec::new();
+    let summary = super::inline_call::summarize_body_blockers_with(
+        &code,
+        1,
+        &[real, symbolic],
+        |_, _| None,
+        &mut |_, _| true,
+        &mut |descr_index| {
+            asked.push(descr_index);
+            true
+        },
+        &mut |_| None,
+        &[],
+    );
+    assert_eq!(
+        asked,
+        vec![0],
+        "only the real call's descr is asked; the blocker stops the walk"
+    );
+    assert_eq!(summary.blocker_effect_free, Some(symbolic));
+    assert_eq!(summary.blocker_after_effect, None);
+    assert!(!summary.may_execute_effect);
+
+    let conservative =
+        super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
+    assert_eq!(conservative.blocker_after_effect, Some(symbolic));
+}
+
+/// A field write into an object this body allocated is no effect: a rewind
+/// drops the allocation.  The same write into a register the body did not
+/// fill from a `new*` keeps the conservative reading.
+#[test]
+fn a_write_into_a_fresh_allocation_is_not_an_effect() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let table = insns_opname_to_byte();
+    let new = *table
+        .get("new/d>r")
+        .expect("`new/d>r` must be in insns table");
+    let setfield = *table
+        .get("setfield_gc_i/rid")
+        .expect("`setfield_gc_i/rid` must be in insns table");
+
+    // r1 = new; r1.field = i0; residual(symbolic)
+    let mut code = vec![new, 0, 0, 1, setfield, 1, 0, 0, 0];
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_effect_free, Some(symbolic));
+    assert_eq!(summary.blocker_after_effect, None);
+    assert!(!summary.may_execute_effect);
+
+    // r2 was never allocated here: the write is an effect.
+    let mut code = vec![new, 0, 0, 1, setfield, 2, 0, 0, 0];
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert!(summary.may_execute_effect);
+}
+
+/// A `switch` whose arm table is known continues only at its arms and the
+/// fallthrough, so the state at one arm's switch does not reach a region no
+/// arm names; without the table every instruction start is a successor.
+#[test]
+fn a_switch_with_a_known_table_does_not_leak_its_state_to_every_start() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    let switch = *insns_opname_to_byte()
+        .get("switch/id")
+        .expect("`switch/id` must be in insns table");
+
+    // 0: residual(real)  6: switch i0 d0  10: return  11: residual(symbolic)  17: return
+    let mut code = residual_call_with_funcbox(1);
+    code.extend([switch, 0, 0, 0]);
+    code.extend(void_return());
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+    assert_eq!(code.len(), 18);
+
+    let known = super::inline_call::summarize_body_blockers_with(
+        &code,
+        1,
+        &[real, symbolic],
+        |_, _| None,
+        &mut |_, _| true,
+        &mut |_| false,
+        &mut |_| Some(vec![10]),
+        &[],
+    );
+    assert_eq!(
+        known.blocker_after_effect, None,
+        "pc 11 is no arm and no fallthrough"
+    );
+    assert_eq!(known.blocker_effect_free, None);
+
+    let widened =
+        super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
+    assert_eq!(widened.blocker_after_effect, Some(symbolic));
 }
 
 /// A callee's blocker is judged by what has run in the caller, not by what had

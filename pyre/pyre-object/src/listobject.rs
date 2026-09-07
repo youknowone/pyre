@@ -310,12 +310,15 @@ impl W_ListObject {
             ListStrategy::Empty | ListStrategy::Size => 0,
             ListStrategy::SimpleRange | ListStrategy::Range => unsafe { range_list_length(self) },
             ListStrategy::Object => self.length_relaxed(),
-            // Direct rlist `length` field reads keep this helper in the
-            // annotator's structural subset; the public `.len()` wrappers are
-            // host collection conveniences that translate as `__len__`.
-            ListStrategy::Integer => self.int_items.len(),
-            ListStrategy::IntOrFloat => self.int_items.len(),
-            ListStrategy::Float => self.float_items.len(),
+            // rlist.py `ll_length` is the `list.int_len` / `list.float_len`
+            // oopspec leaf.  Keep that call boundary: jtransform lowers the
+            // nested `int_items.len` / `float_items.len` path to one field read
+            // off the list owner.  Inlining the Rust field path instead first
+            // materialises the by-value storage struct as a GC Ref and then
+            // reads through it, which is neither an RPython getsubstruct nor a
+            // valid pointer.
+            ListStrategy::Integer | ListStrategy::IntOrFloat => ll_list_int_length(self),
+            ListStrategy::Float => ll_list_float_length(self),
             ListStrategy::Bytes => self.bytes_items.len(),
             ListStrategy::Ascii => self.ascii_items.len(),
         }
@@ -2905,28 +2908,26 @@ pub unsafe fn w_list_int_or_float_setitem(
     true
 }
 
-/// Get the length of a list.
+/// Get the length of a list: `W_ListObject.length()`, a strategy-dispatched
+/// field read (`listobject.py EmptyListStrategy.length` returns 0).
+///
+/// Read without the list's lock, the way `PyList_GET_SIZE` reads `ob_size`
+/// and the way the walked `w_list_*_inner` bodies already read it.  What
+/// makes that sound is the GIL (`majit-gc` `rgil`), which serialises every
+/// mutator against this read: the lock is a narrower scope inside it, not
+/// the thing keeping a strategy switch from being observed half-applied.
+/// The distinction matters because a half-applied switch is not merely a
+/// stale length — the two range strategies answer through `list.items`, and
+/// `switch_range_to_integer_strategy` nulls that pointer before it stores
+/// the new strategy.  With no lock there is no collection point, so `obj`
+/// needs no root here.  Taking the lock instead made the acquire an opaque
+/// residual (`w_list_lock` is `dont_look_inside`) on every traced
+/// `len(list)`, which is what kept the generic builtin descent out of `len`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
-    let _roots = crate::gc_roots::push_roots();
-    let root_base = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
-    let _list_guard = w_list_lock(obj);
-    let obj = crate::gc_roots::shadow_stack_get(root_base);
-    let list = &*(obj as *const W_ListObject);
-    match list.strategy {
-        // listobject.py EmptyListStrategy.length returns 0.
-        ListStrategy::Empty | ListStrategy::Size => 0,
-        ListStrategy::SimpleRange | ListStrategy::Range => range_list_length(list),
-        ListStrategy::Object => list.length_relaxed(),
-        ListStrategy::Integer => ll_list_int_length(list),
-        ListStrategy::IntOrFloat => list.int_items.len(),
-        ListStrategy::Float => list.float_items.len(),
-        ListStrategy::Bytes => list.bytes_items.len(),
-        ListStrategy::Ascii => list.ascii_items.len(),
-    }
+    (*(obj as *const W_ListObject)).live_len()
 }
 
 /// CPython-visible `PyListObject.allocated` under the list's mutation lock.

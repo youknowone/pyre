@@ -162,6 +162,10 @@ fn operator_symbol(op: BinaryOperator) -> &'static str {
     }
 }
 
+/// `inline(never)` is load-bearing: rustc otherwise folds this body into its
+/// one-call wrapper and the codewriter never mints the graph a trace descends
+/// (`specialize.rs try_walker_orthodox_binary_op`).
+#[inline(never)]
 pub fn binary_value_from_tag(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -214,17 +218,34 @@ pub fn compare_value(
     compare(a, b, cmp_op)
 }
 
+/// `inline(never)` for the same reason as [`binary_value_from_tag`]: the
+/// codewriter must mint the graph a trace descends.
+#[inline(never)]
 pub fn compare_value_from_tag(
     a: PyObjectRef,
     b: PyObjectRef,
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
+    // Same contract as `bh_compare_fn`: a compiled force that has not
+    // written a local yet hands a NULL here.  Residual compare published
+    // TypeError; this helper must too, or the inlined path returns a
+    // NULL result without an exception (`ValueError: call failed`).
+    if a.is_null() || b.is_null() {
+        return Err(PyError::type_error("comparison on null operand"));
+    }
     // CONTAINS_OP routes through the compare-residual machinery: tag 6 =
     // `in`, tag 7 = `not in`. `a` is the needle, `b` the container (flatten
     // lowers the args as `[item, container]`).
     if op_tag == 6 || op_tag == 7 {
         let found = crate::baseobjspace::contains(b, a)?;
         let result = if op_tag == 7 { !found } else { found };
+        return Ok(w_bool_from(result));
+    }
+    // IS_OP: tag 8 = `is`, tag 9 = `is not`. `space.is_w`, not raw pointer
+    // identity — same contract as `bh_compare_fn`. Infallible.
+    if op_tag == 8 || op_tag == 9 {
+        let same = crate::baseobjspace::is_w(a, b);
+        let result = if op_tag == 9 { !same } else { same };
         return Ok(w_bool_from(result));
     }
     let op = match op_tag {
@@ -1090,6 +1111,30 @@ pub extern "C" fn jit_unary_positive_value(value: i64) -> i64 {
     }
 }
 
+// `CallControl.get_jitcode` gives each inlined graph its own callable
+// `JitCode.fnaddr`.  The source graphs below are Rust `PyResult` functions,
+// whose native ABI is not the one-word Ref ABI used by codewriter
+// `inline_call_r_r`.  Publish distinct C-ABI entry points for those graph
+// paths, just as translation supplies callable addresses for RPython graphs.
+// Keep these as separate functions from the opcode residual bridges: the
+// fnaddr registry deliberately rejects unrelated path names sharing one
+// address, because address-keyed runtime rebinding would otherwise be
+// ambiguous.
+#[inline(never)]
+pub extern "C" fn jit_descroperation_neg(value: i64) -> i64 {
+    jit_unary_negative_value(value)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_invert(value: i64) -> i64 {
+    jit_unary_invert_value(value)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_pos(value: i64) -> i64 {
+    jit_unary_positive_value(value)
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     match getitem(obj as PyObjectRef, index as PyObjectRef) {
@@ -1374,6 +1419,28 @@ mod tests {
             assert_eq!(w_int_get_value(neg), -4);
             assert!(w_bool_get_value(cmp));
         }
+    }
+
+    #[test]
+    fn test_compare_value_from_tag_identity_uses_is_w() {
+        let two = w_int_new(2);
+        let two_again = w_int_new(2);
+        let seven = w_int_new(7);
+        let is_same = compare_value_from_tag(two, two_again, 8).expect("is tag 8");
+        let is_not_same = compare_value_from_tag(two, seven, 9).expect("is_not tag 9");
+        let is_diff = compare_value_from_tag(two, seven, 8).expect("is tag 8 on unequal");
+        unsafe {
+            assert!(w_bool_get_value(is_same));
+            assert!(w_bool_get_value(is_not_same));
+            assert!(!w_bool_get_value(is_diff));
+        }
+    }
+
+    #[test]
+    fn test_compare_value_from_tag_rejects_null_operands() {
+        let err = compare_value_from_tag(std::ptr::null_mut(), w_int_new(1), 5).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert!(err.to_string().contains("comparison on null operand"));
     }
 
     #[test]

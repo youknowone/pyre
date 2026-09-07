@@ -10457,6 +10457,11 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
             "new_with_vtable/d>r",
             majit_translate::insns::BC_NEW_WITH_VTABLE,
         ),
+        // The header read `jtransform.rs rewrite_op_getfield` replaces,
+        // in the ref bank (`OpKind::GuardClass`: one ref register in, the
+        // class out) — emitted once a descended helper reads `ob_type`
+        // through a graph the codewriter looks inside.
+        ("guard_class/r>r", majit_translate::insns::BC_GUARD_CLASS_R),
     ] {
         insns.insert(key.to_string(), byte);
     }
@@ -10917,6 +10922,9 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // Canonical key is `guard_class/r>i`; the previous `/ri` shape was
     // a pyre-invented bigram that omitted the `>i` return marker.
     builder.wire_handler("guard_class/r>i", handler_guard_class);
+    // The same op with its result in the ref bank — the bank of the header
+    // read `jtransform.rs rewrite_op_getfield` replaced (`BC_GUARD_CLASS_R`).
+    builder.wire_handler("guard_class/r>r", handler_guard_class_r);
     // RPython `rpython/jit/metainterp/blackhole.py:1537-1539`:
     //   @arguments("r", "d", "d")
     //   def bhimpl_record_quasiimmut_field(struct, fielddescr, mutatefielddescr):
@@ -11246,6 +11254,18 @@ fn handler_guard_class(
     let cpu = bh.cpu();
     let typeptr = cpu.bh_classof(bh.registers_r[code[p] as usize]);
     bh.registers_i[code[p + 1] as usize] = typeptr;
+    Ok(p + 2)
+}
+/// [`handler_guard_class`] with the class delivered to the ref bank —
+/// `guard_class/r>r`, for a header read the graph typed as a GC ref.
+fn handler_guard_class_r(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let cpu = bh.cpu();
+    let typeptr = cpu.bh_classof(bh.registers_r[code[p] as usize]);
+    bh.registers_r[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
 }
 /// Safe fallback for the obsolete pyre-only named vtable lookup.

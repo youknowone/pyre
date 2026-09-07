@@ -1,4 +1,5 @@
 use std::ops::{Index, IndexMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::bytesobject::BytesBlock;
 use crate::object_array::{
@@ -16,13 +17,41 @@ use crate::pyobject::PyObjectRef;
 #[repr(C)]
 pub struct BytesArray {
     pub block: *mut ItemsBlock,
-    len: usize,
+    /// Live length (rlist.py `("length", Signed)`), read WITHOUT a lock.
+    ///
+    /// `Include/cpython/listobject.h PyList_GET_SIZE` answers a length under
+    /// `Py_GIL_DISABLED` as `_Py_atomic_load_ssize_relaxed(&ob_size)` — a
+    /// relaxed atomic load, no critical section — so a reader is entitled to a
+    /// value from either side of a concurrent mutation but never to a torn one.
+    /// A compiled trace reads this slot at a raw offset, through the
+    /// `bytes_items.len` descriptor addressed by [`BYTES_ARRAY_LEN_OFFSET`], which is why it cannot be
+    /// a plain `usize`: the methods below write it while a compiled loop is
+    /// reading it, and only an atomic makes that pair defined.  Every write
+    /// here is a relaxed store for the same reason — `&mut self` bounds no
+    /// raw-pointer reader, so `get_mut()` would put the plain store straight
+    /// back.
+    ///
+    /// Same size and bit validity as `usize`, so `offset_of!` and the JIT's
+    /// `Type::Int` read are unchanged.
+    pub(crate) len: AtomicUsize,
 }
 
 pub const BYTES_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(BytesArray, block);
 pub const BYTES_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(BytesArray, len);
 
 impl BytesArray {
+    /// `_Py_atomic_load_ssize_relaxed(&ob_size)`.
+    #[inline]
+    fn len_relaxed(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// `_Py_atomic_store_ssize_relaxed(&ob_size, n)`.
+    #[inline]
+    fn set_len_relaxed(&self, n: usize) {
+        self.len.store(n, Ordering::Relaxed);
+    }
+
     #[inline]
     fn base(&self) -> *mut PyObjectRef {
         unsafe { items_block_items_base(self.block) }
@@ -31,7 +60,7 @@ impl BytesArray {
     pub fn empty() -> Self {
         Self {
             block: std::ptr::null_mut(),
-            len: 0,
+            len: AtomicUsize::new(0),
         }
     }
 
@@ -43,7 +72,7 @@ impl BytesArray {
         let len = refs.len();
         Self {
             block: unsafe { alloc_list_items_block_gc(&refs) },
-            len,
+            len: AtomicUsize::new(len),
         }
     }
 
@@ -56,7 +85,7 @@ impl BytesArray {
             block: unsafe {
                 crate::object_array::grow_list_items_block_gc(std::ptr::null_mut(), capacity, 0)
             },
-            len: 0,
+            len: AtomicUsize::new(0),
         }
     }
 
@@ -85,7 +114,7 @@ impl BytesArray {
 
     #[inline]
     pub fn spare_capacity(&self) -> usize {
-        self.capacity().saturating_sub(self.len)
+        self.capacity().saturating_sub(self.len_relaxed())
     }
 
     #[inline]
@@ -96,7 +125,7 @@ impl BytesArray {
     #[inline]
     pub fn set_len(&mut self, new_len: usize) {
         assert!(new_len <= self.capacity());
-        self.len = new_len;
+        self.set_len_relaxed(new_len);
     }
 
     #[inline]
@@ -118,7 +147,7 @@ impl BytesArray {
     #[inline]
     fn assert_room(&self, additional: usize) {
         assert!(
-            self.len + additional <= self.capacity(),
+            self.len_relaxed() + additional <= self.capacity(),
             "BytesArray needs {additional} more slot(s) than its capacity {}; \
              reserve through W_ListObject::bytes_grow first",
             self.capacity(),
@@ -152,26 +181,35 @@ impl BytesArray {
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
         self.assert_room(1);
         self.barrier();
-        unsafe { *self.base().add(self.len) = crate::gc_roots::shadow_stack_get(value_slot) };
-        self.len += 1;
+        unsafe {
+            *self.base().add(self.len_relaxed()) = crate::gc_roots::shadow_stack_get(value_slot)
+        };
+        self.set_len_relaxed(self.len_relaxed() + 1);
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.len_relaxed()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len_relaxed() == 0
     }
 
     pub fn as_slice(&self) -> &[*const BytesBlock] {
-        unsafe { std::slice::from_raw_parts(self.base() as *const *const BytesBlock, self.len) }
+        unsafe {
+            std::slice::from_raw_parts(self.base() as *const *const BytesBlock, self.len_relaxed())
+        }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [*const BytesBlock] {
-        unsafe { std::slice::from_raw_parts_mut(self.base() as *mut *const BytesBlock, self.len) }
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.base() as *mut *const BytesBlock,
+                self.len_relaxed(),
+            )
+        }
     }
 
     pub fn to_vec(&self) -> Vec<*const BytesBlock> {
@@ -179,7 +217,7 @@ impl BytesArray {
     }
 
     pub fn insert(&mut self, index: usize, value: *const BytesBlock) {
-        assert!(index <= self.len);
+        assert!(index <= self.len_relaxed());
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
@@ -188,14 +226,14 @@ impl BytesArray {
         self.before_move_barrier();
         unsafe {
             let p = self.base().add(index);
-            std::ptr::copy(p, p.add(1), self.len - index);
+            std::ptr::copy(p, p.add(1), self.len_relaxed() - index);
             *p = crate::gc_roots::shadow_stack_get(value_slot);
         }
-        self.len += 1;
+        self.set_len_relaxed(self.len_relaxed() + 1);
     }
 
     pub fn set(&mut self, index: usize, value: *const BytesBlock) {
-        assert!(index < self.len);
+        assert!(index < self.len_relaxed());
         let _roots = crate::gc_roots::push_roots();
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
@@ -204,23 +242,23 @@ impl BytesArray {
     }
 
     pub fn remove(&mut self, index: usize) -> *const BytesBlock {
-        assert!(index < self.len);
+        assert!(index < self.len_relaxed());
         let value = self.as_slice()[index];
         self.before_move_barrier();
         unsafe {
             let p = self.base().add(index);
-            std::ptr::copy(p.add(1), p, self.len - index - 1);
-            *p.add(self.len - index - 1) = std::ptr::null_mut();
+            std::ptr::copy(p.add(1), p, self.len_relaxed() - index - 1);
+            *p.add(self.len_relaxed() - index - 1) = std::ptr::null_mut();
         }
-        self.len -= 1;
+        self.set_len_relaxed(self.len_relaxed() - 1);
         value
     }
 
     pub fn pop(&mut self) -> *const BytesBlock {
-        assert!(self.len > 0);
-        let value = self.as_slice()[self.len - 1];
-        self.len -= 1;
-        unsafe { *self.base().add(self.len) = std::ptr::null_mut() };
+        assert!(self.len_relaxed() > 0);
+        let value = self.as_slice()[self.len_relaxed() - 1];
+        self.set_len_relaxed(self.len_relaxed() - 1);
+        unsafe { *self.base().add(self.len_relaxed()) = std::ptr::null_mut() };
         value
     }
 
@@ -229,7 +267,7 @@ impl BytesArray {
     }
 
     pub fn splice(&mut self, start: usize, remove_count: usize, values: &[*const BytesBlock]) {
-        let old_len = self.len;
+        let old_len = self.len_relaxed();
         let start = start.min(old_len);
         let removed = remove_count.min(old_len - start);
         let new_len = old_len - removed + values.len();
@@ -253,7 +291,7 @@ impl BytesArray {
                 base.add(start + values.len()),
                 old_len - start - removed,
             );
-            self.len = new_len;
+            self.set_len_relaxed(new_len);
             for i in 0..values.len() {
                 *base.add(start + i) = crate::gc_roots::shadow_stack_get(root_base + i);
             }
@@ -264,7 +302,7 @@ impl BytesArray {
     }
 
     pub fn drain(&mut self, range: std::ops::Range<usize>) {
-        assert!(range.start <= range.end && range.end <= self.len);
+        assert!(range.start <= range.end && range.end <= self.len_relaxed());
         let count = range.end - range.start;
         if count == 0 {
             return;
@@ -275,22 +313,22 @@ impl BytesArray {
             std::ptr::copy(
                 base.add(range.end),
                 base.add(range.start),
-                self.len - range.end,
+                self.len_relaxed() - range.end,
             );
-            for i in self.len - count..self.len {
+            for i in self.len_relaxed() - count..self.len_relaxed() {
                 *base.add(i) = std::ptr::null_mut();
             }
         }
-        self.len -= count;
+        self.set_len_relaxed(self.len_relaxed() - count);
     }
 
     pub fn clear(&mut self) {
         unsafe {
-            for i in 0..self.len {
+            for i in 0..self.len_relaxed() {
                 *self.base().add(i) = std::ptr::null_mut();
             }
         }
-        self.len = 0;
+        self.set_len_relaxed(0);
     }
 }
 

@@ -501,7 +501,9 @@ fn raise_path_calls(name: &str) -> (usize, usize, usize) {
                 continue;
             };
             match segments.last().map(String::as_str) {
-                Some("pyerror_type_error_to_exc_object") => fused += 1,
+                Some(
+                    "pyerror_type_error_to_exc_object" | "pyerror_zero_division_to_exc_object",
+                ) => fused += 1,
                 Some("pyerror_to_exc_object") => materialise += 1,
                 Some(_) if segments.len() >= 2 && segments[segments.len() - 2] == "PyError" => {
                     ctors += 1
@@ -561,6 +563,23 @@ fn gateway_wrapper_refusals_all_residualize() {
             })
             .count();
         assert!(residuals > 0, "{name}: the refusals must survive as calls");
+    }
+}
+
+#[test]
+fn exact_int_zero_division_raise_sites_fuse_their_constructor() {
+    // `int_floordiv` and `int_mod` are the two exact-int operator bodies that
+    // raise ZeroDivisionError.  Their shared literal message must reach the
+    // fused materialiser so the generated descent carries a
+    // `W_BaseException`, never an in-trace Rust `PyError` aggregate.
+    for name in ["int_floordiv", "int_mod"] {
+        let (fused, materialise, ctors) = raise_path_calls(name);
+        assert!(fused > 0, "{name}: zero-division fusion must fire");
+        assert_eq!(ctors, 0, "{name}: no PyError constructor may survive");
+        assert_eq!(
+            materialise, 0,
+            "{name}: no unfused materialisation may survive"
+        );
     }
 }
 

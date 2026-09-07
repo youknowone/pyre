@@ -4549,8 +4549,26 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_adr_jump_offset(&self, offset: usize) {
         unsafe { *self.adr_jump_offset.get() = offset };
     }
+    /// `store_info_on_descr` writes `guardtok.faildescr.rd_locs`
+    /// (`llsupport/assembler.py:279`), so a backend that emits machine code for
+    /// this guard leaves its own physical positions here.  The frontend's
+    /// identity-with-holes layout is resume data instead, and
+    /// `_copy_resume_data_from` never runs `store_final_boxes_in_guard` on a
+    /// copied descr, so it is written only on the donor.  Read through to the
+    /// donor when no backend has written one, the same way `fail_arg_types`,
+    /// `rd_numb` and `rd_consts` chase `get_resumestorage(): return prev`
+    /// (`compile.py:847-850`).  Without it the hole mask is empty on every
+    /// backend that keeps failargs in their logical slots, and both consumers
+    /// silently take their unmasked branch.
     fn rd_locs(&self) -> &[u16] {
-        unsafe { &*self.rd_locs.get() }
+        let own = unsafe { &*self.rd_locs.get() };
+        if !own.is_empty() {
+            return own;
+        }
+        self.prev()
+            .as_fail_descr()
+            .map(|fd| fd.rd_locs())
+            .unwrap_or(&[])
     }
     fn set_rd_locs(&self, locs: Vec<u16>) {
         unsafe { *self.rd_locs.get() = locs };
@@ -5099,6 +5117,24 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
         my_fd.set_rd_consts_arc(donor_fd.rd_consts_arc());
         my_fd.set_rd_virtuals_arc(donor_fd.rd_virtuals_arc());
         my_fd.set_rd_pendingfields_arc(donor_fd.rd_pendingfields_arc());
+        // `AbstractFailDescr.rd_locs` is a backend slot upstream, written
+        // only by `store_info_on_descr`, which every upstream backend runs —
+        // so `copy_all_attributes_from` has nothing to carry there.  Pyre also
+        // seeds it in `store_final_boxes_in_guard` with the resume numbering's
+        // identity-with-holes layout, which cranelift and wasm keep because
+        // they leave failargs in their logical slots.  That seed belongs to
+        // the payload copied just above: the known-class bitfield inside
+        // `rd_numb` holds one bit per non-hole Ref livebox, and
+        // `deserialize_optimizer_knowledge` can only find those bits by
+        // masking its fail args with the same holes.
+        //
+        // Every caller hands a descr the optimizer minted for a guard put in
+        // place of an already-emitted one — `replace_guard_op`, the
+        // GUARD_VALUE and GUARD_CLASS strengthening arms of
+        // `optimize_guard_value` / `replace_old_guard_with_guard_class`, and
+        // the vectorizer's `inhert_attributes` — and such a descr never
+        // reaches `store_final_boxes_in_guard`, so it has no layout of its own.
+        my_fd.set_rd_locs(donor_fd.rd_locs().to_vec());
         // compile.py — chain.clone() preserves the donor's
         // (already-flattened) accumulator chain on self, identity-stable.
         let donor_chain = donor_fd.vector_info();

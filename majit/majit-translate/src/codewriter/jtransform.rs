@@ -523,6 +523,19 @@ enum RewriteResult {
     Keep,
 }
 
+/// `jtransform.py is_typeptr_getset`: the access names the class
+/// word of the object header.  Upstream keys on the field name `typeptr`
+/// and the struct's `typeptr` hint; pyre's header is `PyObject { ob_type,
+/// w_class }`, and only the `ob_type` word is the class the tracer guards on
+/// — `w_class` is the Python-level class, an ordinary field to a guard.
+fn is_typeptr_field(field: &FieldDescriptor) -> bool {
+    let owner_leaf = field
+        .owner_root
+        .as_deref()
+        .map(|owner| owner.rsplit("::").next().unwrap_or(owner));
+    field.name == "ob_type" && owner_leaf == Some("PyObject")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResolvedCallResult {
     kind: char,
@@ -605,6 +618,22 @@ pub(crate) fn jit_marker_key_from_target(
     }
 }
 
+/// The false result `can_enter_jit` leaves behind (`rewrite_can_enter_jits`
+/// runs after `make_jitcodes`, so the portal jitcode never enters through it).
+/// Upstream's result is `Constant(False)`, a Bool; stamping the same
+/// concretetype here lets the `bool` hop `set_branch` wrapped around the
+/// condition rewrite to an identity instead of `int_is_true`, so the
+/// constant exitswitch fold after rewriting still sees the constant.
+fn can_enter_jit_false_result(result: &crate::flowspace::model::Variable) -> SpaceOperation {
+    result.set_concretetype(Some(
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+    ));
+    SpaceOperation {
+        result: Some(result.clone()),
+        kind: OpKind::ConstInt(0),
+    }
+}
+
 /// Split a run of [`Variable`]s into (ints, refs, floats) per upstream
 /// `make_three_lists` (`jtransform.py`). Void values are
 /// dropped, matching the upstream filter; Unknown defaults to `Ref`.
@@ -638,6 +667,67 @@ fn split_args_by_kind(
         }
     }
     (ints, refs, floats)
+}
+
+/// `jtransform.py _rewrite_cmp_ptrs` (`rewrite_op_ptr_eq` /
+/// `rewrite_op_ptr_ne`): a pointer compared against NULL is the unary
+/// `ptr_iszero` / `ptr_nonzero` test over the other operand, not a
+/// two-operand `ptr_eq`.  Pyre's front materialises NULL as a Variable
+/// defined by [`OpKind::ConstRefNull`], so the constant is found through its
+/// definition.  The unary form is what `optimize_goto_if_not` fuses into
+/// `goto_if_not_ptr_iszero`, which the walker answers from the heap cache
+/// without recording once the nullity is known; `ptr_eq(x, NULL)` fused into
+/// `goto_if_not_ptr_eq` still recorded `ptr_eq` + `guard_false` per test.
+fn null_test_rewrite(
+    graph: &FunctionGraph,
+    op: &SpaceOperation,
+    eq: bool,
+    lhs: &crate::flowspace::model::Variable,
+    rhs: &crate::flowspace::model::Variable,
+) -> Option<RewriteResult> {
+    // The block under rewrite still holds its original operations, so a NULL
+    // defined there is the `ptr::null[_mut]()` / `PY_NULL` call the
+    // `rtype_ptr_null` arm of `rewrite_op_direct_call` has not yet folded.
+    let is_null_const = |variable: &crate::flowspace::model::Variable| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|def| {
+                def.result.as_ref() == Some(variable)
+                    && match &def.kind {
+                        OpKind::ConstRefNull => true,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            args,
+                            result_ty,
+                        } => {
+                            args.is_empty()
+                                && matches!(result_ty, ValueType::Ref(_))
+                                && resolves_to_null_ptr_builtin(segments)
+                        }
+                        _ => false,
+                    }
+            })
+        })
+    };
+    let operand = if is_null_const(rhs) {
+        lhs
+    } else if is_null_const(lhs) {
+        rhs
+    } else {
+        return None;
+    };
+    if let Some(result) = &op.result {
+        result.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+        ));
+    }
+    Some(RewriteResult::Replace(vec![SpaceOperation {
+        result: op.result.clone(),
+        kind: OpKind::UnaryOp {
+            op: if eq { "ptr_iszero" } else { "ptr_nonzero" }.into(),
+            operand: operand.clone(),
+            result_ty: ValueType::Int,
+        },
+    }]))
 }
 
 /// Pyre's frontend materialises source constants as SSA Variables. Recover
@@ -1276,6 +1366,7 @@ impl<'a> Transformer<'a> {
     /// directly.
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
+        join_blocks(&mut rewritten);
 
         // `jtransform.py transform_graph` opens with
         // `constant_fold_ll_issubclass(graph, cpu)`, which folds a
@@ -2384,7 +2475,12 @@ impl<'a> Transformer<'a> {
             // because Rust's `==`/`!=` is one AST node regardless of operand type;
             // the jtransform layer is where RPython branches on operand kind.
             // Both operands Ref → rewrite to `ptr_eq`/`ptr_ne`. Mixed/Int operands
-            // stay as `int_eq`/`int_ne`.
+            // stay as `int_eq`/`int_ne`.  `rptr.py:167-184
+            // pairtype(PtrRepr, Repr).rtype_eq/ne` calls
+            // `hop.inputargs(r_ptr, r_ptr)` — both operands are already
+            // ptr-typed here, so there is no cast — and pyre's blackhole wires
+            // `bhimpl_ptr_eq` / `bhimpl_ptr_ne` at `bh_binop_r_to_i`, so the
+            // `ptr_eq/rr>i` opname dispatches without `cast_ptr_to_int`.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -2394,6 +2490,19 @@ impl<'a> Transformer<'a> {
                 && self.get_value_kind_var(lhs) == 'r'
                 && self.get_value_kind_var(rhs) == 'r' =>
             {
+                if let Some(rewritten) = null_test_rewrite(graph, &op, binop_name == "eq", lhs, rhs)
+                {
+                    return rewritten;
+                }
+                // The comparison answers an integer, so the result banks as
+                // one; without the stamp it keeps the `'r'` kind the unified
+                // `BinOp` carried in and `op_kind_to_opname_with_kinds` spells
+                // an opname no blackhole handler registers.
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::Signed,
+                );
                 let new_op = if binop_name == "eq" {
                     "ptr_eq"
                 } else {
@@ -2551,44 +2660,6 @@ impl<'a> Transformer<'a> {
             // for the missing rtyper cast remains the canonical
             // convergence path; this jtransform recovery is the
             // bridge until that lands.
-            // eq/ne with BOTH operands ref-kind → emit ptr_eq / ptr_ne
-            // directly.  PyPy `rpython/rtyper/rptr.py:167-184
-            // pairtype(PtrRepr, Repr).rtype_eq/ne` calls
-            // `hop.inputargs(r_ptr, r_ptr)` (both already ptr-typed in
-            // this branch — no cast) and emits `ptr_eq` / `ptr_ne`.
-            // Pyre's blackhole has `bhimpl_ptr_eq` / `bhimpl_ptr_ne`
-            // wired at `bh_binop_r_to_i`, so the resulting
-            // `ptr_eq/rr>i` opname dispatches without going through
-            // `cast_ptr_to_int`.
-            OpKind::BinOp {
-                op: binop_name,
-                lhs,
-                rhs,
-                result_ty,
-            } if matches!(binop_name.as_str(), "eq" | "ne")
-                && self.get_value_kind_var(lhs) == 'r'
-                && self.get_value_kind_var(rhs) == 'r' =>
-            {
-                self.stamp_value_kind(
-                    graph,
-                    op.result.clone(),
-                    crate::codewriter::type_state::ConcreteType::Signed,
-                );
-                let ptr_op = if binop_name == "eq" {
-                    "ptr_eq"
-                } else {
-                    "ptr_ne"
-                };
-                RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::BinOp {
-                        op: ptr_op.into(),
-                        lhs: lhs.clone(),
-                        rhs: rhs.clone(),
-                        result_ty: result_ty.clone(),
-                    },
-                }])
-            }
             // Mixed-kind eq/ne (one ref + one int) or any ordered
             // ref-cmp (lt/le/gt/ge with a ref operand) — PRE-EXISTING
             // ADAPTATION: pyre's frontend admits source patterns
@@ -2939,6 +3010,54 @@ impl<'a> Transformer<'a> {
             // the canonical `float_ne` opname here rather than
             // leaving an intermediate op for the float-comparison
             // arm in `rewrite_operation`.
+            // `rtype_bool` per repr for the un-rtyped `bool` hop that
+            // `FunctionGraph::set_branch` puts before every exitswitch:
+            // `BoolRepr` is the identity, `IntegerRepr.rtype_bool` is
+            // `int_is_true` (`rint.py`), a nullable `PtrRepr` is
+            // `ptr_nonzero` (`rmodel.py`).  Naming the op here, ahead
+            // of `optimize_goto_if_not`, is half of what lets the fusion see
+            // it: that gate matches opnames, and `bool` is not one of them --
+            // but it reads the exitswitch variable's `concretetype` FIRST, so
+            // the result also has to carry the `lltype.Bool` those two
+            // opnames return, which is why the rewrite stamps it exactly as
+            // `null_test_rewrite` does for the same pair.  The identity arm
+            // is what fuses an `is_null` test -- its `ptr_iszero` result is
+            // already Bool -- into `goto_if_not_ptr_iszero`, which the walker
+            // answers from the heap cache without recording once the nullity
+            // is known.  Left as `bool`, every null test of a traced operand
+            // cost `ptr_eq` + `int_is_true` + `guard_false`: six of them per
+            // `int + int` descent.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "bool" && self.get_value_kind_var(operand) != 'f' => {
+                use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                if operand.concretetype() == Some(LowLevelType::Bool) {
+                    RewriteResult::Identity(operand.clone())
+                } else {
+                    let opname = if self.get_value_kind_var(operand) == 'r' {
+                        "ptr_nonzero"
+                    } else {
+                        "int_is_true"
+                    };
+                    // `getkind(Bool)` is `Signed`, so the value-kind channel
+                    // keeps banking the result as an int; the stamp only tells
+                    // `optimize_goto_if_not` that this is the Bool its gate
+                    // asks for.
+                    if let Some(result) = &op.result {
+                        result.set_concretetype(Some(LowLevelType::Bool));
+                    }
+                    RewriteResult::Replace(vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::UnaryOp {
+                            op: opname.into(),
+                            operand: operand.clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    }])
+                }
+            }
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -3706,6 +3825,32 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        // jtransform.py `if self.is_typeptr_getset(op): return
+        // self.handle_getfield_typeptr(op)` — checked before anything else,
+        // as upstream does.  Upstream also folds a Constant receiver to its
+        // class constant; pyre's receivers here are SSA variables (a prebuilt
+        // constant reaches a field read through `ConstRef`, not as an
+        // operand), so that arm has no input and is not spelled.
+        if let OpKind::FieldRead { base, .. } = &op.kind
+            && is_typeptr_field(field)
+        {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("rewrite: getfield({}) → guard_class", field.name),
+            });
+            // `jtransform.py handle_getfield_typeptr`: `-live-` first, the guard is a
+            // resume point.
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                },
+                SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::GuardClass { base: base.clone() },
+                },
+            ]);
+        }
         // `rewrite_op_getsubstruct` applies only to an address-producing
         // projection.  A by-value Rust field can itself have an inline-struct
         // layout (notably a `#[repr(transparent)]` newtype) while the operation
@@ -4745,6 +4890,13 @@ impl<'a> Transformer<'a> {
             && matches!(receiver_root.as_str(), "mut_ptr" | "const_ptr")
             && args.len() == 1
         {
+            // `ptr_iszero` produces `lltype.Bool`; the Bool is what lets
+            // `optimize_goto_if_not` fuse the test into the exitswitch.
+            if let Some(result) = &op.result {
+                result.set_concretetype(Some(
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                ));
+            }
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::UnaryOp {
@@ -4769,6 +4921,12 @@ impl<'a> Transformer<'a> {
             && segments[2] == "eq"
             && args.len() == 2
         {
+            // `ptr_eq` produces `lltype.Bool`, as `ptr_iszero` above.
+            if let Some(result) = &op.result {
+                result.set_concretetype(Some(
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                ));
+            }
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::BinOp {
@@ -6757,10 +6915,9 @@ impl<'a> Transformer<'a> {
             && !jd.active
         {
             return Some(match (key, result) {
-                (JitMarkerKey::CanEnterJit, Some(result)) => vec![SpaceOperation {
-                    result: Some(result.clone()),
-                    kind: OpKind::ConstInt(0),
-                }],
+                (JitMarkerKey::CanEnterJit, Some(result)) => {
+                    vec![can_enter_jit_false_result(result)]
+                }
                 _ => Vec::new(),
             });
         }
@@ -6794,10 +6951,7 @@ impl<'a> Transformer<'a> {
                 if key == JitMarkerKey::CanEnterJit
                     && let Some(result) = result
                 {
-                    ops.push(SpaceOperation {
-                        result: Some(result.clone()),
-                        kind: OpKind::ConstInt(0),
-                    });
+                    ops.push(can_enter_jit_false_result(result));
                 }
                 Some(ops)
             }
@@ -7763,6 +7917,112 @@ fn optimize_goto_if_not(graph: &mut FunctionGraph, block_idx: usize) -> bool {
     false
 }
 
+/// `simplify.py join_blocks(graph)`: a link that is the single exit of a
+/// block without an exitswitch and the single entry of its target is
+/// deleted, the target's operations (inputargs renamed to the link's
+/// arguments) appended to the block, and the target's exitswitch and exits
+/// taken over.
+///
+/// Upstream runs it on every flow graph before annotation, so the graphs
+/// jtransform sees have no such links.  Pyre's MIR front lowers every call
+/// as its own block terminator, which leaves the result of a call in one
+/// block and the `bool` exitswitch that tests it in the next -- across the
+/// link, `optimize_goto_if_not` cannot fuse the test: every `is_null()`
+/// (`ptr_iszero`) opening `py_type_check` /
+/// `is_exact_builtin_instance` stayed a standalone op plus a
+/// `goto_if_not`, and a descended `int + int` recorded six of them as
+/// `ptr_eq` + `guard_false` pairs.  Joining here, ahead of the per-block
+/// rewrite, is what lets the fusion see them.
+///
+/// A link carrying a constant argument is left alone: the model's
+/// operations read variables only, so renaming an inputarg to a constant
+/// has no operand to write it into.  The joined-away block is emptied in
+/// place (no operations, no exits) rather than removed, so every block
+/// index -- `returnblock`, `exceptblock`, the per-block rewrite loop --
+/// keeps its meaning.
+fn join_blocks(graph: &mut FunctionGraph) {
+    use crate::model::LinkArg;
+    let mut entry_count = vec![0usize; graph.blocks.len()];
+    for block in &graph.blocks {
+        for link in &block.exits {
+            entry_count[link.target.0] += 1;
+        }
+    }
+    // `mkentrymap` seeds a synthetic entry link into `graph.startblock`.
+    // Counting it keeps a start block whose only in-edge is a backedge from
+    // reading as single-entry; `joinable` would otherwise absorb the graph's
+    // entry into its own predecessor and empty it.
+    entry_count[graph.startblock.0] += 1;
+    let mut seen = vec![false; graph.blocks.len()];
+    seen[graph.startblock.0] = true;
+    let mut stack: Vec<(usize, usize)> = (0..graph.blocks[graph.startblock.0].exits.len())
+        .map(|exit_idx| (graph.startblock.0, exit_idx))
+        .collect();
+    while let Some((prev, exit_idx)) = stack.pop() {
+        let Some(link) = graph.blocks[prev].exits.get(exit_idx) else {
+            continue;
+        };
+        let target = link.target.0;
+        let joinable = graph.blocks[prev].exitswitch.is_none()
+            && entry_count[target] == 1
+            && !graph.blocks[target].exits.is_empty()
+            && target != prev
+            && link.args.iter().all(|arg| matches!(arg, LinkArg::Value(_)));
+        if joinable {
+            debug_assert_eq!(graph.blocks[prev].exits.len(), 1);
+            let renaming: std::collections::HashMap<
+                crate::flowspace::model::Variable,
+                crate::flowspace::model::Variable,
+            > =
+                graph.blocks[target]
+                    .inputargs
+                    .iter()
+                    .cloned()
+                    .zip(graph.blocks[prev].exits[exit_idx].args.iter().filter_map(
+                        |arg| match arg {
+                            LinkArg::Value(var) => Some(var.clone()),
+                            LinkArg::Const(_) => None,
+                        },
+                    ))
+                    .collect();
+            let target_block = &graph.blocks[target];
+            let moved_ops: Vec<SpaceOperation> = target_block
+                .operations
+                .iter()
+                .map(|op| remap_op(op, &renaming))
+                .collect();
+            let (exitswitch, mut exits) = crate::model::remap_control_flow_metadata_var(
+                &target_block.exitswitch,
+                &target_block.exits,
+                |var| remap_value(var, &renaming),
+                |b| b,
+            );
+            for exit in &mut exits {
+                exit.prevblock = Some(crate::model::BlockId(prev));
+            }
+            {
+                let target_block = &mut graph.blocks[target];
+                target_block.inputargs.clear();
+                target_block.operations.clear();
+                target_block.exitswitch = None;
+                target_block.exits.clear();
+            }
+            let prev_block = &mut graph.blocks[prev];
+            prev_block.operations.extend(moved_ops);
+            prev_block.exitswitch = exitswitch;
+            prev_block.exits = exits;
+            // Re-examine the block with its new exits, as upstream re-pushes
+            // `link.prevblock.exits`.
+            stack.extend((0..graph.blocks[prev].exits.len()).map(|idx| (prev, idx)));
+            continue;
+        }
+        if !seen[target] {
+            seen[target] = true;
+            stack.extend((0..graph.blocks[target].exits.len()).map(|idx| (target, idx)));
+        }
+    }
+}
+
 /// `jtransform.py:206-209` supported-opname gate for
 /// [`optimize_goto_if_not`].  Returns the RPython opname and the op's
 /// operand Variables (`tuple(op.args)`) when the op is one of the
@@ -8601,6 +8861,9 @@ fn remap_op(
         OpKind::IsConstant { value, kind_char } => OpKind::IsConstant {
             value: remap_value(value, aliases),
             kind_char: *kind_char,
+        },
+        OpKind::GuardClass { base } => OpKind::GuardClass {
+            base: remap_value(base, aliases),
         },
         OpKind::IsVirtual { value, kind_char } => OpKind::IsVirtual {
             value: remap_value(value, aliases),
@@ -9865,8 +10128,14 @@ mod tests {
     /// A block inputarg has no operation producer of its own. RPython types
     /// the phi by unioning the matching incoming link arguments, so a Bool
     /// source must retain BoolRepr after crossing the edge.
+    ///
+    /// The join has two predecessors so `simplify.py join_blocks` cannot
+    /// absorb it into startblock; a single-entry successor would be emptied
+    /// in place and this would stop observing the phi.
     #[test]
     fn a_truthify_over_a_bool_phi_is_identity() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+
         let mut graph = FunctionGraph::new("truthify_bool_phi");
         let source = graph
             .push_op_var(
@@ -9881,10 +10150,21 @@ mod tests {
             .unwrap();
         source.set_concretetype(Some(LlType::Signed));
 
+        let then_b = graph.create_block();
+        let else_b = graph.create_block();
         let (join, inputargs) = graph.create_block_with_arg_vars(1);
         let phi = inputargs[0].clone();
         phi.set_concretetype(Some(LlType::Signed));
-        graph.set_goto(graph.startblock, join, vec![source.clone()]);
+        graph.set_control_flow_metadata(
+            graph.startblock,
+            Some(ExitSwitch::Value(source.clone())),
+            vec![
+                Link::new_mixed(vec![], then_b, Some(ExitCase::Bool(true))),
+                Link::new_mixed(vec![], else_b, Some(ExitCase::Bool(false))),
+            ],
+        );
+        graph.set_goto(then_b, join, vec![source.clone()]);
+        graph.set_goto(else_b, join, vec![source.clone()]);
 
         let truthified = graph
             .push_op_var(
@@ -10204,6 +10484,175 @@ mod tests {
             "escaping v must be replaced with the link's bool constant, got {:?}",
             true_arm.args[0],
         );
+    }
+
+    /// A null test whose `ptr_iszero` sits in the block after a call
+    /// terminator: `join_blocks` folds the single-entry successor into its
+    /// predecessor, renaming the inputarg to the link variable, so
+    /// `optimize_goto_if_not` then fuses the test into the exitswitch.
+    #[test]
+    fn join_blocks_lets_goto_if_not_fuse_a_null_test_across_a_link() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("join_then_fuse");
+        let start = graph.startblock;
+        let a = graph.alloc_value_var();
+        let x = graph
+            .push_op_var(
+                start,
+                OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand: a.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        // `x` crosses a plain link into a block whose only work is the test.
+        let tester = graph.create_block();
+        let x_in = graph.alloc_value_var();
+        graph.push_inputarg_var(tester, x_in.clone());
+        let t = graph
+            .push_op_var(
+                tester,
+                OpKind::UnaryOp {
+                    op: "ptr_iszero".to_string(),
+                    operand: x_in.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        t.set_concretetype(Some(LowLevelType::Bool));
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        graph.set_control_flow_metadata(
+            tester,
+            Some(ExitSwitch::Value(t.clone())),
+            vec![
+                Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true))),
+            ],
+        );
+        graph.set_control_flow_metadata(
+            start,
+            None,
+            vec![Link::new_mixed(
+                vec![LinkArg::Value(x.clone())],
+                tester,
+                None,
+            )],
+        );
+
+        super::join_blocks(&mut graph);
+        let joined = &graph.blocks[start.0];
+        assert_eq!(
+            joined.exits.len(),
+            2,
+            "the tester's exits move to the start block"
+        );
+        assert!(
+            graph.blocks[tester.0].operations.is_empty() && graph.blocks[tester.0].exits.is_empty(),
+            "the joined-away block is emptied in place"
+        );
+        assert!(
+            joined.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. } if op == "ptr_iszero" && *operand == x
+            )),
+            "the moved test reads the link variable, not the dead inputarg"
+        );
+
+        assert!(super::optimize_goto_if_not(&mut graph, start.0));
+        match &graph.blocks[start.0].exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(opname, "ptr_iszero");
+                assert_eq!(args, &vec![x]);
+            }
+            other => panic!("expected Fused exitswitch, got {other:?}"),
+        }
+    }
+
+    /// The `bool` hop `set_branch` puts before every exitswitch has to come out
+    /// of the rewrite fusable.  `optimize_goto_if_not` reads the exitswitch
+    /// variable's `concretetype` before it reads any opname, so naming the op
+    /// `int_is_true` is not on its own enough — nothing in the value-kind
+    /// channel can produce `Bool` (`concrete_to_canonical_lltype` has no such
+    /// case), so the rewrite is the only place that stamp can come from.
+    #[test]
+    fn transform_graph_leaves_the_bool_hop_fusable() {
+        use crate::model::ExitSwitch;
+
+        let mut graph = FunctionGraph::new("bool_hop_fusable");
+        let start = graph.startblock;
+        let a = graph
+            .push_op_var(
+                start,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&a, ConcreteType::Signed);
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        graph.set_return(if_true, None);
+        graph.set_return(if_false, None);
+        graph.set_branch(start, a.clone(), if_true, vec![], if_false, vec![]);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        match &transformed.graph.blocks[start.0].exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(opname, "int_is_true");
+                assert_eq!(args, &vec![a]);
+            }
+            other => panic!("expected a fused int_is_true exitswitch, got {other:?}"),
+        }
+    }
+
+    /// The Ref-kind sibling of [`transform_graph_leaves_the_bool_hop_fusable`].
+    /// A `bool` hop over a Ref operand rewrites to `ptr_nonzero`, which
+    /// `optimize_goto_if_not` also fuses, and it reaches that gate through the
+    /// same `Bool` stamp — the value-kind channel banks the result as an int
+    /// either way.
+    #[test]
+    fn transform_graph_leaves_the_ref_bool_hop_fusable() {
+        use crate::model::ExitSwitch;
+
+        let mut graph = FunctionGraph::new("ref_bool_hop_fusable");
+        let start = graph.startblock;
+        let a = graph
+            .push_op_var(
+                start,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&a, ConcreteType::GcRef);
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        graph.set_return(if_true, None);
+        graph.set_return(if_false, None);
+        graph.set_branch(start, a.clone(), if_true, vec![], if_false, vec![]);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        match &transformed.graph.blocks[start.0].exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(opname, "ptr_nonzero");
+                assert_eq!(args, &vec![a]);
+            }
+            other => panic!("expected a fused ptr_nonzero exitswitch, got {other:?}"),
+        }
     }
 
     /// the GotoIfNotOp lowering Stage 1: a non-supported result op (`int_add`) is NOT
@@ -11843,10 +12292,16 @@ mod tests {
             },
         );
         assert_eq!(result.vable_rewrites, 0);
+        // `simplify.py join_blocks` absorbs a single-entry successor into
+        // startblock and empties it in place.  The rematerialized FieldWrite
+        // still has to survive on whichever block remains.
+        let surviving = if result.graph.block(consumer).operations.is_empty() {
+            result.graph.block(graph.startblock)
+        } else {
+            result.graph.block(consumer)
+        };
         assert!(
-            result
-                .graph
-                .block(consumer)
+            surviving
                 .operations
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::FieldWrite { .. }))

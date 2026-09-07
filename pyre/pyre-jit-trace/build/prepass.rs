@@ -1038,6 +1038,23 @@ fn real_main() {
                 )],
                 ..Default::default()
             },
+            // The bodies behind the opcode residuals the walker descends
+            // (`specialize.rs try_walker_orthodox_descent`).  The portal
+            // reaches none of them in source: `call_spec.rs` classifies the
+            // eval loop's `binary_value` call as a residual, and the residual
+            // is lowered to `jit_binary_value_from_tag`, whose body this is.
+            helper_graphs: vec![
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "opcode_ops",
+                    "binary_value_from_tag",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "opcode_ops",
+                    "compare_value_from_tag",
+                ]),
+            ],
             jit_drivers: vec![
                 majit_translate::JitDriverSpec {
                     portal: majit_translate::CallPath::from_segments(["eval", "eval_loop_jit"]),

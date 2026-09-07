@@ -1106,6 +1106,24 @@ pub enum OpKind {
         /// `codewriter/jtransform.py:611`.
         kind_char: char,
     },
+    /// `jtransform.py handle_getfield_typeptr` — a read of the
+    /// object header's class word is not a load but a `guard_class`: the
+    /// tracer pins the receiver's class and the op's result is that class
+    /// as a constant, which is what lets every `isinstance`-shaped test
+    /// downstream fold instead of recording `getfield` + `ptr_eq` +
+    /// `guard_true`.  The blackhole reads the word (`bhimpl_guard_class`,
+    /// `cpu.bh_classof`).
+    ///
+    /// pyre's class word is `PyObject.ob_type`, embedded first in every
+    /// object as `ob_header`; `heaptracker::is_header_word` knows it by
+    /// that name.  The result register keeps the kind the read had —
+    /// `int` when the pointer was typed raw, `ref` when it was typed
+    /// GC — so the consumers of the original read are untouched; the
+    /// class-pointer hint ops (`record_exact_class/ri`) already carry the
+    /// class through the int bank.
+    GuardClass {
+        base: crate::flowspace::model::Variable,
+    },
     /// Project a callee function pointer out of a `dyn Trait` receiver's
     /// vtable for the named method slot.  Result is integer-typed so it
     /// can be fed to `int_guard_value` (RPython `jtransform.py`).

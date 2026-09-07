@@ -75,6 +75,10 @@ pub fn _share_methods(_copycls: PyObjectRef, _subcls: PyObjectRef) {
     let _ = (_copycls, _subcls);
 }
 
+/// `typedef.py use_special_method_shortcut` registrar.  The decorator that
+/// rewrites a descroperation into `call_shortcut` is not a Rust function;
+/// the JIT-visible first arm is `same_rpy_type` + `!user_overridden_class`
+/// then `shortcut_add` / `shortcut_sub` / … in `descroperation.rs`.
 pub fn use_special_method_shortcut(_name: &str, _checkerfunc: Option<PyObjectRef>) -> bool {
     let _ = (_name, _checkerfunc);
     false
@@ -2099,8 +2103,12 @@ pub fn w_type() -> PyObjectRef {
 }
 
 pub fn gettypeobject(tp: &PyType) -> PyObjectRef {
+    // Spelled as a `match` rather than `map_or(PY_NULL, |p| p.as_ptr())`:
+    // the closure's environment lowers to a synthetic aggregate constructor
+    // with no host symbol, which every descent reaching this call stopped
+    // at.  The niche `Option<NonNull<_>>` itself is one pointer word.
     match gettypefor(tp as *const PyType) {
-        Some(w_type) => w_type.as_ptr(),
+        Some(p) => p.as_ptr(),
         None => PY_NULL,
     }
 }
@@ -21579,6 +21587,13 @@ fn init_object_type(ns: PyObjectRef) {
                 "__ne__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
+                    // `transform.py insert_ll_stackcheck` puts a stack check on
+                    // a block of every call-graph cycle.  The lookup below
+                    // reaches this same body whenever the receiver's `__eq__`
+                    // is `object.__ne__` (`A.__eq__ = object.__ne__`), and it
+                    // closes that cycle without pushing a Python frame, so the
+                    // frame-count limit never sees it.
+                    crate::stack_check::stack_check()?;
                     // objectobject.py descr__ne__: look up and call the live
                     // receiver's __eq__ descriptor, then invert that one
                     // result.  Running the full comparison dispatcher here

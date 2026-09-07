@@ -6638,7 +6638,11 @@ mod tests {
     fn exception_materializer_stub_uses_semantic_instance_result() {
         use crate::annotator::model::SomeValue;
 
-        for name in ["pyerror_to_exc_object", "pyerror_type_error_to_exc_object"] {
+        for name in [
+            "pyerror_to_exc_object",
+            "pyerror_type_error_to_exc_object",
+            "pyerror_zero_division_to_exc_object",
+        ] {
             let key = FunctionPathKey::from_segments(["pyre_interpreter", "error", name]);
             let shell = residual_stub_result_shell(&key, Some(OBJECTPTR_RETURN_TYPE))
                 .expect("exception materializer must have a result shell");

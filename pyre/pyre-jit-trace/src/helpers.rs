@@ -623,6 +623,39 @@ pub(crate) fn emit_untag_int(ctx: &mut TraceCtx, obj: OpRef, value: i64) -> OpRe
     raw
 }
 
+/// Teach the heap cache what a `NewWithVtable` determined about `new_op`.
+///
+/// The class is known (`opimpl_new_with_vtable` → `class_now_known`;
+/// `class_now_known` here takes the vtable address, since pyre tracks the
+/// concrete class pointer where upstream only raises `HF_KNOWN_CLASS`), so a
+/// later `guard_class` on `new_op` records nothing.  The class word the
+/// allocation writes from its size descr (`SizeDescr::w_class_obj`, the
+/// same answer `OptVirtualize` folds the header read off a virtual with) is
+/// cached as a recorded `setfield` would be: a later `getfield_gc_r` of
+/// `w_class` on `new_op` yields the class constant and a `promote` of that
+/// read records no guard.  A size descr without a class word, or whose type
+/// has no canonical class, seeds only the class.
+pub fn note_class_word_after_new(
+    ctx: &mut TraceCtx,
+    new_op: OpRef,
+    size_descr: &majit_ir::DescrRef,
+) {
+    let Some(size) = size_descr.as_size_descr() else {
+        return;
+    };
+    ctx.heap_cache_mut()
+        .class_now_known(new_op, size.vtable() as i64);
+    let seed = size
+        .class_word_field()
+        .map(|field| field.index())
+        .zip(size.w_class_obj());
+    let Some((field_index, w_class)) = seed else {
+        return;
+    };
+    let w_class = ctx.const_ref(w_class);
+    ctx.heapcache_getfield_now_known(new_op, field_index, w_class);
+}
+
 /// Emit inline W_Int creation (NewWithVtable + SetfieldGc).
 ///
 /// jtransform.py rewrite_op_setfield: setfield on typeptr is dropped
@@ -637,8 +670,9 @@ pub fn emit_box_int_inline(
     // entirely ("ignore the operation completely -- instead, it's done by
     // 'new'"). rewrite.py handle_malloc_operation emits the vtable
     // setfield via fielddescr_vtable during GC rewrite of NEW_WITH_VTABLE.
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
     ctx.heap_cache_mut().new_object(new_op);
+    note_class_word_after_new(ctx, new_op, &size_descr);
     // Emit: SetfieldGc(v, intval, raw_int)
     let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_int], intval_descr);
@@ -665,8 +699,9 @@ pub fn emit_box_long_inline(
     size_descr: majit_ir::DescrRef,
     value_descr: majit_ir::DescrRef,
 ) -> OpRef {
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
     ctx.heap_cache_mut().new_object(new_op);
+    note_class_word_after_new(ctx, new_op, &size_descr);
     let value_idx = value_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, bigint_ref], value_descr);
     ctx.heapcache_setfield_cached(new_op, value_idx, bigint_ref);

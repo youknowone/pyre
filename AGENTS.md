@@ -233,6 +233,13 @@ comment at the site citing both sides.
 - Confirm the worktree (`git rev-parse --show-toplevel`) before editing and
   before staging — dozens of sibling worktrees share one `.git`.
 
+## Build and CI polling
+
+- Never check a running local build or CI job more often than once every five
+  minutes. While it runs, continue useful independent work when any is
+  available; otherwise wait for the five-minute boundary. Do not spend tokens
+  on repetitive status-only updates.
+
 ## Before committing
 
 - `cargo test --all --no-default-features --features dynasm`. Both halves matter.

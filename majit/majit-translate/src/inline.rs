@@ -766,6 +766,9 @@ pub(crate) fn remap_op_kind(
             value: remap_var(value),
             kind_char: *kind_char,
         },
+        OpKind::GuardClass { base } => OpKind::GuardClass {
+            base: remap_var(base),
+        },
         OpKind::IsInstance {
             obj,
             class_carrier,
@@ -1047,6 +1050,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![clone_var(value)],
+        OpKind::GuardClass { base } => vec![clone_var(base)],
         OpKind::IsInstance {
             obj, class_carrier, ..
         } => {
@@ -1322,6 +1326,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::GuardTrue { .. }
         | OpKind::GuardFalse { .. }
         | OpKind::GuardValue { .. }
+        | OpKind::GuardClass { .. }
         | OpKind::AssertGreen { .. }
         | OpKind::IsConstant { .. }
         | OpKind::IsVirtual { .. }

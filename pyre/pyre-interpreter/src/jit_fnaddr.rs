@@ -24,6 +24,8 @@ pub trait ResidualSlot {}
 /// such a function receives `1` for `Some(p)` and `0` for `None`, never `p`.
 /// That is a silent wrong value rather than a crash, which is why this trait
 /// is deliberately narrow.
+/// This is only a size/bank check: a narrow integer result still needs a
+/// typed widening bridge before a word-returning dispatcher may call it.
 pub trait ResidualRet {}
 
 impl ResidualRet for () {}
@@ -98,6 +100,20 @@ extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
 extern "C" fn bh_code_unit_at(code: i64, index: i64) -> i64 {
     let code = unsafe { &*(code as usize as *const crate::CodeObject) };
     i64::from(crate::pyopcode::code_unit_at(code, index as usize))
+}
+
+/// `descr.py CallDescr.create_call_stub`: call with the actual RESULT type,
+/// then cast to Signed. A raw `-> bool` target defines only the low byte of
+/// the result on x86, while our residual dispatcher reads a whole word.
+/// The policy macro cannot emit this bridge from the opaque `PyObjectRef`
+/// alias spelling, so supply it at the source-only registry boundary.
+extern "C" fn bh_w_type_issubtype(w_type: i64, cls: i64) -> i64 {
+    unsafe {
+        pyre_object::w_type_issubtype(
+            w_type as pyre_object::PyObjectRef,
+            cls as pyre_object::PyObjectRef,
+        ) as i64
+    }
 }
 
 /// Publication helpers that check the signature instead of erasing it.
@@ -938,6 +954,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         // ABI-UNSOUND: `Result<*mut PyObject, error::PyError>` does not fit one residual slot.
         push_abi_unsound_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
     }
+    // `BUILTIN_WRAPPER_DESCRIPTORS` does not exist on wasm32
+    // (`linkme::distributed_slice` has no arm for `target_os = "unknown"`),
+    // so the loop above registers nothing there and
+    // `bytecode_for_address(__majit_wrap_builtin_len)` finds no jitcode: the
+    // builtin `len` gateway descent then declines before its spec gate.  The
+    // address is used for the jitcode lookup only — the gateway body is
+    // descended, never residual-called — so register the one wrapper the
+    // descent recognises explicitly, the way this file registers every other
+    // wasm-reachable helper.
+    #[cfg(target_arch = "wasm32")]
+    push_abi_unsound_fnaddr(
+        &mut entries,
+        "pyre_interpreter::builtins::__majit_wrap_builtin_len",
+        crate::builtins::__majit_wrap_builtin_len as *const (),
+    );
 
     // `type_object()` accessors are `dont_look_inside` (`majit-translate`
     // `front::llbc_hints` stamps them: the JIT residualizes the `OnceLock` body
@@ -1311,18 +1342,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_bool_value_from_truth",
         crate::opcode_ops::jit_bool_value_from_truth,
     );
-    cpa3(
-        &mut entries,
-        "pyre_interpreter::opcode_ops::jit_binary_value_from_tag",
-        "pyre_interpreter::jit_binary_value_from_tag",
-        crate::opcode_ops::jit_binary_value_from_tag,
-    );
-    cpa3(
-        &mut entries,
-        "pyre_interpreter::opcode_ops::jit_compare_value_from_tag",
-        "pyre_interpreter::jit_compare_value_from_tag",
-        crate::opcode_ops::jit_compare_value_from_tag,
-    );
     cpa1(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_unary_negative_value",
@@ -1340,6 +1359,41 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::jit_unary_positive_value",
         "pyre_interpreter::jit_unary_positive_value",
         crate::opcode_ops::jit_unary_positive_value,
+    );
+    // Codewriter `inline_call_r_r` targets the object-space graph names, not
+    // the opcode residual wrappers.  Bind each graph to its dedicated
+    // one-word C-ABI entry point so both recording-time descent and
+    // guard-failure blackholing execute the same interpreter operation.
+    cp1(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::neg",
+        crate::opcode_ops::jit_descroperation_neg,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::invert",
+        crate::opcode_ops::jit_descroperation_invert,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::pos",
+        crate::opcode_ops::jit_descroperation_pos,
+    );
+    // Same binding for the BINARY/COMPARE codewriter `inline_call_ir_r`
+    // graphs: the walker descends `binary_value_from_tag` /
+    // `compare_value_from_tag`, and guard-failure blackholing calls the
+    // matching one-word C-ABI wrapper.  The wrapper's own `jit_*` path is
+    // not registered: two leaf names on one address make
+    // `patch_constants_i_fnaddrs` ambiguous.
+    cp3(
+        &mut entries,
+        "pyre_interpreter::opcode_ops::binary_value_from_tag",
+        crate::opcode_ops::jit_binary_value_from_tag,
+    );
+    cp3(
+        &mut entries,
+        "pyre_interpreter::opcode_ops::compare_value_from_tag",
+        crate::opcode_ops::jit_compare_value_from_tag,
     );
     cpa2(
         &mut entries,
@@ -1462,15 +1516,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `w_type_issubtype` is the MRO membership scan (`_issubtype`,
     // typeobject.py), run under the JIT inside `_pure_issubtype`
     // (`@elidable_promote`, typeobject.py:1657).  Its `#[dont_look_inside]`
-    // residualises the call; bind the `-> bool` Rust `fn` directly by
-    // qualified path (2-pointer args, JIT-representable, no C-ABI bridge).
-    let w_type_issubtype: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> bool =
-        pyre_object::w_type_issubtype;
-    upa2(
+    // residualises the call. `CallDescr.create_call_stub` calls a boolean
+    // RESULT before widening to Signed: bind the word-ABI bridge, never the
+    // raw Rust function whose upper result-register bits are undefined.
+    cpa2(
         &mut entries,
         "pyre_object::typeobject::w_type_issubtype",
         "pyre_object::w_type_issubtype",
-        w_type_issubtype,
+        bh_w_type_issubtype,
     );
     // `lookup_exc_class_for_kind` reads the process-global `EXC_CLASS_BY_KIND`
     // registry the tracer cannot model; its residual call rides a C-ABI
@@ -1865,6 +1918,26 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::_pure_getdictvalue_no_unwrapping",
         "pyre_interpreter::_pure_getdictvalue_no_unwrapping",
         pure_getdictvalue_no_unwrapping,
+    );
+    // The uncached arm's thin-pointer twins (`lookup_where_pair` under the
+    // JIT): a boxed name in, a raw pointer (null for `None`) out.
+    let lookup_in_type_uncached: unsafe fn(
+        *mut pyre_object::PyObject,
+        *mut pyre_object::PyObject,
+    ) -> *mut pyre_object::PyObject = crate::baseobjspace::_lookup_in_type_uncached;
+    up2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_lookup_in_type_uncached",
+        lookup_in_type_uncached,
+    );
+    let lookup_where_class_uncached: unsafe fn(
+        *mut pyre_object::PyObject,
+        *mut pyre_object::PyObject,
+    ) -> *mut pyre_object::PyObject = crate::baseobjspace::_lookup_where_class_uncached;
+    up2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_lookup_where_class_uncached",
+        lookup_where_class_uncached,
     );
     // #346: null-collapsing stable-alloc primitive residualised via
     // `#[dont_look_inside]`, keeping the thread-local GC hook dispatch out of
@@ -2513,6 +2586,23 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::jit_bigint_lshift_int_int_result",
         crate::objspace::descroperation::jit_bigint_lshift_int_int_result,
     );
+    // `_make_ovf2long`: the overflowed add, subtract, and multiply recover
+    // their exact result from the two machine words directly.
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_add_int_int",
+        crate::objspace::descroperation::jit_bigint_add_int_int,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_sub_int_int",
+        crate::objspace::descroperation::jit_bigint_sub_int_int,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_mul_int_int",
+        crate::objspace::descroperation::jit_bigint_mul_int_int,
+    );
     // Unary rbigint operations each take one payload pointer.
     cp1(
         &mut entries,
@@ -2990,6 +3080,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::error::pyerror_type_error_to_exc_object",
         "pyre_interpreter::pyerror_type_error_to_exc_object",
         pyerror_type_error_to_exc_object,
+    );
+    let pyerror_zero_division_to_exc_object: extern "C" fn(i64) -> i64 =
+        crate::error::__majit_call_target_pyerror_zero_division_to_exc_object;
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::error::pyerror_zero_division_to_exc_object",
+        "pyre_interpreter::pyerror_zero_division_to_exc_object",
+        pyerror_zero_division_to_exc_object,
     );
     // `elidable_cannot_raise` subclass-range check; the trampoline widens its
     // one-word bool return by zero-extension.
@@ -4051,10 +4149,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `jtransform.py:576-577 rewrite_op_int_floordiv =
     // _do_builtin_call` (which resolves the helper through
     // `support.py` `_ll_2_int_mod` / `:255` `_ll_2_int_floordiv`).
-    // The C-trunc residual call below is what the trace path sees;
-    // the Python-floor `ll_int_py_*` helpers stay available for the
-    // future route-(b) emitter (Python-bytecode `int.py_mod` /
-    // `int.py_div` direct calls) under the dotted-name keys.
+    // The C-trunc residual call below is what a Rust `/` / `%` in a
+    // descended body sees.  The Python-floor `ll_int_py_*` pair
+    // registered after it is route (b): `int_floordiv` / `int_mod`
+    // call the interpreter's `#[oopspec("int.py_div")]` twins, so the
+    // generated `//` / `%` descent records the same elidable
+    // `int.py_div` / `int.py_mod` call the hand fold did.
     //
     // `register_macro_helper_trace_fnaddr` strips the leading segment
     // from `full_path`; for a single-segment path (no `::`) the entire
@@ -4098,6 +4198,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "_ll_2_int_mod",
         majit_metainterp::blackhole::_ll_2_int_mod,
+    );
+    p2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::ll_int_py_div",
+        crate::objspace::descroperation::ll_int_py_div,
+    );
+    p2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::ll_int_py_mod",
+        crate::objspace::descroperation::ll_int_py_mod,
     );
 
     // `support.py _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
@@ -4991,6 +5101,58 @@ mod tests {
         try_pop_to(depth);
     }
 
+    #[test]
+    fn subtype_residual_registers_the_word_abi() {
+        // descr.py CallDescr.create_call_stub calls the actual RESULT type
+        // before casting to Signed. The trampoline implements that
+        // conversion for the word-returning residual ABI; a raw Rust bool
+        // function leaves the upper return-register bits undefined on x86.
+        let target: extern "C" fn(i64, i64) -> i64 = super::bh_w_type_issubtype;
+        let entries = jit_trace_fnaddrs();
+        for path in [
+            "pyre_object::typeobject::w_type_issubtype",
+            "pyre_object::w_type_issubtype",
+        ] {
+            assert_eq!(
+                entries
+                    .iter()
+                    .find(|(name, _)| *name == path)
+                    .map(|(_, addr)| *addr),
+                Some(target as *const () as usize as i64),
+                "{path} must widen the bool before the residual reads a word",
+            );
+        }
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_codewriter_inline_call_graphs_with_word_abi_bridges() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for (path, expected) in [
+            (
+                "pyre_interpreter::objspace::descroperation::neg",
+                crate::opcode_ops::jit_descroperation_neg as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::objspace::descroperation::invert",
+                crate::opcode_ops::jit_descroperation_invert as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::objspace::descroperation::pos",
+                crate::opcode_ops::jit_descroperation_pos as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::opcode_ops::binary_value_from_tag",
+                crate::opcode_ops::jit_binary_value_from_tag as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::opcode_ops::compare_value_from_tag",
+                crate::opcode_ops::jit_compare_value_from_tag as *const () as usize as i64,
+            ),
+        ] {
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+        }
+    }
+
     /// Two registered functions must never share an address.
     ///
     /// `pyre-jit-trace`'s `patch_constants_i_fnaddrs` rewrites residual-call
@@ -5459,6 +5621,18 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::pyerror_type_error_to_exc_object"],
             fused
+        );
+
+        let zero_division: extern "C" fn(i64) -> i64 =
+            crate::error::__majit_call_target_pyerror_zero_division_to_exc_object;
+        let zero_division = zero_division as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::error::pyerror_zero_division_to_exc_object"],
+            zero_division
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::pyerror_zero_division_to_exc_object"],
+            zero_division
         );
     }
 

@@ -9424,6 +9424,49 @@ where
                     self.replace_box(ctx, opref, const_ref, Type::Float);
                 }
             }
+            // pyjitpl.py opimpl_guard_class:
+            //     clsbox = self.cls_of_box(box)
+            //     if not self.metainterp.heapcache.is_class_known(box):
+            //         self.metainterp.generate_guard(rop.GUARD_CLASS, box, clsbox,
+            //                                        resumepc=orgpc)
+            //         self.metainterp.heapcache.class_now_known(box)
+            //     return clsbox
+            // `jtransform.py handle_getfield_typeptr` emits this for every
+            // read of the header's class word; the result lands in the bank
+            // the read was allocated to (`BC_GUARD_CLASS` int,
+            // `BC_GUARD_CLASS_R` ref).
+            byte @ (jitcode::insns::BC_GUARD_CLASS | jitcode::insns::BC_GUARD_CLASS_R) => {
+                let (opcode_pc, src, dst) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    let src = frame.next_reg() as usize;
+                    let dst = frame.next_reg() as usize;
+                    (opcode_pc, src, dst)
+                };
+                let (opref, concrete) = self.read_ref_reg(src);
+                if concrete == 0 {
+                    return TraceAction::Abort;
+                }
+                let typeptr = self.read_typeptr_from_exception(concrete);
+                let cls_const = ctx.const_int(typeptr);
+                if !ctx.heap_cache().is_class_known(opref) {
+                    self.record_state_guard(
+                        ctx,
+                        sym,
+                        majit_ir::OpCode::GuardClass,
+                        &[opref, cls_const],
+                        opcode_pc,
+                        /* after_residual_call */ false,
+                    );
+                    ctx.heap_cache_mut().class_now_known(opref, typeptr);
+                }
+                if byte == jitcode::insns::BC_GUARD_CLASS {
+                    self.set_int_reg(dst, Some(cls_const), Some(typeptr));
+                } else {
+                    let cls_ref = ctx.const_ref(typeptr);
+                    self.set_ref_reg(dst, Some(cls_ref), Some(typeptr));
+                }
+            }
             jitcode::insns::BC_RAISE => {
                 // pyjitpl.py opimpl_raise:
                 //     if not self.metainterp.heapcache.is_class_known(exc_value_box):

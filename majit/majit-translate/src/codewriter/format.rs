@@ -501,7 +501,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         } => {
             format!(
                 "call_elidable_{}_{result_kind}",
-                kind_signature(args_i, args_r, args_f)
+                kind_signature(args_i, args_r, args_f, *result_kind)
             )
         }
         OpKind::CallResidual {
@@ -513,7 +513,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         } => {
             format!(
                 "residual_call_{}_{result_kind}",
-                kind_signature(args_i, args_r, args_f)
+                kind_signature(args_i, args_r, args_f, *result_kind)
             )
         }
         OpKind::CallMayForce {
@@ -525,7 +525,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         } => {
             format!(
                 "call_may_force_{}_{result_kind}",
-                kind_signature(args_i, args_r, args_f)
+                kind_signature(args_i, args_r, args_f, *result_kind)
             )
         }
         OpKind::InlineCall {
@@ -537,12 +537,15 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         } => {
             format!(
                 "inline_call_{}_{result_kind}",
-                kind_signature(args_i, args_r, args_f)
+                kind_signature(args_i, args_r, args_f, *result_kind)
             )
         }
         OpKind::RecursiveCall { result_kind, .. } => {
             format!("recursive_call_{result_kind}")
         }
+        // The Debug fallback below would spell it "guardclass"; the
+        // canonical opname carries the underscore.
+        OpKind::GuardClass { .. } => "guard_class".to_string(),
         // For the rest, fall back on a stable Debug-derived discriminant.
         other => format!("{:?}", other)
             .split('{')
@@ -556,23 +559,26 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
     }
 }
 
-/// jtransform.py:414-435 — call-family opcode kind suffix.
+/// `jtransform.py rewrite_call` — call-family opcode kind suffix.
 ///
-/// Encodes the (int, ref, float) arg tuple as a single-character
-/// signature ("i", "r", "f", "ir", "irf", …).  Empty bins drop out so
-/// `(args_i=[a], args_r=[], args_f=[])` produces `"i"`.
-fn kind_signature<T>(args_i: &[T], args_r: &[T], args_f: &[T]) -> String {
-    let mut out = String::new();
-    if !args_i.is_empty() {
-        out.push('i');
+/// One of exactly three signatures, chosen by the widest bin in play rather
+/// than by which bins are occupied: `"irf"` when a float appears among the
+/// arguments or as the result, else `"ir"` when an int does, else `"r"`.  So
+/// `(args_i=[a], args_r=[], args_f=[])` is `"ir"` and an all-empty call is
+/// `"r"` — the `r` bin is named even when it is empty, because the sublists
+/// the signature announces are positional and the reader counts them.
+///
+/// The result kind is a signature input, not just the suffix after it: a
+/// float-returning call with no float argument is still `"irf"`.
+fn kind_signature<T>(args_i: &[T], args_r: &[T], args_f: &[T], result_kind: char) -> &'static str {
+    if !args_f.is_empty() || result_kind == 'f' {
+        "irf"
+    } else if !args_i.is_empty() {
+        "ir"
+    } else {
+        let _ = args_r;
+        "r"
     }
-    if !args_r.is_empty() {
-        out.push('r');
-    }
-    if !args_f.is_empty() {
-        out.push('f');
-    }
-    out
 }
 
 fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
@@ -627,6 +633,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
             args_i,
             args_r,
             args_f,
+            result_kind,
             ..
         }
         | OpKind::CallResidual {
@@ -635,6 +642,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
             args_i,
             args_r,
             args_f,
+            result_kind,
             ..
         }
         | OpKind::CallMayForce {
@@ -643,18 +651,22 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
             args_i,
             args_r,
             args_f,
+            result_kind,
             ..
         } => {
             let mut parts = vec![call_funcptr_repr(funcptr)];
-            // jtransform.py:430-433 — emit each ListOfKind only when the
-            // matching kind char is in the signature.
-            if !args_i.is_empty() {
+            // jtransform.py `rewrite_call` — emit each ListOfKind exactly when
+            // the matching kind char is in the signature, which is not the
+            // same test as "the bin is non-empty": `ir` over no int arguments
+            // still announces an empty `I[]`.
+            let kinds = kind_signature(args_i, args_r, args_f, *result_kind);
+            if kinds.contains('i') {
                 parts.push(list_of_kind_repr_vars('i', args_i));
             }
-            if !args_r.is_empty() {
+            if kinds.contains('r') {
                 parts.push(list_of_kind_repr_vars('r', args_r));
             }
-            if !args_f.is_empty() {
+            if kinds.contains('f') {
                 parts.push(list_of_kind_repr_vars('f', args_f));
             }
             // jtransform.py:434 — descr is the last sublist when set.
@@ -671,6 +683,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
             args_i,
             args_r,
             args_f,
+            result_kind,
             ..
         } => {
             let head = match jitcode.try_index() {
@@ -678,13 +691,14 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
                 None => format!("<JitCode {:?}>", jitcode.name),
             };
             let mut parts = vec![head];
-            if !args_i.is_empty() {
+            let kinds = kind_signature(args_i, args_r, args_f, *result_kind);
+            if kinds.contains('i') {
                 parts.push(list_of_kind_repr_vars('i', args_i));
             }
-            if !args_r.is_empty() {
+            if kinds.contains('r') {
                 parts.push(list_of_kind_repr_vars('r', args_r));
             }
-            if !args_f.is_empty() {
+            if kinds.contains('f') {
                 parts.push(list_of_kind_repr_vars('f', args_f));
             }
             out.push_str(&parts.join(", "));
@@ -815,6 +829,11 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } | OpKind::VableArrayLen { .. } => {
             RegKind::Int
         }
+        // The class word of the header, in whichever bank the read it
+        // replaced was allocated to (`OpKind::GuardClass`); the formatter
+        // has no regalloc to ask, and the int bank is where the class
+        // pointer hints (`record_exact_class/ri`) already carry it.
+        OpKind::GuardClass { .. } => RegKind::Int,
         // Result-less or pyre-only debug variants — `op_args_repr`
         // only reaches this fall-through when `op.result.is_some()`,
         // so any miss surfaces as a real coverage gap to extend.

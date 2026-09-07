@@ -116,7 +116,9 @@ pub(crate) fn is_exception_object_materializer(key: &FunctionPathKey) -> bool {
     };
     if !matches!(
         leaf,
-        "pyerror_to_exc_object" | "pyerror_type_error_to_exc_object"
+        "pyerror_to_exc_object"
+            | "pyerror_type_error_to_exc_object"
+            | "pyerror_zero_division_to_exc_object"
     ) {
         return false;
     }
@@ -1167,7 +1169,11 @@ mod tests {
     fn exception_materializers_publish_instance_result_signature() {
         let bk = Rc::new(Bookkeeper::new());
         let registry = CallRegistry::new(bk);
-        for leaf in ["pyerror_to_exc_object", "pyerror_type_error_to_exc_object"] {
+        for leaf in [
+            "pyerror_to_exc_object",
+            "pyerror_type_error_to_exc_object",
+            "pyerror_zero_division_to_exc_object",
+        ] {
             for path in [
                 vec!["pyre_interpreter", "error", leaf],
                 vec!["error", leaf],

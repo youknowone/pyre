@@ -1944,6 +1944,41 @@ impl Assembler {
             // `int_guard_value` and the subsequent `residual_call_*`
             // consume — backend lowering of the actual vtable slot read
             // is not yet implemented.
+            // blackhole.py `@arguments("cpu", "r", returns="i")
+            // bhimpl_guard_class` — one ref register in, the class out.
+            // The result bank follows the register the original read was
+            // allocated to (`guard_class/r>i` or `guard_class/r>r`), see
+            // `OpKind::GuardClass`.
+            OpKind::GuardClass { base } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                // The base is the object whose header word is read, so it is a
+                // ref register; `bhimpl_guard_class` takes `"r"` and both
+                // registered keys (`guard_class/r>i`, `guard_class/r>r`) spell
+                // it that way.  An Int-banked base would form a key nothing
+                // registers, so fail loud at emit time.
+                assert_eq!(
+                    kc, 'r',
+                    "guard_class base must be ref-kind ('r'), got '{kc}'"
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let result = op
+                    .result
+                    .as_ref()
+                    .expect("guard_class must produce a result register");
+                argcodes.push('>');
+                let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                assert!(
+                    kc == 'i' || kc == 'r',
+                    "guard_class result must be int- or ref-kind, got '{kc}'"
+                );
+                argcodes.push(kc);
+                state.code.push(reg);
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::VtableMethodPtr {
                 receiver,
                 trait_root,
@@ -3066,6 +3101,7 @@ impl Assembler {
                 OpKind::GuardTrue { .. } => "GuardTrue",
                 OpKind::GuardFalse { .. } => "GuardFalse",
                 OpKind::GuardValue { .. } => "GuardValue",
+                OpKind::GuardClass { .. } => "GuardClass",
                 OpKind::VtableMethodPtr { .. } => "VtableMethodPtr",
                 OpKind::IndirectCall { .. } => "IndirectCall",
                 OpKind::VableFieldRead { .. } => "VableFieldRead",
@@ -5171,6 +5207,8 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         }
         OpKind::GuardTrue { .. } => "guard_true".into(),
         OpKind::GuardFalse { .. } => "guard_false".into(),
+        // jtransform.py handle_getfield_typeptr: `SpaceOperation('guard_class', [op.args[0]], op.result)`.
+        OpKind::GuardClass { .. } => "guard_class".into(),
         OpKind::GuardValue { kind_char, .. } => {
             // `rpython/jit/codewriter/jtransform.py:611` emits one of
             // `int_guard_value` / `ref_guard_value` / `float_guard_value`
