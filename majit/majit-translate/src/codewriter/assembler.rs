@@ -6494,7 +6494,6 @@ mod tests {
             owner.to_string(),
             vec![
                 ("__discriminant".to_string(), "i64".to_string()),
-                ("jump_args".to_string(), "*mut PyObject".to_string()),
                 ("loop_header_pc".to_string(), "i64".to_string()),
             ],
         );
@@ -6505,16 +6504,13 @@ mod tests {
             "this owner is served by the registry row, not by the reconstruction"
         );
         let spec = bh_size_spec_from_callcontrol(&cc, owner).expect("shelled variant size");
-        assert_eq!(spec.all_fielddescrs.len(), 3);
+        assert_eq!(spec.all_fielddescrs.len(), 2);
         assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
         assert_eq!(spec.all_fielddescrs[0].offset, 0);
         assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
-        assert_eq!(spec.all_fielddescrs[1].field_key(), "jump_args");
+        assert_eq!(spec.all_fielddescrs[1].field_key(), "loop_header_pc");
         assert_eq!(spec.all_fielddescrs[1].offset, 8);
         assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
-        assert_eq!(spec.all_fielddescrs[2].field_key(), "loop_header_pc");
-        assert_eq!(spec.all_fielddescrs[2].offset, 16);
-        assert_eq!(spec.all_fielddescrs[2].index_in_parent, 2);
     }
 
     /// The reconstruction gate covers the generic `Result`/`Option` shell

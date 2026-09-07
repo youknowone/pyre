@@ -1,7 +1,9 @@
-# pyre-check: max-pypy-ratio=2
+# pyre-check: max-pypy-ratio=5
 # pyre-check: skip-cpython
-# The compiled loop now matches pypy: dynasm 0.9x, cranelift 1.0x on
-# darwin-aarch64. The ceiling is twice the slowest native, rounded up.
+# The compiled loop is at pypy parity on darwin-aarch64 (dynasm 0.9x,
+# cranelift 1.0x) and 2.4x on ubuntu-24.04 cranelift. The ceiling is
+# twice that slowest host, rounded up. A 6x ceiling would put the
+# derived floor at 1x and fail the darwin 0.9x reading again.
 # cpython is not gated on — only pypy is.
 # Exercises JIT global-cache invalidation, for both cell kinds.
 #

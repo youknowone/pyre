@@ -31931,7 +31931,7 @@ mod tests {
                 variant("Continue", vec![], 0),
                 variant(
                     "CloseLoop",
-                    vec![int_field("jump_args"), int_field("loop_header_pc")],
+                    vec![int_field("loop_header_pc")],
                     1
                 )
             ]},
@@ -31956,7 +31956,6 @@ mod tests {
             fields.fields.get("fixture::Step::CloseLoop"),
             Some(&vec![
                 ("__discriminant".to_string(), "i64".to_string()),
-                ("jump_args".to_string(), "i64".to_string()),
                 ("loop_header_pc".to_string(), "i64".to_string()),
             ]),
             "the payload rows must follow the inherited tag, not start at slot 0"
@@ -31983,8 +31982,7 @@ mod tests {
             .expect("shelled variant registers an exact layout")
             .field_offsets;
         assert_eq!(offsets.get("__discriminant"), Some(&0));
-        assert_eq!(offsets.get("jump_args"), Some(&8));
-        assert_eq!(offsets.get("loop_header_pc"), Some(&16));
+        assert_eq!(offsets.get("loop_header_pc"), Some(&8));
     }
 
     /// An `ArrayRead` element is addressable two ways: a scalar names its

@@ -1167,6 +1167,10 @@ fn do_match(
         arg_int_kw(args, 2, kwargs, "pos", 0)?,
         arg_int_kw(args, 3, kwargs, "endpos", i64::MAX)?,
     );
+    // `pos`/`endpos` ran `__index__`. Reload the subject from the
+    // rooted objects so a moving collection during that conversion
+    // cannot leave `subj` pointing into a reclaimed gathered buffer.
+    let subj = unsafe { subject_of(string(), w_buffer()) };
 
     let (matched, state) = match subj {
         Subject::AsciiStr(b) | Subject::Bytes(b) => {
