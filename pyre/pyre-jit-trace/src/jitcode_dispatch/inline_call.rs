@@ -12626,6 +12626,7 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
     code: &[u8],
     pc: usize,
     descr_index: usize,
+    sub_index: usize,
     sub_body: &SubJitCodeBody,
     int_args: &[OpRef],
     int_arg_concretes: &[ConcreteValue],
@@ -12688,12 +12689,14 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             // `CallMayForce` when the callee is BINARY: the exact-int
             // descent emits `int_add`/`int_sub` the way PyPy's fib
             // bridges do (`int_add_ovf` on the `n>=3` bridge).
-            if int_args.len() == 1
-                && ref_args.len() == 2
-                && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
+            if ref_args.len() == 2
+                && int_args.len() == 1
+                && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(
+                    sub_index,
+                    int_arg_concretes,
+                )
                 && let Some((dst_bank, dst, _)) = call_opcode_result_dst(code, pc)
                 && dst_bank == 'r'
-                && super::specialize::jitcode_is_binary_value_from_tag(usize::MAX, sub_body)
             {
                 if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
                     super::specialize::try_walker_orthodox_binary_op(
@@ -13873,6 +13876,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         code,
         op.pc,
         descr_index,
+        sub_index,
         &sub_body,
         &[],
         &[],
@@ -14116,6 +14120,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         code,
         op.pc,
         descr_index,
+        sub_index,
         &sub_body,
         &int_args,
         &int_arg_concretes,
@@ -14338,6 +14343,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         code,
         op.pc,
         descr_index,
+        sub_index,
         &sub_body,
         &int_args,
         &int_arg_concretes,
