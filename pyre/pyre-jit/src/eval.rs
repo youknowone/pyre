@@ -5057,6 +5057,19 @@ fn walk_rbigint_parts_cache(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     });
 }
 
+/// Collecting-thread TLS exception cells that mid-major rescan must repeat.
+///
+/// The per-mutator `PyFrameRootArea` already walks these on the first pass
+/// (every thread, including this one). They are *not* extra-root walkers:
+/// that list is also the first-pass seed, and repeating them there would
+/// double-walk the collecting thread. `rescan_major_nonstack_roots_and_drain`
+/// is the only caller.
+fn walk_rescan_tls_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    walk_bh_last_exc_value(visitor);
+    walk_guard_exc_value(visitor);
+    pyre_interpreter::stack_check::walk_jit_pending_exception(visitor);
+}
+
 /// Every exception parked outside GC discipline, as one root source.
 ///
 /// Each carrier below holds a `W_BaseException` in a cell the precise collector
@@ -5068,18 +5081,12 @@ fn walk_rbigint_parts_cache(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// each enumerating its own population.
 fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_jit_exc_value(visitor);
-    walk_bh_last_exc_value(visitor);
-    walk_guard_exc_value(visitor);
     // Children of the off-GC exception singletons, which no carrier and no
     // collection phase reaches on its own.
     walk_immortal_exception_singleton_roots(visitor);
     // Stored `PyError` carrier whose GC refs the precise collector cannot
     // reach through its raw TLS cell. Mirrors `walk_pending_call_error`.
     crate::call_jit::walk_last_ca_exception(visitor);
-    // Exception parked for the next interpreter call boundary (JIT prologue
-    // overflow, or a jd1 drain error handed back to the caller loop): live in
-    // a raw TLS cell across the collecting code that runs before the drain.
-    pyre_interpreter::stack_check::walk_jit_pending_exception(visitor);
     // Trace-time exception carriers held only in the active `PyreSym`
     // (`trace_built_exc` / `last_exc_value` / `current_exc_value`): a
     // trace-built exception is unreachable to the precise collector between its
@@ -5116,6 +5123,7 @@ fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_interpreter_global_root_walker();
     majit_gc::shadow_stack::register_extra_root_walker(walk_parked_exception_roots);
     majit_gc::shadow_stack::register_extra_root_walker(walk_immortal_store_roots);
+    majit_gc::shadow_stack::register_rescan_root_walker(walk_rescan_tls_exception_roots);
     // The mapdict side tables are keyed by owner address. Their values are
     // conditional edges, matching the instance-dict and weakref fields PyPy
     // stores on the owner itself, so major marking keeps a value only after

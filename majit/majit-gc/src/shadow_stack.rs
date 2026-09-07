@@ -1550,6 +1550,48 @@ pub fn register_extra_root_walker(walker: ExtraRootWalkerFn) {
     );
 }
 
+/// Walkers that `rescan_major_nonstack_roots_and_drain` must repeat and that
+/// `walk_extra_roots` must not. Per-mutator `PyFrameRootArea` already walks
+/// the collecting thread's TLS exception cells on the first pass; repeating
+/// those three cells here is what incminimark's second `collect_nonstack_roots`
+/// does for values that can appear after the initial snapshot. Putting them
+/// in [`EXTRA_ROOT_WALKERS`] would double-walk them on every nursery/major
+/// seed.
+static RESCAN_ROOT_WALKERS: parking_lot::RwLock<
+    [Option<ExtraRootWalkerFn>; MAX_EXTRA_ROOT_WALKERS],
+> = parking_lot::RwLock::new([None; MAX_EXTRA_ROOT_WALKERS]);
+
+/// Register a walker that only the mid-major non-stack rescan invokes.
+pub fn register_rescan_root_walker(walker: ExtraRootWalkerFn) {
+    let mut guard = RESCAN_ROOT_WALKERS.write();
+    for slot in guard.iter_mut() {
+        match slot {
+            Some(existing) if std::ptr::fn_addr_eq(*existing, walker) => return,
+            None => {
+                *slot = Some(walker);
+                return;
+            }
+            _ => {}
+        }
+    }
+    panic!(
+        "register_rescan_root_walker: capacity exceeded ({} walkers already registered)",
+        MAX_EXTRA_ROOT_WALKERS
+    );
+}
+
+/// Invoke every rescan-only walker. Called from
+/// `MiniMarkGC::rescan_major_nonstack_roots_and_drain`.
+pub fn walk_rescan_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    let walkers = {
+        let guard = RESCAN_ROOT_WALKERS.read();
+        *guard
+    };
+    for walker in walkers.iter().flatten() {
+        walker(&mut visitor);
+    }
+}
+
 /// Invoke every registered extra root walker with the given visitor.
 ///
 /// Called by `MiniMarkGC::do_collect_nursery` (Phase 1e).
