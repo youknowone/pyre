@@ -7100,17 +7100,17 @@ fn fused_cond_call_value_consumes_the_comparison_i32() {
     );
     validate_wasm(&bytes);
 
-    let mut i64_eq = 0;
-    let mut i64_extend = 0;
-    count_operators(&bytes, |op| match op {
-        wasmparser::Operator::I64Eq => i64_eq += 1,
-        wasmparser::Operator::I64ExtendI32U => i64_extend += 1,
-        _ => {}
-    });
-    assert_eq!(i64_eq, 1, "the comparison must still be emitted");
+    let mut seq: Vec<String> = Vec::new();
+    count_operators(&bytes, |op| seq.push(format!("{op:?}")));
+    let eq_at = seq
+        .iter()
+        .position(|o| o == "I64Eq")
+        .expect("the comparison must still be emitted");
+    assert_eq!(seq.iter().filter(|o| *o == "I64Eq").count(), 1);
     assert_eq!(
-        i64_extend, 1,
-        "fused CondCallValue widens the i32 predicate once for the result"
+        seq.get(eq_at + 1).map(String::as_str),
+        Some("I64ExtendI32U"),
+        "fused CondCallValue consumes the comparison i32 directly: {seq:#?}"
     );
 }
 
@@ -7171,6 +7171,15 @@ fn threadlocalref_get_lowers_through_the_tls_helper() {
         let (bytes, _, _) =
             codegen::build_wasm_module(&inputs).expect("ThreadlocalrefGet should lower");
         validate_wasm(&bytes);
+
+        inputs.alloc.threadlocal_fn_ptr = 0;
+        assert!(
+            matches!(
+                codegen::build_wasm_module(&inputs),
+                Err(majit_backend::BackendError::Unsupported(_))
+            ),
+            "ThreadlocalrefGet must decline without a TLS helper"
+        );
     }
 }
 
@@ -7725,6 +7734,7 @@ fn call_malloc_nursery_variants_lower() {
     let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("headerless should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
+    assert!(const_immediates(&bytes).contains(&0x55));
 
     let frame = make_op(
         OpCode::CallMallocNurseryVarsizeFrame,
@@ -7735,6 +7745,7 @@ fn call_malloc_nursery_variants_lower() {
     let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize frame should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
+    assert!(const_immediates(&bytes).contains(&0x11));
 
     let varsize = make_op(
         OpCode::CallMallocNurseryVarsize,
@@ -7749,6 +7760,18 @@ fn call_malloc_nursery_variants_lower() {
     let inputs = nursery_new_inputs(vec![varsize, finish_int_arg0()], 53);
     let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
     validate_wasm(&bytes);
+    assert_eq!(nursery_top_compare_count(&bytes), 0);
+    assert!(const_immediates(&bytes).contains(&0x22));
+}
+
+#[test]
+fn newstr_without_a_descr_injects_the_builtin_layout() {
+    let newstr = make_op(OpCode::Newstr, &[OpRef::const_int(3)], OpRef::ref_op(1));
+    let inputs = nursery_new_inputs(vec![newstr, finish_int_arg0()], 53);
+    let (bytes, _, _) =
+        codegen::build_wasm_module(&inputs).expect("Newstr without descr should inject and lower");
+    validate_wasm(&bytes);
+    assert!(const_immediates(&bytes).contains(&0x22));
 }
 
 #[test]

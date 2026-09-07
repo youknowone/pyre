@@ -12,6 +12,7 @@
 /// The residual-call trampoline scratch is stored separately at the static
 /// base returned by `jit_call_area_addr`.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
@@ -3634,6 +3635,157 @@ fn aligned_nursery_size(payload: i64) -> Option<usize> {
     Some(((GcHeader::SIZE + payload).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7)
 }
 
+/// `Nursery::alloc` 8-aligns the total. The inline VarsizeFrame bump writes
+/// `nursery_free` itself, so a wasm32 `jfi_frame_size` that is only word-aligned
+/// has to be raised here or the next object header is misaligned.
+fn aligned_varsize_frame_bump(size: i64) -> Option<u32> {
+    let size = u32::try_from(size).ok()?;
+    Some(size.saturating_add(7) & !7)
+}
+
+const BUILTIN_STRING_HASH_OFFSET: usize = 0;
+const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
+const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
+const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
+
+#[derive(Debug)]
+struct BuiltinFieldDescr {
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    signed: bool,
+}
+
+impl majit_ir::Descr for BuiltinFieldDescr {
+    fn as_field_descr(&self) -> Option<&dyn majit_ir::FieldDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::FieldDescr for BuiltinFieldDescr {
+    fn offset(&self) -> usize {
+        self.offset
+    }
+    fn field_size(&self) -> usize {
+        self.field_size
+    }
+    fn field_type(&self) -> Type {
+        self.field_type
+    }
+    fn is_field_signed(&self) -> bool {
+        self.signed
+    }
+}
+
+#[derive(Debug)]
+struct BuiltinArrayDescr {
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    item_type: Type,
+    signed: bool,
+    len_descr: Arc<BuiltinFieldDescr>,
+}
+
+impl majit_ir::Descr for BuiltinArrayDescr {
+    fn as_array_descr(&self) -> Option<&dyn majit_ir::ArrayDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::ArrayDescr for BuiltinArrayDescr {
+    fn base_size(&self) -> usize {
+        self.base_size
+    }
+    fn item_size(&self) -> usize {
+        self.item_size
+    }
+    fn type_id(&self) -> u32 {
+        self.type_id
+    }
+    fn item_type(&self) -> Type {
+        self.item_type
+    }
+    fn is_item_signed(&self) -> bool {
+        self.signed
+    }
+    fn len_descr(&self) -> Option<&dyn majit_ir::FieldDescr> {
+        Some(self.len_descr.as_ref())
+    }
+}
+
+fn builtin_string_array_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
+    let (base_size, item_size, type_id) = match opcode {
+        OpCode::Newstr
+        | OpCode::Strlen
+        | OpCode::Strgetitem
+        | OpCode::Strsetitem
+        | OpCode::Copystrcontent => (
+            BUILTIN_STR_TOKEN_BASE_SIZE,
+            1,
+            majit_gc::lowlevel_str_type_id(),
+        ),
+        OpCode::Newunicode
+        | OpCode::Unicodelen
+        | OpCode::Unicodegetitem
+        | OpCode::Unicodesetitem
+        | OpCode::Copyunicodecontent => (
+            BUILTIN_UNICODE_TOKEN_BASE_SIZE,
+            4,
+            majit_gc::lowlevel_unicode_type_id(),
+        ),
+        _ => return None,
+    };
+    let len_descr = Arc::new(BuiltinFieldDescr {
+        offset: BUILTIN_STRING_LEN_OFFSET,
+        field_size: BUILTIN_STRING_HASH_SIZE,
+        field_type: Type::Int,
+        signed: false,
+    });
+    Some(Arc::new(BuiltinArrayDescr {
+        base_size,
+        item_size,
+        type_id,
+        item_type: Type::Int,
+        signed: false,
+        len_descr,
+    }))
+}
+
+fn builtin_string_hash_field_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
+    if !matches!(opcode, OpCode::Strhash | OpCode::Unicodehash) {
+        return None;
+    }
+    Some(Arc::new(BuiltinFieldDescr {
+        offset: BUILTIN_STRING_HASH_OFFSET,
+        field_size: BUILTIN_STRING_HASH_SIZE,
+        field_type: Type::Int,
+        signed: true,
+    }))
+}
+
+/// Cranelift/dynasm `inject_builtin_string_descrs`: vstring mints
+/// `NEWSTR/1/r` with no descr, and rewrite.py fills it from `str_descr`.
+fn inject_builtin_string_descrs(ops: &mut [Op]) {
+    for op in ops {
+        if op.has_descr() {
+            continue;
+        }
+        if let Some(descr) = builtin_string_array_descr(op.opcode) {
+            op.setdescr(descr);
+        } else if let Some(descr) = builtin_string_hash_field_descr(op.opcode) {
+            op.setdescr(descr);
+        }
+    }
+}
+
+fn needs_builtin_string_descr(op: &Op) -> bool {
+    !op.has_descr()
+        && (builtin_string_array_descr(op.opcode).is_some()
+            || builtin_string_hash_field_descr(op.opcode).is_some())
+}
+
 /// One member of a rewrite.py `gen_malloc_nursery` run: consecutive
 /// inline-eligible `New`/`NewWithVtable` and constant-size `NewArray*`
 /// ops share one bump of `batch_total`. Followers are
@@ -4231,6 +4383,15 @@ pub fn build_wasm_module(
         frame,
         ca,
     } = inputs;
+    let ops_with_string_descrs;
+    let ops: &[Op] = if ops.iter().any(needs_builtin_string_descr) {
+        let mut cloned = ops.to_vec();
+        inject_builtin_string_descrs(&mut cloned);
+        ops_with_string_descrs = cloned;
+        &ops_with_string_descrs
+    } else {
+        ops
+    };
     // A bridge region has no function-entry loads, but its InputArgs and ops
     // still need locals, liveness, homes, guard exits, and call signatures.
     // Analyse the complete function as one stream while keeping `inputargs`
@@ -4282,6 +4443,7 @@ pub fn build_wasm_module(
             merged_ops.extend(bridge.ops.iter().cloned());
             rebased_bridges.push(bridge);
         }
+        inject_builtin_string_descrs(&mut merged_ops);
         (&merged_inputargs, &merged_ops)
     };
     // Guard-entry moves and region emission must name the rebased ids, not the
@@ -7955,7 +8117,7 @@ fn build_function(
             OpCode::CallMallocNurseryVarsizeFrame => {
                 let vi = op.pos.get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
-                let bump_size = size_const.and_then(|size| u32::try_from(size).ok());
+                let bump_size = size_const.and_then(aligned_varsize_frame_bump);
                 let payload =
                     bump_size.map(|size| i64::from(size.saturating_sub(GcHeader::SIZE as u32)));
                 let Some(base) = residual_type_base else {
