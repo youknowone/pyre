@@ -116,7 +116,7 @@ pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyO
                 args_w.len()
             )));
         }
-        return do_call(ct.fargs, ct.ctitem, ct.cif_descr, funcaddr, args_w);
+        return do_call(ct, funcaddr, args_w);
     }
     call_varargs(ct, funcaddr, args_w)
 }
@@ -156,13 +156,13 @@ fn call_varargs(
     }
     let fvarargs = complete_argtypes(&fargs, args_w)?;
     let cif = build_cif_descr(&fvarargs, ct.ctitem, ct.abi, Some(fargs.len()))?;
-    // `new_ctypefunc_completing_argtypes` hands `_call` a function type whose
-    // `fargs` is the completed list; here the completed tuple stands in for
-    // it.  Every ctype is non-moving, so the tuple's items stay valid, and
-    // the tuple itself is pinned for the call.
+    // `new_ctypefunc_completing_argtypes` builds a fresh function type and
+    // calls `_call` on it. The completed tuple is young and is not a field
+    // of `ct`, so this opaque arm pins it for the conversions below.
     let roots = pyre_object::gc_roots::push_roots();
-    let w_fvarargs = roots.pin_root(pyre_object::tupleobject::w_tuple_new(fvarargs));
-    let result = do_call(w_fvarargs, ct.ctitem, cif, funcaddr, args_w);
+    let fargs_slot = roots.base();
+    let _ = roots.pin_root(pyre_object::tupleobject::w_tuple_new(fvarargs));
+    let result = do_call_fargs(roots.get(fargs_slot), ct.ctitem, cif, funcaddr, args_w);
     unsafe { free_cif_descr(cif) };
     result
 }
@@ -190,31 +190,22 @@ fn complete_argtypes(
 
 /// `W_CTypeFunc._call` — fill the exchange buffer, call, read the result out.
 ///
-/// The `try`/`finally` of the original is spelled as a labelled body whose
-/// outcome both arms of the closing `match` release: a `Result` built before
-/// the release ran could not be returned through it, so each arm builds its
-/// own after releasing.  `@jit.unroll_safe`: the argument loop runs
-/// `len(self.fargs)` times, a trace constant once the function type is
-/// promoted.
+/// Upstream reads `self.fargs[i]` off the promoted function type
+/// (`ctypefunc.py` `_call`). The ctype is `allocate_stable`, so `self` does
+/// not move and a collection rewrites the `fargs` field when the tuple does.
+/// Re-reading the field is that load; a second root bracket around a copy of
+/// the pointer was only there so the jitcode eraser could see a single pin.
+///
+/// `args_w` is still a native slice the collector does not rewrite, so the
+/// Python arguments stay on the shadow stack across a conversion that can
+/// collect. The `try`/`finally` of the original is a labelled body whose
+/// outcome both arms of the closing `match` release. `@jit.unroll_safe`: the
+/// argument loop runs `len(self.fargs)` times, a trace constant once the
+/// function type is promoted.
 #[majit_macros::unroll_safe]
-fn do_call(
-    w_fargs: PyObjectRef,
-    w_fresult: PyObjectRef,
-    cif: usize,
-    funcaddr: usize,
-    args_w: &[PyObjectRef],
-) -> Result<PyObjectRef, PyError> {
-    let fresult = ctypeobj::ctype_arg(w_fresult)?;
-    // A conversion can run arbitrary Python, and the argument array a builtin
-    // receives is a native copy no collector rewrites, so the arguments are
-    // read back out of the shadow stack rather than out of `args_w`.
-    // Two brackets rather than one.  The function type is a single pin whose
-    // read-backs all name its own bracket's first slot, which is the shape a
-    // jitcode can answer without consulting the shadow stack; numbering the
-    // argument slots off the same `base()` put both halves outside it.
-    let fargs_roots = pyre_object::gc_roots::push_roots();
-    let fargs_slot = fargs_roots.base();
-    let _ = fargs_roots.pin_root(w_fargs);
+fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let fresult = ctypeobj::ctype_arg(ct.ctitem)?;
+    let cif = ct.cif_descr;
     let args_roots = pyre_object::gc_roots::push_roots();
     let args_slot = args_roots.base();
     for &w_arg in args_w {
@@ -240,7 +231,7 @@ fn do_call(
             // every object-strategy list, so the element read cannot carry
             // that purity; promoting the element hands the trace the same
             // constant behind one guard.
-            let w_argtype = majit_metainterp::jit::promote(farg(fargs_roots.get(fargs_slot), i));
+            let w_argtype = majit_metainterp::jit::promote(farg(ct.fargs, i));
             let argtype = match ctypeobj::ctype_arg(w_argtype) {
                 Ok(argtype) => argtype,
                 Err(e) => break 'body Err(e),
@@ -265,21 +256,70 @@ fn do_call(
     };
     match called {
         Ok(w_res) => {
-            release_arguments(
-                fargs_roots.get(fargs_slot),
-                cif,
-                buffer,
-                mustfree_max_plus_1,
-            );
+            release_arguments(ct.fargs, cif, buffer, mustfree_max_plus_1);
             Ok(w_res)
         }
         Err(e) => {
-            release_arguments(
-                fargs_roots.get(fargs_slot),
-                cif,
-                buffer,
-                mustfree_max_plus_1,
-            );
+            release_arguments(ct.fargs, cif, buffer, mustfree_max_plus_1);
+            Err(e)
+        }
+    }
+}
+
+/// Variadic `_call`: the completed `fargs` tuple is not a field of `ct`.
+#[majit_macros::dont_look_inside]
+fn do_call_fargs(
+    w_fargs: PyObjectRef,
+    w_fresult: PyObjectRef,
+    cif: usize,
+    funcaddr: usize,
+    args_w: &[PyObjectRef],
+) -> Result<PyObjectRef, PyError> {
+    let fresult = ctypeobj::ctype_arg(w_fresult)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let fargs_slot = roots.base();
+    let _ = roots.pin_root(w_fargs);
+    let args_slot = fargs_slot + 1;
+    for &w_arg in args_w {
+        let _ = roots.pin_root(w_arg);
+    }
+    let size = unsafe { exchange_size(cif) };
+    let buffer = cdataobj::raw_malloc_varsize_char(size);
+    if buffer == 0 {
+        return Err(PyError::new(
+            crate::PyErrorKind::MemoryError,
+            "out of memory",
+        ));
+    }
+    let mut mustfree_max_plus_1 = 0usize;
+    let called = 'body: {
+        for i in 0..args_w.len() {
+            let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
+            let argtype = match ctypeobj::ctype_arg(farg(roots.get(fargs_slot), i)) {
+                Ok(argtype) => argtype,
+                Err(e) => break 'body Err(e),
+            };
+            match unsafe {
+                ctypeobj::convert_argument_from_object(argtype, data, roots.get(args_slot + i))
+            } {
+                Ok(true) => mustfree_max_plus_1 = i + 1,
+                Ok(false) => {}
+                Err(e) => break 'body Err(e),
+            }
+        }
+        super::cerrno::errno_before();
+        unsafe { jit_ffi_call(cif, funcaddr, buffer) };
+        super::cerrno::errno_after();
+        let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
+        unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
+    };
+    match called {
+        Ok(w_res) => {
+            release_arguments(roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
+            Ok(w_res)
+        }
+        Err(e) => {
+            release_arguments(roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
             Err(e)
         }
     }
