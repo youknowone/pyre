@@ -10414,20 +10414,18 @@ fn walker_pin_instance_w_class<Sym: WalkSym>(
     expected_typeobj: pyre_object::PyObjectRef,
 ) -> Result<OpRef, DispatchError> {
     let descr = crate::descr::w_class_descr();
-    let field_index = descr.index();
     let actual = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
     let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
     if walker_ref_box_is(ctx, actual, expected_typeobj) {
         return Ok(expected);
     }
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[actual, expected])?;
-    // `pyjitpl.py` `MIFrame.implement_guard_value`'s second half: the guard
-    // has proved the read equals the constant, so later GETFIELDs of this
-    // slot must return that constant, not the GETFIELD box whose concrete
-    // snapshot merely happened to match at record time.
+    // `pyjitpl.py` `implement_guard_value`: generate_guard then replace_box.
+    // heapcache.replace_box marks the GETFIELD FrontendOp replaced-with-const;
+    // the next `opimpl_getfield_gc_r` returns that Const via
+    // `maybe_replace_with_const`.  It does not write the Const back with
+    // `getfield_now_known`.
     ctx.trace_ctx.heap_cache_mut().replace_box(actual, expected);
-    ctx.trace_ctx
-        .heapcache_getfield_now_known(obj, field_index, expected);
     Ok(expected)
 }
 
