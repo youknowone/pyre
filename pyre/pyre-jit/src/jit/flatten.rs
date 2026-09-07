@@ -3869,12 +3869,30 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
-    if let Some(insn) = build_orthodox_inline_call_ir_r(
-        "pyre_interpreter::opcode_ops::binary_value_from_tag",
-        vec![Operand::ConstInt(op_val)],
-        vec![lhs_operand.clone(), rhs_operand.clone()],
-        result_reg,
-    ) {
+    // `jtransform.py handle_regular_call` emits `inline_call` when the
+    // callee jitcode is bound.  Raising tags stay residual so the walker
+    // can use the same specialize + `finishframe` path residual_call
+    // already ports from `pyjitpl.py`:
+    //
+    // * 3/4 (`//`, `%`): `try_walker_specialize_binary_op_int_zero_div`
+    //   records the raise on the *portal* frame.  Flatten `inline_call`
+    //   walks the helper instead, and a later divisor flip
+    //   (`checksum += i // d`) resumes without that local.
+    // * 6 (`getitem`): the helper arm hits an un-lowered residual
+    //   (`OrthodoxSubWalkTraceUnsupported`); `fully_bound_callee_body`
+    //   cannot see it because the funcptr is a register.
+    // * 5 (`/`): float zero-div raise trips a green-key bucket mismatch
+    //   when the helper is inlined (`typed decision key must bucket`).
+    // * 8/9 (`<<`, `>>`): negative-count raise after a prior bigint
+    //   residual poisons `PyError.message` on the inlined helper path.
+    if !matches!(op_val, 3 | 4 | 5 | 6 | 8 | 9)
+        && let Some(insn) = build_orthodox_inline_call_ir_r(
+            "pyre_interpreter::opcode_ops::binary_value_from_tag",
+            vec![Operand::ConstInt(op_val)],
+            vec![lhs_operand.clone(), rhs_operand.clone()],
+            result_reg,
+        )
+    {
         return Some(insn);
     }
     Some(build_residual_call_ir_r_insn_from_operands(

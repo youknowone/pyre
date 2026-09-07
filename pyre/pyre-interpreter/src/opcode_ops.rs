@@ -1412,6 +1412,13 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_value_from_tag_rejects_null_operands() {
+        let err = compare_value_from_tag(std::ptr::null_mut(), w_int_new(1), 5).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert!(err.to_string().contains("comparison on null operand"));
+    }
+
+    #[test]
     fn test_jit_getitem_and_setitem_share_objspace_semantics() {
         let list = pyre_object::w_list_new(vec![w_int_new(2), w_int_new(4)]);
         let item = jit_getitem(list as i64, w_int_new(1) as i64) as PyObjectRef;
