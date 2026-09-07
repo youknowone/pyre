@@ -9,8 +9,10 @@ use parking_lot::Mutex;
 use std::io::Cursor;
 #[cfg(not(feature = "host_env"))]
 use std::io::Write;
+use std::sync::Arc;
+#[cfg(not(feature = "host_env"))]
+use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Once};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustls::client::ClientSessionStore;
@@ -19,8 +21,13 @@ use rustls::pki_types::{
 };
 use rustls::sign::CertifiedKey;
 use sha1::{Digest, Sha1};
+#[cfg(not(feature = "host_env"))]
 use x509_parser::prelude::FromDer;
 
+#[cfg(feature = "host_env")]
+use rustpython_host_env::ssl::{self as host_ssl, cipher, msg, providers::CryptoExt};
+
+#[cfg(not(feature = "host_env"))]
 static INSTALL_PROVIDER: Once = Once::new();
 
 /// Install the process-wide rustls provider before constructing TLS state.
@@ -30,6 +37,19 @@ static INSTALL_PROVIDER: Once = Once::new();
 /// name is already admitted by CPython's `test_ssl` backend-version check.
 #[inline(never)]
 pub fn ensure_provider() {
+    #[cfg(feature = "host_env")]
+    {
+        use rustls::crypto::aws_lc_rs;
+        let ext = CryptoExt {
+            all_cipher_suites: Some(aws_lc_rs::ALL_CIPHER_SUITES),
+            default_cipher_suites: Some(aws_lc_rs::DEFAULT_CIPHER_SUITES),
+            all_kx_groups: Some(aws_lc_rs::ALL_KX_GROUPS),
+            any_supported_key: Some(aws_lc_rs::sign::any_supported_type),
+            ticketer: aws_lc_rs::Ticketer::new,
+        };
+        let _ = CryptoExt::set_provider(aws_lc_rs::default_provider(), ext);
+    }
+    #[cfg(not(feature = "host_env"))]
     INSTALL_PROVIDER.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
@@ -37,15 +57,24 @@ pub fn ensure_provider() {
 
 /// In-memory encrypted transport used by `SSLObject`.
 ///
+/// host_env owns the buffer/`start` compaction; the pointer wrappers below
+/// keep the interpreter off that type graph.
+#[cfg(feature = "host_env")]
+pub type MemoryBio = host_ssl::MemoryBio;
+
+/// In-memory encrypted transport used by `SSLObject`.
+///
 /// Keeping the unread suffix as `(Vec, start)` avoids the repeated whole-buffer
 /// shifts in RustPython's `Vec::drain(..n)` implementation.  Compaction happens
 /// only after a substantial prefix has been consumed.
+#[cfg(not(feature = "host_env"))]
 pub struct MemoryBio {
     buffer: Vec<u8>,
     start: usize,
     eof_written: bool,
 }
 
+#[cfg(not(feature = "host_env"))]
 impl MemoryBio {
     fn pending(&self) -> usize {
         self.buffer.len() - self.start
@@ -65,11 +94,18 @@ impl MemoryBio {
 
 #[inline(never)]
 pub fn memory_bio_new() -> *mut MemoryBio {
-    Box::into_raw(Box::new(MemoryBio {
-        buffer: Vec::new(),
-        start: 0,
-        eof_written: false,
-    }))
+    #[cfg(feature = "host_env")]
+    {
+        Box::into_raw(Box::new(MemoryBio::new()))
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        Box::into_raw(Box::new(MemoryBio {
+            buffer: Vec::new(),
+            start: 0,
+            eof_written: false,
+        }))
+    }
 }
 
 /// # Safety
@@ -87,12 +123,19 @@ pub unsafe fn memory_bio_free(bio: *mut MemoryBio) {
 #[inline(never)]
 pub unsafe fn memory_bio_read(bio: *mut MemoryBio, size: usize) -> Vec<u8> {
     let bio = unsafe { &mut *bio };
-    let count = size.min(bio.pending());
-    let end = bio.start + count;
-    let out = bio.buffer[bio.start..end].to_vec();
-    bio.start = end;
-    bio.compact();
-    out
+    #[cfg(feature = "host_env")]
+    {
+        bio.read(size)
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let count = size.min(bio.pending());
+        let end = bio.start + count;
+        let out = bio.buffer[bio.start..end].to_vec();
+        bio.start = end;
+        bio.compact();
+        out
+    }
 }
 
 /// # Safety
@@ -100,26 +143,48 @@ pub unsafe fn memory_bio_read(bio: *mut MemoryBio, size: usize) -> Vec<u8> {
 #[inline(never)]
 pub unsafe fn memory_bio_write(bio: *mut MemoryBio, data: &[u8]) -> Result<usize, &'static str> {
     let bio = unsafe { &mut *bio };
-    if bio.eof_written {
-        return Err("cannot write() after write_eof()");
+    #[cfg(feature = "host_env")]
+    {
+        bio.write(data)
+            .map_err(|_| "cannot write() after write_eof()")
     }
-    bio.compact();
-    bio.buffer.extend_from_slice(data);
-    Ok(data.len())
+    #[cfg(not(feature = "host_env"))]
+    {
+        if bio.eof_written {
+            return Err("cannot write() after write_eof()");
+        }
+        bio.compact();
+        bio.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
 }
 
 /// # Safety
 /// `bio` must point to a live [`MemoryBio`].
 #[inline(never)]
 pub unsafe fn memory_bio_write_eof(bio: *mut MemoryBio) {
-    unsafe { (*bio).eof_written = true };
+    #[cfg(feature = "host_env")]
+    unsafe {
+        (*bio).write_eof()
+    };
+    #[cfg(not(feature = "host_env"))]
+    unsafe {
+        (*bio).eof_written = true
+    };
 }
 
 /// # Safety
 /// `bio` must point to a live [`MemoryBio`].
 #[inline(never)]
 pub unsafe fn memory_bio_pending(bio: *const MemoryBio) -> usize {
-    unsafe { (&*bio).pending() }
+    #[cfg(feature = "host_env")]
+    {
+        unsafe { (*bio).pending() }
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        unsafe { (*bio).pending() }
+    }
 }
 
 /// # Safety
@@ -127,7 +192,14 @@ pub unsafe fn memory_bio_pending(bio: *const MemoryBio) -> usize {
 #[inline(never)]
 pub unsafe fn memory_bio_eof(bio: *const MemoryBio) -> bool {
     let bio = unsafe { &*bio };
-    bio.eof_written && bio.pending() == 0
+    #[cfg(feature = "host_env")]
+    {
+        bio.eof()
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        bio.eof_written && bio.pending() == 0
+    }
 }
 
 /// Mutable Python-visible SSL context settings plus rustls trust material.
@@ -187,13 +259,27 @@ enum EcdhCurve {
     X25519,
 }
 
+#[cfg(feature = "host_env")]
+pub use host_ssl::{
+    CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, PROTOCOL_TLS, PROTOCOL_TLS_CLIENT,
+    PROTOCOL_TLS_SERVER, PROTOCOL_TLSV1_2, PROTOCOL_TLSV1_3,
+};
+
+#[cfg(not(feature = "host_env"))]
 pub const PROTOCOL_TLS: i32 = 2;
+#[cfg(not(feature = "host_env"))]
 pub const PROTOCOL_TLS_CLIENT: i32 = 16;
+#[cfg(not(feature = "host_env"))]
 pub const PROTOCOL_TLS_SERVER: i32 = 17;
+#[cfg(not(feature = "host_env"))]
 pub const PROTOCOL_TLSV1_2: i32 = 5;
+#[cfg(not(feature = "host_env"))]
 pub const PROTOCOL_TLSV1_3: i32 = 6;
+#[cfg(not(feature = "host_env"))]
 pub const CERT_NONE: i32 = 0;
+#[cfg(not(feature = "host_env"))]
 pub const CERT_OPTIONAL: i32 = 1;
+#[cfg(not(feature = "host_env"))]
 pub const CERT_REQUIRED: i32 = 2;
 
 /// `SSL_OP_*` bits the `_ssl` module publishes.  Both `DEFAULT_OPTIONS` and
@@ -214,9 +300,17 @@ pub const DEFAULT_OPTIONS: u64 = OP_ALL
     | OP_ENABLE_MIDDLEBOX_COMPAT;
 
 /// `X509_V_FLAG_*` bits carried by `SSLContext.verify_flags`.
+#[cfg(feature = "host_env")]
+use host_ssl::{
+    VERIFY_CRL_CHECK_CHAIN, VERIFY_CRL_CHECK_LEAF, VERIFY_X509_PARTIAL_CHAIN, VERIFY_X509_STRICT,
+};
+#[cfg(not(feature = "host_env"))]
 const VERIFY_CRL_CHECK_LEAF: i32 = 4;
+#[cfg(not(feature = "host_env"))]
 const VERIFY_CRL_CHECK_CHAIN: i32 = 12;
+#[cfg(not(feature = "host_env"))]
 const VERIFY_X509_STRICT: i32 = 32;
+#[cfg(not(feature = "host_env"))]
 const VERIFY_X509_PARTIAL_CHAIN: i32 = 0x80000;
 
 /// Revocation scope requested by `verify_flags`.
@@ -472,14 +566,25 @@ impl Context {
 }
 
 fn read_pem_certificates(data: &[u8]) -> NativeResult<Vec<CertificateDer<'static>>> {
-    let mut cursor = Cursor::new(data);
-    let certs = rustls_pemfile::certs(&mut cursor)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(pem_error)?;
-    if certs.is_empty() {
-        return Err(pem_error("no start line"));
+    #[cfg(feature = "host_env")]
+    {
+        let certs = host_ssl::cert::read_certificates(data).map_err(pem_error)?;
+        if certs.is_empty() {
+            return Err(pem_error("no start line"));
+        }
+        Ok(certs.into_iter().map(CertificateDer::from).collect())
     }
-    Ok(certs)
+    #[cfg(not(feature = "host_env"))]
+    {
+        let mut cursor = Cursor::new(data);
+        let certs = rustls_pemfile::certs(&mut cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(pem_error)?;
+        if certs.is_empty() {
+            return Err(pem_error("no start line"));
+        }
+        Ok(certs)
+    }
 }
 
 /// An encrypted private key, in whichever container the file uses.
@@ -770,18 +875,25 @@ pub unsafe fn context_load_native_roots(context: *mut Context) -> NativeResult<u
 }
 
 fn certificate_is_ca(der: &[u8]) -> bool {
-    x509_parser::certificate::X509Certificate::from_der(der)
-        .ok()
-        .map(|(_, cert)| {
-            cert.basic_constraints()
-                .ok()
-                .flatten()
-                .is_some_and(|constraints| constraints.value.ca)
-                // OpenSSL's X509_check_ca retains its legacy rule for a
-                // self-issued X.509v1 trust anchor without BasicConstraints.
-                || (cert.version().0 == 0 && cert.subject() == cert.issuer())
-        })
-        .unwrap_or(false)
+    #[cfg(feature = "host_env")]
+    {
+        host_ssl::is_ca_certificate(der)
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        x509_parser::certificate::X509Certificate::from_der(der)
+            .ok()
+            .map(|(_, cert)| {
+                cert.basic_constraints()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|constraints| constraints.value.ca)
+                    // OpenSSL's X509_check_ca retains its legacy rule for a
+                    // self-issued X.509v1 trust anchor without BasicConstraints.
+                    || (cert.version().0 == 0 && cert.subject() == cert.issuer())
+            })
+            .unwrap_or(false)
+    }
 }
 
 /// Return `(all_x509, ca_x509)`.
@@ -815,18 +927,32 @@ pub unsafe fn context_ca_certs(context: *const Context) -> Vec<Vec<u8>> {
         .collect()
 }
 
+#[cfg(feature = "host_env")]
+type DistinguishedName = host_ssl::cert::DistinguishedName;
+#[cfg(not(feature = "host_env"))]
 type DistinguishedName = Vec<Vec<(String, String)>>;
 
+#[cfg(feature = "host_env")]
+use host_ssl::cert::SubjectAlternativeName;
+#[cfg(not(feature = "host_env"))]
 struct SubjectAlternativeName {
     kind: &'static str,
     value: String,
     directory_name: DistinguishedName,
 }
 
-/// Owned projection of the X.509 fields exposed by CPython's private
-/// `_test_decode_cert()` helper and by `SSLContext.get_ca_certs()`. Keeping
-/// this projection native prevents x509-parser's borrowed type graph from
-/// entering the translated interpreter.
+/// Owned projection of the X.509 fields exposed by `_test_decode_cert()`
+/// and by `SSLContext.get_ca_certs()`. Keeping this projection native
+/// prevents x509-parser's borrowed type graph from entering the translated
+/// interpreter.
+#[cfg(feature = "host_env")]
+pub type DecodedCertificate = host_ssl::DecodedCertificate;
+
+/// Owned projection of the X.509 fields exposed by `_test_decode_cert()`
+/// and by `SSLContext.get_ca_certs()`. Keeping this projection native
+/// prevents x509-parser's borrowed type graph from entering the translated
+/// interpreter.
+#[cfg(not(feature = "host_env"))]
 pub struct DecodedCertificate {
     issuer: DistinguishedName,
     subject: DistinguishedName,
@@ -840,6 +966,7 @@ pub struct DecodedCertificate {
     subject_alt_names: Vec<SubjectAlternativeName>,
 }
 
+#[cfg(not(feature = "host_env"))]
 fn oid_attribute_name(oid: &str) -> String {
     match oid {
         "2.5.4.3" => "commonName".to_string(),
@@ -853,6 +980,7 @@ fn oid_attribute_name(oid: &str) -> String {
     }
 }
 
+#[cfg(not(feature = "host_env"))]
 fn decode_name(name: &x509_parser::x509::X509Name<'_>) -> DistinguishedName {
     name.iter()
         .map(|rdn| {
@@ -873,6 +1001,7 @@ fn decode_name(name: &x509_parser::x509::X509Name<'_>) -> DistinguishedName {
         .collect()
 }
 
+#[cfg(not(feature = "host_env"))]
 fn format_certificate_time(value: &x509_parser::time::ASN1Time) -> String {
     let date = value.to_datetime();
     const MONTHS: [&str; 12] = [
@@ -889,6 +1018,7 @@ fn format_certificate_time(value: &x509_parser::time::ASN1Time) -> String {
     )
 }
 
+#[cfg(not(feature = "host_env"))]
 fn format_ip_address(ip: &[u8]) -> String {
     match ip.len() {
         4 => format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
@@ -901,6 +1031,12 @@ fn format_ip_address(ip: &[u8]) -> String {
     }
 }
 
+#[cfg(feature = "host_env")]
+fn decode_certificate(der: &[u8]) -> NativeResult<DecodedCertificate> {
+    host_ssl::decode_certificate(der).map_err(pem_error)
+}
+
+#[cfg(not(feature = "host_env"))]
 fn decode_certificate(der: &[u8]) -> NativeResult<DecodedCertificate> {
     use x509_parser::extensions::{DistributionPointName, GeneralName, ParsedExtension};
     use x509_parser::oid_registry::{
@@ -1461,6 +1597,7 @@ fn openssl_cipher_name(suite: rustls::SupportedCipherSuite) -> Option<&'static s
     })
 }
 
+#[cfg(not(feature = "host_env"))]
 fn cipher_pattern_matches(suite: rustls::SupportedCipherSuite, pattern: &str) -> bool {
     if suite.tls13().is_some() {
         return false;
@@ -1509,41 +1646,55 @@ pub unsafe fn context_cipher_enabled(context: *const Context, index: usize) -> b
 
 fn parse_cipher_string(pattern: &str) -> Result<Vec<rustls::SupportedCipherSuite>, &'static str> {
     ensure_provider();
-    let provider =
-        rustls::crypto::CryptoProvider::get_default().expect("the _ssl provider is installed");
-    let mut selected = Vec::new();
-    let mut exclusions = Vec::new();
-    for raw in pattern.split(':') {
-        let token = raw.trim().to_ascii_uppercase();
-        if token.is_empty() || token.starts_with('@') || token.starts_with('+') {
-            continue;
-        }
-        if let Some(excluded) = token.strip_prefix('!') {
-            exclusions.push(excluded.to_string());
-            continue;
-        }
-        let parts: Vec<&str> = token.split('+').collect();
-        for suite in &provider.cipher_suites {
-            if parts
-                .iter()
-                .all(|part| cipher_pattern_matches(*suite, part))
-                && !selected
+    #[cfg(feature = "host_env")]
+    {
+        let (selected, _) = cipher::CipherList::parse_to_rustls(pattern)
+            .ok()
+            .filter(|(suites, _)| suites.iter().any(|suite| suite.tls13().is_none()))
+            .ok_or("No cipher can be selected")?;
+        Ok(cipher::restore_default_tls13(
+            selected,
+            CryptoExt::get_ext().default_ciphers_or_provider(),
+        ))
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let provider =
+            rustls::crypto::CryptoProvider::get_default().expect("the _ssl provider is installed");
+        let mut selected = Vec::new();
+        let mut exclusions = Vec::new();
+        for raw in pattern.split(':') {
+            let token = raw.trim().to_ascii_uppercase();
+            if token.is_empty() || token.starts_with('@') || token.starts_with('+') {
+                continue;
+            }
+            if let Some(excluded) = token.strip_prefix('!') {
+                exclusions.push(excluded.to_string());
+                continue;
+            }
+            let parts: Vec<&str> = token.split('+').collect();
+            for suite in &provider.cipher_suites {
+                if parts
                     .iter()
-                    .any(|known: &rustls::SupportedCipherSuite| known.suite() == suite.suite())
-            {
-                selected.push(*suite);
+                    .all(|part| cipher_pattern_matches(*suite, part))
+                    && !selected
+                        .iter()
+                        .any(|known: &rustls::SupportedCipherSuite| known.suite() == suite.suite())
+                {
+                    selected.push(*suite);
+                }
             }
         }
-    }
-    selected.retain(|suite| {
-        !exclusions
-            .iter()
-            .any(|pattern| cipher_pattern_matches(*suite, pattern))
-    });
-    if selected.is_empty() {
-        Err("No cipher can be selected")
-    } else {
-        Ok(selected)
+        selected.retain(|suite| {
+            !exclusions
+                .iter()
+                .any(|pattern| cipher_pattern_matches(*suite, pattern))
+        });
+        if selected.is_empty() {
+            Err("No cipher can be selected")
+        } else {
+            Ok(selected)
+        }
     }
 }
 
@@ -1573,10 +1724,12 @@ pub unsafe fn context_set_ecdh_curve(
     context: *mut Context,
     curve: &str,
 ) -> Result<(), &'static str> {
+    #[cfg(feature = "host_env")]
+    let _ = cipher::kx_group_by_openssl_name(curve).ok_or("unknown elliptic curve")?;
     let curve = match curve {
-        "prime256v1" => EcdhCurve::Secp256r1,
+        "prime256v1" | "secp256r1" => EcdhCurve::Secp256r1,
         "secp384r1" => EcdhCurve::Secp384r1,
-        "X25519" => EcdhCurve::X25519,
+        "X25519" | "x25519" => EcdhCurve::X25519,
         _ => return Err("unknown elliptic curve name"),
     };
     unsafe { (*context).ecdh_curve = Some(curve) };
@@ -2636,6 +2789,7 @@ pub struct TlsMessageEvent {
     pub data: Vec<u8>,
 }
 
+#[cfg(not(feature = "host_env"))]
 #[derive(Default)]
 struct TlsRecordObserver {
     records: Vec<u8>,
@@ -2643,6 +2797,7 @@ struct TlsRecordObserver {
     encrypted: bool,
 }
 
+#[cfg(not(feature = "host_env"))]
 impl TlsRecordObserver {
     fn observe(
         &mut self,
@@ -2849,6 +3004,7 @@ impl rustls::KeyLog for CapturingKeyLog {
     }
 }
 
+#[cfg(not(feature = "host_env"))]
 macro_rules! hmac_digest {
     ($name:ident, $digest:ty, $block_size:expr) => {
         fn $name(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -2879,9 +3035,12 @@ macro_rules! hmac_digest {
     };
 }
 
+#[cfg(not(feature = "host_env"))]
 hmac_digest!(hmac_sha256, sha2::Sha256, 64);
+#[cfg(not(feature = "host_env"))]
 hmac_digest!(hmac_sha384, sha2::Sha384, 128);
 
+#[cfg(not(feature = "host_env"))]
 fn tls12_p_hash(
     secret: &[u8],
     seed: &[u8],
@@ -2901,6 +3060,7 @@ fn tls12_p_hash(
     output
 }
 
+#[cfg(not(feature = "host_env"))]
 fn tls12_finished(secret: &[u8], transcript: &[u8], label: &[u8], sha384: bool) -> Vec<u8> {
     let transcript_hash = if sha384 {
         sha2::Sha384::digest(transcript).to_vec()
@@ -3014,9 +3174,14 @@ pub struct TlsConnection {
     verified_chain: Option<Vec<Vec<u8>>>,
     verified_chain_computed: bool,
     verified_root_taken: bool,
+    #[cfg(feature = "host_env")]
+    msg_state: msg::MsgState,
+    #[cfg(not(feature = "host_env"))]
     incoming_observer: TlsRecordObserver,
+    #[cfg(not(feature = "host_env"))]
     outgoing_observer: TlsRecordObserver,
     message_events: Vec<TlsMessageEvent>,
+    #[cfg(not(feature = "host_env"))]
     tls12_handshake_transcript: Vec<u8>,
     key_log: Arc<CapturingKeyLog>,
     tls_unique: Option<Vec<u8>>,
@@ -3042,6 +3207,35 @@ pub struct TlsConnection {
 }
 
 impl TlsConnection {
+    fn observe_records(&mut self, write: bool, bytes: &[u8]) {
+        #[cfg(feature = "host_env")]
+        {
+            for event in self.msg_state.observe(write, bytes) {
+                self.message_events.push(TlsMessageEvent {
+                    write,
+                    version: event.version as u16,
+                    content_type: event.content_type as u16,
+                    message_type: event.msg_type as u16,
+                    data: event.data,
+                });
+            }
+        }
+        #[cfg(not(feature = "host_env"))]
+        {
+            let observer = if write {
+                &mut self.outgoing_observer
+            } else {
+                &mut self.incoming_observer
+            };
+            observer.observe(
+                bytes,
+                write,
+                &mut self.message_events,
+                &mut self.tls12_handshake_transcript,
+            );
+        }
+    }
+
     fn active_mut(&mut self) -> TlsResult<&mut rustls::Connection> {
         self.inner.as_mut().ok_or_else(|| {
             (
@@ -3086,23 +3280,24 @@ impl TlsConnection {
 
     /// Move every record rustls has queued for the peer into `pending_tls`.
     fn write_pending_tls(&mut self) -> TlsResult<()> {
-        let Some(inner) = self.inner.as_mut() else {
-            return Ok(());
-        };
-        while inner.wants_write() {
+        loop {
             let before = self.pending_tls.len();
-            inner
-                .write_tls(&mut self.pending_tls)
-                .map_err(rustls_error)?;
-            self.outgoing_observer.observe(
-                &self.pending_tls[before..],
-                true,
-                &mut self.message_events,
-                &mut self.tls12_handshake_transcript,
-            );
-            if self.pending_tls.len() == before {
-                break;
+            {
+                let Some(inner) = self.inner.as_mut() else {
+                    return Ok(());
+                };
+                if !inner.wants_write() {
+                    break;
+                }
+                inner
+                    .write_tls(&mut self.pending_tls)
+                    .map_err(rustls_error)?;
+                if self.pending_tls.len() == before {
+                    break;
+                }
             }
+            let chunk = self.pending_tls[before..].to_vec();
+            self.observe_records(true, &chunk);
         }
         Ok(())
     }
@@ -3203,9 +3398,11 @@ impl TlsConnection {
     }
 
     fn capture_tls_unique(&mut self) {
-        if self.tls_unique.is_some()
-            || !(self.incoming_observer.encrypted || self.outgoing_observer.encrypted)
-        {
+        if self.tls_unique.is_some() {
+            return;
+        }
+        #[cfg(not(feature = "host_env"))]
+        if !(self.incoming_observer.encrypted || self.outgoing_observer.encrypted) {
             return;
         }
         let Some(inner) = self.inner.as_ref() else {
@@ -3224,26 +3421,40 @@ impl TlsConnection {
         let Some(secret) = secret else {
             return;
         };
-        let sha384 = matches!(
-            suite.suite(),
-            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-                | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-        );
-        let label = if handshake_kind == rustls::HandshakeKind::Resumed {
-            b"server finished".as_slice()
-        } else {
-            b"client finished".as_slice()
-        };
-        self.tls_unique = Some(tls12_finished(
-            &secret,
-            &self.tls12_handshake_transcript,
-            label,
-            sha384,
-        ));
+        #[cfg(feature = "host_env")]
+        {
+            let server_side = matches!(inner, rustls::Connection::Server(_));
+            self.tls_unique = msg::tls12_unique(
+                suite,
+                &secret,
+                self.msg_state.transcript(),
+                server_side,
+                handshake_kind == rustls::HandshakeKind::Resumed,
+            );
+        }
+        #[cfg(not(feature = "host_env"))]
+        {
+            let sha384 = matches!(
+                suite.suite(),
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+                    | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            );
+            let label = if handshake_kind == rustls::HandshakeKind::Resumed {
+                b"server finished".as_slice()
+            } else {
+                b"client finished".as_slice()
+            };
+            self.tls_unique = Some(tls12_finished(
+                &secret,
+                &self.tls12_handshake_transcript,
+                label,
+                sha384,
+            ));
+            self.tls12_handshake_transcript.clear();
+        }
         // Do not retain key material or the handshake transcript once the
         // RFC 5929 binding has been derived.
         self.key_log.tls12_master_secret.lock().take();
-        self.tls12_handshake_transcript.clear();
     }
 
     fn process_acceptor_tls(&mut self) -> TlsResult<()> {
@@ -3276,12 +3487,8 @@ impl TlsConnection {
                 Err((error, mut alert)) => {
                     let before = self.pending_tls.len();
                     let _ = alert.write_all(&mut self.pending_tls);
-                    self.outgoing_observer.observe(
-                        &self.pending_tls[before..],
-                        true,
-                        &mut self.message_events,
-                        &mut self.tls12_handshake_transcript,
-                    );
+                    let chunk = self.pending_tls[before..].to_vec();
+                    self.observe_records(true, &chunk);
                     self.acceptor = None;
                     return Err(rustls_protocol_error(error));
                 }
@@ -3367,9 +3574,14 @@ pub unsafe fn connection_new(
         verified_chain: None,
         verified_chain_computed: false,
         verified_root_taken: false,
+        #[cfg(feature = "host_env")]
+        msg_state: msg::MsgState::default(),
+        #[cfg(not(feature = "host_env"))]
         incoming_observer: TlsRecordObserver::default(),
+        #[cfg(not(feature = "host_env"))]
         outgoing_observer: TlsRecordObserver::default(),
         message_events: Vec::new(),
+        #[cfg(not(feature = "host_env"))]
         tls12_handshake_transcript: Vec::new(),
         key_log,
         tls_unique: None,
@@ -3405,12 +3617,7 @@ pub unsafe fn connection_receive_tls(
     data: &[u8],
 ) -> TlsResult<usize> {
     let connection = unsafe { &mut *connection };
-    connection.incoming_observer.observe(
-        data,
-        false,
-        &mut connection.message_events,
-        &mut connection.tls12_handshake_transcript,
-    );
+    connection.observe_records(false, data);
     connection.pending_received_tls.extend_from_slice(data);
     if connection.inner.is_none() {
         if connection.accepted.is_some() {
@@ -3524,12 +3731,7 @@ pub unsafe fn connection_reject_server(
     }
     let alert = [21, 3, 3, 0, 2, 2, alert_description];
     connection.pending_tls.extend_from_slice(&alert);
-    connection.outgoing_observer.observe(
-        &alert,
-        true,
-        &mut connection.message_events,
-        &mut connection.tls12_handshake_transcript,
-    );
+    connection.observe_records(true, &alert);
     Ok(())
 }
 

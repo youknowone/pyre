@@ -3395,7 +3395,10 @@ dependencies = [
  "parking_lot",
  "paste",
  "rustix",
+ "rustls",
  "rustls-native-certs",
+ "rustls-pemfile",
+ "rustls-webpki",
  "rustpython-wtf8",
  "rustyline 18.0.1",
  "schannel",
@@ -3405,6 +3408,7 @@ dependencies = [
  "which",
  "widestring",
  "windows-sys 0.61.2",
+ "x509-parser",
 ]
 
 [[package]]

@@ -17,9 +17,10 @@ parking_lot = { workspace = true }
 rustpython-common = { workspace = true, features = ["hashlib"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-# `_ssl` shares platform trust-store loading and default path discovery with
-# RustPython while retaining its direct provider for host_env-free builds.
-rustpython-host_env = { workspace = true, optional = true, features = ["native-certs"] }
+# `_ssl` shares the rustls engine helpers (bio, cert, cipher, chain, msg,
+# provider) plus platform trust-store loading with RustPython. host_env-free
+# builds keep the local copies in `ssl.rs`.
+rustpython-host_env = { workspace = true, optional = true, features = ["native-certs", "ssl"] }
 libc = { workspace = true }
 lz4_flex = { version = "0.13", default-features = false, features = [
     "safe-decode",
