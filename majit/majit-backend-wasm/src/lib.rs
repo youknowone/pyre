@@ -6073,8 +6073,7 @@ impl majit_backend::Backend for WasmBackend {
                 let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
                 data.seed_savedata_from_jf(jf);
                 remember_and_drop_execution_frame(jf, saved);
-
-                return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
+                return DeadFrame::Boxed(data);
             }
 
             // Host-buffer frame path, for an embedder that registered no

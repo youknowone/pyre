@@ -6543,6 +6543,10 @@ impl<S: JitState> JitDriver<S> {
             // so hold the exception where the frontend's root walker can reach
             // it until `prepare_resume_from_failure` hands it to the blackhole.
             let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
+            let savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let _savedata_root = unsafe {
+                crate::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata.is_some())
+            };
 
             // must_compile tick for bridge threshold counting.
             if crate::majit_log_enabled() {
