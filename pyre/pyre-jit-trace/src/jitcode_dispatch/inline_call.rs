@@ -12560,12 +12560,59 @@ pub(crate) fn promote_published_null_return<Sym: WalkSym>(
         return outcome;
     }
     match ctx.last_exc_value() {
-        Some(exc) => DispatchOutcome::SubRaise {
-            exc,
-            exc_concrete: ctx.last_exc_value_concrete(),
-        },
+        Some(exc) => {
+            // `jit_publish_exception` wrote the backend cells.  Drain
+            // them here so a later compiled `GUARD_NO_EXCEPTION` in a
+            // different loop (`flip_floor` after `one_frame`) does not
+            // deopt on the leftover ZeroDivisionError.
+            if let Some(cb) = crate::callbacks::try_get() {
+                (cb.drain_backend_jit_exc)();
+            }
+            DispatchOutcome::SubRaise {
+                exc,
+                exc_concrete: ctx.last_exc_value_concrete(),
+            }
+        }
         None => outcome,
     }
+}
+
+/// `//` / `%` and the other exact-int raisers publish + return NULL.
+/// After a successful inline of those tags, record `GUARD_NO_EXCEPTION`
+/// so a later zero divisor deopts instead of dest-writing NULL into
+/// the caller's `+=` slot (`flip_floor`).
+fn maybe_guard_no_exception_after_raising_binop<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    int_arg_concretes: &[ConcreteValue],
+) -> Result<(), DispatchError> {
+    let Some(ConcreteValue::Int(tag)) = int_arg_concretes.first().copied() else {
+        return Ok(());
+    };
+    use pyre_interpreter::bytecode::BinaryOperator as B;
+    let raises = matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
+        Some(
+            B::FloorDivide
+                | B::InplaceFloorDivide
+                | B::Remainder
+                | B::InplaceRemainder
+                | B::TrueDivide
+                | B::InplaceTrueDivide
+                | B::Power
+                | B::InplacePower
+                | B::Lshift
+                | B::InplaceLshift
+                | B::Subscr
+        )
+    );
+    if !raises {
+        return Ok(());
+    }
+    ctx.trace_ctx
+        .record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12925,6 +12972,9 @@ pub(crate) fn try_finish_replayed_call_subreturn<Sym: WalkSym>(
     };
     ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
     if let Some(exc) = ctx.last_exc_value() {
+        if let Some(cb) = crate::callbacks::try_get() {
+            (cb.drain_backend_jit_exc)();
+        }
         return Some(Ok((
             DispatchOutcome::SubRaise {
                 exc,
@@ -13070,6 +13120,9 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         let mut published_raise = None;
         let dest_err = if let Some(pending) = self.pending_subreturn.take() {
             if let Some(exc) = walk_ctx.last_exc_value() {
+                if let Some(cb) = crate::callbacks::try_get() {
+                    (cb.drain_backend_jit_exc)();
+                }
                 published_raise = Some(DispatchOutcome::SubRaise {
                     exc,
                     exc_concrete: walk_ctx.last_exc_value_concrete(),
@@ -14048,6 +14101,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                         "dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"
                     ),
                 }
+                maybe_guard_no_exception_after_raising_binop(ctx, op.pc, &int_arg_concretes)?;
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
             None => {
