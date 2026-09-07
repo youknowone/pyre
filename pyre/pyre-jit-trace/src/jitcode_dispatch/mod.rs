@@ -2181,9 +2181,9 @@ fn create_segmented_trace<Sym: WalkSym>(
     // staged, that image answers `abort_blackhole_latched()` for a later abort,
     // which then records none of its own and adopts this merge point instead of
     // its own stop — dropping everything executed in between.
-    if !single_frame_blackhole_latched() {
+    if !latched_single_frame_mirror_publishable() {
         reset_single_frame_blackhole();
-        census_record("SegmentTrace::SingleFrameRefused");
+        census_record("SegmentTrace::MirrorStackRefused");
         return Ok(None);
     }
     // pyjitpl.py `generate_guard(rop.GUARD_ALWAYS_FAILS)`. The resume
@@ -11391,34 +11391,43 @@ fn latch_taken_python_branch_abort_stack<Sym: WalkSym>(
 }
 
 fn goto_if_not_branch_on<Sym: WalkSym>(
-    _code: &[u8],
+    code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
     condbox: OpRef,
     switchcase: i64,
     target: usize,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // pyjitpl.py MIFrame.opimpl_goto_if_not: capture at orgpc BEFORE
-    // selecting the tracing continuation. A later guard may share this
-    // snapshot even though this branch succeeded; it must re-evaluate the
-    // condition rather than unconditionally entering the opposite arm.
+    // pyjitpl.py `opimpl_goto_if_not` requires a boolean switchcase.
     assert!(
         switchcase == 0 || switchcase == 1,
         "opimpl_goto_if_not: switchcase must be 0 or 1, got {} (pc={})",
         switchcase,
         op.pc
     );
-    let guard_opcode = if switchcase != 0 {
-        OpCode::GuardTrue
+    let (guard_opcode, taken_pc, other_pc) = if switchcase != 0 {
+        (OpCode::GuardTrue, op.next_pc, target)
     } else {
-        OpCode::GuardFalse
+        (OpCode::GuardFalse, target, op.next_pc)
     };
-    if !condbox.is_constant() {
-        ctx.trace_ctx.record_guard(guard_opcode, &[condbox], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+
+    // `generate_guard` in `pyjitpl.py opimpl_goto_if_not` skips Const boxes.
+    // No register replacement occurs here; fused comparisons pass
+    // `replace=False`, preserving loop-variant conditions.
+    if condbox.is_constant() {
+        branch_without_guard(op, ctx, taken_pc, None)
+    } else {
+        guarded_branch_core(
+            code,
+            op,
+            ctx,
+            guard_opcode,
+            &[condbox],
+            taken_pc,
+            other_pc,
+            None,
+        )
     }
-    let next_pc = if switchcase != 0 { op.next_pc } else { target };
-    Ok((DispatchOutcome::Continue, next_pc))
 }
 
 fn int_ovf_jump<Sym: WalkSym>(
