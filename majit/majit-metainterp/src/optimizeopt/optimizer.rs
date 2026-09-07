@@ -5463,7 +5463,12 @@ impl Optimizer {
             // Rust adaptation: collect BEFORE the call (borrow checker) and pass
             // as parameter. available_boxes filtering happens inside
             // memo.finish() using liveboxes ∩ liveboxes_from_env.
-            let knowledge_for_resume = self.collect_optimizer_knowledge_for_resume(ctx);
+            let failarg_refs: Vec<OpRef> = op
+                .getfailargs()
+                .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
+                .unwrap_or_default();
+            let knowledge_for_resume =
+                self.collect_optimizer_knowledge_for_resume(ctx, &failarg_refs);
             let knowledge = if knowledge_for_resume.is_empty() {
                 None
             } else {
@@ -5683,7 +5688,7 @@ impl Optimizer {
         };
         // virtualize.py:87 store_final_boxes_in_guard(guard_op, []) — the
         // pendingfields argument is the empty list.
-        let knowledge_for_resume = self.collect_optimizer_knowledge_for_resume(ctx);
+        let knowledge_for_resume = self.collect_optimizer_knowledge_for_resume(ctx, &[]);
         let knowledge = if knowledge_for_resume.is_empty() {
             None
         } else {
@@ -5707,6 +5712,7 @@ impl Optimizer {
     fn collect_optimizer_knowledge_for_resume(
         &mut self,
         ctx: &mut OptContext,
+        failargs: &[OpRef],
     ) -> crate::resume::OptimizerKnowledgeForResume {
         let mut heap_fields_raw = Vec::new();
         let mut heap_arrayitems_raw = Vec::new();
@@ -5754,10 +5760,35 @@ impl Optimizer {
         // directly at serialization time in resume.rs via env.has_known_class(),
         // matching RPython's per-livebox getptrinfo(box).get_known_class(cpu).
 
+        // Pyre-only trailing resume section. PyPy's bridge retraces from
+        // the loop COMPARE and re-proves the bound; pyre's resume starts
+        // after that compare, so the bound the loop already has on each
+        // integer failarg has to travel with the guard.
+        let mut int_bounds = Vec::new();
+        for &arg in failargs {
+            if arg.is_none() || arg.is_constant() {
+                continue;
+            }
+            let Some(arg_box) = ctx.get_box_replacement_operand_opt(arg) else {
+                continue;
+            };
+            if !matches!(ctx.opref_type(arg_box.to_opref()), Some(Type::Int)) {
+                continue;
+            }
+            let Some(bound) = ctx.peek_intbound_box(&arg_box) else {
+                continue;
+            };
+            if bound.is_unbounded() {
+                continue;
+            }
+            int_bounds.push((arg_box.to_opref(), bound.lower, bound.upper));
+        }
+
         crate::resume::OptimizerKnowledgeForResume {
             heap_fields,
             heap_arrayitems,
             loopinvariant_results,
+            int_bounds,
         }
     }
 

@@ -7300,6 +7300,8 @@ struct MergedRegion {
     /// keys are in that trace's value numbering, so the merge rebases them with
     /// the region.
     constants: majit_ir::ConstMap<majit_ir::Const>,
+    /// GC-rewritten operations retain their forwardable constant table.
+    gc_table: Option<Arc<majit_gc::GcTable>>,
     /// Where this region's reference constants start in the merged trace's
     /// `GcTable`. The rewrite indexes each stream's table from zero, so every
     /// `LoadFromGcTable` the region carries is shifted onto its own extension of
@@ -7319,6 +7321,7 @@ impl Clone for MergedRegion {
                 .collect(),
             ops: self.ops.clone(),
             constants: self.constants.clone(),
+            gc_table: self.gc_table.clone(),
             gc_table_base: self.gc_table_base,
         }
     }
@@ -8058,6 +8061,15 @@ struct ReemitInputs {
     /// The pool the owner's own compile was given. Each region's pool is merged
     /// onto this one by `merge_regions`, never into it.
     constants: majit_ir::ConstMap<majit_ir::Const>,
+    /// gcreftracer.py gcrefs_trace: keep reference constants in GC-updated
+    /// slots, not in an untraced copy of the pre-rewrite ConstPtr operands.
+    /// The retained operations are already GC-rewritten, as in wasm's
+    /// ModuleBuildInputs; Cranelift re-emission must preserve that contract.
+    gc_table: Option<Arc<majit_gc::GcTable>>,
+    /// How many leading `gc_table` slots belong to the owner stream.
+    /// Region slots are appended after this and must not be replayed as
+    /// owner gcrefs on the next merge.
+    owner_gcref_len: usize,
     invalidation_flag_ptr: Option<usize>,
     /// The compiling driver's one-shot `set_next_frame_value_count_fn`. A
     /// re-emission is the same trace compiled again, so it has to decode the
@@ -9223,9 +9235,9 @@ pub struct CraneliftBackend {
     /// `-live-` decoder for the `rd_numb` reads below.
     next_frame_value_count_fn: Option<fn(i32, i32) -> usize>,
     /// Whether a bridge that closes onto its owner is re-emitted into the
-    /// owner's own function (`MAJIT_CL_BRIDGE_MERGE`). Read once here rather
-    /// than per compile so a test can drive the route without an environment
-    /// the rest of the process shares.
+    /// owner's own function. On by default; `MAJIT_CL_NO_BRIDGE_MERGE`
+    /// turns it off. Read once here rather than per compile so a test can
+    /// drive the route without an environment the rest of the process shares.
     bridge_merge: bool,
     registered_call_assembler_tokens: IndexSet<u64>,
     registered_call_assembler_bridge_traces: IndexSet<u64>,
@@ -9485,7 +9497,10 @@ impl CraneliftBackend {
             next_trace_id: None,
             next_header_pc: None,
             next_frame_value_count_fn: None,
-            bridge_merge: std::env::var_os("MAJIT_CL_BRIDGE_MERGE").is_some(),
+            // On by default. The owner re-emission keeps the rewritten
+            // stream and the GcTable GC forwards; `MAJIT_CL_NO_BRIDGE_MERGE`
+            // restores the out-of-line bridge.
+            bridge_merge: std::env::var_os("MAJIT_CL_NO_BRIDGE_MERGE").is_none(),
             registered_call_assembler_tokens: IndexSet::new(),
             registered_call_assembler_bridge_traces: IndexSet::new(),
             // llmodel.py:64-69: vtable_offset is None when gcremovetypeptr is
@@ -10136,6 +10151,7 @@ impl CraneliftBackend {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             ops: ops.to_vec(),
             constants,
+            gc_table: None,
             gc_table_base: 0,
         });
         // Every guard the re-emission walks, the new region's included.
@@ -10151,6 +10167,14 @@ impl CraneliftBackend {
         self.next_trace_id = Some(owner.trace_id);
         self.next_header_pc = Some(owner.header_pc);
         self.next_frame_value_count_fn = seed.frame_value_count_fn;
+        // `seed.ops` is the owner's already-rewritten stream. Always skip
+        // a second prepare, even when the owner published no gcrefs —
+        // re-preparing rewritten integer ops is what made
+        // `bridge_closing_onto_its_owner_merges_into_the_loop` spin.
+        let reused_owner_gcrefs = Some(seed.gc_table.as_ref().map_or_else(Vec::new, |table| {
+            let n = seed.owner_gcref_len.min(table.len());
+            (0..n).map(|i| table.slot(i)).collect()
+        }));
         let compiled = self.do_compile(
             &seed.inputargs,
             &seed.ops,
@@ -10158,6 +10182,7 @@ impl CraneliftBackend {
             None,
             owner.caller_prefix_layout.as_ref(),
             &seed.regions,
+            reused_owner_gcrefs,
         );
         // `do_compile` consumes all three, but only past the validation it can
         // fail at; clear them so a declined merge leaves nothing for the next
@@ -10198,7 +10223,11 @@ impl CraneliftBackend {
         }
         self.register_fail_descrs(original_token, &compiled.fail_descrs);
         if let Some(table) = compiled.gc_table.clone() {
-            self.register_gc_table(original_token, table);
+            self.register_gc_table(original_token, table.clone());
+            // The merged table is the one the collector walks. Reuse its
+            // leading owner slots on the next merge rather than the
+            // superseded first-compile table.
+            seed.gc_table = Some(table);
         }
         {
             let clt = original_token.compiled_loop_token_expect();
@@ -10266,6 +10295,7 @@ impl CraneliftBackend {
                     .collect(),
                 ops,
                 constants,
+                gc_table: region.gc_table.clone(),
                 gc_table_base: gcrefs.len() as i64,
             });
             gcrefs.extend(region_gcrefs);
@@ -10281,22 +10311,28 @@ impl CraneliftBackend {
         source_guard: Option<(u64, u32)>,
         caller_layout: Option<&ExitRecoveryLayout>,
         regions: &[MergedRegion],
+        reused_owner_gcrefs: Option<Vec<GcRef>>,
     ) -> Result<CompiledLoop, BackendError> {
         // Captured before the merge and the GC rewrite shadow them: a
         // re-emission replays the owner's OWN stream and pool, with every region
         // appended again from scratch.
-        let reemit = source_guard.is_none().then(|| ReemitInputs {
-            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-            ops: ops.to_vec(),
-            constants: self.constants.clone(),
-            invalidation_flag_ptr,
-            // Read before the one-shot below consumes it.
-            frame_value_count_fn: self.next_frame_value_count_fn,
-            regions: regions.to_vec(),
-        });
         validate_call_assembler_rewrite_prereqs(ops)?;
-        let (owner_prepared, mut gcrefs) =
-            self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone());
+        // Keep the rewritten owner stream and the slots GC has already
+        // forwarded. Re-preparing from frontend ConstPtrs resurrects
+        // nursery addresses (`exception_escape_hot_callee_tb_node_once`).
+        let (owner_prepared, mut gcrefs) = if let Some(gcrefs) = reused_owner_gcrefs {
+            (ops.to_vec(), gcrefs)
+        } else {
+            self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone())
+        };
+        let owner_prepared_for_reemit = owner_prepared.clone();
+        let owner_gcrefs_for_reemit = gcrefs.clone();
+        // Snapshot before `take` below empties the pool, and before a
+        // merge overwrites it with the remapped region window. The next
+        // re-emission replays the owner's own ops against this pool;
+        // storing the emptied map made every folded owner constant read
+        // as 0 and spun `bridge_closing_onto_its_owner_merges_into_the_loop`.
+        let owner_constants_for_reemit = self.constants.clone();
         // Every region is appended already prepared, and only then: the rewrite
         // is what fixes a stream's op count — it inserts a `LoadFromGcTable`
         // ahead of the op whose constant it replaces, and expands a nursery
@@ -16922,6 +16958,20 @@ impl CraneliftBackend {
             }
             label_block_id += 1;
         }
+        // Retain the owner's rewritten stream and the pool it was
+        // compiled against. Share the compiled GcTable so a later
+        // collection forwards the same slots the re-emission will reuse
+        // (`gcrefs_trace`).
+        let reemit = Some(ReemitInputs {
+            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            ops: owner_prepared_for_reemit,
+            constants: owner_constants_for_reemit,
+            gc_table: gc_table.clone(),
+            owner_gcref_len: owner_gcrefs_for_reemit.len(),
+            invalidation_flag_ptr,
+            frame_value_count_fn,
+            regions: regions.to_vec(),
+        });
         Ok(CompiledLoop {
             reemit: RefCell::new(reemit),
             superseded_by: OnceLock::new(),
@@ -18058,7 +18108,8 @@ impl majit_backend::Backend for CraneliftBackend {
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
-        let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None, &[])?;
+        let mut compiled =
+            self.do_compile(inputargs, ops, Some(flag_ptr), None, None, &[], None)?;
         compiled.green_key = token.green_key();
         let info = AsmInfo {
             code_addr: compiled.code_ptr as usize,
@@ -18249,6 +18300,7 @@ impl majit_backend::Backend for CraneliftBackend {
             Some((source_trace_id, fail_descr.fail_index_per_trace())),
             caller_layout.as_ref(),
             &[],
+            None,
         );
         let mut compiled = compiled?;
         // Same invariant as the loop path above: skipping would free the arena
@@ -18425,13 +18477,10 @@ impl majit_backend::Backend for CraneliftBackend {
         // faster route to the same guard when the bridge closes back onto the
         // loop it came from. A declined merge leaves it as the only route.
         //
-        // Off by default: the merged stream miscompiles. `synth/dict_set`,
-        // `synth/nested_break_not_hot` and `synth/loops_comprehension` fault,
-        // and `synth/exception_escape_hot_callee_tb_node_once` reaches the
-        // collector with an invalid type id, each of them only once a merge has
-        // fired and none of them with this gate unset. Sixteen of the
-        // cranelift suite's checks separate the two arms, so the route stays
-        // opt-in until that is understood.
+        // On by default. The owner re-emission keeps the rewritten stream
+        // and the GcTable GC forwards, so a later collection cannot
+        // resurrect the nursery ConstPtrs the first compile replaced.
+        // `MAJIT_CL_NO_BRIDGE_MERGE` turns this back off.
         if self.bridge_merge {
             let fail_index = fail_descr.fail_index_per_trace();
             let merged = self.merge_bridge_into_owner(
@@ -20902,8 +20951,8 @@ mod tests {
     #[test]
     fn bridge_closing_onto_its_owner_merges_into_the_loop() {
         let mut backend = CraneliftBackend::new();
-        // The route is opt-in while it miscompiles; this test is what drives
-        // it, so it asks for it here instead of through the environment.
+        // Force the route on so an ambient `MAJIT_CL_NO_BRIDGE_MERGE` cannot
+        // skip the merge this test is asserting.
         backend.bridge_merge = true;
         let loop_descr = make_label_descr(1_500_290);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
@@ -21008,6 +21057,162 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
         assert_eq!(backend.get_int_value(&frame, 0), 0);
         assert_eq!(backend.get_int_value(&frame, 1), 530);
+    }
+
+    /// aarch64/regalloc.py Regalloc.prepare_bridge / get_gcmap: a reference
+    /// passed by a patched guard remains a live root through a collecting
+    /// bridge call and is handed back to the loop at its forwarded address.
+    #[test]
+    fn merged_bridge_preserves_ref_input_across_collection() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xB12D_6001 };
+        let mut backend = backend_with_gc(gc);
+        backend.bridge_merge = true;
+        let label = make_label_descr(1_500_292);
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let reference = OpRef::input_arg_ref(0);
+        let counter = OpRef::input_arg_int(1);
+        let exit = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        exit.setfailargs(smallvec::smallvec![rb(reference)]);
+        let enter = mk_op(OpCode::GuardFalse, &[OpRef::int_op(3)], OpRef::NONE.raw());
+        enter.setfailargs(smallvec::smallvec![rb(reference), rb(counter)]);
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[reference, counter],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(OpCode::IntGt, &[counter, OpRef::const_int(0)], 2),
+            exit,
+            mk_op(OpCode::IntEq, &[counter, OpRef::const_int(2)], 3),
+            enter,
+            mk_op(OpCode::IntSub, &[counter, OpRef::const_int(1)], 4),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[reference, OpRef::int_op(4)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(1_500_292);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let failed = backend.execute_token(&token, &[Value::Ref(root), Value::Int(2)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).unwrap();
+        let bridge = vec![
+            mk_op_with_descr(
+                OpCode::CallN,
+                &[
+                    OpRef::const_int(collect_nursery_via_runtime_void as *const () as usize as i64),
+                    OpRef::const_int(0),
+                ],
+                OpRef::NONE.raw(),
+                make_call_descr(vec![Type::Int], Type::Void),
+            ),
+            mk_op(OpCode::IntSub, &[counter, OpRef::const_int(1)], 2),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[reference, OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+                label,
+            ),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge, &token, &[], None)
+            .unwrap();
+        let owner = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        assert!(
+            owner.superseded_by.get().is_some(),
+            "the collecting bridge must actually merge"
+        );
+        let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(2)]);
+        let moved = backend.get_ref_value(&frame, 0);
+        assert_ne!(
+            moved, root,
+            "the bridge must collect and forward the reference"
+        );
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xB12D_6001);
+    }
+
+    /// gcreftracer.py gcrefs_trace: re-emission must read the forwarded
+    /// reference constant, just as the already compiled owner does.
+    #[test]
+    fn merged_owner_preserves_reference_constant_after_collection() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(type_id, 16);
+        let mut backend = backend_with_gc(gc);
+        backend.bridge_merge = true;
+        let label = make_label_descr(1_500_293);
+        let inputargs = vec![InputArg::new_int(0)];
+        let counter = OpRef::input_arg_int(0);
+        let reference = OpRef::ref_op(1);
+        let constant = mk_op(OpCode::SameAsR, &[OpRef::const_ptr(root)], reference.raw());
+        let exit = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        exit.setfailargs(smallvec::smallvec![rb(reference)]);
+        let enter = mk_op(OpCode::GuardFalse, &[OpRef::int_op(3)], OpRef::NONE.raw());
+        enter.setfailargs(smallvec::smallvec![rb(counter)]);
+        let ops = vec![
+            constant,
+            mk_op_with_descr(OpCode::Label, &[counter], OpRef::NONE.raw(), label.clone()),
+            mk_op(OpCode::IntGt, &[counter, OpRef::const_int(0)], 2),
+            exit,
+            mk_op(OpCode::IntEq, &[counter, OpRef::const_int(2)], 3),
+            enter,
+            mk_op(OpCode::IntSub, &[counter, OpRef::const_int(1)], 4),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(4)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(1_500_293);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let failed = backend.execute_token(&token, &[Value::Int(2)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).unwrap();
+        with_cranelift_gc_required(|gc| gc.collect_nursery());
+        let owner = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let moved = owner.gc_table.as_ref().unwrap().slot(0);
+        assert_ne!(moved, root);
+        let bridge = vec![
+            mk_op(OpCode::IntSub, &[counter, OpRef::const_int(1)], 1),
+            mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge, &token, &[], None)
+            .unwrap();
+        let merged = owner
+            .superseded_by
+            .get()
+            .expect("bridge must actually merge");
+        assert_eq!(
+            merged.gc_table.as_ref().unwrap().slot(0),
+            moved,
+            "re-emission must not resurrect the original nursery address"
+        );
+        let frame = backend.execute_token(&token, &[Value::Int(2)]);
+        assert_eq!(backend.get_ref_value(&frame, 0), moved);
     }
 
     /// `demoted_failarg_slots` is trace-global while `loop_phi_keep` is per
