@@ -3252,11 +3252,10 @@ where
     /// Execute a `BC_RECURSIVE_CALL_*` opcode (pyjitpl.py:1376
     /// `opimpl_recursive_call`).
     ///
-    /// Payload (little-endian, emitted by
-    /// `JitCodeBuilder::recursive_call_int` and siblings):
-    ///   jd_index:u16, result_dst:u8 (`NO_RETURN_REG` = no result / void),
-    ///   num_green:u16, (green_kind:u8, green_src:u8) × num_green,
-    ///   num_args:u16, (kind:u8, caller_src:u8, callee_dst:u8) × num_args.
+    /// Payload matches `jtransform.py handle_recursive_call` /
+    /// `blackhole.py bhimpl_recursive_call_*`:
+    ///   jdindex `i` (const-pool register), then `I R F I R F` lists,
+    ///   then the dest byte for a typed result (`recursive_call_v` has none).
     ///
     /// `result_kind` is `Some(Int/Ref/Float)` for the typed opcodes and
     /// `None` for the void opcode.  The green register sources carry the
@@ -3287,30 +3286,32 @@ where
         // `pc` is set to `code_cursor` so a later `make_result_of_lastop`
         // (driven by the portal's typed return) keys `resulttypes[pc]` at
         // the post-operand offset the emitter recorded.
-        let (jd_index, result_dst, green_srcs, arg_triples) = {
+        let (jd_index, result_dst, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f) = {
             let frame = self.frames.current_mut();
-            let jd_index = frame.next_u16() as usize;
-            let result_dst_raw = frame.next_reg() as usize;
-            let result_dst = if result_dst_raw == crate::jitcode::NO_RETURN_REG as usize {
-                None
-            } else {
-                Some(result_dst_raw)
+            let jd_reg = frame.next_reg() as usize;
+            let read_list = |frame: &mut crate::pyjitpl::frame::MIFrame| {
+                let n = frame.next_u8() as usize;
+                (0..n)
+                    .map(|_| frame.next_reg() as usize)
+                    .collect::<Vec<_>>()
             };
-            let num_green = frame.next_u16() as usize;
-            let mut green_srcs = Vec::with_capacity(num_green);
-            for _ in 0..num_green {
-                let kind = JitArgKind::decode(frame.next_u8());
-                let src = frame.next_reg() as usize;
-                green_srcs.push((kind, src));
-            }
-            let num_args = frame.next_u16() as usize;
-            let mut arg_triples = Vec::with_capacity(num_args);
-            for _ in 0..num_args {
-                let kind = JitArgKind::decode(frame.next_u8());
-                let caller_src = frame.next_reg() as usize;
-                let callee_dst = frame.next_reg() as usize;
-                arg_triples.push((kind, caller_src, callee_dst));
-            }
+            let greens_i = read_list(frame);
+            let greens_r = read_list(frame);
+            let greens_f = read_list(frame);
+            let reds_i = read_list(frame);
+            let reds_r = read_list(frame);
+            let reds_f = read_list(frame);
+            let result_dst = match result_kind {
+                Some(_) => {
+                    let dest = frame.next_reg() as usize;
+                    if dest == crate::jitcode::NO_RETURN_REG as usize {
+                        None
+                    } else {
+                        Some(dest)
+                    }
+                }
+                None => None,
+            };
             // Caller-side result-slot bookkeeping (BC_INLINE_CALL:3298-3300).
             frame._result_argcode = match (result_kind, result_dst) {
                 (Some(JitArgKind::Int), Some(_)) => b'i',
@@ -3320,26 +3321,28 @@ where
             };
             frame.result_arg_index = result_dst;
             frame.pc = frame.code_cursor;
-            (jd_index, result_dst, green_srcs, arg_triples)
+            (
+                jd_reg, result_dst, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+            )
         };
+        let jd_index = self.read_int_reg(jd_index).1 as usize;
 
-        // Read each green from the register bank its `JitArgKind` names: a
-        // ref green (e.g. tl's `program`) from the ref bank, an int green
-        // (e.g. `pc`) from the int bank, a float green from the float bank
-        // (its raw i64 bits feed the green-key hash — `prepare_list_of_boxes`
-        // decodes `argcode == 'f'` from `registers_f`).  The values are
-        // collected in green declaration order so they hash against
-        // `green_args_spec`.  `green_pc` is the first green (the int portal
-        // entry pc), or 0 when the call carries no greens.
-        let green_values: Vec<i64> = green_srcs
-            .iter()
-            .map(|&(kind, src)| match kind {
-                JitArgKind::Ref => self.read_ref_reg(src).1,
-                JitArgKind::Int => self.read_int_reg(src).1,
-                JitArgKind::Float => self.read_float_reg(src).1,
-            })
-            .collect();
-        let green_pc = green_values.first().copied().unwrap_or(0) as usize;
+        // `pyjitpl.py` `boxes3` concatenates the three kind lists (I then R
+        // then F).  `green_pc` is the first int green — the portal entry pc.
+        let mut green_values = Vec::with_capacity(greens_i.len() + greens_r.len() + greens_f.len());
+        for &src in &greens_i {
+            green_values.push(self.read_int_reg(src).1);
+        }
+        for &src in &greens_r {
+            green_values.push(self.read_ref_reg(src).1);
+        }
+        for &src in &greens_f {
+            green_values.push(self.read_float_reg(src).1);
+        }
+        let green_pc = greens_i
+            .first()
+            .map(|&src| self.read_int_reg(src).1 as usize)
+            .unwrap_or(0);
 
         let recursive_depth = ctx.recursive_depth((jd_index, green_pc));
         let inline_depth = ctx.inline_depth();
@@ -3394,7 +3397,6 @@ where
                 jd_index,
                 result_dst,
                 &green_values,
-                &arg_triples,
             );
         }
         // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
@@ -3433,30 +3435,28 @@ where
             // auto-LEAVE pops.
             portal_frame.portal_entered = true;
             portal_frame.portal_jd = jd_index;
-            for (kind, caller_src, callee_dst) in arg_triples {
-                match kind {
-                    JitArgKind::Int => {
-                        let (value, concrete) = self.read_int_reg(caller_src);
-                        #[cfg(feature = "jit-audits")]
-                        majit_ir::reg_write_audit::note_int_write(
-                            portal_frame.int_regs.as_ptr() as usize,
-                            callee_dst,
-                            Some(value),
-                        );
-                        portal_frame.int_regs[callee_dst] = Some(value);
-                        portal_frame.int_values[callee_dst] = Some(concrete);
-                    }
-                    JitArgKind::Ref => {
-                        let (value, concrete) = self.read_ref_reg(caller_src);
-                        portal_frame.ref_regs[callee_dst] = Some(value);
-                        portal_frame.ref_values[callee_dst] = Some(concrete);
-                    }
-                    JitArgKind::Float => {
-                        let (value, concrete) = self.read_float_reg(caller_src);
-                        portal_frame.float_regs[callee_dst] = Some(value);
-                        portal_frame.float_values[callee_dst] = Some(concrete);
-                    }
-                }
+            // Portal args are greens+reds per kind, the same concatenation
+            // `bhimpl_recursive_call_*` passes to `cpu.bh_call_*`.
+            for (dst, &src) in greens_i.iter().chain(reds_i.iter()).enumerate() {
+                let (value, concrete) = self.read_int_reg(src);
+                #[cfg(feature = "jit-audits")]
+                majit_ir::reg_write_audit::note_int_write(
+                    portal_frame.int_regs.as_ptr() as usize,
+                    dst,
+                    Some(value),
+                );
+                portal_frame.int_regs[dst] = Some(value);
+                portal_frame.int_values[dst] = Some(concrete);
+            }
+            for (dst, &src) in greens_r.iter().chain(reds_r.iter()).enumerate() {
+                let (value, concrete) = self.read_ref_reg(src);
+                portal_frame.ref_regs[dst] = Some(value);
+                portal_frame.ref_values[dst] = Some(concrete);
+            }
+            for (dst, &src) in greens_f.iter().chain(reds_f.iter()).enumerate() {
+                let (value, concrete) = self.read_float_reg(src);
+                portal_frame.float_regs[dst] = Some(value);
+                portal_frame.float_values[dst] = Some(concrete);
             }
             match result_kind {
                 Some(JitArgKind::Int) => portal_frame.return_i = result_dst,
@@ -3529,10 +3529,6 @@ where
         jd_index: usize,
         result_dst: Option<usize>,
         green_values: &[i64],
-        // A recursive portal call runs the callee with a FRESH frame, so the
-        // caller's red-arg mapping does not flow into the callee's reds (the
-        // fresh state supersedes it); kept for the opcode's decode shape.
-        _arg_triples: &[(JitArgKind, usize, usize)],
     ) -> TraceAction {
         // Validate the (result_kind, result_dst) pairing: the three typed
         // kinds carry a destination register, `Void` carries none.  Any
@@ -6697,7 +6693,6 @@ where
                             jdindex,
                             result_dst,
                             &green_values,
-                            &[],
                         ) {
                             TraceAction::Continue => {}
                             // Abort propagates (missing fresh-reds / target).
@@ -12195,7 +12190,7 @@ mod tests {
         // then return reg 0.
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.load_const_i_value(5, 42);
-        caller_builder.recursive_call_int(0, 0, &[], &[(JitArgKind::Int, 5, 0)]);
+        caller_builder.recursive_call_int(0, 0, &[], &[(JitArgKind::Int, 5)]);
         caller_builder.int_return(0);
         let caller = caller_builder.finish();
 

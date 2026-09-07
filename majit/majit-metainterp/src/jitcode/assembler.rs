@@ -3274,177 +3274,141 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
-    /// Emit a recursive portal call returning an int (pyjitpl.py:1376
-    /// `opimpl_recursive_call`).  The payload is consumed by
-    /// `JitCodeMachine::exec_recursive_call`:
-    ///   jd_index:u16, result_dst:u8, num_green:u16,
-    ///   (green_kind:u8, green_src:u8) × num_green, num_args:u16,
-    ///   (kind:u8, caller_src:u8, callee_dst:u8) × num_args.
-    /// The portal is self-recursive, so the opcode carries the jitdriver
-    /// index rather than a compiled target.  `greens` are the caller
-    /// registers holding the portal green key, in the jitdriver's green
-    /// declaration order so they hash against `green_args_spec`; each
-    /// carries its own `JitArgKind` so the dispatcher reads it from the
-    /// matching register bank (an int `pc` green from the int bank, a ref
-    /// `program` green from the ref bank).  The first green seeds the
-    /// portal entry pc.  Each arg moves caller register `caller_src` into
-    /// portal register `callee_dst`.
+    /// Emit a recursive portal call returning an int.
+    ///
+    /// `jtransform.py handle_recursive_call` + `assembler.py` encode
+    /// `recursive_call_i/iIRFIRF>i`: jdindex as an `i` register (constant
+    /// pool), then the six kind lists, then the dest byte so
+    /// `blackhole.py _setup_return_value_i` can read `code[position-1]`.
     pub fn recursive_call_int(
         &mut self,
         jd_index: u16,
         result_dst: u16,
         greens: &[(JitArgKind, u16)],
-        args: &[(JitArgKind, u16, u16)],
+        reds: &[(JitArgKind, u16)],
     ) {
         self.touch_reg(result_dst);
-        for &(kind, src) in greens {
-            match kind {
-                JitArgKind::Ref => self.touch_ref_reg(src),
-                JitArgKind::Int => self.touch_reg(src),
-                JitArgKind::Float => self.touch_float_reg(src),
-            }
-        }
-        for &(kind, caller_src, _callee_dst) in args {
-            self.touch_call_arg(JitCallArg {
-                kind,
-                reg: caller_src,
-            });
-        }
-        self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_INT);
-        self.push_u16(jd_index);
-        self.push_reg_u8(result_dst, "recursive_call_int result");
-        self.push_u16(greens.len() as u16);
-        for &(kind, src) in greens {
-            self.push_u8(kind.encode());
-            self.push_reg_u8(src, "recursive_call_int green");
-        }
-        self.push_u16(args.len() as u16);
-        for &(kind, caller_src, callee_dst) in args {
-            self.push_u8(kind.encode());
-            self.push_reg_u8(caller_src, "recursive_call_int caller argument");
-            self.push_reg_u8(callee_dst, "recursive_call_int callee argument");
-        }
-        self.record_resulttype('i');
+        self.emit_recursive_call(
+            jitcode::insns::BC_RECURSIVE_CALL_INT,
+            jd_index,
+            Some(result_dst),
+            greens,
+            reds,
+            Some('i'),
+        );
     }
 
     /// Ref-result sibling of [`Self::recursive_call_int`]
-    /// (`opimpl_recursive_call_r`).  Same payload shape; the result lands in
-    /// the ref register `result_dst`.
+    /// (`blackhole.py bhimpl_recursive_call_r`).
     pub fn recursive_call_ref(
         &mut self,
         jd_index: u16,
         result_dst: u16,
         greens: &[(JitArgKind, u16)],
-        args: &[(JitArgKind, u16, u16)],
+        reds: &[(JitArgKind, u16)],
     ) {
         self.touch_ref_reg(result_dst);
-        for &(kind, src) in greens {
-            match kind {
-                JitArgKind::Ref => self.touch_ref_reg(src),
-                JitArgKind::Int => self.touch_reg(src),
-                JitArgKind::Float => self.touch_float_reg(src),
-            }
-        }
-        for &(kind, caller_src, _callee_dst) in args {
-            self.touch_call_arg(JitCallArg {
-                kind,
-                reg: caller_src,
-            });
-        }
-        self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_REF);
-        self.push_u16(jd_index);
-        self.push_reg_u8(result_dst, "recursive_call_ref result");
-        self.push_u16(greens.len() as u16);
-        for &(kind, src) in greens {
-            self.push_u8(kind.encode());
-            self.push_reg_u8(src, "recursive_call_ref green");
-        }
-        self.push_u16(args.len() as u16);
-        for &(kind, caller_src, callee_dst) in args {
-            self.push_u8(kind.encode());
-            self.push_reg_u8(caller_src, "recursive_call_ref caller argument");
-            self.push_reg_u8(callee_dst, "recursive_call_ref callee argument");
-        }
-        self.record_resulttype('r');
+        self.emit_recursive_call(
+            jitcode::insns::BC_RECURSIVE_CALL_REF,
+            jd_index,
+            Some(result_dst),
+            greens,
+            reds,
+            Some('r'),
+        );
     }
 
     /// Float-result sibling of [`Self::recursive_call_int`]
-    /// (`opimpl_recursive_call_f`).  Same payload shape; the result lands in
-    /// the float register `result_dst`.
+    /// (`blackhole.py bhimpl_recursive_call_f`).
     pub fn recursive_call_float(
         &mut self,
         jd_index: u16,
         result_dst: u16,
         greens: &[(JitArgKind, u16)],
-        args: &[(JitArgKind, u16, u16)],
+        reds: &[(JitArgKind, u16)],
     ) {
         self.touch_float_reg(result_dst);
-        for &(kind, src) in greens {
-            match kind {
-                JitArgKind::Ref => self.touch_ref_reg(src),
-                JitArgKind::Int => self.touch_reg(src),
-                JitArgKind::Float => self.touch_float_reg(src),
-            }
-        }
-        for &(kind, caller_src, _callee_dst) in args {
-            self.touch_call_arg(JitCallArg {
-                kind,
-                reg: caller_src,
-            });
-        }
-        self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_FLOAT);
-        self.push_u16(jd_index);
-        self.push_reg_u8(result_dst, "recursive_call_float result");
-        self.push_u16(greens.len() as u16);
-        for &(kind, src) in greens {
-            self.push_u8(kind.encode());
-            self.push_reg_u8(src, "recursive_call_float green");
-        }
-        self.push_u16(args.len() as u16);
-        for &(kind, caller_src, callee_dst) in args {
-            self.push_u8(kind.encode());
-            self.push_reg_u8(caller_src, "recursive_call_float caller argument");
-            self.push_reg_u8(callee_dst, "recursive_call_float callee argument");
-        }
-        self.record_resulttype('f');
+        self.emit_recursive_call(
+            jitcode::insns::BC_RECURSIVE_CALL_FLOAT,
+            jd_index,
+            Some(result_dst),
+            greens,
+            reds,
+            Some('f'),
+        );
     }
 
     /// Void-result sibling of [`Self::recursive_call_int`]
-    /// (`opimpl_recursive_call_v`).  Carries no result register — the
-    /// `result_dst` slot is emitted as the `jitcode::NO_RETURN_REG` "no
-    /// result" sentinel the dispatcher decodes to `None`.
+    /// (`blackhole.py bhimpl_recursive_call_v`).  No dest byte: the
+    /// assembler omits `emit_call_result_arg` when the result is void.
     pub fn recursive_call_void(
         &mut self,
         jd_index: u16,
         greens: &[(JitArgKind, u16)],
-        args: &[(JitArgKind, u16, u16)],
+        reds: &[(JitArgKind, u16)],
     ) {
-        for &(kind, src) in greens {
-            match kind {
-                JitArgKind::Ref => self.touch_ref_reg(src),
-                JitArgKind::Int => self.touch_reg(src),
-                JitArgKind::Float => self.touch_float_reg(src),
-            }
+        self.emit_recursive_call(
+            jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            jd_index,
+            None,
+            greens,
+            reds,
+            None,
+        );
+    }
+
+    /// `jtransform.py handle_recursive_call` payload:
+    /// `recursive_call_{kind}(jd_index, G_I, G_R, G_F, R_I, R_R, R_F)`
+    /// then the dest register for a typed result.
+    fn emit_recursive_call(
+        &mut self,
+        opcode: u8,
+        jd_index: u16,
+        result_dst: Option<u16>,
+        greens: &[(JitArgKind, u16)],
+        reds: &[(JitArgKind, u16)],
+        resulttype: Option<char>,
+    ) {
+        for &(kind, src) in greens.iter().chain(reds.iter()) {
+            self.touch_call_arg(JitCallArg { kind, reg: src });
         }
-        for &(kind, caller_src, _callee_dst) in args {
-            self.touch_call_arg(JitCallArg {
-                kind,
-                reg: caller_src,
-            });
+        self.start_instr(opcode);
+        // `blackhole.py bhimpl_recursive_call_*` takes jdindex as
+        // `@arguments("self", "i", ...)` — a register, not a literal u16.
+        // Same const-pool patch `jit_merge_point/iIRFIRF` uses.
+        let jdindex_const = self.add_const_i(i64::from(jd_index));
+        let jdindex_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((jdindex_offset, ConstKind::Int, jdindex_const));
+        self.emit_kind_reg_list(greens, JitArgKind::Int);
+        self.emit_kind_reg_list(greens, JitArgKind::Ref);
+        self.emit_kind_reg_list(greens, JitArgKind::Float);
+        self.emit_kind_reg_list(reds, JitArgKind::Int);
+        self.emit_kind_reg_list(reds, JitArgKind::Ref);
+        self.emit_kind_reg_list(reds, JitArgKind::Float);
+        if let Some(dst) = result_dst {
+            self.push_reg_u8(dst, "recursive_call result");
         }
-        self.start_instr(jitcode::insns::BC_RECURSIVE_CALL_VOID);
-        self.push_u16(jd_index);
-        self.push_u8(jitcode::NO_RETURN_REG);
-        self.push_u16(greens.len() as u16);
-        for &(kind, src) in greens {
-            self.push_u8(kind.encode());
-            self.push_reg_u8(src, "recursive_call_void green");
+        if let Some(kind) = resulttype {
+            self.record_resulttype(kind);
         }
-        self.push_u16(args.len() as u16);
-        for &(kind, caller_src, callee_dst) in args {
-            self.push_u8(kind.encode());
-            self.push_reg_u8(caller_src, "recursive_call_void caller argument");
-            self.push_reg_u8(callee_dst, "recursive_call_void callee argument");
+    }
+
+    fn emit_kind_reg_list(&mut self, regs: &[(JitArgKind, u16)], want: JitArgKind) {
+        let selected: Vec<u16> = regs
+            .iter()
+            .filter(|(kind, _)| *kind == want)
+            .map(|(_, src)| *src)
+            .collect();
+        assert!(
+            selected.len() < 256,
+            "recursive_call list length {} exceeds u8 byte encoding",
+            selected.len()
+        );
+        self.push_u8(selected.len() as u8);
+        for src in selected {
+            self.push_u8(src as u8);
         }
     }
 
