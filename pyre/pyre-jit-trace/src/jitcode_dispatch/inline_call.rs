@@ -12132,6 +12132,7 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
 #[allow(clippy::too_many_arguments)]
 fn run_inline_call_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
     pc: usize,
     descr_index: usize,
     sub_body: &SubJitCodeBody,
@@ -12192,7 +12193,15 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
         | Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
             cut_declined_subwalk(ctx, pre_fold_pos);
-            residualize_inline_call_via_fnaddr(ctx, pc, descr_index, int_args, ref_args, float_args)
+            residualize_inline_call_via_fnaddr(
+                ctx,
+                code,
+                pc,
+                descr_index,
+                int_args,
+                ref_args,
+                float_args,
+            )
         }
         other => other,
     }
@@ -12287,6 +12296,7 @@ fn inline_fnaddr_call_setup<Sym: WalkSym>(
 /// address on guard-failure resume.
 fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
     pc: usize,
     descr_index: usize,
     int_args: &[OpRef],
@@ -12304,34 +12314,80 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
             symbolic: fnaddr,
         });
     };
-    let recorded = ctx.trace_ctx.record_op_with_descr(
-        majit_ir::OpCode::CallMayForceR,
+    // `bhimpl_inline_call_*` uses `jitcode.fnaddr` and the callee's
+    // own `calldescr`.  Pick the same `Call*` / `CallMayForce*` /
+    // `CallPure*` family `select_residual_call_opcode` would emit for
+    // that descr (`do_residual_call` / `_opimpl_residual_call*`),
+    // including FORCE_TOKEN + `GuardNotForced` when the helper can force.
+    let ei = call_descr.get_extra_info();
+    let dst_bank = match call_descr.result_type() {
+        majit_ir::Type::Int => 'i',
+        majit_ir::Type::Float => 'f',
+        majit_ir::Type::Void => 'v',
+        majit_ir::Type::Ref => 'r',
+    };
+    let (call_opcode, can_raise, emit_guard_not_forced) =
+        super::residual_call::select_residual_call_opcode(
+            &ei,
+            dst_bank,
+            "residualize_inline_call_via_fnaddr",
+        );
+    super::residual_call::walker_abort_if_mayforce_null_ref_arg(
+        call_opcode,
         &allboxes,
-        descr.clone(),
-    );
+        call_descr,
+        ctx,
+        pc,
+    )?;
+    if emit_guard_not_forced {
+        super::residual_call::maybe_walker_vable_and_vrefs_before_residual_call(ctx, pc);
+    }
+    let recorded = ctx
+        .trace_ctx
+        .record_op_with_descr(call_opcode, &allboxes, descr.clone());
     let resid = super::residual_call::try_execute_residual_call_via_executor(
         ctx,
-        majit_ir::OpCode::CallMayForceR,
+        call_opcode,
         &allboxes,
         call_descr,
         recorded,
         pc,
         None,
     )?;
-    match resid {
-        super::ResidualExecOutcome::Executed(Ok(ptr)) => {
-            ctx.trace_ctx.set_opref_concrete(
-                recorded,
-                majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)),
-            );
-            ctx.trace_ctx
-                .record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
-            walker_capture_snapshot_for_last_guard(ctx, pc)?;
-            Ok(DispatchOutcome::SubReturn {
-                result: Some(recorded),
-            })
+    let resid_raised = match resid {
+        super::ResidualExecOutcome::Executed(result) => result.is_err(),
+        super::ResidualExecOutcome::Declined(_) => {
+            return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                pc,
+                symbolic: fnaddr,
+            });
         }
-        super::ResidualExecOutcome::Executed(Err(_)) => {
+    };
+    ctx.trace_ctx
+        .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+    // `do_residual_call` writes dest before `GUARD_NOT_FORCED` so the
+    // fail_args snapshot sees the result box.  The caller still dest-writes
+    // again from `SubReturn` (`finishframe`); the second write is the same
+    // OpRef.
+    if let Some((op_dst_bank, dst, next_pc)) = call_opcode_result_dst(code, pc) {
+        super::residual_call::write_residual_call_result_to_dst(
+            ctx,
+            pc,
+            dst,
+            op_dst_bank,
+            recorded,
+        )?;
+        if emit_guard_not_forced {
+            ctx.live_after_jit_pc = next_pc;
+        }
+    }
+    if emit_guard_not_forced {
+        ctx.trace_ctx
+            .record_guard(majit_ir::OpCode::GuardNotForced, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    }
+    if can_raise {
+        if resid_raised {
             walker_record_guard_exception(ctx, pc);
             let exc =
                 ctx.last_exc_value()
@@ -12339,18 +12395,18 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
                         pc,
                         symbolic: fnaddr,
                     })?;
-            Ok(DispatchOutcome::SubRaise {
+            return Ok(DispatchOutcome::SubRaise {
                 exc,
                 exc_concrete: ctx.last_exc_value_concrete(),
-            })
+            });
         }
-        super::ResidualExecOutcome::Declined(_) => {
-            Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
-                pc,
-                symbolic: fnaddr,
-            })
-        }
+        ctx.trace_ctx
+            .record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
+    Ok(DispatchOutcome::SubReturn {
+        result: (dst_bank != 'v').then_some(recorded),
+    })
 }
 
 thread_local! {
@@ -13201,6 +13257,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 
     let callee_result = run_inline_call_subwalk(
         ctx,
+        code,
         op.pc,
         descr_index,
         &sub_body,
@@ -13415,6 +13472,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
 
     let callee_outcome = run_inline_call_subwalk(
         ctx,
+        code,
         op.pc,
         descr_index,
         &sub_body,
@@ -13618,6 +13676,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
 
     let callee_result = run_inline_call_subwalk(
         ctx,
+        code,
         op.pc,
         descr_index,
         &sub_body,
