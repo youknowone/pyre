@@ -35681,9 +35681,8 @@ mod tests {
     }
 
     /// PyPy carries `call_function` arguments as one dynamic RPython list.
-    /// The Rust interpreter must not reintroduce a fixed-array RangeTo index
-    /// shortcut into this core dispatcher: core's array index body is opaque
-    /// to Charon and blocks the dispatcher from two-phase translation.
+    /// Keep that producer shape: a fixed array followed by a prefix copy is
+    /// unnecessary even though general RangeTo now lowers through getslice.
     #[test]
     #[ignore]
     fn get_and_call_function_has_no_residual_array_index() {
@@ -35717,7 +35716,7 @@ mod tests {
         assert_eq!(
             calls_path(&["__getslice_rangeto"]),
             0,
-            "no RangeTo getslice call is planted without an immutability proof"
+            "dynamic arguments are already a list; no prefix-slice marker is needed"
         );
     }
 

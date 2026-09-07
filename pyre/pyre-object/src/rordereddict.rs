@@ -403,7 +403,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         }
     }
 
-    /// `ll_dict_store_clean` (rordereddict.py:1128) — probe for a [`FREE`]
+    /// `rordereddict.py::ll_dict_store_clean` — probe for a [`FREE`]
     /// slot only, valid when no key can already be present.
     fn insert_clean(&mut self, hash: u64, slot: u32) {
         let mask = self.indexes.len() - 1;
@@ -582,7 +582,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.num_live_items += 1;
     }
 
-    /// `ll_call_delete_by_entry_index` (rordereddict.py:1157) — re-probe from
+    /// `rordereddict.py::ll_dict_delete_by_entry_index` — re-probe from
     /// the entry's own digest for the one index slot naming it.
     fn delete_by_entry_index(&mut self, hash: u64, slot: usize) {
         let mask = self.indexes.len() - 1;
@@ -947,6 +947,36 @@ mod tests {
         check_invariants(&d);
         let got: Vec<u64> = d.keys().copied().collect();
         assert_eq!(got, (0..100).filter(|i| i % 2 == 1).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn insert_clean_after_more_probes_than_index_slots() {
+        // Unlike the deletion regression, keep all ten entries live for
+        // both clean insertion and reindexing. The tenth distinct slot for
+        // this hash needs 18 probe steps in a 16-slot index table.
+        #[derive(Default)]
+        struct CollisionHasher;
+        impl Hasher for CollisionHasher {
+            fn write(&mut self, _: &[u8]) {}
+            fn finish(&self) -> u64 {
+                0x3c6e_f372_fe94_f82a
+            }
+        }
+        let mut d: RDict<u64, u64, std::hash::BuildHasherDefault<CollisionHasher>> =
+            RDict::default();
+        for k in 0..10 {
+            d.insert_known_absent(k, k);
+        }
+        assert_eq!(d.indexes.len(), 16);
+        check_invariants(&d);
+        // Reindexing uses the same clean-insert probe, without changing
+        // the hash or the number of free index slots in this fixture.
+        d.reindex(16);
+        check_invariants(&d);
+        assert_eq!(
+            d.keys().copied().collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
     }
 
     #[test]
