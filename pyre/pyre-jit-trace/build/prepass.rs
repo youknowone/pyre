@@ -207,12 +207,11 @@ impl DeterminismCheck {
     }
 }
 
-const LOWERING_GATE_ENV: [&str; 6] = [
+const LOWERING_GATE_ENV: [&str; 5] = [
     "PYRE_DYN_INDIRECT",
     "MAJIT_FNPTR_INDIRECT",
     "MAJIT_MIR_FRAMESTATE",
     "PYRE_OPTION_RESIDUAL_NARROW",
-    "PYRE_PORTAL_SPLIT",
     "PYRE_TUPLE_PER_SHAPE_CLASSDEF",
 ];
 
@@ -238,16 +237,6 @@ fn forward_engine_env_aliases() {
             unsafe { std::env::set_var(engine_name, value) };
         }
     }
-}
-
-/// `warmspot.py split_graph_and_record_jitdriver` is the default: jd0 is
-/// registered against the copy split immediately before `jit_merge_point`.
-/// `PYRE_PORTAL_SPLIT=0` restores the unsplit `eval_loop_jit` registration
-/// for A/B. Listed in `LOWERING_GATE_ENV` so the cache key follows the
-/// resolved boolean, not the raw unset string (unset used to mean unsplit).
-fn portal_split_enabled() -> bool {
-    !std::env::var("PYRE_PORTAL_SPLIT")
-        .is_ok_and(|value| matches!(value.as_str(), "0" | "off" | "false"))
 }
 
 /// Entry of the real build: the translation prepass over the LLBC set.
@@ -1062,7 +1051,8 @@ fn real_main() {
                         .iter()
                         .map(|name| (*name).to_string())
                         .collect(),
-                    split_portal: portal_split_enabled(),
+                    // warmspot.py find_portals → split_graph_and_record_jitdriver
+                    split_portal: true,
                 },
                 majit_translate::JitDriverSpec {
                     // `warmspot.py split_graph_and_record_jitdriver` copy of
