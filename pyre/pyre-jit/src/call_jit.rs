@@ -4856,6 +4856,16 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                     exit_layout.is_traced_ref_slot(index)
                 })
             };
+            // compile.py ResumeGuardForcedDescr.handle_fail reads
+            // `cpu.get_savedata_ref(deadframe)` after the bridge attempt.
+            // `dead_frame_from_ran_frame` already copied `jf_savedata`;
+            // root that copy across the same window.
+            let savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let _savedata_root = unsafe {
+                majit_metainterp::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| {
+                    savedata.is_some()
+                })
+            };
             let attempt = try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand);
             if attempt.terminal_declined {
                 // This target cannot reach compiled steady state: each CA
@@ -4895,11 +4905,12 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             {
                 return result;
             }
+            let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
             let bh = crate::eval::resume_in_blackhole_from_exit_layout(
                 &raw_values,
                 &exit_layout,
                 guard_exc,
-                None,
+                descr_arc.is_guard_forced().then_some(savedata).flatten(),
                 false,
                 savedata,
             );

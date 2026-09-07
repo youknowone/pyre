@@ -7227,16 +7227,19 @@ fn build_function(
             }
             OpCode::GuardNotForced => {
                 // x86/assembler.py genop_guard_guard_not_forced:
-                // `CMP [rbp + jf_descr], 0`, fail when nonzero. `Backend::force`
-                // stamps that mark on its way out, so this guard is what turns a
-                // force that landed inside the preceding call into a deopt: the
-                // trace must not run on holding virtualized fields the force has
-                // already written back, and the virtuals `handle_async_forcing`
-                // materialized are attached for THIS exit's resume to consume.
+                // `CMP [rbp + jf_descr], 0`, fail when nonzero.
+                // `WasmBackend::force` / a synchronous force stamps
+                // `FORCE_TAKEN_BIT` in `frame[0]` (this backend's
+                // `jf_descr` word); `emit_force_arm` also writes the
+                // exit index there, so the test must be the force bit
+                // and not a plain nonzero check of the header field.
                 sink.local_get(0);
-                sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-                sink.i32_sub();
-                sink.i32_load(mem32(majit_backend::jitframe::JF_DESCR_OFS as u64));
+                sink.i64_load(mem64(0));
+                sink.i64_const(FORCE_TAKEN_BIT);
+                sink.i64_and();
+                sink.i64_const(32);
+                sink.i64_shr_u();
+                sink.i32_wrap_i64();
                 emit_guard_if_exit(
                     &mut sink,
                     constants,
@@ -12457,6 +12460,13 @@ fn emit_force_arm(
             } else {
                 emit_resolve(sink, constants, value_types, arg_ref);
             }
+        } else if let Some(home) = ref_homes.home(arg_ref) {
+            // `dead_frame_from_forced_frame` still decodes a tagged
+            // home (`offset * 2 + 1`) from this force slot. The home
+            // itself is already stored; publish its offset so a
+            // collection inside the bracketed call forwards the value.
+            let home_offset = frame.home_slot_base + home as u64 * SLOT_SIZE;
+            sink.i64_const((home_offset * 2 + 1) as i64);
         } else {
             emit_resolve(sink, constants, value_types, arg_ref);
         }

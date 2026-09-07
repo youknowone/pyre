@@ -16213,8 +16213,15 @@ impl<M: Clone> MetaInterp<M> {
             );
             // compile.py: cpu.set_savedata_ref(deadframe, AllVirtuals(cache).hide())
             if let Some(cache) = cache {
+                let savedata = crate::compile::AllVirtuals::hide(cache);
+                // compile.py handle_async_forcing writes `deadframe.jf_savedata`
+                // through a GCREF store. Root the fresh AllVirtuals object and
+                // publish the forwarded address.
+                let savedata_slot = [savedata.as_usize() as i64];
+                let _savedata_root =
+                    unsafe { crate::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| true) };
                 self.backend
-                    .set_savedata_ref(&mut deadframe, crate::compile::AllVirtuals::hide(cache));
+                    .set_savedata_ref(&mut deadframe, majit_ir::GcRef(savedata_slot[0] as usize));
             }
         });
     }
