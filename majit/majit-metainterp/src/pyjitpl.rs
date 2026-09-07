@@ -970,31 +970,7 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::O
                 cache.len(),
             )
         });
-    // `_cache` is indexed by `OpRef::raw()`, which drops the variant tag, so
-    // an Int-bank position and a Ref-bank position carrying the same payload
-    // share one slot. That is sound only while `InputArg*(pos)` positions are
-    // flat across banks — `OpRef::inputarg_refs` states the contract:
-    // position IS the slot index. When two numbering authorities issue into
-    // that one namespace the contract breaks, the lookup SUCCEEDS on the
-    // other bank's operand instead of missing, and the caller receives a
-    // well-formed box for an unrelated value. A ref reaching an int register
-    // this way is decoded as an integer and used as an array index.
-    //
-    // A cross-namespace hit is indistinguishable from a correct translation
-    // at this call site, so compare the banks and fail here rather than
-    // letting the wrong box travel into a snapshot.
-    if let (Some(from), Some(to)) = (opref.ty(), translated.ty())
-        && from != to
-    {
-        panic!(
-            "translate_trace_iter_opref bank mismatch: {opref:?} ({from:?}) resolved \
-             to {translated:?} ({to:?}) through shared raw slot {}. The trace-iterator \
-             cache is keyed by position alone, so two OpRef variants with the same \
-             payload collide; one of them was minted by a numbering authority that \
-             does not share this trace's inputarg space.",
-            opref.raw(),
-        );
-    }
+    assert_prepared_cache_bank("translate_trace_iter_opref", opref, translated.ty());
     translated
 }
 
@@ -1153,7 +1129,7 @@ fn untag_prepared_cache(
     if opref.is_none() || opref.is_constant() {
         return majit_ir::operand::Operand::from_opref(opref);
     }
-    cache
+    let found = cache
         .get(opref.raw() as usize)
         .and_then(|slot| slot.clone())
         .unwrap_or_else(|| {
@@ -1161,7 +1137,33 @@ fn untag_prepared_cache(
                 "prepare_bridge in-place cache miss for {opref:?} (cache_len={})",
                 cache.len()
             )
-        })
+        });
+    assert_prepared_cache_bank("untag_prepared_cache", opref, found.to_opref().ty());
+    found
+}
+
+/// `_cache` is indexed by `OpRef::raw()`, which drops the variant tag, so
+/// an Int-bank position and a Ref-bank position carrying the same payload
+/// share one slot. That is sound only while `InputArg*(pos)` positions are
+/// flat across banks — `OpRef::inputarg_refs` states the contract:
+/// position IS the slot index. When two numbering authorities issue into
+/// that one namespace the contract breaks, the lookup SUCCEEDS on the
+/// other bank's operand instead of missing, and the caller receives a
+/// well-formed box for an unrelated value. A ref reaching an int register
+/// this way is decoded as an integer and used as an array index.
+fn assert_prepared_cache_bank(where_: &str, opref: OpRef, found_ty: Option<Type>) {
+    if let (Some(from), Some(to)) = (opref.ty(), found_ty)
+        && from != to
+    {
+        panic!(
+            "{where_} bank mismatch: {opref:?} ({from:?}) resolved \
+             to {to:?} through shared raw slot {}. The trace-iterator \
+             cache is keyed by position alone, so two OpRef variants with the same \
+             payload collide; one of them was minted by a numbering authority that \
+             does not share this trace's inputarg space.",
+            opref.raw(),
+        );
+    }
 }
 
 fn finish_prepared_bridge(
@@ -7168,9 +7170,10 @@ impl<M: Clone> MetaInterp<M> {
         // prefix from the guard to the header must be cut off — otherwise
         // the root entry contract pairs the guard's fail-arg inputargs
         // with the merge point's full-shape JUMP and aborts on arity.
+        let n_inputargs = ctx.num_inputargs();
         let cut_merge_point = ctx
             .get_merge_point_at(green_key, ctx.header_pc)
-            .filter(|mp| mp.position._pos > 0);
+            .filter(|mp| mp.position.has_prefix_ops(n_inputargs));
         // Resolve while `ctx` is still whole (before `ctx.constants` is moved
         // out below) so `patch_new_loop_to_load_virtualizable_fields` can
         // read the heap object via `vinfo.get_array_length(vable, i)`
@@ -7180,7 +7183,9 @@ impl<M: Clone> MetaInterp<M> {
         let cross_loop_cut = cut_merge_point.map(|mp| {
             (
                 mp.green_boxes.clone(),
-                crate::history::TreeLoopCutPosition::new(mp.position._pos),
+                crate::history::TreeLoopCutPosition::new(
+                    mp.position.tree_loop_op_index(n_inputargs),
+                ),
             )
         });
 
@@ -9146,10 +9151,13 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 return false;
             }
+            let n_inputargs = ctx.num_inputargs();
             let retrace_cut = retrace_merge_point.map(|mp| {
                 (
                     mp.green_boxes.clone(),
-                    crate::history::TreeLoopCutPosition::new(mp.position._pos),
+                    crate::history::TreeLoopCutPosition::new(
+                        mp.position.tree_loop_op_index(n_inputargs),
+                    ),
                 )
             });
             let orig_vable_ptr_retrace =

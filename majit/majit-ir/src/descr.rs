@@ -3758,7 +3758,12 @@ pub struct QuasiImmutDescr {
     struct_ptr: u64,
     qmut: std::sync::Arc<dyn QuasiImmutHandle>,
     /// `quasiimmut.py self.constantfieldbox`.
-    constantfieldbox: Option<crate::Value>,
+    ///
+    /// RPython stores a `Const*` box on the descr; the translated GC
+    /// traces `ConstPtr.value` through the Python object. This descr
+    /// lives in an `Arc` outside that graph, so the captured `Value::Ref`
+    /// is forwarded explicitly by `walk_const_ptr_refs`.
+    constantfieldbox: Mutex<Option<crate::Value>>,
 }
 
 impl QuasiImmutDescr {
@@ -3773,7 +3778,7 @@ impl QuasiImmutDescr {
             fielddescr,
             struct_ptr,
             qmut,
-            constantfieldbox,
+            constantfieldbox: Mutex::new(constantfieldbox),
         }
     }
 
@@ -3794,7 +3799,17 @@ impl QuasiImmutDescr {
 
     /// `quasiimmut.py self.constantfieldbox`.
     pub fn constantfieldbox(&self) -> Option<crate::Value> {
-        self.constantfieldbox
+        *self.constantfieldbox.lock()
+    }
+
+    /// Forward a `Value::Ref` captured on this descr after a moving
+    /// collection. `MetaInterp::walk_active_trace_refs` calls this
+    /// through the recorder's slot descrs.
+    pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+        let mut slot = self.constantfieldbox.lock();
+        if let Some(crate::Value::Ref(gcref)) = slot.as_mut() {
+            visitor(gcref);
+        }
     }
 }
 

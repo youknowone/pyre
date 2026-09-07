@@ -2876,7 +2876,6 @@ impl Trace {
     /// `_refs` shadow-stack adaptation; callers must wire it at the same
     /// GC boundaries as the op-graph Ref-walker
     /// (`MetaInterp::walk_active_trace_refs`).
-    #[allow(dead_code)]
     pub(crate) fn refresh_from_gc(&mut self) {
         let mut moved = false;
         for (reference, root) in self._refs[1..].iter_mut().zip(&self.rooted_refs) {

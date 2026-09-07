@@ -17003,18 +17003,22 @@ pub(crate) fn subwalk_guard_follows_store(
     trace_ctx: &TraceCtx,
     start: majit_metainterp::recorder::TracePosition,
 ) -> bool {
-    let ops = trace_ctx.ops();
-    let Some(recorded) = ops.get(start._pos..) else {
+    // Byte-mode `_pos` is the opencoder cursor, not an `ops` index.
+    // `opcode_at` reads `FrontendSlot` without materializing `Rc<Op>`.
+    let start_i = start.tree_loop_op_index(trace_ctx.num_inputargs());
+    let end = trace_ctx.num_ops();
+    if start_i > end {
         return true;
-    };
+    }
     let mut stored = false;
-    for op in recorded {
-        if op.opcode.is_guard() && stored {
+    for i in start_i..end {
+        let Some(opcode) = trace_ctx.opcode_at(i) else {
+            return true;
+        };
+        if opcode.is_guard() && stored {
             return true;
         }
-        stored |= op.opcode.is_setfield()
-            || op.opcode.is_setarrayitem()
-            || op.opcode.is_setinteriorfield();
+        stored |= opcode.is_setfield() || opcode.is_setarrayitem() || opcode.is_setinteriorfield();
     }
     false
 }

@@ -72,6 +72,26 @@ pub struct TracePosition {
     pub guard_count: Option<usize>,
 }
 
+impl TracePosition {
+    /// Recorded-op index into a materialized `TreeLoop.ops`.
+    ///
+    /// `opencoder.py cut_point` `_count` is inputargs + recorded ops;
+    /// `TreeLoop.ops` is recorded ops only. `_pos` is the byte cursor
+    /// in byte mode and must not be used as this index.
+    pub fn tree_loop_op_index(&self, num_inputargs: usize) -> usize {
+        (self._count as usize).saturating_sub(num_inputargs)
+    }
+
+    /// True when this cut point sits after at least one recorded op.
+    ///
+    /// `compile.py compile_loop` compares `start != (0, 0, 0, 0, 0)`.
+    /// The zero tuple is a sentinel, not "byte offset 0": after
+    /// `Trace.__init__` the live `_pos` is already `max_num_inputargs`.
+    pub fn has_prefix_ops(&self, num_inputargs: usize) -> bool {
+        (self._count as usize) > num_inputargs
+    }
+}
+
 /// opencoder.py Snapshot parity: per-guard snapshot of the interpreter
 /// frame state, encoded as tagged references to boxes.
 ///
@@ -980,7 +1000,7 @@ impl Trace {
     /// to the optimizer as a `TreeLoop`. See `TraceCtx::into_tree_loop` for
     /// the snapshot-bearing path.
     pub fn into_parts(self) -> (Vec<InputArgRc>, Vec<OpRc>) {
-        let ops = if self.trb.is_some() {
+        let ops = if self.trb.is_some() && self.ops.is_empty() {
             self.materialize_ops()
         } else {
             self.ops
@@ -1165,10 +1185,24 @@ impl Trace {
                 .get(&gcref)
                 .is_some_and(|cached| cached == arg)
         };
-        for slot in &self.slots {
+        if let Some(trb) = self.trb.as_mut() {
+            trb.refresh_from_gc();
+        }
+        for slot in &mut self.slots {
             if let Some(Value::Ref(mut gcref)) = slot.concrete.get() {
                 visitor(&mut gcref);
                 slot.concrete.set(Some(Value::Ref(gcref)));
+            }
+            if let Some(r) = slot.first_arg.as_mut() {
+                r.walk_const_ptr_refs_mut(visitor);
+            }
+            if let Some(fail) = slot.fail_args.as_mut() {
+                for r in fail.iter_mut() {
+                    r.walk_const_ptr_refs_mut(visitor);
+                }
+            }
+            if let Some(qd) = slot.descr.as_ref().and_then(|d| d.as_quasi_immut_descr()) {
+                qd.walk_const_ptr_refs(visitor);
             }
         }
         for op in &self.ops {
@@ -1187,6 +1221,11 @@ impl Trace {
             if let Some(Value::Ref(mut gcref)) = op.get_value() {
                 visitor(&mut gcref);
                 op.set_value(Value::Ref(gcref));
+            }
+            if let Some(descr) = op.getdescr() {
+                if let Some(qd) = descr.as_quasi_immut_descr() {
+                    qd.walk_const_ptr_refs(visitor);
+                }
             }
         }
     }
@@ -1615,6 +1654,101 @@ mod tests {
         rec.record_input_arg(Type::Int);
         rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
         rec.record_input_arg(Type::Int);
+    }
+
+    #[test]
+    fn tree_loop_cut_uses_op_count_not_byte_cursor() {
+        let pos = TracePosition {
+            _pos: 80,
+            _count: 5,
+            _index: 5,
+            snapshot_data_len: 0,
+            snapshot_array_data_len: 0,
+            guard_count: None,
+        };
+        assert!(pos.has_prefix_ops(2));
+        assert_eq!(pos.tree_loop_op_index(2), 3);
+        assert!(
+            !TracePosition {
+                _pos: 2,
+                _count: 2,
+                _index: 2,
+                snapshot_data_len: 0,
+                snapshot_array_data_len: 0,
+                guard_count: None,
+            }
+            .has_prefix_ops(2)
+        );
+    }
+
+    #[test]
+    fn into_parts_reuses_materialized_ops() {
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        rec.materialize_into_ops();
+        let first = rec.ops()[0].clone();
+        let (_, ops) = rec.into_parts();
+        assert!(std::rc::Rc::ptr_eq(&first, &ops[0]));
+    }
+
+    #[test]
+    fn byte_mode_walk_forwards_slot_const_ptrs() {
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Ref);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        let cptr = OpRef::const_ptr(GcRef(0x1000));
+        rec.record_op(OpCode::GetfieldGcR, &[cptr]);
+        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], None, &[cptr]);
+        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
+        assert_eq!(
+            rec.slots[0].first_arg,
+            Some(OpRef::const_ptr(GcRef(0x2000)))
+        );
+        assert_eq!(
+            rec.slots[1].fail_args.as_ref().map(|a| a.as_slice()),
+            Some(&[OpRef::const_ptr(GcRef(0x2000))][..])
+        );
+        rec.materialize_into_ops();
+        let fail = rec.ops()[1].getfailargs().expect("guard fail_args");
+        assert_eq!(fail[0].to_opref(), OpRef::const_ptr(GcRef(0x2000)));
+    }
+
+    #[test]
+    fn walk_forwards_quasiimmut_constantfieldbox() {
+        #[derive(Debug)]
+        struct Handle;
+        impl majit_ir::QuasiImmutHandle for Handle {
+            fn is_current(&self) -> bool {
+                true
+            }
+            fn register_loop_token(
+                &self,
+                _token: &std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken>,
+            ) {
+            }
+            fn instance_identity(&self) -> usize {
+                1
+            }
+        }
+        let field = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(0, 8, 8, Type::Ref, false))
+            as DescrRef;
+        let descr = std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+            field,
+            0,
+            std::sync::Arc::new(Handle),
+            Some(Value::Ref(GcRef(0x1000))),
+        )) as DescrRef;
+        let mut rec = Trace::new();
+        let obj = rec.record_input_arg(Type::Ref);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
+        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
+        assert_eq!(
+            descr.as_quasi_immut_descr().unwrap().constantfieldbox(),
+            Some(Value::Ref(GcRef(0x2000)))
+        );
     }
 
     #[test]
