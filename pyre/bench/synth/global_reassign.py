@@ -1,7 +1,8 @@
-# pyre-check: max-pypy-ratio=19
+# pyre-check: max-pypy-ratio=2
 # pyre-check: skip-cpython
-# cpython 2.16s vs pyre 0.25s (8.6x on the ubuntu runner), and it is not
-# gated on — only pypy is.
+# The compiled loop now matches pypy: dynasm 0.9x, cranelift 1.0x on
+# darwin-aarch64. The ceiling is twice the slowest native, rounded up.
+# cpython is not gated on — only pypy is.
 # Exercises JIT global-cache invalidation, for both cell kinds.
 #
 # `run_int` reads a module global reassigned to another int between calls: the
