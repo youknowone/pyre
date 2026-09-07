@@ -8755,6 +8755,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -8812,6 +8813,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8820,6 +8823,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
