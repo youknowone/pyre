@@ -372,6 +372,21 @@ pub fn install_runtime_filter() -> io::Result<()> {
         libc::localtime_r(&t, &mut tm);
     }
 
+    // rustc's backtrace symbolizer (`parse_running_mmaps_unix`) and glibc's
+    // `pthread_getattr_np` (main-thread stack bounds) both `openat` this
+    // path on first use. A first Python eval after lockdown that captures a
+    // backtrace or asks for the main thread's stack then dies with syscall
+    // 257. Read the file and drive both consumers now, while path opens are
+    // still allowed; later uses reuse the cached maps / pthread stack info.
+    let _ = std::fs::read("/proc/self/maps");
+    let _ = std::backtrace::Backtrace::force_capture();
+    unsafe {
+        let mut attr: libc::pthread_attr_t = core::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) == 0 {
+            libc::pthread_attr_destroy(&mut attr);
+        }
+    }
+
     // mimalloc defers its NUMA detection to the first thread it builds a TLD
     // for. The main thread uses a static `tld_main` that never asks; only
     // `mi_tld_alloc` stamps `tld->numa_node = _mi_os_numa_node()`, and the
