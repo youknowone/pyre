@@ -1162,6 +1162,7 @@ fn descent_op_applies_effect(opname: &str) -> bool {
         || opname.starts_with("setarrayitem_gc")
         || opname.starts_with("setarrayitem_raw")
         || opname.starts_with("setinteriorfield_gc")
+        || opname.starts_with("raw_store")
         || opname.starts_with("strsetitem")
         || opname.starts_with("unicodesetitem")
 }
