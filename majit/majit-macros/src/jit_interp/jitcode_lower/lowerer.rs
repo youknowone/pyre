@@ -417,30 +417,39 @@ impl<'c> Lowerer<'c> {
         value_tok: &TokenStream,
         miss: &Ident,
     ) {
+        // `flatten.insert_exits` puts `-live-` immediately before the
+        // fused `goto_if_not_*`. The constant load is not the guard, so
+        // it must land first; otherwise `get_list_of_active_snapshot_boxes`
+        // reads `pc - SIZE_LIVE_OP` as the load opcode.
+        let const_reg = if value_tok.to_string().replace(' ', "") == "0" {
+            None
+        } else {
+            let const_reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
+                quote! { __builder.load_const_i_value(#const_reg, #value_tok); },
+            );
+            Some(const_reg)
+        };
         self.emit_op(
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        if value_tok.to_string().replace(' ', "") == "0" {
+        if let Some(const_reg) = const_reg {
+            self.emit_op(
+                OpMeta::conditional_guard_compare(
+                    Register::int(disc_reg),
+                    Register::int(const_reg),
+                    miss.clone(),
+                ),
+                quote! { __builder.goto_if_not_int_eq(#disc_reg, #const_reg, #miss); },
+            );
+        } else {
             self.emit_op(
                 OpMeta::conditional_guard(Register::int(disc_reg), miss.clone()),
                 quote! { __builder.goto_if_not_int_is_zero(#disc_reg, #miss); },
             );
-            return;
         }
-        let const_reg = self.alloc_reg();
-        self.emit_op(
-            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-            quote! { __builder.load_const_i_value(#const_reg, #value_tok); },
-        );
-        self.emit_op(
-            OpMeta::conditional_guard_compare(
-                Register::int(disc_reg),
-                Register::int(const_reg),
-                miss.clone(),
-            ),
-            quote! { __builder.goto_if_not_int_eq(#disc_reg, #const_reg, #miss); },
-        );
     }
 
     /// The branch RPython writes as `goto_if_not_<opname>`: fall through
