@@ -1677,6 +1677,71 @@ fn inline_region_inputs(
 }
 
 #[test]
+fn terminal_force_descriptor_and_failargs_survive_finish() {
+    // runner_test.py test_guard_not_forced_2: return FORCE_TOKEN, then force
+    // the completed frame and read the guard's original failargs.
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let sum = make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        OpRef::int_op(2),
+    );
+    let token = make_op(OpCode::ForceToken, &[], OpRef::ref_op(3));
+    let guard = make_guard(OpCode::GuardNotForced2, &[], &[OpRef::int_op(2)]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::ref_op(3))]);
+    let inputs = inline_region_inputs(&inputargs, vec![sum, token, guard, finish], vec![]);
+    let (bytes, exits, data) = codegen::build_wasm_module(&inputs).unwrap();
+    let engine = Engine::default();
+    let module = Module::new(&engine, bytes).unwrap();
+    let mut store = Store::new(&engine, ());
+    let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+    let frame = 128usize;
+    let items = frame + majit_backend::jitframe::FIRST_ITEM_OFFSET;
+    memory
+        .write(&mut store, items + 8, &20i64.to_le_bytes())
+        .unwrap();
+    memory
+        .write(&mut store, items + 16, &10i64.to_le_bytes())
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, items as i32)
+        .unwrap();
+    let read_i64 = |offset| {
+        let mut bytes = [0; 8];
+        memory.read(&store, offset, &mut bytes).unwrap();
+        i64::from_le_bytes(bytes)
+    };
+    assert_eq!(read_i64(items) as u32, exits[1].fail_index);
+    assert_eq!(read_i64(items + 8), frame as i64);
+    let force = &data.fail_descrs[0];
+    let mut ptr_bytes = [0; 4];
+    memory
+        .read(
+            &store,
+            frame + majit_backend::jitframe::JF_FORCE_DESCR_OFS as usize,
+            &mut ptr_bytes,
+        )
+        .unwrap();
+    assert_eq!(
+        u32::from_le_bytes(ptr_bytes),
+        std::sync::Arc::as_ptr(force) as usize as u32
+    );
+    let location = usize::from(force.rd_locs.as_ref().unwrap()[0]);
+    assert_eq!(
+        read_i64(items + location * std::mem::size_of::<usize>()),
+        30
+    );
+}
+
+#[test]
 fn inlined_bridge_without_owner_loop_label_declines() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let guard = make_guard(
@@ -7056,9 +7121,9 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
         large_threshold: 4096,
         plain_tids: [53].into_iter().collect(),
     });
-    let (bytes, _, homes) = codegen::build_wasm_module(&inputs).unwrap();
+    let (bytes, _, data) = codegen::build_wasm_module(&inputs).unwrap();
     assert_eq!(
-        homes, 2,
+        data.num_ref_homes, 2,
         "the first two objects cross a subsequent allocation"
     );
     validate_wasm(&bytes);

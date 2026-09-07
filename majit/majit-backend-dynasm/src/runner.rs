@@ -386,6 +386,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
         dynasm_alloc_nursery_collecting_typed_rooted,
     ));
+    majit_gc::set_active_alloc_nursery_collecting_typed_roots(Some(
+        dynasm_alloc_nursery_collecting_typed_roots,
+    ));
     majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
     majit_gc::set_active_collect_generation(Some(dynasm_collect_generation));
     majit_gc::set_active_collect_step(Some(dynasm_collect_step));
@@ -701,6 +704,35 @@ unsafe fn dynasm_alloc_nursery_collecting_typed_rooted(
             type_id,
             size,
             root,
+            needs_write_barrier,
+        )
+    }
+}
+
+unsafe fn dynasm_alloc_nursery_collecting_typed_roots(
+    type_id: u32,
+    size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    if let Some(r) = gc_box::with_mut(|g| unsafe {
+        g.alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
+    }) {
+        return r;
+    }
+    unsafe {
+        majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
             needs_write_barrier,
         )
     }
@@ -3214,6 +3246,7 @@ impl Backend for DynasmBackend {
         // grab_exc_value (llmodel.py): read jf_guard_exc off the deadframe
         // tip before the libc jitframe chain is freed (same as execute_token).
         let exception_value = GcRef(unsafe { (*result_jf).jf_guard_exc });
+        let savedata = GcRef(unsafe { (*result_jf).jf_savedata });
         let guard_value_operand = majit_backend::guard_value_counter_slot(descr_fd)
             .map(|slot| unsafe { crate::llmodel::get_int_value_direct(result_jf, slot) as i64 });
 
@@ -3228,7 +3261,7 @@ impl Backend for DynasmBackend {
             outputs,
             typed_outputs,
             exit_layout,
-            savedata: None,
+            savedata: (!savedata.is_null()).then_some(savedata),
             exception_value,
             fail_index: descr_fd.fail_index_per_trace(),
             trace_id: descr_fd.trace_id(),
@@ -3310,6 +3343,27 @@ impl Backend for DynasmBackend {
             DeadFrame::LibcJitFrame(data) => data.exc_value(),
             DeadFrame::Boxed(_) => panic!("dynasm deadframe is a jitframe"),
         }
+    }
+
+    fn set_savedata_ref(&self, frame: &mut DeadFrame, data: GcRef) {
+        match frame {
+            DeadFrame::JitFrame(jf) => {
+                // llmodel.py set_savedata_ref is a GCREF field store.
+                majit_gc::gc_write_barrier(jf.jf_gcref());
+                jf.set_savedata_ref(data);
+            }
+            DeadFrame::LibcJitFrame(jf) => jf.set_savedata_ref(data),
+            DeadFrame::Boxed(_) => panic!("dynasm deadframe is a jitframe"),
+        }
+    }
+
+    fn get_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
+        let data = match frame {
+            DeadFrame::JitFrame(jf) => jf.get_savedata_ref(),
+            DeadFrame::LibcJitFrame(jf) => jf.get_savedata_ref(),
+            DeadFrame::Boxed(_) => panic!("dynasm deadframe is a jitframe"),
+        };
+        (!data.is_null()).then_some(data)
     }
 
     fn clear_stored_exception(&self) {

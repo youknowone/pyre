@@ -226,7 +226,7 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
         roots.get(base + 1),
         crate::call::take_last_exec_ctx(),
         PY_NULL,
-        crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+        crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     ) else {
         return;
     };

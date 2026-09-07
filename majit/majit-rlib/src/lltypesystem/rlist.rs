@@ -293,6 +293,49 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
     }
 }
 
+/// Collecting `malloc_fast` for an items block with the translated graph's
+/// complete native live-root span.  This is the Rust ABI of
+/// `gct_fv_gc_malloc`'s `push_roots(hop)` / `pop_roots(hop)` bracket; MiniMark
+/// consults the span only when the nursery bump reaches
+/// `collect_and_reserve`.
+///
+/// # Safety
+/// Every entry in `roots` must be a valid GC object pointer or null.  The
+/// slice must remain address-stable for this call and callers must reload its
+/// entries after return before dereferencing any pre-call pointer copies.
+pub unsafe fn try_alloc_typed_items_block_nursery_rooted(
+    cap: usize,
+    tid: u32,
+    roots: &mut [majit_ir::GcRef],
+) -> Option<*mut TypedItemsBlock> {
+    let cap = cap.max(1);
+    let layout = try_typed_items_block_layout(cap)?;
+    if itemsblock_gc_enabled() && majit_gc::gc_allocator_installed() {
+        assert!(
+            tid != UNSET_GC_TYPE_ID,
+            "items block allocated with an undeclared GC type id"
+        );
+        let mut needs_write_barrier = false;
+        let raw = unsafe {
+            majit_gc::alloc_fast_nursery_collecting_typed_roots(
+                tid,
+                layout.size(),
+                roots.as_mut_ptr(),
+                roots.len(),
+                &mut needs_write_barrier,
+            )
+        }
+        .0 as *mut u8;
+        if raw.is_null() {
+            return None;
+        }
+        let block = raw as *mut TypedItemsBlock;
+        unsafe { (*block).capacity = cap };
+        return Some(block);
+    }
+    unsafe { try_alloc_typed_items_block_nursery(cap, tid) }
+}
+
 /// `rgc.ll_arrayclear(l.ll_items())` — zero every item of a freshly allocated
 /// block, the second half of `ll_alloc_and_set(LIST, count, 0)`
 /// (rtyper/rlist.py:494-503).
@@ -381,6 +424,32 @@ impl Digits {
             let block = Self::try_new(count)?;
             typed_items_block_clear(block);
             Some(block)
+        }
+    }
+
+    /// `ll_alloc_and_set(..., 0)` at a malloc whose transformed graph carries
+    /// more than one live GC variable.  Kept beside the ordinary list
+    /// operation because the root span is allocation machinery, not bigint
+    /// arithmetic.
+    ///
+    /// # Safety
+    /// See [`try_alloc_typed_items_block_nursery_rooted`].
+    #[inline]
+    pub unsafe fn alloc_and_set_zero_rooted(
+        count: usize,
+        roots: &mut [majit_ir::GcRef],
+    ) -> *mut TypedItemsBlock {
+        unsafe {
+            let block =
+                try_alloc_typed_items_block_nursery_rooted(count, gc_int_array_gc_type_id(), roots)
+                    .unwrap_or_else(|| {
+                        std::alloc::handle_alloc_error(
+                            try_typed_items_block_layout(count.max(1))
+                                .unwrap_or_else(|| Layout::new::<TypedItemsBlock>()),
+                        )
+                    });
+            typed_items_block_clear(block);
+            block
         }
     }
 

@@ -19236,10 +19236,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
             &pyre_object::functional::RANGE_ITER_STEP_ONE_TYPE as *const _ as i64,
         )
     };
-    let new = ctx
-        .trace_ctx
-        .record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
-    ctx.trace_ctx.heap_cache_mut().new_object(new);
+    let new = ctx.trace_ctx.execute_new_with_vtable(size_descr);
 
     // `stop` is `start + length` rather than the range's own stop: a promoted
     // step is one, so the two agree over any non-empty span, and an empty or

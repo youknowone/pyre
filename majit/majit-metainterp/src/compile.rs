@@ -4595,16 +4595,10 @@ impl FailDescr for ResumeGuardCopiedDescr {
     }
     /// Per-emission, and deliberately NOT
     /// chased through `prev`: the classification describes this guard's own
-    /// condition chain, which a sharer does not inherit from its donor.  A
-    /// copied descr always answers `false`, and that is correct twice over.
-    /// A poll guard can never be the *sharer*: sharing requires
-    /// `!op.has_descr() && op.rd_resume_position < 0` (optimizer.rs
-    /// `emit_guard_operation`, mirrored in optimizeopt/mod.rs), whereas the
-    /// poll is emitted by `close_loop_args_at` through `generate_guard`,
-    /// which captures resume data and so always carries a resume position.
-    /// And when a poll guard is the *donor*, the sharer is some descrless
-    /// optimizer-created follow-up guard that is not itself a poll, so
-    /// reading through `prev` would misreport it as one.
+    /// condition chain, which a sharer does not inherit from its donor.
+    /// Sharing redirects resume storage, not the classification of this
+    /// guard's own condition. A poll donor must not classify every sharing
+    /// guard as a poll; a copied poll is stamped independently at emission.
     fn is_back_edge_poll(&self) -> bool {
         self.back_edge_poll
             .load(std::sync::atomic::Ordering::Relaxed)

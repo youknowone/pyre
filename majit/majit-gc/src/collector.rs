@@ -1771,6 +1771,7 @@ impl MiniMarkGC {
                 type_id,
                 payload_size,
                 root,
+                1,
                 needs_write_barrier,
             )
         }
@@ -1797,6 +1798,35 @@ impl MiniMarkGC {
                 type_id,
                 payload_size,
                 root,
+                1,
+                needs_write_barrier,
+            )
+        }
+    }
+
+    /// `malloc_fast` with the full `gc_push_roots(livevars)` span.  The
+    /// common bump path touches none of the slots; only the collection tail
+    /// registers and later reloads them, as `postprocess_inlining` arranges for
+    /// RPython's expanded shadow-stack operations.
+    ///
+    /// # Safety
+    /// `roots` must address `root_count` contiguous mutable [`GcRef`] slots
+    /// until this call returns.
+    #[inline]
+    pub unsafe fn alloc_fast_with_type_roots(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        roots: *mut GcRef,
+        root_count: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.alloc_with_type_rooted_body::<true>(
+                type_id,
+                payload_size,
+                roots,
+                root_count,
                 needs_write_barrier,
             )
         }
@@ -1810,16 +1840,21 @@ impl MiniMarkGC {
         &mut self,
         type_id: u32,
         payload_size: usize,
-        root: *mut GcRef,
+        roots: *mut GcRef,
+        root_count: usize,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         unsafe { *needs_write_barrier = false };
 
         #[cfg(feature = "gc_stress")]
         if self.stress_collect {
-            unsafe { self.roots.add(root) };
+            for i in 0..root_count {
+                unsafe { self.roots.add(roots.add(i)) };
+            }
             self.do_collect_full();
-            self.roots.remove(root);
+            for i in (0..root_count).rev() {
+                self.roots.remove(unsafe { roots.add(i) });
+            }
         }
 
         let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
@@ -1837,7 +1872,15 @@ impl MiniMarkGC {
                 return self.finish_bumped_nursery_object::<FAST>(ptr, type_id);
             }
         }
-        unsafe { self.alloc_with_type_rooted_slow(type_id, total_size, root, needs_write_barrier) }
+        unsafe {
+            self.alloc_with_type_rooted_slow(
+                type_id,
+                total_size,
+                roots,
+                root_count,
+                needs_write_barrier,
+            )
+        }
     }
 
     /// The outcomes [`alloc_with_type_rooted`] leaves out of line: a large
@@ -1851,7 +1894,8 @@ impl MiniMarkGC {
         &mut self,
         type_id: u32,
         total_size: usize,
-        root: *mut GcRef,
+        roots: *mut GcRef,
+        root_count: usize,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         // Large objects never trigger a nursery collection, so the native
@@ -1881,11 +1925,15 @@ impl MiniMarkGC {
         }
 
         self.pending_reserving_size = total_size;
-        unsafe { self.roots.add(root) };
+        for i in 0..root_count {
+            unsafe { self.roots.add(roots.add(i)) };
+        }
         self.do_collect_nursery();
         self.pending_reserving_size = 0;
         if std::mem::take(&mut self.oom_pending) {
-            self.roots.remove(root);
+            for i in (0..root_count).rev() {
+                self.roots.remove(unsafe { roots.add(i) });
+            }
             return GcRef(0);
         }
         let ptr = self.nursery.alloc(total_size);
@@ -1895,7 +1943,9 @@ impl MiniMarkGC {
             ptr
         };
         if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
-            self.roots.remove(root);
+            for i in (0..root_count).rev() {
+                self.roots.remove(unsafe { roots.add(i) });
+            }
             unsafe { *needs_write_barrier = true };
             return self.alloc_in_oldgen_clear(type_id, total_size);
         }
@@ -1909,7 +1959,9 @@ impl MiniMarkGC {
                 ptr = self.reserve_nursery_gap(total_size);
             }
         }
-        self.roots.remove(root);
+        for i in (0..root_count).rev() {
+            self.roots.remove(unsafe { roots.add(i) });
+        }
         assert!(
             !ptr.is_null(),
             "collect_and_reserve could not find nursery space for a non-large object"
@@ -8760,6 +8812,19 @@ impl GcAllocator for MiniMarkGC {
         unsafe { self.alloc_fast_with_type_rooted(type_id, size, root, needs_write_barrier) }
     }
 
+    unsafe fn alloc_fast_nursery_collecting_typed_roots(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        roots: *mut GcRef,
+        root_count: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.alloc_fast_with_type_roots(type_id, size, roots, root_count, needs_write_barrier)
+        }
+    }
+
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         self.alloc_with_type_no_collect(0, size)
     }
@@ -11186,6 +11251,39 @@ mod tests {
 
         assert_eq!(gc.minor_collections, 1);
         assert!(!gc.is_in_nursery(child.0));
+        assert!(gc.is_in_nursery(parent.0));
+        assert!(!needs_write_barrier);
+        assert_eq!(gc.roots.len(), roots_before);
+    }
+
+    #[test]
+    fn rooted_collecting_alloc_forwards_every_livevar_in_span() {
+        let mut gc = test_gc(256);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let mut roots = [gc.alloc_with_type(tid, 16), gc.alloc_with_type(tid, 16)];
+        let old_roots = roots;
+
+        while gc.nursery.remaining() >= GcHeader::SIZE + 16 {
+            let filler = gc.alloc_with_type_no_collect(tid, 16);
+            assert!(gc.is_in_nursery(filler.0));
+        }
+        let roots_before = gc.roots.len();
+        let mut needs_write_barrier = true;
+
+        let parent = unsafe {
+            gc.alloc_fast_with_type_roots(
+                tid,
+                16,
+                roots.as_mut_ptr(),
+                roots.len(),
+                &mut needs_write_barrier,
+            )
+        };
+
+        assert_eq!(gc.minor_collections, 1);
+        assert!(roots.iter().all(|root| !gc.is_in_nursery(root.0)));
+        assert_ne!(roots[0], old_roots[0]);
+        assert_ne!(roots[1], old_roots[1]);
         assert!(gc.is_in_nursery(parent.0));
         assert!(!needs_write_barrier);
         assert_eq!(gc.roots.len(), roots_before);

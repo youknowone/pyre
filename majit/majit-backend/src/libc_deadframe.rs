@@ -125,6 +125,16 @@ impl LibcJitFrameDeadFrame {
         self.tip as usize
     }
 
+    #[inline]
+    pub fn get_savedata_ref(&self) -> GcRef {
+        GcRef(unsafe { (*self.tip).jf_savedata })
+    }
+
+    #[inline]
+    pub fn set_savedata_ref(&mut self, data: GcRef) {
+        unsafe { (*self.tip).jf_savedata = data.0 };
+    }
+
     /// `llmodel.py _decode_pos` — the jitframe slot logical failarg
     /// `index` lives in, or `None` when the descr maps it nowhere.
     ///

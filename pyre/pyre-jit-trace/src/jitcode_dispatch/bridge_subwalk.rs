@@ -567,18 +567,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 // remaining Python frames unwind interpreted, exactly as they
                 // do when the raise surfaces from a residual call.
                 //
-                // The store-back belongs to that same shape and is what makes
-                // the unwind readable: this frame keeps running in the
-                // interpreter, which reads its locals out of
-                // `locals_cells_stack_w`, while the walk held them in the
-                // virtualizable boxes.  `virtualizable.py write_boxes`
-                // writes them on every force with no way to decline, and
-                // `record_top_level_application_traceback` above only performs
-                // it concretely, for the recording pass — so without the
-                // emitted store-back the compiled bridge leaves the frame
-                // holding whatever its entry wrote, and a `tb_frame.f_locals`
-                // or `sys._getframe()` on the way out reads every
-                // post-entry local as unbound.
+                // `compile_exit_frame_with_exception` uses the same lazy
+                // virtualizable-token protocol as an ordinary return.
                 if !recording_raise_keeps_existing_traceback(&mut wc, position) {
                     record_top_level_application_traceback(
                         &mut wc,

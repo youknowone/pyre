@@ -4300,7 +4300,13 @@ impl ResumeDataLoopMemo {
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
         let mut frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 1]> = SmallVec::new();
-        if let Some(sizes) = frame_sizes.filter(|sizes| sizes.len() > 1) {
+        // An explicitly empty framestack is the terminal force snapshot
+        // (opencoder.py create_empty_top_snapshot), not an absent layout.
+        // A one-frame sizes vector is the default single-frame case
+        // (`number` already emits that layout); keep it on the fallback
+        // so a size that does not cover every snapshot box cannot drop
+        // the remainder. Multi-frame and empty stay explicit.
+        if let Some(sizes) = frame_sizes.filter(|sizes| sizes.len() != 1) {
             let mut offset = 0;
             for (i, &size) in sizes.iter().enumerate() {
                 let end = (offset + size).min(snapshot_boxes.len());
@@ -5212,6 +5218,66 @@ mod tests {
         let (val, tagbits) = untag(items[9] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
+    }
+
+    #[test]
+    fn number_from_parts_preserves_an_empty_framestack_with_vable_state() {
+        // opencoder.py create_empty_top_snapshot, reached after
+        // pyjitpl.py finishframe has popped the last MIFrame.
+        let snapshot = Snapshot {
+            framestack: Vec::new(),
+            vable_array: vec![
+                SnapshotBox::from(OpRef::ref_op(0)),
+                SnapshotBox::from(OpRef::const_int(7)),
+            ],
+            vref_array: Vec::new(),
+        };
+        let env = SimpleBoxEnv::new();
+        let expected = ResumeDataLoopMemo::new()
+            .number(&snapshot, &env, -1)
+            .unwrap()
+            .create_numbering();
+        let actual = ResumeDataLoopMemo::new()
+            .number_from_parts(&[], Some(&[]), &[], &snapshot.vable_array, &[], &env, -1)
+            .unwrap()
+            .create_numbering();
+        assert_eq!(actual, expected, "no synthetic (0, 0, 0) frame at FINISH");
+    }
+
+    #[test]
+    fn number_from_parts_keeps_a_one_frame_sizes_vector_on_the_default_path() {
+        // A single-frame sizes entry is the implicit layout `number` already
+        // emits. Using it as an explicit split would drop snapshot boxes
+        // past that count.
+        let snapshot = Snapshot {
+            framestack: vec![SnapshotFrame {
+                jitcode_index: 3,
+                pc: 4,
+                py_pc: 5,
+                boxes: vec![
+                    SnapshotBox::from(OpRef::ref_op(0)),
+                    SnapshotBox::from(OpRef::const_int(9)),
+                    SnapshotBox::from(OpRef::ref_op(1)),
+                ],
+            }],
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
+        };
+        let env = SimpleBoxEnv::new();
+        let expected = ResumeDataLoopMemo::new()
+            .number(&snapshot, &env, -1)
+            .unwrap()
+            .create_numbering();
+        let boxes = snapshot.framestack[0].boxes.clone();
+        let short_size = Some(&[1usize][..]);
+        let actual = ResumeDataLoopMemo::new()
+            .number_from_parts(&boxes, short_size, &[(3, 4, 5)], &[], &[], &env, -1)
+            .unwrap()
+            .create_numbering();
+        assert_eq!(
+            actual, expected,
+            "a one-frame sizes vector must not truncate snapshot boxes"
+        );
     }
 
     #[test]
@@ -8450,8 +8516,9 @@ pub fn blackhole_from_resumedata<'a>(
 /// Used for GUARD_NOT_FORCED handling.
 ///
 /// Returns (virtuals_cache_ptr, virtuals_cache_int) — RPython VirtualCache
-/// parity — plus the virtualizable the vable section named, which the caller
-/// needs as the cache key (see `MetaInterp::save_forced_virtuals`).
+/// parity — plus the virtualizable the vable section named, matching the
+/// upstream force decoder's result even though deadframe-owned `AllVirtuals`
+/// no longer needs an address key.
 #[allow(clippy::needless_lifetimes)]
 #[expect(
     clippy::too_many_arguments,

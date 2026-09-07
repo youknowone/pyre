@@ -16497,8 +16497,9 @@ pub(crate) fn exec_or_eval(
     // (pyframe.py:242-246 "directly executed code object may not contain free
     // variables") when createframe runs below with no outer_func.
     // `inject_closure` records that a validated closure must be bound into the
-    // frame; the `outer_func` carrier is built just before createframe so it
-    // needs no GC rooting across the namespace-setup allocations below.
+    // frame.  The `outer_func` carrier is built just before createframe, but
+    // the cell tuple it is built from has to cross every namespace-setup
+    // allocation to get there, so that tuple is published below.
     let mut inject_closure = false;
     if !is_eval {
         if source_is_code {
@@ -16658,7 +16659,7 @@ pub(crate) fn exec_or_eval(
     // (already wired above) AND caller `getdictscope()`.  When the
     // caller omits ONLY locals, locals collapse to globals (PyPy
     // `pyopcode.py:2010-2013`), which the existing same-storage shape
-    // below covers via the `is_none_or_null(locals_arg)` skip.
+    // below covers via the `locals_is_absent` skip.
     //
     // Resolve the implicit caller-locals only when globals_arg is also
     // None: that's the `exec(src)` shape where PyPy hands the caller's

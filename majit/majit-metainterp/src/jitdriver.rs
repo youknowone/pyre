@@ -7895,18 +7895,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta.walk_compile_snapshot_refs(visitor);
     }
 
-    /// GC walker for the forced-virtual caches awaiting a `GUARD_NOT_FORCED`.
-    /// See `MetaInterp::walk_forced_virtuals_refs`.
-    pub fn walk_forced_virtuals_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
-        self.meta.walk_forced_virtuals_refs(visitor);
-    }
-
-    /// Drop forced-virtual caches whose owner frame died.
-    /// See `MetaInterp::prune_forced_virtuals`.
-    pub fn prune_forced_virtuals(&mut self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
-        self.meta.prune_forced_virtuals(classify);
-    }
-
     pub fn run_compiled_detailed_keyed(
         &mut self,
         green_key: u64,
@@ -8177,6 +8165,7 @@ impl<S: JitState> JitDriver<S> {
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).
         let guard_exc = result.exception.exc_value;
+        let savedata = result.savedata;
         drop(result);
 
         // memmgr.py: keep_loop_alive(loop_token)
@@ -8257,6 +8246,7 @@ impl<S: JitState> JitDriver<S> {
             raw_values,
             exit_layout,
             guard_exc,
+            savedata,
         }
     }
 

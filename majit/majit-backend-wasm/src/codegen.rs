@@ -12,6 +12,7 @@
 /// The residual-call trampoline scratch is stored separately at the static
 /// base returned by `jit_call_area_addr`.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
@@ -2340,6 +2341,7 @@ fn emit_reload_frame_if_necessary(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    wb: &WriteBarrierHelpers,
 ) {
     if let Some(top_addr) = jf_top_addr {
         // assembler.py:1369-1377: reload the possibly-forwarded top JitFrame
@@ -2359,6 +2361,42 @@ fn emit_reload_frame_if_necessary(
         // — it published no reload helper, and reloading from a shadow stack
         // that never held this frame would install an unrelated one.
     }
+    if jf_top_addr.is_some() || ca_reload_fn_ptr != 0 {
+        emit_frame_write_barrier(sink, residual_type_base, wb);
+    }
+}
+
+/// x86/assembler.py `_reload_frame_if_necessary` reapplies the non-array
+/// barrier after reloading the frame. A minor collection can promote it;
+/// subsequent Ref spills must then keep it in the remembered set even after
+/// it leaves the shadow stack. The result of the collecting call may still
+/// be on the wasm operand stack, so this fast path is stack-neutral.
+fn emit_frame_write_barrier(
+    sink: &mut PeepSink<'_, '_>,
+    residual_type_base: Option<u32>,
+    wb: &WriteBarrierHelpers,
+) {
+    if wb.fn_ptr == 0 {
+        return;
+    }
+    let base = residual_type_base.expect("frame barrier needs the one-argument helper type");
+    sink.local_get(0);
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+    sink.i32_const(wb.flag_byteofs);
+    sink.i32_add();
+    sink.i32_load8_u(memarg(0, 0));
+    sink.i32_const(wb.if_flag as i32);
+    sink.i32_and();
+    sink.if_(BlockType::Empty);
+    sink.local_get(0);
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+    sink.i64_extend_i32_u();
+    sink.i32_const(wb.fn_ptr as i32);
+    sink.call_indirect(0, base + 1);
+    sink.drop();
+    sink.end();
 }
 
 /// CA-arm-only variant of [`emit_reload_frame_if_necessary`]. The direct CA
@@ -2369,13 +2407,15 @@ fn emit_reload_ca_frame_if_necessary(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     ca_inline: Option<CaInlineParams>,
+    wb: &WriteBarrierHelpers,
 ) {
     if let Some(inline) = ca_inline {
         debug_assert!(residual_type_base.is_some());
         emit_ca_reload_top(sink, inline.jf_top_addr);
         sink.local_set(0);
+        emit_frame_write_barrier(sink, residual_type_base, wb);
     } else {
-        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, None);
+        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, None, wb);
     }
 }
 
@@ -3483,7 +3523,141 @@ pub struct AllocHelpers {
     pub fmod_fn_ptr: i64,
 }
 
-type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize);
+pub struct WasmModuleData {
+    pub num_ref_homes: usize,
+    /// gcmap.py `allocate_gcmap`: assembler data blocks live with their code.
+    pub gc_maps: Vec<Box<[usize]>>,
+    /// Created before code emission so jf_force_descr can name the same
+    /// stable descriptor the backend publishes for this exit.
+    pub fail_descrs: Vec<Arc<crate::failguard::WasmFailDescr>>,
+}
+
+/// x86/regalloc.py consider_guard_not_forced_2: keep forced state outside
+/// FINISH's return slot. Ref homes are already precise, persistent spills;
+/// other arguments use exit slots starting after the return slot.
+fn force_arg_location(frame: FrameGeometry, homes: &RefHomes, arg: OpRef, index: usize) -> usize {
+    let offset = homes
+        .home(arg)
+        .map_or(FRAME_SLOT_BASE + (index as u64 + 1) * SLOT_SIZE, |home| {
+            frame.home_slot_base + home as u64 * SLOT_SIZE
+        });
+    offset as usize / std::mem::size_of::<usize>()
+}
+
+type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, WasmModuleData);
+
+/// regalloc.py `get_gcmap` and assembler.py `_finish_gcmap`. Homes are spill
+/// locations, not a permanent root set: only live Ref boxes belong in the map
+/// at a collecting call. Tracing all homes after FINISH keeps returned child
+/// PyFrames and their force-token JITFRAMEs alive recursively.
+struct FrameGcMaps {
+    enabled: bool,
+    frame: FrameGeometry,
+    maps: std::cell::RefCell<Vec<Box<[usize]>>>,
+    finish_gcmap: std::cell::RefCell<Vec<usize>>,
+}
+
+impl FrameGcMaps {
+    fn new(enabled: bool, frame: FrameGeometry) -> Self {
+        Self {
+            enabled,
+            frame,
+            maps: Default::default(),
+            finish_gcmap: Default::default(),
+        }
+    }
+
+    fn home_index(&self, home: u32) -> usize {
+        (self.frame.home_slot_base as usize + home as usize * 8) / std::mem::size_of::<usize>()
+    }
+
+    fn live_indices(
+        &self,
+        homes: &RefHomes,
+        live: &HomeLiveness,
+        at: usize,
+        op: &Op,
+    ) -> Vec<usize> {
+        let mut indices: Vec<_> = homes
+            .iter()
+            .filter_map(|(raw, home)| {
+                let ca_arg = op.opcode.is_call_assembler()
+                    && op
+                        .getarglist()
+                        .iter()
+                        .any(|arg| arg.to_opref().raw() == raw && !arg.to_opref().is_constant());
+                (live.live_across(raw, at) || ca_arg).then_some(self.home_index(home))
+            })
+            .collect();
+        // LABEL captures are frozen spill locations shared with chained
+        // bridges; their values remain live until the source loop resumes.
+        for home in self.frame.ordinary_home_slots()..self.frame.home_slots {
+            indices.push(self.home_index(home as u32));
+        }
+        indices
+    }
+
+    fn force_indices(&self, homes: &RefHomes, op: &Op) -> Vec<usize> {
+        let args = exit_fail_args(op);
+        let mask = live_fail_arg_mask(op.getdescr().as_ref(), args.len());
+        args.into_iter()
+            .zip(mask)
+            .enumerate()
+            .filter_map(|(i, (arg, live))| {
+                (live && arg.ty() == Some(Type::Ref))
+                    .then(|| force_arg_location(self.frame, homes, arg, i))
+            })
+            .collect()
+    }
+
+    fn emit_push_gcmap(&self, sink: &mut PeepSink<'_, '_>, indices: &[usize]) {
+        if !self.enabled {
+            return;
+        }
+        // gcmap.py `allocate_gcmap`: length word, then a zeroed bitset.
+        let word = std::mem::size_of::<usize>();
+        let bits = word * 8;
+        let words = self.frame.frame_bytes as usize / word / bits + 1;
+        let mut map = vec![0usize; words + 1].into_boxed_slice();
+        map[0] = words;
+        for &index in indices {
+            map[1 + index / bits] |= 1usize << (index % bits);
+        }
+        let address = map.as_ptr() as usize;
+        self.maps.borrow_mut().push(map);
+        sink.local_get(0);
+        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+        sink.i32_const(address as i32);
+        sink.i32_store(mem32(majit_backend::jitframe::JF_GCMAP_OFS as u64));
+    }
+
+    fn emit_exit_gcmap(&self, sink: &mut PeepSink<'_, '_>, op: &Op, counter_slot: Option<u64>) {
+        let args = exit_fail_args(op);
+        let mask = live_fail_arg_mask(op.getdescr().as_ref(), args.len());
+        let word = std::mem::size_of::<usize>();
+        let mut indices: Vec<_> = args
+            .iter()
+            .zip(mask)
+            .enumerate()
+            .filter_map(|(i, (arg, live))| {
+                (live && arg.ty() == Some(Type::Ref))
+                    .then_some((FRAME_SLOT_BASE as usize + i * 8) / word)
+            })
+            .collect();
+        if counter_value_spill(op, &args).is_some_and(|arg| arg.ty() == Some(Type::Ref)) {
+            if let Some(slot) = counter_slot {
+                indices.push((FRAME_SLOT_BASE as usize + slot as usize * 8) / word);
+            }
+        }
+        if op.opcode == OpCode::Finish {
+            // assembler.py `genop_finish`: preserve only the forced guard's
+            // map, plus the Ref return slot. Ordinary temporary homes die.
+            indices.extend(self.finish_gcmap.borrow_mut().drain(..));
+        }
+        self.emit_push_gcmap(sink, &indices);
+    }
+}
 
 /// Counts entries into an out-of-line bridge module and calls out once there
 /// have been enough of them to pay for merging that bridge into its owner.
@@ -4224,10 +4398,11 @@ pub fn build_wasm_module(
             // this same `(i64×n)->i64` family; make sure arity 2 is declared,
             // which declares the full 0..=2 range including reload's arity 0.
             Some(scanned.map_or(2, |m| m.max(2)))
-        } else if ca.ca_reload_fn_ptr != 0 {
+        } else if ca.ca_reload_fn_ptr != 0 || ca.jf_top_addr.is_some() {
             // Every trace body can reload its own frame after a collecting
             // direct call, even though only bridges emit the CA arm.
-            Some(scanned.map_or(0, |m| m))
+            // The reloaded frame's write barrier takes one argument.
+            Some(scanned.map_or(1, |m| m.max(1)))
         } else {
             scanned
         }
@@ -4502,6 +4677,46 @@ pub fn build_wasm_module(
         .enumerate()
         .map(|(i, &arity)| (arity, first_spill_func_idx + i as u32))
         .collect();
+    let gc_maps = FrameGcMaps::new(ca.ca_reload_fn_ptr != 0 || ca.jf_top_addr.is_some(), *frame);
+    let fail_descrs: Vec<_> = guards
+        .iter()
+        .zip(
+            analysis_ops
+                .iter()
+                .filter(|op| op.opcode.is_guard() || op.opcode == OpCode::Finish),
+        )
+        .map(|(guard, op)| {
+            let rd_locs = matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2)
+                .then(|| {
+                    let mask =
+                        live_fail_arg_mask(op.getdescr().as_ref(), guard.fail_arg_refs.len());
+                    guard
+                        .fail_arg_refs
+                        .iter()
+                        .zip(mask)
+                        .enumerate()
+                        .map(|(i, (&arg, live))| {
+                            if !live || arg.is_none() {
+                                0xFFFF
+                            } else {
+                                u16::try_from(force_arg_location(*frame, &ref_homes, arg, i))
+                                    .ok()
+                                    .filter(|&loc| loc != 0xFFFF)
+                                    .expect("force failarg location exceeds rd_locs")
+                            }
+                        })
+                        .collect()
+                });
+            Arc::new(crate::failguard::WasmFailDescr {
+                fail_index: guard.fail_index,
+                trace_id: 0, // filled by the backend before publishing the code
+                fail_arg_types: guard.fail_arg_types.clone(),
+                rd_locs,
+                is_finish: guard.is_finish,
+                meta_descr: guard.meta_descr.clone(),
+            })
+        })
+        .collect();
     let func = build_function(
         inputargs,
         &analysis_inputargs,
@@ -4543,6 +4758,8 @@ pub fn build_wasm_module(
         label_param_entry,
         inline_trip.map(|probe| (probe, inline_trip_type_idx)),
         &spill_helper_indices,
+        &gc_maps,
+        &fail_descrs,
     )?;
     if label_param_entry {
         codes.function(&build_label_param_shim(trace_func_idx + 1));
@@ -4553,7 +4770,15 @@ pub fn build_wasm_module(
     }
     module.section(&codes);
 
-    Ok((module.finish(), guards, num_ref_homes))
+    Ok((
+        module.finish(),
+        guards,
+        WasmModuleData {
+            num_ref_homes,
+            gc_maps: gc_maps.maps.into_inner(),
+            fail_descrs,
+        },
+    ))
 }
 
 fn build_label_param_shim(wide_func_idx: u32) -> Function {
@@ -4706,6 +4931,8 @@ fn build_function(
     label_param_entry: bool,
     inline_trip: Option<(InlineTripProbe, u32)>,
     spill_helper_indices: &indexmap::IndexMap<usize, u32>,
+    gc_maps: &FrameGcMaps,
+    fail_descrs: &[Arc<crate::failguard::WasmFailDescr>],
 ) -> Result<Function, BackendError> {
     // The CA arm requires residual types (the setup above forces arity >= 2
     // whenever it is emitted). Its `jit_call` fallback branches are retained
@@ -4912,6 +5139,7 @@ fn build_function(
         frame,
         counter_slot: counter_slot(inputargs, ops).map(|slot| slot as u64),
         spill_helpers: spill_helper_indices,
+        gc_maps: Some(gc_maps),
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -5407,6 +5635,13 @@ fn build_function(
         } else {
             None
         };
+        if (op.opcode.is_call() && call_can_collect(op))
+            || op.opcode.is_malloc()
+            || (ca.emit_ca && op.opcode.is_call_assembler())
+        {
+            let indices = gc_maps.live_indices(ref_homes, &liveness, op_idx, op);
+            gc_maps.emit_push_gcmap(&mut sink, &indices);
+        }
         match op.opcode {
             OpCode::Label => {}
 
@@ -5847,15 +6082,10 @@ fn build_function(
                 // trace must not run on holding virtualized fields the force has
                 // already written back, and the virtuals `handle_async_forcing`
                 // materialized are attached for THIS exit's resume to consume.
-                // The bit sits in the upper half of `frame[0]`, so on
-                // little-endian wasm32 it is bit 0 of the i32 at frame offset
-                // 4; masking it leaves the `!= 0` the `if` already applies.
-                const FORCE_TAKEN_HALF_OFS: u64 = 4;
-                const _: () = assert!(FORCE_TAKEN_BIT == 1 << 32);
                 sink.local_get(0);
-                sink.i32_load(memarg(FORCE_TAKEN_HALF_OFS, 2));
-                sink.i32_const(1);
-                sink.i32_and();
+                sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+                sink.i32_sub();
+                sink.i32_load(mem32(majit_backend::jitframe::JF_DESCR_OFS as u64));
                 emit_guard_if_exit(
                     &mut sink,
                     constants,
@@ -5874,6 +6104,9 @@ fn build_function(
                 // to test, it is what `store_token_in_vable` emits before a
                 // FINISH so a force arriving while the virtualizable is still
                 // armed can still rebuild a deadframe. Arm, do not test.
+                let indices = gc_maps.force_indices(ref_homes, op);
+                gc_maps.emit_push_gcmap(&mut sink, &indices);
+                *gc_maps.finish_gcmap.borrow_mut() = indices;
                 emit_force_arm(
                     &mut sink,
                     constants,
@@ -5881,7 +6114,7 @@ fn build_function(
                     ref_homes,
                     frame,
                     op,
-                    exit_index(op, guard_idx),
+                    &fail_descrs[(guard_idx - fail_index_base) as usize],
                     None,
                 );
                 guard_idx += 1;
@@ -6745,6 +6978,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -6837,6 +7071,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -7202,6 +7437,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
             }
             OpCode::ZeroArray => {
@@ -7330,6 +7567,8 @@ fn build_function(
                     ops,
                     op_idx,
                     guard_idx,
+                    fail_index_base,
+                    fail_descrs,
                 );
                 let vi = op.pos.get().raw();
                 let descr = op
@@ -7432,6 +7671,7 @@ fn build_function(
                     op,
                     frame,
                 );
+                emit_frame_write_barrier(&mut sink, residual_type_base, wb);
                 // dispatch key = 0: run the loop from its entry (preamble), not a
                 // LABEL resume — this is a fresh call.
                 sink.local_get(ca_cfp_local);
@@ -7533,11 +7773,17 @@ fn build_function(
                 if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
                     emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
                     sink.local_set(0);
+                    // assembler.py `_reload_frame_if_necessary`: reapply the
+                    // non-array barrier after the post-call reload. The
+                    // recursive CA or deopt helper may have promoted the
+                    // caller; later Ref spills must still remember it.
+                    emit_frame_write_barrier(&mut sink, residual_type_base, wb);
                 } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
                     sink.call_indirect(0, base);
                     sink.i32_wrap_i64();
                     sink.local_set(0);
+                    emit_frame_write_barrier(&mut sink, residual_type_base, wb);
                 }
                 // The frame ABI carries every scalar result as i64 bits. Ref
                 // and Int use those bits directly; Float crosses the local
@@ -7591,6 +7837,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.inline,
+                    wb,
                 );
                 emit_reload_refs_from_homes(
                     &mut sink,
@@ -7645,6 +7892,8 @@ fn build_function(
                     ops,
                     op_idx,
                     guard_idx,
+                    fail_index_base,
+                    fail_descrs,
                 );
                 let vi = op.pos.get().raw();
                 let can_collect = call_can_collect(op);
@@ -7689,6 +7938,7 @@ fn build_function(
                             residual_type_base,
                             ca.ca_reload_fn_ptr,
                             ca.jf_top_addr,
+                            wb,
                         );
                         emit_reload_refs_from_homes(
                             &mut sink,
@@ -7723,6 +7973,7 @@ fn build_function(
                             residual_type_base,
                             ca.ca_reload_fn_ptr,
                             ca.jf_top_addr,
+                            wb,
                         );
                         emit_reload_refs_from_homes(
                             &mut sink,
@@ -7774,6 +8025,7 @@ fn build_function(
                             residual_type_base,
                             ca.ca_reload_fn_ptr,
                             ca.jf_top_addr,
+                            wb,
                         );
                         emit_reload_refs_from_homes(
                             &mut sink,
@@ -7805,6 +8057,7 @@ fn build_function(
                             residual_type_base,
                             ca.ca_reload_fn_ptr,
                             ca.jf_top_addr,
+                            wb,
                         );
                         emit_reload_refs_from_homes(
                             &mut sink,
@@ -7866,6 +8119,7 @@ fn build_function(
                             residual_type_base,
                             ca.ca_reload_fn_ptr,
                             ca.jf_top_addr,
+                            wb,
                         );
                         emit_reload_refs_from_homes(
                             &mut sink,
@@ -8023,6 +8277,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -8123,6 +8378,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
                 if !OpRef::raw_is_constant(vi) {
                     // llmodel.py write_int_at_mem(res, vtable_offset,
@@ -8178,6 +8435,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -8370,6 +8628,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -8446,6 +8705,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -8511,6 +8771,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -8628,6 +8889,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
                 // `wasm_jit_alloc_array` collects; reload other live Refs. The
                 // inline-bump paths already emitted this inside their slow arms.
@@ -8640,6 +8903,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -9530,6 +9794,7 @@ struct BridgeDispatch<'a> {
     /// arguments, for the counts `spill_helper_arities` admitted. An exit whose
     /// count is absent writes its own stores.
     spill_helpers: &'a indexmap::IndexMap<usize, u32>,
+    gc_maps: Option<&'a FrameGcMaps>,
 }
 
 fn emit_guard_true(
@@ -9763,6 +10028,9 @@ fn emit_guard_exit(
         return;
     }
     if dispatch.param_type_indices.is_empty() {
+        if let Some(maps) = dispatch.gc_maps {
+            maps.emit_exit_gcmap(sink, op, dispatch.counter_slot);
+        }
         emit_guard_spill(
             sink,
             constants,
@@ -9779,6 +10047,9 @@ fn emit_guard_exit(
         emit_guard_param_tail_call(sink, constants, value_types, guard_idx, op, dispatch);
         // A missing cell keeps the historical recovery path. It is deliberately
         // after the cell test so a bridge crossing performs no frame spill.
+        if let Some(maps) = dispatch.gc_maps {
+            maps.emit_exit_gcmap(sink, op, dispatch.counter_slot);
+        }
         emit_guard_spill(
             sink,
             constants,
@@ -9908,6 +10179,8 @@ fn emit_force_bracket_before_call(
     ops: &[Op],
     op_idx: usize,
     guard_idx: u32,
+    fail_index_base: u32,
+    fail_descrs: &[Arc<crate::failguard::WasmFailDescr>],
 ) {
     let Some(next_op) = ops.get(op_idx + 1) else {
         return;
@@ -9928,7 +10201,7 @@ fn emit_force_bracket_before_call(
         ref_homes,
         frame,
         next_op,
-        exit_index(next_op, guard_idx),
+        &fail_descrs[(guard_idx - fail_index_base) as usize],
         Some(ops[op_idx].pos.get().raw()),
     );
 }
@@ -9960,26 +10233,26 @@ fn emit_force_arm(
     ref_homes: &RefHomes,
     frame: FrameGeometry,
     guard_op: &Op,
-    exit_idx: u32,
+    descr: &Arc<crate::failguard::WasmFailDescr>,
     undefined: Option<u32>,
 ) {
-    // `counter_value_spill` answers `None` for anything but a GUARD_VALUE, so
-    // the counter slot has nothing to contribute to a force bracket.
-    //
-    // Same range `emit_guard_fail_args_spill` writes and
-    // `normal_frame_value_slots` reserves: one past the last live position.
-    let mut force_args = exit_fail_args(guard_op);
-    force_args.truncate(live_fail_arg_extent(
-        guard_op.getdescr().as_ref(),
-        force_args.len(),
-    ));
-    for (i, &arg_ref) in force_args.iter().enumerate() {
+    let force_args = exit_fail_args(guard_op);
+    let locs = descr.rd_locs.as_ref().expect("force guard has rd_locs");
+    for (i, (&arg_ref, &loc)) in force_args.iter().zip(locs).enumerate() {
+        if loc == 0xFFFF {
+            continue;
+        }
+        debug_assert_eq!(
+            usize::from(loc),
+            force_arg_location(frame, ref_homes, arg_ref, i)
+        );
+        let is_undefined = undefined == Some(arg_ref.raw());
+        if !is_undefined && ref_homes.home(arg_ref).is_some() {
+            continue; // store-on-definition already wrote the traced home
+        }
         sink.local_get(0);
-        if undefined == Some(arg_ref.raw()) {
+        if is_undefined {
             sink.i64_const(0);
-        } else if let Some(home) = ref_homes.home(arg_ref) {
-            let ofs = frame.home_slot_base + home as u64 * SLOT_SIZE;
-            sink.i64_const((ofs as i64) * 2 + 1);
         } else {
             emit_resolve(sink, constants, value_types, arg_ref);
         }
@@ -10150,12 +10423,18 @@ fn emit_memory_error_check(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    wb: &WriteBarrierHelpers,
+    gc_maps: &FrameGcMaps,
 ) {
     emit_resolve(sink, constants, value_types, value);
     sink.i64_eqz();
     sink.if_(BlockType::Empty);
     if crate::failguard::exit_frame_with_exception_attached() {
-        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr, wb);
+        gc_maps.emit_push_gcmap(
+            sink,
+            &[FRAME_SLOT_BASE as usize / std::mem::size_of::<usize>()],
+        );
         sink.local_get(0);
         sink.i32_const(crate::jit_exc_value_addr() as i32);
         sink.i64_load(mem64(0));
@@ -10828,6 +11107,185 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gcmap_uses_live_homes_and_keeps_ca_arguments_across_frame_allocation() {
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let inputargs: Vec<_> = (0..3).map(|i| InputArg::from_type(Type::Ref, i)).collect();
+        let first = Op::new(OpCode::CallR, &[rb(OpRef::input_arg_ref(0))]);
+        first.pos.set(OpRef::ref_op(3));
+        let second = Op::new(OpCode::CallAssemblerR, &[rb(OpRef::input_arg_ref(1))]);
+        second.pos.set(OpRef::ref_op(4));
+        let guard = Op::new(OpCode::GuardNotForced2, &[]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_ref(2))]);
+        let finish = Op::new(OpCode::Finish, &[rb(OpRef::ref_op(4))]);
+        let ops = vec![first, second, guard, finish];
+        let live = HomeLiveness::collect_with_regions(&inputargs, &ops, &[]);
+        let homes = RefHomes {
+            by_id: vec![0, 1, 2, 3, 4],
+            len: 5,
+        };
+        let maps = FrameGcMaps::new(true, FrameGeometry::compact(8, 5, 0));
+        assert_eq!(
+            maps.live_indices(&homes, &live, 1, &ops[1]),
+            vec![maps.home_index(1), maps.home_index(2)]
+        );
+        // The first call's argument and result are dead. Keeping their homes
+        // would retain a completed child call tree through its force token.
+        assert!(
+            !maps
+                .live_indices(&homes, &live, 1, &ops[1])
+                .contains(&maps.home_index(3))
+        );
+    }
+
+    #[test]
+    fn finish_gcmap_keeps_only_force_failargs_and_the_ref_result() {
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let homes = RefHomes {
+            by_id: vec![0, 1, 2],
+            len: 3,
+        };
+        let maps = FrameGcMaps::new(true, FrameGeometry::compact(8, 3, 0));
+        let guard = Op::new(OpCode::GuardNotForced2, &[]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_ref(1))]);
+        let indices = maps.force_indices(&homes, &guard);
+        *maps.finish_gcmap.borrow_mut() = indices;
+        let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(2))]);
+        let mut bytes = Vec::new();
+        {
+            let mut raw = InstructionSink::new(&mut bytes);
+            let mut sink = PeepSink::new(&mut raw);
+            maps.emit_exit_gcmap(&mut sink, &finish, None);
+            sink.flush();
+        }
+        let allocated = maps.maps.borrow();
+        let map = &allocated[0];
+        let bits = usize::BITS as usize;
+        let marked: Vec<_> = (0..map[0] * bits)
+            .filter(|&index| map[1 + index / bits] & (1usize << (index % bits)) != 0)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![
+                FRAME_SLOT_BASE as usize / std::mem::size_of::<usize>(),
+                maps.home_index(1)
+            ]
+        );
+        assert!(
+            maps.finish_gcmap.borrow().is_empty(),
+            "a later trace must not inherit this finish map"
+        );
+    }
+
+    /// x86/assembler.py `_reload_frame_if_necessary`: after a nursery frame
+    /// is promoted, reloading its pointer must also remember later Ref spills.
+    /// Keep a call result below the barrier's operands, as allocation emission
+    /// does, and verify the barrier neither consumes nor replaces that result.
+    #[test]
+    fn reload_frame_reapplies_write_barrier_without_clobbering_call_result() {
+        use wasmi::{
+            Engine, Func, Linker, Memory, MemoryType, Store, Table, TableType, Val, ValType,
+        };
+
+        let wb = WriteBarrierHelpers::for_current_gc(1, 0);
+        let mut function = Function::new([]);
+        {
+            let mut raw = function.instructions();
+            let mut sink = PeepSink::new(&mut raw);
+            sink.i64_const(77);
+            emit_reload_frame_if_necessary(&mut sink, Some(1), 0, Some(16), &wb);
+            sink.end();
+            sink.flush();
+        }
+        let mut types = TypeSection::new();
+        types
+            .ty()
+            .function([wasm_encoder::ValType::I32], [wasm_encoder::ValType::I64]);
+        types.ty().function([], [wasm_encoder::ValType::I64]);
+        types
+            .ty()
+            .function([wasm_encoder::ValType::I64], [wasm_encoder::ValType::I64]);
+        let mut imports = wasm_encoder::ImportSection::new();
+        imports.import(
+            "env",
+            "memory",
+            EntityType::Memory(wasm_encoder::MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            }),
+        );
+        imports.import(
+            "env",
+            "table",
+            EntityType::Table(wasm_encoder::TableType {
+                element_type: RefType::FUNCREF,
+                minimum: 2,
+                maximum: None,
+                table64: false,
+                shared: false,
+            }),
+        );
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        let mut exports = ExportSection::new();
+        exports.export("reload", ExportKind::Func, 0);
+        let mut code = CodeSection::new();
+        code.function(&function);
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&imports)
+            .section(&functions)
+            .section(&exports)
+            .section(&code);
+        let engine = Engine::default();
+        let module = wasmi::Module::new(&engine, module.finish()).unwrap();
+        let mut store = Store::new(&engine, Vec::<i64>::new());
+        let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+        let table = Table::new(
+            &mut store,
+            TableType::new(ValType::FuncRef, 2, None),
+            Val::default(ValType::FuncRef),
+        )
+        .unwrap();
+        let flag_addr = (128i32 + wb.flag_byteofs) as usize;
+        let barrier = Func::wrap(
+            &mut store,
+            move |mut caller: wasmi::Caller<'_, Vec<i64>>, frame: i64| -> i64 {
+                caller.data_mut().push(frame);
+                memory.write(&mut caller, flag_addr, &[0]).unwrap();
+                999
+            },
+        );
+        table.set(&mut store, 1, Val::from(barrier)).unwrap();
+        let mut linker = Linker::new(&engine);
+        linker.define("env", "memory", memory).unwrap();
+        linker.define("env", "table", table).unwrap();
+        let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+        let reload = instance
+            .get_typed_func::<i32, i64>(&store, "reload")
+            .unwrap();
+        memory.write(&mut store, 16, &24u32.to_le_bytes()).unwrap();
+        memory.write(&mut store, 20, &128u32.to_le_bytes()).unwrap();
+        memory.write(&mut store, flag_addr, &[wb.if_flag]).unwrap();
+        // Local 0 deliberately names a stale frame. The barrier must receive
+        // the forwarded object base from the shadow stack, not that old base.
+        assert_eq!(reload.call(&mut store, 4096).unwrap(), 77);
+        assert_eq!(store.data(), &[128]);
+        assert_eq!(reload.call(&mut store, 4096).unwrap(), 77);
+        assert_eq!(store.data(), &[128], "already remembered: no helper call");
+        memory.write(&mut store, flag_addr, &[wb.if_flag]).unwrap();
+        assert_eq!(reload.call(&mut store, 4096).unwrap(), 77);
+        assert_eq!(
+            store.data(),
+            &[128, 128],
+            "minor collection rearms the barrier"
+        );
+    }
+
+    #[test]
     fn peep_sink_applies_all_local_folds() {
         let mut bytes = Vec::new();
         {
@@ -10926,6 +11384,7 @@ mod tests {
             frame: FrameGeometry::compact(1, 0, 0),
             counter_slot: None,
             spill_helpers: &spill_helpers,
+            gc_maps: None,
         };
 
         assert_eq!(inline_region_br_depth(&inline, &dispatch, 0), 0);

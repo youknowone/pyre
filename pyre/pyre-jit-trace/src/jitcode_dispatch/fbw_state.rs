@@ -2850,18 +2850,29 @@ pub(crate) fn fbw_ensure_boxed_for_ca<Sym: WalkSym>(
 /// FBW-native port of `MIFrame::store_token_in_vable` (`pyjitpl.py`).
 /// Records `FORCE_TOKEN` + `SETFIELD_GC(vbox, token, vable_token_descr)`
 /// via `store_token_in_vable_setfield` and, when that fires, the
-/// `GUARD_NOT_FORCED_2` with resumedata captured through the walker's own
-/// single-frame snapshot machinery (`walker_capture_snapshot_for_last_guard`)
-/// — the same resume coordinate (`entry_py_pc` / `outer_active_boxes`) every
-/// other FBW guard uses, since pyre's blackhole can only re-enter the outer
-/// Python opcode boundary.  No-op when there is no standard virtualizable.
+/// `GUARD_NOT_FORCED_2` with the current vable/vref state. Upstream
+/// `finishframe` / `finishframe_exception` have popped every MIFrame before
+/// `compile_done_with_this_frame` / `compile_exit_frame_with_exception` call
+/// this: `capture_resumedata` reaches `create_empty_top_snapshot`. There is
+/// no instruction to restart and no opcode-entry stack to restore. In
+/// particular, ordinary guard capture must not replace the final last_instr
+/// with a `py_pc - 1` resume coordinate. No-op without a standard virtualizable.
 pub(crate) fn fbw_store_token_in_vable<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
     if ctx.trace_ctx.store_token_in_vable_setfield() {
+        if !ctx.trace_ctx.vable_snapshot_buildable() {
+            return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
+        }
         ctx.trace_ctx.record_guard(OpCode::GuardNotForced2, &[], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+        ctx.trace_ctx
+            .capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
+                &[],
+                &vable_boxes,
+                &vref_boxes,
+            );
     }
     Ok(())
 }
@@ -2888,8 +2899,8 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 
 /// Void variant of [`fbw_terminate_with_finish`] for the top-level
 /// `void_return/` portal exit (`compile_done_with_this_frame`'s VOID
-/// branch, pyjitpl.py).  Publishes the return coordinate and stores the
-/// virtualizable back the same way, then stashes a `Type::Void`-marked payload so
+/// branch, pyjitpl.py).  Publishes the return coordinate, arms the same lazy
+/// virtualizable token, then stashes a `Type::Void`-marked payload so
 /// [`crate::trace::full_body_walk_trace`] builds a `TraceAction::Finish`
 /// with no args (`done_with_this_frame_descr_from_types(&[])` resolves the
 /// void descr).  Like the value path it does NOT record the `FINISH` op —
