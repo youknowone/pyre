@@ -10832,9 +10832,12 @@ impl CraneliftBackend {
                 let kept: Vec<usize> = (0..arity)
                     .filter(|&i| loop_phi_keep.is_none_or(|keep| keep[i]))
                     .collect();
-                let vals = if kept.len() <= FROZEN_LABEL_PARAM_ARITY {
+                let vals = if kept.iter().all(|&i| i < FROZEN_LABEL_PARAM_ARITY) {
                     // Wide entry: JUMP values arrived as Tail params
-                    // (`llgraph execute_jump` / wasm label-param entry).
+                    // indexed by original JUMP slot, the same freeze as
+                    // wasm `FROZEN_LABEL_PARAM_ARITY`.  `kept.len()` is
+                    // not the bound — a kept original index can be >= 16
+                    // after demotion of earlier slots.
                     let wide = builder.block_params(loader);
                     kept.iter().map(|&i| wide[i]).collect()
                 } else {
