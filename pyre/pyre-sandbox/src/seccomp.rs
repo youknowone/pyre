@@ -135,7 +135,7 @@ extern "C" fn report_blocked_syscall(
         libc::write(2, buf.as_ptr() as *const libc::c_void, len);
         // openat(2) path is the most common lockdown miss; print it so the
         // next failure names the file instead of only syscall 257.
-        if nr == libc::SYS_openat {
+        if i64::from(nr) == libc::SYS_openat {
             write_openat_path(_ctx);
         }
         libc::_exit(159);
