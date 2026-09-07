@@ -657,7 +657,11 @@ impl AstValidator {
             }
             ast::Expr::DictComp(node) => {
                 self.validate_comprehension(&node.generators)?;
-                self.validate_expr(&node.key, ast::ExprContext::Load)?;
+                let key = node
+                    .key
+                    .as_deref()
+                    .ok_or_else(|| validation_error("field 'key' is required for DictComp"))?;
+                self.validate_expr(key, ast::ExprContext::Load)?;
                 self.validate_expr(&node.value, ast::ExprContext::Load)
             }
             ast::Expr::Await(node) => self.validate_expr(&node.value, ast::ExprContext::Load),

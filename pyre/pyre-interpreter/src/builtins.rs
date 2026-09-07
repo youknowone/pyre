@@ -14937,7 +14937,11 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         // Ruff detects the same condition in its parser, so normalize only
         // that structured error rather than rewriting arbitrary messages.
         match &parse_err.error {
-            ParseErrorType::DuplicateKeywordArgumentError(name) => {
+            ParseErrorType::OtherError(message)
+                if let Some(name) = message
+                    .strip_prefix("Duplicate keyword argument `")
+                    .and_then(|rest| rest.strip_suffix('`')) =>
+            {
                 format!("keyword argument repeated: {name}")
             }
             ParseErrorType::Lexical(LexicalErrorType::FStringError(
