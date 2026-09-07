@@ -3831,32 +3831,35 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the self-recursive `CALL_ASSEMBLER` trampoline the nested-decline
     // hazard names.  Refusing it inside `rec` aborted the inline before
     // `sys._getframe` could force a multi-frame carrier.
+    // Tagged flatten residuals bind `[lhs, rhs, tag]`.  A codewriter
+    // residual of the same helper can bind `[tag, lhs, rhs]`.  The tag
+    // is a small int; treating it as a `PyObjectRef` is a misaligned
+    // dereference (`0x1` for compare tag 1).
+    let is_exact_int_word = |word: i64| {
+        let obj = word as pyre_object::PyObjectRef;
+        !obj.is_null()
+            && (word as usize).is_multiple_of(std::mem::align_of::<usize>())
+            && unsafe {
+                pyre_object::is_int(obj)
+                    && !pyre_object::is_bool(obj)
+                    && pyre_object::is_exact_builtin_instance(obj)
+            }
+    };
+    let exact_int_binop_operands =
+        (args.len() >= 2 && is_exact_int_word(args[0]) && is_exact_int_word(args[1]))
+            || (args.len() >= 3 && is_exact_int_word(args[1]) && is_exact_int_word(args[2]));
     let observed_exact_int_binop = matches!(
         helper,
         majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
-    ) && args.len() >= 2
-        && {
-            let lhs = args[0] as pyre_object::PyObjectRef;
-            let rhs = args[1] as pyre_object::PyObjectRef;
-            !lhs.is_null()
-                && !rhs.is_null()
-                && unsafe {
-                    pyre_object::is_int(lhs)
-                        && !pyre_object::is_bool(lhs)
-                        && pyre_object::is_exact_builtin_instance(lhs)
-                        && pyre_object::is_int(rhs)
-                        && !pyre_object::is_bool(rhs)
-                        && pyre_object::is_exact_builtin_instance(rhs)
-                }
-        };
-    // Flatten residual fallback is tagged `BinaryOp` / `CompareOp`.  A
-    // codewriter residual of the same helper can arrive with
-    // `RuntimeHelperKind::None`; match the published fnaddr so
-    // `do_residual_call` still runs at this framestack depth.
-    let opcode_binop_or_compare = pyre_interpreter::jit_trace_fnaddrs().iter().any(|(n, a)| {
-        *a == func_ptr as i64
-            && (n.ends_with("binary_value_from_tag") || n.ends_with("compare_value_from_tag"))
-    });
+    ) && exact_int_binop_operands;
+    // A codewriter residual of the same helper can arrive with
+    // `RuntimeHelperKind::None`.  The fnaddr only names the helper;
+    // user `__add__` / `__eq__` still mutate, so keep the exact-int gate.
+    let opcode_binop_or_compare = exact_int_binop_operands
+        && pyre_interpreter::jit_trace_fnaddrs().iter().any(|(n, a)| {
+            *a == func_ptr as i64
+                && (n.ends_with("binary_value_from_tag") || n.ends_with("compare_value_from_tag"))
+        });
     // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
     // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
     // cannot mutate an object visible before the call.  Upstream records list

@@ -1881,7 +1881,6 @@ fn caller_operand_slots<Sym: WalkSym>(
 /// found 21 declines across 10 fixtures, every one of them a ref color whose
 /// shadow held the untracked `Null` sentinel.  Gated like the rest of the
 /// walk's build reporting.
-#[allow(dead_code)] // kept for debug re-enable of a live-color refuse
 fn report_caller_image_decline<T: std::fmt::Debug>(
     jitcode_index: u32,
     call_jit_pc: usize,
@@ -2057,10 +2056,20 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                     Some(o) => match ctx.trace_ctx.recover_ref_value(o, 8) {
                         Some(majit_ir::Value::Ref(gc)) => gc.0 as pyre_object::PyObjectRef,
                         _ => {
-                            // Same as a `None` box: the producer is recorded
-                            // but this path never observed the value.
+                            // A real box whose concrete cannot be recovered
+                            // is not an absent `None`.  `_copy_data_from_miframe`
+                            // skips only missing boxes; `build_single_frame_miframe`
+                            // declines this same unrecoverable live color.
+                            report_caller_image_decline(
+                                jitcode_index,
+                                call_jit_pc,
+                                'r',
+                                color,
+                                ctx.concrete_registers_r.len(),
+                                got,
+                            );
                             report_caller_image_ref_box(ctx, color);
-                            continue;
+                            return None;
                         }
                     },
                     None => {
