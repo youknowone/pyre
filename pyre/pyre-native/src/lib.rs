@@ -10,10 +10,6 @@
 pub mod cffi;
 pub mod hash;
 pub mod locale;
-// rustpython-common's lzma module is cfg'd off on Android and wasm32;
-// those targets keep the xz-core engine here so `_lzma` still compiles.
-#[cfg(any(target_os = "android", target_arch = "wasm32"))]
-pub mod lzma;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ssl;
 #[cfg(feature = "wasm_vfs")]
