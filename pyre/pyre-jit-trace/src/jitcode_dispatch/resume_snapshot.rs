@@ -1881,6 +1881,7 @@ fn caller_operand_slots<Sym: WalkSym>(
 /// found 21 declines across 10 fixtures, every one of them a ref color whose
 /// shadow held the untracked `Null` sentinel.  Gated like the rest of the
 /// walk's build reporting.
+#[allow(dead_code)] // kept for debug re-enable of a live-color refuse
 fn report_caller_image_decline<T: std::fmt::Debug>(
     jitcode_index: u32,
     call_jit_pc: usize,
@@ -1989,15 +1990,11 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         }
         let got = ctx.concrete_registers_i.get(color).copied();
         let Some(ConcreteValue::Int(value)) = got else {
-            report_caller_image_decline(
-                jitcode_index,
-                call_jit_pc,
-                'i',
-                color,
-                ctx.concrete_registers_i.len(),
-                got,
-            );
-            return None;
+            // `_copy_data_from_miframe` (`blackhole.py`) skips a `None` /
+            // `MissingValue` box and leaves the register unset.  A live color
+            // past the walk's bank is the same absence: the `-live-` set is
+            // the union of paths into this pc, and this walk took one of them.
+            continue;
         };
         int_values.push((color, value));
         if let Some(seeded) = int_seeded.get_mut(color) {
@@ -2060,29 +2057,17 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                     Some(o) => match ctx.trace_ctx.recover_ref_value(o, 8) {
                         Some(majit_ir::Value::Ref(gc)) => gc.0 as pyre_object::PyObjectRef,
                         _ => {
-                            report_caller_image_decline(
-                                jitcode_index,
-                                call_jit_pc,
-                                'r',
-                                color,
-                                ctx.concrete_registers_r.len(),
-                                got,
-                            );
+                            // Same as a `None` box: the producer is recorded
+                            // but this path never observed the value.
                             report_caller_image_ref_box(ctx, color);
-                            return None;
+                            continue;
                         }
                     },
                     None => {
-                        report_caller_image_decline(
-                            jitcode_index,
-                            call_jit_pc,
-                            'r',
-                            color,
-                            ctx.concrete_registers_r.len(),
-                            got,
-                        );
-                        report_caller_image_ref_box(ctx, color);
-                        return None;
+                        // Color past the walk's `registers_r` bank.  Same
+                        // absence as `Some(o) if o.is_none()`: `_copy_data_from_miframe`
+                        // leaves it unset instead of refusing the image.
+                        continue;
                     }
                 }
             }
@@ -2113,15 +2098,8 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         }
         let got = ctx.registers_f.get(color).copied();
         let Some(opref) = got.filter(|&opref| opref != OpRef::NONE) else {
-            report_caller_image_decline(
-                jitcode_index,
-                call_jit_pc,
-                'f',
-                color,
-                ctx.registers_f.len(),
-                got,
-            );
-            return None;
+            // `_copy_data_from_miframe` skips a missing float box.
+            continue;
         };
         float_values.push((color, opref));
         if let Some(seeded) = float_seeded.get_mut(color) {

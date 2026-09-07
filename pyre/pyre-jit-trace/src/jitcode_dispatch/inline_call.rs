@@ -12183,7 +12183,14 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         // Same cut as `try_walker_orthodox_descent`: an un-lowered helper
         // inside the callee is not a portal abort.  Residualize through
         // `jitcode.fnaddr` (`blackhole.py bhimpl_inline_call_*`).
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+        //
+        // `GuardResumeCoordinateUnavailable` is the same class of decline:
+        // `run_codewriter_helper_inline_call` cannot stamp the helper's
+        // parent resume word (`pyjitpl.py capture_resumedata`).  Aborting
+        // the caller would drop a recursive carrier before `getframe`
+        // forces it; residualize the helper and keep walking the caller.
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
+        | Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
             cut_declined_subwalk(ctx, pre_fold_pos);
             residualize_inline_call_via_fnaddr(ctx, pc, descr_index, int_args, ref_args, float_args)
         }

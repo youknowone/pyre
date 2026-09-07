@@ -586,7 +586,10 @@ pub(crate) fn try_walker_specialize_binary_op_int_zero_div<Sym: WalkSym>(
         }
     }
     // The raising arm needs the helper-produced exception as its concrete
-    // shadow, but records no helper call in the trace.
+    // shadow, but records no helper call in the trace.  Execute the live
+    // `allboxes` (`executor.execute_residual_call`), not the shadow objects
+    // used for the exactness gate: a stale zero in the rhs shadow must not
+    // invent a `ZeroDivisionError` for `n % 2`.
     let Some(Err(exc_i64)) = walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)
     else {
         return Ok(None);
