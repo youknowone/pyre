@@ -11,13 +11,7 @@
 
 use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 use pyre_object::*;
-#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 use rustpython_common::compression::lzma as backend;
-#[cfg(any(target_os = "android", target_arch = "wasm32"))]
-use wasm_backend as backend;
-
-#[cfg(any(target_os = "android", target_arch = "wasm32"))]
-mod wasm_backend;
 
 use parking_lot::Mutex;
 
