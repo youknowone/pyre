@@ -15870,12 +15870,13 @@ impl<M: Clone> MetaInterp<M> {
             let Some(ginfo) = jd.greenfield_info.as_ref() else {
                 return;
             };
-            (jd.num_greens(), ginfo.red_index, jd.virtualizable_info.is_some())
+            (
+                jd.num_greens(),
+                ginfo.red_index,
+                jd.virtualizable_info.is_some(),
+            )
         };
-        debug_assert!(
-            !has_vinfo,
-            "greenfield + virtualizable on the same driver"
-        );
+        debug_assert!(!has_vinfo, "greenfield + virtualizable on the same driver");
         let index = num_greens + red_index;
         let Some((kind, opref, concrete)) = original_boxes.get(index) else {
             return;
@@ -16645,7 +16646,11 @@ impl<M: Clone> MetaInterp<M> {
         let mut start_stack: Vec<(usize, PortalGreenKey, usize)> = Vec::new();
         let mut max_size = 0isize;
         let mut max_key = None;
-        for (jd_no, key, pos) in positions.iter().cloned().chain(machine_events.iter().cloned()) {
+        for (jd_no, key, pos) in positions
+            .iter()
+            .cloned()
+            .chain(machine_events.iter().cloned())
+        {
             match key {
                 // pyjitpl.py:3547-3548 `if key is not None: start_stack.append`.
                 Some(key) => start_stack.push((jd_no, key, pos._pos)),
@@ -21160,10 +21165,8 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let mut jd = crate::jitdriver::JitDriverStaticData::new(
-            vec![],
-            vec![("obj", majit_ir::Type::Ref)],
-        );
+        let mut jd =
+            crate::jitdriver::JitDriverStaticData::new(vec![], vec![("obj", majit_ir::Type::Ref)]);
         jd.greenfield_info = Some(crate::greenfield::GreenFieldInfo::new(
             0,
             vec![("G".into(), "field".into())],
@@ -23133,21 +23136,17 @@ mod metainterp_static_data_tests {
         // of find_biggest_function concatenates both logs.
         meta.portal_trace_positions = Some(Vec::new());
         let start = meta.trace_ctx().expect("tracing").get_trace_position();
-        meta.tracing.as_mut().unwrap().push_portal_trace_event(
-            jd_no,
-            Some((0xCAFE, None)),
-            start,
-        );
+        meta.tracing
+            .as_mut()
+            .unwrap()
+            .push_portal_trace_event(jd_no, Some((0xCAFE, None)), start);
         record_ops(&mut meta, 3);
         let end = meta.trace_ctx().expect("tracing").get_trace_position();
         meta.tracing
             .as_mut()
             .unwrap()
             .push_portal_trace_event(jd_no, None, end);
-        assert_eq!(
-            meta.find_biggest_function(),
-            Some((jd_no, (0xCAFE, None)))
-        );
+        assert_eq!(meta.find_biggest_function(), Some((jd_no, (0xCAFE, None))));
 
         // pyjitpl.py `self.portal_trace_positions = None` — after the
         // abort boundary nothing is logged and nothing is found.
