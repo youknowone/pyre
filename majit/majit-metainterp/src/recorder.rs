@@ -32,7 +32,10 @@ struct FrontendSlot {
     fail_args: Option<Vec<OpRef>>,
     fail_arg_types: Option<Vec<Type>>,
     concrete: Cell<Option<Value>>,
-    args: Vec<OpRef>,
+    /// First operand, only for `GetfieldGcR` recovery while the `Op`
+    /// does not yet exist. `history.py FrontendOp` does not store args;
+    /// they live in the byte stream.
+    first_arg: Option<OpRef>,
 }
 
 /// opencoder.py `cut_point()` — RPython 5-tuple
@@ -382,7 +385,12 @@ impl Trace {
     ) -> OpRef {
         let unique = self.op_count;
         let opref = OpRef::op_typed(unique, opcode.result_type());
-        let boxes: Vec<OcBox> = args.iter().copied().map(|a| self.arg_to_box(a)).collect();
+        let first_arg = args.first().copied();
+        // history.py record0/1/2/3 take the boxes inline. A heap `Vec`
+        // here would be one allocation per recorded op; arity ≤ 4 is
+        // the fixed-op surface (`resoperation.py oparity`).
+        let boxes: smallvec::SmallVec<[OcBox; 4]> =
+            args.iter().copied().map(|a| self.arg_to_box(a)).collect();
         let trb = self
             .trb
             .as_mut()
@@ -409,7 +417,7 @@ impl Trace {
             fail_args: fail_args.map(|a| a.to_vec()),
             fail_arg_types: None,
             concrete: Cell::new(None),
-            args: args.to_vec(),
+            first_arg,
         });
         self.recorded_ops_total += 1;
         self.op_count += 1;
@@ -1217,7 +1225,7 @@ impl Trace {
             return None;
         }
         let descr = slot.descr.clone()?;
-        let obj = slot.args.first().copied()?;
+        let obj = slot.first_arg?;
         Some((descr, obj))
     }
 
