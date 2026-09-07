@@ -31,7 +31,7 @@
 //! bytecode, `GILReleaseAction` (gil.py) yields it from the periodic
 //! action; [`yield_thread`] is that yield.
 
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
 // thread_pthread.c's mutex1_t and mutex2_t own native synchronization objects.
 // rpy_init_mutexes resets them in the forked child. A parking_lot mutex also
 // has waiters in a process-global queue: replacing its local bytes would leave
@@ -55,6 +55,11 @@ const GIL_NOT_INITIALIZED: isize = -42;
 /// thread_gil.c:88 `rpy_early_poll_n`, the running seed for the randomised
 /// early-poll count.
 static RPY_EARLY_POLL_N: AtomicIsize = AtomicIsize::new(0);
+
+/// rgil.py `_emulated_after_thread_switch` / translated
+/// `translator._rgil_invoke_after_thread_switch`. One callback, as upstream
+/// does not implement several.
+static AFTER_THREAD_SWITCH: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// thread_gil.c:111-112.
 const RPY_GIL_POKE_MIN: isize = 40;
@@ -279,6 +284,7 @@ pub fn acquire() {
     if !acquire_fast_path(ident) {
         acquire_slow_path(ident);
     }
+    after_thread_switch();
 }
 
 /// rgil.py `acquire_maybe_in_new_thread`, the acquire used by a thread
@@ -448,6 +454,29 @@ pub fn yield_thread() -> bool {
     true
 }
 
+/// rgil.py `invoke_after_thread_switch` — register the single callback
+/// `acquire` / `acquire_maybe_in_new_thread` / a real `yield_thread`
+/// run after taking the GIL. `yield_thread` goes through [`acquire`],
+/// so the hook fires once there, matching the translated C yield path
+/// that does not re-enter `rgil.acquire`.
+pub fn invoke_after_thread_switch(callback: fn()) {
+    let prev = AFTER_THREAD_SWITCH.swap(callback as *mut (), Ordering::SeqCst);
+    debug_assert!(
+        prev.is_null() || prev == callback as *mut (),
+        "not implemented yet: several invoke_after_thread_switch()"
+    );
+}
+
+/// rgil.py `_after_thread_switch`.
+fn after_thread_switch() {
+    let callback = AFTER_THREAD_SWITCH.load(Ordering::Acquire);
+    if !callback.is_null() {
+        // SAFETY: only [`invoke_after_thread_switch`] stores a `fn()`.
+        let callback: fn() = unsafe { std::mem::transmute(callback) };
+        callback();
+    }
+}
+
 /// RAII bracket for code that enters pyre from outside — a thread that has to
 /// take the GIL before it may touch the GC, and give it back afterwards.
 /// `rffi`'s callback wrappers hold it the same way around the RPython side of a
@@ -491,6 +520,21 @@ mod tests {
         drop(guard);
         assert_eq!(gil_get_holder(), 0);
         assert!(!am_i_holding_the_gil());
+    }
+
+    #[test]
+    fn acquire_runs_the_after_thread_switch_hook() {
+        let _serial = TEST_SERIAL.lock();
+        allocate();
+        static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn hook() {
+            FIRED.store(true, Ordering::SeqCst);
+        }
+        invoke_after_thread_switch(hook);
+        FIRED.store(false, Ordering::SeqCst);
+        let _guard = GilGuard::acquire();
+        assert!(FIRED.load(Ordering::SeqCst));
+        AFTER_THREAD_SWITCH.store(std::ptr::null_mut(), Ordering::SeqCst);
     }
 
     #[test]

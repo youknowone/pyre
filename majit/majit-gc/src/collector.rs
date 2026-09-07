@@ -1450,12 +1450,6 @@ impl MiniMarkGC {
             .oldgen
             .alloc_with_card_header(total_size, card_header_bytes);
         let obj = self.finish_alloc_in_oldgen(type_id, total_size, ptr, extra_flags);
-        // `allocsize = cardheadersize + round_up_for_allocation(totalsize)` is
-        // what upstream adds to `rawmalloced_total_size`; the shared tail
-        // accounted for the object, so the card header is what is left.
-        self.bytes_made_old_since_cycle = self
-            .bytes_made_old_since_cycle
-            .saturating_add(card_header_bytes);
         Self::raw_memclear(obj, total_size);
         obj
     }
@@ -2033,10 +2027,11 @@ impl MiniMarkGC {
     /// that young-result contract because the GC rewrite elides write barriers
     /// while initializing a fresh nursery object (`rewrite.py:911`).
     fn nursery_allocation_size(total_size: usize) -> usize {
+        let align = crate::header::MEMORY_ALIGNMENT;
         total_size
             .max(GcHeader::MIN_NURSERY_OBJ_SIZE)
-            .checked_add(7)
-            .map(|size| size & !7)
+            .checked_add(align - 1)
+            .map(|size| size & !(align - 1))
             .unwrap_or(usize::MAX)
     }
 
@@ -2858,8 +2853,8 @@ impl MiniMarkGC {
             type_id,
             self.oldgen_birth_flags(extra_flags | GcFlags::GCFLAG_TRACK_YOUNG_PTRS),
         );
-        self.bytes_made_old_since_cycle =
-            self.bytes_made_old_since_cycle.saturating_add(total_size);
+        // `size_objects_made_old` counts promotions, not old-gen births.
+        // `external_malloc(..., alloc_young=False)` does not bump it.
         let obj_addr = (ptr as usize) + GcHeader::SIZE;
         self.audit_allocation_size(type_id, total_size, obj_addr, "oldgen");
         if crate::gc_lifetime_log_enabled() {
@@ -3657,7 +3652,7 @@ impl MiniMarkGC {
             None
         };
         self.minor_collection_body();
-        self.run_major_progress_after_minor();
+        self.run_major_progress_after_minor(false);
         self.rrc_invoke_callback();
     }
 
@@ -6289,11 +6284,12 @@ impl MiniMarkGC {
     /// `nursery_size / 2` bytes of promotion credit, and allocation-heavy
     /// minors may need multiple consecutive steps so old-gen growth does not
     /// outrun marking.
-    fn run_major_progress_after_minor(&mut self) {
-        // incminimark.py:832 — automatic major progress after a minor stops
-        // while disabled; explicit collect() passes force_enabled and stays
-        // ungated (collect_full / collect_oldgen_nonmoving here).
-        if !self.enabled {
+    fn run_major_progress_after_minor(&mut self, force_enabled: bool) {
+        // incminimark.py `minor_collection_with_major_progress`: automatic
+        // major progress after a minor stops while disabled; explicit
+        // collect() passes force_enabled and stays ungated without flipping
+        // `enabled`.
+        if !self.enabled && !force_enabled {
             return;
         }
         let extrasize = self.pending_reserving_size;
@@ -7764,19 +7760,18 @@ impl MiniMarkGC {
     /// in progress, run at least one major collection step.  If there is no
     /// major GC but the threshold is reached, start a major GC."
     ///
-    /// `do_collect_nursery` is that function with `force_enabled=False` baked
-    /// in, because its tail `run_major_progress_after_minor` reads
-    /// `self.enabled`.  The forced form lends the flag for the call, which is
-    /// what `force_enabled` means: an explicit collection makes major progress
-    /// even while automatic progress is switched off.
+    /// `do_collect_nursery` is that function with `force_enabled=False`.
+    /// Explicit `collect(0/1)` passes `force_enabled=True` so major progress
+    /// still runs while automatic progress is switched off, without flipping
+    /// `enabled`.
     fn minor_collection_with_major_progress(&mut self, force_enabled: bool) {
         if !force_enabled {
             self.do_collect_nursery();
             return;
         }
-        let was_enabled = std::mem::replace(&mut self.enabled, true);
-        self.do_collect_nursery();
-        self.enabled = was_enabled;
+        self.minor_collection_body();
+        self.run_major_progress_after_minor(true);
+        self.rrc_invoke_callback();
     }
 
     /// incminimark.py `collect(gen=2)`: "Do a minor (gen=0), start a major
@@ -11696,8 +11691,8 @@ mod tests {
             std::mem::size_of::<usize>() * gc.card_marking_words_for_length(length);
         assert!(card_header_bytes > 0);
         assert_eq!(
-            gc.bytes_made_old_since_cycle - bytes_before,
-            card_header_bytes + total_size
+            gc.bytes_made_old_since_cycle, bytes_before,
+            "an old-gen birth is not a promotion"
         );
     }
 
@@ -12876,7 +12871,7 @@ mod tests {
         gc.bytes_made_old_since_cycle = gc.config.nursery_size;
         gc.threshold_bytes_made_old = 0;
         let minors_before = gc.minor_collections;
-        gc.run_major_progress_after_minor();
+        gc.run_major_progress_after_minor(false);
 
         assert!(
             gc.minor_collections > minors_before,
@@ -12916,7 +12911,7 @@ mod tests {
         gc.pending_reserving_size = gc.config.nursery_size / 4;
         let minors_before = gc.minor_collections;
 
-        gc.run_major_progress_after_minor();
+        gc.run_major_progress_after_minor(false);
 
         assert!(gc.minor_collections > minors_before);
         gc.pending_reserving_size = 0;
@@ -12946,7 +12941,7 @@ mod tests {
             gc.pending_reserving_size = extrasize;
             let minors_before = gc.minor_collections;
 
-            gc.run_major_progress_after_minor();
+            gc.run_major_progress_after_minor(false);
 
             assert_eq!(gc.gc_state, GcState::Marking);
             assert_eq!(gc.bytes_made_old_since_cycle, 0);

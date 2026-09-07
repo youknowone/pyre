@@ -134,6 +134,14 @@ impl ArenaCollection {
         }
     }
 
+    /// `llarena.arena_reset(result, sizeof(Address), 0)` after reading the
+    /// next-free link stored in the block's first word.
+    unsafe fn take_free_link(block: *mut u8) -> *mut u8 {
+        let next = unsafe { *(block as *mut *mut u8) };
+        unsafe { *(block as *mut usize) = 0 };
+        next
+    }
+
     /// `ArenaCollection.malloc`: allocate an uninitialized arena block.
     pub fn malloc(&mut self, size: usize) -> *mut u8 {
         let nsize = size;
@@ -154,7 +162,7 @@ impl ArenaCollection {
             let result = (*page).freeblock;
             let freeblock = if (*page).nfree > 0 {
                 (*page).nfree -= 1;
-                *(result as *mut *mut u8)
+                Self::take_free_link(result)
             } else {
                 result.add(nsize)
             };
@@ -180,7 +188,7 @@ impl ArenaCollection {
             let result = (*arena).freepages;
             let freepages = if (*arena).nfreepages > 0 {
                 (*arena).nfreepages -= 1;
-                *(result as *mut *mut u8)
+                Self::take_free_link(result)
             } else {
                 assert!(self.num_uninitialized_pages > 0);
                 self.num_uninitialized_pages -= 1;
@@ -654,7 +662,9 @@ mod tests {
         let objects: Vec<_> = (0..5).map(|_| ac.malloc(2 * WORD)).collect();
         ac.mass_free(|obj| obj == objects[1] || obj == objects[3]);
         assert_eq!(ac.total_memory_used, 3 * 2 * WORD);
-        assert_eq!(ac.malloc(2 * WORD), objects[1]);
+        let reused_first = ac.malloc(2 * WORD);
+        assert_eq!(reused_first, objects[1]);
+        assert_eq!(unsafe { *(reused_first as *const usize) }, 0);
         assert_eq!(ac.malloc(2 * WORD), objects[3]);
     }
 
