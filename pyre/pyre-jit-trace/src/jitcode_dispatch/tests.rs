@@ -617,8 +617,11 @@ fn test_outer_resume_jitcode_index() -> u32 {
 
 #[test]
 fn branch_guard_snapshot_rechecks_the_condition_before_either_arm() {
-    // pyjitpl.py opimpl_goto_if_not captures orgpc, not the other arm.
-    // A later guard sharing this snapshot can fail with either condition.
+    // `guarded_branch_core` captures at `other_target` (the not-taken
+    // arm), not `goto_if_not`'s orgpc. A depth-0 branch resumes past
+    // `POP_JUMP_IF_*`; stamping the guard pc would re-run the branch
+    // and desync the decoded box layout. The condition stays live so
+    // a later shared-snapshot guard can still see it.
     let live = crate::state::op_live();
     let goto = insns_opname_to_byte()["goto_if_not/iL"];
     let code = vec![live, 0, 0, goto, 0, 7, 0, live, 4, 0];
@@ -691,13 +694,13 @@ fn branch_guard_snapshot_rechecks_the_condition_before_either_arm() {
     let guard = tc.ops().last().unwrap();
     let snapshot = tc.get_snapshot(guard.rd_resume_position.get()).unwrap();
     assert_eq!(
-        snapshot.frames[0].pc, 0,
-        "resume must re-execute goto_if_not"
+        snapshot.frames[0].pc, 7,
+        "resume must enter the not-taken arm"
     );
     assert_eq!(
         snapshot.frames[0].boxes.len(),
-        1,
-        "resume must keep the condition"
+        0,
+        "the condition is dead on the not-taken arm"
     );
 }
 
