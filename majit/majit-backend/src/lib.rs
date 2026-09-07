@@ -69,6 +69,7 @@ pub fn fallback_cpu_tracker() -> &'static CpuTotalTracker {
 
 pub mod call_stub;
 pub mod deadframe;
+pub mod eager;
 pub mod finish_descrs;
 pub mod jitframe;
 pub mod libc_deadframe;
@@ -80,9 +81,10 @@ pub mod resume_value;
 pub mod synthetic_cpu;
 
 pub use finish_descrs::{
-    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrMulti,
-    DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef,
-    PropagateExceptionDescr, get_or_attach_done_with_this_frame_descr_multi,
+    DescrContainer, DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt,
+    DoneWithThisFrameDescrMulti, DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid,
+    ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
+    get_or_attach_done_with_this_frame_descr_multi, make_and_attach_done_descrs,
 };
 pub use jitframe::JitFrameInfo;
 pub use rd_payload::RdPayload;
