@@ -14937,7 +14937,11 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         // Ruff detects the same condition in its parser, so normalize only
         // that structured error rather than rewriting arbitrary messages.
         match &parse_err.error {
-            ParseErrorType::DuplicateKeywordArgumentError(name) => {
+            ParseErrorType::OtherError(message)
+                if let Some(name) = message
+                    .strip_prefix("Duplicate keyword argument `")
+                    .and_then(|rest| rest.strip_suffix('`')) =>
+            {
                 format!("keyword argument repeated: {name}")
             }
             ParseErrorType::Lexical(LexicalErrorType::FStringError(
@@ -20077,7 +20081,19 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
 
     if let Some(fd) = file_get_fd(self_obj) {
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        {
+            let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+            let (result, _errno) = pyre_object::with_roots!(self_obj, index =>
+                crate::module::thread::call_external_function(|| {
+                    rustpython_host_env::crt_fd::ftruncate(borrowed, size as libc::off_t)
+                })
+            );
+            result.map_err(|error| fd_errno_err(error.raw_os_error().unwrap_or(0)))?;
+            fileio_clear_stat_atopen(self_obj);
+            return Ok(index);
+        }
+        #[cfg(all(unix, not(feature = "host_env"), not(feature = "sandbox")))]
         {
             if crt_call!(libc::ftruncate(fd, size as libc::off_t)) < 0 {
                 return Err(fd_errno_err(crt_errno()));
@@ -21136,7 +21152,17 @@ fn fileio_close_owned_fd(fd: i32) {
 /// PyPy `_open_inhcache.set_non_inheritable(fd)` / `rposix.set_inheritable`.
 /// A caller-supplied integer descriptor is deliberately excluded: FileIO must
 /// preserve that descriptor's existing inheritance flag.
-#[cfg(all(unix, not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    use std::os::fd::BorrowedFd;
+
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    rustpython_host_env::posix::set_inheritable(fd, false).map_err(|error| {
+        crate::PyError::os_error_syscall(error.raw_os_error().unwrap_or(0), w_name)
+    })
+}
+
+#[cfg(all(unix, not(feature = "host_env"), not(feature = "sandbox")))]
 fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate::PyError> {
     let current = crt_call!(libc::fcntl(fd, libc::F_GETFD));
     if current < 0 {

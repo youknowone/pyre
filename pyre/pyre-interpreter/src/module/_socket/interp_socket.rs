@@ -1649,37 +1649,38 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::make_builtin_function_with_arity(
                 "if_nameindex",
                 |_| {
-                    let head = unsafe { libc::if_nameindex() };
-                    if head.is_null() {
-                        return Err(socket_last_error());
-                    }
-                    // Every field and entry is freshly allocated and the next
-                    // one allocates again, so each is pinned as it is produced
-                    // (`build_list_storage`).  The field bracket closes before
-                    // its tuple joins the outer one: the pins share one stack
-                    // and must unwind in order.
-                    let mut items = pyre_object::gc_roots::RootedItems::new();
-                    let mut p = head;
-                    unsafe {
+                    #[cfg(all(feature = "host_env", any(target_os = "dragonfly", target_os = "freebsd", target_os = "fuchsia", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "netbsd", target_os = "openbsd")))]
+                    let interfaces = rustpython_host_env::socket::if_nameindex()
+                        .map_err(socket_io_err)?
+                        .into_iter()
+                        .map(|(index, name)| (index, name.into_bytes()))
+                        .collect::<Vec<_>>();
+                    #[cfg(not(all(feature = "host_env", any(target_os = "dragonfly", target_os = "freebsd", target_os = "fuchsia", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "netbsd", target_os = "openbsd"))))]
+                    let interfaces = unsafe {
+                        let head = libc::if_nameindex();
+                        if head.is_null() {
+                            return Err(socket_last_error());
+                        }
+                        let mut interfaces = Vec::new();
+                        let mut p = head;
                         while (*p).if_index != 0 && !(*p).if_name.is_null() {
-                            let entry = {
-                                let mut fields = pyre_object::gc_roots::RootedItems::new();
-                                fields.push(pyre_object::w_int_new((*p).if_index as i64));
-                                // An interface name is an OS string:
-                                // `dev_valid_name` rejects only NUL, '/', ':',
-                                // whitespace, '.' and '..', so any other octet
-                                // is legal.  The sibling `if_nametoindex` below
-                                // fsencodes, so decoding here any other way
-                                // breaks the round trip.
-                                fields.push(crate::gateway::fsdecode_filename_bytes(
-                                    std::ffi::CStr::from_ptr((*p).if_name).to_bytes(),
-                                ));
-                                pyre_object::w_tuple_new(fields.take())
-                            };
-                            items.push(entry);
+                            interfaces.push(((*p).if_index, std::ffi::CStr::from_ptr((*p).if_name).to_bytes().to_vec()));
                             p = p.add(1);
                         }
                         libc::if_freenameindex(head);
+                        interfaces
+                    };
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
+                    for (index, name) in interfaces {
+                        let entry = {
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_int_new(index as i64));
+                            // Interface names are OS bytes: preserve fsencode/fsdecode
+                            // round trips, including non-UTF-8 names.
+                            fields.push(crate::gateway::fsdecode_filename_bytes(&name));
+                            pyre_object::w_tuple_new(fields.take())
+                        };
+                        items.push(entry);
                     }
                     Ok(pyre_object::w_list_new(items.take()))
                 },
@@ -1709,10 +1710,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let name = crate::gateway::fsencode_bytes_w(args[0])?;
                     let c_name = std::ffi::CString::new(name)
                         .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
-                    let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-                    if idx == 0 {
-                        return Err(socket_last_error());
-                    }
+                    #[cfg(feature = "host_env")]
+                    let idx = rustpython_host_env::socket::if_nametoindex_checked(&c_name)
+                        .map_err(socket_io_err)?;
+                    #[cfg(not(feature = "host_env"))]
+                    let idx = {
+                        let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+                        if idx == 0 {
+                            return Err(socket_last_error());
+                        }
+                        idx
+                    };
                     Ok(pyre_object::w_int_new(idx as i64))
                 },
                 1,
@@ -1740,14 +1748,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             "Python int too large for C unsigned int",
                         )
                     })?;
-                    let mut buf = [0u8; libc::IF_NAMESIZE];
-                    let p =
-                        unsafe { libc::if_indextoname(idx, buf.as_mut_ptr() as *mut libc::c_char) };
-                    if p.is_null() {
-                        return Err(socket_last_error());
-                    }
-                    let s = unsafe { std::ffi::CStr::from_ptr(p) };
-                    Ok(crate::gateway::fsdecode_filename_bytes(s.to_bytes()))
+                    #[cfg(feature = "host_env")]
+                    let name = rustpython_host_env::socket::if_indextoname_checked(idx)
+                        .map_err(socket_io_err)?
+                        .into_bytes();
+                    #[cfg(not(feature = "host_env"))]
+                    let name = {
+                        let mut buf = [0u8; libc::IF_NAMESIZE];
+                        let p = unsafe { libc::if_indextoname(idx, buf.as_mut_ptr().cast()) };
+                        if p.is_null() {
+                            return Err(socket_last_error());
+                        }
+                        unsafe { std::ffi::CStr::from_ptr(p).to_bytes().to_vec() }
+                    };
+                    Ok(crate::gateway::fsdecode_filename_bytes(&name))
                 },
                 1,
             ),
@@ -1843,19 +1857,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let raw = crate::builtins::space_index_w(
                         crate::baseobjspace::space_index(args[0])?,
                     )?;
-                    let max_payload = i64::from(libc::c_int::MAX)
-                        - i64::from(unsafe { libc::CMSG_SPACE(1) });
-                    if raw < 0 || raw > max_payload {
-                        return Err(crate::PyError::overflow_error(
-                            "CMSG_SPACE() argument out of range",
-                        ));
-                    }
-                    let n = unsafe { libc::CMSG_SPACE(raw as libc::c_uint) };
-                    if n == 0 || u64::from(n) > libc::c_int::MAX as u64 {
-                        return Err(crate::PyError::overflow_error(
-                            "CMSG_SPACE() argument out of range",
-                        ));
-                    }
+                    #[cfg(all(feature = "host_env", not(target_os = "redox")))]
+                    let n = usize::try_from(raw)
+                        .ok()
+                        .and_then(rustpython_host_env::socket::checked_cmsg_space)
+                        .ok_or_else(|| {
+                            crate::PyError::overflow_error(
+                                "CMSG_SPACE() argument out of range",
+                            )
+                        })?;
+                    #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
+                    let n = {
+                        let max_payload = i64::from(libc::c_int::MAX)
+                            - i64::from(unsafe { libc::CMSG_SPACE(1) });
+                        if raw < 0 || raw > max_payload {
+                            return Err(crate::PyError::overflow_error(
+                                "CMSG_SPACE() argument out of range",
+                            ));
+                        }
+                        let n = unsafe { libc::CMSG_SPACE(raw as libc::c_uint) };
+                        if n == 0 || u64::from(n) > libc::c_int::MAX as u64 {
+                            return Err(crate::PyError::overflow_error(
+                                "CMSG_SPACE() argument out of range",
+                            ));
+                        }
+                        n as usize
+                    };
                     Ok(pyre_object::w_int_new(n as i64))
                 },
                 1,
@@ -1870,17 +1897,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let raw = crate::builtins::space_index_w(
                         crate::baseobjspace::space_index(args[0])?,
                     )?;
-                    if raw < 0 || raw > i64::from(libc::c_int::MAX) {
-                        return Err(crate::PyError::overflow_error(
-                            "CMSG_LEN() argument out of range",
-                        ));
-                    }
-                    let n = unsafe { libc::CMSG_LEN(raw as libc::c_uint) };
-                    if n == 0 || u64::from(n) > libc::c_int::MAX as u64 {
-                        return Err(crate::PyError::overflow_error(
-                            "CMSG_LEN() argument out of range",
-                        ));
-                    }
+                    #[cfg(all(feature = "host_env", not(target_os = "redox")))]
+                    let n = usize::try_from(raw)
+                        .ok()
+                        .and_then(rustpython_host_env::socket::checked_cmsg_len)
+                        .ok_or_else(|| {
+                            crate::PyError::overflow_error("CMSG_LEN() argument out of range")
+                        })?;
+                    #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
+                    let n = {
+                        if raw < 0 || raw > i64::from(libc::c_int::MAX) {
+                            return Err(crate::PyError::overflow_error(
+                                "CMSG_LEN() argument out of range",
+                            ));
+                        }
+                        let n = unsafe { libc::CMSG_LEN(raw as libc::c_uint) };
+                        if n == 0 || u64::from(n) > libc::c_int::MAX as u64 {
+                            return Err(crate::PyError::overflow_error(
+                                "CMSG_LEN() argument out of range",
+                            ));
+                        }
+                        n as usize
+                    };
                     Ok(pyre_object::w_int_new(n as i64))
                 },
                 1,
@@ -5463,11 +5501,62 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
 
             // Lay out cmsgs into a single control buffer.
-            let total_control: usize = cmsgs
-                .iter()
-                .map(|(_, _, d)| unsafe { libc::CMSG_SPACE(d.len() as libc::c_uint) as usize })
-                .sum();
-            let mut control = vec![0u8; total_control];
+            #[cfg(all(feature = "host_env", not(target_os = "redox")))]
+            let mut control = {
+                let refs: Vec<_> = cmsgs
+                    .iter()
+                    .map(|(level, ty, data)| (*level, *ty, data.as_slice()))
+                    .collect();
+                rustpython_host_env::socket::pack_ancillary_messages(&refs).map_err(|error| {
+                    use rustpython_host_env::socket::AncillaryPackError;
+                    match error {
+                        AncillaryPackError::ItemTooLarge => {
+                            crate::PyError::os_error("ancillary data item too large")
+                        }
+                        AncillaryPackError::TooMuchData => {
+                            crate::PyError::os_error("too much ancillary data")
+                        }
+                        AncillaryPackError::UnexpectedNullHeader => crate::PyError::runtime_error(
+                            "unexpected NULL result from CMSG_FIRSTHDR/CMSG_NXTHDR",
+                        ),
+                    }
+                })?
+            };
+            #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
+            let mut control = {
+                let total_control: usize = cmsgs
+                    .iter()
+                    .map(|(_, _, d)| unsafe {
+                        libc::CMSG_SPACE(d.len() as libc::c_uint) as usize
+                    })
+                    .sum();
+                let mut control = vec![0u8; total_control];
+                if total_control > 0 {
+                    let mut packing_msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                    packing_msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                    packing_msg.msg_controllen = total_control as _;
+                    unsafe {
+                        let mut cur = libc::CMSG_FIRSTHDR(&packing_msg);
+                        for (level, ty, data) in &cmsgs {
+                            if cur.is_null() {
+                                break;
+                            }
+                            let cmsg_len = libc::CMSG_LEN(data.len() as libc::c_uint);
+                            (*cur).cmsg_level = *level;
+                            (*cur).cmsg_type = *ty;
+                            (*cur).cmsg_len = cmsg_len as _;
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                libc::CMSG_DATA(cur),
+                                data.len(),
+                            );
+                            cur = libc::CMSG_NXTHDR(&packing_msg, cur);
+                        }
+                    }
+                }
+                control
+            };
+            let total_control = control.len();
             let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
             msg.msg_iov = iovs.as_mut_ptr();
             msg.msg_iovlen = iovs.len() as _;
@@ -5478,24 +5567,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if total_control > 0 {
                 msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                 msg.msg_controllen = total_control as _;
-                unsafe {
-                    let mut cur = libc::CMSG_FIRSTHDR(&msg);
-                    for (level, ty, data) in &cmsgs {
-                        if cur.is_null() {
-                            break;
-                        }
-                        let cmsg_len = libc::CMSG_LEN(data.len() as libc::c_uint);
-                        (*cur).cmsg_level = *level;
-                        (*cur).cmsg_type = *ty;
-                        (*cur).cmsg_len = cmsg_len as _;
-                        std::ptr::copy_nonoverlapping(
-                            data.as_ptr(),
-                            libc::CMSG_DATA(cur),
-                            data.len(),
-                        );
-                        cur = libc::CMSG_NXTHDR(&msg, cur);
-                    }
-                }
             }
 
             socket_wait_writable(obj, fd)?;

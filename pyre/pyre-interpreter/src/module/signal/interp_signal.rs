@@ -728,7 +728,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // `os.fstat` then `get_status_flags`: a bad fd is a ValueError
             // and the fd must already be in non-blocking mode.
             if fd != -1 {
-                #[cfg(unix)]
+                #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+                {
+                    let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+                    let blocking = rustpython_host_env::fileutils::fstat(borrowed)
+                        .and_then(|_| rustpython_host_env::fcntl::get_blocking(borrowed.into()));
+                    let blocking = match blocking {
+                        Ok(blocking) => blocking,
+                        Err(error) => {
+                            if error.raw_os_error() == Some(libc::EBADF) {
+                                return Err(crate::PyError::value_error("invalid fd"));
+                            }
+                            return Err(crate::PyError::os_error_with_errno(
+                                error.raw_os_error().unwrap_or(0),
+                                format!("{error}"),
+                            ));
+                        }
+                    };
+                    if blocking {
+                        return Err(crate::PyError::value_error(format!(
+                            "the fd {fd} must be in non-blocking mode"
+                        )));
+                    }
+                }
+                #[cfg(all(
+                    unix,
+                    any(not(feature = "host_env"), feature = "sandbox")
+                ))]
                 unsafe {
                     let mut st: libc::stat = std::mem::zeroed();
                     let bad_fd = libc::fstat(fd, &mut st) != 0;

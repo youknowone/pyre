@@ -2932,7 +2932,81 @@ fn get_default_verify_paths(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// Windows roots through the platform certificate provider — but callers that
 /// mine the store themselves (`wincertstore`, trust-list builders) read it
 /// through these.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
+mod cert_store {
+    use pyre_object::{PyObjectRef, gc_roots::RootedItems};
+    use rustpython_host_env::cert_store::{self as host, CertificateUses, EncodingType};
+
+    fn win32_error(error: std::io::Error) -> crate::PyError {
+        crate::PyError::os_error_win32_syscall2(
+            error.raw_os_error().unwrap_or(0),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        )
+    }
+
+    fn encoding_type(encoding: EncodingType) -> PyObjectRef {
+        match encoding {
+            EncodingType::X509Asn => pyre_object::w_str_new("x509_asn"),
+            EncodingType::Pkcs7Asn => pyre_object::w_str_new("pkcs_7_asn"),
+            EncodingType::Other(value) => pyre_object::w_int_new(value as i64),
+        }
+    }
+
+    pub fn enum_certificates(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let name = crate::baseobjspace::str_utf8_w(args[0])?;
+        let certs = host::enum_certificates(name);
+        if !certs.had_open_store {
+            return Err(crate::PyError::os_error(format!(
+                "failed to open certificate store {name:?}"
+            )));
+        }
+        let mut items = RootedItems::new();
+        for entry in certs.entries {
+            let tuple = {
+                let mut fields = RootedItems::new();
+                fields.push(pyre_object::w_bytes_from_bytes(&entry.der));
+                fields.push(encoding_type(entry.encoding));
+                // A store can contain hundreds of objects; root both the
+                // completed tuples and every intermediate allocation.
+                let trust = match entry.valid_uses.map_err(win32_error)? {
+                    CertificateUses::All => pyre_object::w_bool_from(true),
+                    CertificateUses::Oids(oids) => {
+                        let mut strings = RootedItems::new();
+                        for oid in oids {
+                            strings.push(pyre_object::w_str_new(&oid));
+                        }
+                        pyre_object::w_frozenset_from_items(&strings.take())
+                    }
+                };
+                fields.push(trust);
+                pyre_object::w_tuple_new(fields.take())
+            };
+            items.push(tuple);
+        }
+        Ok(pyre_object::w_list_new(items.take()))
+    }
+
+    pub fn enum_crls(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let name = crate::baseobjspace::str_utf8_w(args[0])?;
+        let entries = host::enum_crls(name).map_err(|_| {
+            crate::PyError::os_error(format!("failed to open certificate store {name:?}"))
+        })?;
+        let mut items = RootedItems::new();
+        for entry in entries {
+            let tuple = {
+                let mut fields = RootedItems::new();
+                fields.push(pyre_object::w_bytes_from_bytes(&entry.der));
+                fields.push(encoding_type(entry.encoding));
+                pyre_object::w_tuple_new(fields.take())
+            };
+            items.push(tuple);
+        }
+        Ok(pyre_object::w_list_new(items.take()))
+    }
+}
+
+#[cfg(all(windows, not(feature = "host_env")))]
 mod cert_store {
     use pyre_object::{
         PyObjectRef, w_bool_from, w_bytes_from_bytes, w_frozenset_from_items, w_int_new,

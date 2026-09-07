@@ -14,17 +14,12 @@ wasm_vfs = ["dep:lz4_flex"]
 
 [dependencies]
 parking_lot = { workspace = true }
-md-5 = { workspace = true }
+rustpython-common = { workspace = true, features = ["hashlib"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-sha3 = { workspace = true }
-blake2b_simd = { workspace = true }
-blake2s_simd = { workspace = true }
-scrypt = { workspace = true }
-rustpython-common = { workspace = true }
-bzip2 = { workspace = true }
-xz-core = { workspace = true }
-rustpython-host_env = { workspace = true, optional = true }
+# `_ssl` shares platform trust-store loading and default path discovery with
+# RustPython while retaining its direct provider for host_env-free builds.
+rustpython-host_env = { workspace = true, optional = true, features = ["native-certs"] }
 libc = { workspace = true }
 lz4_flex = { version = "0.13", default-features = false, features = [
     "safe-decode",

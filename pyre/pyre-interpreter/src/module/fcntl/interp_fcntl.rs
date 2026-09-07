@@ -434,11 +434,8 @@ fn ioctl_ptr(fd: i32, request: libc::c_ulong, ptr: *mut u8) -> Result<i32, crate
     // own and overwrites what this call left behind.
     let result = {
         let _blocked = crate::module::thread::before_external_block();
-        let ret = unsafe { libc::ioctl(fd, request, ptr as *mut libc::c_void) };
-        if ret < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(ret)
+        unsafe {
+            rustpython_host_env::fcntl::ioctl_ptr(fd, request, ptr as *mut libc::c_void)
         }
     };
     result.map_err(|e| {

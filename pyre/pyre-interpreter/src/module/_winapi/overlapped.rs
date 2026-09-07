@@ -14,6 +14,7 @@
 
 use parking_lot::Mutex;
 use pyre_object::{PY_NULL, PyObject, PyObjectRef};
+use rustpython_host_env::overlapped as host_overlapped;
 use rustpython_host_env::winapi as host_winapi;
 use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -26,7 +27,6 @@ const ERROR_MORE_DATA: u32 = 234;
 const ERROR_OPERATION_ABORTED: u32 = 995;
 const ERROR_IO_INCOMPLETE: u32 = 996;
 const ERROR_PIPE_CONNECTED: u32 = 535;
-const ERROR_NOT_FOUND: u32 = 1168;
 
 /// What the buffer holds, which is also what `getbuffer` may answer with.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -145,7 +145,6 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
         let state = record.lock();
         (state.handle, std::ptr::addr_of!(state.overlapped))
     };
-    let mut transferred: u32 = 0;
     // Read inside the released region, which is what
     // `llexternal(..., save_err=rffi.RFFI_SAVE_LASTERROR)` does: it saves
     // `GetLastError()` between the call and the reacquire, and callers read
@@ -153,22 +152,12 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
     // goes through `mutex2_lock_timeout`, whose timed condition wait leaves
     // `ERROR_TIMEOUT` behind on every poll that expires, so a value read after
     // the guard names that wait rather than this call.
-    let error = {
+    let result = {
         let _blocked = crate::module::thread::before_external_block();
-        let completed = unsafe {
-            windows_sys::Win32::System::IO::GetOverlappedResult(
-                handle,
-                overlapped,
-                &mut transferred,
-                i32::from(wait),
-            )
-        };
-        if completed == 0 {
-            unsafe { windows_sys::Win32::Foundation::GetLastError() }
-        } else {
-            0
-        }
+        host_overlapped::get_overlapped_result(handle, overlapped, wait)
     };
+    let transferred = result.transferred;
+    let error = result.error;
     let mut state = record.lock();
     match error {
         0 | ERROR_MORE_DATA | ERROR_OPERATION_ABORTED => {
@@ -225,19 +214,12 @@ fn overlapped_cancel(args: &[PyObjectRef]) -> crate::PyResult {
     // guard reports `ERROR_TIMEOUT` from the reacquire's timed wait instead,
     // and `multiprocessing.connection.wait`'s `finally` turns that into an
     // `OSError` that kills the pool's `_handle_workers` thread.
-    let (cancelled, error) = {
+    let result = {
         let _blocked = crate::module::thread::before_external_block();
-        let cancelled =
-            unsafe { windows_sys::Win32::System::IO::CancelIoEx(state.handle, &state.overlapped) };
-        let error = if cancelled == 0 {
-            unsafe { windows_sys::Win32::Foundation::GetLastError() }
-        } else {
-            0
-        };
-        (cancelled, error)
+        host_overlapped::cancel_overlapped(state.handle, &state.overlapped)
     };
-    if cancelled == 0 && error != ERROR_NOT_FOUND {
-        return Err(super::win32_code(error));
+    if let Err(error) = result {
+        return Err(win32_err(error));
     }
     Ok(pyre_object::w_none())
 }
@@ -332,16 +314,7 @@ pub unsafe fn w_overlapped_dealloc(obj: PyObjectRef) {
     {
         let mut state = backend.lock();
         if state.pending {
-            let mut transferred: u32 = 0;
-            unsafe {
-                windows_sys::Win32::System::IO::CancelIoEx(state.handle, &state.overlapped);
-                windows_sys::Win32::System::IO::GetOverlappedResult(
-                    state.handle,
-                    &state.overlapped,
-                    &mut transferred,
-                    1,
-                );
-            }
+            host_overlapped::cancel_overlapped_for_drop(state.handle, &state.overlapped);
             state.pending = false;
         }
     }
@@ -373,12 +346,10 @@ pub fn connect_named_pipe(
         // An overlapped `ConnectNamedPipe` never reports success directly; it
         // reports either the pending connection or one already made.
         let _blocked = crate::module::thread::before_external_block();
-        unsafe {
-            windows_sys::Win32::System::Pipes::ConnectNamedPipe(handle, &mut state.overlapped);
-            windows_sys::Win32::Foundation::GetLastError()
-        }
+        host_overlapped::start_connect_named_pipe(handle, &mut state.overlapped)
     };
     match error {
+        0 => {}
         ERROR_IO_PENDING => backend.lock().pending = true,
         // Nothing is left to wait for, so the event is signalled by hand and
         // the caller's wait returns at once.
@@ -417,22 +388,13 @@ pub fn read_file(
         let mut state = backend.lock();
         state.transfer = Transfer::Read;
         state.buffer = vec![0u8; size as usize];
-        let mut read: u32 = 0;
         let _blocked = crate::module::thread::before_external_block();
-        let ok = unsafe {
-            windows_sys::Win32::Storage::FileSystem::ReadFile(
-                handle,
-                state.buffer.as_mut_ptr().cast(),
-                size,
-                &mut read,
-                &mut state.overlapped,
-            )
-        };
-        if ok == 0 {
-            unsafe { windows_sys::Win32::Foundation::GetLastError() }
-        } else {
-            0
-        }
+        host_overlapped::start_read_file(
+            handle,
+            state.buffer.as_mut_ptr(),
+            size,
+            &mut state.overlapped,
+        )
     };
     match error {
         0 | ERROR_MORE_DATA => {}
@@ -473,22 +435,13 @@ pub fn write_file(
         state.transfer = Transfer::Write;
         state.buffer = data.to_vec();
         let length = state.buffer.len().min(u32::MAX as usize) as u32;
-        let mut written: u32 = 0;
         let _blocked = crate::module::thread::before_external_block();
-        let ok = unsafe {
-            windows_sys::Win32::Storage::FileSystem::WriteFile(
-                handle,
-                state.buffer.as_ptr().cast(),
-                length,
-                &mut written,
-                &mut state.overlapped,
-            )
-        };
-        if ok == 0 {
-            unsafe { windows_sys::Win32::Foundation::GetLastError() }
-        } else {
-            0
-        }
+        host_overlapped::start_write_file(
+            handle,
+            state.buffer.as_ptr(),
+            length,
+            &mut state.overlapped,
+        )
     };
     match error {
         0 => {}
