@@ -53,10 +53,9 @@ impl JitCodeSym for UnpackSym {
         // body's op layout (e.g. how the `unpackiterable_driver` receiver read
         // lowers), so discover it rather than hardcode.  The drain loop carries
         // exactly one merge point (`baseobjspace.py:1012`, no `can_enter_jit`).
-        let canonical = crate::jitcode_runtime::portal_jitcode_for_key(
-            "baseobjspace::unpackiterable_portal",
-        )
-        .expect("jd1 portal jitcode must be registered");
+        let canonical =
+            crate::jitcode_runtime::portal_jitcode_for_key("baseobjspace::unpackiterable_portal")
+                .expect("jd1 portal jitcode must be registered");
         crate::jitcode_runtime::decoded_ops(&canonical.code)
             .find(|op| op.opname == "jit_merge_point")
             .expect("jd1 drain body must contain a jit_merge_point")
@@ -184,10 +183,9 @@ mod tests {
     /// unit test.
     #[test]
     fn jd1_build_time_descrs_resolve_through_global_pool() {
-        let canonical = crate::jitcode_runtime::portal_jitcode_for_key(
-            "baseobjspace::unpackiterable_portal",
-        )
-        .expect("jd1's extracted main JitCode must be registered");
+        let canonical =
+            crate::jitcode_runtime::portal_jitcode_for_key("baseobjspace::unpackiterable_portal")
+                .expect("jd1's extracted main JitCode must be registered");
         // The extracted body is the walkable unpack loop: exactly one merge
         // point, whose byte offset depends on the drain body's op layout
         // (`UnpackSym::loop_header_pc` discovers it rather than hardcoding).
