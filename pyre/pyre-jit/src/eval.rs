@@ -10790,7 +10790,16 @@ fn handle_fail(
     raw_values: &[i64],
     guard_exc: i64,
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
-) -> HandleFailOutcome {
+    savedata: Option<majit_ir::GcRef>,
+) -> (HandleFailOutcome, Option<majit_ir::GcRef>) {
+    // compile.py ResumeGuardForcedDescr.handle_fail keeps the deadframe
+    // (and `jf_savedata`) alive across the bridge decision. The native
+    // raw-exit path has already copied that field out, so root the copy
+    // before this function's GC hooks and reload the forwarded address.
+    let savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+    let _savedata_root = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata.is_some())
+    };
     // The guard exception arrives as a bare pointer whose deadframe root is
     // already gone, and bridge setup decodes resume data (allocating) before
     // `setup_bridge_sym` copies it onto the sym. Park it for the walker first.
@@ -10868,7 +10877,10 @@ fn handle_fail(
         // The `ResumeInBlackhole` below decodes off the exit layout it was
         // handed, so retiring the entry here cannot starve it of slot types.
         driver.remove_compiled_loop(green_key);
-        return HandleFailOutcome::ResumeInBlackhole;
+        return (
+            HandleFailOutcome::ResumeInBlackhole,
+            savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+        );
     }
 
     // A keyed failure proves this FOR_ITER site's instance-`__next__`
@@ -10937,7 +10949,10 @@ fn handle_fail(
                     // compile.py:708: bridge compiled → ContinueRunningNormally.
                     // RPython: the bridge is attached to the guard descr;
                     // re-entering compiled code will follow the bridge.
-                    return HandleFailOutcome::BridgeCompiled;
+                    return (
+                        HandleFailOutcome::BridgeCompiled,
+                        savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+                    );
                 }
                 crate::call_jit::BridgeResolution::Finished(cv) => {
                     // #177: the walk ran the resumed frame forward to its
@@ -10950,10 +10965,16 @@ fn handle_fail(
                         pyre_jit_trace::state::ConcreteValue::Null => w_none(),
                         other => other.to_pyobj(),
                     };
-                    return HandleFailOutcome::BridgeFinished(v);
+                    return (
+                        HandleFailOutcome::BridgeFinished(v),
+                        savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+                    );
                 }
                 crate::call_jit::BridgeResolution::FinishedException(cv) => {
-                    return HandleFailOutcome::BridgeRaised(finish_concrete_raise_error(cv));
+                    return (
+                        HandleFailOutcome::BridgeRaised(finish_concrete_raise_error(cv)),
+                        savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+                    );
                 }
                 crate::call_jit::BridgeResolution::ResumeBlackhole => {}
             }
@@ -10961,7 +10982,10 @@ fn handle_fail(
     }
     // compile.py:710-716 / pyjitpl.py:2906 (SwitchToBlackhole):
     // resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
-    HandleFailOutcome::ResumeInBlackhole
+    (
+        HandleFailOutcome::ResumeInBlackhole,
+        savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+    )
 }
 
 /// Short tag for a `BlackholeResult` variant, for the `[bh-rd-numb]`
@@ -11446,12 +11470,13 @@ fn execute_assembler(
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
             ) {
-                HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
+                (HandleFailOutcome::BridgeCompiled, _) => Some(LoopResult::ContinueRunningNormally),
                 // #177: single-frame bridge walk returned a concrete Finish.
-                HandleFailOutcome::BridgeFinished(v) => Some(LoopResult::Done(Ok(v))),
-                HandleFailOutcome::BridgeRaised(err) => Some(LoopResult::Done(Err(err))),
-                HandleFailOutcome::ResumeInBlackhole => {
+                (HandleFailOutcome::BridgeFinished(v), _) => Some(LoopResult::Done(Ok(v))),
+                (HandleFailOutcome::BridgeRaised(err), _) => Some(LoopResult::Done(Err(err))),
+                (HandleFailOutcome::ResumeInBlackhole, savedata) => {
                     // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
                     let bh_result = resume_in_blackhole_from_exit_layout(
                         raw_values,
@@ -11815,18 +11840,19 @@ fn bound_reached(
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
             ) {
-                HandleFailOutcome::BridgeCompiled => {
+                (HandleFailOutcome::BridgeCompiled, _) => {
                     return Some(LoopResult::ContinueRunningNormally);
                 }
                 // #177: single-frame bridge walk returned a concrete Finish.
-                HandleFailOutcome::BridgeFinished(v) => {
+                (HandleFailOutcome::BridgeFinished(v), _) => {
                     return Some(LoopResult::Done(Ok(v)));
                 }
-                HandleFailOutcome::BridgeRaised(err) => {
+                (HandleFailOutcome::BridgeRaised(err), _) => {
                     return Some(LoopResult::Done(Err(err)));
                 }
-                HandleFailOutcome::ResumeInBlackhole => {
+                (HandleFailOutcome::ResumeInBlackhole, savedata) => {
                     let bh_result = resume_in_blackhole_from_exit_layout(
                         raw_values,
                         exit_layout,
@@ -12129,21 +12155,22 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
             ) {
-                HandleFailOutcome::BridgeCompiled => {
+                (HandleFailOutcome::BridgeCompiled, _) => {
                     // Bridge compiled → ContinueRunningNormally → re-enter
                     // compiled code which will follow the new bridge.
                     // Fall through to eval_loop_jit below.
                 }
                 // #177: single-frame bridge walk returned a concrete Finish.
                 // This site returns `Option<PyResult>` (not `LoopResult`).
-                HandleFailOutcome::BridgeFinished(v) => {
+                (HandleFailOutcome::BridgeFinished(v), _) => {
                     return Some(Ok(v));
                 }
-                HandleFailOutcome::BridgeRaised(err) => {
+                (HandleFailOutcome::BridgeRaised(err), _) => {
                     return Some(Err(err));
                 }
-                HandleFailOutcome::ResumeInBlackhole => {
+                (HandleFailOutcome::ResumeInBlackhole, savedata) => {
                     let bh_result = resume_in_blackhole_from_exit_layout(
                         raw_values,
                         exit_layout,

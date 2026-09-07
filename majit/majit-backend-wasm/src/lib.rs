@@ -4068,7 +4068,13 @@ fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame 
         .collect();
     let mut data = WasmFrameData::boxed(raw_values, fail_descr, 0);
     unsafe {
-        data.attach_forced_jitframe(GcRef(frame_ptr));
+        // `attach_forced_jitframe` wants the JitFrame object base: it
+        // checks GC ownership and later casts this address to
+        // `*mut JitFrame` in `set_savedata_ref`. `frame_ptr` here is
+        // the items base `force` decoded from the token.
+        data.attach_forced_jitframe(GcRef(
+            frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET,
+        ));
     }
     DeadFrame::Boxed(data)
 }

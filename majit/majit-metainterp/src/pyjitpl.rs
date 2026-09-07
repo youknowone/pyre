@@ -15782,7 +15782,15 @@ impl<M: Clone> MetaInterp<M> {
             )
             .expect("forced guard must have resume data");
         let savedata = crate::allvirtuals::allocate(ptrs, ints);
-        self.backend.set_savedata_ref(&mut deadframe, savedata);
+        // compile.py handle_async_forcing writes `deadframe.jf_savedata`
+        // through a GCREF store. Every managed backend starts that store
+        // with a write barrier, so root the fresh AllVirtuals object and
+        // publish the forwarded address.
+        let savedata_slot = [savedata.as_usize() as i64];
+        let _savedata_root =
+            unsafe { crate::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| true) };
+        self.backend
+            .set_savedata_ref(&mut deadframe, majit_ir::GcRef(savedata_slot[0] as usize));
     }
 
     pub fn is_force_token_armed(&self, token: u64) -> bool {

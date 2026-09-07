@@ -9872,6 +9872,9 @@ impl CraneliftBackend {
                         .iter()
                         .map(|slot| force_spill_base + slot)
                         .collect();
+                    info.fail_locs = (0..info.fail_arg_refs.len())
+                        .map(|index| force_spill_base + index)
+                        .collect();
                     info.gcmap = allocate_gcmap(&info.failarg_ref_slots);
                     // opassembler.py `_finish_gcmap`: the map armed by
                     // GUARD_NOT_FORCED_2 remains installed on the returned
