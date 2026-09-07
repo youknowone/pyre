@@ -1030,19 +1030,46 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // decode identically for every consumer (banks + bridge maps +
                 // const refill) where the anchor coincides, and flags the
                 // divergent minority for the check.py output-equality gate.
-                // pyjitpl.py opimpl_goto_if_not and capture_resumedata:
-                // branch guards carry the same arm-independent orgpc as
-                // specialization guards. Re-evaluate the condition on resume;
-                // a shared guard is not evidence that the donor branch failed.
-                if ctx.live_before_jit_pc != usize::MAX
+                // A depth-0 branch guard (`GuardTrue`/`GuardFalse`) carries the walk's
+                // arm-independent `-live-` BEFORE anchor (`ctx.live_before_jit_pc`,
+                // `orgpc`) TAGGED into the negative space of the word plus the
+                // guard flavor, instead of the py_pc-keyed block-head `marker`.
+                // Carried ONLY when the tagged word's decode-side expansion
+                // (`expand_branch_carried`, the same fn every consumer runs)
+                // reproduces today's `marker` (self-cert) — so decode expands it
+                // back to exactly `marker` and the encode is byte-identical by
+                // construction. Requires a stepped `-live-` anchor in i16-tag
+                // range (`BRANCH_ORGPC_MAX`) and a resolvable `marker`; otherwise
+                // fall through to the perop / marker paths unchanged.
+                let flavor_true =
+                    matches!(ctx.trace_ctx.last_guard_opcode(), Some(OpCode::GuardTrue));
+                let is_branch = matches!(
+                    ctx.trace_ctx.last_guard_opcode(),
+                    Some(OpCode::GuardTrue | OpCode::GuardFalse)
+                );
+                if is_branch
+                    && ctx.live_before_jit_pc != usize::MAX
+                    && ctx.live_before_jit_pc <= majit_ir::resumedata::BRANCH_ORGPC_MAX
+                    && marker.is_some()
+                    && {
+                        // Self-certify byte-identity: the tagged word must expand
+                        // back to today's carried `marker`.
+                        let tagged = majit_ir::resumedata::encode_branch_orgpc(
+                            ctx.live_before_jit_pc,
+                            flavor_true,
+                        );
+                        let jc = unsafe { &*sym.jitcode() };
+                        expand_branch_carried(&jc.payload, tagged)
+                            == marker
+                                .map(|m| m as i32)
+                                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+                    }
+                {
+                    majit_ir::resumedata::encode_branch_orgpc(ctx.live_before_jit_pc, flavor_true)
+                } else if ctx.live_before_jit_pc != usize::MAX
                     && matches!(
                         ctx.trace_ctx.last_guard_opcode(),
-                        Some(
-                            OpCode::GuardValue
-                                | OpCode::GuardClass
-                                | OpCode::GuardTrue
-                                | OpCode::GuardFalse
-                        )
+                        Some(OpCode::GuardValue | OpCode::GuardClass)
                     )
                     && unsafe {
                         (&*sym.jitcode())

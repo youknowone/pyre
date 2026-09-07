@@ -14,6 +14,7 @@
     "unbracketed_calls_fns": 832,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
+      "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ]
   },
@@ -32,6 +33,7 @@
     "unbracketed_calls_fns": 836,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
+      "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ]
   }

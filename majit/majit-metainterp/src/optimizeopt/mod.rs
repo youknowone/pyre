@@ -6234,8 +6234,13 @@ impl OptContext {
         // then simply unused and must not gate the test.
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
+        // `op.rd_resume_position.get() < 0`: see the same conjunct in
+        // `Optimizer::emit_guard_operation` — a guard that owns a recorded
+        // snapshot cannot inherit another's without replaying the recorded
+        // bytecode range, and its committed side effects with it.
         let can_share = self.last_guard_idx.is_some()
             && !op.has_descr()
+            && op.rd_resume_position.get() < 0
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
