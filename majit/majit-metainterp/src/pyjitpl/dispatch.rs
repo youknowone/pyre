@@ -664,21 +664,6 @@ pub trait JitCodeSym {
     fn abort_portal_op(&mut self) {}
     fn total_slots(&self) -> usize;
     fn loop_header_pc(&self) -> usize;
-    /// Full interpreter-visible state to materialize on guard failure.
-    ///
-    /// When `None`, guards fall back to the legacy auto-generated fail args.
-    fn fail_args(&self) -> Option<Vec<OpRef>>;
-
-    /// Guard-failure state materialization that may record extra IR.
-    fn fail_args_with_ctx(&mut self, _ctx: &mut TraceCtx) -> Option<Vec<OpRef>> {
-        self.fail_args()
-    }
-
-    /// Types of fail_args values. When Some, used instead of default all-Int.
-    fn fail_args_types(&self) -> Option<Vec<majit_ir::Type>> {
-        None
-    }
-
     /// pyjitpl.py:2981-2989 `live_arg_boxes` — this merge point's
     /// loop-carried boxes, in the exact order the closing JUMP emits them.
     ///
@@ -1656,43 +1641,21 @@ where
         {
             return first;
         }
-        if let Some(fail_args) = sym.fail_args_with_ctx(ctx) {
-            let fail_types = sym.fail_args_types();
-            // The snapshot is the source of truth — the
-            // optimizer's `store_final_boxes_in_guard`
-            // (`optimizeopt/mod.rs`) overwrites `op.fail_args` from
-            // the snapshot built below, so the inline `fail_args` copy
-            // that the legacy
-            // `record_guard_typed_with_fail_args` /
-            // `record_guard_with_fail_args` paths used to write is
-            // redundant.  Mirrors RPython's
-            // `pyjitpl.MetaInterp.generate_guard`
-            // (`pyjitpl.py:2558-2602`) which records the guard with no
-            // inline fail_args and lets `capture_resumedata` +
-            // `_number_boxes` populate them from the snapshot chain.
-            let guard_op = if let Some(types) = fail_types {
-                ctx.record_guard_typed(opcode, args, types)
-            } else {
-                ctx.record_guard(opcode, args, fail_args.len())
-            };
-            // framestack-lift 3b: capture a
-            // matching snapshot and patch the guard's
-            // rd_resume_position so the optimizer's
-            // store_final_boxes_in_guard derives fail_args from the
-            // snapshot (RPython parity, opencoder.py:819 +
-            // resume.py:396-397).
-            self.publish_last_guard_resume_snapshot(
-                ctx,
-                sym,
-                resume_pc,
-                after_residual_call,
-                GuardStampTarget::LastOp,
-                Some((opcode, fail_args.len())),
-            );
-            guard_op
-        } else {
-            ctx.record_guard(opcode, args, sym.total_slots())
-        }
+        // `pyjitpl.py MetaInterp.generate_guard` records the guard and then
+        // captures its live MIFrames. It does not construct a second failarg
+        // list (or type list) to decide whether the frame snapshot exists.
+        // `resume.py ResumeDataVirtualAdder.finish` derives the final failargs
+        // from that snapshot after optimization.
+        let guard_op = ctx.record_guard(opcode, args, 0);
+        self.publish_last_guard_resume_snapshot(
+            ctx,
+            sym,
+            resume_pc,
+            after_residual_call,
+            GuardStampTarget::LastOp,
+            Some(opcode),
+        );
+        guard_op
     }
 
     /// Attach a resume snapshot to a guard a `TraceCtx::vable_*` call emitted
@@ -1748,12 +1711,6 @@ where
         if minted == 0 {
             return;
         }
-        if sym.fail_args_with_ctx(ctx).is_none() {
-            // The sym cannot name the live set, so no snapshot is buildable —
-            // the same condition under which `record_state_guard` records a
-            // guard without one.
-            return;
-        }
         let restored = write.and_then(|w| {
             ctx.swap_virtualizable_entry(w.index, w.prev_box, w.prev_value)
                 .map(|current| (w.index, current))
@@ -1791,7 +1748,7 @@ where
     /// top of the vable promote, so that caller needs the guard form or the
     /// position lands on the COND_CALL.
     ///
-    /// `diag` carries the guard opcode and its fail-arg count for the
+    /// `diag` carries the guard opcode for the
     /// `callee_rca` trace only; callers re-stamping a guard `TraceCtx`
     /// recorded internally pass `None`.
     fn publish_last_guard_resume_snapshot(
@@ -1801,7 +1758,7 @@ where
         resume_pc: usize,
         after_residual_call: bool,
         target: GuardStampTarget,
-        diag: Option<(OpCode, usize)>,
+        diag: Option<OpCode>,
     ) {
         let top_idx = self
             .frames
@@ -1898,12 +1855,11 @@ where
                 .collect();
             eprintln!(
                 "[callee-rca][record-guard] opcode={:?} resume_pc={} \
-                 vable_boxes={} vref_boxes={} fail_args={:?}",
-                diag.map(|(opcode, _)| opcode),
+                 vable_boxes={} vref_boxes={}",
+                diag,
                 resume_pc,
                 virtualizable_snapshot.len(),
                 virtualref_snapshot.len(),
-                diag.map(|(_, n)| n),
             );
             eprintln!("[callee-rca][record-guard-vable] {:?}", vable_payload);
         }
@@ -11941,10 +11897,6 @@ mod tests {
         fn loop_header_pc(&self) -> usize {
             0
         }
-
-        fn fail_args(&self) -> Option<Vec<OpRef>> {
-            None
-        }
     }
 
     #[test]
@@ -12216,10 +12168,6 @@ mod tests {
             0
         }
 
-        fn fail_args(&self) -> Option<Vec<OpRef>> {
-            None
-        }
-
         fn recursive_fresh_entry_reds(&self) -> Option<(Vec<Value>, Box<dyn std::any::Any>)> {
             let fresh: Box<Vec<i64>> = Box::new(vec![0i64; 12]);
             let base = &*fresh as *const Vec<i64> as usize;
@@ -12252,19 +12200,21 @@ mod tests {
     #[test]
     fn recursive_call_assembler_records_fresh_frame_and_returns_result() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
 
         // Caller jitcode: recurse (decision = CallAssembler), result into reg
         // 0, then return reg 0.  The callee runs with a fresh frame, so no
         // caller reds flow in (the arg-triple is ignored).
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_int(0, 0, &[], &[]);
+        caller_builder.live(&mut asm, &[0], &[], &[]);
         caller_builder.int_return(0);
         let caller = caller_builder.finish();
 
         let runtime = RecursiveAssemblerRuntime {
             token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
         };
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut sym = RecursiveFreshSym;
         let action =
             trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
@@ -12396,16 +12346,18 @@ mod tests {
     #[test]
     fn a_residual_decision_still_reaches_call_assembler_through_the_token_seam() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
 
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_int(0, 0, &[], &[]);
+        caller_builder.live(&mut asm, &[0], &[], &[]);
         caller_builder.int_return(0);
         let caller = caller_builder.finish();
 
         let runtime = RecursiveResidualDecisionRuntime {
             token: Some(std::sync::Arc::new(majit_backend::JitCellToken::new(7))),
         };
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut sym = RecursiveFreshSym;
         let action =
             trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
@@ -12467,16 +12419,18 @@ mod tests {
     #[test]
     fn recursive_call_assembler_ref_records_and_returns_result() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
 
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_ref(0, 0, &[], &[]);
+        caller_builder.live(&mut asm, &[], &[0], &[]);
         caller_builder.ref_return(0);
         let caller = caller_builder.finish();
 
         let runtime = RecursiveAssemblerRuntime {
             token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
         };
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut sym = RecursiveFreshSym;
         let action =
             trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
@@ -12532,16 +12486,18 @@ mod tests {
     #[test]
     fn recursive_call_assembler_float_records_and_returns_result() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
 
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_float(0, 0, &[], &[]);
+        caller_builder.live(&mut asm, &[], &[], &[0]);
         caller_builder.float_return(0);
         let caller = caller_builder.finish();
 
         let runtime = RecursiveAssemblerRuntime {
             token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
         };
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut sym = RecursiveFreshSym;
         let action =
             trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
@@ -12597,16 +12553,18 @@ mod tests {
     #[test]
     fn recursive_call_assembler_void_records_and_runs_side_effect() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
 
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_void(0, &[], &[]);
+        caller_builder.live(&mut asm, &[], &[], &[]);
         caller_builder.void_return();
         let caller = caller_builder.finish();
 
         let runtime = RecursiveAssemblerRuntime {
             token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
         };
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut sym = RecursiveFreshSym;
         let action =
             trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
@@ -12722,6 +12680,7 @@ mod tests {
 
     #[test]
     fn recursive_portal_merge_point_cuts_to_call_assembler() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         // Portal body: a merge point THEN a return.  The merge point is
         // reached at portal_call_depth > 0 (inlined), triggering the
         // else-branch cut; the trailing `int_return` must NOT be traced (the
@@ -12735,6 +12694,7 @@ mod tests {
         // reg 0, then return reg 0.
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_int(0, 0, &[], &[]);
+        caller_builder.live(&mut asm, &[0], &[], &[]);
         caller_builder.int_return(0);
         let caller = caller_builder.finish();
 
@@ -12742,6 +12702,8 @@ mod tests {
         // merge point auto-stamps `seen_loop_header_for_jdindex` (>= 0),
         // bypassing the EDIT-A seen<0 skip and flowing into the depth>0 cut.
         let mut staticdata = crate::MetaInterpStaticData::new();
+        staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
+        staticdata.liveness_info = asm.all_liveness().to_vec();
         let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![("frame", Type::Int)]);
         jd.index = Some(0);
         jd.result_type = Type::Int;
@@ -12979,23 +12941,18 @@ mod tests {
         assert_eq!(recorder.num_ops(), 0);
     }
 
-    /// A `JitCodeSym` that names a live set, so guard capture is reachable.
-    /// `DummySym` answers `None` and skips it entirely.
-    struct FailArgsSym {
-        fail_args: Vec<OpRef>,
+    /// A symbol whose two state slots already reside in the live MIFrame.
+    struct LiveSlotsSym {
+        num_slots: usize,
     }
 
-    impl JitCodeSym for FailArgsSym {
+    impl JitCodeSym for LiveSlotsSym {
         fn total_slots(&self) -> usize {
-            self.fail_args.len()
+            self.num_slots
         }
 
         fn loop_header_pc(&self) -> usize {
             0
-        }
-
-        fn fail_args(&self) -> Option<Vec<OpRef>> {
-            Some(self.fail_args.clone())
         }
     }
 
@@ -13044,9 +13001,7 @@ mod tests {
             Some(array_box)
         );
 
-        let mut sym = FailArgsSym {
-            fail_args: vec![OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-        };
+        let mut sym = LiveSlotsSym { num_slots: 2 };
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -13143,9 +13098,7 @@ mod tests {
         // the standard path instead of falling back to the heap.
         ctx.set_opref_concrete(vable_arg, Value::Ref(majit_ir::GcRef(999)));
 
-        let mut sym = FailArgsSym {
-            fail_args: vec![OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-        };
+        let mut sym = LiveSlotsSym { num_slots: 2 };
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -13502,15 +13455,17 @@ mod tests {
 
     #[test]
     fn jitcode_call_may_force_marks_standard_virtualizable_token_and_guards() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
         let fn_idx = builder.add_fn_ptr(residual_no_force as *const ());
         builder.call_may_force_void_canonical_via_target(fn_idx, &[JitCallArg::reference(0)]);
+        builder.live(&mut asm, &[], &[0], &[]);
         let jitcode = builder.finish();
 
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_ref(obj_ptr);
@@ -13722,6 +13677,7 @@ mod tests {
 
     #[test]
     fn residual_call_can_raise_records_guard_no_exception_on_success() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let fn_idx = builder.add_fn_ptr(residual_void_no_args as *const ());
         builder.residual_call_void_canonical_via_target_with_effect_info(
@@ -13729,9 +13685,10 @@ mod tests {
             &[],
             residual_effect(majit_ir::descr::ExtraEffect::CanRaise),
         );
+        builder.live(&mut asm, &[], &[], &[]);
         let jitcode = builder.finish();
 
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut sym = DummySym;
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -13748,6 +13705,7 @@ mod tests {
 
     #[test]
     fn residual_call_exception_records_guard_exception_and_routes_to_handler() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let handler = builder.new_label();
         let fn_idx = builder.add_fn_ptr(residual_void_raises as *const ());
@@ -13756,13 +13714,15 @@ mod tests {
             &[],
             residual_effect(majit_ir::descr::ExtraEffect::CanRaise),
         );
+        builder.live(&mut asm, &[], &[], &[]);
         builder.catch_exception(handler);
         builder.mark_label(handler);
         builder.last_exc_value(0);
+        builder.live(&mut asm, &[], &[0], &[]);
         builder.ref_guard_value(0);
         let jitcode = builder.finish();
 
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut sym = DummySym;
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -13983,9 +13943,6 @@ mod tests {
             fn loop_header_pc(&self) -> usize {
                 0
             }
-            fn fail_args(&self) -> Option<Vec<OpRef>> {
-                Some(vec![OpRef::int_op(50)])
-            }
             fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
                 frame.int_regs[0] = Some(OpRef::int_op(50));
                 frame.int_values[0] = Some(500);
@@ -14064,15 +14021,17 @@ mod tests {
 
     #[test]
     fn jitcode_residual_call_int_may_force_marks_standard_virtualizable_token_and_guards() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
         let fn_idx = builder.add_fn_ptr(residual_int_no_force as *const ());
         builder.call_may_force_int_canonical_via_target(fn_idx, &[JitCallArg::reference(0)], 1);
+        builder.live(&mut asm, &[1], &[0], &[]);
         let jitcode = builder.finish();
 
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_ref(obj_ptr);
@@ -14123,15 +14082,17 @@ mod tests {
 
     #[test]
     fn jitcode_residual_call_ref_may_force_marks_standard_virtualizable_token_and_guards() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
         let fn_idx = builder.add_fn_ptr(residual_ref_no_force as *const ());
         builder.call_may_force_ref_canonical_via_target(fn_idx, &[JitCallArg::reference(0)], 1);
+        builder.live(&mut asm, &[], &[0, 1], &[]);
         let jitcode = builder.finish();
 
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_ref(obj_ptr);
@@ -14182,15 +14143,17 @@ mod tests {
 
     #[test]
     fn jitcode_residual_call_float_may_force_marks_standard_virtualizable_token_and_guards() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
         let fn_idx = builder.add_fn_ptr(residual_float_no_force as *const ());
         builder.call_may_force_float_canonical_via_target(fn_idx, &[JitCallArg::reference(0)], 1);
+        builder.live(&mut asm, &[], &[0], &[1]);
         let jitcode = builder.finish();
 
-        let mut ctx = TraceCtx::for_test(0);
+        let mut ctx = context_with_liveness(&[], &asm);
         let mut info = VirtualizableInfo::new(0);
         info.set_parent_descr(majit_ir::descr::make_size_descr(64));
         let vable_ref = ctx.const_ref(obj_ptr);
@@ -14277,13 +14240,15 @@ mod tests {
 
         // Non-constant operands (input args 5 < 3 = false): the compare and
         // the GuardFalse are materialised.
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
+        builder.live(&mut asm, &[0, 1], &[], &[]);
         builder.goto_if_not_int_lt(0, 1, target);
         builder.mark_label(target);
         let jitcode = builder.finish();
 
-        let mut ctx = TraceCtx::for_test(2);
+        let mut ctx = context_with_liveness(&[Type::Int, Type::Int], &asm);
         let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
@@ -14323,7 +14288,30 @@ mod tests {
         jitcode: &JitCode,
         argboxes: &[(JitArgKind, OpRef, i64)],
     ) -> Vec<OpCode> {
-        let mut ctx = TraceCtx::for_test_types(types);
+        traced_opcodes_with_liveness(types, jitcode, argboxes, &Default::default())
+    }
+
+    fn context_with_liveness(
+        types: &[majit_ir::Type],
+        asm: &majit_translate::codewriter::assembler::Assembler,
+    ) -> TraceCtx {
+        let mut staticdata = crate::MetaInterpStaticData::new();
+        staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
+        staticdata.liveness_info = asm.all_liveness().to_vec();
+        TraceCtx::new(
+            crate::recorder::Trace::with_input_types(types),
+            0,
+            std::sync::Arc::new(staticdata),
+        )
+    }
+
+    fn traced_opcodes_with_liveness(
+        types: &[majit_ir::Type],
+        jitcode: &JitCode,
+        argboxes: &[(JitArgKind, OpRef, i64)],
+        asm: &majit_translate::codewriter::assembler::Assembler,
+    ) -> Vec<OpCode> {
+        let mut ctx = context_with_liveness(types, asm);
         let mut sym = DummySym;
         let action = trace_jitcode_with_args(&mut ctx, &mut sym, jitcode, 0, |_pc| 0, argboxes);
         assert!(matches!(action, TraceAction::Continue));
@@ -14364,14 +14352,17 @@ mod tests {
             ),
         ];
         for (emit, ptr, want) in cases {
+            let mut asm = majit_translate::codewriter::assembler::Assembler::new();
             let mut builder = JitCodeBuilder::new();
             let target = builder.new_label();
+            builder.live(&mut asm, &[], &[0], &[]);
             emit(&mut builder, target);
             builder.mark_label(target);
-            let recorded = traced_opcodes(
+            let recorded = traced_opcodes_with_liveness(
                 &[majit_ir::Type::Ref],
                 &builder.finish(),
                 &[(JitArgKind::Ref, OpRef::input_arg_ref(0), ptr)],
+                &asm,
             );
             assert_eq!(recorded, vec![want], "ptr={ptr:#x}");
         }
@@ -14382,17 +14373,21 @@ mod tests {
     /// short-circuit and guards nothing.
     #[test]
     fn a_second_nullity_branch_on_one_box_is_answered_by_the_heapcache() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let first = builder.new_label();
+        builder.live(&mut asm, &[], &[0], &[]);
         builder.goto_if_not_ptr_nonzero(0, first);
         builder.mark_label(first);
         let second = builder.new_label();
+        builder.live(&mut asm, &[], &[0], &[]);
         builder.goto_if_not_ptr_nonzero(0, second);
         builder.mark_label(second);
-        let recorded = traced_opcodes(
+        let recorded = traced_opcodes_with_liveness(
             &[majit_ir::Type::Ref],
             &builder.finish(),
             &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0x40)],
+            &asm,
         );
         assert_eq!(recorded, vec![OpCode::GuardNonnull], "{recorded:?}");
     }
@@ -14406,15 +14401,18 @@ mod tests {
     /// through `FASTPATHS_SAME_BOXES` and would answer the same either way.
     #[test]
     fn a_null_ptr_nullity_branch_rebinds_its_source_register() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
+        builder.live(&mut asm, &[], &[0], &[]);
         builder.goto_if_not_ptr_iszero(0, target);
         builder.ptr_nonzero(1, 0);
         builder.mark_label(target);
-        let recorded = traced_opcodes(
+        let recorded = traced_opcodes_with_liveness(
             &[majit_ir::Type::Ref],
             &builder.finish(),
             &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0)],
+            &asm,
         );
         assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
     }
@@ -14446,17 +14444,20 @@ mod tests {
     /// through the alias folds.
     #[test]
     fn a_null_ptr_nullity_branch_replaces_the_box_in_an_aliasing_register() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
+        builder.live(&mut asm, &[], &[0, 1], &[]);
         builder.goto_if_not_ptr_iszero(0, target);
         // Read the ALIAS, not the register the branch resolved.
         builder.ptr_nonzero(0, 1);
         builder.mark_label(target);
         let aliased = OpRef::input_arg_ref(0);
-        let recorded = traced_opcodes(
+        let recorded = traced_opcodes_with_liveness(
             &[majit_ir::Type::Ref, majit_ir::Type::Ref],
             &builder.finish(),
             &[(JitArgKind::Ref, aliased, 0), (JitArgKind::Ref, aliased, 0)],
+            &asm,
         );
         assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
     }
@@ -14467,15 +14468,18 @@ mod tests {
     /// recording arithmetic against a box already pinned to a value.
     #[test]
     fn a_guard_value_promote_replaces_the_box_in_an_aliasing_register() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
+        builder.live(&mut asm, &[0, 1], &[], &[]);
         builder.int_guard_value(0);
         // Read the ALIAS, not the register the guard named.
         builder.record_binop_i(2, OpCode::IntAdd, 1, 1);
         let aliased = OpRef::input_arg_int(0);
-        let recorded = traced_opcodes(
+        let recorded = traced_opcodes_with_liveness(
             &[majit_ir::Type::Int, majit_ir::Type::Int],
             &builder.finish(),
             &[(JitArgKind::Int, aliased, 3), (JitArgKind::Int, aliased, 3)],
+            &asm,
         );
         assert_eq!(recorded, vec![OpCode::GuardValue], "{recorded:?}");
     }
@@ -14487,17 +14491,20 @@ mod tests {
     fn goto_if_not_rebinds_its_condition_register_to_the_proved_constant() {
         // `cond` is an input arg, so the guard cannot be elided; reading it
         // again after the branch is what shows the rebind.
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
+        builder.live(&mut asm, &[0], &[], &[]);
         builder.goto_if_not_int_is_true(0, target);
         builder.record_binop_i(1, OpCode::IntAdd, 0, 0);
         builder.mark_label(target);
         let jitcode = builder.finish();
 
-        let recorded = traced_opcodes(
+        let recorded = traced_opcodes_with_liveness(
             &[majit_ir::Type::Int],
             &jitcode,
             &[(JitArgKind::Int, OpRef::input_arg_int(0), 1)],
+            &asm,
         );
         assert!(recorded.contains(&OpCode::GuardTrue), "{recorded:?}");
         assert!(
@@ -14513,8 +14520,10 @@ mod tests {
     /// jitcode is patched to it directly.
     #[test]
     fn goto_if_not_int_is_true_records_the_folded_int_is_true() {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
+        builder.live(&mut asm, &[0], &[], &[]);
         builder.goto_if_not_int_is_true(0, target);
         builder.record_binop_i(1, OpCode::IntAdd, 0, 0);
         builder.mark_label(target);
@@ -14526,10 +14535,11 @@ mod tests {
             .expect("the builder writes the canonical goto_if_not byte");
         code[at] = jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE;
 
-        let recorded = traced_opcodes(
+        let recorded = traced_opcodes_with_liveness(
             &[majit_ir::Type::Int],
             &jitcode,
             &[(JitArgKind::Int, OpRef::input_arg_int(0), 7)],
+            &asm,
         );
         assert!(recorded.contains(&OpCode::IntIsTrue), "{recorded:?}");
         assert!(recorded.contains(&OpCode::GuardTrue), "{recorded:?}");
@@ -14822,14 +14832,17 @@ mod tests {
         assert!(!folded.contains(&OpCode::IntIsZero));
         assert!(!folded.contains(&OpCode::GuardFalse));
 
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
+        builder.live(&mut asm, &[0], &[], &[]);
         builder.goto_if_not_int_is_zero(0, target);
         builder.mark_label(target);
-        let recorded = traced_opcodes(
+        let recorded = traced_opcodes_with_liveness(
             &[majit_ir::Type::Int],
             &builder.finish(),
             &[(JitArgKind::Int, OpRef::input_arg_int(0), 5)],
+            &asm,
         );
         assert!(recorded.contains(&OpCode::IntIsZero));
         assert!(recorded.contains(&OpCode::GuardFalse));
@@ -14850,16 +14863,19 @@ mod tests {
         assert!(!folded.contains(&OpCode::IntEq));
         assert!(!folded.contains(&OpCode::GuardFalse));
 
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let case_a = builder.new_label();
         let case_b = builder.new_label();
+        builder.live(&mut asm, &[0], &[], &[]);
         builder.switch(0, &[(-3, case_a), (7, case_b)]);
         builder.mark_label(case_a);
         builder.mark_label(case_b);
-        let recorded = traced_opcodes(
+        let recorded = traced_opcodes_with_liveness(
             &[majit_ir::Type::Int],
             &builder.finish(),
             &[(JitArgKind::Int, OpRef::input_arg_int(0), 99)],
+            &asm,
         );
         assert_eq!(
             recorded.iter().filter(|&&o| o == OpCode::IntEq).count(),
@@ -14923,11 +14939,13 @@ mod tests {
         assert!(ops.contains(&OpCode::GetfieldGcI));
     }
 
-    fn switch_return_jitcode() -> JitCode {
+    fn switch_return_jitcode() -> (JitCode, majit_translate::codewriter::assembler::Assembler) {
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let case_a = builder.new_label();
         let case_b = builder.new_label();
         let case_c = builder.new_label();
+        builder.live(&mut asm, &[0], &[], &[]);
         builder.switch(0, &[(-3, case_a), (7, case_b), (42, case_c)]);
         builder.load_const_i_value(1, 10);
         builder.int_return(1);
@@ -14940,7 +14958,7 @@ mod tests {
         builder.mark_label(case_c);
         builder.load_const_i_value(1, 40);
         builder.int_return(1);
-        builder.finish()
+        (builder.finish(), asm)
     }
 
     #[test]
@@ -14948,8 +14966,8 @@ mod tests {
         // RPython `pyjitpl.py opimpl_switch` hit path:
         // promote the switched value with GUARD_VALUE, then jump to the
         // target from SwitchDictDescr.dict.
-        let jitcode = switch_return_jitcode();
-        let mut ctx = TraceCtx::for_test(1);
+        let (jitcode, asm) = switch_return_jitcode();
+        let mut ctx = context_with_liveness(&[Type::Int], &asm);
         let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
@@ -14983,8 +15001,8 @@ mod tests {
         // RPython `pyjitpl.py opimpl_switch` miss path:
         // for each `const_keys_in_order`, emit INT_EQ plus GUARD_FALSE,
         // then leave pc at the fall-through default path.
-        let jitcode = switch_return_jitcode();
-        let mut ctx = TraceCtx::for_test(1);
+        let (jitcode, asm) = switch_return_jitcode();
+        let mut ctx = context_with_liveness(&[Type::Int], &asm);
         let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
@@ -15297,9 +15315,6 @@ mod tests {
             fn loop_header_pc(&self) -> usize {
                 0
             }
-            fn fail_args(&self) -> Option<Vec<OpRef>> {
-                None
-            }
             fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
                 let mut slot = 0;
                 // scalars
@@ -15341,10 +15356,10 @@ mod tests {
     }
 
     #[test]
-    fn record_state_guard_attaches_snapshot_when_sym_supplies_fail_args() {
-        // When a JitCodeSym implementation returns `Some(_)` from
-        // `fail_args_with_ctx` and overrides `populate_frame_int_regs`
-        // (the macro-emitted state-field-JIT shape), every guard
+    fn record_state_guard_captures_frames_without_building_legacy_fail_args() {
+        // `pyjitpl.py MetaInterp.generate_guard` captures the live frames,
+        // without first constructing a second full list of guard failargs.
+        // With the macro-emitted state-field-JIT shape, every guard
         // recorded via `record_state_guard` must
         //   (a) push a snapshot through `TraceCtx::capture_resumedata`,
         //   (b) patch the just-recorded guard's `rd_resume_position`
@@ -15357,7 +15372,6 @@ mod tests {
         // call) is caught at the unit level rather than only via the
         // macro-example end-to-end suites.
         struct StateFieldLikeSym {
-            fail_args: Vec<OpRef>,
             populated: Vec<(usize, OpRef, i64)>,
         }
         impl JitCodeSym for StateFieldLikeSym {
@@ -15366,9 +15380,6 @@ mod tests {
             }
             fn loop_header_pc(&self) -> usize {
                 0
-            }
-            fn fail_args(&self) -> Option<Vec<OpRef>> {
-                Some(self.fail_args.clone())
             }
             fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
                 for &(slot, opref, value) in &self.populated {
@@ -15402,7 +15413,6 @@ mod tests {
         // — the actual values are arbitrary; the snapshot must mirror
         // them slot-for-slot post-`populate_frame_int_regs`.
         let mut sym = StateFieldLikeSym {
-            fail_args: vec![OpRef::int_op(50), OpRef::int_op(51), OpRef::int_op(52)],
             populated: vec![
                 (0, OpRef::int_op(50), 500),
                 (1, OpRef::int_op(51), 510),
@@ -15459,24 +15469,26 @@ mod tests {
     }
 
     #[test]
-    fn record_state_guard_skips_snapshot_when_sym_returns_none_fail_args() {
-        // Inverse of the above: when a JitCodeSym returns `None` from
-        // `fail_args_with_ctx` (legacy / non-state-field path), the
-        // else branch of `record_state_guard` keeps the original
-        // `record_guard` semantics — no snapshot capture, no
-        // `set_last_guard_resume_position` patch.  Locks the negative
-        // contract so the wire-up does not bleed into call sites that
-        // did not opt in.
+    fn record_state_guard_uses_live_frames_without_legacy_fail_args() {
+        // `MetaInterp.generate_guard` always captures the current frame.
+        // A symbol without a legacy failarg list still has live registers;
+        // it must not leave the guard with an unusable -1 resume position.
         // Non-constant input-arg operands (regs 0, 1) so the fused compare is
         // recorded rather than folded; 5 < 3 is false → GuardFalse.
+        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
+        builder.live(&mut asm, &[0, 1], &[], &[]);
         builder.goto_if_not_int_lt(0, 1, target);
         builder.mark_label(target);
         let jitcode = builder.finish();
 
-        let mut ctx = TraceCtx::for_test(2);
-        let mut sym = DummySym; // fail_args() = None
+        let mut staticdata = crate::MetaInterpStaticData::new();
+        staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
+        staticdata.liveness_info = asm.all_liveness().to_vec();
+        let recorder = crate::recorder::Trace::with_num_inputs(2);
+        let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -15492,8 +15504,8 @@ mod tests {
 
         assert_eq!(
             ctx.snapshots().len(),
-            0,
-            "DummySym fail_args() = None must skip the snapshot wire-up",
+            1,
+            "live MIFrame registers must supply a snapshot without legacy failargs",
         );
         let recorder = ctx.into_recorder();
         let guard = recorder
@@ -15504,8 +15516,8 @@ mod tests {
             .expect("guard recorded");
         assert_eq!(
             guard.rd_resume_position.get(),
-            -1,
-            "non-state-field guard keeps the -1 sentinel",
+            0,
+            "non-state-field guard must carry its frame snapshot",
         );
     }
 

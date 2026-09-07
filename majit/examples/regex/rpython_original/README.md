@@ -446,6 +446,65 @@ gap; bridge construction remains the structural difference.
 
 ### Where majit's share of that gap goes
 
+#### Allocator control corrected 2026-09-05
+
+`fast-alloc` used to select mimalloc only when `alloc-census` was also enabled.
+A clean `--features dynasm,fast-alloc` timing build therefore still used System.
+The feature now selects mimalloc with or without the census; it remains opt-in.
+This fixes the measurement control, not the recorder representation.
+
+Three clean System/mimalloc/mimalloc/System rounds at 262,144 characters,
+`PYRE_REGEX_ROWS=2`, each process running the usual five timed samples, were
+collected with `/usr/bin/time -l`.
+
+The saved pair used the recorder at `bdf4abd130e`, before the accompanying
+GC/byte-materializer repairs, and differed only in allocator selection. This
+is an allocator-only control, not a timing of the completed recorder migration.
+
+| allocator | whole-process retired instructions, median of six processes | range |
+|---|---:|---:|
+| System | 51,391,087,211 | 51,301,743,543–51,465,158,457 |
+| mimalloc | 47,970,429,131 | 47,916,263,321–48,018,761,845 |
+
+These are `/usr/bin/time -l` process totals, including setup and warm-up,
+**not** allocations or JIT-only instruction counts. The reduction is 6.7%.
+Both arms retained the 150-op body and the `0 / 24 / 93 / 2` structural counts.
+All twelve processes reported 3,612 bridges and 293,782 compiled bridge ops.
+Concurrent builds made wall time unusable: the six process medians ranged
+125,163–275,993 chars/s for System and 131,786–284,267 for mimalloc. No wall-clock
+speedup or RPython parity is established by this experiment. The live recorder
+still uses `Rc<Op>` and structured snapshots; switching allocators does not
+close that structural gap.
+
+To reproduce the controls, build and save each executable separately:
+
+```sh
+cargo build -p regex --release --no-default-features --features dynasm
+cargo build -p regex --release --no-default-features --features dynasm,fast-alloc
+# Run each saved executable in alternating forward/reverse order:
+PYRE_REGEX_LENGTHS=262144 PYRE_REGEX_ROWS=2 /usr/bin/time -l <saved-executable>
+```
+
+The subsequent GC/materializer repairs and direct live-frame guard capture
+were measured against that saved mimalloc executable with the same clean
+build flags, length and three ABBA rounds. Both arms used mimalloc; neither
+enabled `alloc-census`. This comparison includes all those repairs, so it
+does not isolate the removal of the old full-state failarg-list builder.
+
+| mimalloc build | whole-process retired instructions, median of six processes | range |
+|---|---:|---:|
+| saved allocator control | 47,941,578,060 | 47,899,039,519–48,055,675,906 |
+| GC/materializer repairs + direct guard capture | 47,906,746,857 | 47,880,392,131–47,942,807,794 |
+
+The median difference is only 0.073%, with overlapping ranges: **no meaningful
+performance improvement is established**. The process-median throughput ranges
+were 227,697–294,767 and 255,293–289,188 chars/s respectively. All twelve
+processes again had the same 150-op body, four structural counts, 3,612 bridges
+and 293,782 bridge ops. Removing the redundant list API is a structural repair,
+not evidence that the live byte-recorder migration or the `and/or` gap is done.
+
+#### Recorder and resume costs
+
 Three theories about that gap were measured and two of them were wrong, so the
 numbers matter more than the reasoning:
 

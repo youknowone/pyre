@@ -7262,10 +7262,6 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
     fn loop_header_pc(&self) -> usize {
         self.header_pc
     }
-
-    fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
-        None
-    }
 }
 
 /// Stage-0 diagnostic drive of the build-time jd0 portal jitcode. Set
