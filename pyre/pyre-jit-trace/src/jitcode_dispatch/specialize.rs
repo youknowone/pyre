@@ -5545,7 +5545,7 @@ fn walker_emit_apparent_super_attr_result<Sym: WalkSym>(
     binding: SuperAttrBinding,
 ) -> Result<OpRef, DispatchError> {
     let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !cls.is_constant() {
+    if !walker_ref_box_is(ctx, cls, concrete_cls) {
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls, cls_const])?;
         ctx.trace_ctx.heap_cache_mut().replace_box(cls, cls_const);
     }
@@ -5578,8 +5578,10 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
     class_mode: bool,
 ) -> Result<OpRef, DispatchError> {
     // The class the walk starts after is baked into the emitted body.
+    // A virtual proxy's `super_type` field is already that constant; a
+    // second GUARD_VALUE of the GETFIELD box is a tautology.
     let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !cls.is_constant() {
+    if !walker_ref_box_is(ctx, cls, concrete_cls) {
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls, cls_const])?;
         ctx.trace_ctx.heap_cache_mut().replace_box(cls, cls_const);
     }
@@ -5628,20 +5630,12 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
         // anything else -- there this guard is what proves the class the walk
         // used.  A proxy proves that from its own `w_objtype` field instead,
         // and its receiver's class may be unrelated.
-        let self_class_const = ctx
-            .trace_ctx
-            .const_ref(unsafe { (*concrete_self).w_class } as i64);
-        let w_class_op =
-            walker_record_getfield_gc_r_uncached(ctx, self_obj, crate::descr::w_class_descr());
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[w_class_op, self_class_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(w_class_op, self_class_const);
+        //
+        // The cached pin: `two_arg_super_call` / `bare_super_virtual` already
+        // ran this on the same receiver when they emitted the virtual proxy,
+        // and a second uncached GETFIELD + GUARD_VALUE was the extra name-bound
+        // cost.  `walker_pin_instance_w_class` reuses the heapcache box.
+        walker_pin_instance_w_class(ctx, op_pc, self_obj, unsafe { (*concrete_self).w_class })?;
     }
 
     // typeobject.py `promote(self.version_tag())`.  Every class the suffix
@@ -5795,7 +5789,11 @@ pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
         crate::descr::super_obj_type_descr(),
         concrete_objtype,
     );
-    if !objtype_op.is_constant() {
+    // A virtual proxy answers this field from its own SetfieldGc cache as
+    // the constant `emit_super_proxy` stored.  A second GUARD_VALUE of that
+    // word is a tautology; `walker_ref_box_is` sees the forwarded constant
+    // even when the opref itself is still the GETFIELD box.
+    if !walker_ref_box_is(ctx, objtype_op, concrete_objtype) {
         let objtype_const = ctx.trace_ctx.const_ref(concrete_objtype as i64);
         walker_emit_fold_guard_with_snapshot(
             ctx,
@@ -5998,7 +5996,7 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
     class_mode: bool,
 ) -> Result<OpRef, DispatchError> {
     let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !cls_op.is_constant() {
+    if !walker_ref_box_is(ctx, cls_op, concrete_cls) {
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls_op, cls_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
@@ -6040,17 +6038,10 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
         // `_super_check`'s answer is baked, so pin the receiver's exact Python
         // class.  An exception instance carrying the generic stub may resolve
         // its class through the kind registry instead and was declined above.
-        let w_class_op =
-            walker_record_getfield_gc_r_uncached(ctx, obj_op, crate::descr::w_class_descr());
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[w_class_op, objtype_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(w_class_op, objtype_const);
+        // Cached: the following `load_attr_on_super` lookup re-reads this
+        // slot, and an uncached GETFIELD made that a second per-iteration
+        // GUARD_VALUE of the same word.
+        walker_pin_instance_w_class(ctx, op_pc, obj_op, objtype)?;
     }
     // A `__bases__` reassignment anywhere in the selected class's ancestry
     // bumps this tag and can make `issubtype_w(objtype, cls)` stop holding.
@@ -6081,7 +6072,7 @@ fn walker_emit_apparent_super_proxy<Sym: WalkSym>(
     apparent: ApparentSuperClass,
 ) -> Result<OpRef, DispatchError> {
     let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !cls_op.is_constant() {
+    if !walker_ref_box_is(ctx, cls_op, concrete_cls) {
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls_op, cls_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
