@@ -47,7 +47,7 @@ impl<'c> Lowerer<'c> {
         // RPython `jtransform.py` `optimize_goto_if_not`: when the boolean
         // comparison result is used only as this block's exitswitch, remove
         // the value-producing op and carry its operands in the exitswitch.
-        // Flatten then emits `goto_if_not_<opname>/{ii,ff}L`.
+        // Flatten then emits `goto_if_not_<opname>/{ii,ff,rr}L`.
         //
         // Do not fuse through `!`: `!(a < b)` is not `a >= b` for NaNs.
         if !negated {
@@ -64,30 +64,94 @@ impl<'c> Lowerer<'c> {
                     BinOp::Ge(_) => "ge",
                     _ => return None,
                 };
-                let lhs = s.lower_value_expr(&binary.left)?;
-                let rhs = s.lower_value_expr(&binary.right)?;
-                if lhs.kind != rhs.kind
-                    || !matches!(lhs.kind, BindingKind::Int | BindingKind::Float)
-                {
-                    return None;
-                }
-                // `_rewrite_equality` then `optimize_goto_if_not`:
-                // `int_eq(x, 0)` → `int_is_zero` → `goto_if_not_int_is_zero`.
-                if matches!(lhs.kind, BindingKind::Int)
-                    && matches!(binary.op, BinOp::Eq(_) | BinOp::Ne(_))
-                {
-                    let left_zero = int_literal_value(&binary.left) == Some(0);
-                    let right_zero = int_literal_value(&binary.right) == Some(0);
-                    if left_zero || right_zero {
-                        let value = if right_zero { lhs } else { rhs };
+                // `_rewrite_equality` on `ptr_eq` / `ptr_ne`: a comparison
+                // against null is `ptr_iszero` / `ptr_nonzero`. Detect the
+                // null spelling on the source tree — `null_mut()` does not
+                // lower as a value, so waiting until both sides are bound
+                // would refuse the condition.
+                if matches!(binary.op, BinOp::Eq(_) | BinOp::Ne(_)) {
+                    let left_null = expr_is_null_ptr(&binary.left);
+                    let right_null = expr_is_null_ptr(&binary.right);
+                    if left_null || right_null {
+                        if left_null && right_null {
+                            return None;
+                        }
+                        let other = if right_null {
+                            &binary.left
+                        } else {
+                            &binary.right
+                        };
+                        let value = s.lower_value_expr(other)?;
+                        if !matches!(value.kind, BindingKind::Ref) {
+                            return None;
+                        }
                         let negated = matches!(binary.op, BinOp::Eq(_));
                         return Some(LoweredCondition::Value {
                             binding: value,
                             negated,
-                            int_is_true: true,
+                            int_is_true: false,
                         });
                     }
                 }
+                let lhs = s.lower_value_expr(&binary.left)?;
+                let rhs = s.lower_value_expr(&binary.right)?;
+                if lhs.kind != rhs.kind {
+                    return None;
+                }
+                match lhs.kind {
+                    BindingKind::Int => {
+                        // `_rewrite_equality` then `optimize_goto_if_not`:
+                        // `int_eq(x, 0)` → `int_is_zero` → `goto_if_not_int_is_zero`.
+                        if matches!(binary.op, BinOp::Eq(_) | BinOp::Ne(_)) {
+                            let left_zero = int_literal_value(&binary.left) == Some(0);
+                            let right_zero = int_literal_value(&binary.right) == Some(0);
+                            if left_zero || right_zero {
+                                let value = if right_zero { lhs } else { rhs };
+                                let negated = matches!(binary.op, BinOp::Eq(_));
+                                return Some(LoweredCondition::Value {
+                                    binding: value,
+                                    negated,
+                                    int_is_true: true,
+                                });
+                            }
+                        }
+                    }
+                    BindingKind::Float => {}
+                    BindingKind::Ref => {
+                        // `optimize_goto_if_not` lists `ptr_eq` / `ptr_ne`.
+                        // Ordered pointer compares do not exist upstream.
+                        if !matches!(binary.op, BinOp::Eq(_) | BinOp::Ne(_)) {
+                            return None;
+                        }
+                        return Some(LoweredCondition::Compare {
+                            lhs,
+                            rhs,
+                            branch: format_ident!("goto_if_not_ptr_{suffix}"),
+                        });
+                    }
+                }
+                if !matches!(lhs.kind, BindingKind::Int | BindingKind::Float) {
+                    return None;
+                }
+                // `_rewrite_symmetric` before `optimize_goto_if_not`:
+                // `c1 < v2` → `v2 > c1` so flatten sees one bytecode form.
+                let swap = binop_is_symmetric(&binary.op)
+                    && int_literal_value(&binary.left).is_some()
+                    && int_literal_value(&binary.right).is_none();
+                let (op, lhs, rhs) = if swap {
+                    (mirrored_compare_binop(&binary.op), rhs, lhs)
+                } else {
+                    (binary.op, lhs, rhs)
+                };
+                let suffix = match &op {
+                    BinOp::Lt(_) => "lt",
+                    BinOp::Le(_) => "le",
+                    BinOp::Eq(_) => "eq",
+                    BinOp::Ne(_) => "ne",
+                    BinOp::Gt(_) => "gt",
+                    BinOp::Ge(_) => "ge",
+                    _ => return None,
+                };
                 let prefix = match lhs.kind {
                     BindingKind::Int => "goto_if_not_int_",
                     BindingKind::Float => "goto_if_not_float_",
@@ -102,6 +166,21 @@ impl<'c> Lowerer<'c> {
             if fused.is_some() {
                 return fused;
             }
+        }
+
+        // `x.is_null()` is `ptr_iszero`. Combined with a peeled `!` it
+        // is `ptr_nonzero` — the same pair `_rewrite_equality` produces
+        // for `ptr == NULL` / `ptr != NULL`.
+        if let Some(receiver) = expr_is_ptr_is_null_method(expr) {
+            let binding = self.lower_value_expr(receiver)?;
+            if !matches!(binding.kind, BindingKind::Ref) {
+                return None;
+            }
+            return Some(LoweredCondition::Value {
+                binding,
+                negated: !negated,
+                int_is_true: false,
+            });
         }
 
         let binding = self.lower_value_expr(expr)?;
@@ -214,26 +293,10 @@ impl<'c> Lowerer<'c> {
             self.emit_aux(quote! { let #next_label = __builder.new_label(); });
 
             if value_tokens.len() == 1 {
-                let value_tok = &value_tokens[0];
-                let const_reg = self.alloc_reg();
-                let eq_reg = self.alloc_reg();
-                self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-                    quote! { __builder.load_const_i_value(#const_reg, #value_tok); },
-                );
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::BinopI,
-                        Register::ints(&[disc_reg, const_reg]),
-                        vec![Register::int(eq_reg)],
-                    ),
-                    quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
-                );
-                self.emit_op(
-                    OpMeta::live_marker(),
-                    quote! { let _ = __builder.live_placeholder(); },
-                );
-                self.emit_conditional_guard(eq_reg, &next_label);
+                // `optimize_goto_if_not` fuses `int_eq` + exitswitch into
+                // `goto_if_not_int_eq`. A compare against zero is
+                // `_rewrite_equality` → `goto_if_not_int_is_zero`.
+                self.emit_fused_int_eq_miss(disc_reg, &value_tokens[0], &next_label);
             } else {
                 let first_tok = &value_tokens[0];
                 let first_const_reg = self.alloc_reg();
@@ -693,26 +756,7 @@ impl<'c> Lowerer<'c> {
             self.emit_aux(quote! { let #next_label = __builder.new_label(); });
 
             if values.len() == 1 {
-                let value = &values[0];
-                let const_reg = self.alloc_reg();
-                let eq_reg = self.alloc_reg();
-                self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
-                    quote! { __builder.load_const_i_value(#const_reg, #value); },
-                );
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::BinopI,
-                        Register::ints(&[disc_reg, const_reg]),
-                        vec![Register::int(eq_reg)],
-                    ),
-                    quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
-                );
-                self.emit_op(
-                    OpMeta::live_marker(),
-                    quote! { let _ = __builder.live_placeholder(); },
-                );
-                self.emit_conditional_guard(eq_reg, &next_label);
+                self.emit_fused_int_eq_miss(disc_reg, &values[0], &next_label);
             } else {
                 let first_val = &values[0];
                 let first_const_reg = self.alloc_reg();
@@ -828,8 +872,19 @@ impl<'c> Lowerer<'c> {
     }
 
     fn emit_checked_ovf_match(&mut self, parsed: CheckedOvfMatch<'_>) -> Option<Binding> {
-        let lhs = self.lower_value_expr(parsed.recv)?;
-        let rhs = self.lower_value_expr(parsed.arg)?;
+        // `rewrite_op_int_add_ovf` / `rewrite_op_int_mul_ovf` run
+        // `_rewrite_symmetric` before emitting `-live-` + the ovf op.
+        // `int_sub_ovf` is not symmetric.
+        let swap = parsed.builder_method != "int_sub_jump_if_ovf"
+            && int_literal_value(parsed.recv).is_some()
+            && int_literal_value(parsed.arg).is_none();
+        let (lhs_expr, rhs_expr) = if swap {
+            (parsed.arg, parsed.recv)
+        } else {
+            (parsed.recv, parsed.arg)
+        };
+        let lhs = self.lower_value_expr(lhs_expr)?;
+        let rhs = self.lower_value_expr(rhs_expr)?;
         if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
             return None;
         }
@@ -1277,6 +1332,61 @@ mod unroll_binding_tests {
     }
 
     #[test]
+    fn if_const_lt_var_mirrors_to_goto_if_not_int_gt() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.bindings.insert(
+            "n".to_string(),
+            Binding {
+                reg: 4,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr_if: syn::ExprIf = syn::parse_quote! { if 0 < n { } };
+        assert!(lowerer.lower_if_stmt(&expr_if).is_some());
+        let emitted = emitted_if(&lowerer);
+        assert!(
+            emitted.contains("goto_if_not_int_gt"),
+            "`if 0 < n` must swap to int_gt, got:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("goto_if_not_int_lt"),
+            "must not keep the constant-left form:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn match_fuses_to_goto_if_not_int_eq() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.bindings.insert(
+            "n".to_string(),
+            Binding {
+                reg: 4,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr_match: syn::ExprMatch = syn::parse_quote! {
+            match n {
+                1 => {},
+                _ => {},
+            }
+        };
+        assert!(lowerer.lower_match_stmt(&expr_match).is_some());
+        let emitted = emitted_if(&lowerer);
+        assert!(
+            emitted.contains("goto_if_not_int_eq"),
+            "`match n {{ 1 => }}` must fuse to int_eq, got:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("IntEq"),
+            "must not materialise the compare:\n{emitted}"
+        );
+    }
+
+    #[test]
     fn if_eq_zero_fuses_to_goto_if_not_int_is_zero() {
         let mut lowerer = Lowerer::new(None);
         lowerer.bindings.insert(
@@ -1303,6 +1413,101 @@ mod unroll_binding_tests {
         assert!(
             !emitted.contains("goto_if_not_int_eq"),
             "must not keep the binary compare:\n{emitted}"
+        );
+    }
+
+    fn insert_ref(lowerer: &mut Lowerer, name: &str, reg: u16) {
+        lowerer.bindings.insert(
+            name.to_string(),
+            Binding {
+                reg,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+    }
+
+    fn emitted_if(lowerer: &Lowerer) -> String {
+        lowerer
+            .statements
+            .iter()
+            .map(|tokens| tokens.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn if_ptr_eq_fuses_to_goto_if_not_ptr_eq() {
+        let mut lowerer = Lowerer::new(None);
+        insert_ref(&mut lowerer, "a", 0);
+        insert_ref(&mut lowerer, "b", 1);
+        let expr_if: syn::ExprIf = syn::parse_quote! { if a == b { } };
+        assert!(lowerer.lower_if_stmt(&expr_if).is_some());
+        let emitted = emitted_if(&lowerer);
+        assert!(
+            emitted.contains("goto_if_not_ptr_eq"),
+            "`if a == b` on refs must fuse to ptr_eq, got:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("ptr_iszero") && !emitted.contains("goto_if_not_int"),
+            "must not fall through to an int branch:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn if_ptr_eq_null_fuses_to_goto_if_not_ptr_iszero() {
+        let mut lowerer = Lowerer::new(None);
+        insert_ref(&mut lowerer, "p", 0);
+        let expr_if: syn::ExprIf = syn::parse_quote! { if p == std::ptr::null_mut() { } };
+        assert!(lowerer.lower_if_stmt(&expr_if).is_some());
+        let emitted = emitted_if(&lowerer);
+        assert!(
+            emitted.contains("goto_if_not_ptr_iszero"),
+            "`if p == null_mut()` must fuse to ptr_iszero, got:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn if_ptr_ne_null_fuses_to_goto_if_not_ptr_nonzero() {
+        let mut lowerer = Lowerer::new(None);
+        insert_ref(&mut lowerer, "p", 0);
+        let expr_if: syn::ExprIf = syn::parse_quote! { if p != std::ptr::null() { } };
+        assert!(lowerer.lower_if_stmt(&expr_if).is_some());
+        let emitted = emitted_if(&lowerer);
+        assert!(
+            emitted.contains("goto_if_not_ptr_nonzero"),
+            "`if p != null()` must fuse to ptr_nonzero, got:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn if_is_null_fuses_to_goto_if_not_ptr_iszero() {
+        let mut lowerer = Lowerer::new(None);
+        insert_ref(&mut lowerer, "p", 0);
+        let expr_if: syn::ExprIf = syn::parse_quote! { if p.is_null() { } };
+        assert!(lowerer.lower_if_stmt(&expr_if).is_some());
+        let emitted = emitted_if(&lowerer);
+        assert!(
+            emitted.contains("goto_if_not_ptr_iszero"),
+            "`if p.is_null()` must fuse to ptr_iszero, got:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn if_not_is_null_fuses_to_goto_if_not_ptr_nonzero() {
+        let mut lowerer = Lowerer::new(None);
+        insert_ref(&mut lowerer, "p", 0);
+        let expr_if: syn::ExprIf = syn::parse_quote! { if !p.is_null() { } };
+        assert!(lowerer.lower_if_stmt(&expr_if).is_some());
+        let emitted = emitted_if(&lowerer);
+        assert!(
+            emitted.contains("goto_if_not_ptr_nonzero"),
+            "`if !p.is_null()` must fuse to ptr_nonzero, got:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("goto_if_not_ptr_iszero"),
+            "the negation must replace the branch, not add one:\n{emitted}"
         );
     }
 
@@ -1351,6 +1556,47 @@ mod unroll_binding_tests {
         assert!(
             emitted.contains("IntAdd") || emitted.contains("int_add"),
             "Some(v) => v + 1 must emit the increment, got:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn checked_add_swaps_a_constant_receiver() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.bindings.insert(
+            "x".to_string(),
+            Binding {
+                reg: 3,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: syn::ExprMatch = syn::parse_quote! {
+            match 1.checked_add(x) {
+                Some(v) => v,
+                None => 0,
+            }
+        };
+        assert!(
+            lowerer
+                .lower_checked_ovf_match(&expr)
+                .expect("recognized")
+                .is_some()
+        );
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(|tokens| tokens.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            emitted.contains("int_add_jump_if_ovf ("),
+            "expected the ovf add, got:\n{emitted}"
+        );
+        // `_rewrite_symmetric` moves the variable to the left: dst, x, 1.
+        assert!(
+            emitted.contains("int_add_jump_if_ovf (") && emitted.contains("3u16"),
+            "the variable must be the left ovf operand, got:\n{emitted}"
         );
     }
 }

@@ -1681,6 +1681,40 @@ impl<'c> Lowerer<'c> {
                 // helper performs leaves the trace with no diagnostic. The
                 // workaround is to bind the result to `let _x = ...`, which is
                 // a source change the declaration does not ask for.
+                crate::jit_interp::CallPolicyKind::InlinePipelineInt
+                | crate::jit_interp::CallPolicyKind::InlinePipelineRef
+                | crate::jit_interp::CallPolicyKind::InlinePipelineFloat => {
+                    let result_kind = binding_kind_for_inline_policy(kind)
+                        .expect("the arm's own patterns are the pipeline result policies");
+                    let throwaway_reg = self.alloc_reg();
+                    let pipeline_name = match &*call.func {
+                        syn::Expr::Path(ep) => ep
+                            .path
+                            .segments
+                            .last()
+                            .map(|segment| segment.ident.to_string()),
+                        _ => None,
+                    }?;
+                    let (inline_call, post_live) = inline_call_tokens(&arg_bindings, throwaway_reg);
+                    let arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.inline_liveness_prebuild.push(quote! {
+                        __majit_pipeline_liveness_prebuild(__asm);
+                    });
+                    self.emit_op(
+                        OpMeta::linear(
+                            OpKind::InlineCall,
+                            arg_regs,
+                            vec![Register::new(result_kind, throwaway_reg)],
+                        ),
+                        quote! {
+                            let __sub_jitcode = __majit_pipeline_jitcode(#pipeline_name);
+                            let __sub_idx = __builder.add_sub_jitcode_arc(__sub_jitcode);
+                            #inline_call
+                        },
+                    );
+                    self.emit_op(OpMeta::live_marker(), post_live);
+                }
                 crate::jit_interp::CallPolicyKind::InlineInt
                 | crate::jit_interp::CallPolicyKind::InlineRef
                 | crate::jit_interp::CallPolicyKind::InlineFloat => {

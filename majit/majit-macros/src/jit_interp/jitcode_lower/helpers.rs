@@ -456,6 +456,46 @@ pub(super) fn expr_is_unsigned_int(expr: &Expr) -> bool {
     }
 }
 
+fn type_is_raw_pointer(ty: &Type) -> bool {
+    matches!(ty, Type::Ptr(_))
+}
+
+/// `jtransform.py` `_rewrite_equality`'s `not arg.value` test for a
+/// pointer: the operand is still a source expression, so the null
+/// spellings RPython would have as `Constant(nullptr)` are recognised
+/// here. `ptr::null` / `ptr::null_mut` (any path prefix, optional
+/// turbofish) and `0 as *mut T` / `0 as *const T`.
+pub(super) fn expr_is_null_ptr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(paren) => expr_is_null_ptr(&paren.expr),
+        Expr::Group(group) => expr_is_null_ptr(&group.expr),
+        Expr::Call(call) if call.args.is_empty() => {
+            match &*call.func {
+                Expr::Path(path) => path.path.segments.last().is_some_and(|seg| {
+                    matches!(seg.ident.to_string().as_str(), "null" | "null_mut")
+                }),
+                _ => false,
+            }
+        }
+        Expr::Cast(cast) => {
+            int_literal_value(&cast.expr) == Some(0) && type_is_raw_pointer(&cast.ty)
+        }
+        _ => false,
+    }
+}
+
+/// `x.is_null()` — the Rust spelling of RPython `ptr_iszero`.
+pub(super) fn expr_is_ptr_is_null_method(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::Paren(paren) => expr_is_ptr_is_null_method(&paren.expr),
+        Expr::Group(group) => expr_is_ptr_is_null_method(&group.expr),
+        Expr::MethodCall(call) if call.method == "is_null" && call.args.is_empty() => {
+            Some(&call.receiver)
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn is_supported_float_type(ty: &Type) -> bool {
     match ty {
         Type::Path(type_path) => type_path.path.is_ident("f64"),

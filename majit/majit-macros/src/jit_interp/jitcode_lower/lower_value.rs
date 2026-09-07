@@ -378,6 +378,9 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_float_bitcast_method_call(call) {
                     return Some(binding);
                 }
+                if let Some(binding) = self.lower_ptr_is_null_method_call(call) {
+                    return Some(binding);
+                }
                 self.lower_method_call_value(call)
             }
             Expr::Struct(s) => self.lower_struct_value(s),
@@ -681,17 +684,36 @@ impl<'c> Lowerer<'c> {
             .iter()
             .map(|(member, value)| {
                 let is_ref = matches!(value.kind, BindingKind::Ref);
-                // A struct literal names no sub-word integer field: the
-                // allocation's own field stores go through the int/ref banks,
-                // so the layout registers `scalar_size`'s default here. A ref
-                // field's width comes from `Type::Ref` and ignores this.
+                // `rewrite_op_malloc` + `rewrite_op_setfield` register
+                // each field through `fielddescrof`, which reads width
+                // and signedness from FIELDTYPE. Use the same
+                // `int_fields` / `ref_fields` witness the getfield path
+                // already consults.
+                let struct_name = struct_path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let member_name = named_member(member).unwrap_or_default();
+                let key = format!("{struct_name}::{member_name}");
+                let (size, signed, witness) = match self.config {
+                    Some(config) => {
+                        super::lower_vable::field_scalar_tokens(config, &key, struct_path, member)
+                    }
+                    None => (
+                        quote! { ::core::mem::size_of::<i64>() },
+                        quote! { true },
+                        quote! {},
+                    ),
+                };
                 quote! {
+                    #witness
                     (
                         ::core::mem::offset_of!(#struct_path, #member),
                         #is_ref,
                         stringify!(#member),
-                        ::core::mem::size_of::<i64>(),
-                        true,
+                        #size,
+                        #signed,
                     )
                 }
             })
@@ -1952,6 +1974,75 @@ impl<'c> Lowerer<'c> {
         self.lower_call_value(&normalized)
     }
 
+    /// `jtransform.py` `_rewrite_equality` via `rewrite_op_ptr_eq` /
+    /// `rewrite_op_ptr_ne`: a comparison against the null pointer is the
+    /// unary `ptr_iszero` / `ptr_nonzero`. The null operand is recognised
+    /// on the source tree because `null_mut()` is not a lowerable value.
+    fn lower_ptr_equality_against_null(&mut self, expr: &ExprBinary) -> Option<Binding> {
+        let left_null = expr_is_null_ptr(&expr.left);
+        let right_null = expr_is_null_ptr(&expr.right);
+        if !left_null && !right_null {
+            return None;
+        }
+        if left_null && right_null {
+            let value = i64::from(matches!(expr.op, BinOp::Eq(_)));
+            let reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(reg)]),
+                quote! { __builder.load_const_i_value(#reg, #value); },
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            });
+        }
+        let other = if right_null { &expr.left } else { &expr.right };
+        let binding = self.lower_value_expr(other)?;
+        if !matches!(binding.kind, BindingKind::Ref) {
+            return None;
+        }
+        self.emit_ptr_nullity_test(binding, matches!(expr.op, BinOp::Eq(_)))
+    }
+
+    /// `x.is_null()` is RPython `ptr_iszero`.
+    fn lower_ptr_is_null_method_call(&mut self, call: &ExprMethodCall) -> Option<Binding> {
+        if call.method != "is_null" || !call.args.is_empty() {
+            return None;
+        }
+        let recv = self.lower_value_expr(&call.receiver)?;
+        if !matches!(recv.kind, BindingKind::Ref) {
+            return None;
+        }
+        self.emit_ptr_nullity_test(recv, true)
+    }
+
+    /// `ptr_iszero` when `is_zero`, otherwise `ptr_nonzero`.
+    fn emit_ptr_nullity_test(&mut self, binding: Binding, is_zero: bool) -> Option<Binding> {
+        let src_reg = binding.reg;
+        let reg = self.alloc_reg();
+        let emit = if is_zero {
+            quote! { __builder.ptr_iszero(#reg, #src_reg); }
+        } else {
+            quote! { __builder.ptr_nonzero(#reg, #src_reg); }
+        };
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::UnaryI,
+                vec![Register::ref_(src_reg)],
+                vec![Register::int(reg)],
+            ),
+            emit,
+        );
+        Some(Binding {
+            reg,
+            kind: BindingKind::Int,
+            depends_on_stack: binding.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
     fn lower_if_value(&mut self, expr_if: &ExprIf) -> Option<Binding> {
         if let Some(binding) = self.lower_bool_if(expr_if) {
             return Some(binding);
@@ -2031,20 +2122,16 @@ impl<'c> Lowerer<'c> {
         match (then_value, else_value) {
             (1, 0) => Some(cond),
             (0, 1) => {
-                let zero_reg = self.alloc_reg();
-                self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(zero_reg)]),
-                    quote! { __builder.load_const_i_value(#zero_reg, 0); },
-                );
-                let reg = self.alloc_reg();
+                // `_rewrite_equality` / `bool_not` → `int_is_zero`.
                 let cond_reg = cond.reg;
+                let reg = self.alloc_reg();
                 self.emit_op(
                     OpMeta::linear(
-                        OpKind::BinopI,
-                        Register::ints(&[cond_reg, zero_reg]),
+                        OpKind::UnaryI,
+                        Register::ints(&[cond_reg]),
                         vec![Register::int(reg)],
                     ),
-                    quote! { __builder.record_binop_i(#reg, majit_ir::OpCode::IntEq, #cond_reg, #zero_reg); },
+                    quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::IntIsZero, #cond_reg); },
                 );
                 Some(Binding {
                     reg,
@@ -2216,6 +2303,11 @@ impl<'c> Lowerer<'c> {
     }
 
     fn lower_binary(&mut self, expr: &ExprBinary) -> Option<Binding> {
+        if matches!(expr.op, BinOp::Eq(_) | BinOp::Ne(_)) {
+            if let Some(binding) = self.lower_ptr_equality_against_null(expr) {
+                return Some(binding);
+            }
+        }
         let lhs = self.lower_value_expr(&expr.left)?;
         let rhs = self.lower_value_expr(&expr.right)?;
         if matches!(lhs.kind, BindingKind::Float) && matches!(rhs.kind, BindingKind::Float) {
@@ -3149,6 +3241,60 @@ mod tests {
             });
             assert!(out.is_some());
             assert!(emitted(&lowerer).contains("PtrNe"));
+        }
+
+        #[test]
+        fn a_ref_equality_against_null_lowers_to_ptr_iszero() {
+            let (lowerer, out) = lower("p == std::ptr::null_mut()", |l| {
+                l.bindings.insert("p".into(), ref_binding(0, None));
+            });
+            assert!(out.is_some(), "null_mut() must not refuse the compare");
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("ptr_iszero"),
+                "`p == null_mut()` is `_rewrite_equality` to ptr_iszero, got:\n{text}"
+            );
+            assert!(
+                !text.contains("PtrEq"),
+                "must not keep the binary pointer compare:\n{text}"
+            );
+        }
+
+        #[test]
+        fn a_ref_inequality_against_null_lowers_to_ptr_nonzero() {
+            let (lowerer, out) = lower("p != core::ptr::null()", |l| {
+                l.bindings.insert("p".into(), ref_binding(0, None));
+            });
+            assert!(out.is_some());
+            assert!(
+                emitted(&lowerer).contains("ptr_nonzero"),
+                "`p != null()` is ptr_nonzero"
+            );
+        }
+
+        #[test]
+        fn a_zero_cast_to_raw_pointer_is_the_null_constant() {
+            let (lowerer, out) = lower("p == (0 as *mut u8)", |l| {
+                l.bindings.insert("p".into(), ref_binding(0, None));
+            });
+            assert!(out.is_some());
+            assert!(
+                emitted(&lowerer).contains("ptr_iszero"),
+                "`0 as *mut T` is the same null constant"
+            );
+        }
+
+        #[test]
+        fn is_null_lowers_to_ptr_iszero() {
+            let mut lowerer = Lowerer::new(None);
+            lowerer.bindings.insert("p".into(), ref_binding(0, None));
+            let expr: Expr = syn::parse_str("p.is_null()").expect("parse method call");
+            let out = lowerer.lower_value_expr(&expr);
+            assert!(out.is_some(), "is_null() must not refuse");
+            assert!(
+                emitted(&lowerer).contains("ptr_iszero"),
+                "`p.is_null()` is ptr_iszero"
+            );
         }
 
         #[test]
