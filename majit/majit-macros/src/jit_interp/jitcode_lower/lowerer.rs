@@ -405,7 +405,51 @@ impl<'c> Lowerer<'c> {
     }
 
     pub(super) fn emit_conditional_guard(&mut self, cond_reg: u16, target: &Ident) {
-        self.emit_conditional_guard_negatable(cond_reg, target, false, false);
+        self.emit_conditional_guard_negatable(cond_reg, target, false, false, BindingKind::Int);
+    }
+
+    /// `optimize_goto_if_not` on `int_eq(disc, const)`: fall through when
+    /// they match, jump to `miss` otherwise. Zero is `_rewrite_equality`
+    /// → `goto_if_not_int_is_zero`.
+    pub(super) fn emit_fused_int_eq_miss(
+        &mut self,
+        disc_reg: u16,
+        value_tok: &TokenStream,
+        miss: &Ident,
+    ) {
+        // `flatten.insert_exits` puts `-live-` immediately before the
+        // fused `goto_if_not_*`. The constant load is not the guard, so
+        // it must land first; otherwise `get_list_of_active_snapshot_boxes`
+        // reads `pc - SIZE_LIVE_OP` as the load opcode.
+        let const_reg = if value_tok.to_string().replace(' ', "") == "0" {
+            None
+        } else {
+            let const_reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
+                quote! { __builder.load_const_i_value(#const_reg, #value_tok); },
+            );
+            Some(const_reg)
+        };
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        if let Some(const_reg) = const_reg {
+            self.emit_op(
+                OpMeta::conditional_guard_compare(
+                    Register::int(disc_reg),
+                    Register::int(const_reg),
+                    miss.clone(),
+                ),
+                quote! { __builder.goto_if_not_int_eq(#disc_reg, #const_reg, #miss); },
+            );
+        } else {
+            self.emit_op(
+                OpMeta::conditional_guard(Register::int(disc_reg), miss.clone()),
+                quote! { __builder.goto_if_not_int_is_zero(#disc_reg, #miss); },
+            );
+        }
     }
 
     /// The branch RPython writes as `goto_if_not_<opname>`: fall through
@@ -419,26 +463,40 @@ impl<'c> Lowerer<'c> {
     ///
     /// `int_is_true` is the integer `!= 0` rewrite. A Rust `if`/`while`
     /// condition is otherwise `bool`, so flatten emits plain `goto_if_not`.
+    ///
+    /// A Ref binding is the `_rewrite_equality` fold of `ptr_eq` /
+    /// `ptr_ne` against null (`ptr_iszero` / `ptr_nonzero`); flatten
+    /// writes `goto_if_not_ptr_iszero/rL` / `goto_if_not_ptr_nonzero/rL`.
     pub(super) fn emit_conditional_guard_negatable(
         &mut self,
         cond_reg: u16,
         target: &Ident,
         negated: bool,
         int_is_true: bool,
+        kind: BindingKind,
     ) {
-        let branch = if negated {
-            format_ident!("goto_if_not_int_is_zero")
-        } else if int_is_true {
-            format_ident!("goto_if_not_int_is_true")
+        let (branch, register) = if matches!(kind, BindingKind::Ref) {
+            let branch = if negated {
+                format_ident!("goto_if_not_ptr_iszero")
+            } else {
+                format_ident!("goto_if_not_ptr_nonzero")
+            };
+            (branch, Register::ref_(cond_reg))
         } else {
-            format_ident!("goto_if_not")
+            let branch = if negated {
+                format_ident!("goto_if_not_int_is_zero")
+            } else if int_is_true {
+                format_ident!("goto_if_not_int_is_true")
+            } else {
+                format_ident!("goto_if_not")
+            };
+            (branch, Register::int(cond_reg))
         };
-        // Both forms read an int-banked register: `assembler.py write_insn`
-        // takes a `Register` operand's argcode from `x.kind[0]`, which is
-        // `'i'` for the int bank — encode the kind into the metadata
-        // `Register` so the liveness walker keeps it under Int.
+        // `assembler.py write_insn` takes a `Register` operand's argcode
+        // from `x.kind[0]`; encode the bank into the metadata `Register`
+        // so the liveness walker keeps a Ref truth-test under Ref.
         self.emit_op(
-            OpMeta::conditional_guard(Register::int(cond_reg), target.clone()),
+            OpMeta::conditional_guard(register, target.clone()),
             quote! { __builder.#branch(#cond_reg, #target); },
         );
     }
@@ -456,7 +514,13 @@ impl<'c> Lowerer<'c> {
                 negated,
                 int_is_true,
             } => {
-                self.emit_conditional_guard_negatable(binding.reg, target, *negated, *int_is_true);
+                self.emit_conditional_guard_negatable(
+                    binding.reg,
+                    target,
+                    *negated,
+                    *int_is_true,
+                    binding.kind,
+                );
             }
             LoweredCondition::Compare { lhs, rhs, branch } => {
                 let lhs_reg = Register::new(lhs.kind, lhs.reg);

@@ -751,14 +751,18 @@ fn rewrite_symmetric(graph: &FunctionGraph, op: SpaceOperation) -> SpaceOperatio
 /// `add` / `mul` cover both `int_add` / `int_mul` and `float_add` /
 /// `float_mul`, and the bare comparisons cover the `int_`, `uint_` and
 /// `float_` families at once, because the register kind is not yet part of
-/// the name at this point.  `sub`, the divisions, the shifts and the
-/// `*_assign` spellings are absent for the same reason they are absent
-/// upstream: they are not symmetric.
+/// the name at this point.  `add_ovf` / `mul_ovf` are the same rewrite:
+/// `rewrite_op_int_add_ovf` (aliased to `rewrite_op_int_mul_ovf`) calls
+/// `_rewrite_symmetric` before prepending `-live-`.  `sub`, `sub_ovf`,
+/// the divisions, the shifts and the `*_assign` spellings are absent for
+/// the same reason they are absent upstream: they are not symmetric.
 fn is_symmetric_binop(name: &str) -> bool {
     matches!(
         name,
         "add"
             | "mul"
+            | "add_ovf"
+            | "mul_ovf"
             | "bitand"
             | "bitor"
             | "bitxor"
@@ -3981,6 +3985,20 @@ impl<'a> Transformer<'a> {
         // The structural arm, as on the read side: a write into a
         // non-dereferenced local aggregate is not a virtualizable write.
         let fresh_virtualizable = fresh_virtualizable || field.base_is_local_aggregate();
+        // `is_virtualizable_getset`: writing the array field itself
+        // (not an element) raises `VirtualizableArrayField`. `rewrite_op_setfield`
+        // does not catch it, so translation fails. A fresh virtualizable
+        // is still being initialised and may take a plain `setfield`.
+        if !fresh_virtualizable && self.config.virtualizable_array(field).is_some() {
+            panic!(
+                "A virtualizable array is passed around; it should\n\
+                 only be used immediately after being read.  Note\n\
+                 that a possible cause is writing the array field\n\
+                 itself rather than an element.\n\
+                 This is about: {field:?}\n\
+                 Occurred in: {graph_name}"
+            );
+        }
         if let Some(vable_field) = self
             .config
             .virtualizable_field(field)
@@ -4081,28 +4099,38 @@ impl<'a> Transformer<'a> {
                 },
             ]);
         }
-        if &typed_item_ty != item_ty {
+        let (array_type_id, nolength, source_pure) = match &op.kind {
+            OpKind::ArrayRead {
+                array_type_id,
+                nolength,
+                pure,
+                ..
+            } => (array_type_id.clone(), *nolength, *pure),
+            _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
+        };
+        // `rewrite_op_getarrayitem`: `immut = ARRAY._immutable_field(None)`
+        // → `pure = '_pure'`. The front leaves ordinary reads `pure: false`;
+        // the array type's immutability lives on
+        // `CallControl.immutable_array_types` (`descr.py is_pure`).
+        // `OpHelpers.is_pure_with_descr` does not consult the descr for
+        // `GETARRAYITEM_GC_*`, so the opcode itself must be the `_pure`
+        // form.
+        let immutable = array_type_id.as_deref().is_some_and(|aid| {
+            self.callcontrol
+                .as_deref()
+                .is_some_and(|cc| cc.immutable_array_types.contains(aid))
+        });
+        let pure = source_pure || immutable;
+        if &typed_item_ty != item_ty || pure != source_pure {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::ArrayRead {
                     base: base.clone(),
                     index: index.clone(),
                     item_ty: typed_item_ty,
-                    array_type_id: match &op.kind {
-                        OpKind::ArrayRead { array_type_id, .. } => array_type_id.clone(),
-                        _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
-                    },
-                    nolength: match &op.kind {
-                        OpKind::ArrayRead { nolength, .. } => *nolength,
-                        _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
-                    },
-                    // Preserve the source foldable/immutable flag through
-                    // the item_ty re-type — never hardcode it (rlist.py:724
-                    // ll_getitem_foldable_nonneg).
-                    pure: match &op.kind {
-                        OpKind::ArrayRead { pure, .. } => *pure,
-                        _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
-                    },
+                    array_type_id,
+                    nolength,
+                    pure,
                 },
             }]);
         }
@@ -4769,7 +4797,11 @@ impl<'a> Transformer<'a> {
             && segments[2] == "eq"
             && args.len() == 2
         {
-            return RewriteResult::Replace(vec![SpaceOperation {
+            // Finish as `ptr_eq` and then run `rewrite_op_ptr_eq` —
+            // `_rewrite_equality` + `_rewrite_cmp_ptrs` — so
+            // `ptr::eq(p, NULL)` becomes `ptr_iszero` and a two-variable
+            // compare is fusable as `goto_if_not_ptr_eq`.
+            let lowered = SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::BinOp {
                     op: "eq".into(),
@@ -4777,7 +4809,8 @@ impl<'a> Transformer<'a> {
                     rhs: args[1].clone(),
                     result_ty: ValueType::Int,
                 },
-            }]);
+            };
+            return self.rewrite_operation(&lowered, graph_name, graph);
         }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if self.callcontrol.is_some() {
@@ -6325,7 +6358,7 @@ impl<'a> Transformer<'a> {
 
         // RPython jtransform.py: promote_greens emits guard_value
         // for each non-void green arg before the recursive_call.
-        let mut ops = self.promote_greens(green_args);
+        let mut ops = self.promote_greens(graph, green_args);
 
         // RPython jtransform.py:532-533: recursive_call + -live-
         ops.push(SpaceOperation {
@@ -6350,16 +6383,23 @@ impl<'a> Transformer<'a> {
 
     /// RPython: `Transformer.promote_greens(args, jitdriver)`.
     ///
-    /// Emits `-live-` + `{kind}_guard_value` for each non-void green arg.
-    /// This ensures green values are constant before the recursive call.
+    /// Emits `-live-` + `{kind}_guard_value` for each non-void, non-constant
+    /// green arg. This ensures green values are constant before the recursive
+    /// call.
     ///
-    /// RPython jtransform.py:1646-1656.
+    /// `promote_greens`: skip `Constant` and Void. A source constant is
+    /// an SSA `Const*` Variable here, which `is_source_constant_variable`
+    /// recovers.
     fn promote_greens(
         &self,
+        graph: &FunctionGraph,
         green_args: &[crate::flowspace::model::Variable],
     ) -> Vec<SpaceOperation> {
         let mut ops = Vec::new();
         for var in green_args {
+            if is_source_constant_variable(graph, var) {
+                continue;
+            }
             let kind = self.get_value_kind_var(var);
             if kind == 'v' {
                 continue; // skip void
@@ -6911,7 +6951,7 @@ impl<'a> Transformer<'a> {
                         "Constant specified red in jit_merge_point()"
                     );
                 }
-                let mut ops = self.promote_greens(greens_raw);
+                let mut ops = self.promote_greens(graph, greens_raw);
                 let (greens_i, greens_r, greens_f) = split_args_by_kind(greens_raw);
                 let (reds_i, reds_r, reds_f) = split_args_by_kind(reds_raw);
                 // jtransform.py final shape is `ops + [op3, op1, op2]`.
@@ -10964,6 +11004,41 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "virtualizable array")]
+    fn writing_a_vable_array_field_is_refused() {
+        let mut graph = FunctionGraph::new("vable_array_setfield");
+        let frame = graph.alloc_value_var();
+        let array = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame.clone());
+        graph.push_inputarg_var(graph.startblock, array.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: frame,
+                field: crate::model::FieldDescriptor::new("locals_stack_w", Some("Frame".into()))
+                    .with_base_is_deref(true),
+                value: crate::model::LinkArg::Value(array),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        let _ = transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                    "locals_stack_w",
+                    Some("Frame".into()),
+                    0,
+                    8,
+                    true,
+                )],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
     fn transform_graph_tags_vable_arrays_with_explicit_base() {
         let mut graph = FunctionGraph::new("test");
         let base_var = graph.alloc_value_var();
@@ -13666,7 +13741,7 @@ mod tests {
         let mut graph = crate::model::FunctionGraph::new("test_promote_greens_fixture");
         let greens: Vec<crate::flowspace::model::Variable> =
             (0..3).map(|_| graph.alloc_value_var()).collect();
-        let ops = transformer.promote_greens(&greens);
+        let ops = transformer.promote_greens(&graph, &greens);
         assert_eq!(ops.len(), 6, "expect 2 ops per green");
         for i in 0..greens.len() {
             assert!(
@@ -13689,7 +13764,28 @@ mod tests {
     fn promote_greens_empty_input_yields_empty_output() {
         let config = GraphTransformConfig::default();
         let transformer = Transformer::new(&config);
-        assert!(transformer.promote_greens(&[]).is_empty());
+        assert!(
+            transformer
+                .promote_greens(&crate::model::FunctionGraph::new("empty"), &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn promote_greens_skips_source_constants() {
+        let config = GraphTransformConfig::default();
+        let transformer = Transformer::new(&config);
+        let mut graph = crate::model::FunctionGraph::new("const_green");
+        let live = graph.alloc_value_var();
+        let constant = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(0), true)
+            .unwrap();
+        let ops = transformer.promote_greens(&graph, &[live.clone(), constant]);
+        assert_eq!(ops.len(), 2, "only the variable green is promoted: {ops:?}");
+        match &ops[1].kind {
+            OpKind::GuardValue { value, .. } => assert_eq!(value, &live),
+            other => panic!("expected GuardValue of the live green, got {other:?}"),
+        }
     }
 
     #[test]
@@ -17829,6 +17925,51 @@ mod tests {
             let (op, lhs, _) = binary_op(&ops).expect("the addition must survive");
             assert_eq!(op, "add", "`add` has no mirror: {ops:?}");
             assert_eq!(lhs, x, "the variable must move to the left: {ops:?}");
+        }
+
+        #[test]
+        fn a_constant_left_operand_of_add_ovf_is_swapped() {
+            let (ops, x) = transform_binop(
+                "add_ovf",
+                OpKind::ConstInt(5),
+                ConcreteType::Signed,
+                ConcreteType::Signed,
+                ValueType::Int,
+                true,
+            );
+            let (op, lhs, _) = binary_op(&ops).expect("the overflow add must survive");
+            assert_eq!(op, "add_ovf", "`add_ovf` has no mirror: {ops:?}");
+            assert_eq!(
+                lhs, x,
+                "`rewrite_op_int_add_ovf` runs `_rewrite_symmetric`: {ops:?}"
+            );
+            assert!(
+                ops.iter().any(|o| matches!(o.kind, OpKind::Live)),
+                "the swapped ovf op must still be led by -live-: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn a_constant_left_operand_of_sub_ovf_keeps_its_operand_order() {
+            let (ops, _x) = transform_binop(
+                "sub_ovf",
+                OpKind::ConstInt(5),
+                ConcreteType::Signed,
+                ConcreteType::Signed,
+                ValueType::Int,
+                true,
+            );
+            let (op, lhs, _) = binary_op(&ops).expect("the overflow sub must survive");
+            assert_eq!(op, "sub_ovf");
+            assert!(
+                matches!(
+                    ops.iter()
+                        .find(|o| o.result.as_ref() == Some(&lhs))
+                        .map(|o| &o.kind),
+                    Some(OpKind::ConstInt(5))
+                ),
+                "`5 -ovf x` must keep the constant on the left: {ops:?}"
+            );
         }
 
         #[test]
