@@ -148,7 +148,12 @@ def expand_features(arg: str, cargo_features: str) -> str:
 
 
 def crate_flags(spec: CrateSpec, cargo_features: str) -> list[str]:
-    return [expand_features(arg, cargo_features) for arg in spec.cargo_args]
+    # Charon's rustc is the 1.95 nightly it pins (2026-02-22). rustpython-ruff
+    # 0.16.5 declares rust-version 1.96; the crates still compile on 1.95.
+    return [
+        "--ignore-rust-version",
+        *[expand_features(arg, cargo_features) for arg in spec.cargo_args],
+    ]
 
 
 def charon_crate_flags(spec: CrateSpec, cargo_features: str) -> list[str]:
@@ -165,7 +170,10 @@ def crate_layout_flags(
     """
     if spec.layout_cargo_args is None:
         return flags
-    return [expand_features(arg, cargo_features) for arg in spec.layout_cargo_args]
+    return [
+        "--ignore-rust-version",
+        *[expand_features(arg, cargo_features) for arg in spec.layout_cargo_args],
+    ]
 
 
 def features_in_cargo_flags(crate: str, flags: list[str]) -> list[str]:
