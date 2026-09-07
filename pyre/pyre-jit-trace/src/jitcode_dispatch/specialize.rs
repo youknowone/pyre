@@ -9290,7 +9290,7 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
             return Err(error);
         }
     };
-    let result = match walk_outcome {
+    let result = match promote_published_null_return(ctx, walk_outcome) {
         DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
         // `front::result_exc::fuse_kind_ctor_raise` removes the Rust

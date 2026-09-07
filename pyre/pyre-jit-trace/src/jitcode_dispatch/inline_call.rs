@@ -4994,7 +4994,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             return Err(error);
         }
     };
-    match walk_result {
+    match promote_published_null_return(ctx, walk_result) {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete = concrete_from_recorded_opref(ctx, value);
@@ -8131,7 +8131,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
     };
 
-    match outcome {
+    match promote_published_null_return(ctx, outcome) {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
@@ -12548,6 +12548,26 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
     result
 }
 
+/// `jit_*_from_tag` publishes and returns NULL on raise.  A subwalk that
+/// recorded that arm looks like `SubReturn` with `last_exc_value` set.
+/// `finishframe` would clear the exception; promote to
+/// `finishframe_exception` instead of dest-writing the NULL.
+pub(crate) fn promote_published_null_return<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    outcome: DispatchOutcome,
+) -> DispatchOutcome {
+    if !matches!(outcome, DispatchOutcome::SubReturn { .. }) {
+        return outcome;
+    }
+    match ctx.last_exc_value() {
+        Some(exc) => DispatchOutcome::SubRaise {
+            exc,
+            exc_concrete: ctx.last_exc_value_concrete(),
+        },
+        None => outcome,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_inline_call_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -12904,6 +12924,15 @@ pub(crate) fn try_finish_replayed_call_subreturn<Sym: WalkSym>(
         unreachable!("matches_subreturn required SubReturn");
     };
     ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
+    if let Some(exc) = ctx.last_exc_value() {
+        return Some(Ok((
+            DispatchOutcome::SubRaise {
+                exc,
+                exc_concrete: ctx.last_exc_value_concrete(),
+            },
+            next_pc,
+        )));
+    }
     let applied = match finish_inline_callee_return(ctx, result) {
         Some(value) => super::residual_call::write_residual_call_result_to_dst(
             ctx, op.pc, dst, dst_bank, value,
@@ -13038,25 +13067,34 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         // ChangeFrame: dest-write from the finished callee, then walk at
         // the opcode after the CALL.  The first CALL step already ran
         // vstack/live bookkeeping before it suspended.
+        let mut published_raise = None;
         let dest_err = if let Some(pending) = self.pending_subreturn.take() {
-            let applied = match finish_inline_callee_return(&mut walk_ctx, pending.result) {
-                Some(value) => super::residual_call::write_residual_call_result_to_dst(
-                    &mut walk_ctx,
-                    pending.caller_pc,
-                    pending.dst,
-                    pending.dst_bank,
-                    value,
-                )
-                .is_ok(),
-                None => pending.dst_bank == 'v',
-            };
-            if applied {
-                SUBWALK_DIRECT_RESUME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(exc) = walk_ctx.last_exc_value() {
+                published_raise = Some(DispatchOutcome::SubRaise {
+                    exc,
+                    exc_concrete: walk_ctx.last_exc_value_concrete(),
+                });
                 None
             } else {
-                Some(DispatchError::UnexpectedVoidSubReturn {
-                    pc: pending.caller_pc,
-                })
+                let applied = match finish_inline_callee_return(&mut walk_ctx, pending.result) {
+                    Some(value) => super::residual_call::write_residual_call_result_to_dst(
+                        &mut walk_ctx,
+                        pending.caller_pc,
+                        pending.dst,
+                        pending.dst_bank,
+                        value,
+                    )
+                    .is_ok(),
+                    None => pending.dst_bank == 'v',
+                };
+                if applied {
+                    SUBWALK_DIRECT_RESUME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    None
+                } else {
+                    Some(DispatchError::UnexpectedVoidSubReturn {
+                        pc: pending.caller_pc,
+                    })
+                }
             }
         } else {
             None
@@ -13064,7 +13102,9 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         // The bank is rooted by `SubWalkDriver::push_frame` for this frame's
         // whole residency, which outlasts this call.
         self.box_replacements.set_listening(false);
-        let result = if let Some(err) = dest_err {
+        let result = if let Some(raised) = published_raise {
+            Ok((raised, self.pc))
+        } else if let Some(err) = dest_err {
             Err(err)
         } else {
             walk(self.body.code, self.pc, &mut walk_ctx)
@@ -13767,7 +13807,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         &arg_concretes,
         &[],
     );
-    let callee_outcome = callee_result?;
+    let callee_outcome = promote_published_null_return(ctx, callee_result?);
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -13970,7 +14010,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    let callee_outcome = run_inline_call_subwalk(
+    let walked = run_inline_call_subwalk(
         ctx,
         code,
         op.pc,
@@ -13982,6 +14022,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         &ref_arg_concretes,
         &[],
     )?;
+    let callee_outcome = promote_published_null_return(ctx, walked);
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -14186,7 +14227,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         &ref_arg_concretes,
         &float_args,
     );
-    let callee_outcome = callee_result?;
+    let callee_outcome = promote_published_null_return(ctx, callee_result?);
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
