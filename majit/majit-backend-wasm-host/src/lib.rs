@@ -19,8 +19,12 @@ pub struct TraceState {
     pub memory: Option<Memory>,
     pub table: Option<Table>,
     pub trace_base: u64,
-    // Published wide entries cannot be dropped by a replacement. Sorted slot
-    // membership is sufficient; there is no language-specific registry here.
+    // Pair-base slots whose spare half is a published `trace_wide`.
+    // The table stores a copy of the narrow function in that half when no
+    // wide entry exists, so membership here is what forbids a later replace
+    // from dropping a published wide target. Keys are pair bases, not wide
+    // indices; replace/free must reject a wide index before they rewrite
+    // `slot` and `slot + 1`.
     wide_slots: BTreeSet<u32>,
 }
 
@@ -118,6 +122,7 @@ pub fn replace<T: HostState>(
     wide: Option<Func>,
 ) -> Result<u32> {
     let table = table(caller)?;
+    pair_base(caller, slot)?;
     live_trace(caller, slot)?;
     if wide.is_none() && caller.data().traces().wide_slots.contains(&slot) {
         return Err(Error::msg("replacement would drop a published wide entry"));
@@ -127,6 +132,28 @@ pub fn replace<T: HostState>(
     if let Some(wide) = wide {
         table.set(&mut *caller, slot as u64 + 1, Ref::Func(Some(wide)))?;
         caller.data_mut().traces_mut().wide_slots.insert(slot);
+    }
+    Ok(slot)
+}
+
+/// The published handle is the even index of a reserved pair.
+///
+/// `publish` grows the table by two. `execute` may call `slot + 1` as the
+/// wide entry, so that index is a live function, but `replace`/`free` rewrite
+/// or clear both halves. Treating a wide index as a handle would write past
+/// the last pair or clear the next pair's narrow function. `live_trace`
+/// cannot tell those apart. `execute` does not use this: calling a wide
+/// entry is the point of the spare slot.
+fn pair_base<T: HostState>(caller: &Caller<'_, T>, slot: u32) -> Result<u32> {
+    let traces = caller.data().traces();
+    if (slot as u64) < traces.trace_base {
+        return Err(Error::msg(format!(
+            "slot {slot} belongs to the guest, not a trace"
+        )));
+    }
+    let size = table(caller)?.size(caller);
+    if (slot as u64) + 1 >= size || (slot as u64 - traces.trace_base) % 2 != 0 {
+        return Err(Error::msg(format!("slot {slot} is not a trace pair base")));
     }
     Ok(slot)
 }
@@ -157,6 +184,7 @@ pub fn free<T: HostState>(caller: &mut Caller<'_, T>, slot: u32) -> Result<()> {
     if (slot as u64) < caller.data().traces().trace_base {
         return Ok(());
     }
+    pair_base(caller, slot)?;
     let table = table(caller)?;
     table.set(&mut *caller, slot as u64, Ref::Func(None))?;
     table.set(&mut *caller, slot as u64 + 1, Ref::Func(None))?;
