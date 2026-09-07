@@ -12805,20 +12805,26 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
             .record_guard(majit_ir::OpCode::GuardNotForced, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
+    // `pyjitpl.py handle_possible_exception`: a standing last_exc_value
+    // always `finishframe_exception`s.  The EI `can_raise` flag only
+    // chooses whether a successful call records `GUARD_NO_EXCEPTION`.
+    // `jit_binary_value_from_tag` publishes + returns null on raise;
+    // treating that as `SubReturn` dest-writes NULL and swallows the
+    // TypeError / OverflowError (`keys() & None`, `[0] * 2**63`).
+    if resid_raised {
+        walker_record_guard_exception(ctx, pc);
+        let exc = ctx
+            .last_exc_value()
+            .ok_or(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                pc,
+                symbolic: fnaddr,
+            })?;
+        return Ok(DispatchOutcome::SubRaise {
+            exc,
+            exc_concrete: ctx.last_exc_value_concrete(),
+        });
+    }
     if can_raise {
-        if resid_raised {
-            walker_record_guard_exception(ctx, pc);
-            let exc =
-                ctx.last_exc_value()
-                    .ok_or(DispatchError::OrthodoxSubWalkTraceUnsupported {
-                        pc,
-                        symbolic: fnaddr,
-                    })?;
-            return Ok(DispatchOutcome::SubRaise {
-                exc,
-                exc_concrete: ctx.last_exc_value_concrete(),
-            });
-        }
         ctx.trace_ctx
             .record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
