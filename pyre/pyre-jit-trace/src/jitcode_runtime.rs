@@ -3701,9 +3701,17 @@ mod tests {
         // canonical object that build.rs persisted.
         let bt_jc = portal_jitcode().expect("configured portal must resolve to a jitcode");
         assert!(!bt_jc.code.is_empty());
+        // `warmspot.py split_graph_and_record_jitdriver` registers the copy
+        // cut at `jit_merge_point` (`eval::eval_loop_jit_portal`). The unsplit
+        // key remains when `PYRE_PORTAL_SPLIT=0`.
         let eval_driver = COMPILED_JIT_DRIVERS
             .iter()
-            .find(|driver| driver.portal.canonical_key() == "eval::eval_loop_jit")
+            .find(|driver| {
+                matches!(
+                    driver.portal.canonical_key().as_str(),
+                    "eval::eval_loop_jit" | "eval::eval_loop_jit_portal"
+                )
+            })
             .expect("compiled drivers must contain the main eval portal");
         assert_eq!(eval_driver.main_jitcode_index, bt_jc.index());
         assert_eq!(
