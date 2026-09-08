@@ -1022,7 +1022,20 @@ impl MIFrame {
         } else {
             self.pc - SIZE_LIVE_OP
         };
-        debug_assert_eq!(self.jitcode.code[pc], op_live);
+        if self.jitcode.code.get(pc).copied() != Some(op_live) {
+            let start = pc.saturating_sub(12);
+            let end = self.jitcode.code.len().min(pc + 12);
+            panic!(
+                "live marker missing: jitcode={} pc={pc} byte={:?} op_live={op_live} \
+                 in_a_call={in_a_call} after_residual={after_residual_call} \
+                 last_op_pos={} cursor={} surround[{start}..{end}]={:02x?}",
+                self.jitcode.name(),
+                self.jitcode.code.get(pc),
+                self.last_opcode_position,
+                self.code_cursor,
+                &self.jitcode.code[start..end],
+            );
+        }
 
         let mut offset = decode_offset(&self.jitcode.code, pc + 1);
         let length_i = all_liveness[offset] as u32;

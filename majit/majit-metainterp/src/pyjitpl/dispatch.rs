@@ -3255,13 +3255,15 @@ where
                 }
             };
             if !matches!(action, TraceAction::Continue) {
-                if crate::tldbg_enabled() {
+                if crate::majit_log_enabled() || crate::tldbg_enabled() {
+                    let fr = self.frames.current_mut();
                     eprintln!(
-                        "@@@TLDBG run_to_end end action={:?} step_count={} num_recorded_ops={} trace_limit={}",
+                        "[interpret] run_to_end action={:?} steps={step_count} ops={} cursor={} last_op=0x{:02x} jitcode={}",
                         action,
-                        step_count,
                         ctx.num_recorded_ops(),
-                        ctx.trace_limit()
+                        fr.code_cursor,
+                        fr.jitcode.code.get(fr.last_opcode_position).copied().unwrap_or(0xff),
+                        fr.jitcode.name(),
                     );
                 }
                 match action {
@@ -3934,6 +3936,13 @@ where
             // `unwind_to_exception_handler` above.)
             jitcode::insns::BC_LIVE => {
                 let _liveness_offset = self.frames.current_mut().next_u16();
+            }
+            // pyjitpl.py opimpl_unreachable: raise AssertionError("unreachable").
+            // A landing here is a wrong-path generation/dispatch defect; abort
+            // the attempt so the interpreter can resume instead of panicking
+            // mid-opcode (which left a stack underflow on the Python frame).
+            jitcode::insns::BC_UNREACHABLE => {
+                return TraceAction::Abort;
             }
             // -- State field access (register/tape machines) --
             // Argcodes: `d` = u16 descr (`assembler.py:197-207`),
@@ -8367,13 +8376,26 @@ where
                     // results this way (`jitcode_dispatch/residual_call.rs`).
                     ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
                     self.set_int_reg(dst, Some(traced), Some(concrete));
-                    if is_forces
-                        && matches!(
+                    if is_forces {
+                        if crate::majit_log_enabled() {
+                            let frame = self.frames.current_mut();
+                            eprintln!(
+                                "[interpret] residual may_force jitcode={} last_op={} cursor={} \
+                                 extraeffect={:?} can_raise={} next={:?}",
+                                frame.jitcode.name(),
+                                frame.last_opcode_position,
+                                frame.code_cursor,
+                                effectinfo.extraeffect,
+                                effectinfo.check_can_raise(false),
+                                frame.jitcode.code.get(frame.code_cursor),
+                            );
+                        }
+                        if matches!(
                             self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
+                        ) {
+                            return TraceAction::Abort;
+                        }
                     }
                     // pyjitpl.py `exc = exc and not isinstance(op, Const)`:
                     // a pure call that const-folded clears `exc`, so
@@ -9981,6 +10003,12 @@ where
         let Some(sub_jitcode) = sub_jitcode else {
             // The callee is in neither pool; abort the trace instead of
             // crashing the process.
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[interpret] inline_call descrs[{sub_idx}] missing (pool={})",
+                    crate::jitcode::global_build_descr_pool().is_some(),
+                );
+            }
             return TraceAction::Abort;
         };
         let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));

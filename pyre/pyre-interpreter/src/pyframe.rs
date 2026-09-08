@@ -3984,8 +3984,13 @@ impl PyFrame {
     /// no locals bound yet (a function before its first `fast2locals`).
     #[inline]
     pub fn get_w_locals(&self) -> PyObjectRef {
-        self.getdebug_data()
-            .map_or(pyre_object::PY_NULL, |data| data.w_locals)
+        // `pyframe.py get_w_locals`: plain None-check, no closure.
+        // `map_or` lowers to a synthetic-transparent-ctor residual the
+        // walker cannot bind (`get_w_locals::closure`).
+        match self.getdebug_data() {
+            None => pyre_object::PY_NULL,
+            Some(data) => data.w_locals,
+        }
     }
 
     /// CPython 3.14 `PyFrameObject.f_extra_locals`, allocated by
@@ -5308,13 +5313,23 @@ impl PyFrame {
     /// pyframe.py get_f_trace_lines
     #[inline]
     pub fn get_f_trace_lines(&self) -> bool {
-        self.getdebug_data().is_none_or(|d| d.f_trace_lines)
+        // `pyframe.py get_f_trace_lines`: None → True. Avoid `is_none_or`
+        // so the walker does not residual a synthetic closure ctor.
+        match self.getdebug_data() {
+            None => true,
+            Some(d) => d.f_trace_lines,
+        }
     }
 
     /// pyframe.py get_f_trace_opcodes
     #[inline]
     pub fn get_f_trace_opcodes(&self) -> bool {
-        self.getdebug_data().is_some_and(|d| d.f_trace_opcodes)
+        // `pyframe.py get_f_trace_opcodes`: None → False. Avoid `is_some_and`
+        // so the walker does not residual a synthetic closure ctor.
+        match self.getdebug_data() {
+            None => false,
+            Some(d) => d.f_trace_opcodes,
+        }
     }
 
     /// pyframe.py fget_f_trace_lines

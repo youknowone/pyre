@@ -2316,6 +2316,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pycode::w_code_const",
         crate::pycode::w_code_const,
     );
+    // `named_key_hash` residualizes `w_code_getname_w` (`dont_look_inside`).
+    // Without this row the codewriter mints a symbolic path hash and
+    // `interpret()` aborts the first LOAD_NAME / LOAD_GLOBAL walk.
+    up2(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_getname_w",
+        crate::pycode::w_code_getname_w,
+    );
     // `compare` residualizes its `compare_slot` tail: the slot body reads two
     // `&[u8]` through `core::slice::cmp`, which has no LLBC, so the source lift
     // fails and the whole callee becomes a residual. What was missing is only
@@ -5393,6 +5401,16 @@ mod tests {
             stray.is_empty(),
             "these wrapper descriptors cannot join the BuiltinCode.func PBC \
              family, so they get no jitcode: {stray:?}",
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_w_code_getname_w() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::pycode::w_code_getname_w as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pycode::w_code_getname_w"],
+            expected,
         );
     }
 

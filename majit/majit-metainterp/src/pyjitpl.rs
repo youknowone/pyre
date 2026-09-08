@@ -5445,6 +5445,10 @@ impl<M: Clone> MetaInterp<M> {
                 .flatten()
                 .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
+                // warmstate.py bound_reached / function-entry: MetaInterp(...)
+                // then compile_and_run_once. This arm does not call
+                // `setup_tracing`, so it runs the same constructor half.
+                self.begin_attempt();
                 // RPython pyjitpl.py `create_empty_history(inputargs)`: the
                 // MetaInterp owns the history/Trace factory, not warmstate.
                 let mut recorder = crate::recorder::Trace::new();
@@ -5750,6 +5754,53 @@ impl<M: Clone> MetaInterp<M> {
         }))
     }
 
+    /// pyjitpl.py `MetaInterp.__init__` attempt fields.
+    ///
+    /// Upstream builds a new `MetaInterp` at each `warmstate.py
+    /// bound_reached` and `compile.py _trace_and_compile_from_bridge`.
+    /// pyre keeps one long-lived object so `warm_state` / `backend` /
+    /// `compiled_loops` stay shared; this method is the constructor
+    /// half that those sites run. Long-lived fields are not touched.
+    fn begin_attempt(&mut self) {
+        // pyjitpl.py MetaInterp.__init__
+        self.portal_trace_positions = Some(Vec::new());
+        self.free_frames_list.clear();
+        self.last_exc_value = 0;
+        self.forced_virtualizable = 0;
+        self.partial_trace = None;
+        self.retracing_from = None;
+        self.call_ids.clear();
+        self.current_call_id = 0;
+        self.box_names_memo.clear();
+        self.aborted_tracing_jitdriver = None;
+        self.aborted_tracing_greenkey = None;
+        self.trace_length_at_last_tco = -1;
+        // class attributes reset on a fresh instance
+        self.portal_call_depth = 0;
+        self.cancel_count = 0;
+        self.exported_state = None;
+        self.last_exc_box = None;
+        self.class_of_last_exc_is_const = false;
+        self.ovf_flag = false;
+        self.framestack = crate::pyjitpl::MIFrameStack::empty();
+        self.pending_abort_green_key = None;
+        self.pending_abort_reason = None;
+        self.pending_abort_permanent = false;
+        self.pending_abort_blackhole = None;
+        self.keep_tracing_after_close = false;
+        self.retrace_after_bridge = false;
+        self.potential_retrace_position = None;
+        self.active_jitdriver_sd = None;
+        self.bridge_info = None;
+        self.pending_frontend_boxes = None;
+        self.pending_frontend_box_types = None;
+        self.active_trace_session = None;
+        // `force_finish_trace` is written by the caller from the cell /
+        // loop-token bit after this reset, matching `__init__(...,
+        // force_finish_trace=...)`.
+        self.force_finish_trace = false;
+    }
+
     fn setup_tracing(
         &mut self,
         green_key: u64,
@@ -5758,10 +5809,10 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        // RPython parity: each tracing pass starts with cancel_count=0.
-        // In RPython, MetaInterp is re-created per _compile_and_run_once.
-        // In pyre, MetaInterp is reused, so reset per-trace state here.
-        self.cancel_count = 0;
+        // warmstate.py bound_reached: MetaInterp(...) then
+        // compile_and_run_once. The long-lived object stays; attempt
+        // fields start as `__init__` left them.
+        self.begin_attempt();
         // RPython pyjitpl.py `create_empty_history(inputargs)` — the
         // MetaInterp owns the history factory.
         let mut recorder = crate::recorder::Trace::new();
@@ -15438,6 +15489,9 @@ impl<M: Clone> MetaInterp<M> {
         // `get_resumestorage`/`loop_token_wref()`; both gate the trace on
         // the source loop still being live.
         crate::mc_diag_bump(6); // start_retrace_from_guard entered
+        // compile.py _trace_and_compile_from_bridge: MetaInterp(...) then
+        // handle_guard_failure. Attempt fields start as `__init__` left them.
+        self.begin_attempt();
         self.enter_profiler_tracing();
         self.try_to_free_some_loops();
         let _compiled = match self.compiled_loops.get(&green_key) {
@@ -16400,16 +16454,7 @@ impl<M: Clone> MetaInterp<M> {
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
         original_boxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
     ) {
-        // pyjitpl.py:3268: self.portal_call_depth = -1 # always one portal around
-        self.portal_call_depth = -1;
-        // pyjitpl.py:3269: self.framestack = []
-        self.framestack = crate::pyjitpl::MIFrameStack::empty();
-        // pyjitpl.py: f = self.newframe(self.jitdriver_sd.mainjitcode)
-        let _ = self.newframe(mainjitcode, None);
-        // pyjitpl.py: f.setup_call(original_boxes)
-        self.framestack.current_mut().setup_call(original_boxes);
-        // pyjitpl.py:3272: assert self.portal_call_depth == 0
-        debug_assert_eq!(self.portal_call_depth, 0);
+        self.reset_framestack_from_start(mainjitcode, original_boxes);
         // pyjitpl.py `self.virtualref_boxes = []` is implicit: the
         // backing vector lives on `TraceCtx`, which is fresh for every
         // `MetaInterp::setup_tracing` cycle.
@@ -17204,14 +17249,37 @@ impl<M: Clone> MetaInterp<M> {
         self.portal_trace_positions = None;
     }
 
-    /// pyjitpl.py `initialize_state_from_start` frame half.
+    /// pyjitpl.py `initialize_state_from_start` frame half:
+    /// `newframe(mainjitcode)` then `setup_call(original_boxes)`.
     ///
-    /// `setup_tracing` already ran `initialize_virtualizable`. This
-    /// only rebuilds the root portal `MIFrame` so `portal_call_depth`
-    /// starts at 0 and `call_ids` holds the root id, matching
-    /// `newframe(mainjitcode)` with no greenkey.
-    pub fn seed_root_portal_frame(&mut self, mainjitcode: std::sync::Arc<crate::jitcode::JitCode>) {
-        self.rebuild_portal_framestack_from_resume(mainjitcode, 1);
+    /// `setup_tracing` already ran `initialize_virtualizable`. Resume
+    /// uses [`Self::rebuild_portal_framestack_from_resume`] and
+    /// `setup_resume_at_op`, not this.
+    pub fn seed_root_portal_frame(
+        &mut self,
+        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        original_boxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
+    ) {
+        self.reset_framestack_from_start(mainjitcode, original_boxes);
+    }
+
+    fn reset_framestack_from_start(
+        &mut self,
+        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        original_boxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
+    ) {
+        // pyjitpl.py:3268: self.portal_call_depth = -1 # always one portal around
+        self.portal_call_depth = -1;
+        // pyjitpl.py:3269: self.framestack = []
+        self.framestack = crate::pyjitpl::MIFrameStack::empty();
+        self.call_ids.clear();
+        self.current_call_id = 0;
+        // pyjitpl.py: f = self.newframe(self.jitdriver_sd.mainjitcode)
+        let _ = self.newframe(mainjitcode, None);
+        // pyjitpl.py: f.setup_call(original_boxes)
+        self.framestack.current_mut().setup_call(original_boxes);
+        // pyjitpl.py:3272: assert self.portal_call_depth == 0
+        debug_assert_eq!(self.portal_call_depth, 0);
     }
 
     /// resume.py `rebuild_from_resumedata`: `newframe(jitcode)` per
@@ -21883,6 +21951,139 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn seed_root_portal_frame_setup_call_writes_original_boxes() {
+        // pyjitpl.py initialize_state_from_start: setup_call packs
+        // greens then reds into the typed banks.
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        builder.load_const_i_value(1, 0);
+        builder.load_const_r_value(0, 0);
+        builder.load_const_r_value(1, 0);
+        builder.load_const_r_value(2, 0);
+        let mainjitcode = builder.finish();
+        mainjitcode.set_jitdriver_sd(0);
+        let mainjitcode = std::sync::Arc::new(mainjitcode);
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.seed_root_portal_frame(
+            mainjitcode,
+            &[
+                (JitArgKind::Int, OpRef::const_int(11), 11),
+                (JitArgKind::Int, OpRef::const_int(0), 0),
+                (
+                    JitArgKind::Ref,
+                    OpRef::const_ptr(majit_ir::GcRef(0xabc)),
+                    0xabc,
+                ),
+                (
+                    JitArgKind::Ref,
+                    OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+                    0x100,
+                ),
+                (
+                    JitArgKind::Ref,
+                    OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+                    0x200,
+                ),
+            ],
+        );
+        let frame = meta.framestack.current_mut();
+        assert_eq!(frame.pc, 0);
+        assert_eq!(frame.int_values[0], Some(11));
+        assert_eq!(frame.int_values[1], Some(0));
+        assert_eq!(frame.ref_values[0], Some(0xabc));
+        assert_eq!(frame.ref_values[1], Some(0x100));
+        assert_eq!(frame.ref_values[2], Some(0x200));
+        assert_eq!(meta.portal_call_depth, 0);
+        assert_eq!(meta.call_ids, vec![0]);
+    }
+
+    #[test]
+    fn begin_attempt_resets_constructor_fields_and_keeps_warmstate() {
+        // warmstate.py bound_reached / compile.py
+        // _trace_and_compile_from_bridge: each attempt is a new
+        // MetaInterp. The long-lived object keeps warm_state.
+        use crate::jitcode::JitCodeBuilder;
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.cancel_count = 3;
+        meta.portal_call_depth = 4;
+        meta.current_call_id = 9;
+        meta.call_ids = vec![1, 2];
+        meta.last_exc_value = 0xabc;
+        meta.forced_virtualizable = 0xdef;
+        meta.ovf_flag = true;
+        meta.trace_length_at_last_tco = 12;
+        let leftover = std::sync::Arc::new(JitCodeBuilder::new().finish());
+        meta.perform_call(leftover, &[], None).unwrap_err();
+        assert!(!meta.framestack.is_empty());
+
+        meta.begin_attempt();
+
+        assert_eq!(meta.cancel_count, 0);
+        assert_eq!(meta.portal_call_depth, 0);
+        assert_eq!(meta.current_call_id, 0);
+        assert!(meta.call_ids.is_empty());
+        assert_eq!(meta.last_exc_value, 0);
+        assert_eq!(meta.forced_virtualizable, 0);
+        assert!(!meta.ovf_flag);
+        assert_eq!(meta.trace_length_at_last_tco, -1);
+        assert!(meta.framestack.is_empty());
+        assert!(
+            meta.portal_trace_positions
+                .as_ref()
+                .is_some_and(|p| p.is_empty())
+        );
+        // Long-lived owner: the same WarmEnterState instance remains.
+        assert_eq!(meta.warm_state.threshold(), 10);
+    }
+
+    #[test]
+    fn interpret_walks_the_seeded_root_portal_frame() {
+        // pyjitpl.py `_compile_and_run_once`: initialize_state_from_start
+        // then interpret() on that framestack, no extra push/pop.
+        use crate::BackEdgeAction;
+        use crate::jitcode::JitCodeBuilder;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        jitcode.set_jitdriver_sd(0);
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        meta.seed_root_portal_frame(
+            jitcode,
+            &[(crate::jitcode::JitArgKind::Int, OpRef::const_int(0), 0)],
+        );
+        assert_eq!(meta.framestack.len(), 1);
+
+        struct NoopSym;
+        impl crate::JitCodeSym for NoopSym {
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+            fn fail_args(&self) -> Option<Vec<OpRef>> {
+                None
+            }
+        }
+        let mut sym = NoopSym;
+        let action = meta.interpret(&mut sym);
+        assert!(matches!(
+            action,
+            crate::TraceAction::Continue
+                | crate::TraceAction::Abort
+                | crate::TraceAction::Finish { .. }
+        ));
+    }
+
+    #[test]
     fn initialize_state_from_start_seeds_greenfield_virtualizable_box() {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
@@ -23326,10 +23527,12 @@ mod metainterp_static_data_tests {
         // Override cls_of_box so we can inject a known typeptr without
         // dereferencing a raw pointer.
         meta.cpu = crate::cpu::cpu_from_cls_of_box_fn(|_| 0xc1a55);
-        meta.last_exc_value = 0xfeed;
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
+        // Attempt fields belong to this MetaInterp instance, so they
+        // are written after `__init__` / `begin_attempt`.
+        meta.last_exc_value = 0xfeed;
         // pyjitpl.py:2533-2538: with an empty framestack the exception
         // unwind drains immediately and surfaces
         // `ExitFrameWithExceptionRef`. The GUARD_EXCEPTION op + the
@@ -23375,11 +23578,11 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.cpu = crate::cpu::cpu_from_cls_of_box_fn(|_| 0xc1a55);
-        meta.last_exc_value = 0xfeed;
-        meta.class_of_last_exc_is_const = true;
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
+        meta.last_exc_value = 0xfeed;
+        meta.class_of_last_exc_is_const = true;
         let result = meta.handle_possible_exception();
         assert!(matches!(
             result,
@@ -23604,10 +23807,10 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.cpu = crate::cpu::cpu_from_cls_of_box_fn(|_| 0xcafef00d);
-        meta.last_exc_value = 0xbeef;
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
+        meta.last_exc_value = 0xbeef;
 
         meta.framestack
             .push(crate::pyjitpl::MIFrame::new(caller_jitcode, 0));

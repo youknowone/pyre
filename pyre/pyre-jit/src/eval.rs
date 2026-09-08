@@ -11519,6 +11519,45 @@ fn execute_assembler(
     }
 }
 
+/// pyjitpl.py `initialize_original_boxes` for the Python portal.
+///
+/// Greens are Const; reds are InputArg. `setup_call` then packs them
+/// by kind into the portal MIFrame banks (`pyjitpl.py MIFrame.setup_call`).
+fn portal_original_boxes(
+    meta: &mut majit_metainterp::MetaInterp<crate::jit::state::PyreMeta>,
+    frame: &PyFrame,
+    next_instr: usize,
+    portal: &majit_metainterp::jitcode::JitCode,
+) -> Vec<(majit_metainterp::JitArgKind, majit_ir::OpRef, i64)> {
+    use majit_ir::OpRef;
+    use majit_metainterp::JitArgKind;
+
+    let ctx = meta
+        .trace_ctx()
+        .expect("portal_original_boxes requires an active trace");
+    let next_instr = next_instr as i64;
+    let is_being_profiled = i64::from(frame.get_is_being_profiled());
+    let pycode = frame.pycode as usize as i64;
+    let live_frame = frame as *const PyFrame as usize as i64;
+    let ec = pyre_interpreter::call::getexecutioncontext() as usize as i64;
+    let next_instr_op = ctx.const_int(next_instr);
+    let profiled_op = ctx.const_int(is_being_profiled);
+    let pycode_op = ctx.const_ref(pycode);
+    let frame_op = OpRef::input_arg_typed(0, Type::Ref);
+    let ec_op = OpRef::input_arg_typed(1, Type::Ref);
+    match portal.calldescr().arg_classes.as_str() {
+        "r" => vec![(JitArgKind::Ref, frame_op, live_frame)],
+        "iirrr" => vec![
+            (JitArgKind::Int, next_instr_op, next_instr),
+            (JitArgKind::Int, profiled_op, is_being_profiled),
+            (JitArgKind::Ref, pycode_op, pycode),
+            (JitArgKind::Ref, frame_op, live_frame),
+            (JitArgKind::Ref, ec_op, ec),
+        ],
+        other => panic!("portal start expected arg_classes \"r\" or \"iirrr\", got {other:?}"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompileOnceStart {
     BackEdge,
@@ -11548,6 +11587,12 @@ fn compile_and_run_once(
         CompileOnceStart::FunctionEntry => 19,
     });
 
+    // LLBC-extracted portal jitcodes resolve `d`/`j` argcodes through
+    // the process-global build-time descr table (RPython
+    // `Assembler.descrs`). jd1 and the metatrace probe already install
+    // it; `_compile_and_run_once` must too or the first
+    // `inline_call_*` aborts with an empty pool.
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     // warmspot/codewriter ordering: the portal and all drained JitCodes are
     // installed before the marker-driven metainterpreter starts.  Resolve the
     // per-green static entry here; `trace_bytecode` consumes the same sidecar
@@ -11581,48 +11626,60 @@ fn compile_and_run_once(
         return None;
     }
 
-    // pyjitpl.py initialize_state_from_start: root portal frame, no
-    // greenkey. Virtualizable boxes were already seeded by setup_tracing.
+    // pyjitpl.py initialize_state_from_start: newframe(mainjitcode)
+    // then setup_call(original_boxes). Virtualizable boxes were already
+    // seeded by setup_tracing.
     if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
-        driver.meta_interp_mut().seed_root_portal_frame(portal);
+        let meta = driver.meta_interp_mut();
+        let boxes = portal_original_boxes(meta, frame_root.frame(), target_pc, &portal);
+        meta.seed_root_portal_frame(portal, &boxes);
     }
 
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     let mut propagated_exception = None;
+    // pyjitpl.py `_compile_and_run_once`: `interpret()` on the seeded
+    // portal framestack.
     let outcome = driver.jit_merge_point_keyed(
         green_key,
         target_pc,
         &mut jit_state,
         env,
         || {},
-        |meta, sym| {
-            let concrete_frame = frame_root.frame().snapshot_for_tracing();
-            let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
-            let (action, executed_frame) = trace_bytecode(
-                meta,
-                sym,
-                code,
-                target_pc,
-                concrete_frame,
-                live_frame_addr,
-                true,
-            );
-            let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
-            let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
-            if walk_end_flushed {
-                frame_root
-                    .frame()
-                    .restore_resume_state_from(&executed_frame);
-            } else if let Some(restart_pc) = walk_end_restart_pc {
-                // A marker inside a super-instruction closes the loop at
-                // `loop_header_pc + 1`, and the walk already advanced
-                // `valuestackdepth` through the super-instruction. Set both the
-                // resume pc and its operand depth so the handed-back frame is
-                // self-consistent, mirroring the flush leg above and the
-                // blackhole legs (`apply_blackhole_crn_handoff`).
-                let frame = frame_root.frame();
-                frame.set_last_instr_from_next_instr(restart_pc);
-                correct_resume_vsd(frame, restart_pc);
+        |meta, _sym| {
+            let mut portal_sym = PortalMetatraceSym {
+                header_pc: target_pc,
+            };
+            if majit_metainterp::majit_log_enabled() {
+                let (name, cursor, first) = if meta.framestack.is_empty() {
+                    ("<empty>".to_owned(), 0, 0u8)
+                } else {
+                    let frame = meta.framestack.current_mut();
+                    let first = frame.jitcode.code.get(frame.code_cursor).copied().unwrap_or(0);
+                    (frame.jitcode.name().to_owned(), frame.code_cursor, first)
+                };
+                eprintln!(
+                    "[interpret] enter depth={} jitcode={} cursor={} first=0x{first:02x} ops={}",
+                    meta.framestack.len(),
+                    name,
+                    cursor,
+                    meta.trace_ctx().map(|c| c.num_recorded_ops()).unwrap_or(0),
+                );
+            }
+            let action = meta.interpret(&mut portal_sym);
+            if majit_metainterp::majit_log_enabled() {
+                let (name, cursor) = if meta.framestack.is_empty() {
+                    ("<empty>".to_owned(), 0)
+                } else {
+                    let frame = meta.framestack.current_mut();
+                    (frame.jitcode.name().to_owned(), frame.code_cursor)
+                };
+                eprintln!(
+                    "[interpret] leave action={action:?} depth={} jitcode={} cursor={} ops={}",
+                    meta.framestack.len(),
+                    name,
+                    cursor,
+                    meta.trace_ctx().map(|c| c.num_recorded_ops()).unwrap_or(0),
+                );
             }
             propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
             action
