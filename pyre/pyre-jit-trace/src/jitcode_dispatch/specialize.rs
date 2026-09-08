@@ -7452,9 +7452,12 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
         return Ok(None);
     };
     let exc_class = exc_class.as_ptr();
-    if !std::ptr::eq(unsafe { (*exc).w_class }, exc_class) {
-        return Ok(None);
-    }
+    // `typedef::type` falls back to the kind registry when `w_class` is
+    // still the generic BaseException stub (`w_exception_new` internals).
+    // The match walked that registry class; pin the kind field so a
+    // different ExcKind cannot reuse this fold. A GuardValue on `w_class`
+    // would pin the stub and fail at runtime.
+    let pin_kind_instead_of_w_class = !std::ptr::eq(unsafe { (*exc).w_class }, exc_class);
     // `eval::check_exc_match_against` = `exception_match(type(exc), match)`
     // (eval.rs), walking the exception class MRO and accepting a tuple of
     // classes. Inlined here.
@@ -7507,18 +7510,34 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
                 .heap_cache_mut()
                 .class_now_known(exc_op, exc_layout);
         }
-        let w_class_op =
-            walker_record_getfield_gc_r_uncached(ctx, exc_op, crate::descr::w_class_descr());
-        let expected = ctx.trace_ctx.const_ref(exc_class as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[w_class_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(w_class_op, expected);
+        if pin_kind_instead_of_w_class {
+            let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
+            let (_, kind_descr, _, _) = crate::descr::w_exception_descrs(kind);
+            let kind_op = walker_record_getfield_gc_i_uncached(ctx, exc_op, kind_descr);
+            let expected = ctx.trace_ctx.const_int(kind as u8 as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[kind_op, expected],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(kind_op, expected);
+        } else {
+            let w_class_op =
+                walker_record_getfield_gc_r_uncached(ctx, exc_op, crate::descr::w_class_descr());
+            let expected = ctx.trace_ctx.const_ref(exc_class as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[w_class_op, expected],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(w_class_op, expected);
+        }
     }
 
     // The match is a constant at trace time: emit the immortal bool singleton

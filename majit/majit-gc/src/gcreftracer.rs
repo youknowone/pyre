@@ -8,8 +8,8 @@
 //! address of a per-loop array of reference slots and emits a
 //! `LoadFromGcTable(index)` load (`x86/assembler.py:1545`
 //! `genop_load_from_gc_table`). Each slot is a GC root: the collector
-//! forwards it in place during a stop-the-world collection, so the next
-//! load observes the relocated object.
+//! forwards it in place during a collection step, so the next load
+//! observes the relocated object.
 //!
 //! Upstream models the array with a `GCREFTRACER` `GcStruct`
 //! (`gcreftracer.py:7-11`) carrying `array_base_addr` + `array_length`,
@@ -76,15 +76,16 @@ pub struct GcTable {
     _owned: Option<Box<[Cell<GcRef>]>>,
 }
 
-// SAFETY: a `GcTable`'s slots are only mutated through `trace`, which
-// runs exclusively during a stop-the-world collection
-// (`collector.rs` `do_collect_nursery` / major), when no JIT or
-// interpreter thread is reading the slots. Construction fills the slots
-// before the `Arc` is shared, and they are never written again outside
-// `trace`. The `Cell` provides interior mutability for in-place
-// forwarding; the `Send`/`Sync` bounds let the `Arc<GcTable>` live on
-// `CompiledLoopToken.asmmemmgr_gcreftracers` and a `Weak<GcTable>` in
-// the global registry.
+// SAFETY: slots are written only by `trace`, which runs inside a
+// collection step (`do_collect_nursery` / major). That step is exclusive
+// on the collecting MiniMark: `gc_op` holds the GIL, and
+// `quiesce_mutators` pauses other registered mutators when
+// `stw_required()`. Incremental major steps resume mutators in between;
+// those mutators only read slots (`LoadFromGcTable`). Construction fills
+// the slots before the `Arc` is shared. The `Cell` is the in-place
+// forward; `Send`/`Sync` let the `Arc` live on
+// `CompiledLoopToken.asmmemmgr_gcreftracers` and a `Weak` in the
+// registry.
 unsafe impl Send for GcTable {}
 unsafe impl Sync for GcTable {}
 
@@ -105,27 +106,24 @@ unsafe impl Sync for GcTable {}
 /// one.
 static LIVE_GC_TABLES: RwLock<Vec<Weak<GcTable>>> = RwLock::new(Vec::new());
 
-/// Test-only lock modeling the stop-the-world invariant that no table is
-/// dropped while a walk is in flight. The harness runs tests in parallel, so
-/// a collector test's collection — which walks this registry through the
-/// globally-registered [`gc_table_extra_root_walker`] once any table has
-/// existed — can call [`walk_all_gc_tables`] concurrently with a registry
-/// test's table drop, transiently upgrading a `Weak` the dropping test
-/// expects to be dead. A registry test takes the write side to exclude every
-/// walk across its drop/observe window; each walk takes the read side.
-/// Compiled out in production, where the STW collector already guarantees no
-/// concurrent drop.
+/// Test-only lock serializing a registry drop/observe window against a
+/// concurrent extra-root walk. `LIVE_GC_TABLES` is process-global, and the
+/// harness runs MiniMark tests in parallel, so a walk can upgrade a `Weak`
+/// a registry test is dropping. A registry test takes the write side;
+/// each walk takes the read side. Compiled out in production: table drop
+/// vs walk is serialized by the collection-step exclusion (`gc_op` / GIL),
+/// not by a world-stop.
 #[cfg(test)]
 static GC_TABLE_WALK_LOCK: RwLock<()> = RwLock::new(());
 
 /// Tables built since the last minor collection. `GCREFTRACER` is an
 /// ordinary old object upstream: writing its slots at construction puts it
-/// in MiniMark's `old_objects_pointing_to_young` for exactly one minor
-/// collection, which promotes every referent it holds, and no later minor
-/// visits it again because its slots are never written afterwards. A major
-/// collection marks through every live tracer regardless. This list is that
-/// remembered set: [`walk_all_gc_tables_inner`] drains it on a minor walk and
-/// walks the whole registry on a major one.
+/// on that MiniMark's `old_objects_pointing_to_young` for exactly one
+/// minor, which promotes every referent it holds; later minors skip it
+/// because the slots are never written again. A major marks through every
+/// live tracer. This list is that remembered set, but process-global —
+/// it belongs on the collector. [`walk_all_gc_tables_inner`] drains it on
+/// a minor walk and walks the whole registry on a major one.
 static PENDING_MINOR_TABLES: parking_lot::Mutex<Vec<Weak<GcTable>>> =
     parking_lot::Mutex::new(Vec::new());
 
@@ -230,8 +228,8 @@ impl GcTable {
             .then(crate::rmmap::AssemblerWriting::enter);
         for i in 0..self.array_length {
             let p = (self.array_base_addr + i * WORD) as *mut GcRef;
-            // SAFETY: see `slot`; this runs inside a stop-the-world
-            // collection, the only writer.
+            // SAFETY: see `slot`; this runs inside a collection step, the
+            // only writer.
             unsafe {
                 let mut r = *p;
                 visitor(&mut r);
@@ -272,6 +270,14 @@ fn walk_all_gc_tables_inner(visitor: &mut dyn FnMut(&mut GcRef)) {
     // promoted referents, which a minor collection does not move.
     if crate::shadow_stack::extra_root_walk_kind() == crate::shadow_stack::ExtraRootWalkKind::Minor
     {
+        // Remembered-set drain, same as MiniMark's
+        // `old_objects_pointing_to_young`: this minor consumes the tables
+        // that recorded a young store since the last one. A later write
+        // re-registers. `take` is that consume — there is no test/prod
+        // split. Parallel MiniMarks sharing this process-global list is a
+        // harness isolation defect (the list belongs on the collector);
+        // cloning it would leave the set undrained and let two visitors
+        // `trace` the same unsynchronized slots.
         let pending = std::mem::take(&mut *PENDING_MINOR_TABLES.lock());
         for table in pending.iter().filter_map(Weak::upgrade) {
             table.trace(visitor);
@@ -308,14 +314,12 @@ pub fn install_gc_table_walker() {
 mod tests {
     use super::*;
 
-    // `LIVE_GC_TABLES` is a process-global registry; in production it is
-    // only mutated outside a collection (table build at compile time) and
-    // only read inside a stop-the-world collection, so there is never a
-    // concurrent build-vs-walk. The test harness runs tests in parallel, so
-    // besides serializing the table-touching tests against each other, the
-    // write side of [`GC_TABLE_WALK_LOCK`] also excludes any concurrent
-    // collector-test collection whose walk would otherwise transiently
-    // resurrect a table this test is dropping — modeling the STW invariant.
+    // `LIVE_GC_TABLES` is process-global. Production mutates it at compile
+    // time and reads it inside a collection step; those are exclusive via
+    // `gc_op` / GIL. The harness runs MiniMark tests in parallel, so the
+    // write side of [`GC_TABLE_WALK_LOCK`] also excludes a sibling
+    // collection whose walk would otherwise upgrade a `Weak` this test is
+    // dropping.
 
     #[test]
     fn trace_forwards_slots_in_place() {
