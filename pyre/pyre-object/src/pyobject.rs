@@ -390,16 +390,16 @@ pub fn assign_subclass_range(tp: &PyType, min: i64, max: i64) {
 }
 
 /// Sequence lock (seqlock) guarding the batch (re)stamping of the static
-/// `subclassrange_{min,max}` fields. The interpreter and GC initializers use
-/// the same registration-ordered `TotalOrderSymbolic` numbering, but a reader
-/// must still not observe a partially written batch while startup writers run
-/// concurrently.
+/// `subclassrange_{min,max}` fields. Full interpreter startup publishes the
+/// registration-ordered `TotalOrderSymbolic` numbering; GC only verifies it.
+/// Object-only unit tests can also seed a partial alias set, so their later
+/// full publication must not expose a partially written batch to readers.
 ///
 /// A seqlock, not a mutex/rwlock, because this is free-threaded (`nogil`):
 /// the writes happen once at startup while `ll_issubclass` is a hot,
 /// concurrently-read path.  Optimistic readers touch only `SUBCLASS_RANGE_SEQ`
-/// with plain loads (no read-side atomic RMW), so once both one-time inits
-/// settle and the sequence stops changing, concurrent readers share that
+/// with plain loads (no read-side atomic RMW), so once startup publication
+/// settles and the sequence stops changing, concurrent readers share that
 /// cache line read-only with no cross-core contention.  Even = stable,
 /// odd = a batch write is in flight.
 static SUBCLASS_RANGE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -410,8 +410,9 @@ static SUBCLASS_RANGE_WRITER_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII write section for a batch subclass-range update. Held by
 /// `compute_subclass_ranges_from_hierarchy` for the whole batch; GC rebuilds
-/// validate published ranges and do not enter it. Entering makes the sequence odd (optimistic readers
-/// retry), dropping publishes the writes and makes it even again.
+/// validate published ranges and do not enter it. Entering makes the sequence
+/// odd (optimistic readers retry), dropping publishes the writes and makes it
+/// even again.
 pub struct SubclassRangeWriteGuard {
     _writers: parking_lot::MutexGuard<'static, ()>,
     seq: u64,
@@ -875,29 +876,24 @@ pub fn compute_subclass_ranges_from_hierarchy(
     }
 }
 
-/// Compute ranges from the complete object-model census. Configuration-aware
-/// embedders should call [`compute_subclass_ranges_from_hierarchy`] with their
-/// active hierarchy instead.
-pub fn compute_subclass_ranges_from(alias_chains: &[&[SubclassRangeAlias]]) {
+/// Seed standalone tests from the complete object-model census. Production
+/// startup supplies its active hierarchy through the full publication owner.
+#[cfg(test)]
+fn compute_subclass_ranges_from(alias_chains: &[&[SubclassRangeAlias]]) {
     compute_subclass_ranges_from_hierarchy(SUBCLASS_RANGE_HIERARCHY, alias_chains);
 }
 
-/// Lazy first-caller-wins gate around `compute_subclass_ranges_from`.
-/// Pyre's interpreter-side `init_typeobjects` passes both object and
-/// interpreter alias slices so cross-crate types (e.g. `CODE_TYPE`,
-/// `PYTRACEBACK_TYPE`) are written. Pyre-object's own tests can reach
-/// `is_exception` without calling `init_typeobjects`, so this `OnceLock`
-/// triggers a fallback write of the object-owned aliases. Both paths compute
-/// from the complete shared hierarchy; only the set of PyType aliases written
-/// differs. GC construction verifies the interpreter's full publication.
+/// Publication gate shared by full interpreter startup and the standalone
+/// object unit-test initializer. There is no object-only runtime fallback:
+/// production readers follow `typedef::init_subclass_ranges`, which supplies
+/// the active hierarchy and both crates' aliases. GC verifies that publication.
 static SUBCLASS_RANGES_INIT: OnceLock<()> = OnceLock::new();
 
-// `dont_look_inside`: one-time host initialization (`OnceLock` +
-// global type-table walk) stays opaque to the JIT — production
-// entry points have run the full init before any trace executes,
-// so the residual call is a no-op there.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn ensure_object_subclass_ranges_initialized() {
+/// Standalone object tests have no interpreter startup. Seed their vtables
+/// explicitly, outside `is_exception`, just as rclass.py `ll_isinstance`
+/// reads values prebuilt by `ClassRepr.fill_vtable_root` without a lazy call.
+#[cfg(test)]
+pub(crate) fn ensure_object_subclass_ranges_initialized() {
     SUBCLASS_RANGES_INIT.get_or_init(|| {
         let aliases = all_subclass_range_aliases();
         compute_subclass_ranges_from(&[&aliases]);
