@@ -9867,10 +9867,18 @@ impl CraneliftBackend {
                         .filter(|&&slot| slot != 0xFFFF)
                         .map(|&slot| slot as usize)
                         .collect();
+                    // Stores write `force_spill_base + fail-arg index`.
+                    // `failarg_ref_slots` still holds the collect_guards
+                    // `fail_locs` (1+index, slot 0 reserved for FINISH);
+                    // adding `force_spill_base` to those marks one past
+                    // the last store and leaves the first force slot
+                    // unmarked.
                     info.failarg_ref_slots = info
-                        .failarg_ref_slots
+                        .fail_arg_refs
                         .iter()
-                        .map(|slot| force_spill_base + slot)
+                        .enumerate()
+                        .filter(|(_, arg)| !arg.is_none() && arg.ty() == Some(Type::Ref))
+                        .map(|(index, _)| force_spill_base + index)
                         .collect();
                     info.fail_locs = (0..info.fail_arg_refs.len())
                         .map(|index| force_spill_base + index)
