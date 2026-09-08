@@ -1915,7 +1915,7 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
     let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
     let typecode = unsafe { arr::w_array_typecode(obj) };
     let tc = typecode as char;
-    let w_typecode = pyre_object::w_str_new(&tc.to_string());
+    let w_typecode = pyre_object::w_str_new_managed(&tc.to_string());
     let w_dict =
         crate::baseobjspace::findattr_result(obj, "__dict__")?.unwrap_or_else(pyre_object::w_none);
     let mformat = array_machine_format_code(typecode, unsafe { arr::w_array_itemsize(obj) });
@@ -2318,7 +2318,7 @@ pub fn init_array_type(ns: PyObjectRef) {
                     |args| {
                         let obj = require_array_receiver(args, "typecode", true)?;
                         let tc = unsafe { arr::w_array_typecode(obj) } as char;
-                        Ok(pyre_object::w_str_new(&tc.to_string()))
+                        Ok(pyre_object::w_str_new_managed(&tc.to_string()))
                     },
                     1,
                 ),

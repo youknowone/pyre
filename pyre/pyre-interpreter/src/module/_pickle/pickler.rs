@@ -2859,7 +2859,7 @@ fn save_global(
     }
 
     if ctx.proto >= 4 {
-        save(ctx, buf, pyre_object::w_str_new(&module_name))?;
+        save(ctx, buf, pyre_object::w_str_new_managed(&module_name))?;
         save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(name_slot))?;
         buf.push(op::STACK_GLOBAL);
     } else if name.contains('.') {
@@ -2881,7 +2881,7 @@ fn save_global(
         }
         save_toplevel_by_name(ctx, buf, &module_name, parts[0])?;
         for attrname in rest {
-            save(ctx, buf, pyre_object::w_str_new(attrname))?;
+            save(ctx, buf, pyre_object::w_str_new_managed(attrname))?;
             if ctx.proto < 2 {
                 buf.push(op::TUPLE);
             } else {
@@ -3072,10 +3072,10 @@ fn save_toplevel_by_name(
     };
     let encoding = if ctx.proto < 3 { "ascii" } else { "utf-8" };
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_module_name = pyre_object::w_str_new(&module_name);
+    let w_module_name = pyre_object::w_str_new_managed(&module_name);
     let _ = pyre_object::gc_roots::pin_root(w_module_name);
     let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let w_name = pyre_object::w_str_new(&name);
+    let w_name = pyre_object::w_str_new_managed(&name);
     let _ = pyre_object::gc_roots::pin_root(w_name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let module_bytes = crate::type_methods::encode_object(
@@ -3117,8 +3117,8 @@ fn extension_code(module_name: &str, name: &str) -> Option<i64> {
     let copyreg = import_module("copyreg").ok()?;
     let registry = crate::baseobjspace::getattr_str(copyreg, "_extension_registry").ok()?;
     let key = pyre_object::tupleobject::w_tuple_new(vec![
-        pyre_object::w_str_new(module_name),
-        pyre_object::w_str_new(name),
+        pyre_object::w_str_new_managed(module_name),
+        pyre_object::w_str_new_managed(name),
     ]);
     let code = unsafe { pyre_object::w_dict_lookup(registry, key) }?;
     crate::baseobjspace::int_w(code).ok()

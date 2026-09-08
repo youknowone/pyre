@@ -379,11 +379,22 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
     }
     let byte_len = value.len();
     let char_len = value.code_points().count();
+    // The value box is a live GC child with no heap edge until the header
+    // is written.  Pin it (and the class word `get_instantiate` may allocate)
+    // across the header malloc, then remember the old-to-young edge — the
+    // same bracket `w_str_from_storage` / `build_bytes` already use.
+    let _roots = crate::gc_roots::push_roots();
     let value = crate::gc_storage::gc_alloc_storage_box(value, unicode_value_gc_type_id());
+    let value_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(value as PyObjectRef);
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(get_instantiate(&STR_TYPE));
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
+    let value = crate::gc_roots::shadow_stack_get(value_slot) as *mut Wtf8Buf;
     let unicode = W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
-            w_class: get_instantiate(&STR_TYPE),
+            w_class: crate::gc_roots::shadow_stack_get(class_slot),
         },
         value,
         byte_len,
@@ -392,7 +403,6 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
         index_storage: std::ptr::null_mut(),
         hash: 0,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     if raw.is_null() {
         // Header alloc failed after the value box: rebuild a fully immortal
         // string rather than pair a `malloc_typed` header with a GC value box it
@@ -404,8 +414,9 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
     }
     unsafe {
         std::ptr::write(raw as *mut W_UnicodeObject, unicode);
-        raw as PyObjectRef
     }
+    crate::gc_hook::try_gc_write_barrier_managed(raw);
+    raw as PyObjectRef
 }
 
 /// Allocate a dynamic exact string at a terminal, GC-safe return site.
@@ -554,15 +565,25 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     // Mortal (subclass) holder: the value buffer lives in a GC-managed box so
     // the sweep reclaims it through the box tid's drop glue, and the holder's
     // `value` gc-pointer edge greys it. Falls back to `malloc_raw` when no GC
-    // hook is installed (pre-init / unit tests).
+    // hook is installed (pre-init / unit tests).  Pin both pre-existing
+    // children across the header malloc (`w_bytes_subclass_from_bytes`).
+    let _roots = crate::gc_roots::push_roots();
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
     let value = crate::gc_storage::gc_alloc_storage_box(value, unicode_value_gc_type_id());
+    let value_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(value as PyObjectRef);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        W_UNICODE_USER_GC_TYPE_ID.get(),
+        W_UNICODE_USER_OBJECT_SIZE,
+    );
     let unicode = W_UnicodeObjectUser {
         base: W_UnicodeObject {
             ob_header: PyObject {
                 ob_type: &STR_TYPE as *const PyType,
-                w_class,
+                w_class: crate::gc_roots::shadow_stack_get(class_slot),
             },
-            value,
+            value: crate::gc_roots::shadow_stack_get(value_slot) as *mut Wtf8Buf,
             byte_len,
             len: char_len,
             w_slots: PY_NULL,
@@ -572,17 +593,14 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         map: 0,
         storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
-        W_UNICODE_USER_GC_TYPE_ID.get(),
-        W_UNICODE_USER_OBJECT_SIZE,
-    );
     let obj = if raw.is_null() {
         crate::lltype::malloc_typed(unicode) as PyObjectRef
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_UnicodeObjectUser, unicode);
-            raw as PyObjectRef
         }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        raw as PyObjectRef
     };
     crate::gc_hook::maybe_register_finalizer(obj);
     obj

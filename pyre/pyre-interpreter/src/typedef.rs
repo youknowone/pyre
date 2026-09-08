@@ -15957,7 +15957,7 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
                     ));
                 };
                 let method_name = unsafe { crate::function::function_get_name(descr) };
-                Ok(pyre_object::w_str_new(&format!(
+                Ok(pyre_object::w_str_new_managed(&format!(
                     "{owner_qualname}.{method_name}"
                 )))
             }) as crate::gateway::BuiltinCodeFn,
@@ -16380,7 +16380,7 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
                     ));
                 };
                 let method_name = unsafe { crate::function::function_get_name(descr) };
-                Ok(pyre_object::w_str_new(&format!(
+                Ok(pyre_object::w_str_new_managed(&format!(
                     "{owner_qualname}.{method_name}"
                 )))
             }) as crate::gateway::BuiltinCodeFn,
@@ -17300,7 +17300,9 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
             } else {
                 unsafe { pyre_object::w_type_get_qualname(owner) }.to_string()
             };
-            Ok(pyre_object::w_str_new(&format!("{owner_qualname}.{name}")))
+            Ok(pyre_object::w_str_new_managed(&format!(
+                "{owner_qualname}.{name}"
+            )))
         },
         2,
     );
@@ -29105,7 +29107,7 @@ fn coroutine_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn async_generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
-    Ok(w_str_new(&format!(
+    Ok(w_str_new_managed(&format!(
         "<async_generator object {} at {}>",
         unsafe { pyre_object::w_str_get_value(name) },
         crate::display::repr_addr(args[0] as usize)

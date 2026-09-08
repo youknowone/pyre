@@ -1941,9 +1941,9 @@ fn format_render(
         let converted = match conversion_spec {
             None => val,
             Some(cp) => match cp.to_char_lossy() {
-                's' => pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(val)? }),
-                'r' => pyre_object::w_str_from_wtf8(unsafe { crate::py_repr_wtf8(val)? }),
-                'a' => pyre_object::w_str_new(&crate::builtins::py_ascii(val)?),
+                's' => pyre_object::w_str_from_wtf8_managed(unsafe { crate::py_str_wtf8(val)? }),
+                'r' => pyre_object::w_str_from_wtf8_managed(unsafe { crate::py_repr_wtf8(val)? }),
+                'a' => pyre_object::w_str_new_managed(&crate::builtins::py_ascii(val)?),
                 // `\0` is the sentinel for a field with no conversion
                 // requested, so a literal NUL conversion character formats the
                 // field as if the `!` had not been written.
@@ -7314,7 +7314,7 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
     }
     let exc = err.to_exc_object();
     err.exc_object = exc;
-    let note = w_str_new(&format!(
+    let note = w_str_new_managed(&format!(
         "Cannot convert dictionary update sequence element #{idx} to a sequence"
     ));
     unsafe {

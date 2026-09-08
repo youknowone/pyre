@@ -81,13 +81,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::_structseq::new_instance(
             struct_passwd_type(),
             vec![
-                pyre_object::w_str_new(&pw.name),
-                pyre_object::w_str_new(&pw.passwd),
+                pyre_object::w_str_new_managed(&pw.name),
+                pyre_object::w_str_new_managed(&pw.passwd),
                 pyre_object::w_int_new(pw.uid as i64),
                 pyre_object::w_int_new(pw.gid as i64),
-                pyre_object::w_str_new(&pw.gecos),
-                pyre_object::w_str_new(&pw.dir),
-                pyre_object::w_str_new(&pw.shell),
+                pyre_object::w_str_new_managed(&pw.gecos),
+                pyre_object::w_str_new_managed(&pw.dir),
+                pyre_object::w_str_new_managed(&pw.shell),
             ],
         )
     }
@@ -106,13 +106,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::_structseq::new_instance(
             struct_passwd_type(),
             vec![
-                pyre_object::w_str_new(&cstr((*pw).pw_name)),
-                pyre_object::w_str_new(&cstr((*pw).pw_passwd)),
+                pyre_object::w_str_new_managed(&cstr((*pw).pw_name)),
+                pyre_object::w_str_new_managed(&cstr((*pw).pw_passwd)),
                 pyre_object::w_int_new((*pw).pw_uid as i64),
                 pyre_object::w_int_new((*pw).pw_gid as i64),
-                pyre_object::w_str_new(&cstr((*pw).pw_gecos)),
-                pyre_object::w_str_new(&cstr((*pw).pw_dir)),
-                pyre_object::w_str_new(&cstr((*pw).pw_shell)),
+                pyre_object::w_str_new_managed(&cstr((*pw).pw_gecos)),
+                pyre_object::w_str_new_managed(&cstr((*pw).pw_dir)),
+                pyre_object::w_str_new_managed(&cstr((*pw).pw_shell)),
             ],
         )
     }

@@ -281,8 +281,9 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_IntObjectUser, obj);
-            raw as PyObjectRef
         }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        raw as PyObjectRef
     }
 }
 

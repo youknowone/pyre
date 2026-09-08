@@ -126,7 +126,7 @@ fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
     let args = vec![
         cls,
         pyre_object::w_int_new(errno as i64),
-        pyre_object::w_str_new(&strerror),
+        pyre_object::w_str_new_managed(&strerror),
     ];
     let exc = crate::builtins::exc_os_error_new(&args)
         .expect("exc_os_error_new is infallible for int/str args");
@@ -940,7 +940,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     #[cfg(not(any(unix, windows)))]
                     let text = wasm_signals::strsignal(signum).map(str::to_owned);
                     Ok(text
-                        .map(|s| pyre_object::w_str_new(&s))
+                        .map(|s| pyre_object::w_str_new_managed(&s))
                         .unwrap_or(pyre_object::w_none()))
                 }
                 #[cfg(not(feature = "host_env"))]

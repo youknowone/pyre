@@ -144,12 +144,12 @@ fn strategy(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let obj = args[0];
     let dict = crate::type_methods::resolve_dict_backing(obj);
     if !dict.is_null() && unsafe { pyre_object::is_dict(dict) } {
-        return Ok(pyre_object::w_str_new(unsafe {
+        return Ok(pyre_object::w_str_new_managed(unsafe {
             pyre_object::dictmultiobject::w_dict_strategy_name(dict)
         }));
     }
     if unsafe { pyre_object::is_list(obj) } {
-        return Ok(pyre_object::w_str_new(unsafe {
+        return Ok(pyre_object::w_str_new_managed(unsafe {
             pyre_object::listobject::w_list_strategy_name(obj)
         }));
     }
@@ -157,10 +157,10 @@ fn strategy(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         // W_SetObject currently has one ObjectKey-backed representation.  The
         // helper reports that real shape; EmptySetStrategy and
         // IntegerSetStrategy remain explicit builtin-type porting work.
-        return Ok(pyre_object::w_str_new("ObjectSetStrategy"));
+        return Ok(pyre_object::w_str_new_managed("ObjectSetStrategy"));
     }
     if let Some(name) = unsafe { crate::objspace::std::mapdict::mapdict_strategy_repr(obj) } {
-        return Ok(pyre_object::w_str_from_wtf8(name));
+        return Ok(pyre_object::w_str_from_wtf8_managed(name));
     }
     Err(crate::PyError::type_error(
         "expecting dict or list or set object, or instance of some kind",

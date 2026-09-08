@@ -433,6 +433,7 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
         crate::lltype::malloc_typed(payload) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_BytesObject, payload) };
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     };
     // `allocate_instance` registers the fresh instance on the finalizer queue

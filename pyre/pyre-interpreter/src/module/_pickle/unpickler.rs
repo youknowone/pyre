@@ -1587,7 +1587,7 @@ fn packed_list_from_args(
                 if !text.is_ascii() {
                     return Err(PyError::value_error(error));
                 }
-                pyre_object::w_str_new(text)
+                pyre_object::w_str_new_managed(text)
             }
             PackedListKind::Bytes => {
                 pyre_object::bytesobject::w_bytes_from_bytes(&data[offset..end])
@@ -1661,14 +1661,14 @@ fn read_line_int(slot: usize) -> Result<i64, PyError> {
 /// Dispatch to `self.find_class(module, name)` through the instance, so a
 /// Python subclass override (the standard security hook) is honoured.
 /// `call_find_class` for two fresh module/name strings: allocate and pin the
-/// module string before allocating the name string, so the second `w_str_new`
-/// cannot relocate the first before both are rooted.
+/// module string before allocating the name string, so the second constructor
+/// cannot reclaim the first before both are rooted.
 fn call_find_class_names(slot: usize, module: &str, name: &str) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_module = pyre_object::w_str_new(module);
+    let w_module = pyre_object::w_str_new_managed(module);
     let _ = pyre_object::gc_roots::pin_root(w_module);
     let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let w_name = pyre_object::w_str_new(name);
+    let w_name = pyre_object::w_str_new_managed(name);
     call_find_class(
         slot,
         pyre_object::gc_roots::shadow_stack_get(module_slot),
@@ -1711,8 +1711,8 @@ fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
             audit,
             &[
                 pyre_object::w_str_new("pickle.find_class"),
-                pyre_object::w_str_new(module),
-                pyre_object::w_str_new(name),
+                pyre_object::w_str_new_managed(module),
+                pyre_object::w_str_new_managed(name),
             ],
         )?;
     }
@@ -1800,10 +1800,10 @@ fn decode_string(slot: usize, data: &[u8]) -> Result<PyObjectRef, PyError> {
     let w_bytes = pyre_object::w_bytes_from_bytes(data);
     let _ = pyre_object::gc_roots::pin_root(w_bytes);
     let b = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let w_encoding = pyre_object::w_str_new(&encoding);
+    let w_encoding = pyre_object::w_str_new_managed(&encoding);
     let _ = pyre_object::gc_roots::pin_root(w_encoding);
     let e = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let w_errors = pyre_object::w_str_new(&errors);
+    let w_errors = pyre_object::w_str_new_managed(&errors);
     call_meth(
         pyre_object::gc_roots::shadow_stack_get(b),
         "decode",

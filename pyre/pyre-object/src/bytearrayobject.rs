@@ -121,14 +121,25 @@ impl crate::lltype::GcType for W_BytearrayObject {
 fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     let length = buf.len();
     let alloc = if buf.is_empty() { 0 } else { buf.len() + 1 };
+    // `build_bytes` (bytesobject.rs): the data box has no heap edge until
+    // the body is written, and both `get_instantiate` and the body malloc
+    // can collect.  Pin the box and the class, reload after the last
+    // allocation, and remember the old-to-young data edge.
+    let _roots = crate::gc_roots::push_roots();
     let data =
         crate::gc_storage::gc_alloc_storage_box(buf, crate::bytesobject::bytes_data_gc_type_id());
-    let header = PyObject {
-        ob_type: &BYTEARRAY_TYPE as *const PyType,
-        w_class: get_instantiate(&BYTEARRAY_TYPE),
-    };
+    let data_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(data as PyObjectRef);
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(get_instantiate(&BYTEARRAY_TYPE));
+    let raw =
+        crate::gc_hook::try_gc_alloc_stable_raw(W_BYTEARRAY_GC_TYPE_ID, W_BYTEARRAY_OBJECT_SIZE);
+    let data = crate::gc_roots::shadow_stack_get(data_slot) as *mut Vec<u8>;
     let body = W_BytearrayObject {
-        ob_header: header,
+        ob_header: PyObject {
+            ob_type: &BYTEARRAY_TYPE as *const PyType,
+            w_class: crate::gc_roots::shadow_stack_get(class_slot),
+        },
         data,
         length: AtomicUsize::new(length),
         alloc,
@@ -138,17 +149,15 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
         w_weakreflifeline: PY_NULL,
         w_slots: PY_NULL,
     };
-    let raw =
-        crate::gc_hook::try_gc_alloc_stable_raw(W_BYTEARRAY_GC_TYPE_ID, W_BYTEARRAY_OBJECT_SIZE);
-    let w_bytearray = if !raw.is_null() {
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(raw as *mut W_BytearrayObject, body);
         }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
         crate::lltype::malloc_typed(body) as PyObjectRef
-    };
-    w_bytearray
+    }
 }
 
 /// Allocate a new bytearray filled with zeros.
@@ -211,6 +220,7 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
         crate::lltype::malloc_typed(payload) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_BytearrayObject, payload) };
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     };
     // `allocate_instance` registers the fresh instance on the finalizer queue
