@@ -510,6 +510,28 @@ pub trait JitState: Sized {
         None
     }
 
+    /// Rebind portal reds on a guard-resume framestack from the live
+    /// interpreter state.
+    ///
+    /// Generated `setup_bridge_sym` binds a state-field identity register
+    /// the resume frame does not carry as a `Const` from the live mirrors
+    /// `initialize_sym` left behind. A frontend whose reds *are* those
+    /// identities — Grain's live frame and live Vm, republished on every
+    /// merge-point consult — has the same gap on the opposite side: the
+    /// register is present, but `bridge_decode_red` keys it by failarg
+    /// index and the concrete bits can still be a walk-local address the
+    /// parent loop walk snapshotted. Residual calls then write through
+    /// that address instead of the interpreter object still on the stack.
+    ///
+    /// Only the concrete shadow is rewritten. The `OpRef` stays the
+    /// failarg or folded `Const` the resume stream named, so a compiled
+    /// bridge keeps taking a per-eval red rather than baking this eval's
+    /// stack pointer in. The default is a no-op: generated frontends
+    /// already rebound their identity registers in `setup_bridge_sym`,
+    /// and a state whose reds are not heap/stack identities has nothing
+    /// to replace.
+    fn rebind_bridge_reds(&self, _frames: &mut [GuardResumeFrame]) {}
+
     /// resume.py rebuild_from_resumedata: decode rd_numb to
     /// reconstruct the complete frame state for bridge tracing.
     ///

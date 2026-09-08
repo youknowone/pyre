@@ -1208,6 +1208,77 @@ fn report_symbolic_residual_call_target(
     TraceAction::Abort
 }
 
+/// A walk-local `Dynamic` arrives as a small integer in a Ref register,
+/// not a live cell. Residual-calling a helper that drops `Union` through
+/// that address is `EXC_BAD_ACCESS`. Abort the walk the same way an
+/// unbound symbolic target does, so the portal resumes at the merge point.
+fn refuse_walk_local_ref_args(
+    ctx: &mut TraceCtx,
+    func: usize,
+    raw_i: &[i64],
+    raw_r: &[i64],
+    args: &[OpRef],
+    arg_classes: &str,
+) -> Option<TraceAction> {
+    let small_ref = raw_r.iter().any(|&ptr| {
+        let addr = ptr as u64 as usize;
+        addr != 0 && addr <= 0x1000
+    });
+    // `rir` is `operand_stack_store` / `operand_stack_take` of a
+    // walk-local `Dynamic`. That address is a real stack slot, so the
+    // small-integer check above cannot see it. `rr` is `dynamic_store` /
+    // `push_from_cell`; those helpers refuse a non-heap cell themselves.
+    let bridge_store = crate::is_bridge_walking() && matches!(arg_classes, "rir");
+    // `rii` is `operand_stack_store_int` / `_bool`; `rif` is `_float`.
+    // The first `i` is a stack depth. A walk local in that slot is a
+    // pointer-sized word. Do not match plain `ri`: that class also
+    // carries `track_operation` position bits (`line << 16`).
+    let pointer_index = matches!(arg_classes, "rii" | "rif")
+        && raw_i.first().is_some_and(|&index| {
+            let as_usize = index as u64 as usize;
+            as_usize > 0x1_0000
+        });
+    if !small_ref && !bridge_store && !pointer_index {
+        return None;
+    }
+    ctx.symbolic_residual_abort = true;
+    if crate::is_bridge_walking() || ctx.is_bridge_trace {
+        ctx.deterministic_bridge_abort = true;
+    }
+    SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if crate::majit_log_enabled() {
+        eprintln!(
+            "[jit] residual refused: walk-local Ref/index arg \
+             (fn={func:#x} classes={arg_classes} ints={raw_i:?} \
+             refs={raw_r:?} bridge={})",
+            crate::is_bridge_walking(),
+        );
+    }
+    Some(TraceAction::Abort)
+}
+
+fn host_requested_walk_abort(
+    ctx: &mut TraceCtx,
+    func: usize,
+    arg_classes: &str,
+) -> Option<TraceAction> {
+    if !crate::take_walk_abort() {
+        return None;
+    }
+    ctx.symbolic_residual_abort = true;
+    if crate::is_bridge_walking() || ctx.is_bridge_trace {
+        ctx.deterministic_bridge_abort = true;
+    }
+    SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if crate::majit_log_enabled() {
+        eprintln!(
+            "[jit] residual refused: host rejected walk-local Vm/index \
+             (fn={func:#x} classes={arg_classes})"
+        );
+    }
+    Some(TraceAction::Abort)
+}
+
 /// Refuse a trace whose statically reachable body contains an unbound
 /// symbolic residual target, before the walk can execute any body instruction.
 fn refuse_reachable_symbolic_residuals(jitcode: &JitCode) -> bool {
@@ -3070,6 +3141,14 @@ where
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+        // A previous walk may have left a committed-residual latch.
+        let _ = crate::take_residual_committed();
+        // Same latch class: a blackhole residual that refused a walk-local
+        // arms `request_walk_abort` with no walker to consume it. The next
+        // walk must not die on its first `run_one_step`.
+        if crate::take_walk_abort() && crate::majit_log_enabled() {
+            eprintln!("[jit] dropped leftover walk-abort at run_to_end");
+        }
         // Stable program-pc anchor for the state-field-JIT portal op —
         // the outer interpreter pc that `trace_jitcode` was invoked with.
         // Survives `BC_INLINE_CALL`'s `frame.pc = frame.code_cursor`
@@ -3764,6 +3843,13 @@ where
     }
 
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
+        if crate::take_walk_abort() || majit_backend::take_null_mem_access() {
+            ctx.symbolic_residual_abort = true;
+            if crate::is_bridge_walking() || ctx.is_bridge_trace {
+                ctx.deterministic_bridge_abort = true;
+            }
+            return TraceAction::Abort;
+        }
         if self.frames.is_empty() {
             return TraceAction::Continue;
         }
@@ -4578,6 +4664,18 @@ where
                 };
                 let cached =
                     field_key.and_then(|key| ctx.heapcache_getfield_cached(struct_opref, key));
+                let cached_payload = cached.and_then(|cached| match ctx.box_value(cached) {
+                    Some(Value::Int(n)) => Some(n),
+                    Some(Value::Ref(r)) => Some(r.0 as i64),
+                    _ => None,
+                });
+                // Parentless placeholder descrs can share `field_key`, so a
+                // Position word and a frame `base` collide. A hit whose
+                // payload is not the live load is that collision: take the
+                // miss path and record a fresh op.
+                let cached = cached.filter(|_| {
+                    struct_ptr == 0 || cached_payload.is_none() || cached_payload == Some(loaded)
+                });
                 let (op, reg_concrete) = if let Some(cached) = cached {
                     // `profiler.count_ops(rop.GETFIELD_GC_I,
                     // Counters.HEAPCACHED_OPS)` — folded-away op
@@ -7661,6 +7759,16 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                if let Some(action) = refuse_walk_local_ref_args(
+                    ctx,
+                    concrete_ptr as usize,
+                    &raw_i,
+                    &raw_r,
+                    &args,
+                    &calldescr.arg_classes,
+                ) {
+                    return action;
+                }
 
                 let effectinfo = &calldescr.extra_info;
 
@@ -7701,6 +7809,13 @@ where
                                 Some(&raw_f),
                             );
                         }
+                    }
+                    if let Some(action) = host_requested_walk_abort(
+                        ctx,
+                        concrete_ptr as usize,
+                        &calldescr.arg_classes,
+                    ) {
+                        return action;
                     }
                     // `pyjitpl.py do_not_in_trace_call`:
                     //     if self.last_exc_value:
@@ -7803,6 +7918,13 @@ where
                                 Some(&raw_f),
                             );
                         }
+                    }
+                    if let Some(action) = host_requested_walk_abort(
+                        ctx,
+                        concrete_ptr as usize,
+                        &calldescr.arg_classes,
+                    ) {
+                        return action;
                     }
                     // pyjitpl.py:2046-2049 — after the residual call,
                     // walk the vrefs.  If any were forced by the call
@@ -7990,6 +8112,16 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                if let Some(action) = refuse_walk_local_ref_args(
+                    ctx,
+                    concrete_ptr as usize,
+                    &raw_i,
+                    &raw_r,
+                    &args,
+                    &calldescr.arg_classes,
+                ) {
+                    return action;
+                }
 
                 let effectinfo = &calldescr.extra_info;
 
@@ -8026,6 +8158,13 @@ where
                                 Some(&raw_f),
                             );
                         }
+                    }
+                    if let Some(action) = host_requested_walk_abort(
+                        ctx,
+                        concrete_ptr as usize,
+                        &calldescr.arg_classes,
+                    ) {
+                        return action;
                     }
                     // `pyjitpl.py do_not_in_trace_call`:
                     //     if self.last_exc_value: raise SwitchToBlackhole(
@@ -8114,6 +8253,13 @@ where
                             )
                         }
                     };
+                    if let Some(action) = host_requested_walk_abort(
+                        ctx,
+                        concrete_ptr as usize,
+                        &calldescr.arg_classes,
+                    ) {
+                        return action;
+                    }
                     // pyjitpl.py — vrefs_after_residual_call
                     // (see void arm for the explanation; gated on
                     // `is_forces` because the before-hook only stamps
@@ -8318,6 +8464,16 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                if let Some(action) = refuse_walk_local_ref_args(
+                    ctx,
+                    concrete_ptr as usize,
+                    &raw_i,
+                    &raw_r,
+                    &args,
+                    &calldescr.arg_classes,
+                ) {
+                    return action;
+                }
 
                 let effectinfo = &calldescr.extra_info;
 
@@ -8345,6 +8501,13 @@ where
                                 Some(&raw_f),
                             );
                         }
+                    }
+                    if let Some(action) = host_requested_walk_abort(
+                        ctx,
+                        concrete_ptr as usize,
+                        &calldescr.arg_classes,
+                    ) {
+                        return action;
                     }
                     // `pyjitpl.py do_not_in_trace_call`:
                     //     if self.last_exc_value: raise SwitchToBlackhole(
@@ -8429,6 +8592,13 @@ where
                             )
                         }
                     };
+                    if let Some(action) = host_requested_walk_abort(
+                        ctx,
+                        concrete_ptr as usize,
+                        &calldescr.arg_classes,
+                    ) {
+                        return action;
+                    }
                     // pyjitpl.py — vrefs_after_residual_call
                     // (see void arm for the explanation; gated on
                     // `is_forces` because the before-hook only stamps
@@ -8598,6 +8768,16 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                if let Some(action) = refuse_walk_local_ref_args(
+                    ctx,
+                    concrete_ptr as usize,
+                    &raw_i,
+                    &raw_r,
+                    &args,
+                    &calldescr.arg_classes,
+                ) {
+                    return action;
+                }
 
                 let effectinfo = &calldescr.extra_info;
 
@@ -8625,6 +8805,13 @@ where
                                 Some(&raw_f),
                             );
                         }
+                    }
+                    if let Some(action) = host_requested_walk_abort(
+                        ctx,
+                        concrete_ptr as usize,
+                        &calldescr.arg_classes,
+                    ) {
+                        return action;
                     }
                     // `pyjitpl.py do_not_in_trace_call`:
                     //     if self.last_exc_value: raise SwitchToBlackhole(
@@ -9486,6 +9673,12 @@ where
             }
             jitcode::insns::BC_ABORT => {
                 self.log_bytecode_abort("BC_ABORT");
+                // A helper's `BC_ABORT` is a compile-time "this path cannot
+                // be traced". The reconstructed registers that reached it
+                // will reach it again; retrying rebuilds the same abort.
+                if crate::is_bridge_walking() || ctx.is_bridge_trace {
+                    ctx.deterministic_bridge_abort = true;
+                }
                 return TraceAction::Abort;
             }
             jitcode::insns::BC_ABORT_PERMANENT => {
@@ -10560,7 +10753,7 @@ where
 ///
 /// Shared by every walk entry: where the walk started does not change what a
 /// consumer needs in order to resume from where it stopped.
-fn publish_walk_abort_handoff(
+pub fn publish_walk_abort_handoff(
     ctx: &mut TraceCtx,
     action: &TraceAction,
     standalone: &mut StandaloneFrameStack,
@@ -10573,12 +10766,23 @@ fn publish_walk_abort_handoff(
         // runtime Int register is invisible to that scan and reaches this
         // site-level backstop; it also takes the arm-replay position, because
         // the post-decode framestack would skip the refused call altogether.
-        // An earlier residual call in that arm may already have committed heap
-        // effects, so replay runs that prefix a second time. This narrowed
-        // duplicate-effect window is the residue the trace-start gate does not
-        // close, and replay is still preferred over publishing the post-decode
-        // framestack and skipping the refused call.
-        if std::mem::replace(&mut ctx.symbolic_residual_abort, false) {
+        //
+        // That replay is only sound when no residual has committed. A bound
+        // helper such as `iter_next_store` may already have popped the
+        // iterator; re-running the merge-point opcode then raises
+        // `no iterator to advance`. Compiled code can have made that
+        // call before the guard failed, so a bridge walk that then
+        // refuses an unbound residual (`__len`, `scope_rewind`) must
+        // not fall back to the loop header either — `pyjitpl.py
+        // run_blackhole_interp_to_cancel_tracing` converts the live
+        // framestack instead. Keep i0 and the framestack when the host
+        // marked a committed residual or this walk is already a
+        // guard-resume bridge.
+        if std::mem::replace(&mut ctx.symbolic_residual_abort, false)
+            && !crate::take_residual_committed()
+            && !crate::is_bridge_walking()
+            && !ctx.is_bridge_trace
+        {
             return;
         }
         if let Some(pc) = standalone.frames.frames[0]

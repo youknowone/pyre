@@ -6490,6 +6490,166 @@ pub trait BlackholeAllocator {
 pub struct NullAllocator;
 impl BlackholeAllocator for NullAllocator {}
 
+/// `cpu.bh_setfield_gc_*` / `cpu.bh_setarrayitem_gc_*` (`llmodel.py`).
+///
+/// The applying reader records a deferred store *and* writes it. A
+/// frontend that has no object-model override still owes those writes
+/// — otherwise `start_bridge_tracing` marks the replay incomplete and
+/// every pending field declines to the blackhole.
+pub struct LlmodelBlackholeAllocator;
+
+/// `cpu.bh_new` / `bh_new_array` (`llmodel.py`): old-gen when a GC owns
+/// the heap, otherwise a zeroed raw block. A GC that is installed but
+/// cannot satisfy the request returns 0 rather than a raw pointer the
+/// collector will not trace.
+fn llmodel_alloc(type_id: u32, size: usize) -> i64 {
+    let size = size.max(1);
+    let gc = majit_gc::alloc_oldgen_typed(type_id, size);
+    if gc.0 != 0 {
+        return gc.0 as i64;
+    }
+    if majit_gc::gc_allocator_installed() {
+        return 0;
+    }
+    let mut block = vec![0u8; size].into_boxed_slice();
+    let ptr = block.as_mut_ptr();
+    std::mem::forget(block);
+    ptr as i64
+}
+
+impl BlackholeAllocator for LlmodelBlackholeAllocator {
+    fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
+        let Some(sd) = descr.as_size_descr() else {
+            return 0;
+        };
+        let ptr = llmodel_alloc(sd.type_id(), sd.size());
+        if ptr != 0 && vtable != 0 {
+            unsafe {
+                majit_backend::llmodel::write_ref_at_mem(ptr as usize, 0, vtable);
+            }
+        }
+        ptr
+    }
+
+    fn bh_new(&self, typedescr: &majit_ir::DescrRef) -> i64 {
+        let Some(sd) = typedescr.as_size_descr() else {
+            return 0;
+        };
+        llmodel_alloc(sd.type_id(), sd.size())
+    }
+
+    fn bh_new_array(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        let Some(ad) = arraydescr.as_array_descr() else {
+            return 0;
+        };
+        let size = ad
+            .base_size()
+            .saturating_add(length.saturating_mul(ad.item_size()));
+        llmodel_alloc(ad.type_id(), size)
+    }
+
+    fn bh_new_array_clear(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        self.bh_new_array(length, arraydescr)
+    }
+    fn bh_setfield_gc_i(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        if struct_ptr == 0 {
+            return;
+        }
+        unsafe {
+            majit_backend::llmodel::write_int_at_mem(
+                struct_ptr as usize,
+                descr_info.offset,
+                descr_info.field_size,
+                value,
+            );
+        }
+    }
+
+    fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        if struct_ptr == 0 {
+            return;
+        }
+        unsafe {
+            majit_backend::llmodel::write_ref_at_mem(
+                struct_ptr as usize,
+                descr_info.offset,
+                value as usize,
+            );
+        }
+    }
+
+    fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
+        if struct_ptr == 0 {
+            return;
+        }
+        unsafe {
+            majit_backend::llmodel::write_float_at_mem(
+                struct_ptr as usize,
+                descr_info.offset,
+                f64::from_bits(value as u64),
+            );
+        }
+    }
+
+    fn bh_setarrayitem_gc_i(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        let Some(ad) = descr.as_array_descr() else {
+            return;
+        };
+        let ofs = ad
+            .base_size()
+            .wrapping_add(index.wrapping_mul(ad.item_size()));
+        unsafe {
+            majit_backend::llmodel::write_int_at_mem(array as usize, ofs, ad.item_size(), value);
+        }
+    }
+
+    fn bh_setarrayitem_gc_r(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        let Some(ad) = descr.as_array_descr() else {
+            return;
+        };
+        let ofs = ad
+            .base_size()
+            .wrapping_add(index.wrapping_mul(ad.item_size()));
+        unsafe {
+            majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize);
+        }
+    }
+
+    fn bh_setarrayitem_gc_f(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        let Some(ad) = descr.as_array_descr() else {
+            return;
+        };
+        let ofs = ad
+            .base_size()
+            .wrapping_add(index.wrapping_mul(ad.item_size()));
+        unsafe {
+            majit_backend::llmodel::write_float_at_mem(
+                array as usize,
+                ofs,
+                f64::from_bits(value as u64),
+            );
+        }
+    }
+}
+
 /// Metainterp-side extension methods on `VirtualInfo` (which lives in
 /// majit-backend since the Phase C-1 cascade).  These methods depend
 /// on `ResumeDataDirectReader` + `BlackholeAllocator` — both

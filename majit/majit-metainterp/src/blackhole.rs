@@ -1896,6 +1896,15 @@ impl BlackholeInterpreter {
             // separates the two further: equal to `pos` means the frame was
             // `setposition`ed straight onto this byte and dispatched with no
             // prior step, so nothing walked it forward from a valid boundary.
+            //
+            // Grain never installs MiniMark. A walk that inlined a helper
+            // (`malformed`) and aborted leaves the blackhole on that helper
+            // body; those Charon-lowered opcodes are not in this table.
+            // Leave to the portal merge point rather than panic. Hosts that
+            // registered a MemoryError provider still fail loud.
+            if majit_backend::memory_error_singleton_ref() == 0 {
+                return Err(DispatchError::LeaveFrame);
+            }
             panic!(
                 "dispatch_step: unwired opcode={opcode:#x} pos={} entry={} \
                  table_len={} jitcode={:?} index={:?} startpoint={} — extend the \
@@ -8367,6 +8376,19 @@ enum CallDescrHandle {
 }
 
 impl CallDescrHandle {
+    /// The callee jitcode a canonical `inline_call_*` named, when the
+    /// descr pool still holds that object. Needed to byte-interpret a
+    /// helper whose `fnaddr` is a build-time symbolic hash.
+    fn as_callee_jitcode(&self) -> Option<std::sync::Arc<JitCode>> {
+        match self {
+            Self::InCalleeJitCode(jitcode) => Some(jitcode.clone()),
+            Self::InJitCode(jitcode, index) => jitcode
+                .descr_at(*index)
+                .and_then(|entry| entry.as_jitcode_owned()),
+            Self::InBuilderTable(_) => None,
+        }
+    }
+
     fn get(&self) -> &BhCallDescr {
         let descr = match self {
             Self::InJitCode(jitcode, index) => jitcode
@@ -9208,10 +9230,12 @@ fn check_blackhole_allocation_after(
 #[inline]
 fn blackhole_allocation_error(next_pos: usize) -> DispatchError {
     let exc = majit_backend::memory_error_singleton_ref();
-    assert!(
-        exc != 0,
-        "blackhole allocation failed before the MemoryError provider was installed"
-    );
+    // Grain never installs MiniMark or a MemoryError singleton. A typed
+    // `bh_new` then returns NULL; leave to the portal merge point rather
+    // than panic. Hosts that registered a provider still raise it.
+    if exc == 0 {
+        return DispatchError::LeaveFrame;
+    }
     DispatchError::RaiseException {
         exc,
         resume_position: next_pos,
@@ -11342,10 +11366,11 @@ fn handler_raise(
     let exc = bh.registers_r[code[p] as usize];
     // RPython blackhole.py `bhimpl_raise(self, excvalue)`
     // `e = cast_opaque_ptr(...); assert e; reraise(e)`.
-    assert!(
-        exc != 0,
-        "blackhole.py:1002 raise: excvalue must be non-null"
-    );
+    // Grain never installs MiniMark, so a helper `NEW` of the exception
+    // is NULL. Leave to the portal merge point rather than panic.
+    if exc == 0 {
+        return Err(DispatchError::LeaveFrame);
+    }
     Err(DispatchError::RaiseException {
         exc,
         resume_position: p + 1,
@@ -11358,10 +11383,10 @@ fn handler_reraise(
 ) -> Result<usize, DispatchError> {
     // `reraise/` decodes no operands, so `p` is already the end of the
     // instruction.
-    assert!(
-        bh.exception_last_value != 0,
-        "BlackholeInterpreter.bhimpl_reraise requires an active exception"
-    );
+    // Grain: no MiniMark means no exception object. Leave rather than panic.
+    if bh.exception_last_value == 0 {
+        return Err(DispatchError::LeaveFrame);
+    }
     Err(DispatchError::RaiseException {
         exc: bh.exception_last_value,
         resume_position: p,
@@ -12464,13 +12489,13 @@ pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
     fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)
 }
 
-/// Refuse to call an unresolved `inline_call_*` target.
+/// Refuse to call an unresolved `inline_call_*` target when its jitcode
+/// body is not available to interpret either.
 ///
-/// The walker declines the equivalent residual (`ResidualDecline::Symbolic`);
-/// the blackhole has no decline channel, so it aborts the frame — a
-/// guard-failure resume that cannot finish hands the continuation back to the
-/// interpreter, which is always correct, where an indirect branch to a hash is
-/// not.
+/// The walker declines the equivalent residual (`ResidualDecline::Symbolic`).
+/// The blackhole must finish the half-opcode (`convert_and_run_from_pyjitpl`);
+/// jumping to a symbolic hash is not a finish. Prefer
+/// [`interpret_unresolved_inline_call`] when the descr still names a body.
 #[inline]
 fn reject_unresolved_inline_call(
     bh: &mut BlackholeInterpreter,
@@ -12486,19 +12511,155 @@ fn reject_unresolved_inline_call(
     bh.aborted = true;
     DispatchError::LeaveFrame
 }
+
+/// Byte-interpret a canonical `inline_call_*` whose `fnaddr` is symbolic.
+///
+/// Upstream `bhimpl_inline_call_*` (`blackhole.py`) calls
+/// `cpu.bh_call_*(jitcode.fnaddr)` because the codewriter and the runtime
+/// share one process, so every helper jitcode carries a real entry.
+/// pyre's lowering runs in `build.rs`; an unpublished path stays a
+/// `symbolic_fnaddr_for_path` hash. `handler_inline_call_nested_ext`
+/// already interprets that shape when `fnaddr` is 0. The canonical
+/// handlers must do the same, or `convert_and_run_from_pyjitpl` aborts
+/// mid-opcode and the portal sees `usize::MAX` instead of a merge point.
+fn interpret_unresolved_inline_call(
+    bh: &mut BlackholeInterpreter,
+    handle: &CallDescrHandle,
+    jitcode_index: usize,
+    fnaddr: i64,
+    args_i: &[i64],
+    args_r: &[i64],
+    args_f: &[i64],
+    dest: Option<(JitArgKind, usize)>,
+    post_p: usize,
+) -> Result<usize, DispatchError> {
+    // Grain and other hosts that never install MiniMark cannot execute
+    // Charon-lowered helper bodies: those bodies emit GETFIELD_GC that
+    // expect the collector. Fall back to LeaveFrame; the portal resumes
+    // at its merge point rather than jumping to a symbolic hash.
+    if !majit_gc::gc_sync::is_initialized() {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    }
+    let Some(sub_jitcode) = handle.as_callee_jitcode() else {
+        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
+    };
+    if crate::majit_log_enabled() {
+        eprintln!(
+            "[bh] inline_call interpreting jitcodes[{jitcode_index}] name={:?} \
+             (fnaddr={fnaddr:#x} is not callable)",
+            sub_jitcode.name,
+        );
+    }
+    let mut callee = bh
+        .inline_callee_scratch
+        .take()
+        .unwrap_or_else(|| Box::new(BlackholeInterpreter::default()));
+    callee.clone_context_from(bh);
+    callee.setposition(sub_jitcode, 0);
+    for (index, &value) in args_i.iter().enumerate() {
+        if index < callee.registers_i.len() {
+            callee.registers_i[index] = value;
+        }
+    }
+    for (index, &value) in args_r.iter().enumerate() {
+        if index < callee.registers_r.len() {
+            callee.registers_r[index] = value;
+        }
+    }
+    for (index, &value) in args_f.iter().enumerate() {
+        if index < callee.registers_f.len() {
+            callee.registers_f[index] = value;
+        }
+    }
+
+    let outcome = 'callee: {
+        match callee.run() {
+            BhRunOutcome::ContinueRunningNormally(args) => {
+                bh.position = post_p;
+                break 'callee Err(DispatchError::ContinueRunningNormally(args));
+            }
+            BhRunOutcome::EndOfCode => panic!(
+                "inline_call: callee jitcode {:?} index {:?} ended without a \
+                 return opcode, so there is no result for the caller",
+                callee.jitcode.name,
+                callee.jitcode.try_index(),
+            ),
+            BhRunOutcome::LeaveFrame | BhRunOutcome::Exception => {}
+        }
+        if callee.aborted {
+            bh.position = post_p;
+            bh.aborted = true;
+            bh.abort_permanent_bail = callee.abort_permanent_bail;
+            break 'callee Err(DispatchError::LeaveFrame);
+        }
+        if callee.got_exception {
+            let exc_val = callee.exception_last_value;
+            if exc_val != 0 {
+                break 'callee Err(DispatchError::RaiseException {
+                    exc: exc_val,
+                    resume_position: post_p,
+                });
+            }
+            bh.position = post_p;
+            bh.got_exception = true;
+            break 'callee Err(DispatchError::LeaveFrame);
+        }
+        if let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() {
+            let caller_dst = dest.map(|(_, dst)| dst).expect(
+                "inline_call interpret: callee returns a value but the caller \
+                 declared no destination",
+            );
+            match return_kind {
+                JitArgKind::Int => {
+                    bh.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
+                }
+                JitArgKind::Ref => {
+                    bh.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
+                }
+                JitArgKind::Float => {
+                    bh.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
+                }
+            }
+        } else {
+            assert!(
+                dest.is_none(),
+                "inline_call interpret: callee jitcode {:?} ends without a \
+                 typed return, but the caller declared dest {dest:?}",
+                callee.jitcode.name,
+            );
+        }
+        Ok(post_p)
+    };
+    if callee.called_residual.get() {
+        bh.called_residual.set(true);
+    }
+    callee.reset_for_inline_reuse();
+    bh.inline_callee_scratch = Some(callee);
+    outcome
+}
 fn handler_inline_call_irf_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
     let dst = code[p] as usize;
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &ai,
+            &ar,
+            &af,
+            Some((JitArgKind::Int, dst)),
+            p + 1,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_irf_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_inline_call_irf_i(fnaddr, &ai, &ar, &af, calldescr.get());
@@ -12512,13 +12673,23 @@ fn handler_inline_call_irf_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
     let dst = code[p] as usize;
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &ai,
+            &ar,
+            &af,
+            Some((JitArgKind::Ref, dst)),
+            p + 1,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_irf_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_inline_call_irf_r(fnaddr, &ai, &ar, &af, calldescr.get());
@@ -12532,13 +12703,23 @@ fn handler_inline_call_irf_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
     let dst = code[p] as usize;
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &ai,
+            &ar,
+            &af,
+            Some((JitArgKind::Float, dst)),
+            p + 1,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_irf_f.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_inline_call_irf_f(fnaddr, &ai, &ar, &af, calldescr.get());
@@ -12552,12 +12733,22 @@ fn handler_inline_call_irf_v(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &ai,
+            &ar,
+            &af,
+            None,
+            p,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_irf_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_inline_call_irf_v(fnaddr, &ai, &ar, &af, calldescr.get());
@@ -12570,12 +12761,22 @@ fn handler_inline_call_ir_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let dst = code[p] as usize;
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &ai,
+            &ar,
+            &[],
+            Some((JitArgKind::Int, dst)),
+            p + 1,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_ir_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_inline_call_ir_i(fnaddr, &ai, &ar, calldescr.get());
@@ -12589,12 +12790,22 @@ fn handler_inline_call_ir_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let dst = code[p] as usize;
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &ai,
+            &ar,
+            &[],
+            Some((JitArgKind::Ref, dst)),
+            p + 1,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_ir_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_inline_call_ir_r(fnaddr, &ai, &ar, calldescr.get());
@@ -12608,11 +12819,21 @@ fn handler_inline_call_ir_v(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &ai,
+            &ar,
+            &[],
+            None,
+            p,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_ir_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_inline_call_ir_v(fnaddr, &ai, &ar, calldescr.get());
@@ -12625,11 +12846,21 @@ fn handler_inline_call_r_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ar, p) = read_list_r(bh, code, p);
     let dst = code[p] as usize;
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &[],
+            &ar,
+            &[],
+            Some((JitArgKind::Int, dst)),
+            p + 1,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_r_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_inline_call_r_i(fnaddr, &ar, calldescr.get());
@@ -12643,11 +12874,21 @@ fn handler_inline_call_r_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ar, p) = read_list_r(bh, code, p);
     let dst = code[p] as usize;
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &[],
+            &ar,
+            &[],
+            Some((JitArgKind::Ref, dst)),
+            p + 1,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_r_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_inline_call_r_r(fnaddr, &ar, calldescr.get());
@@ -12661,10 +12902,20 @@ fn handler_inline_call_r_v(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    if !is_callable_fnaddr(fnaddr) {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let (ar, p) = read_list_r(bh, code, p);
+    if !is_callable_fnaddr(fnaddr) {
+        return interpret_unresolved_inline_call(
+            bh,
+            &calldescr,
+            jitcode_index,
+            fnaddr,
+            &[],
+            &ar,
+            &[],
+            None,
+            p,
+        );
+    }
     // blackhole.py → bhimpl_inline_call_r_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_inline_call_r_v(fnaddr, &ar, calldescr.get());

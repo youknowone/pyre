@@ -568,10 +568,17 @@ pub struct TraceCtx {
     /// Set when the walk refused a residual call whose target was still a
     /// symbolic path hash.  A dispatch-arm sub-JitCode may contain an earlier
     /// residual call that already executed concretely, so neither replaying
-    /// the source opcode nor resuming after the refused call is sound.  The
-    /// abort publisher consumes this flag and declines both resume handoffs;
-    /// [`crate::symbolic_residual_trace_aborts`] is the embedder-facing signal.
+    /// the source opcode nor resuming after the refused call is sound —
+    /// unless the host marked that earlier call via
+    /// [`crate::note_residual_committed`], in which case replay applies the
+    /// heap effect twice and the publisher keeps the live portal pc.
+    /// The abort publisher consumes this flag; [`crate::symbolic_residual_trace_aborts`]
+    /// is the embedder-facing signal.
     pub symbolic_residual_abort: bool,
+    /// A bridge walk aborted on a walk-local residual that will fail the
+    /// same way every time. `handle_fail` must not `must_compile` this
+    /// guard again (`compile.py` blackhole `else` arm).
+    pub deterministic_bridge_abort: bool,
     /// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` needs
     /// `metainterp.framestack` to still exist when it calls
     /// `blackhole.py convert_and_run_from_pyjitpl(self, ...)`.  RPython
@@ -1851,6 +1858,7 @@ impl TraceCtx {
             last_mp_green_pc: None,
             abort_after_panic: false,
             symbolic_residual_abort: false,
+            deterministic_bridge_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
             walk_finish_values: Vec::new(),
@@ -1952,6 +1960,7 @@ impl TraceCtx {
             last_mp_green_pc: None,
             abort_after_panic: false,
             symbolic_residual_abort: false,
+            deterministic_bridge_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
             walk_finish_values: Vec::new(),

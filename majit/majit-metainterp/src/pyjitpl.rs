@@ -15225,6 +15225,13 @@ impl<M: Clone> MetaInterp<M> {
                     optimized_ops.len()
                 );
             }
+            // Grain's `Scope` and walk-local `Dynamic`s live on the
+            // interpreter stack. A bridge that folded one of those
+            // addresses into `ConstPtr` is correct only for the
+            // recording eval; the next `Vm::new` has a different
+            // stack and the baked pointer becomes a hot always-fail
+            // guard (switch bench `fail_index=4` on the iterator
+            // bridge). Refuse the artifact; later fails blackhole.
             // The source guard's recovery_layout is read from
             // the metainterp's `StoredExitLayout` cache (per-trace,
             // keyed by per-trace fail_index) and passed to the backend

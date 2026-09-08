@@ -13,6 +13,19 @@ use std::sync::{Arc, OnceLock};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 
+/// `llmodel.py protect_speculative_field` rejected a null gcptr.
+/// The walker aborts the trace instead of panicking the host.
+static NULL_MEM_ACCESS: AtomicBool = AtomicBool::new(false);
+
+pub fn note_null_mem_access() {
+    NULL_MEM_ACCESS.store(true, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn take_null_mem_access() -> bool {
+    NULL_MEM_ACCESS.swap(false, Ordering::Relaxed)
+}
+
 /// `rpython/jit/backend/model.py CPUTotalTracker` — per-CPU totals
 /// bumped by `CompiledLoopToken.__init__` / `compiling_a_bridge` (loops
 /// and bridges created) and by the memory manager (loops and bridges

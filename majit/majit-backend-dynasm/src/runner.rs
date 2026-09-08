@@ -716,6 +716,11 @@ fn dynasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
     if let Some(r) = gc_box::with_mut(|g| g.alloc_oldgen_typed(type_id, size)) {
         return r;
     }
+    // Grain never installs MiniMark. A typed blackhole NEW with no collector
+    // is NULL (`bh_alloc_struct`), not a panic on the unset singleton.
+    if !majit_gc::gc_sync::is_initialized() {
+        return GcRef(0);
+    }
     majit_gc::gc_sync::gc_op(|g| g.alloc_oldgen_typed(type_id, size))
 }
 
@@ -1660,17 +1665,19 @@ impl DynasmBackend {
     }
 
     #[inline]
-    fn raw_mem_ptr(addr: i64, offset: i64) -> usize {
-        assert_ne!(
-            addr, 0,
-            "llmodel.py parity: raw memory helpers must not silently accept NULL addresses"
-        );
-        (addr as usize).wrapping_add(offset as usize)
+    fn raw_mem_ptr(addr: i64, offset: i64) -> Option<usize> {
+        if addr == 0 {
+            majit_backend::note_null_mem_access();
+            return None;
+        }
+        Some((addr as usize).wrapping_add(offset as usize))
     }
 
     /// llmodel.py read_int_at_mem(gcref, ofs, size, sign).
     fn read_int_at_mem(&self, addr: i64, offset: i64, size: usize, sign: bool) -> i64 {
-        let ptr = Self::raw_mem_ptr(addr, offset);
+        let Some(ptr) = Self::raw_mem_ptr(addr, offset) else {
+            return 0;
+        };
         unsafe {
             match (size, sign) {
                 (1, true) => (ptr as *const i8).read_unaligned() as i64,
@@ -1686,7 +1693,9 @@ impl DynasmBackend {
 
     /// llmodel.py write_int_at_mem(gcref, ofs, size, newvalue).
     fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64) {
-        let ptr = Self::raw_mem_ptr(addr, offset);
+        let Some(ptr) = Self::raw_mem_ptr(addr, offset) else {
+            return;
+        };
         unsafe {
             match size {
                 1 => (ptr as *mut u8).write_unaligned(newvalue as u8),
@@ -1699,13 +1708,17 @@ impl DynasmBackend {
 
     /// llmodel.py read_float_at_mem(gcref, ofs).
     fn read_float_at_mem(&self, addr: i64, offset: i64) -> f64 {
-        let ptr = Self::raw_mem_ptr(addr, offset);
+        let Some(ptr) = Self::raw_mem_ptr(addr, offset) else {
+            return 0.0;
+        };
         unsafe { (ptr as *const f64).read_unaligned() }
     }
 
     /// llmodel.py write_float_at_mem(gcref, ofs, newvalue).
     fn write_float_at_mem(&self, addr: i64, offset: i64, newvalue: f64) {
-        let ptr = Self::raw_mem_ptr(addr, offset);
+        let Some(ptr) = Self::raw_mem_ptr(addr, offset) else {
+            return;
+        };
         unsafe { (ptr as *mut f64).write_unaligned(newvalue) }
     }
 

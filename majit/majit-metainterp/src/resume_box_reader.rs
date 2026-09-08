@@ -196,7 +196,7 @@ impl<'a> BridgeVirtualCache<'a> {
 
     /// The address a materialized virtual currently lives at, by the `OpRef`
     /// the recording half minted for it.
-    fn concrete_root_of(&self, opref: OpRef) -> Option<i64> {
+    pub(crate) fn concrete_root_of(&self, opref: OpRef) -> Option<i64> {
         let vidx = self
             .virtuals_ptr_cache
             .iter()
@@ -483,6 +483,54 @@ fn apply_setfield(
     true
 }
 
+/// resume.py `ResumeDataBoxReader.setarrayitem` applying half.
+///
+/// `_prepare_pendingfields` dispatches `itemindex >= 0` to
+/// `execute_setarrayitem_gc` — the same three-way split
+/// `ResumeDataDirectReader.setarrayitem` makes over
+/// `cpu.bh_setarrayitem_gc_{r,f,i}`. Without this twin the applying
+/// reader declined every array pending field, so a guard that deferred
+/// a `SETARRAYITEM_GC` could only blackhole.
+fn apply_setarrayitem(
+    ctx: &crate::TraceCtx,
+    cache: &BridgeVirtualCache<'_>,
+    allocator: &dyn crate::resume::BlackholeAllocator,
+    array_op: OpRef,
+    index: i32,
+    value_op: OpRef,
+    descr: &majit_ir::DescrRef,
+) -> bool {
+    use majit_ir::Value;
+    let Some(ad) = descr.as_array_descr() else {
+        return false;
+    };
+    let Some(Value::Ref(array)) = operand_concrete(ctx, cache, array_op) else {
+        return false;
+    };
+    let Some(value) = operand_concrete(ctx, cache, value_op) else {
+        return false;
+    };
+    let array = array.as_usize() as i64;
+    let index = index as usize;
+    if ad.is_array_of_pointers() {
+        let Value::Ref(r) = value else {
+            return false;
+        };
+        allocator.bh_setarrayitem_gc_r(array, index, r.as_usize() as i64, descr);
+    } else if ad.is_array_of_floats() {
+        let Value::Float(f) = value else {
+            return false;
+        };
+        allocator.bh_setarrayitem_gc_f(array, index, f.to_bits() as i64, descr);
+    } else {
+        let Value::Int(i) = value else {
+            return false;
+        };
+        allocator.bh_setarrayitem_gc_i(array, index, i, descr);
+    }
+    true
+}
+
 pub fn materialize_bridge_virtual(
     ctx: &mut crate::TraceCtx,
     vidx: usize,
@@ -594,17 +642,6 @@ pub fn materialize_bridge_virtual(
         true
     }
 
-    // Only `VStructInfo` has its applying twin wired here (`bh_new` plus the
-    // `setfields` stores). Recording a NEW the heap does not hold would give
-    // the trace an identity the interpreter cannot resume against, so the
-    // applying reader declines every other kind instead. The recording reader
-    // is unaffected: a direct reader has already allocated for it.
-    if cache.allocator().is_some()
-        && !matches!(entry.as_ref(), majit_ir::RdVirtualInfo::VStructInfo { .. })
-    {
-        return OpRef::NONE;
-    }
-
     match entry.as_ref() {
         // resume.py VirtualInfo.allocate
         majit_ir::RdVirtualInfo::VirtualInfo {
@@ -625,6 +662,15 @@ pub fn materialize_bridge_virtual(
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py decoder.virtuals_cache.set_ptr(index, struct)
             cache.set_ptr(vidx, new_op);
+            if let Some(allocator) = cache.allocator() {
+                let vtable = size_descr.as_size_descr().map_or(0, |sd| sd.vtable());
+                let ptr = allocator.allocate_with_vtable(&size_descr, vtable);
+                if ptr == 0 {
+                    return OpRef::NONE;
+                }
+                cache.set_concrete_root(vidx, ptr);
+                ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+            }
             // resume.py self.setfields(decoder, struct)
             if !setfields(
                 ctx,
@@ -751,6 +797,18 @@ pub fn materialize_bridge_virtual(
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py decoder.virtuals_cache.set_ptr(index, array)
             cache.set_ptr(vidx, new_op);
+            if let Some(allocator) = cache.allocator() {
+                let ptr = if clear {
+                    allocator.bh_new_array_clear(length, &array_descr)
+                } else {
+                    allocator.bh_new_array(length, &array_descr)
+                };
+                if ptr == 0 {
+                    return OpRef::NONE;
+                }
+                cache.set_concrete_root(vidx, ptr);
+                ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+            }
             // resume.py:656-670 element loop: dispatch by arraydescr kind
             // NB. the check for the kind of array elements is moved out of the loop
             let set_opcode = match kind {
@@ -764,6 +822,9 @@ pub fn materialize_bridge_virtual(
                 }
                 let value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
                 if value.is_none() {
+                    if cache.allocator().is_some() {
+                        return OpRef::NONE;
+                    }
                     continue;
                 }
                 let idx_ref = ctx.const_int(i as i64);
@@ -776,6 +837,19 @@ pub fn materialize_bridge_virtual(
                     &[new_op, idx_ref, value],
                     array_descr.clone(),
                 );
+                if let Some(allocator) = cache.allocator()
+                    && !apply_setarrayitem(
+                        ctx,
+                        cache,
+                        allocator,
+                        new_op,
+                        i as i32,
+                        value,
+                        &array_descr,
+                    )
+                {
+                    return OpRef::NONE;
+                }
             }
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -1233,12 +1307,10 @@ pub fn emit_pending_field_op(
         }
         ctx.heapcache_setfield_cached(target_op, descr.index(), value_op);
     } else {
-        // No applying twin is wired for the array element form, so a reader
-        // that must apply declines rather than record a write the heap will
-        // not have.
-        if cache.allocator().is_some() {
-            return false;
-        }
+        // resume.py `_prepare_pendingfields` → `setarrayitem` →
+        // `execute_setarrayitem_gc`. Record the store and, when this
+        // is the applying reader, write it through the same
+        // `bh_setarrayitem_gc_*` split the direct reader uses.
         let index_op = ctx.const_int(item_index as i64);
         ctx.profiler()
             .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
@@ -1249,6 +1321,13 @@ pub fn emit_pending_field_op(
             &[target_op, index_op, value_op],
             descr.clone(),
         );
+        if let Some(allocator) = cache.allocator() {
+            if !apply_setarrayitem(
+                ctx, cache, allocator, target_op, item_index, value_op, descr,
+            ) {
+                return false;
+            }
+        }
         ctx.heapcache_setarrayitem(target_op, index_op, descr.index(), value_op);
     }
     true
