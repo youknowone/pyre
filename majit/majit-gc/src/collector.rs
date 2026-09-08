@@ -1670,7 +1670,9 @@ impl MiniMarkGC {
         // already present a complete root set at an allocation; the young birth
         // adds no requirement they do not already meet.
         if total_size >= self.config.large_object_threshold {
-            self.maybe_collect_for_external_malloc(total_size);
+            if self.maybe_collect_for_external_malloc(total_size) {
+                return GcRef(0);
+            }
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
             }
@@ -1849,18 +1851,24 @@ impl MiniMarkGC {
         root: *mut GcRef,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
-        // Large objects never trigger a nursery collection, so the native
-        // slot needs no temporary registration. `alloc_with_type_slow` records
-        // why the oversized arm is a young non-moving birth.
-        //
         // `needs_write_barrier` stays true for the young birth as well. The
         // young object carries no GCFLAG_TRACK_YOUNG_PTRS, so the barrier the
         // caller then emits finds the flag clear and does nothing — a cost, not
         // a hazard, and the alternative is a caller that has to know which of
         // the two births it got.
+        //
+        // `external_malloc` may run a moving minor before the new block
+        // exists. The caller's live slot is not yet a nursery object, but it
+        // may be the only reference to one; register it across that collection
+        // the same way the nursery-full arm does.
         if total_size >= self.config.large_object_threshold {
             unsafe { *needs_write_barrier = true };
-            self.maybe_collect_for_external_malloc(total_size);
+            unsafe { self.roots.add(root) };
+            let oom = self.maybe_collect_for_external_malloc(total_size);
+            self.roots.remove(root);
+            if oom {
+                return GcRef(0);
+            }
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
             }
@@ -2695,13 +2703,17 @@ impl MiniMarkGC {
     /// Only collecting entry points call this. A no-collect path still
     /// cannot root the caller's native locals, so it keeps the deferred
     /// breaker in `finish_alloc_*`.
-    fn maybe_collect_for_external_malloc(&mut self, totalsize: usize) {
+    ///
+    /// Returns true when the collection armed `oom_pending`: the triggering
+    /// allocation must fail rather than allocate past `PYPY_GC_MAX`.
+    fn maybe_collect_for_external_malloc(&mut self, totalsize: usize) -> bool {
         if !self.threshold_reached(totalsize) {
-            return;
+            return false;
         }
         self.pending_reserving_size = totalsize.saturating_add(self.config.nursery_size / 2);
         self.minor_collection_with_major_progress(false);
         self.pending_reserving_size = 0;
+        std::mem::take(&mut self.oom_pending)
     }
 
     fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> GcRef {
@@ -3009,7 +3021,9 @@ impl MiniMarkGC {
         length: usize,
         has_gc_ptrs_in_var: bool,
     ) -> GcRef {
-        self.maybe_collect_for_external_malloc(total_size);
+        if self.maybe_collect_for_external_malloc(total_size) {
+            return GcRef(0);
+        }
         self.try_alloc_young_nonmoving_with_cards(type_id, total_size, length, has_gc_ptrs_in_var)
             .unwrap_or_else(|| {
                 self.alloc_in_oldgen_with_cards(type_id, total_size, length, has_gc_ptrs_in_var)
@@ -8581,6 +8595,13 @@ impl MiniMarkGC {
         if self.gc_state == GcState::Scanning && !self.threshold_reached(0) {
             return false;
         }
+        // `collect_step` takes the same pause: a leading minor moves the
+        // nursery, so every registered mutator has to be off the heap.
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
         self.minor_collection_body();
         self.major_collection_step();
         true

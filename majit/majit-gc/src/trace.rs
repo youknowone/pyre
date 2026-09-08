@@ -1114,6 +1114,10 @@ impl TypeRegistry {
     /// a late attach cannot leave the group describing a type without a
     /// destructor.
     pub fn set_destructor(&mut self, type_id: u32, destructor: DestructorFn) {
+        assert!(
+            self.entries[type_id as usize].old_style_finalizer.is_none(),
+            "a type cannot have both a light destructor and an old-style finalizer"
+        );
         self.entries[type_id as usize].destructor = Some(destructor);
         if self.frozen_layout_table.is_some() {
             self.rematerialize_type_entry(type_id as usize);

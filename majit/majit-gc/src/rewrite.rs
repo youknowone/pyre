@@ -2742,7 +2742,7 @@ impl GcRewriterImpl {
             .as_ref()
             .expect("gen_write_barrier_array reached with no write barrier descriptor");
         if wb_descr.has_write_barrier_from_array() {
-            // rewrite.py:957 `has_write_barrier_from_array`. If we know
+            // rewrite.py `gen_write_barrier_array`. If we know
             // statically the length of 'v_base', and it is not too big,
             // then produce a regular write_barrier. If it's unknown or
             // too big, produce a write_barrier_from_array.

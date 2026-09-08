@@ -1115,6 +1115,7 @@ impl Arguments {
         let kw_defs_slot = pyre_object::gc_roots::pin_roots(&live);
         let w_kw_defs = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot);
         let keywords_base = kw_defs_slot + 1;
+        let names_base = keywords_base + keywords_w.len();
         // The defaults arrive as a caller-owned slice — `Function`'s `defs_w`
         // reaches here through a borrow, and a gateway builds its own array —
         // so the collector rewrites neither, while the run is read out one
@@ -1173,12 +1174,15 @@ impl Arguments {
             let mapping_len = co_argcount + co_kwonlyargcount - input_argcount;
             let mut mapping = vec![-1isize; mapping_len];
             // argument.py:259-262 — match keyword names to argnames.
+            let names_w: Vec<PyObjectRef> = (0..keyword_names_w.unwrap().len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+                .collect();
             num_remainingkwds = match_keywords(
                 signature,
                 blindargs,
                 co_posonlyargcount,
                 input_argcount,
-                keyword_names_w.unwrap(),
+                &names_w,
                 &mut mapping,
             )?;
             if num_remainingkwds > 0 {
@@ -1191,7 +1195,7 @@ impl Arguments {
                         .map(|i| pyre_object::gc_roots::shadow_stack_get(keywords_base + i))
                         .collect();
                     collect_keyword_args(
-                        keyword_names_w.unwrap(),
+                        &names_w,
                         &values_w,
                         pyre_object::gc_roots::shadow_stack_get(kwds_slot),
                         &mapping,
@@ -1207,8 +1211,7 @@ impl Arguments {
                     // than silently substituting an empty string.
                     let mut name = String::new();
                     if num_remainingkwds == 1 {
-                        let names = keyword_names_w.unwrap();
-                        for (i, &w_n) in names.iter().enumerate() {
+                        for (i, &w_n) in names_w.iter().enumerate() {
                             if !mapping_contains(&mapping, i as isize) {
                                 if unsafe { pyre_object::is_str(w_n) } {
                                     name = unsafe { pyre_object::w_str_get_value(w_n).to_string() };

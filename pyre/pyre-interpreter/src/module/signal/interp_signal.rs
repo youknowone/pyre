@@ -582,7 +582,17 @@ impl AsyncActionOps for CheckSignalAction {
     ) -> Result<AsyncActionControl, crate::PyError> {
         let w_exc = crate::module::thread::take_async_exception(ec as *mut ExecutionContext);
         if !w_exc.is_null() {
-            let w_obj = crate::builtins::exc_exception_new(&[w_exc])?;
+            // interp_signal.py `perform`: raise oefmt(w_exc, "asynchronous
+            // exception triggered from another thread"). Pin the type across
+            // the message allocation.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let cls_slot = pyre_object::gc_roots::pin_roots(&[w_exc]);
+            let w_msg =
+                pyre_object::w_str_new("asynchronous exception triggered from another thread");
+            let w_obj = crate::builtins::exc_exception_new(&[
+                pyre_object::gc_roots::shadow_stack_get(cls_slot),
+                w_msg,
+            ])?;
             return Err(unsafe { crate::PyError::from_exc_object(w_obj) });
         }
         self.poll_for_signals(ec)?;
