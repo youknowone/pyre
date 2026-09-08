@@ -3578,13 +3578,14 @@ impl Optimizer {
                                 .unwrap_or_else(|| arg.clone());
                             preamble_op.setarg(i, resolved);
                         }
-                        if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
+                        if let Some(mut fail_args) = preamble_op.getfailargs() {
                             for arg in fail_args.iter_mut() {
                                 if arg.is_none() {
                                     continue;
                                 }
                                 *arg = ctx.get_box_replacement_operand(arg.to_opref());
                             }
+                            preamble_op.setfailargs(fail_args);
                         }
                         // Resolve the carried slot by entry kind. An InputArg
                         // label arg whose canonical result forwards away is absent
@@ -3948,7 +3949,7 @@ impl Optimizer {
                         );
                     }
                 }
-                if let Some(fail_args) = op.fail_args.borrow_mut().as_mut() {
+                if let Some(mut fail_args) = op.getfailargs() {
                     for arg in fail_args.iter_mut() {
                         // Same rule as the args loop above: a bound failarg
                         // live-tracks its producer's already-remapped
@@ -4053,8 +4054,8 @@ impl Optimizer {
                             "position-only exported-short-box arg remapped: {pre:?}"
                         );
                     }
-                    if let Some(fa) = entry.op.fail_args.borrow_mut().as_mut() {
-                        for arg in fa.iter_mut() {
+                    if let Some(fa) = entry.op.getfailargs() {
+                        for arg in fa.iter() {
                             // Bound failargs live-track the producer's
                             // already-remapped pos (same rule as the args
                             // loop above); re-remapping would double-map.

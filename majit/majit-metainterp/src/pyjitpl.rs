@@ -889,6 +889,87 @@ fn snapshot_map_from_trace_snapshots(
     (box_map, size_map, vable_map, vref_map, frame_pcs_map)
 }
 
+fn snapshot_maps_from_ctx(
+    ctx: &mut TraceCtx,
+    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
+) -> (
+    SnapshotBoxes,
+    SnapshotFrameSizes,
+    SnapshotBoxes,
+    SnapshotBoxes,
+    SnapshotFramePcs,
+) {
+    if ctx.recorder.has_byte_buffer() {
+        return snapshot_map_from_byte_recorder(&ctx.recorder, constants);
+    }
+    snapshot_map_from_trace_snapshots(ctx.snapshots(), constants)
+}
+
+fn snapshot_map_from_byte_recorder(
+    recorder: &crate::recorder::Trace,
+    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
+) -> (
+    SnapshotBoxes,
+    SnapshotFrameSizes,
+    SnapshotBoxes,
+    SnapshotBoxes,
+    SnapshotFramePcs,
+) {
+    let _ = constants;
+    let box_to_unique = recorder.box_to_unique_map();
+    let n = recorder.snapshot_offset_count();
+    let mut box_map = Vec::with_capacity(n);
+    let mut size_map = Vec::with_capacity(n);
+    let mut vable_map = Vec::with_capacity(n);
+    let mut vref_map = Vec::with_capacity(n);
+    let mut frame_pcs_map = Vec::with_capacity(n);
+    let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
+        match t {
+            crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
+                let tp = opref.ty().unwrap_or(fallback_tp);
+                SnapshotBox::typed(opref, tp)
+            }
+            crate::recorder::SnapshotTagged::Const(val, tp) => {
+                let value = heap_value_for(tp, val);
+                let opref = majit_ir::OpRef::const_inline_from_value(&value);
+                SnapshotBox::typed(opref, tp)
+            }
+        }
+    };
+    recorder.for_each_captured_snapshot_arrays(|vable_t, vref_t, frames_t, py_pcs| {
+        let mut boxes = Vec::new();
+        let mut frame_sizes = Vec::with_capacity(frames_t.len());
+        let mut frame_pcs = Vec::with_capacity(frames_t.len());
+        for (fi, (jc, pc, tagged)) in frames_t.into_iter().enumerate() {
+            frame_sizes.push(tagged.len());
+            frame_pcs.push((
+                crate::recorder::Trace::decode_jitcode_index(jc) as i32,
+                pc as i32,
+                py_pcs.get(fi).copied().unwrap_or(pc as u32) as i32,
+            ));
+            boxes.extend(
+                tagged
+                    .into_iter()
+                    .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique))),
+            );
+        }
+        let vable_boxes: Vec<SnapshotBox> = vable_t
+            .into_iter()
+            .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
+            .collect();
+        let vref_boxes: Vec<SnapshotBox> = vref_t
+            .into_iter()
+            .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
+            .collect();
+        box_map.push(Some(boxes));
+        size_map.push(Some(frame_sizes));
+        vable_map.push(Some(vable_boxes));
+        vref_map.push(Some(vref_boxes));
+        frame_pcs_map.push(Some(frame_pcs));
+    });
+    (box_map, size_map, vable_map, vref_map, frame_pcs_map)
+}
+
 struct PreparedBridgeTrace {
     ops: Vec<OpRc>,
     inputargs: Vec<InputArg>,
@@ -2680,7 +2761,7 @@ fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     for arg in op.args.borrow().iter() {
         arg.walk_const_ptr_refs(visitor);
     }
-    if let Some(fail_args) = op.fail_args.borrow().as_ref() {
+    if let Some(fail_args) = op.getfailargs() {
         for arg in fail_args.iter() {
             arg.walk_const_ptr_refs(visitor);
         }
@@ -9017,7 +9098,7 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_boxes,
             mut snapshot_vref_boxes,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(ctx.snapshots(), &mut constants);
+        ) = snapshot_maps_from_ctx(ctx, &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_boxes,
             &mut snapshot_vable_boxes,
