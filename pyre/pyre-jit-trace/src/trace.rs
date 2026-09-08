@@ -424,6 +424,20 @@ pub(crate) struct InlineRegisterBankGuard {
     _root: Option<crate::jitcode_dispatch::RegisterBankRoot>,
 }
 
+/// Keep the frame's semantic mirrors rooted through both execution and
+/// suspension, just like the register bank owned by the same MIFrame.
+pub(crate) struct InlineFrameStateGuard {
+    _root: Option<crate::jitcode_dispatch::WalkFrameStateRoot>,
+}
+
+impl InlineFrameStateGuard {
+    pub(crate) fn enter(state: &crate::jitcode_dispatch::WalkFrameState) -> Self {
+        Self {
+            _root: ACTIVE_TRACE.with(|c| c.get().then(|| state.root())),
+        }
+    }
+}
+
 impl InlineRegisterBankGuard {
     pub(crate) fn enter(bank: &crate::jitcode_dispatch::RegisterBank) -> Self {
         Self {

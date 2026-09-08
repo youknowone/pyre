@@ -355,7 +355,7 @@ pub(crate) fn reconcile_load_global_method_shape(
 }
 
 /// #73: reconcile the PREVIOUS Python opcode's stack effect into
-/// [`WalkContext::vstack_boxes`] at an opcode boundary, BEFORE the new
+/// [`WalkFrameStateData::vstack_boxes`] at an opcode boundary, BEFORE the new
 /// opcode (`new_pypc`) is walked.  Running this before the new op means
 /// that when the new op is a branch guard, `vstack_boxes` already holds
 /// the correct boxes for the guard's resume depth.
@@ -447,14 +447,15 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // instead of running unprotected.
     if ctx.vstack_reorder_ceiling != u32::MAX && new_pypc > ctx.vstack_reorder_ceiling {
         ctx.vstack_reorder_ceiling = u32::MAX;
-        ctx.vstack_reorder_saved = None;
+        ctx.frame_state.borrow_mut().vstack_reorder_saved = None;
     }
     if !cfg_successor && ctx.vstack_reorder_ceiling == u32::MAX {
         ctx.vstack_reorder_ceiling = (new_pypc as usize).max(prev_pypc) as u32;
-        ctx.vstack_reorder_saved = Some((
+        let mut state = ctx.frame_state.borrow_mut();
+        state.vstack_reorder_saved = Some((
             prev_pypc as u32,
             ctx.vstack_depth,
-            ctx.vstack_boxes.clone(),
+            state.vstack_boxes.clone(),
             Vec::new(),
         ));
     }
@@ -476,7 +477,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             },
             crate::liveness::target_pc(code, &instr, prev_pypc, op_arg),
             crate::liveness::exception_target_pc(code, prev_pypc),
-            ctx.vstack_last_ref
+            ctx.frame_state.borrow().vstack_last_ref
         );
     }
     // A JitCode's block layout can visit source-PC floor segments out of
@@ -511,12 +512,14 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // place, so the interpreter has no walk position to leave and return to,
     // and nothing here to mirror.
     let returned_to_arm_point = matches!(
-        &ctx.vstack_reorder_saved,
+        &ctx.frame_state.borrow().vstack_reorder_saved,
         Some((pc, depth, _, _)) if *pc == new_pypc && *depth == new_depth
     );
     let restored = in_reorder_region && returned_to_arm_point;
     if restored {
         let (_, _, saved, mask) = ctx
+            .frame_state
+            .borrow_mut()
             .vstack_reorder_saved
             .take()
             .expect("checked by returned_to_arm_point");
@@ -552,22 +555,28 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
         // blackhole resuming into WITH_EXCEPT_START calls with the receiver
         // twice.
         if mask.iter().all(|&w| !w) {
-            ctx.vstack_boxes = saved;
+            ctx.frame_state.borrow_mut().vstack_boxes = saved;
         } else {
             // Merge per slot rather than keeping either side whole: one window
             // can hold both an executed store and a slot the reseed dropped.
-            let cur = std::mem::replace(&mut ctx.vstack_boxes, saved);
-            if ctx.vstack_boxes.len() < new_depth {
-                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            let cur = std::mem::replace(&mut ctx.frame_state.borrow_mut().vstack_boxes, saved);
+            if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
+                ctx.frame_state
+                    .borrow_mut()
+                    .vstack_boxes
+                    .resize(new_depth, OpRef::NONE);
             }
             for s in 0..new_depth {
                 if mask.get(s).copied().unwrap_or(false)
                     && let Some(&v) = cur.get(s)
                 {
-                    ctx.vstack_boxes[s] = v;
+                    ctx.frame_state.borrow_mut().vstack_boxes[s] = v;
                 }
             }
-            ctx.vstack_boxes.truncate(new_depth);
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .truncate(new_depth);
         }
         ctx.vstack_reorder_ceiling = u32::MAX;
     }
@@ -600,21 +609,33 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
         // replaying a stale effect.  The reorder region is already served by
         // the `ShadowReseed` arm, so exclude it here.
         _ if layout_only_boundary && !in_reorder_region => {
-            ctx.vstack_boxes.truncate(new_depth);
-            if ctx.vstack_boxes.len() < new_depth {
-                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .truncate(new_depth);
+            if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
+                ctx.frame_state
+                    .borrow_mut()
+                    .vstack_boxes
+                    .resize(new_depth, OpRef::NONE);
             }
         }
         VstackOpClass::ResultToTos => {
-            ctx.vstack_boxes.truncate(new_depth);
-            if ctx.vstack_boxes.len() < new_depth {
-                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .truncate(new_depth);
+            if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
+                ctx.frame_state
+                    .borrow_mut()
+                    .vstack_boxes
+                    .resize(new_depth, OpRef::NONE);
             }
             if new_depth > 0 {
                 // `NONE` means the result was produced in an unboxed bank;
                 // leave an intentional hole so the capture overlay around
                 // stack_sync omits the slot and resume rematerializes it.
-                let mut top = ctx.vstack_last_ref;
+                let mut top = ctx.frame_state.borrow().vstack_last_ref;
                 if top == OpRef::NONE {
                     // A value `LOAD_CONST` (large int / float) routes its result
                     // through the unboxed int/float bank, so `write_ref_reg`
@@ -632,7 +653,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                     // reaches this fallback.
                     top = loadconst_operand_ref(ctx, code, &instr, op_arg);
                 }
-                ctx.vstack_boxes[new_depth - 1] = top;
+                ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;
             }
         }
         VstackOpClass::LoadGlobalMethod => {
@@ -641,14 +662,17 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             // semantically live even though it carries no GC pointer.
             let null = ctx.trace_ctx.const_null();
             reconcile_load_global_method_shape(
-                &mut ctx.vstack_boxes,
+                &mut ctx.frame_state.borrow_mut().vstack_boxes,
                 ctx.vstack_depth,
                 new_depth,
                 null,
             );
         }
         VstackOpClass::PopOnlyOrSideStore => {
-            ctx.vstack_boxes.truncate(new_depth);
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .truncate(new_depth);
         }
         VstackOpClass::Swap(i) => {
             // SWAP is net-depth-0 (prev_depth == new_depth).  Exchange the
@@ -669,16 +693,22 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             // depth matches the fallthrough successor.  The depth normalization
             // still runs: it is what keeps mirror slot `s` naming operand-stack
             // slot `s` at the observed depth.
-            ctx.vstack_boxes.truncate(new_depth);
-            if ctx.vstack_boxes.len() < new_depth {
-                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .truncate(new_depth);
+            if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
+                ctx.frame_state
+                    .borrow_mut()
+                    .vstack_boxes
+                    .resize(new_depth, OpRef::NONE);
             }
             if repeat_boundary {
                 // The retiring boundary performs the exchange.
             } else if new_depth >= 1 && i >= 1 && i <= new_depth {
                 let top = new_depth - 1;
                 let other = new_depth - i;
-                ctx.vstack_boxes.swap(top, other);
+                ctx.frame_state.borrow_mut().vstack_boxes.swap(top, other);
             } else {
                 ctx.vstack_valid = false;
             }
@@ -692,13 +722,21 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             // is faithful; `COPY 1` reduces to dup-of-TOS.  A missing source
             // slot or out-of-range arg declines (latch invalid).
             match new_depth.checked_sub(1 + i) {
-                Some(src_idx) if i >= 1 && src_idx < ctx.vstack_boxes.len() => {
-                    let src = ctx.vstack_boxes[src_idx];
-                    ctx.vstack_boxes.truncate(new_depth);
-                    if ctx.vstack_boxes.len() < new_depth {
-                        ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+                Some(src_idx)
+                    if i >= 1 && src_idx < ctx.frame_state.borrow().vstack_boxes.len() =>
+                {
+                    let src = ctx.frame_state.borrow().vstack_boxes[src_idx];
+                    ctx.frame_state
+                        .borrow_mut()
+                        .vstack_boxes
+                        .truncate(new_depth);
+                    if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
+                        ctx.frame_state
+                            .borrow_mut()
+                            .vstack_boxes
+                            .resize(new_depth, OpRef::NONE);
                     }
-                    ctx.vstack_boxes[new_depth - 1] = src;
+                    ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = src;
                 }
                 _ => ctx.vstack_valid = false,
             }
@@ -710,8 +748,11 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             // unsourceable slot (genuine NULL exc-info / Int temp) stays NONE
             // and `mirror_covers_kept` declines for it — the conservative
             // fallback, never a corrupt box.
-            ctx.vstack_boxes.clear();
-            ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            ctx.frame_state.borrow_mut().vstack_boxes.clear();
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .resize(new_depth, OpRef::NONE);
         }
         VstackOpClass::MultiResultFromShadow | VstackOpClass::LoadSpecialMethod => {
             // UNPACK_* pops ONE sequence (at `prev_depth - 1`) and pushes its
@@ -737,16 +778,22 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 _ => None,
             };
             let pop_point = ctx.vstack_depth.saturating_sub(1);
-            ctx.vstack_boxes.truncate(new_depth);
-            if ctx.vstack_boxes.len() < new_depth {
-                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .truncate(new_depth);
+            if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
+                ctx.frame_state
+                    .borrow_mut()
+                    .vstack_boxes
+                    .resize(new_depth, OpRef::NONE);
             }
             for s in pop_point..new_depth {
-                ctx.vstack_boxes[s] = OpRef::NONE;
+                ctx.frame_state.borrow_mut().vstack_boxes[s] = OpRef::NONE;
             }
             if new_depth > 0 {
                 if let Some(null) = trailing_null {
-                    ctx.vstack_boxes[new_depth - 1] = null;
+                    ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = null;
                 }
             }
         }
@@ -781,6 +828,8 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
         // admitted it, so `inline_subwalk` alone is that predicate here.
         let callee_local_shadow = ctx.fbw_mode.inline_subwalk;
         let hole = ctx
+            .frame_state
+            .borrow()
             .vstack_boxes
             .get(..new_depth)
             .map(|s| s.iter().any(|&b| b == OpRef::NONE))
@@ -800,7 +849,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     if ctx.vstack_valid {
         ctx.vstack_cur_pypc = new_pypc;
         ctx.vstack_depth = new_depth;
-        ctx.vstack_last_ref = OpRef::NONE;
+        ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
     }
 }
 
@@ -814,15 +863,24 @@ fn reseed_vstack_from_callee_shadow<Sym: WalkSym>(
     code: &pyre_interpreter::CodeObject,
     new_depth: usize,
 ) -> bool {
-    if ctx.vstack_boxes.len() < new_depth {
-        ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+    if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
+        ctx.frame_state
+            .borrow_mut()
+            .vstack_boxes
+            .resize(new_depth, OpRef::NONE);
     }
     let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+    let mut state = ctx.frame_state.borrow_mut();
+    let WalkFrameStateData {
+        callee_shadow,
+        vstack_boxes,
+        ..
+    } = &mut *state;
+    let Some(shadow) = callee_shadow.as_ref() else {
         return false;
     };
     let mut all_present = true;
-    for (s, slot) in ctx.vstack_boxes[..new_depth].iter_mut().enumerate() {
+    for (s, slot) in vstack_boxes[..new_depth].iter_mut().enumerate() {
         if *slot != OpRef::NONE {
             continue;
         }
@@ -888,12 +946,15 @@ pub(crate) fn reseed_vstack_from_shadow<Sym: WalkSym>(
     // refuses an image with any unresolved slot, and an escape inside the call
     // then had no blackhole image at all and fell back to the legacy entry
     // replay — which re-runs the residuals the walk already executed.
-    if ctx.vstack_boxes.len() < new_depth {
-        ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+    if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
+        ctx.frame_state
+            .borrow_mut()
+            .vstack_boxes
+            .resize(new_depth, OpRef::NONE);
     }
     let mut all_present = true;
     for s in 0..new_depth {
-        if ctx.vstack_boxes[s] != OpRef::NONE {
+        if ctx.frame_state.borrow().vstack_boxes[s] != OpRef::NONE {
             continue;
         }
         let flat = nvs + nlocals + s;
@@ -903,7 +964,7 @@ pub(crate) fn reseed_vstack_from_shadow<Sym: WalkSym>(
                     && (!opref_is_null_const_ptr(b)
                         || ctx.trace_ctx.virtualizable_slot_stored_live_null(flat)) =>
             {
-                ctx.vstack_boxes[s] = b;
+                ctx.frame_state.borrow_mut().vstack_boxes[s] = b;
             }
             // Fill what we can; an unsourceable hole (NONE / NULL const-ptr —
             // an Int/Float-bank temp or a function-local the portal never
@@ -1146,16 +1207,16 @@ pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(
     let Some((first_pypc, _code_ptr, _depth)) = frame.vstack_coordinate_for_jitcode_pc(0) else {
         return;
     };
-    ctx.vstack_boxes.clear();
+    ctx.frame_state.borrow_mut().vstack_boxes.clear();
     ctx.vstack_depth = 0;
     ctx.vstack_cur_pypc = first_pypc;
-    ctx.vstack_last_ref = OpRef::NONE;
+    ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
     ctx.vstack_handler_landing_py = None;
     ctx.vstack_valid = true;
 }
 
 /// #73: seed the walk-level operand-stack box mirror
-/// ([`WalkContext::vstack_boxes`]) at full-body-walk entry.  Enables the
+/// ([`WalkFrameStateData::vstack_boxes`]) at full-body-walk entry.  Enables the
 /// mirror (`vstack_valid = true`) only when the outer `sym` owns the
 /// virtualizable shadow AND the entry operand stack can be fully sourced
 /// from that shadow.  Sets `vstack_cur_pypc = entry_py_pc` and
@@ -1257,10 +1318,10 @@ pub(crate) fn seed_vstack_mirror<Sym: WalkSym>(
             _ => return,
         }
     }
-    ctx.vstack_boxes = boxes;
+    ctx.frame_state.borrow_mut().vstack_boxes = boxes;
     ctx.vstack_depth = depth;
     ctx.vstack_cur_pypc = first_pypc;
-    ctx.vstack_last_ref = OpRef::NONE;
+    ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
     ctx.vstack_handler_landing_py = None;
     ctx.vstack_valid = true;
 }
@@ -1316,7 +1377,7 @@ pub(crate) fn disarm_vstack_reorder_region<Sym: WalkSym>(ctx: &mut WalkContext<'
         return;
     }
     ctx.vstack_reorder_ceiling = u32::MAX;
-    ctx.vstack_reorder_saved = None;
+    ctx.frame_state.borrow_mut().vstack_reorder_saved = None;
 }
 
 /// `PYRE_VSTACK_KEEP_REORDER`: leave an armed region in place across a mirror
@@ -1425,12 +1486,15 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
     } else {
         py_stack_depth(code_ptr, handler_py)
     };
-    ctx.vstack_boxes.clear();
-    ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
+    ctx.frame_state.borrow_mut().vstack_boxes.clear();
+    ctx.frame_state
+        .borrow_mut()
+        .vstack_boxes
+        .resize(handler_depth, OpRef::NONE);
     disarm_vstack_reorder_region(ctx);
     // The unwinder pushes the caught exception onto the new TOS.
     if handler_depth >= 1 && exc != OpRef::NONE {
-        ctx.vstack_boxes[handler_depth - 1] = exc;
+        ctx.frame_state.borrow_mut().vstack_boxes[handler_depth - 1] = exc;
     }
     vstack_handler_diag(
         "outer",
@@ -1442,7 +1506,7 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
     );
     ctx.vstack_cur_pypc = handler_py;
     ctx.vstack_depth = handler_depth;
-    ctx.vstack_last_ref = OpRef::NONE;
+    ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
     ctx.vstack_handler_landing_py = (floor_py != handler_py).then_some(floor_py);
     // Revive: the handler-entry state is shadow-sourced, independent of the
     // pre-raise mirror.
@@ -1500,11 +1564,14 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
     // Truncate to the handler's setup depth, keeping the tracked survivors; a
     // mirror shallower than the handler depth pads with NONE holes, which
     // `mirror_covers_kept` declines per slot rather than latching invalid.
-    ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
+    ctx.frame_state
+        .borrow_mut()
+        .vstack_boxes
+        .resize(handler_depth, OpRef::NONE);
     disarm_vstack_reorder_region(ctx);
     // The unwinder pushes the caught exception onto the new TOS.
     if handler_depth >= 1 && exc != OpRef::NONE {
-        ctx.vstack_boxes[handler_depth - 1] = exc;
+        ctx.frame_state.borrow_mut().vstack_boxes[handler_depth - 1] = exc;
     }
     vstack_handler_diag(
         "callee",
@@ -1516,6 +1583,6 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
     );
     ctx.vstack_cur_pypc = handler_py;
     ctx.vstack_depth = handler_depth;
-    ctx.vstack_last_ref = OpRef::NONE;
+    ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
     ctx.vstack_handler_landing_py = (floor_py != handler_py).then_some(floor_py);
 }

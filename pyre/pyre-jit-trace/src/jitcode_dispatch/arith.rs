@@ -655,18 +655,7 @@ pub(crate) fn guard_value_record<Sym: WalkSym>(
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[value, expected], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx.replace_box(value, expected);
-    match bank {
-        GuardValueBank::Int => {
-            ctx.registers_i.replace_active_box(value, expected);
-        }
-        GuardValueBank::Ref => {
-            ctx.registers_r.replace_active_box(value, expected);
-        }
-        GuardValueBank::Float => {
-            ctx.registers_f.replace_active_box(value, expected);
-        }
-    }
+    super::vable_ops::walker_replace_box(ctx, value, expected);
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 

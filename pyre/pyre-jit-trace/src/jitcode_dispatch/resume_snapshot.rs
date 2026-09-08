@@ -314,7 +314,7 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
         let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
         ctx.trace_ctx
             .capture_snapshot_for_last_guard_op_with_vable_vref(
-                &ctx.outer_active_boxes,
+                &ctx.frame_state.borrow().outer_active_boxes,
                 ctx.outer_jitcode_index,
                 nsvable_pc_word,
                 nsvable_py_pc,
@@ -842,7 +842,12 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 (0..depth)
                     .filter_map(|s| {
                         let v = if ctx.vstack_valid {
-                            ctx.vstack_boxes.get(s).copied().unwrap_or(OpRef::NONE)
+                            ctx.frame_state
+                                .borrow()
+                                .vstack_boxes
+                                .get(s)
+                                .copied()
+                                .unwrap_or(OpRef::NONE)
                         } else {
                             OpRef::NONE
                         };
@@ -1292,7 +1297,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 entry_jitcode_pc,
                 entry_twin,
                 entry_caller,
-                ctx.vstack_valid.then_some(ctx.vstack_boxes.as_slice()),
+                ctx.vstack_valid
+                    .then_some(ctx.frame_state.borrow().vstack_boxes.as_slice()),
                 scope.branch_guard_kept_recovered,
                 has_branch_guard.then_some(&mut unsourced_kept),
             );
@@ -1344,7 +1350,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
     let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
-    let active = std::mem::take(&mut ctx.outer_active_boxes);
+    let active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
     publish_single_frame_snapshot(
         ctx,
         scope.guard_stamp,
@@ -1357,7 +1363,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         "carried",
         op_pc,
     );
-    ctx.outer_active_boxes = active;
+    ctx.frame_state.borrow_mut().outer_active_boxes = active;
     Ok(())
 }
 
@@ -1521,7 +1527,8 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     color: usize,
 ) -> Option<pyre_object::PyObjectRef> {
-    if let Some(ConcreteValue::Ref(ptr)) = ctx.concrete_registers_r.get(color) {
+    if let Some(ConcreteValue::Ref(ptr)) = ctx.frame_state.borrow().concrete_registers_r.get(color)
+    {
         if !ptr.is_null() {
             return Some(*ptr);
         }
@@ -1631,10 +1638,15 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         return Some(Vec::new());
     }
     let mut overrides = Vec::new();
-    if ctx.vstack_valid && ctx.vstack_depth == depth && ctx.vstack_boxes.len() >= depth {
+    if ctx.vstack_valid
+        && ctx.vstack_depth == depth
+        && ctx.frame_state.borrow().vstack_boxes.len() >= depth
+    {
         for d in 0..depth {
             let slot = nlocals + d;
-            if let Some(value) = concrete_ref_for_opref(ctx, ctx.vstack_boxes[d]) {
+            if let Some(value) =
+                concrete_ref_for_opref(ctx, ctx.frame_state.borrow().vstack_boxes[d])
+            {
                 overrides.push((slot, value));
             }
         }
@@ -1746,9 +1758,10 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             if overrides.iter().any(|&(present, _)| present == slot) {
                 continue;
             }
-            let vstack_box =
-                (ctx.vstack_valid && ctx.vstack_depth == depth && ctx.vstack_boxes.len() >= depth)
-                    .then(|| ctx.vstack_boxes[slot - nlocals]);
+            let vstack_box = (ctx.vstack_valid
+                && ctx.vstack_depth == depth
+                && ctx.frame_state.borrow().vstack_boxes.len() >= depth)
+                .then(|| ctx.frame_state.borrow().vstack_boxes[slot - nlocals]);
             let vstack_concrete =
                 vstack_box.map(|opref| concrete_ref_for_opref(ctx, opref).is_some());
             let pcdep_color = pcdep_entries
@@ -2030,7 +2043,12 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         // `set_stack_at` on a concrete PyFrame — a different index space.
         // Reading the shadow through it stamped whatever register happened to
         // live at the slot's number.
-        let got = ctx.concrete_registers_r.get(color).copied();
+        let got = ctx
+            .frame_state
+            .borrow()
+            .concrete_registers_r
+            .get(color)
+            .copied();
         let value = match got {
             Some(ConcreteValue::Ref(value)) => value,
             // The shadow holds `ConcreteValue::Null`, the walker's UNTRACKED
@@ -2065,7 +2083,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                                 call_jit_pc,
                                 'r',
                                 color,
-                                ctx.concrete_registers_r.len(),
+                                ctx.frame_state.borrow().concrete_registers_r.len(),
                                 got,
                             );
                             report_caller_image_ref_box(ctx, color);
@@ -2078,7 +2096,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                             call_jit_pc,
                             'r',
                             color,
-                            ctx.concrete_registers_r.len(),
+                            ctx.frame_state.borrow().concrete_registers_r.len(),
                             got,
                         );
                         report_caller_image_ref_box(ctx, color);
@@ -2098,7 +2116,13 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         }
         // `ConcreteValue::Null` is the walker's "unknown" sentinel rather than a
         // proven Python null, so it seeds nothing.
-        if let Some(ConcreteValue::Ref(value)) = ctx.concrete_registers_r.get(color).copied() {
+        if let Some(ConcreteValue::Ref(value)) = ctx
+            .frame_state
+            .borrow()
+            .concrete_registers_r
+            .get(color)
+            .copied()
+        {
             ref_values.push((color, value));
             swept[1] += 1;
         }
@@ -3139,7 +3163,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // stack slots.
     if scope.branch_guard_jitcode_pc.is_some()
         && ctx.vstack_valid
-        && ctx.vstack_depth <= ctx.vstack_boxes.len()
+        && ctx.vstack_depth <= ctx.frame_state.borrow().vstack_boxes.len()
     {
         for &(bank, color, slot) in &maps.pcdep_entries {
             if bank != 1 {
@@ -3152,7 +3176,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             if stack_slot >= ctx.vstack_depth {
                 continue;
             }
-            let value = ctx.vstack_boxes[stack_slot];
+            let value = ctx.frame_state.borrow().vstack_boxes[stack_slot];
             if value == OpRef::NONE || opref_is_null_const_ptr(value) {
                 continue;
             }
@@ -3162,7 +3186,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         }
     }
     if recovered_regs_r.iter().any(|value| value.is_none()) && !callee_pjc.code_ptr.is_null() {
-        if let Some(shadow) = ctx.callee_shadow.as_ref() {
+        if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
             for (color, value) in recovered_regs_r.iter_mut().enumerate() {
                 if !value.is_none() {
                     continue;

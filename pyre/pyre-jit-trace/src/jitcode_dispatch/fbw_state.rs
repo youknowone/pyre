@@ -169,7 +169,9 @@ mod recursion_depth_policy_tests {
 /// The innermost inline level's strict-fold frame register (`u16::MAX` when
 /// inactive / no inline level).
 pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> u16 {
-    ctx.callee_shadow
+    ctx.frame_state
+        .borrow()
+        .callee_shadow
         .as_ref()
         .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
 }

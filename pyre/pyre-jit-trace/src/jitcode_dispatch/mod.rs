@@ -245,8 +245,11 @@ mod vstack_mirror;
 pub use vstack_mirror::*;
 mod vable_ops;
 use vable_ops::FrameBoxReplacements;
+mod frame_state;
 mod register_bank;
 mod register_list;
+pub(crate) use frame_state::WalkFrameStateRoot;
+pub use frame_state::{WalkFrameState, WalkFrameStateData};
 pub use register_bank::RegisterBank;
 pub(crate) use register_bank::RegisterBankRoot;
 use register_bank::RegisterValues;
@@ -1047,6 +1050,8 @@ fn concrete_portal_frame<Sym: WalkSym>(
 ) -> Option<*mut pyre_interpreter::PyFrame> {
     let jitcode = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
     let ConcreteValue::Ref(frame) = ctx
+        .frame_state
+        .borrow()
         .concrete_registers_r
         .get(jitcode.metadata.portal_frame_reg as usize)
         .copied()?
@@ -1100,7 +1105,8 @@ fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
     frame: *mut pyre_interpreter::PyFrame,
     frame_reg: u16,
 ) -> bool {
-    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+    let state = ctx.frame_state.borrow();
+    let Some(shadow) = state.callee_shadow.as_ref() else {
         return false;
     };
     flush_callee_locals_region(shadow, frame, frame_reg)
@@ -1189,7 +1195,13 @@ fn finish_current_frame_execution<Sym: WalkSym>(
         if let Some(jitcode) = crate::state::pyjitcode_for_jitcode_index(jitcode_index) {
             let frame_reg = jitcode.metadata.portal_frame_reg as usize;
             frame = ctx.registers_r.get(frame_reg).unwrap_or(OpRef::NONE);
-            concrete = match ctx.concrete_registers_r.get(frame_reg).copied() {
+            concrete = match ctx
+                .frame_state
+                .borrow()
+                .concrete_registers_r
+                .get(frame_reg)
+                .copied()
+            {
                 Some(ConcreteValue::Ref(frame_ptr)) => frame_ptr as *mut pyre_interpreter::PyFrame,
                 _ => std::ptr::null_mut(),
             };
@@ -1200,7 +1212,7 @@ fn finish_current_frame_execution<Sym: WalkSym>(
         // an unescaped concrete, and finishing that other box leaves the
         // returned object with only `FLAG_ESCAPED`.  `frame.clear()` then
         // refuses a frame that has already returned.
-        if let Some(shadow) = ctx.callee_shadow.as_ref() {
+        if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
             let shadow_concrete = if shadow.concrete_frame == 0 {
                 std::ptr::null_mut()
             } else {
@@ -1604,14 +1616,8 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// `CALL_ASSEMBLER` (`opimpl_recursive_call_assembler`) rather than
     /// re-unrolling the call tree to the multi-frame depth cap.
     pub carrier_resume: bool,
-    /// The exception a bridge resumes with, and after a walked
-    /// `set_current_exception` the value that store published.  Read by the
-    /// nullary bare-reraise folds, and by the PUSH_EXC_INFO `prev` save only
-    /// under [`FbwWalkMode::current_exception_seed_from_walk_store`].
-    pub current_exception_seed: Option<OpRef>,
-    /// Concrete shadow paired with [`FbwWalkMode::current_exception_seed`].
-    pub current_exception_seed_concrete: pyre_object::PyObjectRef,
-    /// Whether [`FbwWalkMode::current_exception_seed`] names a value this walk
+
+    /// Whether [`WalkFrameStateData::current_exception_seed`] names a value this walk
     /// stored into `ExecutionContext.sys_exc_value`, as opposed to the
     /// exception the bridge is resuming with.  Only the former answers "what
     /// does that field hold": the bridge's in-flight exception is the one a
@@ -1713,8 +1719,6 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
             carrier_resume: false,
-            current_exception_seed: None,
-            current_exception_seed_concrete: pyre_object::PY_NULL,
             current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,
             bridge_entry_merge_pc: None,
@@ -1734,9 +1738,8 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
 ///   lookup. These flow unchanged from caller into callee, so they
 ///   keep their original (longer) lifetime.
 pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
-    /// Present only for an inlined-callee sub-walk. Top-level and other walks
-    /// have no callee shadow, preserving the former empty-stack no-op behavior.
-    pub callee_shadow: Option<CalleeLocalsShadow>,
+    /// The active and paused adapters share the same frame-owned slots.
+    pub frame_state: WalkFrameState,
     /// Compile-time-constant frame fields of this inlined callee's own
     /// unseeded portal frame. This is the walk-time equivalent of the
     /// codewriter's non-portal branch (`codewriter.rs`),
@@ -1773,43 +1776,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `MIFrame.registers_f` (`pyjitpl.py`). Mutable so
     /// `float_<binop>/ff>f` and `float_neg/f>f` can land their dst.
     pub registers_f: &'frame RegisterBank,
-    /// Concrete shadow mirror for `registers_r`.
-    ///
-    /// Semantic-slot indexed, length equals `registers_r.len()`. At
-    /// `dispatch_via_miframe` entry, populated by concatenating
-    /// `PyreSym.concrete_locals` + `PyreSym.concrete_stack`; sub-walks
-    /// allocate a fresh `Vec<ConcreteValue>` sized to the callee's
-    /// `num_regs_r` and fill arg slots from the parent's slice at the
-    /// arg byte indices.
-    ///
-    /// **Mutable invariant**: every walker handler that
-    /// writes `registers_r[dst]` MUST also write `concrete_registers_r
-    /// [dst]` in lock-step.  Use the [`write_ref_reg`] helper which
-    /// enforces this contract.  Sites that don't know the result's
-    /// concrete pass `ConcreteValue::Null` — downstream consumers
-    /// (e.g. `raise/r` GUARD_CLASS gate) treat `Null` as "no info,
-    /// skip the guard", same as slots the snapshot never populated.
-    /// Copy-style handlers (`ref_copy/r>r`,
-    /// `last_exc_value/>r`) propagate the source's concrete.
-    ///
-    /// The slice is mutable so the concrete shadow tracks the symbolic
-    /// register in lock-step. If it were immutable, sibling handlers
-    /// like `last_exc_value/>r` could rewrite the symbolic register
-    /// without touching the concrete snapshot, so a follow-on `raise/r`
-    /// would read a stale concrete and silently skip the GUARD_CLASS
-    /// gate; the lock-step contract keeps walker-side GUARD_CLASS sound.
-    ///
-    /// **Companion bank** `concrete_registers_i` below carries the same
-    /// contract for the Int bank.  Production entries size and seed it:
-    /// `dispatch_via_miframe` from `top_constants_i` and `argboxes_i`,
-    /// and both inline-callee entries; only the test fixtures pass
-    /// `&mut []`.
-    ///
-    /// `goto_if_not/iL` and `switch/id` read neither bank: both resolve
-    /// their branch value through `TraceCtx::concrete_of_opref` and
-    /// surface `GotoIfNotValueNotConcrete` rather than guess a
-    /// direction.
-    pub concrete_registers_r: &'frame mut [ConcreteValue],
+
     /// Concrete shadow mirror for `registers_i`.  Color-indexed (not
     /// semantic-slot indexed like `concrete_registers_r`) because pyre's
     /// Int bank has no "semantic-slot" abstraction — Int registers are
@@ -1907,20 +1874,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `0` — the full-body guard capture reads `sym.jitcode` directly
     /// instead of this field.
     pub outer_jitcode_index: u32,
-    /// Frozen `PyFrame` state at the outer Python opcode boundary —
-    /// `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`
-    /// captured at walk entry (the retired per-opcode arm entry did
-    /// this; inline sub-walks seed it from the CALL-site capture; the
-    /// full-body root leaves it empty and collects at guard capture),
-    /// filtered by `OpRef::is_none()`.  This is what
-    /// [`walker_capture_snapshot_for_last_guard`] passes as the
-    /// snapshot frame's active boxes on the arm path.
-    ///
-    /// Sub-walks clone the parent's Vec — outer active-box count is
-    /// small (a Python frame's live locals + stack tail) and walker
-    /// nesting depth is shallow (2–3 levels), so the per-sub-walk
-    /// clone cost is negligible.
-    pub outer_active_boxes: Vec<OpRef>,
+
     /// Snapshot-capture failure latched by the `WalkerFrameOps`
     /// `generate_guard` impl, whose `()` trait signature (shared with
     /// `MIFrame`) has no error channel.  The residual-call dispatcher
@@ -1928,27 +1882,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// recorded without a resume snapshot aborts the walk instead of
     /// compiling.
     pub pending_guard_snapshot_error: Option<DispatchError>,
-    /// PyPy-faithful kept-operand-stack snapshot: the walk-level
-    /// symbolic operand stack, indexed by ABSOLUTE operand-stack depth
-    /// (slot `s`, `s in 0..vstack_depth`).  The Python operand stack is
-    /// all-Ref (`W_Root`), so a single `Vec<OpRef>` (Ref bank) suffices.
-    /// This is the walker analog of PyPy's `MIFrame.registers_r`
-    /// valuestack array snapshotted by `get_list_of_active_boxes`
-    /// (`pyjitpl.py`) — the authoritative per-slot box source the
-    /// `stack_sync` vable overlay reads at a branch guard instead of the
-    /// unreliable `registers_r[stack_slot_color_map[s]]` static-color read.
-    ///
-    /// Maintained ONLY when `sym.owns_virtualizable_shadow()`; on any
-    /// unmodeled stack effect the maintenance sets `vstack_valid = false`
-    /// and `stack_sync` omits every operand slot, which resume
-    /// re-materializes (zero regression).
-    ///
-    /// The mirror is the SOLE kept-stack source at a branch guard: the
-    /// flat `stack_slot_color_map` static-color read it once fell back to
-    /// is retired, so a slot the mirror does not cover is omitted rather
-    /// than read from the flat map.  `PYRE_VSTACK_DIAG` logs the per-op
-    /// reconcile trace.
-    pub vstack_boxes: Vec<OpRef>,
+
     /// #73: the absolute operand-stack depth `vstack_boxes` currently
     /// reflects — the depth ON ENTRY to the Python opcode at
     /// `vstack_cur_pypc` (i.e. AFTER the previous opcode's stack effect
@@ -1964,12 +1898,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `false` permanently on the first unmodeled stack effect so the
     /// `stack_sync` overlay declines to use it.
     pub vstack_valid: bool,
-    /// #73: the last Ref box written via [`write_ref_reg`] during the
-    /// CURRENT Python opcode — the box a value-producing opcode lands on
-    /// the operand-stack TOS.  Reset to `OpRef::NONE` at every opcode
-    /// boundary; read by [`reconcile_vstack_at_boundary`] for the
-    /// RESULT-TO-TOS class.
-    pub vstack_last_ref: OpRef,
+
     /// #389(b): the py_pc the walk backed off FROM when it entered the
     /// codewriter's out-of-order FOR_ITER-entry permutation lowering
     /// (`SWAP`/`BUILD_LIST`/`SWAP` before a `FOR_ITER`, lowered non-monotonically
@@ -1979,19 +1908,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// the virtualizable shadow instead of replaying stack effects.  Cleared once
     /// the walk advances past this ceiling (py-pc order is monotonic again).
     pub vstack_reorder_ceiling: u32,
-    /// The `(py_pc, depth, boxes)` the mirror held when `vstack_reorder_ceiling`
-    /// was armed.  A layout excursion that returns to that exact coordinate has
-    /// retired no Python opcode, so the operand stack it left is still the
-    /// operand stack it comes back to and the saved boxes are restored verbatim
-    /// — the shadow reseed cannot reconstruct them, because mid-expression the
-    /// virtualizable's stack region holds the NULLs the in-flight opcode's
-    /// `popvalue_maybe_none` wrote.  `None` outside a region.
-    ///
-    /// There is nothing to snapshot upstream: `pyjitpl.py:1892`
-    /// `MIFrame.run_one_step` steps a live frame whose `registers_r` survive
-    /// the step.  This mirror is instead reconstructed from source pcs, and
-    /// that reconstruction is exactly what an excursion can lose.
-    pub vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>, Vec<bool>)>,
+
     /// The py_pc the walk's floor lookup reports while it is inside an
     /// out-of-line exception LANDING block — the unwind bookkeeping the
     /// codewriter emits per catch site, after the whole body, which then jumps
@@ -4602,7 +4519,9 @@ fn read_ref_reg_concrete<Sym: WalkSym>(
 ) -> ConcreteValue {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
-    ctx.concrete_registers_r
+    ctx.frame_state
+        .borrow()
+        .concrete_registers_r
         .get(reg)
         .copied()
         .unwrap_or(ConcreteValue::Null)
@@ -4662,7 +4581,12 @@ fn write_ref_reg<Sym: WalkSym>(
             ConcreteValue::Null
         }
     };
-    if let Some(c_slot) = ctx.concrete_registers_r.get_mut(dst) {
+    if let Some(c_slot) = ctx
+        .frame_state
+        .borrow_mut()
+        .concrete_registers_r
+        .get_mut(dst)
+    {
         *c_slot = sanitized;
     }
     // #73: record the box just written as the candidate
@@ -4672,7 +4596,7 @@ fn write_ref_reg<Sym: WalkSym>(
     // `reconcile_vstack_at_boundary` reconstruct the new TOS without a
     // per-opcode hook.  Cheap unconditional write to a new side-field;
     // only consumed when the mirror is valid (never alters existing state).
-    ctx.vstack_last_ref = value;
+    ctx.frame_state.borrow_mut().vstack_last_ref = value;
     Ok(())
 }
 
@@ -4694,9 +4618,9 @@ fn write_vable_field_ref_reg<Sym: WalkSym>(
     value: OpRef,
     concrete: ConcreteValue,
 ) -> Result<(), DispatchError> {
-    let saved = ctx.vstack_last_ref;
+    let saved = ctx.frame_state.borrow().vstack_last_ref;
     write_ref_reg(ctx, pc, dst, value, concrete)?;
-    ctx.vstack_last_ref = saved;
+    ctx.frame_state.borrow_mut().vstack_last_ref = saved;
     Ok(())
 }
 
@@ -4936,7 +4860,9 @@ fn read_ref_var_list_concrete<Sym: WalkSym>(
     (0..len)
         .map(|i| {
             let reg = code[len_pc + 1 + i] as usize;
-            ctx.concrete_registers_r
+            ctx.frame_state
+                .borrow()
+                .concrete_registers_r
                 .get(reg)
                 .copied()
                 .unwrap_or(ConcreteValue::Null)
@@ -5055,8 +4981,7 @@ fn dispatch_switch_id<Sym: WalkSym>(
             ctx.trace_ctx
                 .record_guard(OpCode::GuardValue, &[valuebox, expected], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            ctx.trace_ctx.replace_box(valuebox, expected);
-            ctx.registers_i.replace_active_box(valuebox, expected);
+            vable_ops::walker_replace_box(ctx, valuebox, expected);
         }
         return Ok((DispatchOutcome::Continue, target));
     }
@@ -5388,8 +5313,7 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[w_globals_op, expected], 0);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx.replace_box(w_globals_op, expected);
-    ctx.registers_r.replace_active_box(w_globals_op, expected);
+    vable_ops::walker_replace_box(ctx, w_globals_op, expected);
     Ok(true)
 }
 
@@ -7891,7 +7815,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
 }
 
 /// #73: classification of a Python opcode's effect on the walk-level
-/// symbolic operand stack ([`WalkContext::vstack_boxes`]), used by
+/// symbolic operand stack ([`WalkFrameStateData::vstack_boxes`]), used by
 /// [`reconcile_vstack_at_boundary`] to update `vstack_boxes` at an
 /// opcode boundary.  The depth delta is already known from
 /// `depth_at_py_pc`; this only decides WHERE the new boxes come from.
@@ -11094,7 +11018,9 @@ fn guarded_branch_core<Sym: WalkSym>(
         let mirror_covers_kept = ctx.vstack_valid
             && resume_depth.is_some_and(|d| {
                 (0..d).all(|s| {
-                    ctx.vstack_boxes
+                    ctx.frame_state
+                        .borrow()
+                        .vstack_boxes
                         .get(s as usize)
                         .copied()
                         .is_some_and(|b| b != OpRef::NONE)
@@ -11264,7 +11190,11 @@ fn guarded_branch_core<Sym: WalkSym>(
             // invalid-mirror walk.
             let kept_boxed_int = !ctx.vstack_valid
                 && gate_frame.as_ref().is_some_and(|f| {
-                    kept_stack_has_boxed_int_hazard(f, other_target, ctx.concrete_registers_r)
+                    kept_stack_has_boxed_int_hazard(
+                        f,
+                        other_target,
+                        &ctx.frame_state.borrow().concrete_registers_r,
+                    )
                 });
             // A not-taken arm resuming at an exception-handler-protected
             // PC carries the kept exception operand (`PUSH_EXC_INFO`'s
@@ -11430,10 +11360,16 @@ fn latch_taken_python_branch_abort_stack<Sym: WalkSym>(
     else {
         return;
     };
-    if !ctx.vstack_valid || depth > ctx.vstack_depth || depth > ctx.vstack_boxes.len() {
+    if !ctx.vstack_valid
+        || depth > ctx.vstack_depth
+        || depth > ctx.frame_state.borrow().vstack_boxes.len()
+    {
         return;
     }
-    fbw_branch_abort_stack_latch(successor, ctx.vstack_boxes[..depth].to_vec());
+    fbw_branch_abort_stack_latch(
+        successor,
+        ctx.frame_state.borrow().vstack_boxes[..depth].to_vec(),
+    );
 }
 
 fn goto_if_not_branch_on<Sym: WalkSym>(
@@ -11926,7 +11862,7 @@ fn establish_nullity<Sym: WalkSym>(
         walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[boxref])?;
         // `constant_from_op` of a proven-null ref is the null constant.
         let promoted = ctx.trace_ctx.const_ref(0);
-        ctx.trace_ctx.replace_box(boxref, promoted);
+        vable_ops::walker_replace_box(ctx, boxref, promoted);
     }
     ctx.trace_ctx
         .heap_cache_mut()

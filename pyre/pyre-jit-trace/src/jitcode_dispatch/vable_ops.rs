@@ -17,23 +17,18 @@ use super::*;
 /// All register banks share the frame's owned slots, so replacement follows
 /// `MIFrame.replace_active_box_in_frame` without a retained mutable slice or
 /// delayed replay. Ref-bank GC registration retains the same shared storage.
-/// Walker-only extras (vstack, callee shadow) remain
-/// queued and `apply` before the owner executes again.
-///
-/// Delivery of the extras must precede the caller continuation, not the
-/// next opcode: trace rollback can reuse an OpRef id, and a later
-/// delivery could rewrite a new value that was never present in the
-/// paused caller.
+/// Walker-only extras (vstack, callee shadow) share the same frame-owned
+/// state and are rewritten at the same time, never replayed on resume.
 ///
 /// Weak registration neither extends a frame's lifetime nor leaks aliases
 /// into a nested trace session. Heap-owned SubWalkFrames keep this owner
 /// across suspension; recursive callers keep it for precisely the child call.
-/// Convergence for the remaining extras is one red frame per inlined call
+/// Convergence for the semantic/color mirrors is one red frame per inlined call
 /// (#1731).
 pub(super) struct FrameBoxReplacements(std::rc::Rc<FrameBoxReplacementInbox>);
 
 pub(crate) struct FrameBoxReplacementInbox {
-    pending: std::cell::RefCell<Vec<(OpRef, OpRef)>>,
+    frame_state: std::cell::RefCell<Option<WalkFrameState>>,
     listening: std::cell::Cell<bool>,
     banks_r: std::cell::RefCell<Option<RegisterBank>>,
     banks_i: std::cell::RefCell<Option<RegisterBank>>,
@@ -43,7 +38,7 @@ pub(crate) struct FrameBoxReplacementInbox {
 impl FrameBoxReplacements {
     pub(super) fn new(session: &std::cell::RefCell<WalkSession>) -> Self {
         let pending = std::rc::Rc::new(FrameBoxReplacementInbox {
-            pending: std::cell::RefCell::new(Vec::new()),
+            frame_state: std::cell::RefCell::new(None),
             listening: std::cell::Cell::new(true),
             banks_r: std::cell::RefCell::new(None),
             banks_i: std::cell::RefCell::new(None),
@@ -66,11 +61,8 @@ impl FrameBoxReplacements {
         *self.0.banks_f.borrow_mut() = Some(f.clone());
     }
 
-    pub(super) fn apply<Sym: WalkSym>(&self, ctx: &mut WalkContext<'_, '_, Sym>) {
-        for (oldbox, newbox) in self.0.pending.borrow_mut().drain(..) {
-            // Owned slots were updated at replace_box, not on resume.
-            replace_box_in_walk_frame(ctx, oldbox, newbox);
-        }
+    pub(super) fn bind_frame_state(&self, state: &WalkFrameState) {
+        *self.0.frame_state.borrow_mut() = Some(state.clone());
     }
 
     pub(super) fn set_listening(&self, listening: bool) {
@@ -91,35 +83,17 @@ fn replace_box_in_walk_frame<Sym: WalkSym>(
     oldbox: OpRef,
     newbox: OpRef,
 ) {
-    replace_slots(&mut ctx.outer_active_boxes, oldbox, newbox);
-    replace_slots(&mut ctx.vstack_boxes, oldbox, newbox);
-    replace_slots(
-        std::slice::from_mut(&mut ctx.vstack_last_ref),
-        oldbox,
-        newbox,
-    );
-    if let Some((_, _, boxes, _)) = ctx.vstack_reorder_saved.as_mut() {
-        replace_slots(boxes, oldbox, newbox);
-    }
-    if let Some(shadow) = ctx.callee_shadow.as_mut() {
-        replace_slots(std::slice::from_mut(&mut shadow.frame_box), oldbox, newbox);
-        for value in shadow.opref.values_mut() {
-            replace_slots(std::slice::from_mut(value), oldbox, newbox);
-        }
-    }
-    if ctx.fbw_mode.current_exception_seed == Some(oldbox) {
-        ctx.fbw_mode.current_exception_seed = Some(newbox);
-    }
+    ctx.frame_state.replace_active_box(oldbox, newbox);
 }
 
 fn replace_bound_banks(frame: &FrameBoxReplacementInbox, oldbox: OpRef, newbox: OpRef) {
-    if let Some(bank) = frame.banks_r.borrow().as_ref() {
-        bank.replace_active_box(oldbox, newbox);
-    }
-    if let Some(bank) = frame.banks_i.borrow().as_ref() {
-        bank.replace_active_box(oldbox, newbox);
-    }
-    if let Some(bank) = frame.banks_f.borrow().as_ref() {
+    let bank = match oldbox.ty() {
+        Some(Type::Int) => &frame.banks_i,
+        Some(Type::Ref) => &frame.banks_r,
+        Some(Type::Float) => &frame.banks_f,
+        _ => panic!("replace_active_box_in_frame requires a typed value: {oldbox:?}"),
+    };
+    if let Some(bank) = bank.borrow().as_ref() {
         bank.replace_active_box(oldbox, newbox);
     }
 }
@@ -129,9 +103,11 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
         if let Some(frame) = frame.upgrade() {
             if frame.listening.get() {
                 // `MIFrame.replace_active_box_in_frame`: write the bound
-                // banks now. Walker extras stay on `pending` for `apply`.
+                // banks and every frame-owned mirror now.
                 replace_bound_banks(&frame, oldbox, newbox);
-                frame.pending.borrow_mut().push((oldbox, newbox));
+                if let Some(state) = frame.frame_state.borrow().as_ref() {
+                    state.replace_active_box(oldbox, newbox);
+                }
             }
             true
         } else {
@@ -168,10 +144,33 @@ pub(super) fn apply_pending_vable_box_replace<Sym: WalkSym>(ctx: &mut WalkContex
     let Some((oldbox, newbox)) = ctx.trace_ctx.take_pending_box_replace() else {
         return;
     };
+    replace_box_in_all_walk_frames(ctx, oldbox, newbox);
+}
+
+/// `pyjitpl.py MetaInterp.replace_box`: promotion updates the recording
+/// state and every live MIFrame, including callers suspended in descendants.
+pub(super) fn walker_replace_box<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    oldbox: OpRef,
+    newbox: OpRef,
+) {
+    ctx.trace_ctx.replace_box(oldbox, newbox);
+    replace_box_in_all_walk_frames(ctx, oldbox, newbox);
+}
+
+fn replace_box_in_all_walk_frames<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    oldbox: OpRef,
+    newbox: OpRef,
+) {
     replace_box_in_paused_frames(&mut ctx.session.borrow_mut(), oldbox, newbox);
-    ctx.registers_r.replace_active_box(oldbox, newbox);
-    ctx.registers_i.replace_active_box(oldbox, newbox);
-    ctx.registers_f.replace_active_box(oldbox, newbox);
+    let bank = match oldbox.ty() {
+        Some(Type::Int) => ctx.registers_i,
+        Some(Type::Ref) => ctx.registers_r,
+        Some(Type::Float) => ctx.registers_f,
+        _ => panic!("replace_active_box_in_frame requires a typed value: {oldbox:?}"),
+    };
+    bank.replace_active_box(oldbox, newbox);
     replace_box_in_walk_frame(ctx, oldbox, newbox);
 }
 
@@ -201,6 +200,24 @@ mod frame_replacement_tests {
         );
         let active = FrameBoxReplacements::new(&session);
         active.set_listening(false);
+        let make_state = || {
+            WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: Some(CalleeLocalsShadow {
+                    frame_box: old,
+                    ..Default::default()
+                }),
+                outer_active_boxes: vec![old],
+                vstack_boxes: vec![old],
+                vstack_last_ref: old,
+                ..Default::default()
+            })
+        };
+        let parent_state = make_state();
+        let suspended_state = make_state();
+        let active_state = make_state();
+        parent.bind_frame_state(&parent_state);
+        suspended.bind_frame_state(&suspended_state);
+        active.bind_frame_state(&active_state);
         session.borrow_mut().framestack.push(InlineFrame {
             w_code: 1,
             recursion_greenkey: true,
@@ -223,25 +240,26 @@ mod frame_replacement_tests {
         assert_eq!(suspended_regs.get(0), Some(standard));
         // The active frame is rewritten directly, never on a later replay
         // where the trace could have reused one of these operation ids.
-        assert!(active.0.pending.borrow().is_empty());
+        assert_eq!(active_state.borrow().vstack_boxes, [old]);
         drop(active);
         // Guard capture in the child already sees the rewritten caller.
         assert_eq!(
             session.borrow().framestack[0].parents[0].boxes,
             vec![standard]
         );
-        // Consuming one frame's mailbox must not consume another's.
-        for (owner, regs) in [(parent, parent_regs), (suspended, suspended_regs)] {
+        // Both frames have already changed before either continuation runs.
+        assert_eq!(parent_state.borrow().vstack_boxes, [standard]);
+        assert_eq!(suspended_state.borrow().vstack_boxes, [standard]);
+        for (owner, regs, state) in [
+            (parent, parent_regs, parent_state),
+            (suspended, suspended_regs, suspended_state),
+        ] {
             let mut trace = TraceCtx::for_test_types(&[Type::Ref; 3]);
             let mut ints = Vec::new();
             let mut floats = Vec::new();
-            let mut concrete_r = Vec::new();
             let mut concrete_i = Vec::new();
             let mut ctx = WalkContext {
-                callee_shadow: Some(CalleeLocalsShadow {
-                    frame_box: old,
-                    ..Default::default()
-                }),
+                frame_state: state,
                 inline_callee_consts: None,
                 inline_poison_pcs: None,
                 fbw_mode: FbwWalkMode::<crate::state::PyreSym>::default(),
@@ -249,7 +267,7 @@ mod frame_replacement_tests {
                 registers_r: &regs,
                 registers_i: &RegisterBank::new(ints.iter().copied()),
                 registers_f: &RegisterBank::new(floats.iter().copied()),
-                concrete_registers_r: &mut concrete_r,
+
                 concrete_registers_i: &mut concrete_i,
                 descr_refs: &[],
                 raw_descrs: RawDescrPool::Global,
@@ -260,32 +278,44 @@ mod frame_replacement_tests {
                 entry_py_pc: EntryPyPc::Py(0),
                 outer_resume_marker_jit_pc: None,
                 outer_jitcode_index: 0,
-                outer_active_boxes: vec![old],
+
                 pending_guard_snapshot_error: None,
-                vstack_boxes: vec![old],
+
                 vstack_depth: 1,
                 vstack_cur_pypc: 0,
                 vstack_valid: true,
-                vstack_last_ref: old,
+
                 vstack_reorder_ceiling: u32::MAX,
-                vstack_reorder_saved: None,
+
                 vstack_handler_landing_py: None,
                 live_before_jit_pc: usize::MAX,
                 live_after_jit_pc: usize::MAX,
             };
-            owner.apply(&mut ctx);
             assert_eq!(ctx.registers_r.to_vec(), vec![standard]);
-            assert_eq!(ctx.outer_active_boxes, vec![standard]);
-            assert_eq!(ctx.vstack_boxes, vec![standard]);
-            assert_eq!(ctx.callee_shadow.as_ref().unwrap().frame_box, standard);
-            assert!(owner.0.pending.borrow().is_empty());
+            assert_eq!(ctx.frame_state.borrow().outer_active_boxes, vec![standard]);
+            assert_eq!(ctx.frame_state.borrow().vstack_boxes, vec![standard]);
+            assert_eq!(
+                ctx.frame_state
+                    .borrow()
+                    .callee_shadow
+                    .as_ref()
+                    .unwrap()
+                    .frame_box,
+                standard
+            );
 
             // The traceback emitter is another vable writer, outside the
             // bytecode arms. An alias promoted there must rewrite registers
             // before the next writer can replace the single pending slot.
             owner.set_listening(false);
+            // Explicit guard promotions use the same full-frame operation as
+            // nonstandard virtualizable promotion, not just this Ref bank.
+            walker_replace_box(&mut ctx, standard, middle);
+            assert_eq!(ctx.frame_state.borrow().vstack_boxes, [middle]);
+            assert_eq!(session.borrow().framestack[0].parents[0].boxes, [middle]);
+            walker_replace_box(&mut ctx, middle, standard);
             ctx.registers_r.set(0, old);
-            ctx.vstack_boxes[0] = old;
+            ctx.frame_state.borrow_mut().vstack_boxes[0] = old;
             let mut info =
                 majit_metainterp::virtualizable::VirtualizableInfo::without_vable_token();
             info.add_field("last_instr", Type::Int, 0);
@@ -318,7 +348,7 @@ mod frame_replacement_tests {
             .unwrap();
             assert!(ctx.trace_ctx.num_guards() > guards_before);
             assert_eq!(ctx.registers_r.to_vec(), vec![standard]);
-            assert_eq!(ctx.vstack_boxes, vec![standard]);
+            assert_eq!(ctx.frame_state.borrow().vstack_boxes, vec![standard]);
             assert!(ctx.trace_ctx.take_pending_box_replace().is_none());
         }
         // Re-entering after the frames die does not retain their aliases.
@@ -369,8 +399,9 @@ mod frame_replacement_tests {
 /// `virtualizable_boxes` preserves its concrete value. Pyre splits that Box
 /// between an OpRef bank and a parallel concrete bank. Ref values prefer the
 /// recorder Box payload because the active-trace root walker forwards it in
-/// place across a collection; the raw concrete shadow is not a GC root and can
-/// retain the pre-forwarding address. Residual results do not necessarily have
+/// place across a collection. The frame-owned concrete shadow is now rooted
+/// too; retaining this preference preserves the canonical Box payload when
+/// both channels are present. Residual results do not necessarily have
 /// such a payload, so they fall back to the authoritative walker's shadow.
 /// Int/Float values are not GC addresses and keep the shadow-first order.
 pub(super) fn vable_value_concrete<Sym: WalkSym>(
@@ -677,7 +708,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
             ctx.trace_ctx
                 .virtualizable_info()
                 .and_then(|info| info.static_field_by_descr(&descr)),
-            ctx.callee_shadow.as_ref(),
+            ctx.frame_state.borrow().callee_shadow.as_ref(),
         ) {
             if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
                 fbw_arm_durable_frame_undo(frame);
@@ -844,8 +875,7 @@ fn walker_promote_vable_array_index<Sym: WalkSym>(
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[index, expected], 0);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
-    ctx.trace_ctx.replace_box(index, expected);
-    ctx.registers_i.replace_active_box(index, expected);
+    walker_replace_box(ctx, index, expected);
     Ok(expected)
 }
 
@@ -878,11 +908,13 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         let index = read_int_reg(code, op, 1, ctx)?;
         if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index) {
-            if let Some(result) = ctx
+            let result = ctx
+                .frame_state
+                .borrow()
                 .callee_shadow
                 .as_ref()
-                .and_then(|shadow| shadow.opref.get(&slot).copied())
-            {
+                .and_then(|shadow| shadow.opref.get(&slot).copied());
+            if let Some(result) = result {
                 let dst = code[op.pc + 7] as usize;
                 let concrete = concrete_from_recorded_opref(ctx, result);
                 match dst_bank {
@@ -980,11 +1012,15 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // heapcache entry this pass, yet its recording-time concrete is known.
     let shadow_value = if matches!(shadow_value, Value::Void) {
         let entry = ctx
+            .frame_state
+            .borrow()
             .callee_shadow
             .as_ref()
             .and_then(|shadow| shadow.concrete.get(&index_value).copied())
             .filter(|entry| entry.frame_reg == code[op.pc + 1] as u16);
         let slot_opref = ctx
+            .frame_state
+            .borrow()
             .callee_shadow
             .as_ref()
             .and_then(|shadow| shadow.opref.get(&index_value).copied());
@@ -1062,7 +1098,8 @@ fn folded_store_is_observable_local<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     slot: i64,
 ) -> bool {
-    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+    let state = ctx.frame_state.borrow();
+    let Some(shadow) = state.callee_shadow.as_ref() else {
         return false;
     };
     if !shadow.frame_materialized {
@@ -1089,7 +1126,7 @@ fn active_frame_code<'a, Sym: WalkSym>(
     // A resolved shadow is authoritative: falling back to the outer sym when
     // its `code_ptr` is unset would answer with the CALLER's frame, the exact
     // misattribution `active_frame_nlocals` exists to prevent.
-    let code_ptr = if let Some(shadow) = ctx.callee_shadow.as_ref() {
+    let code_ptr = if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
         shadow.code_ptr
     } else {
         let sym = ctx.fbw_mode.snapshot_sym;
@@ -1123,7 +1160,7 @@ fn active_frame_code<'a, Sym: WalkSym>(
 /// callee then read them back as NULL from the reconstructed frame — the next
 /// call in the callee arrived one positional argument short.
 fn active_frame_nlocals<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<i64> {
-    if ctx.callee_shadow.is_some() {
+    if ctx.frame_state.borrow().callee_shadow.is_some() {
         return active_frame_code(ctx)
             .map(|code| crate::state::callee_layout_for_call_assembler(code).0 as i64);
     }
@@ -1170,7 +1207,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             };
             let concrete = vable_value_concrete(code, op, 2, ctx, value_bank, value)
                 .unwrap_or(majit_ir::Value::Void);
-            if let Some(shadow) = ctx.callee_shadow.as_mut() {
+            if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(fold_frame_reg, slot, concrete);
             }
@@ -1183,7 +1220,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
                 "folded locals_cells_stack_w store must carry a Ref-compatible value"
             );
             if matches!(concrete, majit_ir::Value::Ref(_))
-                && let Some(shadow) = ctx.callee_shadow.as_ref()
+                && let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref()
             {
                 if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
                     fbw_arm_durable_frame_undo(frame);
@@ -1258,7 +1295,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         && let Some(nlocals) = active_frame_nlocals(ctx)
         && index_value >= 0
         && index_value < nlocals
-        && let Some(&tos) = ctx.vstack_boxes.last()
+        && let Some(&tos) = ctx.frame_state.borrow().vstack_boxes.last()
         && !tos.is_none()
     {
         value = tos;
@@ -1305,7 +1342,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // through the (GC-forwarded) op-table over the raw `concrete` copy, so the
     // OpRef must track the stored value on every write — otherwise a re-stored
     // slot would re-resolve a stale OpRef while `concrete` held the fresh value.
-    if let Some(shadow) = ctx.callee_shadow.as_mut() {
+    if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
         shadow.set_opref(index_value, value);
         shadow.set_concrete(code[op.pc + 1] as u16, index_value, concrete);
     }
@@ -1338,10 +1375,13 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             });
             let stack_slot = (index_value - nlocals) as usize;
             if method_load {
-                if ctx.vstack_boxes.len() <= stack_slot {
-                    ctx.vstack_boxes.resize(stack_slot + 1, OpRef::NONE);
+                if ctx.frame_state.borrow().vstack_boxes.len() <= stack_slot {
+                    ctx.frame_state
+                        .borrow_mut()
+                        .vstack_boxes
+                        .resize(stack_slot + 1, OpRef::NONE);
                 }
-                ctx.vstack_boxes[stack_slot] = value;
+                ctx.frame_state.borrow_mut().vstack_boxes[stack_slot] = value;
             }
             // Mark the slot as execution-derived while an out-of-order region
             // is armed, so the boundary restore does not put its pc-derived
@@ -1357,13 +1397,15 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             // whose only executed store came from, say, `LOAD_NAME` or
             // `BINARY_OP` reported an empty mask and the restore reinstated the
             // pre-window mirror wholesale over it.
-            if let Some((_, _, _, mask)) = ctx.vstack_reorder_saved.as_mut() {
+            if let Some((_, _, _, mask)) =
+                ctx.frame_state.borrow_mut().vstack_reorder_saved.as_mut()
+            {
                 if mask.len() <= stack_slot {
                     mask.resize(stack_slot + 1, false);
                 }
                 mask[stack_slot] = true;
             }
-            ctx.vstack_last_ref = value;
+            ctx.frame_state.borrow_mut().vstack_last_ref = value;
         }
     }
     Ok((DispatchOutcome::Continue, op.next_pc))

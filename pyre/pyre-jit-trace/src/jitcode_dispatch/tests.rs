@@ -737,7 +737,15 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     let mut concrete_r = Vec::new();
     let mut concrete_i = Vec::new();
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete_r).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: mode,
@@ -745,7 +753,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::new(regs_f.iter().copied()),
-        concrete_registers_r: &mut concrete_r,
+
         concrete_registers_i: &mut concrete_i,
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -756,15 +764,15 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -1290,7 +1298,15 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -1298,7 +1314,7 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut concrete,
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -1309,15 +1325,15 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -1554,7 +1570,15 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
     let mut regs_i = vec![OpRef::NONE];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -1562,7 +1586,7 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -1573,15 +1597,15 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -1610,7 +1634,15 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
     let mut regs_i = vec![OpRef::NONE];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -1618,7 +1650,7 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -1629,15 +1661,15 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -1684,7 +1716,15 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
         let mut regs_i = vec![OpRef::NONE];
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
-            callee_shadow: None,
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: None,
+                concrete_registers_r: ([]).to_vec(),
+                outer_active_boxes: Vec::new(),
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
+                ..Default::default()
+            }),
             inline_callee_consts: None,
             inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
@@ -1692,7 +1732,7 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
             registers_r: &RegisterBank::new(regs_r.iter().copied()),
             registers_i: &RegisterBank::new(regs_i.iter().copied()),
             registers_f: &RegisterBank::default(),
-            concrete_registers_r: &mut [],
+
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
@@ -1703,15 +1743,15 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
             outer_jitcode_index: 0,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
-            outer_active_boxes: Vec::new(),
+
             pending_guard_snapshot_error: None,
-            vstack_boxes: Vec::new(),
+
             vstack_depth: 0,
             vstack_cur_pypc: 0,
             vstack_valid: false,
-            vstack_last_ref: OpRef::NONE,
+
             vstack_reorder_ceiling: u32::MAX,
-            vstack_reorder_saved: None,
+
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -1780,7 +1820,15 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
         let mut regs_i = vec![OpRef::NONE, OpRef::NONE];
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
-            callee_shadow: None,
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: None,
+                concrete_registers_r: ([]).to_vec(),
+                outer_active_boxes: Vec::new(),
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
+                ..Default::default()
+            }),
             inline_callee_consts: None,
             inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
@@ -1788,7 +1836,7 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
             registers_r: &RegisterBank::new(regs_r.iter().copied()),
             registers_i: &RegisterBank::new(regs_i.iter().copied()),
             registers_f: &RegisterBank::default(),
-            concrete_registers_r: &mut [],
+
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
@@ -1799,15 +1847,15 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
             outer_jitcode_index: 0,
             raw_descrs: RawDescrPool::Global,
             is_authoritative_executor: false,
-            outer_active_boxes: Vec::new(),
+
             pending_guard_snapshot_error: None,
-            vstack_boxes: Vec::new(),
+
             vstack_depth: 0,
             vstack_cur_pypc: 0,
             vstack_valid: false,
-            vstack_last_ref: OpRef::NONE,
+
             vstack_reorder_ceiling: u32::MAX,
-            vstack_reorder_saved: None,
+
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -1911,7 +1959,15 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
         let guards_before = tc.num_guards();
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
-            callee_shadow: None,
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: None,
+                concrete_registers_r: ([]).to_vec(),
+                outer_active_boxes: Vec::new(),
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
+                ..Default::default()
+            }),
             inline_callee_consts: None,
             inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
@@ -1919,7 +1975,7 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
             registers_r: &RegisterBank::new(regs_r.iter().copied()),
             registers_i: &RegisterBank::new(regs_i.iter().copied()),
             registers_f: &RegisterBank::default(),
-            concrete_registers_r: &mut [],
+
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::PerFn(&raw_pool),
@@ -1930,15 +1986,15 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
             entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
-            outer_active_boxes: Vec::new(),
+
             pending_guard_snapshot_error: None,
-            vstack_boxes: Vec::new(),
+
             vstack_depth: 0,
             vstack_cur_pypc: 0,
             vstack_valid: false,
-            vstack_last_ref: OpRef::NONE,
+
             vstack_reorder_ceiling: u32::MAX,
-            vstack_reorder_saved: None,
+
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -2182,7 +2238,15 @@ fn drive_int_add_jump_if_ovf(
     ];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -2190,7 +2254,7 @@ fn drive_int_add_jump_if_ovf(
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut concrete_i,
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -2201,15 +2265,15 @@ fn drive_int_add_jump_if_ovf(
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2339,7 +2403,15 @@ fn drive_alloc_with_descr(
     let mut concrete_r = vec![ConcreteValue::Null];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete_r).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -2347,7 +2419,7 @@ fn drive_alloc_with_descr(
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut concrete_r,
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -2358,15 +2430,15 @@ fn drive_alloc_with_descr(
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2565,7 +2637,15 @@ fn run_hint_step_full(
     let outer_jitcode_index = test_outer_resume_jitcode_index();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: concrete_r.to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -2573,7 +2653,7 @@ fn run_hint_step_full(
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::new(regs_f.iter().copied()),
-        concrete_registers_r: concrete_r,
+
         concrete_registers_i: concrete_i,
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -2584,15 +2664,15 @@ fn run_hint_step_full(
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -2601,6 +2681,7 @@ fn run_hint_step_full(
     regs_f.copy_from_slice(&wc.registers_f.to_vec());
     regs_i.copy_from_slice(&wc.registers_i.to_vec());
     regs_r.copy_from_slice(&wc.registers_r.to_vec());
+    concrete_r.copy_from_slice(&wc.frame_state.borrow().concrete_registers_r);
     result
 }
 
@@ -3157,7 +3238,15 @@ fn switch_id_hit_jumps_to_matching_target() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -3165,7 +3254,7 @@ fn switch_id_hit_jumps_to_matching_target() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -3176,15 +3265,15 @@ fn switch_id_hit_jumps_to_matching_target() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3214,7 +3303,15 @@ fn switch_id_miss_falls_through() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -3222,7 +3319,7 @@ fn switch_id_miss_falls_through() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -3233,15 +3330,15 @@ fn switch_id_miss_falls_through() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3270,7 +3367,15 @@ fn switch_id_requires_concrete_int_value() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -3278,7 +3383,7 @@ fn switch_id_requires_concrete_int_value() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -3289,15 +3394,15 @@ fn switch_id_requires_concrete_int_value() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3335,7 +3440,15 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -3343,7 +3456,7 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -3354,15 +3467,15 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3392,7 +3505,15 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -3400,7 +3521,7 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -3411,15 +3532,15 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3448,7 +3569,15 @@ fn goto_if_not_requires_concrete_int_value() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -3456,7 +3585,7 @@ fn goto_if_not_requires_concrete_int_value() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -3467,15 +3596,15 @@ fn goto_if_not_requires_concrete_int_value() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3830,7 +3959,15 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         sess.last_exc_value_concrete = ConcreteValue::Int(123);
     }
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -3838,7 +3975,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -3849,15 +3986,15 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -3952,7 +4089,15 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
         .class_now_known(expected, 0x1234_5678);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut walk_ctx = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -3960,7 +4105,7 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -3971,15 +4116,15 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4150,7 +4295,15 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4158,7 +4311,7 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -4169,15 +4322,15 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4268,7 +4421,15 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4276,7 +4437,7 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -4287,15 +4448,15 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4380,7 +4541,15 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4388,7 +4557,7 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::new(regs_f.iter().copied()),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -4399,15 +4568,15 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4481,7 +4650,15 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4489,7 +4666,7 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -4500,15 +4677,15 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4577,7 +4754,15 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4585,7 +4770,7 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -4596,15 +4781,15 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4655,7 +4840,15 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
     let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4663,7 +4856,7 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -4674,15 +4867,15 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4712,7 +4905,15 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
     descr_pool[3] = make_jitcode_descr(999_999);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4720,7 +4921,7 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -4731,15 +4932,15 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4765,7 +4966,15 @@ fn step_through_live_opcode_advances_by_offset_size() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4773,7 +4982,7 @@ fn step_through_live_opcode_advances_by_offset_size() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -4784,15 +4993,15 @@ fn step_through_live_opcode_advances_by_offset_size() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4827,7 +5036,15 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4835,7 +5052,7 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
         registers_r: &RegisterBank::new(regs.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -4846,15 +5063,15 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4887,7 +5104,15 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4895,7 +5120,7 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -4906,15 +5131,15 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -4948,7 +5173,15 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
     let mut registers_r = [OpRef::NONE, OpRef::NONE];
     let mut concrete_registers_r = [ConcreteValue::Null, ConcreteValue::Null];
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete_registers_r).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -4956,7 +5189,7 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
         registers_r: &RegisterBank::new(registers_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut concrete_registers_r,
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -4967,15 +5200,15 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5010,7 +5243,15 @@ fn step_through_int_return_records_finish_with_int_descr() {
     let descr_int = make_fail_descr(42);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5018,7 +5259,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5029,15 +5270,15 @@ fn step_through_int_return_records_finish_with_int_descr() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5089,7 +5330,15 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
     let expected = regs_i[1];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5097,7 +5346,7 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5108,15 +5357,15 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5156,7 +5405,15 @@ fn step_through_void_return_stashes_void_finish_payload() {
     let mut tc = fresh_trace_ctx();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5164,7 +5421,7 @@ fn step_through_void_return_stashes_void_finish_payload() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5175,15 +5432,15 @@ fn step_through_void_return_stashes_void_finish_payload() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5224,7 +5481,15 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
     let mut tc = fresh_trace_ctx();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5232,7 +5497,7 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5243,15 +5508,15 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5280,7 +5545,15 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5288,7 +5561,7 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5299,15 +5572,15 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5339,7 +5612,15 @@ fn step_through_goto_jumps_to_label_target() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5347,7 +5628,7 @@ fn step_through_goto_jumps_to_label_target() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5358,15 +5639,15 @@ fn step_through_goto_jumps_to_label_target() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5398,7 +5679,15 @@ fn step_through_goto_handles_high_byte_of_label() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5406,7 +5695,7 @@ fn step_through_goto_handles_high_byte_of_label() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5417,15 +5706,15 @@ fn step_through_goto_handles_high_byte_of_label() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5511,7 +5800,15 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
         sess.last_exc_value = Some(active_exc);
     }
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5519,7 +5816,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
         registers_r: &RegisterBank::new(regs.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5530,15 +5827,15 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5565,7 +5862,15 @@ fn step_through_catch_exception_advances_past_label_operand() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5573,7 +5878,7 @@ fn step_through_catch_exception_advances_past_label_operand() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5584,15 +5889,15 @@ fn step_through_catch_exception_advances_past_label_operand() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5633,7 +5938,15 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5641,7 +5954,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
         registers_r: &RegisterBank::new(regs.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5652,15 +5965,15 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5711,7 +6024,15 @@ fn top_level_raise_settles_the_vable_token() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5719,7 +6040,7 @@ fn top_level_raise_settles_the_vable_token() {
         registers_r: &RegisterBank::new(regs.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5730,15 +6051,15 @@ fn top_level_raise_settles_the_vable_token() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5832,7 +6153,15 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5840,7 +6169,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
         registers_r: &RegisterBank::new(regs.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut concrete,
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5851,15 +6180,15 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -5938,7 +6267,15 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         sess.last_exc_value = Some(active_exc);
     }
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -5946,7 +6283,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -5957,15 +6294,15 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6015,7 +6352,15 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6023,7 +6368,7 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6034,15 +6379,15 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6069,7 +6414,15 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
     let descr_done = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6077,7 +6430,7 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6088,15 +6441,15 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6187,7 +6540,15 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     descr_pool[11] = make_jitcode_descr(11);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6195,7 +6556,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -6206,15 +6567,15 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6307,7 +6668,15 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
     descr_pool[13] = make_jitcode_descr(13);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6315,7 +6684,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -6327,15 +6696,15 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6377,7 +6746,15 @@ fn step_through_int_copy_advances_past_operand_bytes() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6385,7 +6762,7 @@ fn step_through_int_copy_advances_past_operand_bytes() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6396,15 +6773,15 @@ fn step_through_int_copy_advances_past_operand_bytes() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6443,7 +6820,15 @@ fn int_copy_writes_src_value_into_dst_register() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6451,7 +6836,7 @@ fn int_copy_writes_src_value_into_dst_register() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6462,15 +6847,15 @@ fn int_copy_writes_src_value_into_dst_register() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6502,7 +6887,15 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6510,7 +6903,7 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6521,15 +6914,15 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6558,7 +6951,15 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6566,7 +6967,7 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(), // empty — index 7 must surface OOR
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6577,15 +6978,15 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6634,7 +7035,15 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6642,7 +7051,7 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6653,15 +7062,15 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6698,7 +7107,15 @@ fn ref_copy_writes_src_value_into_dst_register() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6706,7 +7123,7 @@ fn ref_copy_writes_src_value_into_dst_register() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6717,15 +7134,15 @@ fn ref_copy_writes_src_value_into_dst_register() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6755,7 +7172,15 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6763,7 +7188,7 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6774,15 +7199,15 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6809,7 +7234,15 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6817,7 +7250,7 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(), // empty — index 7 must surface OOR
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6828,15 +7261,15 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -6874,7 +7307,15 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -6882,7 +7323,7 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -6893,15 +7334,15 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7099,7 +7540,15 @@ fn drive_int_between(
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -7107,7 +7556,7 @@ fn drive_int_between(
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -7118,15 +7567,15 @@ fn drive_int_between(
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7236,7 +7685,15 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -7244,7 +7701,7 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::new(regs_f.iter().copied()),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -7255,15 +7712,15 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7326,7 +7783,15 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -7334,7 +7799,7 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::new(regs_f.iter().copied()),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -7345,15 +7810,15 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7404,7 +7869,15 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -7412,7 +7885,7 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -7423,15 +7896,15 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7517,7 +7990,15 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -7525,7 +8006,7 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -7536,15 +8017,15 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7688,7 +8169,15 @@ fn run_float_step(
     let outer_jitcode_index = test_outer_resume_jitcode_index();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -7696,7 +8185,7 @@ fn run_float_step(
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::new(regs_f.iter().copied()),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -7707,15 +8196,15 @@ fn run_float_step(
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7885,7 +8374,15 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -7893,7 +8390,7 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -7904,15 +8401,15 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7940,7 +8437,15 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -7948,7 +8453,7 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -7959,15 +8464,15 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -7997,7 +8502,15 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -8005,7 +8518,7 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -8016,15 +8529,15 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8071,7 +8584,15 @@ fn unsupported_opname_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -8079,7 +8600,7 @@ fn unsupported_opname_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -8090,15 +8611,15 @@ fn unsupported_opname_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8212,7 +8733,15 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
     let mut registers_r = vec![OpRef::NONE; body.c_num_regs_r as usize];
     let mut concrete_registers_r = vec![ConcreteValue::Null; body.c_num_regs_r as usize];
     let mut walk_ctx = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete_registers_r).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -8220,7 +8749,7 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
         registers_r: &RegisterBank::new(registers_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut concrete_registers_r,
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -8231,15 +8760,15 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8286,7 +8815,15 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
     let mut regs_i = [OpRef::None];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -8294,7 +8831,7 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -8305,15 +8842,15 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8458,7 +8995,15 @@ fn abort_result_r_stops_the_walk() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -8466,7 +9011,7 @@ fn abort_result_r_stops_the_walk() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -8477,15 +9022,15 @@ fn abort_result_r_stops_the_walk() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8513,17 +9058,27 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
     let code = [byte, 0];
     let mut tc = fresh_trace_ctx();
     let descr = done_descr_ref_for_tests();
-    // Symbolic side: a recorded op OpRef (not a Const).
-    let value_opref = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    // MIFrame.replace_active_box_in_frame selects the bank by the Box type.
+    // Use a real Ref result; PtrEq would manufacture an IntOp in registers_r.
+    let concrete_ptr: usize = 0xdead_beef;
+    let source = tc.const_ref(concrete_ptr as i64);
+    let value_opref = tc.record_op(majit_ir::OpCode::SameAsR, &[source]);
     let mut regs_r = [value_opref];
     let mut regs_i = [OpRef::None];
-    let concrete_ptr: usize = 0xdead_beef;
     let mut concrete_r = [ConcreteValue::Ref(
         concrete_ptr as *mut pyre_object::pyobject::PyObject,
     )];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete_r).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -8531,7 +9086,7 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut concrete_r,
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -8542,15 +9097,15 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8607,7 +9162,15 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
     let mut concrete_i = [ConcreteValue::Int(42)];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -8615,7 +9178,7 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut concrete_i,
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -8626,15 +9189,15 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8692,7 +9255,15 @@ fn ref_guard_value_on_const_records_nothing() {
     )];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete_r).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -8700,7 +9271,7 @@ fn ref_guard_value_on_const_records_nothing() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut concrete_r,
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -8711,15 +9282,15 @@ fn ref_guard_value_on_const_records_nothing() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8790,7 +9361,15 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -8798,7 +9377,7 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -8809,15 +9388,15 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -8958,7 +9537,15 @@ fn run_symbolic_box_str_dispatch(
     )];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: FbwWalkMode {
@@ -8969,7 +9556,7 @@ fn run_symbolic_box_str_dispatch(
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -8980,15 +9567,15 @@ fn run_symbolic_box_str_dispatch(
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9102,7 +9689,15 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9110,7 +9705,7 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -9121,15 +9716,15 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9185,7 +9780,15 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
     let mut regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9193,7 +9796,7 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -9204,15 +9807,15 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9257,7 +9860,15 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9265,7 +9876,7 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -9276,15 +9887,15 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9315,7 +9926,15 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9323,7 +9942,7 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -9334,15 +9953,15 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9387,7 +10006,15 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9395,7 +10022,7 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -9406,15 +10033,15 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9489,7 +10116,15 @@ fn may_force_with_active_vable_executes_and_clears_token() {
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9497,7 +10132,7 @@ fn may_force_with_active_vable_executes_and_clears_token() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -9508,15 +10143,15 @@ fn may_force_with_active_vable_executes_and_clears_token() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9590,7 +10225,15 @@ fn may_force_vable_escape_surfaces_typed_abort() {
     let call_descr = descr.as_call_descr().expect("CallI descr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9598,7 +10241,7 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -9609,15 +10252,15 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9687,7 +10330,15 @@ fn run_not_in_trace(
     NOT_IN_TRACE_CALLS.with(|c| c.set(0));
     let ops_before = tc.ops().len();
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9695,7 +10346,7 @@ fn run_not_in_trace(
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -9706,15 +10357,15 @@ fn run_not_in_trace(
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9816,7 +10467,15 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9824,7 +10483,7 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -9835,15 +10494,15 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9873,7 +10532,15 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9881,7 +10548,7 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -9892,15 +10559,15 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -9942,7 +10609,15 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -9950,7 +10625,7 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -9961,15 +10636,15 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10013,7 +10688,15 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10021,7 +10704,7 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10032,15 +10715,15 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10104,7 +10787,15 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10112,7 +10803,7 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10123,15 +10814,15 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10185,7 +10876,15 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10193,7 +10892,7 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10204,15 +10903,15 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10265,7 +10964,15 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10273,7 +10980,7 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10284,15 +10991,15 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10324,7 +11031,15 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10332,7 +11047,7 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10343,15 +11058,15 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10421,7 +11136,15 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10429,7 +11152,7 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10440,15 +11163,15 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10517,7 +11240,15 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10525,7 +11256,7 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10536,15 +11267,15 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10621,7 +11352,15 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10629,7 +11368,7 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10640,15 +11379,15 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10757,7 +11496,15 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10765,7 +11512,7 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10776,15 +11523,15 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10829,7 +11576,15 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10837,7 +11592,7 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10848,15 +11603,15 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10887,7 +11642,15 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
     let frame_done_descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10895,7 +11658,7 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10906,15 +11669,15 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -10969,7 +11732,15 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
     fbw_finish_payload_reset();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -10977,7 +11748,7 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -10988,15 +11759,15 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11082,7 +11853,15 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -11090,7 +11869,7 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -11101,15 +11880,15 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11207,7 +11986,15 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
         descr_pool[7] = make_jitcode_descr(7);
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
-            callee_shadow: None,
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: None,
+                concrete_registers_r: ([]).to_vec(),
+                outer_active_boxes: Vec::new(),
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
+                ..Default::default()
+            }),
             inline_callee_consts: None,
             inline_poison_pcs: None,
             fbw_mode: FbwWalkMode {
@@ -11218,7 +12005,7 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
             registers_r: &RegisterBank::new(regs_r.iter().copied()),
             registers_i: &RegisterBank::default(),
             registers_f: &RegisterBank::default(),
-            concrete_registers_r: &mut [],
+
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
             raw_descrs: RawDescrPool::Global,
@@ -11229,15 +12016,15 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
             entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
-            outer_active_boxes: Vec::new(),
+
             pending_guard_snapshot_error: None,
-            vstack_boxes: Vec::new(),
+
             vstack_depth: 0,
             vstack_cur_pypc: 0,
             vstack_valid: false,
-            vstack_last_ref: OpRef::NONE,
+
             vstack_reorder_ceiling: u32::MAX,
-            vstack_reorder_saved: None,
+
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -11299,7 +12086,15 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
     descr_pool[5] = make_jitcode_descr(5);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -11307,7 +12102,7 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -11318,15 +12113,15 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11409,7 +12204,15 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         sess.last_exc_value_concrete = ConcreteValue::Int(123);
     }
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -11417,7 +12220,7 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -11428,15 +12231,15 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11492,7 +12295,15 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -11500,7 +12311,7 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -11511,15 +12322,15 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11576,7 +12387,15 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -11584,7 +12403,7 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -11595,15 +12414,15 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11658,7 +12477,15 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -11666,7 +12493,7 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -11677,15 +12504,15 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11745,7 +12572,15 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -11753,7 +12588,7 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::new(regs_f.iter().copied()),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -11764,15 +12599,15 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11830,7 +12665,15 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -11838,7 +12681,7 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::new(regs_f.iter().copied()),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -11849,15 +12692,15 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11904,7 +12747,15 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -11912,7 +12763,7 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -11923,15 +12774,15 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -11999,7 +12850,15 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
 
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12007,7 +12866,7 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12018,15 +12877,15 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12072,7 +12931,15 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12080,7 +12947,7 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12091,15 +12958,15 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12133,7 +13000,15 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
     let frame_done = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12141,7 +13016,7 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12152,15 +13027,15 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12206,7 +13081,15 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12214,7 +13097,7 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12225,15 +13108,15 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12299,7 +13182,15 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12307,7 +13198,7 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12318,15 +13209,15 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12382,7 +13273,15 @@ fn setfield_gc_i_redundant_write_skips_recording() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12390,7 +13289,7 @@ fn setfield_gc_i_redundant_write_skips_recording() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12401,15 +13300,15 @@ fn setfield_gc_i_redundant_write_skips_recording() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12443,7 +13342,15 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12451,7 +13358,7 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12462,15 +13369,15 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12530,7 +13437,15 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12538,7 +13453,7 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12549,15 +13464,15 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12600,7 +13515,15 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12608,7 +13531,7 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12619,15 +13542,15 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12748,7 +13671,15 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
     let prof_before = tc.profiler().snapshot();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12756,7 +13687,7 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12767,15 +13698,15 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12825,7 +13756,15 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12833,7 +13772,7 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12844,15 +13783,15 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -12894,7 +13833,15 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -12902,7 +13849,7 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -12913,15 +13860,15 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -13212,7 +14159,15 @@ fn walk_undecodable_byte_surfaces_typed_error() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -13220,7 +14175,7 @@ fn walk_undecodable_byte_surfaces_typed_error() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -13231,15 +14186,15 @@ fn walk_undecodable_byte_surfaces_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -13290,7 +14245,15 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -13298,7 +14261,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -13309,15 +14272,15 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -13378,7 +14341,15 @@ fn loop_header_stamps_seen_flag() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -13386,7 +14357,7 @@ fn loop_header_stamps_seen_flag() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -13397,15 +14368,15 @@ fn loop_header_stamps_seen_flag() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -13446,7 +14417,15 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
     let mut regs_r = [pycode];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -13454,7 +14433,7 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -13465,15 +14444,15 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -13509,7 +14488,15 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -13517,7 +14504,7 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -13528,15 +14515,15 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -13900,7 +14887,15 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
     let mut concrete_i = vec![ConcreteValue::Int(7), ConcreteValue::Int(99)];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -13908,7 +14903,7 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut concrete_i,
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -13919,15 +14914,15 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -14095,7 +15090,15 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
     let mut regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -14103,7 +15106,7 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -14114,15 +15117,15 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -14214,7 +15217,15 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
     let mut regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
     let wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -14222,7 +15233,7 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -14233,15 +15244,15 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -14307,7 +15318,15 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
     let mut regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
     let wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -14315,7 +15334,7 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -14326,15 +15345,15 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
@@ -14537,7 +15556,15 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
     let session = std::cell::RefCell::new(WalkSession::default());
     let callee_index = 4242;
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
@@ -14545,7 +15572,7 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
         registers_r: &RegisterBank::default(),
         registers_i: &RegisterBank::default(),
         registers_f: &RegisterBank::default(),
-        concrete_registers_r: &mut [],
+
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -14556,15 +15583,15 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-        outer_active_boxes: Vec::new(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
