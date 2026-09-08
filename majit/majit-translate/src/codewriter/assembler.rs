@@ -1667,13 +1667,12 @@ impl Assembler {
                 pure,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
-                assert_eq!(
-                    kc, 'r',
-                    "getfield_gc base must use the Ref register bank \
-                     (blackhole.py bhimpl_getfield_gc_* @arguments(\"cpu\", \"r\", \"d\", returns=\"X\")); \
-                     an Int-bank base is getfield_raw — graph {:?}",
+                assert!(
+                    kc == 'r' || kc == 'i',
+                    "getfield base must be Ref (gc) or Int (raw), got {kc:?} — graph {:?}",
                     self.current_graph_name,
                 );
+                let is_gc = kc == 'r';
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
@@ -1696,8 +1695,22 @@ impl Assembler {
                 } else {
                     'v'
                 };
-                let mut opname = format!("getfield_gc_{result_kind}");
-                if *pure {
+                // `jtransform.py rewrite_op_getfield`: `_gckind == 'raw'`
+                // emits `getfield_raw_*` and strips `_pure`.  A non-pure
+                // `getfield_raw_r` is refused.
+                if !is_gc && result_kind == 'r' && !*pure {
+                    panic!(
+                        "getfield_raw_r (without _pure) not supported \
+                         (jtransform.py rewrite_op_getfield) — graph {:?}",
+                        self.current_graph_name,
+                    );
+                }
+                let mut opname = if is_gc {
+                    format!("getfield_gc_{result_kind}")
+                } else {
+                    format!("getfield_raw_{result_kind}")
+                };
+                if is_gc && *pure {
                     opname.push_str("_pure");
                 }
                 let key = format!("{opname}/{argcodes}");
@@ -2013,6 +2026,12 @@ impl Assembler {
                 ty,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert!(
+                    kc == 'r' || kc == 'i',
+                    "setfield base must be Ref (gc) or Int (raw), got {kc:?} — graph {:?}",
+                    self.current_graph_name,
+                );
+                let is_gc = kc == 'r';
                 state.code.push(reg);
                 argcodes.push(kc);
                 // RPython `bhimpl_setfield_gc_{i,r,f}` canonical keys key
@@ -2028,6 +2047,7 @@ impl Assembler {
                 // (`/rid`) when wide (`assembler.py:99-107`, `setfield_gc`
                 // ∈ USE_C_FORM at `assembler.py`); a ref/float Constant
                 // takes its pooled `r`/`f` byte (`assembler.py:168`).
+                // `setfield_raw_*` is not in USE_C_FORM.
                 let value_kind = match value {
                     crate::model::LinkArg::Value(var) => {
                         let (reg, kc) = self.lookup_reg_with_kind_var(var, regallocs);
@@ -2040,7 +2060,11 @@ impl Assembler {
                         if kind == 'i' {
                             let (byte, argcode) = self.emit_const_i_from_const_allow_short(
                                 &c.value,
-                                use_c_form("setfield_gc_i"),
+                                use_c_form(if is_gc {
+                                    "setfield_gc_i"
+                                } else {
+                                    "setfield_raw_i"
+                                }),
                                 state,
                                 callcontrol,
                             );
@@ -2054,11 +2078,22 @@ impl Assembler {
                         kind
                     }
                 };
+                if !is_gc && value_kind == 'r' {
+                    panic!(
+                        "setfield_raw_r not supported (jtransform.py rewrite_op_setfield) \
+                         — graph {:?}",
+                        self.current_graph_name,
+                    );
+                }
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                let opname = format!("setfield_gc_{value_kind}");
+                let opname = if is_gc {
+                    format!("setfield_gc_{value_kind}")
+                } else {
+                    format!("setfield_raw_{value_kind}")
+                };
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -2172,6 +2207,12 @@ impl Assembler {
                 pure,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert!(
+                    kc == 'r' || kc == 'i',
+                    "getarrayitem base must be Ref (gc) or Int (raw), got {kc:?} — graph {:?}",
+                    self.current_graph_name,
+                );
+                let is_gc = kc == 'r';
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind_var(index, regallocs);
@@ -2221,15 +2262,27 @@ impl Assembler {
                 } else {
                     'v'
                 };
+                // `jtransform.py rewrite_op_getarrayitem`: `_gckind != 'gc'`
+                // emits `getarrayitem_raw_*` and strips `_pure`.  A
+                // `getarrayitem_raw_r` is refused.
+                if !is_gc && result_kind == 'r' {
+                    panic!(
+                        "getarrayitem_raw_r not supported \
+                         (jtransform.py rewrite_op_getarrayitem) — graph {:?}",
+                        self.current_graph_name,
+                    );
+                }
                 // `getarrayitem_gc_{i,r,f}_pure` for a foldable/immutable
                 // element load (`ll_getitem_foldable_nonneg`, rlist.py);
                 // `blackhole.py:1339-1341` aliases `bhimpl_getarrayitem_gc_*_pure
                 // = bhimpl_getarrayitem_gc_*`, so the `rid>X` argcodes are
                 // identical to the non-pure form — only the opname differs.
-                let opname = if *pure {
+                let opname = if is_gc && *pure {
                     format!("getarrayitem_gc_{result_kind}_pure")
-                } else {
+                } else if is_gc {
                     format!("getarrayitem_gc_{result_kind}")
+                } else {
+                    format!("getarrayitem_raw_{result_kind}")
                 };
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
@@ -2244,6 +2297,12 @@ impl Assembler {
                 nolength,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert!(
+                    kc == 'r' || kc == 'i',
+                    "setarrayitem base must be Ref (gc) or Int (raw), got {kc:?} — graph {:?}",
+                    self.current_graph_name,
+                );
+                let is_gc = kc == 'r';
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind_var(index, regallocs);
@@ -2279,7 +2338,11 @@ impl Assembler {
                         if kind == 'i' {
                             let (byte, argcode) = self.emit_const_i_from_const_allow_short(
                                 &c.value,
-                                use_c_form("setarrayitem_gc_i"),
+                                use_c_form(if is_gc {
+                                    "setarrayitem_gc_i"
+                                } else {
+                                    "setarrayitem_raw_i"
+                                }),
                                 state,
                                 callcontrol,
                             );
@@ -2310,9 +2373,20 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
+                if !is_gc && value_kind == 'r' {
+                    panic!(
+                        "setarrayitem_raw_r not supported \
+                         (jtransform.py rewrite_op_setarrayitem) — graph {:?}",
+                        self.current_graph_name,
+                    );
+                }
                 // RPython `bhimpl_setarrayitem_gc_{i,r,f}` keys off the
                 // value register's kind — same rationale as setfield_gc_*.
-                let opname = format!("setarrayitem_gc_{value_kind}");
+                let opname = if is_gc {
+                    format!("setarrayitem_gc_{value_kind}")
+                } else {
+                    format!("setarrayitem_raw_{value_kind}")
+                };
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -2328,6 +2402,16 @@ impl Assembler {
                 nolength,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                // `jtransform.py rewrite_op_getarraysize` asserts
+                // `ARRAY._gckind == 'gc'`.  An Int-bank base is not
+                // `arraylen_gc`.
+                assert_eq!(
+                    kc, 'r',
+                    "arraylen_gc base must use the Ref register bank \
+                     (blackhole.py bhimpl_arraylen_gc @arguments(\"cpu\", \"r\", \"d\", returns=\"i\")) \
+                     — graph {:?}",
+                    self.current_graph_name,
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 let len_offset = if *nolength { None } else { Some(0) };
@@ -7769,11 +7853,10 @@ mod tests {
         }
     }
 
-    /// `bhimpl_getfield_gc_*` declares the struct as `r`.  An Int-bank
-    /// base is `getfield_raw`, not a GC field load.
+    /// An Int-bank FieldRead is `getfield_raw`, matching
+    /// `jtransform.py rewrite_op_getfield` `_gckind == 'raw'`.
     #[test]
-    #[should_panic(expected = "getfield_gc base must use the Ref register bank")]
-    fn assemble_rejects_int_bank_getfield_gc_base() {
+    fn assemble_int_bank_field_read_emits_getfield_raw() {
         use crate::flatten::flatten_graph;
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
@@ -7806,6 +7889,16 @@ mod tests {
         let mut flat = flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.contains_key("getfield_raw_i/id>i"),
+            "Int-bank FieldRead must assemble as getfield_raw_i/id>i, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_gc_")),
+            "Int-bank FieldRead must not emit getfield_gc, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
     }
 
     /// `promote_gc_field_bases` rehomes a Signed GC FieldRead base so
