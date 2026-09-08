@@ -1493,19 +1493,20 @@ impl TranslationDriver {
         out
     }
 
-    /// Upstream `task_pyjitpl_lltype(self)` at `:347-363`.
+    /// Upstream `rpython/translator/driver.py TranslationDriver.task_pyjitpl_lltype`.
     ///
-    /// Cross-crate boundary note (TODO):
-    /// upstream `:359-360` calls
-    /// `rpython.jit.metainterp.warmspot.apply_jit`, which would map to
-    /// `majit_metainterp::warmspot::apply_jit`. `majit-translate` does
-    /// **not** depend on `majit-metainterp` (the dependency runs the
-    /// other way per `majit-metainterp/Cargo.toml`), so the call has no
-    /// in-crate path. Convergence: register the apply-jit hook from
-    /// `majit-metainterp` via a thread-local callback table once
-    /// `warmspot.rs` lands. Until then the body assembles every
-    /// upstream-shaped argument it can (`policy`, `backend_name`,
-    /// `inline=True`) and surfaces a TaskError citing `:358`.
+    /// The upstream task calls `warmspot.apply_jit`; the reverse dependency
+    /// from this crate to `majit-metainterp` would form a Cargo cycle. A
+    /// callback alone would not complete the port: production must consume
+    /// the interpreter graphs that `WarmRunnerDesc` prepares, including its
+    /// `split_graph_and_record_jitdriver` and `rewrite_jit_merge_point` passes.
+    /// `register_configured_jitdrivers` already copies and splits the portal graph when
+    /// requested, but pyre still traces runtime per-CodeObject JitCodes by
+    /// default. See `warmspot-portal.plan.md` for that consumer migration.
+    /// Complete the graph rewrites and their production consumers before
+    /// integrating the whole task; translator setup has no thread-local
+    /// state owner in upstream. Until then this body assembles the available
+    /// arguments and returns the explicit missing-task error below.
     pub fn task_pyjitpl_lltype(&self) -> Result<TaskOutput, TaskError> {
         let translator = self.translator.borrow().clone().ok_or_else(|| TaskError {
             message: "task_pyjitpl_lltype: translator slot is unset".to_string(),

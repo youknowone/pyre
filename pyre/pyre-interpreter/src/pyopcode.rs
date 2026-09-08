@@ -127,14 +127,10 @@ pub enum StepResult<V> {
     Continue,
     Return(V),
     CloseLoop {
-        /// The arguments [`ControlFlowOpcodeHandler::close_loop_args`]
-        /// supplied, carried as an `Option` so a handler that has none does
-        /// not have to build an empty `Vec` for the field.  The distinction
-        /// costs nothing at the reader — the back edge is the report itself,
-        /// and no consumer reads these — while an owned empty `Vec` costs an
-        /// allocation on every back edge and, in a jitcode, a residual call to
-        /// `Vec::new` that the translator has no binding for.
-        jump_args: Option<Vec<V>>,
+        /// The back edge's target pc.  `PyFrame.jump_absolute`
+        /// (`interp_jit.py`) reports a back edge by calling
+        /// `pypyjitdriver.can_enter_jit` with named greens and reds and
+        /// returning the pc; there is no argument vector at this layer.
         loop_header_pc: usize,
     },
     Yield(V),
@@ -523,18 +519,11 @@ pub trait TruthOpcodeHandler: SharedOpcodeHandler {
 pub trait ControlFlowOpcodeHandler: SharedOpcodeHandler {
     fn fallthrough_target(&mut self) -> usize;
     fn set_next_instr(&mut self, target: usize) -> Result<(), PyError>;
-    fn close_loop_args(&mut self, _target: usize) -> Result<Option<Vec<Self::Value>>, PyError> {
-        Ok(None)
-    }
-
-    fn close_loop(&mut self, target: usize) -> Result<StepResult<Self::Value>, PyError> {
-        match self.close_loop_args(target)? {
-            Some(args) => Ok(StepResult::CloseLoop {
-                jump_args: Some(args),
-                loop_header_pc: target,
-            }),
-            None => Ok(StepResult::Continue),
-        }
+    /// `PyFrame.jump_absolute` (`pyopcode.py`) — the non-JIT base returns the
+    /// pc and reports no back edge.  `PyFrame` overrides this with the
+    /// `interp_jit.py` form, which does.
+    fn close_loop(&mut self, _target: usize) -> Result<StepResult<Self::Value>, PyError> {
+        Ok(StepResult::Continue)
     }
 
     fn finish_value(&mut self, value: Self::Value) -> Result<StepResult<Self::Value>, PyError> {
@@ -2392,13 +2381,7 @@ where
     match step {
         StepResult::Continue => Ok(StepResult::Continue),
         StepResult::Return(value) => Ok(StepResult::Return(value)),
-        StepResult::CloseLoop {
-            jump_args,
-            loop_header_pc,
-        } => Ok(StepResult::CloseLoop {
-            jump_args,
-            loop_header_pc,
-        }),
+        StepResult::CloseLoop { loop_header_pc } => Ok(StepResult::CloseLoop { loop_header_pc }),
         StepResult::Yield(value) => Ok(StepResult::Yield(value)),
     }
 }
@@ -2656,13 +2639,7 @@ where
     match step {
         StepResult::Continue => Ok(StepResult::Continue),
         StepResult::Return(value) => Ok(StepResult::Return(value)),
-        StepResult::CloseLoop {
-            jump_args,
-            loop_header_pc,
-        } => Ok(StepResult::CloseLoop {
-            jump_args,
-            loop_header_pc,
-        }),
+        StepResult::CloseLoop { loop_header_pc } => Ok(StepResult::CloseLoop { loop_header_pc }),
         StepResult::Yield(value) => Ok(StepResult::Yield(value)),
     }
 }
@@ -3622,13 +3599,7 @@ pub fn execute_unsupported<E: OpcodeStepExecutor>(
     match step {
         StepResult::Continue => Ok(StepResult::Continue),
         StepResult::Return(value) => Ok(StepResult::Return(value)),
-        StepResult::CloseLoop {
-            jump_args,
-            loop_header_pc,
-        } => Ok(StepResult::CloseLoop {
-            jump_args,
-            loop_header_pc,
-        }),
+        StepResult::CloseLoop { loop_header_pc } => Ok(StepResult::CloseLoop { loop_header_pc }),
         StepResult::Yield(value) => Ok(StepResult::Yield(value)),
     }
 }

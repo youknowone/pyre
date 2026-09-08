@@ -2978,12 +2978,12 @@ impl WarmEnterState {
             "trace_limit" => self.trace_limit = DEFAULT_TRACE_LIMIT,
             "trace_eagerness" => self.set_param_trace_eagerness(DEFAULT_TRACE_EAGERNESS),
             "function_threshold" => self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD),
-            "max_inline_depth" => self.max_inline_depth = 10,
+            "max_inline_depth" => self.set_max_inline_depth(DEFAULT_MAX_INLINE_DEPTH),
             "retrace_limit" => self.memory_manager.retrace_limit = DEFAULT_RETRACE_LIMIT,
             "max_retrace_guards" => self.memory_manager.max_retrace_guards = 15,
             "max_unroll_loops" => self.memory_manager.max_unroll_loops = 0,
             "max_unroll_recursion" => {
-                self.memory_manager.max_unroll_recursion = DEFAULT_MAX_INLINE_DEPTH;
+                self.memory_manager.max_unroll_recursion = DEFAULT_MAX_UNROLL_RECURSION;
             }
             "loop_longevity" => self.memory_manager.set_max_age(1000, 0),
             "vectorize" => self.vectorize = false,

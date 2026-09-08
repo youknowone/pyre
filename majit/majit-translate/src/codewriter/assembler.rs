@@ -6472,10 +6472,57 @@ mod tests {
         assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
     }
 
-    /// Every spelling `front::mir` admits reaches the shell, and only a path
-    /// rooted at `core`/`std` (or short enough to have no root of its own)
-    /// does.  `synthetic_result_ctor_identity_accepts_qualified_spellings`
-    /// pins the same list on the producer side.
+    /// A shelled variant that is not `Result`/`Option` carries the inherited
+    /// tag as one of its own registry rows, so the generic walker produces the
+    /// flattened `heaptracker.all_fielddescrs` list — base field first, payload
+    /// after it — without the reconstruction `is_explicit_shell_variant_owner`
+    /// gates.  The payload must not claim slot 0: that is the slot the tag's
+    /// own descr claims, and a virtual keyed on `index_in_parent` would let the
+    /// payload store replace the tag store.
+    #[test]
+    fn a_shelled_variant_row_places_the_payload_past_the_inherited_tag() {
+        use crate::call::CallControl;
+
+        let owner = "pyopcode::StepResult::CloseLoop";
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            "pyopcode::StepResult".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("__discriminant".to_string(), "i64".to_string()),
+                ("loop_header_pc".to_string(), "i64".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+
+        assert!(
+            !is_explicit_shell_variant_owner(owner),
+            "this owner is served by the registry row, not by the reconstruction"
+        );
+        let spec = bh_size_spec_from_callcontrol(&cc, owner).expect("shelled variant size");
+        assert_eq!(spec.all_fielddescrs.len(), 2);
+        assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
+        assert_eq!(spec.all_fielddescrs[0].offset, 0);
+        assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
+        assert_eq!(spec.all_fielddescrs[1].field_key(), "loop_header_pc");
+        assert_eq!(spec.all_fielddescrs[1].offset, 8);
+        assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
+    }
+
+    /// The reconstruction gate covers the generic `Result`/`Option` shell
+    /// alone, in every spelling `front::mir` mints for it and no other.  It is
+    /// needed only there: the enum-root tag stays on the template while the
+    /// concrete payload row belongs to the instantiation, so no single registry
+    /// entry carries both and the tag slot has to be synthesized.  Every other
+    /// shelled variant registers its own inherited `__discriminant` row
+    /// (`front/mir.rs`) and takes the generic walker instead —
+    /// `a_shelled_variant_row_places_the_payload_past_the_inherited_tag`.
+    /// `synthetic_result_ctor_identity_accepts_qualified_spellings` pins the
+    /// same list on the producer side.
     #[test]
     fn the_shelled_variant_owners_are_every_rooted_spelling() {
         let _registry = register_struct_ids_serialized(standard_shell_struct_ids());

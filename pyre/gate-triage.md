@@ -249,12 +249,12 @@ build.
 | PYRE_FBW_INLINE_POISON | admits a callee the replay scan declined and refuses at the scan's poisoned pcs during the walk (`diag.rs fbw_inline_poison_enabled`) | when a refusal that follows an executed effect has a resume leg that neither repeats it nor drops it |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
 
-### §6b — VALUE knobs (17): config, not gates
+### §6b — VALUE knobs (16): config, not gates
 
 `PYRE_FBW_MULTIFRAME_DEPTH`,
 `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
-`PYRE_PORTAL_METATRACE_ENTRY`, `PYRE_PORTAL_METATRACE_SKIP`,
+`PYRE_PORTAL_METATRACE_SKIP`,
 `PYRE_CENSUS_TRACE_SIZE`, `PYRE_CENSUS_TRACE_SKIP`,
 `MAJIT_DTRACE_CONST_FROM`, `MAJIT_DTRACE_CONST_TO`,
 `MAJIT_TRACE_CALL_DIAG`, `MAJIT_TRACE_OPS_DIAG`,
@@ -281,12 +281,11 @@ consulted/fired tallies. `PYRE_WASM_SPEC_CENSUS` is that same readout on the
 wasm backend, where the guest reads no environment and the runner has to arm
 it through the `pyre_fbw_spec_census_enable` export instead.
 
-`PYRE_PORTAL_METATRACE_ENTRY` selects where the one-shot jd0 portal probe
-starts: `merge` (the default) seeds the merge-point registers and `start`
-enters at pc 0 with the portal's declared arguments.  The numeric
-`PYRE_PORTAL_METATRACE_SKIP` value selects how many cached-loop back-edges the
-probe passes before firing; it defaults to zero.  Neither has an effect unless
-the probe in §6c is enabled.
+The numeric `PYRE_PORTAL_METATRACE_SKIP` value selects how many admitted
+back-edges the probe passes before firing; it defaults to zero and has no
+effect unless the probe in §6c is enabled. The former
+`PYRE_PORTAL_METATRACE_ENTRY` knob is retired: the probe requires a split
+portal and enters at pc 0 through `initialize_state_from_start`.
 
 ### §6c — Default-OFF diagnostics, censuses and probes (74): keep, cost nothing
 
@@ -382,11 +381,14 @@ read: `PYRE_FBW_CENSUS` finds the walks that ended `committed=false` with
 unrecoverable effects, and this one says which residual decline put them there.
 It goes when the flag carries its own provenance.
 
-`PYRE_PORTAL_METATRACE` drives one Stage-0 `JitCodeMachine` walk over the
-build-time jd0 portal jitcode after the selected cached-loop back-edge and
-prints the `[jd0-mt]` summary.  It is unset by default and exists to inspect
-the portal split and entry seeding; it goes with that investigation once the
-ordinary warmspot path owns the same coverage.
+`PYRE_PORTAL_METATRACE` drives one metainterp-owned walk over the build-time
+jd0 portal jitcode after the selected admitted back-edge and prints the
+`[jd0-mt]` summary. It requires a `PYRE_PORTAL_SPLIT=1` build. An aborted walk
+finishes its live MIFrames through the blackhole before returning to the
+native portal; an incomplete generated instruction is a failed probe, not
+permission to replay its Python opcode. Terminal-return and compiled-exit
+coverage are still prerequisites for enabling this path in ordinary warmstate.
+It is unset by default and retires when that migration completes.
 
 `PYRE_LOOP_CENSUS` prints one `[loop-census] <arm> <name>` line per compiled
 trace, naming it through `get_printable_location` — the JitDriver green-key

@@ -217,6 +217,20 @@ fn portal_jit_merge_point_graph_args(
     // that per-SpaceOp Variable here so the canonical
     // `flatten_graph` driver sees no unresolved `Opaque(Ref)`
     // constants.
+    //
+    // Deviation: the `is_being_profiled` green is the constant `0`, while
+    // `pypyjit/interp_jit.py PyFrame.dispatch` hoists
+    // `self.get_is_being_profiled()` and passes the live flag. The runtime
+    // green-key producers pass the live flag too
+    // (`make_green_key(code_ptr, pc, is_being_profiled)` at eval.rs, and
+    // `frame.get_is_being_profiled()` at call_jit.rs). The per-code walker
+    // builds its key from `WalkSession::is_being_profiled` instead of this
+    // operand, although its debug merge point does record the emitted list.
+    // The canonical machine consumes the whole list through
+    // `TraceCtx::merge_point_green_key`; routing these per-code bodies through
+    // it therefore requires a live operand first. The generated interpreter
+    // portal carries the live flag already; migrating to that graph removes
+    // this duplicated marker producer and the walk-session substitution.
     let greens = vec![
         super::flow::Constant::signed(next_instr as i64).into(),
         super::flow::Constant::signed(0).into(),

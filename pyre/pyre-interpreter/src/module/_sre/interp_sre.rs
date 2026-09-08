@@ -1155,14 +1155,22 @@ fn do_match(
     // both the slice and the match this returns.
     let _roots = pyre_object::gc_roots::push_roots();
     let (subj, w_buffer) = make_subject(pat, string)?;
-    let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_buffer);
+    // `subx` pins the subject and reloads it at the stamp; a match writes both
+    // the subject and this gathered buffer into traced fields, so both come
+    // back off the shadow stack rather than out of the locals.
+    let base = pyre_object::gc_roots::pin_roots(&[string, w_buffer]);
+    let string = || pyre_object::gc_roots::shadow_stack_get(base);
+    let w_buffer = || pyre_object::gc_roots::shadow_stack_get(base + 1);
 
     let (pos, endpos) = normalize_bounds(
         subj.len(),
         arg_int_kw(args, 2, kwargs, "pos", 0)?,
         arg_int_kw(args, 3, kwargs, "endpos", i64::MAX)?,
     );
+    // `pos`/`endpos` ran `__index__`. Reload the subject from the
+    // rooted objects so a moving collection during that conversion
+    // cannot leave `subj` pointing into a reclaimed gathered buffer.
+    let subj = unsafe { subject_of(string(), w_buffer()) };
 
     let (matched, state) = match subj {
         Subject::AsciiStr(b) | Subject::Bytes(b) => {
@@ -1177,8 +1185,8 @@ fn do_match(
     if matched {
         Ok(make_match(
             pat,
-            string,
-            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+            string(),
+            w_buffer(),
             &state,
             pos as i64,
             endpos as i64,
@@ -1376,18 +1384,21 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // them as its `_buffer`.
     let _roots = pyre_object::gc_roots::push_roots();
     let (subj, w_buffer) = make_subject(pat, string)?;
-    let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_buffer);
+    // Same pair `do_match` pins: the scanner stamps both, and the bound
+    // conversions below run `__index__` first.
+    let base = pyre_object::gc_roots::pin_roots(&[string, w_buffer]);
+    let string = || pyre_object::gc_roots::shadow_stack_get(base);
+    let w_buffer = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let (pos, endpos) = normalize_bounds(
         subj.len(),
         arg_int_kw(args, 2, kwargs, "pos", 0)?,
         arg_int_kw(args, 3, kwargs, "endpos", i64::MAX)?,
     );
-    let export_active = unsafe { crate::builtins::buffer_export_incref(string) };
+    let export_active = unsafe { crate::builtins::buffer_export_incref(string()) };
     let scanner = w_sre_scanner_new(
         pat,
-        string,
-        pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+        string(),
+        w_buffer(),
         pos as i64,
         endpos as i64,
         export_active,

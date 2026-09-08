@@ -2879,19 +2879,11 @@ pub enum DispatchError {
     /// through pyre's abort ceiling, so the permanent mapping records the
     /// structural nature of this abort without changing runtime behavior.
     BranchGuardUnrestorableKeptStackPermanent { pc: usize },
-    /// `pyjitpl.py opimpl_jit_force_quasi_immutable`: the mutate
-    /// field was already non-null when the walk reached a write that bumps the
-    /// guarded version, so the tracer forced the invalidation itself and
-    /// abandons the attempt (`raise SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`).
+    /// `opimpl_jit_force_quasi_immutable`: the watcher was installed when the
+    /// walk reached a write that invalidates it, so the tracer forces the
+    /// watcher and raises `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`.
     ///
-    /// Carried as a typed error rather than a `SwitchToBlackhole` OUTCOME so it
-    /// reaches the abort-pc flush leg: upstream's blackhole resumes at the
-    /// `-live-` in front of the write with every earlier residual already
-    /// applied, and pyre's only equivalent is committing the walk and resuming
-    /// the interpreter AT the enclosing Python opcode.  An `Ok` outcome falls
-    /// through to the plain `Abort`, whose journal rollback replays the walked
-    /// region from its start and re-executes every residual the walk already
-    /// ran (`pickle_terminal_raise_resume` is the corpus detector).
+    /// `pc` is the next operation to execute after that synthetic marker.
     ForceQuasiImmutable { pc: usize },
     /// A residual call to a pure-Python callee that is inline-eligible
     /// (plain, exact-positional, closure-free, not recursion-bound) but
@@ -3142,12 +3134,7 @@ impl DispatchError {
                     blackhole_required: true,
                     ..
                 }
-                // The direct counterpart of `pyjitpl.py:1116`
-                // `raise SwitchToBlackhole(Counters.ABORT_FORCE_QUASIIMMUT)`:
-                // taken with the registers bound, after `do_force_quasi_immutable`
-                // already ran.  Classified here for what it is; the general leg
-                // still steps aside for it, because it owns a narrower one that
-                // resumes AT the forcing opcode (`flush_qmut_abort_state`).
+                // Forcing the watcher leaves every register bound.
                 | Self::ForceQuasiImmutable { .. }
                 // Emitted only after both segment-cut blackhole preflights
                 // succeed. The missing guard snapshot affects compilation of

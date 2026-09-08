@@ -3682,6 +3682,67 @@ mod tests {
         majit_ir::descr::register_struct_ids(std::collections::HashMap::new());
     }
 
+    /// The `super` edge is not `Result`/`Option`-only: every payload enum
+    /// whose host layout would seat a payload on the tag gets the same
+    /// explicit shell, so the same inherited-tag slot appears under a
+    /// pyre-interpreter variant owner.  It carries exactly one field —
+    /// the base's synthetic `__discriminant` — and nothing else crosses it.
+    #[test]
+    fn slot_identity_accepts_the_inherited_tag_of_any_shelled_enum() {
+        // `with_parent_descr` downgrades to a `Weak`, so the parents are
+        // returned alongside and held for the length of the test.
+        // Cache keys must be the producer-canonical identities
+        // `variant_inherits_enum_tag` requires (`StructId::from_canonical_spelling`).
+        let descr = |size: usize, owner: &str, key: &str| {
+            let mut size_descr = majit_ir::descr::SimpleSizeDescr::new(0, size, 1);
+            size_descr
+                .set_cache_key(majit_ir::descr::StructId::from_canonical_spelling(owner).as_u64());
+            let parent = Arc::new(size_descr) as DescrRef;
+            let field = majit_ir::SimpleFieldDescr::new_with_name(
+                0,
+                0,
+                8,
+                Type::Int,
+                false,
+                majit_ir::ArrayFlag::Signed,
+                format!("{owner}.{key}"),
+                key.to_string(),
+            )
+            .with_parent_descr(parent.clone(), 0);
+            (field, parent)
+        };
+
+        let (slot, _slot_parent) = descr(24, "pyopcode::StepResult::CloseLoop", "__discriminant");
+        let (inherited, _base_parent) = descr(8, "pyopcode::StepResult", "__discriminant");
+        assert!(
+            slot_holds_field(&slot, &inherited),
+            "the inherited tag of a shelled pyre enum must identify the variant's slot 0"
+        );
+
+        // Only the tag crosses the edge.  A payload field belongs to the
+        // variant subclass alone, so a base-owned descr spelling the same key
+        // is a different `(STRUCT, fieldname)` and must not match.
+        let (payload_slot, _payload_parent) =
+            descr(24, "pyopcode::StepResult::CloseLoop", "payload");
+        let (base_owned_payload, _base_payload_parent) =
+            descr(8, "pyopcode::StepResult", "payload");
+        assert!(
+            !slot_holds_field(&payload_slot, &base_owned_payload),
+            "a non-tag field must not be admitted across the inheritance edge"
+        );
+
+        // The runtime spelling aliases the shell was first written for still
+        // reconcile: `struct_template_id_for_name` is a build-only registry,
+        // so `core::option::Option` and `option::Option` are recovered by name.
+        let (alias_slot, _alias_slot_parent) =
+            descr(16, "core::option::Option<i64>::Some", "__discriminant");
+        let (alias_base, _alias_base_parent) = descr(8, "option::Option<i64>", "__discriminant");
+        assert!(
+            slot_holds_field(&alias_slot, &alias_base),
+            "the crate-stripped alias of the standard-library shell must still reconcile"
+        );
+    }
+
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
             // Type-tag op.pos so `opref_type` priority 0

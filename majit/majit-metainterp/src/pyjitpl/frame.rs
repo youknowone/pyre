@@ -180,7 +180,7 @@ impl MIFrame {
         // resume paths can construct a frame without immediately
         // interning constants into a `TraceCtx`.
         //
-        // `MetaInterp::newframe`, `trace_jitcode_with_framestack`,
+        // `MetaInterp::newframe`, `interpret`,
         // `trace_jitcode`, and inline-call dispatch should call
         // `MIFrame::setup(...)` below, which mirrors the rest of
         // `pyjitpl.py:74-95`.

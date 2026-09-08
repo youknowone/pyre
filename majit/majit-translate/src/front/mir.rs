@@ -1845,10 +1845,10 @@ fn derive_program_metadata(
                 // every such enum instead of the two that were noticed.
                 //
                 // `pyre_interpreter::pyopcode::StepResult` — what every opcode
-                // handler returns — is one of them.  Charon gives
-                // `CloseLoop.jump_args` and `Return.__pos_0` offset 0, the tag's
-                // own offset, so `close_loop`'s jitcode stamped discriminant 2
-                // and then overwrote it with `jump_args`; `execute_jump_backward`
+                // handler returns — is one of them.  Charon gave `CloseLoop`'s
+                // payload field and `Return.__pos_0` offset 0, the tag's own
+                // offset, so `close_loop`'s jitcode stamped discriminant 2 and
+                // then overwrote it with the payload; `execute_jump_backward`
                 // read the null back as tag 0 and reported `Continue`, and the
                 // portal took its `Continue` arm on every back edge.  A walk of
                 // the portal could therefore never reach `loop_header`, and no
@@ -1936,6 +1936,25 @@ fn derive_program_metadata(
                             Vec::with_capacity(v.fields.len());
                         let mut voffsets: std::collections::HashMap<String, u64> =
                             std::collections::HashMap::new();
+                        // `rclass.InstanceRepr._setup_repr` declares a subclass as
+                        // `MkStruct(name, ('super', rbase.object_type), *llfields)`, so
+                        // `heaptracker.all_fielddescrs` walks the embedded base FIRST and
+                        // an inherited field keeps the same index in the subclass as in
+                        // the base.  A shelled variant inherits exactly one field — the
+                        // base's synthetic `__discriminant` at byte 0 — so register it as
+                        // this subclass's own first row.  Without it the payload row takes
+                        // slot 0, the same slot the tag's own descr claims, and a virtual's
+                        // payload store replaces the tag store it is keyed against.
+                        // A payload-less variant is skipped: a lone `__discriminant` row is
+                        // the sentinel `StructFieldRegistry::is_enum_base` reads to tell a
+                        // base from a subclass.
+                        if explicit_sum_shell && !v.fields.is_empty() {
+                            vrows.push((
+                                "__discriminant".to_string(),
+                                discr_ty.unwrap_or("i64").to_string(),
+                            ));
+                            voffsets.insert("__discriminant".to_string(), 0);
+                        }
                         for (i, f) in v.fields.iter().enumerate() {
                             let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
                             // A bytecode-arg marker reads as a `u32` at runtime
@@ -31847,6 +31866,123 @@ mod tests {
             super::tyref_to_value_type(&mixed_ty, &llbc),
             ValueType::Ref(_)
         ));
+    }
+
+    /// `rclass.InstanceRepr._setup_repr` declares a subclass as
+    /// `MkStruct(name, ('super', rbase.object_type), *llfields)`, so
+    /// `heaptracker.all_fielddescrs` walks the embedded base first and the
+    /// inherited field holds the same index in the subclass as in the base.
+    /// A shelled variant's one inherited field is the base's synthetic
+    /// `__discriminant`, so it must be the variant subclass's own first row —
+    /// otherwise the payload row claims slot 0, the slot the tag's descr also
+    /// claims, and a virtual's payload store replaces the tag store.
+    ///
+    /// A payload-less variant registers no rows at all: a lone
+    /// `__discriminant` row is the sentinel `StructFieldRegistry::is_enum_base`
+    /// reads to tell an enum base from a variant subclass.
+    #[test]
+    fn a_shelled_variant_carries_the_inherited_discriminant_as_its_first_row() {
+        let span = || {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }})
+        };
+        let item_meta = |name: &str| {
+            serde_json::json!({
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": [name, 0]}
+                ],
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let int_field = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "ty": {"Literal": {"Int": "I64"}},
+                "attr_info": null
+            })
+        };
+        let variant = |name: &str, fields: Vec<serde_json::Value>, discriminant: u64| {
+            serde_json::json!({
+                "name": name,
+                "fields": fields,
+                "discriminant": {"Scalar": {"Unsigned": ["U8", discriminant.to_string()]}}
+            })
+        };
+        // No `layout` entry at all — the case that hid this defect.  The
+        // variant offsets then fall back to packing from byte 0, which is the
+        // inherited discriminant's byte, so `payload_seats_on_tag` takes its
+        // `None` arm and the enum is shelled.
+        let step = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta("Step"),
+            "kind": {"Enum": [
+                variant("Continue", vec![], 0),
+                variant(
+                    "CloseLoop",
+                    vec![int_field("loop_header_pc")],
+                    1
+                )
+            ]},
+            "layout": []
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [step],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let (_, _, fields, _, _, _, exact_layouts, _) = super::derive_program_metadata(&llbc);
+
+        assert_eq!(
+            fields.fields.get("fixture::Step::CloseLoop"),
+            Some(&vec![
+                ("__discriminant".to_string(), "i64".to_string()),
+                ("loop_header_pc".to_string(), "i64".to_string()),
+            ]),
+            "the payload rows must follow the inherited tag, not start at slot 0"
+        );
+        assert_eq!(
+            fields.fields.get("Step::CloseLoop"),
+            fields.fields.get("fixture::Step::CloseLoop"),
+            "the dual-published spellings must carry the same rows"
+        );
+        assert_eq!(
+            fields.fields.get("fixture::Step::Continue"),
+            Some(&vec![]),
+            "a payload-less variant inherits nothing to seat and stays row-free"
+        );
+        assert_eq!(
+            fields.fields.get("fixture::Step"),
+            Some(&vec![("__discriminant".to_string(), "i64".to_string())]),
+            "the base still carries the tag alone"
+        );
+
+        let variant_sid = majit_ir::descr::StructId::from_canonical("Step::CloseLoop");
+        let offsets = &exact_layouts
+            .get(&variant_sid)
+            .expect("shelled variant registers an exact layout")
+            .field_offsets;
+        assert_eq!(offsets.get("__discriminant"), Some(&0));
+        assert_eq!(offsets.get("loop_header_pc"), Some(&8));
     }
 
     /// An `ArrayRead` element is addressable two ways: a scalar names its

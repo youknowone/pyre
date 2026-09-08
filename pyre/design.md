@@ -350,9 +350,15 @@ layers, unevenly:
   `rewrite_set_param_and_get_stats`, `rewrite_force_virtual`,
   `rewrite_force_quasi_immutable`, `add_finish`, `make_driverhook_graphs`,
   `create_jit_entry_points`) together with `inline_inlineable_portals` and
-  `prejit_optimizations` — and those are blocked by pyre having no mutable
-  graph-rewriting stage over the interpreter's own graphs at that point in the
-  pipeline, which is the A1 debt the next bullet names, not by crate layering.
+  `prejit_optimizations`. Mutable graph rewriting now exists in
+  `majit-translate::register_configured_jitdrivers`: with `PYRE_PORTAL_SPLIT=1`, it copies
+  and splits the interpreter graph before its merge point, following
+  `WarmRunnerDesc.split_graph_and_record_jitdriver`. This does not yet supply
+  `rewrite_jit_merge_point`'s original-portal/runner rewrite or move production
+  tracing onto the split graph. The remaining boundary is the consumers of
+  those graphs and the outstanding rewrite passes, not crate layering or a
+  complete absence of mutable graphs. `warmspot-portal.plan.md` records the
+  subsequent split-portal probes and their remaining runtime dependencies.
 - **A second codewriter runs at runtime.** majit-translate's
   `transform_graph_to_jitcode` consumes a `FunctionGraph` once per build;
   pyre-jit's `transform_graph_to_jitcode` consumes a user `CodeObject`, is

@@ -1,7 +1,10 @@
-# pyre-check: max-pypy-ratio=19
+# pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
-# cpython 2.16s vs pyre 0.25s (8.6x on the ubuntu runner), and it is not
-# gated on — only pypy is.
+# Topology matches pypy (8 loops, 0 bridges). Native ratios: darwin
+# 0.9-1.2x, ubuntu 2.2-2.5x (main's own ubuntu jobs are 2.2-2.3x). 3
+# covers the ubuntu cranelift 2.5x reading; 2 does not. Floor is 0.5x
+# so darwin 0.9x still passes. A 6x ceiling would put the derived
+# floor at 1x. cpython is not gated on — only pypy is.
 # Exercises JIT global-cache invalidation, for both cell kinds.
 #
 # `run_int` reads a module global reassigned to another int between calls: the

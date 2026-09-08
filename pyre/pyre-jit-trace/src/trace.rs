@@ -4916,47 +4916,12 @@ fn run_perfn_walk<Sym: WalkSym>(
         if segment_adopted && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some() {
             crate::jitcode_dispatch::census_record("SegmentTrace::AdoptedWithFinish");
         }
-        // Every OTHER aborting error is the same situation: the walk executed
-        // residuals concretely and then stopped, so replaying the region from
-        // the trace entry re-applies those effects.  `convert_and_run_from_
-        // pyjitpl` (`blackhole.py:1799`) finishes the frames instead, which is
-        // what the latch staged.
-        //
-        // Four classes keep their own, more precise recovery and are excluded
-        // so this general leg cannot pre-empt them:
-        // `VableEscapedDuringResidualCall` latches a narrower resume-marker
-        // image and has an escape-pc fallback (arm below);
-        // `LoopBearingCalleeInlineUnsupported { blackhole_required: false }`
-        // and `AbortPermanentMarkerReached` route to the gh#467 CALL-forward
-        // carrier, which resumes the OUTER frame at its CALL rather than
-        // inside the discarded callee attempt.  The nested-residual variant
-        // marked `blackhole_required: true` is the one this leg owns, and only
-        // once the walk has actually executed something: that is the whole
-        // claim the flag makes — residuals ran that a rewind-to-the-CALL would
-        // repeat — and it carries a complete per-frame image.  It stays here
-        // only because the drive now publishes each returning level's
-        // `frame_finished_execution` (`on_leave_level`); before that a frame
-        // outliving the call read back as still executing, which
-        // `parity_tests/jit_inline_traceback_frame_clear.py` catches on
-        // `sys._getframe().clear()` once the loop compiles.
-        // `ForceQuasiImmutable` resumes AT the forcing opcode via
-        // `flush_qmut_abort_state` (arm below), which re-runs the write the
-        // walk stopped in front of instead of finishing the frame past it.
-        //
-        // And only for an abort whose image is COMPLETE
-        // (`DispatchError::leaves_complete_image`).  Pyre's walker has a whole
-        // family of aborts upstream has no counterpart for — the abort IS the
-        // report that a register / concrete / descr could not be resolved — and
-        // for those the MIFrame the latch would build is missing exactly the
-        // value the blackhole resumes on.  Measured over the 353 synth
-        // fixtures with the classification removed, 351 are unchanged and two
-        // break: `list_length_hint_validate` adopts its one
-        // `RegisterReadUnbound` walk (`pc=456 reg=3 bank=r`) and underflows the
-        // operand stack, and `getframe_while_subwalk_decline_shapes` — a
-        // fixture pinned precisely so that "the decline stays a decline rather
-        // than silently becoming a wrong answer" — adopts an inline-escape
-        // shape whose caller banks are incomplete and dies on an unwired
-        // blackhole opcode.
+        // A complete abort image can continue the frames that the walk already
+        // advanced, avoiding entry replay of their concrete residual effects.
+        // Errors with missing live values are excluded by
+        // `leaves_complete_image`; the cases below have narrower recovery and
+        // must not be pre-empted here.  Root qmut uses its one-frame flush,
+        // while inline qmut belongs here because it captured the full stack.
         let walk_abort_adopted = !trace_too_long_adopted
             && !segment_adopted
             && matches!(&walk_result, Err(error) if error.leaves_complete_image()
@@ -4968,8 +4933,11 @@ fn run_perfn_walk<Sym: WalkSym>(
                         blackhole_required: false,
                         ..
                     }
-                    | crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
-            ))
+            )
+            && (!matches!(
+                error,
+                crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
+            ) || session.borrow().abort_in_subwalk))
             && walk_abort_leg_enabled()
             && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::WalkAbort);
         if walk_abort_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -5370,17 +5338,10 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
         }
 
-        // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` (pyjitpl.py:1116) landed
-        // as a resume, not a replay.  Upstream's blackhole picks up at the
-        // `-live-` in front of the forcing write with every earlier residual
-        // already applied and never re-runs one; the walker's equivalent is to
-        // keep the journal and resume the interpreter AT the Python opcode the
-        // write belongs to, which has not run yet (the abort fires before the
-        // residual executes).  Falling through to the plain `Abort` instead
-        // rolls the journal back and replays the walked region from its start,
-        // re-executing every residual the walk already ran.
-        if let Err(crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { pc }) =
-            &walk_result
+        // Inline qmut is consumed by the framestack handoff above.
+        if !walk_abort_adopted
+            && let Err(crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { pc }) =
+                &walk_result
         {
             let abort_jit_pc = *pc;
             // A recorded-but-unexecuted residual is applied only by the replay
