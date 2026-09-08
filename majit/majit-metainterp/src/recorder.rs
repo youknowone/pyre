@@ -465,88 +465,79 @@ impl Trace {
         }
     }
 
+    /// `_list_of_boxes` from tagged snapshot values, encoding each box
+    /// into `_snapshot_array_data` the way `opencoder.py _add_box_to_storage`
+    /// does — no intermediate `Vec<i64>`.
+    fn write_tagged_array(&mut self, boxes: &[SnapshotTagged]) -> i64 {
+        let res = self
+            .trb
+            .as_mut()
+            .expect("write_tagged_array requires attach_byte_buffer")
+            .new_array(boxes.len());
+        for &tagged in boxes {
+            let b = self.snapshot_tagged_to_box(tagged);
+            self.trb
+                .as_mut()
+                .expect("write_tagged_array requires attach_byte_buffer")
+                ._add_box_to_storage_box(b);
+        }
+        res
+    }
+
     /// `opencoder.py create_top_snapshot` / `create_snapshot` from a
     /// structured `Snapshot`. Sequential id is the live
     /// `rd_resume_position`; the byte offset lives in `snapshot_offsets`.
     pub fn encode_captured_snapshot(&mut self, snapshot: &Snapshot) -> i32 {
         let id = self.snapshot_offsets.len() as i32;
         let py_pcs: Vec<u32> = snapshot.frames.iter().map(|f| f.py_pc).collect();
-        let vable: Vec<OcBox> = snapshot
-            .vable_boxes
-            .iter()
-            .copied()
-            .map(|t| self.snapshot_tagged_to_box(t))
-            .collect();
-        let vref: Vec<OcBox> = snapshot
-            .vref_boxes
-            .iter()
-            .copied()
-            .map(|t| self.snapshot_tagged_to_box(t))
-            .collect();
-        let frame_boxes: Vec<Vec<OcBox>> = snapshot
-            .frames
-            .iter()
-            .map(|f| {
-                f.boxes
-                    .iter()
-                    .copied()
-                    .map(|t| self.snapshot_tagged_to_box(t))
-                    .collect()
-            })
-            .collect();
-        let frame_meta: Vec<(i64, i64)> = snapshot
-            .frames
-            .iter()
-            .map(|f| (Self::encode_jitcode_index(f.jitcode_index), i64::from(f.pc)))
-            .collect();
-
-        let trb = self
-            .trb
-            .as_mut()
-            .expect("encode_captured_snapshot requires attach_byte_buffer");
-        let encode_boxes = |trb: &mut TraceRecordBuffer, boxes: &[OcBox]| -> Vec<i64> {
-            boxes.iter().copied().map(|b| trb._encode(b)).collect()
-        };
 
         // Write `_snapshot_data` only. `create_top_snapshot` also patches
         // the last op's descr slot (`opencoder.py`); that slot is the
         // RPython resume position. Live pyre keeps the sequential id on
         // `FrontendSlot.resume` and must not rewrite a later non-guard's
         // trailing bytes as if they were the placeholder.
-        let offset = if frame_meta.is_empty() {
-            let vable_t = encode_boxes(trb, &vable);
-            let vref_t = encode_boxes(trb, &vref);
+        let offset = if snapshot.frames.is_empty() {
+            let empty_array = self.write_tagged_array(&[]);
+            let vable_array = self.write_tagged_array(&snapshot.vable_boxes);
+            let vref_array = self.write_tagged_array(&snapshot.vref_boxes);
+            let trb = self
+                .trb
+                .as_mut()
+                .expect("encode_captured_snapshot requires attach_byte_buffer");
             trb._total_snapshots += 1;
             let s = trb._snapshot_data.len() as i64;
-            let empty_array = trb._list_of_boxes(&[]);
-            let vable_array = trb._list_of_boxes_virtualizable(&vable_t);
-            let vref_array = trb._list_of_boxes(&vref_t);
             trb.append_snapshot_data_int(vable_array);
             trb.append_snapshot_data_int(vref_array);
             trb._encode_snapshot(-1, 0, empty_array, true);
             s
         } else {
-            let last = frame_meta.len() - 1;
-            let inner = encode_boxes(trb, &frame_boxes[last]);
-            let array = trb._list_of_boxes(&inner);
-            let vable_t = encode_boxes(trb, &vable);
-            let vref_t = encode_boxes(trb, &vref);
-            trb._total_snapshots += 1;
-            let s = trb._snapshot_data.len() as i64;
-            let vable_array = trb._list_of_boxes(&vable_t);
-            let vref_array = trb._list_of_boxes(&vref_t);
-            trb.append_snapshot_data_int(vable_array);
-            trb.append_snapshot_data_int(vref_array);
-            trb._encode_snapshot(
-                frame_meta[last].0,
-                frame_meta[last].1,
-                array,
-                frame_meta.len() == 1,
-            );
+            let last = snapshot.frames.len() - 1;
+            let array = self.write_tagged_array(&snapshot.frames[last].boxes);
+            let vable_array = self.write_tagged_array(&snapshot.vable_boxes);
+            let vref_array = self.write_tagged_array(&snapshot.vref_boxes);
+            let jitcode = Self::encode_jitcode_index(snapshot.frames[last].jitcode_index);
+            let pc = i64::from(snapshot.frames[last].pc);
+            let is_last = snapshot.frames.len() == 1;
+            let s = {
+                let trb = self
+                    .trb
+                    .as_mut()
+                    .expect("encode_captured_snapshot requires attach_byte_buffer");
+                trb._total_snapshots += 1;
+                let s = trb._snapshot_data.len() as i64;
+                trb.append_snapshot_data_int(vable_array);
+                trb.append_snapshot_data_int(vref_array);
+                trb._encode_snapshot(jitcode, pc, array, is_last);
+                s
+            };
             for i in (0..last).rev() {
-                let tagged = encode_boxes(trb, &frame_boxes[i]);
-                let array = trb._list_of_boxes(&tagged);
-                trb.create_snapshot(frame_meta[i].0, frame_meta[i].1, array, i == 0);
+                let array = self.write_tagged_array(&snapshot.frames[i].boxes);
+                let jitcode = Self::encode_jitcode_index(snapshot.frames[i].jitcode_index);
+                let pc = i64::from(snapshot.frames[i].pc);
+                self.trb
+                    .as_mut()
+                    .expect("encode_captured_snapshot requires attach_byte_buffer")
+                    .create_snapshot(jitcode, pc, array, i == 0);
             }
             s
         };
