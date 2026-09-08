@@ -5174,9 +5174,10 @@ impl PyFrame {
         if !self.w_yielding_from.is_null() {
             released.push(majit_ir::GcRef(self.w_yielding_from as usize));
         }
-        if !self.f_backref.is_null() {
-            released.push(majit_ir::GcRef(self.f_backref as usize));
-        }
+        // `f_backref` is the caller frame, still on the stack.  CPython's
+        // refcount drop is only the generator frame's own locals;
+        // walking the caller here treats live test-method objects as
+        // released and forces a heap collect on every `close()`.
         if let Some(debug) = self.getdebug_data() {
             released.extend(
                 [debug.w_locals, debug.w_extra_locals, debug.w_f_trace]

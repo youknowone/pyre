@@ -6269,9 +6269,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     fn scandir_iter_mark_closed(self_obj: PyObjectRef) {
         // `W_ScandirIterator._close` clears the state inspected by
         // `_finalize_`, whether closure is explicit or due to exhaustion.
+        // `dirp` is already gone on this eager iterator, so the queued
+        // finalizer is a no-op; `may_ignore_finalizer` is the same answer
+        // the prompt-finalization census needs so `gen.close()` does not
+        // collect the whole heap for an already-closed scandir.
         let _ = with_scandir_iter(self_obj, |iterator| {
             iterator.open = false;
         });
+        crate::executioncontext::may_ignore_finalizer(self_obj);
     }
     fn scandir_iter_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         scandir_iter_mark_closed(args[0]);

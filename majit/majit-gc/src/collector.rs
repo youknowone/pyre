@@ -7603,15 +7603,16 @@ impl MiniMarkGC {
     /// unreachable, but it need not collect when that graph contains no
     /// registered finalizer at all.  Walk the same traced edges as marking and
     /// use inspector.py's `GCFLAG_EXTRA` visited bit, restoring every bit
-    /// before returning.  This is a conservative prefilter: rawrefcount can
-    /// run external deallocators whose ownership graph is not represented by
-    /// these fields, so an enabled rawrefcount bridge always keeps the sweep.
+    /// before returning.  An enabled rawrefcount bridge keeps the sweep only
+    /// when a reached object itself has a mirror — a process-wide rrc flag
+    /// is not a per-graph witness.
     pub fn do_subgraph_has_pending_finalizer(&self, roots: &[GcRef]) -> bool {
-        if self.registered_finalizer_count() == 0 {
-            return self.rawrefcount_enabled();
-        }
-        if self.rawrefcount_enabled() {
-            return true;
+        // A process-wide rawrefcount bridge is not a witness that *this*
+        // released graph can run a death callback.  Walking the same edges
+        // as marking, an enabled rrc only keeps the sweep when a reached
+        // object itself has a mirror (`rawrefcount_from_obj`).
+        if self.registered_finalizer_count() == 0 && !self.rawrefcount_enabled() {
+            return false;
         }
 
         let mut pending = Vec::new();
@@ -7627,6 +7628,8 @@ impl MiniMarkGC {
                     && !(*hdr).has_flag(GcFlags::FINALIZER_RUN)
                     && !(*hdr).has_flag(GcFlags::GCFLAG_IGNORE_FINALIZER)
             } {
+                found = true;
+            } else if self.rawrefcount_enabled() && self.rawrefcount_from_obj(obj.0) != 0 {
                 found = true;
             }
             self.visit_referents(obj.0, &mut |child| self.heap_dump_add(child, &mut pending));
@@ -15421,6 +15424,13 @@ cache size\t: 8192 kB\n";
         unsafe { *(holder.0 as *mut GcRef) = finalizable };
         GcAllocator::register_finalizer(&mut gc, 0, finalizable, trigger);
 
+        assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated]));
+        assert!(gc.do_subgraph_has_pending_finalizer(&[holder]));
+        gc.rawrefcount_init(rrc_test_trigger);
+        assert!(
+            gc.rawrefcount_enabled(),
+            "rrc must not make an unrelated subgraph look finalizable"
+        );
         assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated]));
         assert!(gc.do_subgraph_has_pending_finalizer(&[holder]));
         // The inspector visited bit is scratch state, not a semantic mark.
