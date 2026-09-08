@@ -4216,10 +4216,11 @@ fn new_inline_nursery_member(
     na: &NurseryAllocParams,
     constants: &indexmap::IndexMap<u32, i64>,
 ) -> Option<(usize, u32)> {
-    let result_id = op.pos().get().raw();
-    if OpRef::raw_is_constant(result_id) {
+    let result = op.pos().get();
+    if result.is_constant() {
         return None;
     }
+    let result_id = result.raw();
     match op.opcode {
         OpCode::New | OpCode::NewWithVtable => {
             let descr = op.getdescr()?;
@@ -4467,7 +4468,7 @@ impl FrameGcMaps {
                 // case.
                 let call_arg = op.getarglist().iter().any(|arg| {
                     let arg = arg.to_opref();
-                    arg.raw() == raw && !arg.is_constant()
+                    !arg.is_constant() && arg.raw() == raw
                 });
                 (live.live_across(raw, at) || call_arg).then_some(self.home_index(home))
             })
