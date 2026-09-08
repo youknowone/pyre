@@ -3669,6 +3669,7 @@ impl MiniMarkGC {
         self.minor_collection_body();
         self.run_major_progress_after_minor(false);
         self.rrc_invoke_callback();
+        self.rrc_invoke_cpyext_drain();
     }
 
     /// incminimark.py `invalidate_young_weakrefs(self)`.
@@ -4208,21 +4209,27 @@ impl MiniMarkGC {
     /// `collect_step`, `minor_collection_with_major_progress`), never from
     /// inside a phase: the collector is borrowed, so the callback may only
     /// schedule the drain, not perform it.
-    ///
-    /// Upstream fires only when `rrc_dealloc_pending` is non-empty. A
-    /// collection that queued only `tp_finalize` work or a C-only cycle
-    /// (`c_garbage`) would then leave `drain_dead` unscheduled.
-    /// `gcmodule.c finalize_garbage` runs before `delete_garbage` and is
-    /// what those two queues implement; the extra arms keep that order
-    /// observable. Evidence: `cpyext/pyobject.rs drain_dead` drains
-    /// finalize, then `clear_garbage`, then dealloc.
     fn rrc_invoke_callback(&mut self) {
-        if !self.rrc.enabled {
-            return;
+        if self.rrc.enabled
+            && !self.rrc.dealloc_pending.is_empty()
+            && let Some(trigger) = self.rrc.dealloc_trigger
+        {
+            trigger();
         }
-        let has_dealloc = !self.rrc.dealloc_pending.is_empty();
-        let has_cpyext_work = !self.rrc.finalize_pending.is_empty() || self.rrc.c_garbage;
-        if (has_dealloc || has_cpyext_work)
+    }
+
+    /// Schedule `drain_dead` for work PyPy's `rrc_invoke_callback` does not
+    /// see: claimed `tp_finalize` blocks and C-only cycles.
+    ///
+    /// `gcmodule.c finalize_garbage` runs before `delete_garbage`. A
+    /// collection that queued only those two would leave the drain unscheduled
+    /// if this sat inside `rrc_invoke_callback`. The sibling keeps that
+    /// function dealloc-only and is called from the same entry points.
+    /// Evidence: `cpyext/pyobject.rs drain_dead` drains finalize, then
+    /// `clear_garbage`, then dealloc.
+    fn rrc_invoke_cpyext_drain(&mut self) {
+        if self.rrc.enabled
+            && (!self.rrc.finalize_pending.is_empty() || self.rrc.c_garbage)
             && let Some(trigger) = self.rrc.dealloc_trigger
         {
             self.rrc.c_garbage = false;
@@ -7779,6 +7786,7 @@ impl MiniMarkGC {
 
         // incminimark.py:808.
         self.rrc_invoke_callback();
+        self.rrc_invoke_cpyext_drain();
     }
 
     /// incminimark.py `minor_collection_with_major_progress`: "Do a minor
@@ -7798,6 +7806,7 @@ impl MiniMarkGC {
         self.minor_collection_body();
         self.run_major_progress_after_minor(true);
         self.rrc_invoke_callback();
+        self.rrc_invoke_cpyext_drain();
     }
 
     /// incminimark.py `collect(gen=2)`: "Do a minor (gen=0), start a major
@@ -7833,6 +7842,7 @@ impl MiniMarkGC {
             }
         }
         self.rrc_invoke_callback();
+        self.rrc_invoke_cpyext_drain();
     }
 
     /// incminimark.py `set_max_heap_size`.  `PYPY_GC_MAX` is read once at
@@ -7875,6 +7885,7 @@ impl MiniMarkGC {
 
         // incminimark.py:821.
         self.rrc_invoke_callback();
+        self.rrc_invoke_cpyext_drain();
 
         crate::GcStepTransition {
             old_state: old_state.encoded(),
@@ -7934,6 +7945,7 @@ impl MiniMarkGC {
         // This entry has no upstream counterpart, but it is a public collection
         // entry point and it can queue mirrors, so it owes the same schedule.
         self.rrc_invoke_callback();
+        self.rrc_invoke_cpyext_drain();
     }
 
     /// Clear the nursery VISITED bits accumulated by one non-moving major.
@@ -15923,6 +15935,73 @@ cache size\t: 8192 kB\n";
             1,
             "incminimark.py:3248-3250 schedules the drain for a non-empty queue"
         );
+    }
+
+    /// incminimark.py `rrc_invoke_callback` watches only `rrc_dealloc_pending`.
+    #[test]
+    fn rrc_invoke_callback_ignores_finalize_and_c_garbage() {
+        let mut gc = rrc_test_gc();
+        gc.rrc.finalize_pending.push_back(0x100);
+        gc.rrc.c_garbage = true;
+        RRC_TRIGGER_FIRED.with(|fired| fired.set(0));
+
+        gc.rrc_invoke_callback();
+
+        assert_eq!(RRC_TRIGGER_FIRED.with(|fired| fired.get()), 0);
+        assert!(
+            gc.rrc.c_garbage,
+            "the dealloc-only callback does not clear c_garbage"
+        );
+        assert_eq!(gc.rrc.finalize_pending.len(), 1);
+    }
+
+    /// A collection that queued only `tp_finalize` still owes `drain_dead`.
+    #[test]
+    fn rrc_invoke_cpyext_drain_fires_for_finalize_pending() {
+        let mut gc = rrc_test_gc();
+        gc.rrc.finalize_pending.push_back(0x100);
+        RRC_TRIGGER_FIRED.with(|fired| fired.set(0));
+
+        gc.rrc_invoke_cpyext_drain();
+
+        assert_eq!(RRC_TRIGGER_FIRED.with(|fired| fired.get()), 1);
+        assert_eq!(
+            gc.rawrefcount_next_finalize(),
+            0x100,
+            "the sibling only schedules; the embedder drains"
+        );
+    }
+
+    /// A C-only cycle sets `c_garbage` with an empty dealloc queue.
+    #[test]
+    fn rrc_invoke_cpyext_drain_fires_for_c_garbage() {
+        let mut gc = rrc_test_gc();
+        gc.rrc.c_garbage = true;
+        RRC_TRIGGER_FIRED.with(|fired| fired.set(0));
+
+        gc.rrc_invoke_cpyext_drain();
+
+        assert_eq!(RRC_TRIGGER_FIRED.with(|fired| fired.get()), 1);
+        assert!(
+            !gc.rrc.c_garbage,
+            "the sibling consumes the flag when it schedules"
+        );
+    }
+
+    /// Both functions fire independently when both kinds of work are queued.
+    #[test]
+    fn rrc_invoke_pair_fires_once_each_when_both_queues_are_full() {
+        let mut gc = rrc_test_gc();
+        gc.rrc.dealloc_pending.push(0x10);
+        gc.rrc.finalize_pending.push_back(0x20);
+        RRC_TRIGGER_FIRED.with(|fired| fired.set(0));
+
+        gc.rrc_invoke_callback();
+        gc.rrc_invoke_cpyext_drain();
+
+        assert_eq!(RRC_TRIGGER_FIRED.with(|fired| fired.get()), 2);
+        assert_eq!(gc.rawrefcount_next_dead(), 0x10);
+        assert_eq!(gc.rawrefcount_next_finalize(), 0x20);
     }
 
     /// incminimark.py `_rrc_free`: LIGHT means the mirror needs no C
