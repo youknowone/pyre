@@ -970,31 +970,7 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::O
                 cache.len(),
             )
         });
-    // `_cache` is indexed by `OpRef::raw()`, which drops the variant tag, so
-    // an Int-bank position and a Ref-bank position carrying the same payload
-    // share one slot. That is sound only while `InputArg*(pos)` positions are
-    // flat across banks — `OpRef::inputarg_refs` states the contract:
-    // position IS the slot index. When two numbering authorities issue into
-    // that one namespace the contract breaks, the lookup SUCCEEDS on the
-    // other bank's operand instead of missing, and the caller receives a
-    // well-formed box for an unrelated value. A ref reaching an int register
-    // this way is decoded as an integer and used as an array index.
-    //
-    // A cross-namespace hit is indistinguishable from a correct translation
-    // at this call site, so compare the banks and fail here rather than
-    // letting the wrong box travel into a snapshot.
-    if let (Some(from), Some(to)) = (opref.ty(), translated.ty())
-        && from != to
-    {
-        panic!(
-            "translate_trace_iter_opref bank mismatch: {opref:?} ({from:?}) resolved \
-             to {translated:?} ({to:?}) through shared raw slot {}. The trace-iterator \
-             cache is keyed by position alone, so two OpRef variants with the same \
-             payload collide; one of them was minted by a numbering authority that \
-             does not share this trace's inputarg space.",
-            opref.raw(),
-        );
-    }
+    assert_prepared_cache_bank("translate_trace_iter_opref", opref, translated.ty());
     translated
 }
 
@@ -1024,6 +1000,212 @@ fn translate_trace_iter_box_map(
 /// fresh OpRefs in `[bridge_inputarg_base..)`, and rewrites every
 /// reference (op args, fail_args, snapshot boxes, vable boxes,
 /// `pending_bridge_rd.liveboxes`) through the iterator's `_cache`.
+/// `unroll.py UnrollOptimizer.optimize_bridge` `trace.get_iter()` when the caller already uniquely
+/// owns the `ByteTraceIter` / recorder `OpRc`s. RPython's iterator
+/// `cls()` is the one materialization; cloning those objects again
+/// just to rewrite `pos` is a second `cls()`. Rewrite args and
+/// positions in place when `strong_count == 1`.
+fn prepare_bridge_trace_from_owned(
+    mut bridge_ops: Vec<majit_ir::OpRc>,
+    bridge_inputargs: &[InputArg],
+    snapshot_boxes: SnapshotBoxes,
+    snapshot_frame_sizes: SnapshotFrameSizes,
+    snapshot_vable_boxes: SnapshotBoxes,
+    snapshot_vref_boxes: SnapshotBoxes,
+    snapshot_frame_pcs: SnapshotFramePcs,
+    pending_bridge_rd: Option<PendingBridgeRd>,
+    runtime_boxes: Vec<OpRef>,
+    bridge_inputarg_base: u32,
+) -> PreparedBridgeTrace {
+    if !bridge_ops
+        .iter()
+        .all(|op| std::rc::Rc::strong_count(op) == 1)
+    {
+        return prepare_bridge_trace_for_optimizer(
+            &bridge_ops,
+            bridge_inputargs,
+            snapshot_boxes,
+            snapshot_frame_sizes,
+            snapshot_vable_boxes,
+            snapshot_vref_boxes,
+            snapshot_frame_pcs,
+            pending_bridge_rd,
+            runtime_boxes,
+            bridge_inputarg_base,
+        );
+    }
+    #[cfg(feature = "jit-audits")]
+    next_audit_prepare_generation();
+    let max_pos = bridge_ops
+        .iter()
+        .flat_map(|op| {
+            std::iter::once(op.pos.get())
+                .chain(op.getarglist_copy().into_iter().map(|a| a.to_opref()))
+                .chain(op.getfailargs().into_iter().flatten().map(|a| a.to_opref()))
+        })
+        .filter(|opref| !opref.is_none() && !opref.is_constant())
+        .map(|opref| opref.raw())
+        .max()
+        .unwrap_or(0);
+    let cache_size = ((max_pos as usize) + 1).max(bridge_inputargs.len());
+    let mut cache: Vec<Option<majit_ir::operand::Operand>> = vec![None; cache_size];
+    let mut fresh = bridge_inputarg_base;
+    let reminted_inputargs: Vec<InputArg> = bridge_inputargs
+        .iter()
+        .map(|arg| {
+            let reminted = InputArg::from_type(arg.tp, fresh);
+            fresh += 1;
+            if let Some(value) = arg.get_value() {
+                reminted.set_value(value);
+            }
+            reminted
+        })
+        .collect();
+    for (i, arg) in bridge_inputargs.iter().enumerate() {
+        let p = arg.opref().raw() as usize;
+        if p >= cache.len() {
+            cache.resize(p + 1, None);
+        }
+        let ia = InputArg::from_type_rc(arg.tp, reminted_inputargs[i].index);
+        if let Some(value) = reminted_inputargs[i].get_value() {
+            ia.set_value(value);
+        }
+        cache[p] = Some(majit_ir::operand::Operand::from_bound_inputarg(&ia));
+    }
+    for i in 0..bridge_ops.len() {
+        let orig;
+        let is_void;
+        {
+            let op = std::rc::Rc::get_mut(&mut bridge_ops[i]).expect("strong_count checked above");
+            for ai in 0..op.num_args() {
+                let arg = op.arg(ai);
+                if !arg.is_constant() {
+                    op.setarg(ai, untag_prepared_cache(arg.to_opref(), &cache));
+                }
+            }
+            if let Some(fa) = op.fail_args_mut() {
+                for arg in fa.iter_mut() {
+                    if !arg.is_constant() {
+                        *arg = untag_prepared_cache(arg.to_opref(), &cache);
+                    }
+                }
+            }
+            orig = op.pos.get();
+            is_void = orig.is_none() || op.opcode.result_type() == Type::Void;
+            if !is_void {
+                op.pos.set(OpRef::op_typed(fresh, op.opcode.result_type()));
+                fresh += 1;
+            } else if !orig.is_none() {
+                op.pos.set(OpRef::void_op(fresh));
+                fresh += 1;
+            }
+        }
+        if !is_void {
+            let slot = orig.raw() as usize;
+            if slot >= cache.len() {
+                cache.resize(slot + 1, None);
+            }
+            cache[slot] = Some(majit_ir::operand::Operand::from_bound_op(&bridge_ops[i]));
+        }
+    }
+    finish_prepared_bridge(
+        bridge_ops,
+        reminted_inputargs,
+        cache,
+        snapshot_boxes,
+        snapshot_frame_sizes,
+        snapshot_vable_boxes,
+        snapshot_vref_boxes,
+        snapshot_frame_pcs,
+        pending_bridge_rd,
+        runtime_boxes,
+    )
+}
+
+fn untag_prepared_cache(
+    opref: OpRef,
+    cache: &[Option<majit_ir::operand::Operand>],
+) -> majit_ir::operand::Operand {
+    if opref.is_none() || opref.is_constant() {
+        return majit_ir::operand::Operand::from_opref(opref);
+    }
+    let found = cache
+        .get(opref.raw() as usize)
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "prepare_bridge in-place cache miss for {opref:?} (cache_len={})",
+                cache.len()
+            )
+        });
+    assert_prepared_cache_bank("untag_prepared_cache", opref, found.to_opref().ty());
+    found
+}
+
+/// `_cache` is indexed by `OpRef::raw()`, which drops the variant tag, so
+/// an Int-bank position and a Ref-bank position carrying the same payload
+/// share one slot. That is sound only while `InputArg*(pos)` positions are
+/// flat across banks — `OpRef::inputarg_refs` states the contract:
+/// position IS the slot index. When two numbering authorities issue into
+/// that one namespace the contract breaks, the lookup SUCCEEDS on the
+/// other bank's operand instead of missing, and the caller receives a
+/// well-formed box for an unrelated value. A ref reaching an int register
+/// this way is decoded as an integer and used as an array index.
+fn assert_prepared_cache_bank(where_: &str, opref: OpRef, found_ty: Option<Type>) {
+    if let (Some(from), Some(to)) = (opref.ty(), found_ty)
+        && from != to
+    {
+        panic!(
+            "{where_} bank mismatch: {opref:?} ({from:?}) resolved \
+             to {to:?} through shared raw slot {}. The trace-iterator \
+             cache is keyed by position alone, so two OpRef variants with the same \
+             payload collide; one of them was minted by a numbering authority that \
+             does not share this trace's inputarg space.",
+            opref.raw(),
+        );
+    }
+}
+
+fn finish_prepared_bridge(
+    ops: Vec<majit_ir::OpRc>,
+    inputargs: Vec<InputArg>,
+    cache: Vec<Option<majit_ir::operand::Operand>>,
+    snapshot_boxes: SnapshotBoxes,
+    snapshot_frame_sizes: SnapshotFrameSizes,
+    snapshot_vable_boxes: SnapshotBoxes,
+    snapshot_vref_boxes: SnapshotBoxes,
+    snapshot_frame_pcs: SnapshotFramePcs,
+    pending_bridge_rd: Option<PendingBridgeRd>,
+    runtime_boxes: Vec<OpRef>,
+) -> PreparedBridgeTrace {
+    let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
+    let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
+    let snapshot_vref_boxes = translate_trace_iter_box_map(snapshot_vref_boxes, &cache);
+    let pending_bridge_rd = pending_bridge_rd.map(|mut prd| {
+        prd.liveboxes = prd
+            .liveboxes
+            .into_iter()
+            .map(|opref| translate_trace_iter_opref(opref, &cache))
+            .collect();
+        prd
+    });
+    let runtime_boxes = runtime_boxes
+        .into_iter()
+        .map(|opref| translate_trace_iter_opref(opref, &cache))
+        .collect();
+    PreparedBridgeTrace {
+        ops,
+        inputargs,
+        snapshot_boxes,
+        snapshot_frame_sizes,
+        snapshot_vable_boxes,
+        snapshot_vref_boxes,
+        snapshot_frame_pcs,
+        pending_bridge_rd,
+        runtime_boxes,
+    }
+}
+
 fn prepare_bridge_trace_for_optimizer<T>(
     bridge_ops: &[T],
     bridge_inputargs: &[InputArg],
@@ -5183,6 +5365,11 @@ impl<M: Clone> MetaInterp<M> {
                 self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
                 // pyjitpl.py initialize_virtualizable parity.
                 self.initialize_virtualizable(&mut ctx, live_values);
+                // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
+                // runs after `initialize_state_from_start`, which has already
+                // appended `virtualizable_boxes` onto `original_boxes`. Attach
+                // here so `Trace(max_num_inputargs)` sees the full cap.
+                ctx.attach_live_byte_recorder();
                 // warmstate.py:439 `force_finish_trace=bool(cell.flags &
                 // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky
                 // upstream (no clear in rpython/jit/metainterp/).
@@ -5493,6 +5680,11 @@ impl<M: Clone> MetaInterp<M> {
         self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
         // pyjitpl.py initialize_virtualizable parity.
         self.initialize_virtualizable(&mut ctx, live_values);
+        // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
+        // runs after `initialize_state_from_start`, which has already
+        // appended `virtualizable_boxes` onto `original_boxes`. Attach
+        // here so `Trace(max_num_inputargs)` sees the full cap.
+        ctx.attach_live_byte_recorder();
 
         // warmstate.py:439 `force_finish_trace=bool(cell.flags &
         // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky upstream.
@@ -6978,9 +7170,10 @@ impl<M: Clone> MetaInterp<M> {
         // prefix from the guard to the header must be cut off — otherwise
         // the root entry contract pairs the guard's fail-arg inputargs
         // with the merge point's full-shape JUMP and aborts on arity.
+        let n_inputargs = ctx.num_inputargs();
         let cut_merge_point = ctx
             .get_merge_point_at(green_key, ctx.header_pc)
-            .filter(|mp| mp.position._pos > 0);
+            .filter(|mp| mp.position.has_prefix_ops(n_inputargs));
         // Resolve while `ctx` is still whole (before `ctx.constants` is moved
         // out below) so `patch_new_loop_to_load_virtualizable_fields` can
         // read the heap object via `vinfo.get_array_length(vable, i)`
@@ -6990,13 +7183,16 @@ impl<M: Clone> MetaInterp<M> {
         let cross_loop_cut = cut_merge_point.map(|mp| {
             (
                 mp.green_boxes.clone(),
-                crate::history::TreeLoopCutPosition::new(mp.position._pos),
+                crate::history::TreeLoopCutPosition::new(
+                    mp.position.tree_loop_op_index(n_inputargs),
+                ),
             )
         });
 
         // compile.py:221: call_pure_results = metainterp.call_pure_results
         let call_pure_results = ctx.take_call_pure_results();
 
+        let snapshots = ctx.take_snapshots();
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED. This allows external invalidation
@@ -7014,7 +7210,7 @@ impl<M: Clone> MetaInterp<M> {
         // captured resumedata. `recorder.get_trace()` on its own returns
         // a snapshot-less TreeLoop.
         let mut trace = recorder.get_trace();
-        trace.snapshots = std::mem::take(&mut ctx.snapshots);
+        trace.snapshots = snapshots;
 
         // compile.py:269-270: cut trace at cross-loop merge point.
         // When the trace was retargeted to a different loop header, record
@@ -8594,6 +8790,7 @@ impl<M: Clone> MetaInterp<M> {
         // canonical `Rc<Op>` handles preserves the same live trace identity
         // and lets `prepare_bridge_trace_for_optimizer` perform the sole fresh
         // materialization, as upstream does.
+        ctx.recorder.materialize_into_ops();
         let bridge_ops: Vec<majit_ir::OpRc> = ctx.ops().to_vec();
         // Carry the history's live input boxes, WITHOUT carrying the values
         // the recorder's own inputargs hold.
@@ -8751,7 +8948,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     fail_index,
                     fail_descr,
-                    &bridge_ops,
+                    bridge_ops,
                     &bridge_inputargs,
                     bridge_constants,
                     snapshot_boxes,
@@ -8955,10 +9152,13 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 return false;
             }
+            let n_inputargs = ctx.num_inputargs();
             let retrace_cut = retrace_merge_point.map(|mp| {
                 (
                     mp.green_boxes.clone(),
-                    crate::history::TreeLoopCutPosition::new(mp.position._pos),
+                    crate::history::TreeLoopCutPosition::new(
+                        mp.position.tree_loop_op_index(n_inputargs),
+                    ),
                 )
             });
             let orig_vable_ptr_retrace =
@@ -10100,9 +10300,10 @@ impl<M: Clone> MetaInterp<M> {
         // walk_active_trace_refs coverage; `compile_snapshot_refs` picks
         // up the snapshot ConstPtrs a few lines below.
         let mut ctx = self.compile_tracing.take().unwrap();
+        let snapshots = ctx.take_snapshots();
         let recorder = ctx.recorder;
         let mut trace = recorder.get_trace();
-        trace.snapshots = std::mem::take(&mut ctx.snapshots);
+        trace.snapshots = snapshots;
         let SimpleCompileViews {
             data: simple_data,
             trace_snapshots,
@@ -10584,13 +10785,14 @@ impl<M: Clone> MetaInterp<M> {
             self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
 
         let call_pure_results = ctx.take_call_pure_results();
+        let snapshots = ctx.take_snapshots();
         let recorder = ctx.recorder;
         // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
         // downstream consumers (`trace.snapshots`) still observe the
         // captured resumedata. `recorder.get_trace()` on its own returns
         // a snapshot-less TreeLoop.
         let mut trace = recorder.get_trace();
-        trace.snapshots = std::mem::take(&mut ctx.snapshots);
+        trace.snapshots = snapshots;
         let SimpleCompileViews {
             data: simple_data,
             trace_snapshots,
@@ -14187,7 +14389,7 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    pub fn compile_bridge<T>(
+    pub fn compile_bridge(
         &mut self,
         green_key: u64,
         // The jitcell the closing JUMP enters (`bridge_cell_token_key`).
@@ -14204,7 +14406,7 @@ impl<M: Clone> MetaInterp<M> {
         jump_target_key: u64,
         fail_index: u32,
         fail_descr: &dyn majit_ir::FailDescr,
-        bridge_ops: &[T],
+        bridge_ops: Vec<majit_ir::OpRc>,
         bridge_inputargs: &[majit_ir::InputArg],
         bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
@@ -14213,10 +14415,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
         call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
-    ) -> bool
-    where
-        T: std::borrow::Borrow<majit_ir::Op>,
-    {
+    ) -> bool {
         self.remember_compiled_graph_write();
         self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered
@@ -14425,12 +14624,12 @@ impl<M: Clone> MetaInterp<M> {
         // for every recorded operation, immediately before TraceIterator
         // allocated the real fresh objects consumed by the optimizer.
         let bridge_runtime_boxes: Vec<OpRef> =
-            Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs);
+            Self::closing_jump_runtime_boxes(&bridge_ops, bridge_inputargs);
         // `UnrollOptimizer.optimize_bridge`'s `trace = trace.get_iter()`: mint
         // fresh InputArg / ResOperation objects in a disjoint OpRef namespace
         // (`TraceIterator.__init__`, `opencoder.py`:
         // `self.inputargs = [rop.inputarg_from_tp(arg.type) for ...]`).
-        let prepared = prepare_bridge_trace_for_optimizer(
+        let prepared = prepare_bridge_trace_from_owned(
             bridge_ops,
             bridge_inputargs,
             snapshot_boxes,
@@ -15060,6 +15259,7 @@ impl<M: Clone> MetaInterp<M> {
                 .expect("bridge source token must name a registered jitdriver");
             ctx.set_driver_descriptor(descriptor.clone());
         }
+        ctx.attach_live_byte_recorder();
         ctx.set_force_finish(self.force_finish_trace);
         // pyjitpl.py:929-947 `self.metainterp.cpu` analog — see
         // `setup_tracing` for the contract on raw-pointer lifetime
@@ -17565,7 +17765,7 @@ impl<M: Clone> MetaInterp<M> {
         let tracelength = self
             .tracing
             .as_ref()
-            .map(|ctx| ctx.ops().len() as i32)
+            .map(|ctx| ctx.num_ops() as i32)
             .unwrap_or(0);
         if tracelength == self.trace_length_at_last_tco {
             // pyjitpl.py:1318-1319: emit SAME_AS_I(ConstInt(tracelength))
@@ -21268,9 +21468,6 @@ mod metainterp_static_data_tests {
             }
             fn loop_header_pc(&self) -> usize {
                 0
-            }
-            fn fail_args(&self) -> Option<Vec<OpRef>> {
-                None
             }
         }
         let mut sym = NoopSym;

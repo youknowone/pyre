@@ -5384,21 +5384,22 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     // and the trace keeps a value that is already stale.  Without a GIL that
     // window is a real interleaving, not a theoretical one.
     let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
-    // quasiimmut.py:125 `self.constantfieldbox =
-    // self.get_current_constant_fieldvalue()` — the field's value at the moment
-    // the trace baked it.  `heap.py OptHeap.optimize_QUASIIMMUT_FIELD is_still_valid_for` compares it against
-    // the live value and abandons the loop when they disagree, so it has to be
-    // captured here; by the time the optimizer runs, the change it is looking
-    // for has already happened.
+    // `quasiimmut.py QuasiImmutDescr.__init__` captures
+    // `constantfieldbox` on the descr; `pyjitpl.py
+    // opimpl_record_quasiimmut_field` then `record1(QUASIIMMUT_FIELD,
+    // box, descr=qmutdescr)`.
     let constantfieldbox = current_quasiimmut_field_value(ctx, obj, &descr);
     ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
-    // The captured value is the one `QuasiImmutDescr` member that stays off the
-    // descr: it is a Box, so it rides as the op's second operand.
-    let descr = qmutdescr.unwrap_or(descr);
-    match constantfieldbox {
-        Some(value) => ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj, value], descr),
-        None => ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr),
+    let descr = match qmutdescr.as_ref().and_then(|d| d.as_quasi_immut_descr()) {
+        Some(qd) => std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+            qd.fielddescr().clone(),
+            qd.struct_ptr(),
+            qd.qmut().clone(),
+            constantfieldbox.and_then(|r| r.inline_const_to_value()),
+        )) as majit_ir::DescrRef,
+        None => descr,
     };
+    ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr);
     if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
         ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
     }
@@ -5533,6 +5534,7 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
         descr.clone(),
         struct_ptr as u64,
         std::sync::Arc::new(RecordedQuasiImmut(qmut)),
+        None,
     )))
 }
 

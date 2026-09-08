@@ -87,6 +87,7 @@ fn elidable_helper_traces_to_call_pure_i_when_args_not_all_const() {
     );
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
 
     assert!(
@@ -135,6 +136,7 @@ fn emit_trace_call_int_typed_elidable_cannot_raise_routes_to_call_pure_i() {
     };
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     assert!(
         ops.iter().any(|op| op.opcode == OpCode::CallPureI),
@@ -189,6 +191,7 @@ fn elidable_int_bit_count_macro_advertises_extern_c_trampoline_and_traces_call_p
     );
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     assert!(
         ops.iter().any(|op| op.opcode == OpCode::CallPureI),
@@ -231,6 +234,7 @@ fn elidable_helper_all_const_args_fold_to_const_and_cut_call() {
     );
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     assert!(
         ops.iter()
@@ -314,6 +318,7 @@ fn emit_ref_lookup_shape_routes_to_call_pure_r_when_type_not_const() {
     };
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     let opcodes: Vec<_> = ops.iter().map(|op| op.opcode).collect();
     assert!(
@@ -376,6 +381,7 @@ fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
     };
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     assert!(
         ops.iter()
@@ -455,6 +461,7 @@ fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
     };
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     let opcodes: Vec<_> = ops.iter().map(|op| op.opcode).collect();
     assert!(
@@ -514,6 +521,7 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
     };
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     assert!(
         ops.iter()
@@ -585,6 +593,7 @@ fn instance_getdictvalue_records_residual_call_r_not_pure() {
     };
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     let opcodes: Vec<_> = ops.iter().map(|op| op.opcode).collect();
     assert!(

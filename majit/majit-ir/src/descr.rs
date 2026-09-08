@@ -3748,29 +3748,37 @@ pub trait QuasiImmutHandle: Send + Sync + std::fmt::Debug {
 /// field descr directly — including `index()`, which the heap cache and the
 /// tracer key on.
 ///
-/// `constantfieldbox` (`quasiimmut.py:125`) is the one member that stays off
-/// this descr: it is a Box, and pyre records it as the op's second operand
-/// instead.
+/// `constantfieldbox` (`quasiimmut.py QuasiImmutDescr.__init__`) is
+/// captured on the descr, matching `record1(QUASIIMMUT_FIELD, box,
+/// descr=qmutdescr)`.
 #[derive(Debug)]
 pub struct QuasiImmutDescr {
     fielddescr: DescrRef,
     /// `quasiimmut.py self.struct = struct` — compared, never dereferenced.
     struct_ptr: u64,
     qmut: std::sync::Arc<dyn QuasiImmutHandle>,
+    /// `quasiimmut.py self.constantfieldbox`.
+    ///
+    /// RPython stores a `Const*` box on the descr; the translated GC
+    /// traces `ConstPtr.value` through the Python object. This descr
+    /// lives in an `Arc` outside that graph, so the captured `Value::Ref`
+    /// is forwarded explicitly by `walk_const_ptr_refs`.
+    constantfieldbox: Mutex<Option<crate::Value>>,
 }
 
 impl QuasiImmutDescr {
-    /// `quasiimmut.py QuasiImmutDescr.__init__`, minus the field read
-    /// the caller keeps as an operand.
+    /// `quasiimmut.py QuasiImmutDescr.__init__`.
     pub fn new(
         fielddescr: DescrRef,
         struct_ptr: u64,
         qmut: std::sync::Arc<dyn QuasiImmutHandle>,
+        constantfieldbox: Option<crate::Value>,
     ) -> Self {
         Self {
             fielddescr,
             struct_ptr,
             qmut,
+            constantfieldbox: Mutex::new(constantfieldbox),
         }
     }
 
@@ -3787,6 +3795,21 @@ impl QuasiImmutDescr {
     /// `quasiimmut.py self.qmut = get_current_qmut_instance(...)`.
     pub fn qmut(&self) -> &std::sync::Arc<dyn QuasiImmutHandle> {
         &self.qmut
+    }
+
+    /// `quasiimmut.py self.constantfieldbox`.
+    pub fn constantfieldbox(&self) -> Option<crate::Value> {
+        *self.constantfieldbox.lock()
+    }
+
+    /// Forward a `Value::Ref` captured on this descr after a moving
+    /// collection. `MetaInterp::walk_active_trace_refs` calls this
+    /// through the recorder's slot descrs.
+    pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+        let mut slot = self.constantfieldbox.lock();
+        if let Some(crate::Value::Ref(gcref)) = slot.as_mut() {
+            visitor(gcref);
+        }
     }
 }
 

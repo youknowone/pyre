@@ -1050,6 +1050,11 @@ pub struct OptContext {
     /// `OptimizationResult::Remove`, reset on every successful
     /// `emit_operation` (see `Optimizer::emit_operation`).
     pub last_op_removed: bool,
+    /// `history.py Const*` object identity. `get_box_replacement` on a
+    /// Const box returns that same box; minting a fresh `Operand::Const`
+    /// on every `resolve_to_operand` lookup is a lookup-time allocation
+    /// RPython never pays.
+    const_operands: std::cell::RefCell<crate::FxIndexMap<OpRef, Operand>>,
     /// Deferred `InvalidLoop` signal.  RPython `raise InvalidLoop`
     /// abandons the trace; pyre carries the same signal as a
     /// `Result<_, InvalidLoop>` threaded through the optimizer driver so
@@ -1882,6 +1887,7 @@ impl OptContext {
             remove_gctypeptr: true,
             last_op_removed: false,
             pending_invalid_loop: std::cell::Cell::new(None),
+            const_operands: std::cell::RefCell::new(crate::FxIndexMap::default()),
         }
     }
 
@@ -2284,12 +2290,19 @@ impl OptContext {
             return None;
         }
         if opref.is_constant() {
-            return match opref {
+            if let Some(cached) = self.const_operands.borrow().get(&opref).cloned() {
+                return Some(cached);
+            }
+            let minted = match opref {
                 OpRef::ConstInt(v) => Some(Operand::const_from_value(Value::Int(v))),
                 OpRef::ConstFloat(v) => Some(Operand::const_from_value(Value::Float(v))),
                 OpRef::ConstPtr(v) => Some(Operand::const_from_value(Value::Ref(v))),
                 _ => None,
             };
+            if let Some(ref op) = minted {
+                self.const_operands.borrow_mut().insert(opref, op.clone());
+            }
+            return minted;
         }
         if let Some(op) = self.find_producer_op(opref) {
             return Some(Operand::from_bound_op(&op));
@@ -2501,6 +2514,7 @@ impl OptContext {
             remove_gctypeptr: true,
             last_op_removed: false,
             pending_invalid_loop: std::cell::Cell::new(None),
+            const_operands: std::cell::RefCell::new(crate::FxIndexMap::default()),
         }
     }
 

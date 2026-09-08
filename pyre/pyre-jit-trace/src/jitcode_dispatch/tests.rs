@@ -37,10 +37,6 @@ impl JitCodeSym for StaticRefusalSym {
     fn loop_header_pc(&self) -> usize {
         0
     }
-
-    fn fail_args(&self) -> Option<Vec<OpRef>> {
-        Some(Vec::new())
-    }
 }
 
 /// The generated dispatch loop re-runs its source arm when a trace start
@@ -14539,7 +14535,7 @@ fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
     // there must not pass for "no guard after a store".
     let tc = TraceCtx::for_test_types(&[Type::Ref]);
     let mut past_end = tc.get_trace_position();
-    past_end._pos = tc.ops().len() + 1;
+    past_end._count = (tc.num_inputargs() + tc.num_ops() + 1) as u32;
     assert!(
         subwalk_guard_follows_store(&tc, past_end),
         "an unreadable window declines"

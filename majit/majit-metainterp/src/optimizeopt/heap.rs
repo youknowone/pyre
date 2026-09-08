@@ -958,11 +958,11 @@ impl OptHeap {
     /// struct to the hidden `mutate_*` slot.
     ///
     /// The value comparison is upstream's closing assert: the recording
-    /// captured the field on `arg(1)` (`state::current_quasiimmut_field_value`)
-    /// and a live re-read through `get_runtime_field` is
-    /// `get_current_constant_fieldvalue`. It is answered as a verdict rather
-    /// than an assert, and skipped for an op that carries no captured value —
-    /// the namespace twin, which records a slot index there instead.
+    /// captured the field on `QuasiImmutDescr.constantfieldbox`
+    /// (`quasiimmut.py QuasiImmutDescr.__init__`) and a live re-read
+    /// through `get_runtime_field` is `get_current_constant_fieldvalue`.
+    /// It is answered as a verdict rather than an assert, and skipped
+    /// when the descr carries no captured value.
     ///
     /// ⚠️Answering it as a verdict is LOAD-BEARING here and must not be
     /// demoted to the `debug_assert!` upstream has (gh#964 proposes exactly
@@ -978,7 +978,7 @@ impl OptHeap {
     /// test cannot see. Modelling that chain, or installing the watcher along
     /// it, is what has to come first.
     fn quasiimmut_field_still_valid(
-        op: &Op,
+        _op: &Op,
         obj: OpRef,
         struct_ptr: u64,
         qmutdescr: &majit_ir::QuasiImmutDescr,
@@ -990,10 +990,7 @@ impl OptHeap {
         if !qmutdescr.qmut().is_current() {
             return false;
         }
-        if op.num_args() < 2 {
-            return true;
-        }
-        let Some(constantfieldbox) = op.arg(1).const_value() else {
+        let Some(constantfieldbox) = qmutdescr.constantfieldbox() else {
             return true;
         };
         let Some(currentbox) = ctx
