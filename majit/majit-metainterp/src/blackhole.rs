@@ -5907,14 +5907,13 @@ mod tests {
         }
 
         #[test]
-        fn wire_bhimpl_handlers_wires_non_vable_int_base_access_aliases() {
-            // setfield/array int-base forms still exist (FieldWrite /
-            // ArrayRead emit has not been rehomed).  getfield_gc is
-            // Ref-bank only — an Int-bank base is getfield_raw.
+        fn wire_bhimpl_handlers_wires_raw_int_base_access() {
+            // Int-bank field/array access is the raw family, not a
+            // getfield_gc/setfield_gc alias.
             let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
-            insns.insert("setfield_gc_i/iid".to_string(), 0u8);
-            insns.insert("setfield_gc_r/ird".to_string(), 1u8);
-            insns.insert("getarrayitem_gc_i/iid>i".to_string(), 2u8);
+            insns.insert("getfield_raw_i/id>i".to_string(), 0u8);
+            insns.insert("setfield_raw_i/iid".to_string(), 1u8);
+            insns.insert("getarrayitem_raw_i/iid>i".to_string(), 2u8);
 
             let mut builder = BlackholeInterpBuilder::new();
             builder.setup_insns(&insns);
@@ -5934,9 +5933,12 @@ mod tests {
             let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
             insns.insert("getfield_gc_i/id>i".to_string(), 0u8);
             insns.insert("getfield_gc_r/id>r".to_string(), 1u8);
-            insns.insert("getfield_vable_i/id>i".to_string(), 2u8);
-            insns.insert("setfield_vable_i/iid".to_string(), 3u8);
-            insns.insert("setfield_vable_r/ird".to_string(), 4u8);
+            insns.insert("setfield_gc_i/iid".to_string(), 2u8);
+            insns.insert("setfield_gc_r/ird".to_string(), 3u8);
+            insns.insert("getarrayitem_gc_i/iid>i".to_string(), 4u8);
+            insns.insert("getfield_vable_i/id>i".to_string(), 5u8);
+            insns.insert("setfield_vable_i/iid".to_string(), 6u8);
+            insns.insert("setfield_vable_r/ird".to_string(), 7u8);
 
             let mut builder = BlackholeInterpBuilder::new();
             builder.setup_insns(&insns);
@@ -5947,6 +5949,9 @@ mod tests {
                 vec![
                     "getfield_gc_i/id>i",
                     "getfield_gc_r/id>r",
+                    "setfield_gc_i/iid",
+                    "setfield_gc_r/ird",
+                    "getarrayitem_gc_i/iid>i",
                     "getfield_vable_i/id>i",
                     "setfield_vable_i/iid",
                     "setfield_vable_r/ird",
@@ -8584,36 +8589,12 @@ fn handler_setfield_gc_i_c(
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
-fn handler_setfield_gc_i_intbase(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[position] as usize];
-    let value = bh.registers_i[code[position + 1] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
-    Ok(pos)
-}
 fn handler_setfield_gc_r(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
-    let value = bh.registers_r[code[position + 1] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
-    Ok(pos)
-}
-fn handler_setfield_gc_r_intbase(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[position] as usize];
     let value = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
     let cpu = bh.cpu();
@@ -8672,18 +8653,6 @@ fn handler_getarrayitem_gc_i_c(
     let (descr, pos) = read_descr(bh, code, position + 2);
     let result = bh.cpu().bh_getarrayitem_gc_i(array, index, descr);
     bh.registers_i[code[pos] as usize] = result;
-    Ok(pos + 1)
-}
-fn handler_getarrayitem_gc_i_intbase(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[position] as usize];
-    let index = bh.registers_i[code[position + 1] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
     Ok(pos + 1)
 }
 fn handler_getarrayitem_gc_r(
@@ -9967,9 +9936,10 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // (an int field store, `setfield_gc_i/rid` = BC_SETFIELD_GC_I 0xac)
     // landed on the unwired-opcode placeholder.
     // Canonical `rd`/`r{i,r,f}d` argcodes only (these access fields off a
-    // ref base).  `getfield_gc` intbase (`id`) is no longer a handler;
+    // ref base).  GC intbase (`id`/`iid`) is no longer a handler;
     // `promote_gc_field_bases` rehomes a Signed GC pointer so the
-    // assembler emits `/rd>X`.  Additive: every byte is currently unwired.
+    // assembler emits `/rd>X` / `/rid`.  An Int-bank leftover is the
+    // raw family.  Additive: every byte is currently unwired.
     for (key, byte) in [
         (
             "getfield_gc_i/rd>i",
@@ -10735,19 +10705,15 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("setfield_gc_i/rcd", handler_setfield_gc_i_c);
     builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
     builder.wire_handler("setfield_gc_f/rfd", handler_setfield_gc_f);
-    builder.wire_handler("setfield_gc_i/iid", handler_setfield_gc_i_intbase);
-    builder.wire_handler("setfield_gc_r/ird", handler_setfield_gc_r_intbase);
     builder.wire_handler("arraylen_gc/rd>i", handler_arraylen_gc);
 
-    // Array item operations (blackhole.py:1329-1365). The `/iid>i` variant
-    // carries a pyre tagged-int base in an int register — same backend
-    // primitive as the canonical `/rid>i` form, only the base's register
-    // class differs.
+    // Array item operations (`bhimpl_getarrayitem_gc_*`).
+    // The GC form takes the array in the Ref bank.
+    // An Int-bank base is `getarrayitem_raw_*`.
     builder.wire_handler("getarrayitem_gc_i/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r/rid>r", handler_getarrayitem_gc_r);
     builder.wire_handler("getarrayitem_gc_i/rcd>i", handler_getarrayitem_gc_i_c);
     builder.wire_handler("getarrayitem_gc_r/rcd>r", handler_getarrayitem_gc_r_c);
-    builder.wire_handler("getarrayitem_gc_i/iid>i", handler_getarrayitem_gc_i_intbase);
     builder.wire_handler("getarrayitem_gc_i_pure/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r_pure/rid>r", handler_getarrayitem_gc_r);
     builder.wire_handler("setarrayitem_gc_i/riid", handler_setarrayitem_gc_i);

@@ -195,16 +195,22 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Varia
 /// address-sized word).  The assembler then keys the first argcode off
 /// that bank and emits the pyre-only `getfield_gc_*/id>X` form.
 ///
-/// Walk every surviving `FieldRead`/`FieldWrite` of a GC owner
-/// (unknown owner defaults to `_gckind='gc'`, matching
-/// `jtransform.py rewrite_op_getfield`'s `getattr(STRUCT, '_gckind',
-/// 'gc')`) and publish `GcRef` on a `Signed`/`Unknown`/`Void` base.
+/// Walk every surviving GC field/array access (unknown owner defaults
+/// to `_gckind='gc'`, matching `jtransform.py rewrite_op_getfield`'s
+/// `getattr(STRUCT, '_gckind', 'gc')`) and publish `GcRef` on a
+/// `Signed`/`Unknown`/`Void` base.
 ///
 /// Raw owners (`CallControl::struct_storage_for` →
 /// `is_gc_managed=false`) are left alone: a `Signed` base stays an
-/// address, a `GcRef` base stays a Ref-banked raw struct (`PyType` /
-/// `CLASSTYPE` travels through the Ref bank even though its storage
-/// is not a GC object).
+/// address (`getfield_raw` / `setfield_raw`), a `GcRef` base stays a
+/// Ref-banked raw struct (`PyType` / `CLASSTYPE` travels through the
+/// Ref bank even though its storage is not a GC object).
+///
+/// `ArrayRead` / `ArrayWrite` / `ArrayLen` are the GC-array family
+/// (`jtransform.py` emits `getarrayitem_gc` / `arraylen_gc` only when
+/// `ARRAY._gckind == 'gc'`; raw arrays go through `raw_load` /
+/// `getarrayitem_raw`).  A Signed base on those ops is the same
+/// mis-banked GC pointer FieldRead had.
 pub(crate) fn promote_gc_field_bases(
     graph: &FunctionGraph,
     callcontrol: Option<&crate::call::CallControl>,
@@ -215,25 +221,33 @@ pub(crate) fn promote_gc_field_bases(
                 OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
                     (base, field_owner_is_gc(field, callcontrol))
                 }
-                OpKind::VableFieldRead { base, .. } | OpKind::VableFieldWrite { base, .. } => {
-                    (base, true)
-                }
+                OpKind::VableFieldRead { base, .. }
+                | OpKind::VableFieldWrite { base, .. }
+                | OpKind::ArrayRead { base, .. }
+                | OpKind::ArrayWrite { base, .. }
+                | OpKind::ArrayLen { base, .. }
+                | OpKind::VableArrayRead { base, .. }
+                | OpKind::VableArrayWrite { base, .. }
+                | OpKind::VableArrayLen { base, .. } => (base, true),
                 _ => continue,
             };
             if !force_gc {
                 continue;
             }
-            match FunctionGraph::concretetype_of(base) {
-                ConcreteType::GcRef => {}
-                ConcreteType::Float => panic!(
-                    "GC field base {base:?} has Float concretetype — \
-                     history.getkind(Ptr(GC)) is 'ref' (graph {})",
-                    graph.name
-                ),
-                ConcreteType::Signed | ConcreteType::Unknown | ConcreteType::Void => {
-                    FunctionGraph::set_concretetype_of_inline(base, ConcreteType::GcRef);
-                }
-            }
+            stamp_gc_ref_base(base, &graph.name);
+        }
+    }
+}
+
+fn stamp_gc_ref_base(base: &crate::flowspace::model::Variable, graph_name: &str) {
+    match FunctionGraph::concretetype_of(base) {
+        ConcreteType::GcRef => {}
+        ConcreteType::Float => panic!(
+            "GC field/array base {base:?} has Float concretetype — \
+             history.getkind(Ptr(GC)) is 'ref' (graph {graph_name})"
+        ),
+        ConcreteType::Signed | ConcreteType::Unknown | ConcreteType::Void => {
+            FunctionGraph::set_concretetype_of_inline(base, ConcreteType::GcRef);
         }
     }
 }
@@ -301,6 +315,37 @@ mod tests {
             FunctionGraph::concretetype_of(&base),
             ConcreteType::GcRef,
             "a GC FieldRead base that arrived as Signed must be published as GcRef"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_lifts_a_signed_array_read_base() {
+        let mut graph = FunctionGraph::new("int_base_getarrayitem");
+        let base = push_input(&mut graph, "arr", ValueType::Int);
+        let index = push_input(&mut graph, "i", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: base.clone(),
+                    index,
+                    item_ty: ValueType::Int,
+                    array_type_id: None,
+                    nolength: false,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+
+        promote_gc_field_bases(&graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::GcRef,
+            "a GC ArrayRead base that arrived as Signed must be published as GcRef"
         );
     }
 
