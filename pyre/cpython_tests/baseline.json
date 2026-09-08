@@ -496,8 +496,7 @@
       "reason": "implementation detail"
     },
     "test.test_free_threading": {
-      "dynasm": "SKIP",
-      "reason": "CPython free-threading internals"
+      "dynasm": "IMPORTERROR"
     },
     "test.test_frozen": {
       "dynasm": "SKIP",
@@ -764,9 +763,6 @@
       "dynasm": "PASS"
     },
     "test.test_monitoring": {
-      "dynasm": "IMPORTERROR"
-    },
-    "test.test_msvcrt": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_multibytecodec": {
@@ -1081,9 +1077,6 @@
       "dynasm": "SKIP",
       "reason": "needs ctypes.pythonapi"
     },
-    "test.test_startfile": {
-      "dynasm": "IMPORTERROR"
-    },
     "test.test_stat": {
       "dynasm": "PASS"
     },
@@ -1385,15 +1378,6 @@
     "test.test_webbrowser": {
       "dynasm": "PASS"
     },
-    "test.test_winapi": {
-      "dynasm": "IMPORTERROR"
-    },
-    "test.test_winconsoleio": {
-      "dynasm": "IMPORTERROR"
-    },
-    "test.test_winreg": {
-      "dynasm": "IMPORTERROR"
-    },
     "test.test_winsound": {
       "dynasm": "SKIP",
       "reason": "needs audio hardware"
@@ -1401,9 +1385,6 @@
     "test.test_with": {
       "cranelift": "PASS",
       "dynasm": "PASS"
-    },
-    "test.test_wmi": {
-      "dynasm": "IMPORTERROR"
     },
     "test.test_wsgiref": {
       "dynasm": "PASS"

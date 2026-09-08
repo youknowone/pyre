@@ -14990,8 +14990,19 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             // below to the forgot-a-comma form).
             ParseErrorType::ExpectedToken {
                 expected: rustpython_compiler::ast::token::TokenKind::Colon,
-                ..
-            } if compound_suite_header_at(source, parse_err.raw_location.start().to_usize()) => {
+                found,
+            } if matches!(
+                found,
+                rustpython_compiler::ast::token::TokenKind::Newline
+                    | rustpython_compiler::ast::token::TokenKind::NonLogicalNewline
+                    | rustpython_compiler::ast::token::TokenKind::EndOfFile
+                    | rustpython_compiler::ast::token::TokenKind::Indent
+                    | rustpython_compiler::ast::token::TokenKind::Dedent
+            ) && compound_suite_header_at(
+                source,
+                parse_err.raw_location.start().to_usize(),
+            ) =>
+            {
                 "expected ':'".to_owned()
             }
             ParseErrorType::ExpectedToken { .. } => "invalid syntax".to_owned(),
@@ -15684,14 +15695,30 @@ fn scan_line_nesting(bytes: &[u8], depth: &mut usize, in_triple: &mut Option<u8>
     Some(())
 }
 
-/// Whether `loc` sits on a compound suite header that is missing its `:`.
+/// Whether `loc` sits after a compound suite header that is missing its `:`.
 ///
 /// The 3.14 `invalid_colon` rule names `try`/`if`/`def`/…, not every
-/// colon the parser can demand (`lambda`, dict displays).
+/// colon the parser can demand (`lambda`, dict displays).  A parenthesized
+/// `if`/`def` header can place `loc` on the newline after `)`, so the
+/// keyword is found by walking back through balanced brackets.
 fn compound_suite_header_at(source: &str, loc: usize) -> bool {
     let loc = loc.min(source.len());
-    let line_start = source[..loc].rfind('\n').map_or(0, |i| i + 1);
-    let mut rest = source[line_start..].trim_start();
+    let bytes = source.as_bytes();
+    let mut i = loc;
+    let mut depth = 0i32;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' if depth > 0 => depth -= 1,
+            b'\n' if depth == 0 => {
+                i += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let mut rest = source[i..loc].trim_start();
     if let Some(after) = rest.strip_prefix("async") {
         if after.starts_with(|c: char| c.is_whitespace()) {
             rest = after.trim_start();
