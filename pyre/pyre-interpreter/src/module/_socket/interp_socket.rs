@@ -1089,7 +1089,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let Some(text) = rffi::inet_ntoa([data[0], data[1], data[2], data[3]]) else {
                     return Err(crate::PyError::os_error("inet_ntoa failed"));
                 };
-                Ok(pyre_object::w_str_new(&text))
+                Ok(pyre_object::w_str_new_managed(&text))
             },
             1,
         ),
@@ -1171,7 +1171,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let Some(text) = rffi::ntop(af, data) else {
                     return Err(crate::PyError::os_error("inet_ntop failed"));
                 };
-                Ok(pyre_object::w_str_new(&text))
+                Ok(pyre_object::w_str_new_managed(&text))
             },
             2,
         ),
@@ -1286,7 +1286,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             "gethostbyname: address is not representable",
                         ));
                     };
-                    Ok(pyre_object::w_str_new(&text))
+                    Ok(pyre_object::w_str_new_managed(&text))
                 },
                 1,
             ),
@@ -1480,7 +1480,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         .to_string_lossy()
                         .into_owned()
                 };
-                Ok(pyre_object::w_str_new(&name))
+                Ok(pyre_object::w_str_new_managed(&name))
             }),
         );
     }
@@ -1835,7 +1835,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         })?;
                     let name = rustpython_host_env::socket::if_indextoname_checked(index)
                         .map_err(interface_io_error)?;
-                    Ok(pyre_object::w_str_new(&name))
+                    Ok(pyre_object::w_str_new_managed(&name))
                 },
                 1,
             ),
@@ -2176,11 +2176,11 @@ fn unpack_hostent(he: *mut rffi::Hostent) -> Result<pyre_object::PyObjectRef, cr
         }
         let aliases = alias_strings
             .iter()
-            .map(|alias| pyre_object::w_str_new(alias))
+            .map(|alias| pyre_object::w_str_new_managed(alias))
             .collect();
         let addrs = addr_strings
             .iter()
-            .map(|addr| pyre_object::w_str_new(addr))
+            .map(|addr| pyre_object::w_str_new_managed(addr))
             .collect();
         // `w_list_new` roots the items it is handed, not the header it returns,
         // and that header is a movable nursery object (`rlist.py:116 LIST =
@@ -2192,7 +2192,7 @@ fn unpack_hostent(he: *mut rffi::Hostent) -> Result<pyre_object::PyObjectRef, cr
         let addrs_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(addrs));
         Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(&name),
+            pyre_object::w_str_new_managed(&name),
             pyre_object::gc_roots::shadow_stack_get(aliases_slot),
             pyre_object::gc_roots::shadow_stack_get(addrs_slot),
         ]))
@@ -2392,7 +2392,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         fields.push(pyre_object::w_int_new(ai.ai_family as i64));
                         fields.push(pyre_object::w_int_new(ai.ai_socktype as i64));
                         fields.push(pyre_object::w_int_new(ai.ai_protocol as i64));
-                        fields.push(pyre_object::w_str_new(&canon));
+                        fields.push(pyre_object::w_str_new_managed(&canon));
                         fields.push(unpack_inet_addr(&storage, copy_len as rffi::SockLen));
                         pyre_object::w_tuple_new(fields.take())
                     };
@@ -2571,8 +2571,8 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         .into_owned()
                 };
                 Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_str_new(&host_s),
-                    pyre_object::w_str_new(&serv_s),
+                    pyre_object::w_str_new_managed(&host_s),
+                    pyre_object::w_str_new_managed(&serv_s),
                 ]))
             },
             2,
@@ -3395,7 +3395,7 @@ fn unpack_bluetooth_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObj
     let bth: bt::SOCKADDR_BTH =
         unsafe { core::ptr::read_unaligned(storage as *const _ as *const bt::SOCKADDR_BTH) };
     pyre_object::w_tuple_new(vec![
-        pyre_object::w_str_new(&bdaddr_string(bth.btAddr)),
+        pyre_object::w_str_new_managed(&bdaddr_string(bth.btAddr)),
         pyre_object::w_int_new(i64::from(bth.port)),
     ])
 }
@@ -3521,8 +3521,8 @@ fn unpack_hyperv_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObject
     let vm_id = hyperv_guid_string(&hv.vm_id);
     let service_id = hyperv_guid_string(&hv.service_id);
     pyre_object::w_tuple_new(vec![
-        pyre_object::w_str_new(&vm_id),
-        pyre_object::w_str_new(&service_id),
+        pyre_object::w_str_new_managed(&vm_id),
+        pyre_object::w_str_new_managed(&service_id),
     ])
 }
 
@@ -3955,7 +3955,7 @@ fn unpack_inet_addr(
         };
         let port = u16::from_be(sin.sin_port) as i64;
         pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(&host),
+            pyre_object::w_str_new_managed(&host),
             pyre_object::w_int_new(port),
         ])
     } else if family == rffi::AF_INET6 {
@@ -3976,7 +3976,7 @@ fn unpack_inet_addr(
         };
         let port = u16::from_be(sin6.sin6_port) as i64;
         pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(&host),
+            pyre_object::w_str_new_managed(&host),
             pyre_object::w_int_new(port),
             pyre_object::w_int_new(u32::from_be(sin6.sin6_flowinfo) as i64),
             pyre_object::w_int_new(rffi::sockaddr_in6_get_scope_id(sin6) as i64),
@@ -6038,7 +6038,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let family = socket_get_attr_i64(obj, "_family");
                 let ty = socket_get_attr_i64(obj, "_type");
                 let proto = socket_get_attr_i64(obj, "_proto");
-                Ok(pyre_object::w_str_new(&format!(
+                Ok(pyre_object::w_str_new_managed(&format!(
                     "<socket object, fd={fd}, family={family}, type={ty}, proto={proto}>"
                 )))
             },

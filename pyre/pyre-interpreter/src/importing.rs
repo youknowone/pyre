@@ -1482,12 +1482,13 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
             joined.push(path);
         }
         unsafe {
-            let w_key = pyre_object::w_str_new("TZPATH");
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("TZPATH"));
             let w_value =
                 pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(&joined));
             pyre_object::w_dict_store(
                 pyre_object::gc_roots::shadow_stack_get(vars_slot),
-                w_key,
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
                 w_value,
             );
         }
@@ -1585,9 +1586,10 @@ fn init_scproxy(ns: PyObjectRef) -> Result<(), crate::PyError> {
                 let w_key = pyre_object::w_str_new("exclude_simple");
                 let w_value = pyre_object::w_bool_from(false);
                 pyre_object::w_dict_store(roots.get(d_slot), w_key, w_value);
-                let w_key = pyre_object::w_str_new("exceptions");
+                let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = roots.pin_root(pyre_object::w_str_new("exceptions"));
                 let w_value = pyre_object::w_list_new(Vec::new());
-                pyre_object::w_dict_store(roots.get(d_slot), w_key, w_value);
+                pyre_object::w_dict_store(roots.get(d_slot), roots.get(key_slot), w_value);
             }
             Ok(roots.get(d_slot))
         }),

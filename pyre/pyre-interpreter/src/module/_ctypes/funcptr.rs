@@ -142,11 +142,11 @@ fn cfuncptr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let address = crate::display::repr_addr(obj as usize);
     #[cfg(windows)]
     if let Some(index) = com_index(obj) {
-        return Ok(pyre_object::w_str_new(&format!(
+        return Ok(pyre_object::w_str_new_managed(&format!(
             "<COM method offset {index}: {name} at {address}>"
         )));
     }
-    Ok(pyre_object::w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<{name} object at {address}>"
     )))
 }

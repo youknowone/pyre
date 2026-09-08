@@ -54,7 +54,7 @@ fn generate_suggestions(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         names.push(crate::baseobjspace::str_utf8_w(element)?.to_string());
     }
     Ok(match crate::error::best_suggestion(&names, &wrong_name) {
-        Some(name) => w_str_new(&name),
+        Some(name) => w_str_new_managed(&name),
         None => w_none(),
     })
 }

@@ -597,7 +597,7 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             .is_some_and(|base| base == simplecdata_type());
     if !direct {
         let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
-        return Ok(pyre_object::w_str_new(&format!(
+        return Ok(pyre_object::w_str_new_managed(&format!(
             "<{name} object at {}>",
             crate::display::repr_addr(obj as usize)
         )));
@@ -605,14 +605,14 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let tc = type_code_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
     if tc == "O" && host_ctypes::read_pointer_from_buffer(cdata_bytes(obj).unwrap_or(&[])) == 0 {
         let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
-        return Ok(pyre_object::w_str_new(&format!("{name}(<NULL>)")));
+        return Ok(pyre_object::w_str_new_managed(&format!("{name}(<NULL>)")));
     }
     let value = decode_slot(&tc, cdata_bytes(obj).unwrap_or(&[]));
     let rendered = unsafe { crate::display::py_repr_wtf8(value) }?;
     let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
-    Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
-        name, "(", rendered, ")"
-    )))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        crate::display::wtf8_format!(name, "(", rendered, ")"),
+    ))
 }
 
 /// `_SimpleCData.from_param(cls, value)` — identity stub (see caller note).

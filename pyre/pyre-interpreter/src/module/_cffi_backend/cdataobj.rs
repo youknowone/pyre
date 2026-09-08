@@ -693,7 +693,7 @@ fn cdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     } else {
         ""
     };
-    Ok(pyre_object::w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<cdata '{}{extra1}' {extra}>",
         ct.name()
     )))

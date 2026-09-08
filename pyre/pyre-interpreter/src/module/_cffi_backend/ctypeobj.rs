@@ -893,7 +893,10 @@ pub fn kind_name(ct: &W_CType) -> &'static str {
 /// `W_CType.repr`.
 fn ctype_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let ct = ctype_arg(args[0])?;
-    Ok(pyre_object::w_str_new(&format!("<ctype '{}'>", ct.name())))
+    Ok(pyre_object::w_str_new_managed(&format!(
+        "<ctype '{}'>",
+        ct.name()
+    )))
 }
 
 /// `W_CType.dir` — every attribute above that this ctype answers.

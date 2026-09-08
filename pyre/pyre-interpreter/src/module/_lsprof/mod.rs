@@ -410,7 +410,7 @@ fn create_spec_for_method(w_function: PyObjectRef, w_type: PyObjectRef) -> PyObj
     } else {
         "object"
     };
-    pyre_object::w_str_new(&format!("<method '{name}' of '{class_name}' objects>"))
+    pyre_object::w_str_new_managed(&format!("<method '{name}' of '{class_name}' objects>"))
 }
 
 fn create_spec_for_function(w_func: PyObjectRef) -> PyObjectRef {
@@ -436,7 +436,7 @@ fn create_spec_for_object(w_type: PyObjectRef) -> PyObjectRef {
     } else {
         "object"
     };
-    pyre_object::w_str_new(&format!("<'{class_name}' object>"))
+    pyre_object::w_str_new_managed(&format!("<'{class_name}' object>"))
 }
 
 fn prepare_spec(w_arg: PyObjectRef) -> (PyObjectRef, PyObjectRef, PyObjectRef) {

@@ -25,7 +25,7 @@ fn termios_converted_error(errno: i32) -> crate::PyError {
     let args = vec![
         cls,
         pyre_object::w_int_new(errno as i64),
-        pyre_object::w_str_new(&message),
+        pyre_object::w_str_new_managed(&message),
     ];
     let exc = crate::builtins::exc_exception_new(&args)
         .expect("exc_exception_new is infallible for str/int args");

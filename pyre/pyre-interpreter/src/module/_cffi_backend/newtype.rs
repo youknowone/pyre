@@ -511,7 +511,7 @@ pub fn detect_custom_layout(
         ));
         err.exc_object = crate::builtins::exc_exception_new(&[
             ffi_error(),
-            pyre_object::w_str_new(&format!(
+            pyre_object::w_str_new_managed(&format!(
                 "{name}: {msg} (cdef says {cdef_value}, but C compiler says {compiler_value}). fix it or use \"...;\" as the last field in the cdef for {name} to make it flexible"
             )),
         ])?;

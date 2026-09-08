@@ -157,6 +157,15 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
     // the interpreter's mapdict layer), so a type whose terminator has not
     // been created yet gets one on first access. The `is_type` test keeps the
     // sentinel used by single-crate tests from being dereferenced as a type.
+    // `gct_fv_gc_malloc` bracket (`framework.py`): `w_class` is a live
+    // child written after the malloc.  Heap types can sit in the nursery,
+    // so the slot is re-read after the allocation and the creation barrier
+    // remembers a black instance pointing at a still-white type
+    // (`w_bytes_from_block` / `w_cell_new`).
+    let _roots = crate::gc_roots::push_roots();
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
     let map = unsafe {
         if crate::typeobject::is_type(w_class) {
             crate::typeobject::w_type_get_terminator(w_class) as usize
@@ -164,6 +173,9 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
             0
         }
     };
+    let raw =
+        crate::gc_hook::try_gc_alloc_stable_raw(W_OBJECT_OBJECT_GC_TYPE_ID, W_OBJECT_OBJECT_SIZE);
+    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
     let value = W_ObjectObject {
         ob_header: PyObject {
             ob_type: &INSTANCE_TYPE as *const PyType,
@@ -172,14 +184,12 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
         map,
         storage: std::ptr::null_mut(),
     };
-
-    let raw =
-        crate::gc_hook::try_gc_alloc_stable_raw(W_OBJECT_OBJECT_GC_TYPE_ID, W_OBJECT_OBJECT_SIZE);
     if !raw.is_null() {
         unsafe {
             std::ptr::write(raw as *mut W_ObjectObject, value);
-            raw as PyObjectRef
         }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        raw as PyObjectRef
     } else {
         crate::lltype::malloc(value) as PyObjectRef
     }

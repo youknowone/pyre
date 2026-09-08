@@ -255,7 +255,7 @@ impl<'a> MiniXmlParser<'a> {
             match key.as_str() {
                 "version" => version = value,
                 "encoding" => {
-                    encoding = w_str_new(&value);
+                    encoding = w_str_new_managed(&value);
                     let _ = roots.pin_root(encoding);
                 }
                 "standalone" => {
@@ -277,7 +277,7 @@ impl<'a> MiniXmlParser<'a> {
         }
         self.call_handler(
             "XmlDeclHandler",
-            &[w_str_new(&version), encoding, standalone],
+            &[w_str_new_managed(&version), encoding, standalone],
         )?;
         if unsafe { is_int(standalone) && w_int_get_value(standalone) == 0 } {
             crate::baseobjspace::setdictvalue_native(
@@ -305,7 +305,7 @@ impl<'a> MiniXmlParser<'a> {
             self.bump_char();
         }
         self.set_event_position(event_pos);
-        self.call_handler("CommentHandler", &[w_str_new(&text)])
+        self.call_handler("CommentHandler", &[w_str_new_managed(&text)])
     }
 
     fn parse_pi(&mut self) -> Result<(), crate::PyError> {
@@ -328,7 +328,7 @@ impl<'a> MiniXmlParser<'a> {
         self.set_event_position(event_pos);
         self.call_handler(
             "ProcessingInstructionHandler",
-            &[w_str_new(&target), w_str_new(&data)],
+            &[w_str_new_managed(&target), w_str_new_managed(&data)],
         )
     }
 
@@ -373,15 +373,15 @@ impl<'a> MiniXmlParser<'a> {
         if self.starts_with("PUBLIC") {
             self.expect("PUBLIC")?;
             self.skip_ws();
-            pubid = w_str_new(&self.read_quoted()?);
+            pubid = w_str_new_managed(&self.read_quoted()?);
             let _ = roots.pin_root(pubid);
             self.skip_ws();
-            sysid = w_str_new(&self.read_quoted()?);
+            sysid = w_str_new_managed(&self.read_quoted()?);
             let sysid = roots.pin_root(sysid);
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
-            sysid = w_str_new(&self.read_quoted()?);
+            sysid = w_str_new_managed(&self.read_quoted()?);
             let _ = roots.pin_root(sysid);
         }
         self.skip_ws();
@@ -401,14 +401,14 @@ impl<'a> MiniXmlParser<'a> {
             self.set_event_position(event_pos);
             self.call_handler(
                 "StartDoctypeDeclHandler",
-                &[w_str_new(&name), sysid, pubid, w_int_new(1)],
+                &[w_str_new_managed(&name), sysid, pubid, w_int_new(1)],
             )?;
             self.parse_internal_subset()?;
         } else {
             self.set_event_position(event_pos);
             self.call_handler(
                 "StartDoctypeDeclHandler",
-                &[w_str_new(&name), sysid, pubid, w_int_new(0)],
+                &[w_str_new_managed(&name), sysid, pubid, w_int_new(0)],
             )?;
         }
         self.skip_ws();
@@ -471,12 +471,12 @@ impl<'a> MiniXmlParser<'a> {
         if matches!(self.peek_char(), Some('"' | '\'')) {
             let v = self.read_quoted()?;
             self.internal_entities.insert(name.clone(), v.clone());
-            value = w_str_new(&v);
+            value = w_str_new_managed(&v);
             let _ = roots.pin_root(value);
         } else if self.starts_with("PUBLIC") {
             self.expect("PUBLIC")?;
             self.skip_ws();
-            pubid = w_str_new(&self.read_quoted()?);
+            pubid = w_str_new_managed(&self.read_quoted()?);
             let pubid = roots.pin_root(pubid);
             self.skip_ws();
             let system = self.read_quoted()?;
@@ -487,7 +487,7 @@ impl<'a> MiniXmlParser<'a> {
                     Some(unsafe { w_str_get_value(pubid) }.to_string()),
                 ),
             );
-            sysid = w_str_new(&system);
+            sysid = w_str_new_managed(&system);
             let sysid = roots.pin_root(sysid);
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
@@ -495,14 +495,14 @@ impl<'a> MiniXmlParser<'a> {
             let system = self.read_quoted()?;
             self.external_entities
                 .insert(name.clone(), (system.clone(), None));
-            sysid = w_str_new(&system);
+            sysid = w_str_new_managed(&system);
             let _ = roots.pin_root(sysid);
         }
         self.skip_ws();
         if self.starts_with("NDATA") {
             self.expect("NDATA")?;
             self.skip_ws();
-            notation = w_str_new(&self.read_name()?);
+            notation = w_str_new_managed(&self.read_name()?);
             let _ = roots.pin_root(notation);
         }
         self.skip_until_gt()?;
@@ -511,14 +511,14 @@ impl<'a> MiniXmlParser<'a> {
         if !unsafe { is_none(notation) } {
             self.call_handler(
                 "UnparsedEntityDeclHandler",
-                &[w_str_new(&name), base, sysid, pubid, notation],
+                &[w_str_new_managed(&name), base, sysid, pubid, notation],
             )?;
             return Ok(());
         }
         self.call_handler(
             "EntityDeclHandler",
             &[
-                w_str_new(&name),
+                w_str_new_managed(&name),
                 w_int_new(is_param),
                 value,
                 base,
@@ -572,7 +572,7 @@ impl<'a> MiniXmlParser<'a> {
         ]);
         let model = roots.pin_root(model);
         self.set_event_position(event_pos);
-        self.call_handler("ElementDeclHandler", &[w_str_new(&name), model])
+        self.call_handler("ElementDeclHandler", &[w_str_new_managed(&name), model])
     }
 
     fn parse_attlist_decl(&mut self) -> Result<(), crate::PyError> {
@@ -605,9 +605,9 @@ impl<'a> MiniXmlParser<'a> {
             self.call_handler(
                 "AttlistDeclHandler",
                 &[
-                    w_str_new(&elem),
-                    w_str_new(&attr),
-                    w_str_new(&kind),
+                    w_str_new_managed(&elem),
+                    w_str_new_managed(&attr),
+                    w_str_new_managed(&kind),
                     w_none(),
                     w_int_new(required),
                 ],
@@ -631,24 +631,24 @@ impl<'a> MiniXmlParser<'a> {
         if self.starts_with("PUBLIC") {
             self.expect("PUBLIC")?;
             self.skip_ws();
-            pubid = w_str_new(&self.read_quoted()?);
+            pubid = w_str_new_managed(&self.read_quoted()?);
             let _ = roots.pin_root(pubid);
             self.skip_ws();
             if matches!(self.peek_char(), Some('"' | '\'')) {
-                sysid = w_str_new(&self.read_quoted()?);
+                sysid = w_str_new_managed(&self.read_quoted()?);
                 let _ = roots.pin_root(sysid);
             }
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
-            sysid = w_str_new(&self.read_quoted()?);
+            sysid = w_str_new_managed(&self.read_quoted()?);
             let _ = roots.pin_root(sysid);
         }
         self.skip_until_gt()?;
         self.set_event_position(event_pos);
         self.call_handler(
             "NotationDeclHandler",
-            &[w_str_new(&name), w_none(), sysid, pubid],
+            &[w_str_new_managed(&name), w_none(), sysid, pubid],
         )
     }
 
@@ -814,7 +814,7 @@ impl<'a> MiniXmlParser<'a> {
             let base = roots.base();
             for (name, value) in attrs {
                 let _ = roots.pin_root(self.intern_string(name));
-                let _ = roots.pin_root(w_str_new(value));
+                let _ = roots.pin_root(w_str_new_managed(value));
             }
             // `w_list_new` pins the vector it is handed, so the vector is built
             // out of the slots at the call rather than while the members are
@@ -833,7 +833,7 @@ impl<'a> MiniXmlParser<'a> {
                 let name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = name_roots.base();
                 let _ = name_roots.pin_root(self.intern_string(name));
-                let w_value = w_str_new(value);
+                let w_value = w_str_new_managed(value);
                 unsafe { w_dict_store(roots.get(attrs_slot), name_roots.get(name_slot), w_value) };
             }
             roots.get(attrs_slot)
@@ -850,7 +850,7 @@ impl<'a> MiniXmlParser<'a> {
                 self.flush_character_buffer()?;
             }
             if text.len() > size {
-                return self.call_handler_raw("CharacterDataHandler", &[w_str_new(text)]);
+                return self.call_handler_raw("CharacterDataHandler", &[w_str_new_managed(text)]);
             }
             self.char_buffer.push_str(text);
             crate::baseobjspace::setdictvalue_native(
@@ -860,7 +860,7 @@ impl<'a> MiniXmlParser<'a> {
             );
             Ok(())
         } else {
-            self.call_handler_raw("CharacterDataHandler", &[w_str_new(text)])
+            self.call_handler_raw("CharacterDataHandler", &[w_str_new_managed(text)])
         }
     }
 
@@ -892,7 +892,7 @@ impl<'a> MiniXmlParser<'a> {
         }
         let text = std::mem::take(&mut self.char_buffer);
         crate::baseobjspace::setdictvalue_native(self.parser, "buffer_used", w_int_new(0));
-        self.call_handler_raw("CharacterDataHandler", &[w_str_new(&text)])
+        self.call_handler_raw("CharacterDataHandler", &[w_str_new_managed(&text)])
     }
 
     fn call_handler(&mut self, name: &str, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
@@ -918,13 +918,23 @@ impl<'a> MiniXmlParser<'a> {
         if self.suppress_current {
             return Ok(());
         }
+        // `getattr` and the handler call both run Python.  A plain Rust slice
+        // is not a place the collector updates, so the argument words are
+        // pinned before the lookup and read back out of their root slots at
+        // the call — the same bracket `call_handler` uses.
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.base();
+        for &arg in args {
+            let _ = roots.pin_root(arg);
+        }
         let Ok(handler) = crate::baseobjspace::getattr_str(self.parser, name) else {
             return Ok(());
         };
         if handler.is_null() || unsafe { is_none(handler) } {
             return Ok(());
         }
-        crate::call::call_function_impl_result(handler, args)?;
+        let args: Vec<PyObjectRef> = (0..args.len()).map(|i| roots.get(base + i)).collect();
+        crate::call::call_function_impl_result(handler, &args)?;
         Ok(())
     }
 
@@ -1012,9 +1022,12 @@ impl<'a> MiniXmlParser<'a> {
                 let w_prefix = if prefix.is_empty() {
                     w_none()
                 } else {
-                    w_str_new(&prefix)
+                    w_str_new_managed(&prefix)
                 };
-                self.call_handler("StartNamespaceDeclHandler", &[w_prefix, w_str_new(value)])?;
+                self.call_handler(
+                    "StartNamespaceDeclHandler",
+                    &[w_prefix, w_str_new_managed(value)],
+                )?;
             }
         }
         Ok(())
@@ -1026,7 +1039,7 @@ impl<'a> MiniXmlParser<'a> {
             let w_prefix = if prefix.is_empty() {
                 w_none()
             } else {
-                w_str_new(&prefix)
+                w_str_new_managed(&prefix)
             };
             self.call_handler("EndNamespaceDeclHandler", &[w_prefix])?;
         }
@@ -1125,8 +1138,11 @@ impl<'a> MiniXmlParser<'a> {
                         .map_err(|_| "error in processing external entity reference".to_string())?;
                 }
                 _ if content => {
-                    self.call_handler("SkippedEntityHandler", &[w_str_new(ent), w_int_new(0)])
-                        .map_err(|_| "undefined entity".to_string())?;
+                    self.call_handler(
+                        "SkippedEntityHandler",
+                        &[w_str_new_managed(ent), w_int_new(0)],
+                    )
+                    .map_err(|_| "undefined entity".to_string())?;
                 }
                 _ => return Err("undefined entity".to_string()),
             }
@@ -1161,15 +1177,13 @@ impl<'a> MiniXmlParser<'a> {
         let handler = roots.pin_root(handler);
         let base = crate::baseobjspace::getattr_str(self.parser, "_pyre_base")
             .unwrap_or_else(|_| w_none());
-        let ret = crate::call::call_function_impl_result(
-            handler,
-            &[
-                w_str_new(context),
-                base,
-                w_str_new(sysid),
-                pubid.map(w_str_new).unwrap_or_else(w_none),
-            ],
-        )?;
+        let w_context = roots.pin_root(w_str_new_managed(context));
+        let w_sysid = roots.pin_root(w_str_new_managed(sysid));
+        let w_pubid = pubid
+            .map(|s| roots.pin_root(w_str_new_managed(s)))
+            .unwrap_or_else(w_none);
+        let ret =
+            crate::call::call_function_impl_result(handler, &[w_context, base, w_sysid, w_pubid])?;
         if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
             return self.fail("error in processing external entity reference");
         }
@@ -1313,7 +1327,7 @@ fn decode_xml_bytes(parser: PyObjectRef, data: &[u8]) -> Result<String, crate::P
     crate::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_forced_encoding",
-        w_str_new(&normalized),
+        w_str_new_managed(&normalized),
     );
     match normalized.as_str() {
         "utf-8" | "us-ascii" => {
@@ -1462,7 +1476,7 @@ fn is_true_obj(obj: PyObjectRef) -> bool {
 fn make_builtin_error(name: &str, msg: &str) -> crate::PyError {
     let mut err = crate::PyError::value_error(msg.to_string());
     if let Some(cls) = crate::builtins::lookup_exc_class(name) {
-        let args = [cls, w_str_new(msg)];
+        let args = [cls, w_str_new_managed(msg)];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }
@@ -1478,7 +1492,11 @@ fn parser_pending(parser: PyObjectRef) -> String {
 }
 
 fn set_parser_pending(parser: PyObjectRef, pending: &str) {
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_pending_xml", w_str_new(pending));
+    crate::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_pending_xml",
+        w_str_new_managed(pending),
+    );
 }
 
 fn get_parser_int(parser: PyObjectRef, name: &str, default: i64) -> i64 {
@@ -1636,7 +1654,7 @@ const EXPAT_ERROR_NAME: &str = "xml.parsers.expat.ExpatError";
 fn pyexpat_error(msg: String, code: i64, lineno: i64, offset: i64) -> crate::PyError {
     let mut err = crate::PyError::value_error(msg.clone());
     if let Some(cls) = crate::builtins::lookup_exc_class(EXPAT_ERROR_NAME) {
-        let args = [cls, w_str_new(&msg)];
+        let args = [cls, w_str_new_managed(&msg)];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
             // The fresh exception is named only by this local while the three
             // stores below build their values and grow its attribute storage.
@@ -1964,7 +1982,7 @@ fn parser_create3(
         crate::baseobjspace::setdictvalue_native(
             parser,
             "_pyre_namespace_separator",
-            w_str_new(value),
+            w_str_new_managed(value),
         );
     } else {
         return Err(parser_create_not_str(
@@ -2198,14 +2216,19 @@ crate::py_module! {
                 continue;
             }
             let (msg, code) = ERROR_TABLE[idx - 1];
-            let w_msg = w_str_new(msg);
-            crate::baseobjspace::setdictvalue_native(errors, name, w_msg);
+            let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = error_map_roots.pin_root(w_str_new(msg));
+            crate::baseobjspace::setdictvalue_native(
+                errors,
+                name,
+                error_map_roots.get(msg_slot),
+            );
             let w_code = w_int_new(code);
             let codes = error_map_roots.get(codes_slot);
             unsafe { w_dict_setitem_str(codes, msg, w_code) };
             let w_key = w_int_new(code);
             let messages = error_map_roots.get(messages_slot);
-            unsafe { w_dict_store(messages, w_key, w_msg) };
+            unsafe { w_dict_store(messages, w_key, error_map_roots.get(msg_slot)) };
         }
         let codes = error_map_roots.get(codes_slot);
         crate::baseobjspace::setdictvalue_native(errors, "codes", codes);

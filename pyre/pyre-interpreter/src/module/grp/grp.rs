@@ -29,13 +29,16 @@ fn struct_group_type() -> pyre_object::PyObjectRef {
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     #[cfg(feature = "host_env")]
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
-        let mem_items: Vec<pyre_object::PyObjectRef> =
-            g.mem.iter().map(|s| pyre_object::w_str_new(s)).collect();
+        let mem_items: Vec<pyre_object::PyObjectRef> = g
+            .mem
+            .iter()
+            .map(|s| pyre_object::w_str_new_managed(s))
+            .collect();
         crate::_structseq::new_instance(
             struct_group_type(),
             vec![
-                pyre_object::w_str_new(&g.name),
-                pyre_object::w_str_new(&g.passwd),
+                pyre_object::w_str_new_managed(&g.name),
+                pyre_object::w_str_new_managed(&g.passwd),
                 pyre_object::w_int_new(g.gid as i64),
                 pyre_object::w_list_new(mem_items),
             ],
@@ -56,15 +59,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let mut p = (*g).gr_mem;
         if !p.is_null() {
             while !(*p).is_null() {
-                mem_items.push(pyre_object::w_str_new(&cstr(*p)));
+                mem_items.push(pyre_object::w_str_new_managed(&cstr(*p)));
                 p = p.add(1);
             }
         }
         crate::_structseq::new_instance(
             struct_group_type(),
             vec![
-                pyre_object::w_str_new(&cstr((*g).gr_name)),
-                pyre_object::w_str_new(&cstr((*g).gr_passwd)),
+                pyre_object::w_str_new_managed(&cstr((*g).gr_name)),
+                pyre_object::w_str_new_managed(&cstr((*g).gr_passwd)),
                 pyre_object::w_int_new((*g).gr_gid as i64),
                 pyre_object::w_list_new(mem_items),
             ],

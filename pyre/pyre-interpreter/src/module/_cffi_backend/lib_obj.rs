@@ -345,7 +345,7 @@ fn get_attr(
                     .ok_or_else(|| PyError::system_error("module type is not initialized"));
             }
             "__name__" => {
-                return Ok(pyre_object::w_str_new(&format!(
+                return Ok(pyre_object::w_str_new_managed(&format!(
                     "{}.lib",
                     libname(lib_arg(roots.get(lib_slot))?)?
                 )));
@@ -552,7 +552,7 @@ pub unsafe fn w_lib_dealloc(obj: PyObjectRef) {
 }
 
 fn lib_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    Ok(pyre_object::w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<Lib object for '{}'>",
         libname(lib_arg(args[0])?)?
     )))

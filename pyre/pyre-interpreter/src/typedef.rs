@@ -8462,13 +8462,24 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             type_name_of(w_frame)
         )));
     }
-    let frame = w_frame as *mut crate::pyframe::PyFrame;
-
-    // tb_lasti / tb_lineno: both are declared `int` in the signature, so the
-    // converter Argument Clinic emits is `PyLong_AsInt` — it reduces through
-    // `__index__` and refuses a value the C `int` cannot hold.
-    let lasti = traceback_c_int_arg(w_lasti)?;
-    let lineno = traceback_c_int_arg(w_lineno)?;
+    // `PyTraceback.descr_new` keeps `w_next` / `w_frame` as GC locals across
+    // the `unwrap_spec(lasti=int, lineno=int)` conversions (`space.index_w`
+    // / `__index__` can collect).  Pin the remaining wrapped args and reload
+    // the frame out of the anchor after the conversions, the way gctransform
+    // reloads those locals.
+    let _tb_roots = pyre_object::gc_roots::push_roots();
+    let next_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(next);
+    let lasti_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_lasti);
+    let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_lineno);
+    let frame_anchor =
+        unsafe { crate::eval::FrameAnchor::from_raw(w_frame as *mut crate::pyframe::PyFrame) };
+    let lasti = traceback_c_int_arg(pyre_object::gc_roots::shadow_stack_get(lasti_slot))?;
+    let lineno = traceback_c_int_arg(pyre_object::gc_roots::shadow_stack_get(lineno_slot))?;
+    let frame = frame_anchor.live();
+    let next = pyre_object::gc_roots::shadow_stack_get(next_slot);
     let w_code = unsafe { (*frame).fget_f_code() };
 
     Ok(crate::pytraceback::w_pytraceback_new(
@@ -11883,7 +11894,7 @@ fn patch_getset_descriptor_metadata() {
                                 "<generic property>".to_string()
                             };
                             let combined =
-                                pyre_object::w_str_new(&format!("{type_qualname}.{name}"));
+                                pyre_object::w_str_new_managed(&format!("{type_qualname}.{name}"));
                             pyre_object::typedef::w_getset_set_qualname(descr, combined);
                             Ok(combined)
                         }
@@ -15946,7 +15957,7 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
                     ));
                 };
                 let method_name = unsafe { crate::function::function_get_name(descr) };
-                Ok(pyre_object::w_str_new(&format!(
+                Ok(pyre_object::w_str_new_managed(&format!(
                     "{owner_qualname}.{method_name}"
                 )))
             }) as crate::gateway::BuiltinCodeFn,
@@ -16369,7 +16380,7 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
                     ));
                 };
                 let method_name = unsafe { crate::function::function_get_name(descr) };
-                Ok(pyre_object::w_str_new(&format!(
+                Ok(pyre_object::w_str_new_managed(&format!(
                     "{owner_qualname}.{method_name}"
                 )))
             }) as crate::gateway::BuiltinCodeFn,
@@ -17289,7 +17300,9 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
             } else {
                 unsafe { pyre_object::w_type_get_qualname(owner) }.to_string()
             };
-            Ok(pyre_object::w_str_new(&format!("{owner_qualname}.{name}")))
+            Ok(pyre_object::w_str_new_managed(&format!(
+                "{owner_qualname}.{name}"
+            )))
         },
         2,
     );
@@ -24783,7 +24796,7 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             for &byte in data {
                 out.push_str(&format!("{byte:02x}"));
             }
-            return Ok(pyre_object::w_str_new(&out));
+            return Ok(pyre_object::w_str_new_managed(&out));
         };
 
         // `pypy/objspace/std/bytearrayobject.py:645-687 _binascii_hexstr`
@@ -24833,7 +24846,7 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             }
             out.push_str(&format!("{byte:02x}"));
         }
-        Ok(pyre_object::w_str_new(&out))
+        Ok(pyre_object::w_str_new_managed(&out))
     })();
     receiver.release();
     result
@@ -25684,7 +25697,7 @@ fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         }
     }
     out.push(quote);
-    Ok(pyre_object::w_str_new(&out))
+    Ok(pyre_object::w_str_new_managed(&out))
 }
 
 fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -29094,7 +29107,7 @@ fn coroutine_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn async_generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
-    Ok(w_str_new(&format!(
+    Ok(w_str_new_managed(&format!(
         "<async_generator object {} at {}>",
         unsafe { pyre_object::w_str_get_value(name) },
         crate::display::repr_addr(args[0] as usize)

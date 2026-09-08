@@ -208,7 +208,7 @@ fn strict_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn ignore_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = codec_error_arg(args)?;
-    Ok(codec_result(w_str_new(""), exc.w_end))
+    Ok(codec_result(w_str_new_managed(""), exc.w_end))
 }
 
 fn error_codepoints(exc: &CodecException) -> Result<Vec<u32>, crate::PyError> {
@@ -250,7 +250,7 @@ fn replace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             ));
         }
     };
-    Ok(codec_result(w_str_new(&replacement), exc.w_end))
+    Ok(codec_result(w_str_new_managed(&replacement), exc.w_end))
 }
 
 fn xmlcharrefreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -264,7 +264,7 @@ fn xmlcharrefreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         .into_iter()
         .map(|code| format!("&#{code};"))
         .collect();
-    Ok(codec_result(w_str_new(&replacement), exc.w_end))
+    Ok(codec_result(w_str_new_managed(&replacement), exc.w_end))
 }
 
 fn backslashreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -295,7 +295,7 @@ fn backslashreplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             ));
         }
     };
-    Ok(codec_result(w_str_new(&replacement), exc.w_end))
+    Ok(codec_result(w_str_new_managed(&replacement), exc.w_end))
 }
 
 fn namereplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -317,7 +317,7 @@ fn namereplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             replacement.push_str(&raw_unicode_escape(code));
         }
     }
-    Ok(codec_result(w_str_new(&replacement), exc.w_end))
+    Ok(codec_result(w_str_new_managed(&replacement), exc.w_end))
 }
 
 #[derive(Clone, Copy)]

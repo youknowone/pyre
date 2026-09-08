@@ -119,7 +119,7 @@ fn capsule_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Some(name) => format!("\"{name}\""),
         None => "NULL".to_string(),
     };
-    Ok(pyre_object::w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<capsule object {name} at {:#x}>",
         slot_get(args[0], POINTER_KEY)
     )))

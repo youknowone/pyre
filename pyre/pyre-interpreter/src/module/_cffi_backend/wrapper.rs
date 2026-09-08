@@ -204,7 +204,7 @@ fn wrapper_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         .ok_or_else(|| PyError::system_error("function wrapper lost its raw type"))?;
     let fnname = crate::baseobjspace::text_w(wrapper.w_fnname)?.to_string();
     let doc = raw.repr_fn_type(wrapper.w_ffi, &fnname)?;
-    Ok(pyre_object::w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<FFIFunctionWrapper '{doc}'>"
     )))
 }
@@ -216,7 +216,7 @@ fn wrapper_get_doc(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let fnname = crate::baseobjspace::text_w(wrapper.w_fnname)?.to_string();
     let modulename = crate::baseobjspace::text_w(wrapper.w_modulename)?.to_string();
     let doc = raw.repr_fn_type(wrapper.w_ffi, &fnname)?;
-    Ok(pyre_object::w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "{doc};\n\nCFFI C function from {}.lib",
         modulename
     )))

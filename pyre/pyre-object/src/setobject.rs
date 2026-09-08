@@ -360,42 +360,7 @@ fn set_write_barrier(obj: PyObjectRef) {
 /// constructor models it by signature — a plain `PyObjectRef` GCREF.
 #[majit_macros::dont_look_inside]
 pub fn w_set_new() -> PyObjectRef {
-    let items =
-        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::default(), set_items_gc_type_id());
-    let header = PyObject {
-        ob_type: &SET_TYPE as *const PyType,
-        w_class: get_instantiate(&SET_TYPE),
-    };
-    // Allocate the body in GC old-gen (mark-sweep, non-moving) so it
-    // carries TRACK_YOUNG_PTRS, mirroring `w_list_new` / `w_tuple_new`.
-    // `w_set_add` stores possibly-young elements into `items`; the write
-    // barrier (`set_write_barrier`) only remembers the set on a minor
-    // collection when the body is an old-gen object, so a body allocated
-    // through the plain `malloc_typed` (no TRACK_YOUNG_PTRS) would leave
-    // young elements unforwarded and collected. Falls back to
-    // `malloc_typed` when no GC hook is installed (unit tests).
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
-    if !raw.is_null() {
-        unsafe {
-            std::ptr::write(
-                raw as *mut W_SetObject,
-                W_SetObject {
-                    ob_header: header,
-                    items,
-                    len: AtomicUsize::new(0),
-                    hash: -1,
-                },
-            );
-        }
-        raw as PyObjectRef
-    } else {
-        crate::lltype::malloc_typed(W_SetObject {
-            ob_header: header,
-            items,
-            len: AtomicUsize::new(0),
-            hash: -1,
-        }) as PyObjectRef
-    }
+    alloc_set_object(&SET_TYPE)
 }
 
 /// Allocate an empty `frozenset`.
@@ -406,33 +371,49 @@ pub fn w_set_new() -> PyObjectRef {
 /// [`w_set_new`].
 #[majit_macros::dont_look_inside]
 pub fn w_frozenset_new() -> PyObjectRef {
+    alloc_set_object(&FROZENSET_TYPE)
+}
+
+fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
+    // Allocate the body in GC old-gen (mark-sweep, non-moving) so it
+    // carries TRACK_YOUNG_PTRS, mirroring `w_list_new` / `w_tuple_new`.
+    // `w_set_add` stores possibly-young elements into `items`; the write
+    // barrier (`set_write_barrier`) only remembers the set on a minor
+    // collection when the body is an old-gen object, so a body allocated
+    // through the plain `malloc_typed` (no TRACK_YOUNG_PTRS) would leave
+    // young elements unforwarded and collected. Falls back to
+    // `malloc_typed` when no GC hook is installed (unit tests).
+    //
+    // The items box has no heap edge until the body is written, and both
+    // `get_instantiate` and the body malloc can collect.  Pin the box and
+    // the class, reload after the last allocation, and remember the
+    // old-to-young items edge (`w_bytearray_alloc` / `build_bytes`).
+    let _roots = crate::gc_roots::push_roots();
     let items =
         crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::default(), set_items_gc_type_id());
-    let header = PyObject {
-        ob_type: &FROZENSET_TYPE as *const PyType,
-        w_class: get_instantiate(&FROZENSET_TYPE),
-    };
+    let items_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(items as PyObjectRef);
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(get_instantiate(set_type));
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
+    let items = crate::gc_roots::shadow_stack_get(items_slot) as *mut SetItemsStorage;
+    let body = W_SetObject {
+        ob_header: PyObject {
+            ob_type: set_type as *const PyType,
+            w_class: crate::gc_roots::shadow_stack_get(class_slot),
+        },
+        items,
+        len: AtomicUsize::new(0),
+        hash: -1,
+    };
     if !raw.is_null() {
         unsafe {
-            std::ptr::write(
-                raw as *mut W_SetObject,
-                W_SetObject {
-                    ob_header: header,
-                    items,
-                    len: AtomicUsize::new(0),
-                    hash: -1,
-                },
-            );
+            std::ptr::write(raw as *mut W_SetObject, body);
         }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
-        crate::lltype::malloc_typed(W_SetObject {
-            ob_header: header,
-            items,
-            len: AtomicUsize::new(0),
-            hash: -1,
-        }) as PyObjectRef
+        crate::lltype::malloc_typed(body) as PyObjectRef
     }
 }
 

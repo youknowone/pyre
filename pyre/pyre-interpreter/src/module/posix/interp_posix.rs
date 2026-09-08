@@ -3225,9 +3225,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     )));
                 }
                 let code = crate::baseobjspace::c_int_w(args[0])?;
-                Ok(pyre_object::w_str_new(&crate::PyError::clean_strerror(
-                    code,
-                )))
+                Ok(pyre_object::w_str_new_managed(
+                    &crate::PyError::clean_strerror(code),
+                ))
             },
             1,
         ),
@@ -6683,11 +6683,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(crate::_structseq::new_instance(
                     uname_result_seq_type(),
                     vec![
-                        pyre_object::w_str_new(&sysname),
-                        pyre_object::w_str_new(&nodename),
-                        pyre_object::w_str_new(&release),
-                        pyre_object::w_str_new(&version),
-                        pyre_object::w_str_new(&machine),
+                        pyre_object::w_str_new_managed(&sysname),
+                        pyre_object::w_str_new_managed(&nodename),
+                        pyre_object::w_str_new_managed(&release),
+                        pyre_object::w_str_new_managed(&version),
+                        pyre_object::w_str_new_managed(&machine),
                     ],
                 ))
             },
@@ -7147,7 +7147,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         return Ok(crate::typedef::charp2uni(&msg));
                     }
                     #[cfg(not(feature = "sandbox"))]
-                    Ok(pyre_object::w_str_new(
+                    Ok(pyre_object::w_str_new_managed(
                         &rustpython_host_env::time::strerror(code),
                     ))
                 },
@@ -12254,7 +12254,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::make_builtin_function_with_arity(
                 "getlogin",
                 |_| match host_nt::getlogin() {
-                    Ok(name) => Ok(pyre_object::w_str_new(&name)),
+                    Ok(name) => Ok(pyre_object::w_str_new_managed(&name)),
                     Err(e) => Err(fs_err_with_filename2(
                         e,
                         0,
@@ -12613,7 +12613,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     match host_os::device_encoding(fd) {
                         // `GetConsoleCP` answers 0 for a process with no console.
-                        Some(name) if name != "cp0" => Ok(pyre_object::w_str_new(&name)),
+                        Some(name) if name != "cp0" => Ok(pyre_object::w_str_new_managed(&name)),
                         _ => Ok(pyre_object::w_none()),
                     }
                 },

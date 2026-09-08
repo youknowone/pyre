@@ -2723,7 +2723,7 @@ mod certificate_methods {
         fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
             let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
             let subject = native_result(pyre_native::ssl::certificate_subject_rfc2253(der))?;
-            Ok(w_str_new(&format!("<Certificate '{subject}'>")))
+            Ok(w_str_new_managed(&format!("<Certificate '{subject}'>")))
         }
 
         fn __hash__(&mut self) -> Result<i64, crate::PyError> {

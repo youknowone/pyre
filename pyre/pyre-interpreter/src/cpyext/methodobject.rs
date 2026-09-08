@@ -874,7 +874,7 @@ fn method_name(carrier: PyObjectRef) -> String {
 
 fn descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
-    Ok(pyre_object::w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<built-in function {}>",
         method_name(carrier)
     )))

@@ -100,7 +100,7 @@ fn binascii_error(msg: impl Into<String>) -> crate::PyError {
     let msg = msg.into();
     let mut err = crate::PyError::value_error(msg.clone());
     if let Some(cls) = crate::builtins::lookup_exc_class("binascii.Error") {
-        let args = [cls, w_str_new(&msg)];
+        let args = [cls, w_str_new_managed(&msg)];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }

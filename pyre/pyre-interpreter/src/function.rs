@@ -3560,7 +3560,7 @@ pub unsafe fn method_class_bound_qualname(
             "type.__qualname__ is not a unicode object",
         ));
     };
-    Ok(Some(pyre_object::w_str_new(&format!(
+    Ok(Some(pyre_object::w_str_new_managed(&format!(
         "{owner_qualname}.{inherited_name}"
     ))))
 }
@@ -3638,7 +3638,7 @@ pub unsafe fn descr_function_get(
 pub unsafe fn descr_function_repr(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let name = function_get_name(obj);
-        pyre_object::w_str_new(&format!("function {name}"))
+        pyre_object::w_str_new_managed(&format!("function {name}"))
     }
 }
 

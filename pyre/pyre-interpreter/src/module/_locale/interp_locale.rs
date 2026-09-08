@@ -409,7 +409,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let territory = windows_default_locale_component(LOCALE_SISO3166CTRYNAME);
                 let locale = match (language, territory) {
                     (Some(language), Some(territory)) => {
-                        pyre_object::w_str_new(&format!("{language}_{territory}"))
+                        pyre_object::w_str_new_managed(&format!("{language}_{territory}"))
                     }
                     _ => pyre_object::w_none(),
                 };
@@ -418,7 +418,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // to a codec name is `locale.getdefaultlocale`'s job, not this
                 // hook's.
                 let codepage = active_acp();
-                let encoding = pyre_object::w_str_new(&format!("cp{codepage}"));
+                let encoding = pyre_object::w_str_new_managed(&format!("cp{codepage}"));
                 Ok(pyre_object::w_tuple_new(vec![locale, encoding]))
             },
             0,
