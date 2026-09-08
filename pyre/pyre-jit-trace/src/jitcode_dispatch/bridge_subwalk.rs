@@ -194,7 +194,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     let total_r = top_num_regs_r + top_constants_r.len();
     let total_i = top_num_regs_i + top_constants_i.len();
     let total_f = top_num_regs_f + top_constants_f.len();
-    let mut top_regs_r = vec![OpRef::NONE; total_r];
+    let top_regs_r = RegisterBank::with_constants(vec![OpRef::NONE; total_r], top_num_regs_r);
+    let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&top_regs_r);
     let mut top_regs_i = vec![OpRef::NONE; total_i];
     let mut top_regs_f = vec![OpRef::NONE; total_f];
     let mut top_concrete_r = vec![ConcreteValue::Null; total_r];
@@ -217,7 +218,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // slot).
     for (i, v) in top_constants_r.iter().enumerate() {
         let v = v.get();
-        top_regs_r[top_num_regs_r + i] = trace_ctx.const_ref(v);
+        top_regs_r.set(top_num_regs_r + i, trace_ctx.const_ref(v));
         top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in top_constants_f.iter().enumerate() {
@@ -260,7 +261,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         });
     }
     for (i, &box_ref) in argboxes_r.iter().enumerate() {
-        top_regs_r[i] = box_ref;
+        top_regs_r.set(i, box_ref);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = trace_ctx.box_value(box_ref) {
             top_concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
@@ -376,9 +377,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 ..Default::default()
             },
             session,
-            registers_r: &mut top_regs_r,
-            registers_i: &mut top_regs_i,
-            registers_f: &mut top_regs_f,
+            registers_r: &top_regs_r,
+            registers_i: &RegisterBank::with_constants(top_regs_i, top_num_regs_i),
+            registers_f: &RegisterBank::with_constants(top_regs_f, top_num_regs_f),
             concrete_registers_r: &mut top_concrete_r,
             concrete_registers_i: &mut top_concrete_i,
             descr_refs: &descr_refs,
@@ -650,8 +651,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // `sym.registers_r`, so publish it for the length of the walk or a
             // fold's freshly minted `ConstPtr` sits in a bank no root area
             // reaches.
-            let _bank_guard =
-                crate::trace::InlineRegisterBankGuard::enter(&raw mut *wc.registers_r);
+            let _bank_guard = crate::trace::InlineRegisterBankGuard::enter(wc.registers_r);
             walk(jitcode_code, walk_position, &mut wc)
         };
         if matches!(
@@ -803,7 +803,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     // non-bridge callers (`bridge_registers_r == None`).
     let mut regs_r = root_sym
         .bridge_registers_r()
-        .cloned()
+        .map(|regs| regs.to_vec())
         .unwrap_or_else(|| root_sym.registers_r().to_vec());
     let result_color = unsafe { &(*root_sym.jitcode()).payload }
         .result_color_trivia_for_jitcode_pc(root_pc)
@@ -1165,7 +1165,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let total_r = num_regs_r + jc.constants_r.len();
     let total_i = num_regs_i + jc.constants_i.len();
     let total_f = num_regs_f + jc.constants_f.len();
-    let mut regs_r = vec![OpRef::NONE; total_r];
+    let regs_r = RegisterBank::with_constants(vec![OpRef::NONE; total_r], num_regs_r);
+    let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&regs_r);
     let mut regs_i = vec![OpRef::NONE; total_i];
     let mut regs_f = vec![OpRef::NONE; total_f];
     let mut concrete_r = vec![ConcreteValue::Null; total_r];
@@ -1178,7 +1179,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     // reading as the top-level seeding above and as `build_callee_banks`.
     for (i, v) in jc.constants_r.iter().enumerate() {
         let v = v.get();
-        regs_r[num_regs_r + i] = ctx.const_ref(v);
+        regs_r.set(num_regs_r + i, ctx.const_ref(v));
         concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in jc.constants_f.iter().enumerate() {
@@ -1192,7 +1193,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         }));
     }
     for (i, &box_ref) in argboxes_r.iter().enumerate() {
-        regs_r[i] = box_ref;
+        regs_r.set(i, box_ref);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(box_ref) {
             concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
@@ -1230,7 +1231,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 callee_num_regs_r: regs_r.len(),
             }));
         }
-        regs_r[call_dst_reg] = result;
+        regs_r.set(call_dst_reg, result);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
             concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
@@ -1342,9 +1343,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 ..Default::default()
             },
             session,
-            registers_r: &mut regs_r,
-            registers_i: &mut regs_i,
-            registers_f: &mut regs_f,
+            registers_r: &regs_r,
+            registers_i: &RegisterBank::with_constants(regs_i, num_regs_i),
+            registers_f: &RegisterBank::with_constants(regs_f, num_regs_f),
             concrete_registers_r: &mut concrete_r,
             concrete_registers_i: &mut concrete_i,
             descr_refs: &perfn_descr_refs,
@@ -1467,7 +1468,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             sub_wc.vstack_valid = true;
         }
         // As above: the callee bank is a local of this frame.
-        let bank_guard = crate::trace::InlineRegisterBankGuard::enter(&raw mut *sub_wc.registers_r);
+        let bank_guard = crate::trace::InlineRegisterBankGuard::enter(sub_wc.registers_r);
         let outcome = walk(callee_code, entry, &mut sub_wc);
         drop(bank_guard);
         // `pyjitpl.py handle_guard_failure` wraps `_handle_guard_failure`

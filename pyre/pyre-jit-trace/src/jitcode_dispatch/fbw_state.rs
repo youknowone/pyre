@@ -507,8 +507,8 @@ pub(crate) fn fbw_built_exc_insert(op: OpRef) {
 /// `true` if it was present — i.e. the raised value was built inline by
 /// [`try_walker_trace_exception_new`].  Removed (not just read) so a
 /// second raise of the same object (whose `w_context` is now stamped)
-/// takes the residual path, matching the trait's
-/// `trace_built_exc.remove(&exc_val.opref)`.
+/// takes the residual path. This set tracks symbolic freshness only; the
+/// exception's concrete value remains attached to its recorder box.
 pub(crate) fn fbw_built_exc_take(op: OpRef) -> bool {
     FBW_BUILT_EXC.with(|s| s.borrow_mut().remove(&op))
 }

@@ -397,25 +397,27 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
     let collect_locals = locals_field
         .map(|f| {
             if let Some(nl) = nlocals_field {
-                quote! { __args.extend_from_slice(&self.#f[..self.#nl.min(self.#f.len())]); }
+                quote! { __args.extend(self.#f.iter().take(self.#nl).map(|opref| *std::borrow::Borrow::<majit_ir::OpRef>::borrow(&opref))); }
             } else {
-                quote! { __args.extend_from_slice(&self.#f); }
+                quote! { __args.extend(self.#f.iter().map(|opref| *std::borrow::Borrow::<majit_ir::OpRef>::borrow(&opref))); }
             }
         })
         .unwrap_or_default();
 
-    let collect_stack =
-        if let (Some(lf), Some(_vsd), Some(nl)) = (locals_field, vsd_field, nlocals_field) {
-            quote! {
-                let __stack_only = self.__vable_stack_only_depth();
-                let __nlocals = self.#nl;
-                let __avail = self.#lf.len().saturating_sub(__nlocals);
-                let __stack_len = __stack_only.min(__avail);
-                __args.extend_from_slice(&self.#lf[__nlocals..__nlocals + __stack_len]);
-            }
-        } else {
-            quote! {}
-        };
+    let collect_stack = if let (Some(lf), Some(_vsd), Some(nl)) =
+        (locals_field, vsd_field, nlocals_field)
+    {
+        quote! {
+            let __stack_only = self.__vable_stack_only_depth();
+            let __nlocals = self.#nl;
+            assert!(__nlocals <= self.#lf.len(), "locals window exceeds register storage");
+            let __avail = self.#lf.len().saturating_sub(__nlocals);
+            let __stack_len = __stack_only.min(__avail);
+            __args.extend(self.#lf.iter().skip(__nlocals).take(__stack_len).map(|opref| *std::borrow::Borrow::<majit_ir::OpRef>::borrow(&opref)));
+        }
+    } else {
+        quote! {}
+    };
 
     // Stage 3.4 Phase C: typed emission mirrors the locals+stack
     // window of `locals_field`. The `stack_types_field` side table
@@ -427,14 +429,16 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         if let Some(nl) = nlocals_field {
             quote! {
                 let __locals_len = self.#nl.min(self.#lf.len());
-                for (__i, &__opref) in self.#lf[..__locals_len].iter().enumerate() {
+                for (__i, __opref) in self.#lf.iter().take(__locals_len).enumerate() {
+                    let __opref = *std::borrow::Borrow::<majit_ir::OpRef>::borrow(&__opref);
                     let __tp = self.#ltf.get(__i).copied().unwrap_or(majit_ir::Type::Ref);
                     __args.push((__opref, __tp));
                 }
             }
         } else {
             quote! {
-                for (__i, &__opref) in self.#lf.iter().enumerate() {
+                for (__i, __opref) in self.#lf.iter().enumerate() {
+                    let __opref = *std::borrow::Borrow::<majit_ir::OpRef>::borrow(&__opref);
                     let __tp = self.#ltf.get(__i).copied().unwrap_or(majit_ir::Type::Ref);
                     __args.push((__opref, __tp));
                 }
@@ -450,9 +454,11 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         quote! {
             let __stack_only = self.__vable_stack_only_depth();
             let __nlocals = self.#nl;
+            assert!(__nlocals <= self.#lf.len(), "locals window exceeds register storage");
             let __avail = self.#lf.len().saturating_sub(__nlocals);
             let __stack_len = __stack_only.min(__avail);
-            for (__i, &__opref) in self.#lf[__nlocals..__nlocals + __stack_len].iter().enumerate() {
+            for (__i, __opref) in self.#lf.iter().skip(__nlocals).take(__stack_len).enumerate() {
+                let __opref = *std::borrow::Borrow::<majit_ir::OpRef>::borrow(&__opref);
                 let __tp = self.#stf.get(__i).copied().unwrap_or(majit_ir::Type::Ref);
                 __args.push((__opref, __tp));
             }

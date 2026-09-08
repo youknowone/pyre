@@ -333,220 +333,101 @@ pub unsafe fn walk_walk_end_roots_area(
 }
 
 thread_local! {
-    /// Raw pointer to the `PyreSym` being traced on this thread, or null when no
-    /// trace is in flight. Lets [`walk_active_sym_exc_roots`] reach the
-    /// trace-time exception carriers (`trace_built_exc` / `last_exc_value` /
-    /// `current_exc_value`) during a collection triggered mid-trace. Set at
-    /// [`trace_bytecode`] entry, restored on return.
-    static ACTIVE_SYM_EXC: std::cell::Cell<*mut PyreSym> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    // Current execution-context state only, not a root owner or a borrowed
+    // frame pointer. Each TraceRoots independently owns all its publications.
+    static ACTIVE_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// RAII guard restoring the previous [`ACTIVE_SYM_EXC`] on drop, so nested /
-/// re-entrant `trace_bytecode` (recursive portal) unwinds to the outer trace's
-/// sym rather than leaving a stale or null anchor.
-pub(crate) struct ActiveSymExcGuard {
-    prev: *mut PyreSym,
+/// Translated stack roots for a tracing attempt. Nested attempts retain their
+/// outer roots without reaching back through a borrowed PyreSym.
+pub struct TraceRoots {
+    prev_active: bool,
+    _register_roots: [crate::jitcode_dispatch::RegisterListRoot; 4],
+    _exception_roots: [ExceptionRoot; 2],
 }
 
-impl Drop for ActiveSymExcGuard {
+impl TraceRoots {
+    pub(crate) fn enter(owner: &PyreSym) -> Self {
+        let register_roots = [
+            owner.registers_r.root(),
+            owner.bridge_registers_r.root(),
+            owner.bridge_local_oprefs.root(),
+            owner.bridge_stack_oprefs.root(),
+        ];
+        let exception_roots = [
+            ExceptionRoot::new(&owner.last_exc_value),
+            ExceptionRoot::new(&owner.current_exc_value),
+        ];
+        let prev_active = ACTIVE_TRACE.with(|c| c.replace(true));
+        Self {
+            prev_active,
+            _register_roots: register_roots,
+            _exception_roots: exception_roots,
+        }
+    }
+}
+
+impl Drop for TraceRoots {
     fn drop(&mut self) {
-        ACTIVE_SYM_EXC.with(|c| c.set(self.prev));
+        ACTIVE_TRACE.with(|c| c.set(self.prev_active));
     }
 }
 
-/// Publish `sym` as the active trace's exception-carrier anchor for the lifetime
-/// of the returned guard. Called once at [`trace_bytecode`] entry.
-pub(crate) fn set_active_sym_exc(sym: *mut PyreSym) -> ActiveSymExcGuard {
-    let prev = ACTIVE_SYM_EXC.with(|c| c.replace(sym));
-    ActiveSymExcGuard { prev }
+/// pyjitpl.py MetaInterp.execute_ll_raised/clear_exception stores the carrier
+/// on its owner, where the translated GC reaches it. The native cell keeps
+/// that ownership independent of the tracer's exclusive PyreSym borrow.
+struct ExceptionRoot {
+    _area: majit_gc::shadow_stack::MutatorExtraAreaGuard,
+    _owner: std::rc::Rc<std::cell::Cell<pyre_object::PyObjectRef>>,
 }
 
-/// The LIVE interpreter frame of the walk currently recording, or `0` outside
-/// one.
-///
-/// The walk owns this frame's resume coordinate: it steps the frame's opcodes
-/// itself and, when it declines its end state, hands the frame back for the
-/// interpreter to re-enter.  A hook that writes `PyFrame` fields the resume
-/// path reads must leave this one alone.  Every OTHER frame a walk materializes
-/// — the seeded inline-callee levels — takes no per-opcode store and is never
-/// resumed, which is what makes those safe to write.
-///
-/// SAFETY: same contract as [`walk_active_sym_exc_roots`] — the reader runs on
-/// the tracing thread, so the tracer's `&mut PyreSym` up the stack is a
-/// suspended frame and only a shared read of one `usize` field is taken.
-pub fn active_walk_live_frame() -> usize {
-    let sym_ptr = ACTIVE_SYM_EXC.with(|c| c.get());
-    if sym_ptr.is_null() {
-        return 0;
+impl ExceptionRoot {
+    fn new(owner: &std::rc::Rc<std::cell::Cell<pyre_object::PyObjectRef>>) -> Self {
+        let area = unsafe {
+            // Stable Rc allocation retained until after area retirement.
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
+                walk_exception_slot,
+                std::rc::Rc::as_ptr(owner).cast(),
+                "trace_exception",
+            )
+        };
+        Self {
+            _area: area,
+            _owner: owner.clone(),
+        }
     }
-    use crate::state::WalkSym as _;
-    unsafe { (*sym_ptr).live_vable_frame_addr() }
 }
 
-/// Root the trace-time exception carriers held in the active `PyreSym`.
-///
-/// Between construction (`sym.trace_built_exc` insert, `state.rs`) and
-/// lift-out (`swap_remove` at the raise), a trace-built exception is reachable
-/// only through `sym.trace_built_exc`, invisible to the precise collector; an
-/// allocating safepoint in that window would otherwise sweep it. `last_exc_value`
-/// / `current_exc_value` cover the seeded-raise and reraise paths.
-///
-/// Mirrors `walk_jit_exc_value`: the carriers are oldgen-stable exceptions
-/// (`try_gc_alloc_stable_raw`), so a bare mark-by-value suffices — no forwarded
-/// write-back — which means only a shared read of the sym is taken, never a
-/// second `&mut` aliasing the tracer's live borrow.
-pub fn walk_active_sym_exc_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let sym_ptr = ACTIVE_SYM_EXC.with(|c| c.get());
-    if sym_ptr.is_null() {
+unsafe fn walk_exception_slot(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let slot = unsafe { &*(data as *const std::cell::Cell<pyre_object::PyObjectRef>) };
+    let p = slot.get();
+    if p.is_null() {
         return;
     }
-    // SAFETY: a collection triggered mid-trace runs on the SAME thread (the
-    // allocating thread becomes the collector), so the tracer's `&mut PyreSym`
-    // up the stack is a suspended frame. Only a shared `&PyreSym` is formed and
-    // oldgen-stable (non-moving) exceptions are marked by value, never writing a
-    // forwarded pointer back — matching the accepted `jit_driver_pair_from_root_area`
-    // convention in `pyre-jit`.
-    let sym = unsafe { &*sym_ptr };
-    let carriers = [sym.last_exc_value, sym.current_exc_value];
-    for p in carriers
-        .into_iter()
-        .chain(sym.trace_built_exc.values().copied())
-    {
-        if p.is_null() {
-            continue;
-        }
-        let mut gcref = majit_ir::GcRef(p as usize);
-        visitor(&mut gcref);
-        // The carrier is non-moving, so a minor's root visitor no-ops on it
-        // and never reaches its fields: young children (tracebacks/args built
-        // while tracing) would be left dangling across the minor. Forward the
-        // raw child slots explicitly; the writes land in the exception
-        // object, not the sym, so the shared-read contract above holds.
-        unsafe { pyre_interpreter::eval::walk_raw_exception_roots(p, visitor) };
-    }
+    let mut gcref = majit_ir::GcRef(p as usize);
+    visitor(&mut gcref);
+    let forwarded = gcref.0 as pyre_object::PyObjectRef;
+    slot.set(forwarded);
+    // Native exception carriers are oldgen-stable. A minor's bare root visit
+    // does not trace their young args/traceback children, so preserve the
+    // explicit child traversal of the former active-sym walker.
+    unsafe { pyre_interpreter::eval::walk_raw_exception_roots(forwarded, visitor) };
 }
 
-/// Capture this mutator's [`ACTIVE_SYM_EXC`] cell for STW root walking.
-pub fn capture_active_sym_root_area() -> *const () {
-    ACTIVE_SYM_EXC.with(|c| c as *const _ as *const ())
-}
-
-/// Root the inline `ConstPtr` GcRefs a fold has parked in the active walk's
-/// reference register banks.
+/// Root the frame's register list for the lifetime of a sub-walk, including
+/// suspension and unwind. Like the translated root of MIFrame.registers_r,
+/// publication names the owned list, not the currently selected PyreSym.
 ///
-/// `MIFrame.registers_r` is an ordinary RPython list of `GCREF` upstream, so
-/// the collector traces and forwards it with every other field and a fold never
-/// has to ask where its result is going to sit.  Pyre mirrors that bank as a
-/// `Vec<OpRef>` on `PyreSym`, which nothing else reaches: `TraceCtx::const_ref`
-/// mints an `OpRef::ConstPtr` carrying an inline `GcRef`, and
-/// `write_residual_call_result_to_dst` parks it in the bank until an operation
-/// consumes it into the recorder — from there `walk_active_trace_refs` and the
-/// emit-time `LoadFromGcTable` rewrite take over.  A collection landing in that
-/// window used to move the object and leave the bank naming the old address,
-/// which is the hazard the `can_move` tests on the walker folds stood in for.
-///
-/// Only the innermost `PyreSym` is anchored, and that covers the window: a mint
-/// and the operation recording it sit inside one opcode's dispatch, while a
-/// re-entrant `trace_bytecode` can only open between opcodes.
-///
-/// An inline sub-walk is the one bank that is not `sym.registers_r`:
-/// `inline_call.rs` gives the callee `WalkContext` a local `Vec<OpRef>` and
-/// calls `walk` on it directly, leaving `ACTIVE_SYM_EXC` on the caller's sym.
-/// [`InlineRegisterBankGuard`] publishes each such bank on
-/// `PyreSym::inline_register_banks` for the length of that sub-walk, so a
-/// callee fold's mint is rooted on the same terms as the outer one.
-///
-/// `MIFrame.pre_opcode_registers_r`, the opcode-start rollback clone, hangs off
-/// the per-instruction wrapper rather than the anchor, and so would be out of
-/// this area's reach.  Nothing writes it: every constructor leaves it `None`,
-/// the sole assignment clears it, and each read is an `is_some()` fallback, so
-/// no clone exists to be read forward stale.  A writer restored there carries
-/// the same defect this area closes, one level down, and would need an anchor
-/// of its own.
-///
-/// # Safety
-/// `data` must come from [`capture_active_sym_root_area`], and the owning
-/// mutator must be quiesced when a foreign collector thread calls this.  Unlike
-/// [`walk_active_sym_exc_roots`] this walk writes forwarded pointers back, so it
-/// reaches the banks through `addr_of_mut!` on the raw anchor rather than
-/// re-forming a whole `&mut PyreSym` alongside the tracer's.
-pub unsafe fn walk_active_sym_register_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    let cell = unsafe { &*(data as *const std::cell::Cell<*mut PyreSym>) };
-    let sym_ptr = cell.get();
-    if sym_ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let bank = &mut *std::ptr::addr_of_mut!((*sym_ptr).registers_r);
-        for slot in bank.iter_mut() {
-            slot.walk_const_ptr_refs_mut(visitor);
-        }
-        // The bridge-setup overrides of the same bank, each of which a resume
-        // fills from `rd_consts` and can therefore carry an inline `ConstPtr`.
-        for bank in [
-            &mut *std::ptr::addr_of_mut!((*sym_ptr).bridge_registers_r),
-            &mut *std::ptr::addr_of_mut!((*sym_ptr).bridge_local_oprefs),
-            &mut *std::ptr::addr_of_mut!((*sym_ptr).bridge_stack_oprefs),
-        ] {
-            let Some(bank) = bank.as_mut() else { continue };
-            for slot in bank.iter_mut() {
-                slot.walk_const_ptr_refs_mut(visitor);
-            }
-        }
-        // The open sub-walks' own banks: each entry is the `(address, length)`
-        // of the Ref bank of a frame below this one, published for that
-        // frame's whole residency on `SubWalkDriver::frames` -- a parent
-        // suspended at a CALL keeps minted `ConstPtr`s in its bank while the
-        // child walks, so the publication outlives its own `walk` call.
-        // A shared borrow of the list is enough
-        // -- every bank it names is a separate allocation, so the `&mut`
-        // slices below do not alias it.
-        let inline = &*std::ptr::addr_of!((*sym_ptr).inline_register_banks);
-        for index in 0..inline.len() {
-            let (addr, len) = inline[index];
-            let bank = std::slice::from_raw_parts_mut(addr as *mut majit_ir::OpRef, len);
-            for slot in bank.iter_mut() {
-                slot.walk_const_ptr_refs_mut(visitor);
-            }
-        }
-    }
-}
-
-/// Publish an inline sub-walk's reference register bank on the active
-/// [`PyreSym`] for the length of the sub-walk, and take it back down on the way
-/// out — including an unwind, so an aborted callee body leaves no address the
-/// next collection would walk into a dead frame.
-///
-/// A null anchor (no trace in flight) makes this inert: nothing walks the bank
-/// then either.
+/// Without a trace in flight this is inert; there are no traced bank roots
+/// to publish.
 pub(crate) struct InlineRegisterBankGuard {
-    sym: *mut PyreSym,
+    _root: Option<crate::jitcode_dispatch::RegisterBankRoot>,
 }
 
 impl InlineRegisterBankGuard {
-    pub(crate) fn enter(bank: *mut [majit_ir::OpRef]) -> Self {
-        let sym = ACTIVE_SYM_EXC.with(|c| c.get());
-        if !sym.is_null() {
-            let entry = (bank as *mut majit_ir::OpRef as usize, bank.len());
-            unsafe {
-                (*std::ptr::addr_of_mut!((*sym).inline_register_banks)).push(entry);
-            }
-        }
-        Self { sym }
-    }
-}
-
-impl Drop for InlineRegisterBankGuard {
-    fn drop(&mut self) {
-        if self.sym.is_null() {
-            return;
-        }
-        unsafe {
-            (*std::ptr::addr_of_mut!((*self.sym).inline_register_banks)).pop();
+    pub(crate) fn enter(bank: &crate::jitcode_dispatch::RegisterBank) -> Self {
+        Self {
+            _root: ACTIVE_TRACE.with(|c| c.get().then(|| bank.root())),
         }
     }
 }
@@ -1407,12 +1288,9 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // trace left unconsumed.
     let _ = crate::state::take_trace_abort_requested();
 
-    // Publish this trace's `sym` as the exception-carrier root anchor: a
-    // collection triggered by an allocating traced opcode marks the trace-built
-    // exception held only in `sym.trace_built_exc` (and the seeded/caught
-    // `last_exc_value` / `current_exc_value`). The guard restores the prior
-    // anchor on every return path, including panics and nested tracing.
-    let _active_sym_guard = sym.active_exc_anchor().map(set_active_sym_exc);
+    // Root this attempt's owned lists and exception slots through every exit,
+    // including nested attempts and unwind, without publishing a PyreSym borrow.
+    let _trace_roots = sym.enter_trace_roots();
 
     let ctx = meta
         .trace_ctx()
@@ -1864,7 +1742,7 @@ fn inject_root_call_result<Sym: WalkSym>(
         if bridge_regs.len() <= result_reg {
             bridge_regs.resize(result_reg + 1, majit_ir::OpRef::NONE);
         }
-        bridge_regs[result_reg] = result;
+        bridge_regs.set(result_reg, result);
     }
     let post_call_depth = residual_call
         .and_then(|(call_pc, _)| payload.depth_after_residual_for_jitcode_pc(call_pc))
@@ -1881,7 +1759,7 @@ fn inject_root_call_result<Sym: WalkSym>(
             if locals.len() <= semantic_result_slot {
                 locals.resize(semantic_result_slot + 1, majit_ir::OpRef::NONE);
             }
-            locals[semantic_result_slot] = result;
+            locals.set(semantic_result_slot, result);
         }
     } else {
         let slot = semantic_result_slot - nlocals;
@@ -1889,7 +1767,7 @@ fn inject_root_call_result<Sym: WalkSym>(
         if bridge.len() <= slot {
             bridge.resize(slot + 1, majit_ir::OpRef::NONE);
         }
-        bridge[slot] = result;
+        bridge.set(slot, result);
     }
     // `MIFrame.make_result_of_lastop` both stores the value and advances the
     // caller's stack pointer.  Without the matching depth update,
@@ -2073,6 +1951,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         is_being_profiled,
         ..Default::default()
     });
+    let _session_roots = crate::jitcode_dispatch::WalkSessionRoots::new(&session);
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
     // A prior walk's blackhole image must not be adopted as this drain's
@@ -4085,6 +3964,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         is_being_profiled,
         ..Default::default()
     });
+    let _session_roots = crate::jitcode_dispatch::WalkSessionRoots::new(&session);
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         eprintln!("[walk-perfn] no per-CodeObject PyJitCode for code={w_code:?}");
         return None;
@@ -4460,7 +4340,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 // shortcut below is wrong here because a kept temp's abstract
                 // color is not `nlocals + depth` under free register coloring.
                 if let Some(bridge_regs_r) = sym.bridge_registers_r() {
-                    for (color, &opref) in bridge_regs_r.iter().enumerate() {
+                    for (color, opref) in bridge_regs_r.iter().enumerate() {
                         if opref.is_none() {
                             continue;
                         }
@@ -4534,7 +4414,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 // A NONE `bridge_stack[i]` (dead/empty slot) leaves the color's
                 // red seed intact — the red genuinely still owns the color there.
                 let nl = sym.nlocals();
-                for (i, &opref) in bridge_stack.iter().enumerate() {
+                for (i, opref) in bridge_stack.iter().enumerate() {
                     if !opref.is_none() {
                         let color = (nl + i) as u8;
                         seed(color, opref);
@@ -4557,7 +4437,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                         });
                 if let Some((color, opref)) = pending_result_color.and_then(|color| {
                     sym.bridge_registers_r()
-                        .and_then(|regs| regs.get(color).copied())
+                        .and_then(|regs| regs.get(color))
                         .filter(|opref| !opref.is_none())
                         .map(|opref| (color, opref))
                 }) {
@@ -6976,6 +6856,117 @@ mod tests {
     use pyre_interpreter::bytecode::Instruction;
     use pyre_interpreter::compile_exec;
     use pyre_interpreter::decode_instruction_at;
+
+    #[test]
+    fn nested_inline_banks_remain_visible_to_collector() {
+        // Diagnostic only: manually nesting anchors does not demonstrate a
+        // reachable nested trace. Upstream warmstate.py bound_reached owns a
+        // fresh MetaInterp per attempt; a translated collector sees all live
+        // attempts. Verify that an inner anchor cannot hide outer frame banks.
+        use crate::jitcode_dispatch::RegisterBank;
+        use crate::state::PyreSym;
+        use majit_ir::{GcRef, OpRef};
+
+        let _runtime = crate::trace_ctx_for_test(0);
+        let ptr = |word| OpRef::const_ptr(GcRef(word));
+        let outer = Box::new(PyreSym::new_uninit(OpRef::NONE));
+        let inner = Box::new(PyreSym::new_uninit(OpRef::NONE));
+        outer.registers_r.replace(vec![ptr(0x1000)]);
+        inner.registers_r.replace(vec![ptr(0x2000)]);
+        let outer_bank = RegisterBank::new([ptr(0x3000)]);
+        let inner_bank = RegisterBank::new([ptr(0x4000)]);
+        // Do not expose sentinel addresses to another test's real collector.
+        let _stw = majit_gc::gc_sync::quiesce_mutators();
+        let outer_anchor = super::TraceRoots::enter(&outer);
+        let outer_registration = super::InlineRegisterBankGuard::enter(&outer_bank);
+        let inner_anchor = super::TraceRoots::enter(&inner);
+        let inner_registration = super::InlineRegisterBankGuard::enter(&inner_bank);
+        let mut seen = Vec::new();
+        // Sentinel words are never dereferenced. This is a forwarding visitor,
+        // not a real collection. Use the actual registry, including the
+        // independently registered frame banks, not just the current anchor.
+        {
+            majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+                if (0x1000..0x5000).contains(&root.0) {
+                    seen.push(root.0);
+                    root.0 += 0x80;
+                }
+            });
+        }
+        drop(inner_registration);
+        drop(inner_anchor);
+        assert_eq!(seen, [0x1000, 0x3000, 0x2000, 0x4000]);
+        assert_eq!(outer.registers_r.to_vec(), [ptr(0x1080)]);
+        assert_eq!(outer_bank.get(0), Some(ptr(0x3080)));
+        assert_eq!(inner.registers_r.to_vec(), [ptr(0x2080)]);
+        assert_eq!(inner_bank.get(0), Some(ptr(0x4080)));
+
+        seen.clear();
+        {
+            majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+                if (0x1000..0x5000).contains(&root.0) {
+                    seen.push(root.0);
+                    root.0 += 0x80;
+                }
+            });
+        }
+        drop(outer_registration);
+        drop(outer_anchor);
+        assert_eq!(seen, [0x1080, 0x3080]);
+        assert_eq!(outer.registers_r.to_vec(), [ptr(0x1100)]);
+        assert_eq!(outer_bank.get(0), Some(ptr(0x3100)));
+    }
+
+    #[test]
+    fn nested_exception_roots_keep_outer_carriers_and_children() {
+        use majit_ir::OpRef;
+        use pyre_object::interp_exceptions::{ExcKind, W_BaseException, w_exception_new_empty};
+        pyre_interpreter::typedef::init_typeobjects();
+        let _pins = pyre_object::gc_roots::push_roots();
+        let outer_exc =
+            pyre_object::gc_roots::pin_root(w_exception_new_empty(ExcKind::UnicodeTranslateError));
+        let inner_exc = pyre_object::gc_roots::pin_root(w_exception_new_empty(ExcKind::TypeError));
+        let child =
+            pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::w_str_new("outer child"));
+        let replacement = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::w_str_new(
+            "forwarded child",
+        ));
+        let _stw = majit_gc::gc_sync::quiesce_mutators();
+        // init_typeobjects entered the runtime thread and registered its
+        // mutator already; its TLS owner unregisters after these roots drop.
+        let outer = crate::state::PyreSym::new_uninit(OpRef::NONE);
+        let inner = crate::state::PyreSym::new_uninit(OpRef::NONE);
+        outer.last_exc_value.set(outer_exc);
+        inner.last_exc_value.set(inner_exc);
+        unsafe {
+            (*(outer_exc as *mut W_BaseException)).w_object = child;
+        }
+        let outer_roots = super::TraceRoots::enter(&outer);
+        let inner_roots = super::TraceRoots::enter(&inner);
+        let mut seen = Vec::new();
+        majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+            seen.push(root.0);
+            if root.0 == child as usize {
+                root.0 = replacement as usize;
+            }
+        });
+        assert!(seen.contains(&(outer_exc as usize)));
+        assert!(seen.contains(&(inner_exc as usize)));
+        assert!(seen.contains(&(child as usize)));
+        assert_eq!(
+            unsafe { (*(outer_exc as *const W_BaseException)).w_object },
+            replacement
+        );
+        drop(inner_roots);
+        seen.clear();
+        majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+            seen.push(root.0);
+        });
+        assert!(seen.contains(&(outer_exc as usize)));
+        assert!(seen.contains(&(replacement as usize)));
+        assert!(!seen.contains(&(inner_exc as usize)));
+        drop(outer_roots);
+    }
 
     #[test]
     fn complete_image_walk_abort_keeps_blackhole_terminal_result() {

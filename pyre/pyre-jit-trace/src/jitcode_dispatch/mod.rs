@@ -245,6 +245,13 @@ mod vstack_mirror;
 pub use vstack_mirror::*;
 mod vable_ops;
 use vable_ops::FrameBoxReplacements;
+mod register_bank;
+mod register_list;
+pub use register_bank::RegisterBank;
+pub(crate) use register_bank::RegisterBankRoot;
+use register_bank::RegisterValues;
+pub use register_list::RegisterList;
+pub(crate) use register_list::RegisterListRoot;
 pub use vable_ops::*;
 mod heapcache_ops;
 pub use heapcache_ops::*;
@@ -858,7 +865,6 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
         .and_then(|jitcode| {
             ctx.registers_r
                 .get(jitcode.metadata.portal_frame_reg as usize)
-                .copied()
         })
         .unwrap_or(OpRef::NONE);
     if emit_runtime && !hook.is_null() && !exc.is_none() && !frame.is_none() {
@@ -1014,7 +1020,6 @@ fn record_inline_application_traceback<Sym: WalkSym>(
         .and_then(|jitcode| {
             ctx.registers_r
                 .get(jitcode.metadata.portal_frame_reg as usize)
-                .copied()
         })
         .unwrap_or(OpRef::NONE);
     let frame_hook = majit_metainterp::record_application_traceback_hook_address();
@@ -1183,11 +1188,7 @@ fn finish_current_frame_execution<Sym: WalkSym>(
         let mut concrete = std::ptr::null_mut();
         if let Some(jitcode) = crate::state::pyjitcode_for_jitcode_index(jitcode_index) {
             let frame_reg = jitcode.metadata.portal_frame_reg as usize;
-            frame = ctx
-                .registers_r
-                .get(frame_reg)
-                .copied()
-                .unwrap_or(OpRef::NONE);
+            frame = ctx.registers_r.get(frame_reg).unwrap_or(OpRef::NONE);
             concrete = match ctx.concrete_registers_r.get(frame_reg).copied() {
                 Some(ConcreteValue::Ref(frame_ptr)) => frame_ptr as *mut pyre_interpreter::PyFrame,
                 _ => std::ptr::null_mut(),
@@ -1333,7 +1334,6 @@ fn traceback_node_site<Sym: WalkSym>(
     let frame = ctx
         .registers_r
         .get(jitcode.metadata.portal_frame_reg as usize)
-        .copied()
         .unwrap_or(OpRef::NONE);
     // Storing this box into the node's `frame` field lets the traceback
     // outlive the frame, so folded inline-callee locals have to reach the
@@ -1762,20 +1762,17 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// Symbolic Ref-bank register file. Indexing matches RPython
     /// `MIFrame.registers_r` (`pyjitpl.py`); the byte after a
     /// `r`-coded operand opcode indexes directly into this slice.
-    /// Mutable so handlers writing `>r` results (currently
-    /// `residual_call_r_r/iRd>r`) can land their dst.
-    pub registers_r: &'frame mut [OpRef],
+    /// Shared frame-owned slots permit result stores and GC forwarding without
+    /// an exclusive slice surviving a descendant call.
+    pub registers_r: &'frame RegisterBank,
     /// Symbolic Int-bank register file. Indexing matches RPython
-    /// `MIFrame.registers_i` (`pyjitpl.py`). Pyre's PyreSym is
-    /// mid-migration to a 3-bank typed model — production callers may
-    /// pass an empty slice today (the assembler only emits `i`-coded
-    /// operands once the codewriter wires Int kind). Mutable so
-    /// `int_copy/i>i` can land its dst.
-    pub registers_i: &'frame mut [OpRef],
+    /// `MIFrame.registers_i` (`pyjitpl.py`). Result stores update shared
+    /// frame-owned slots, just as `int_copy/i>i` writes the MIFrame list.
+    pub registers_i: &'frame RegisterBank,
     /// Symbolic Float-bank register file. Indexing matches RPython
     /// `MIFrame.registers_f` (`pyjitpl.py`). Mutable so
     /// `float_<binop>/ff>f` and `float_neg/f>f` can land their dst.
-    pub registers_f: &'frame mut [OpRef],
+    pub registers_f: &'frame RegisterBank,
     /// Concrete shadow mirror for `registers_r`.
     ///
     /// Semantic-slot indexed, length equals `registers_r.len()`. At
@@ -4061,7 +4058,6 @@ fn read_ref_reg_raw<Sym: WalkSym>(
     let reg = code[byte_pc] as usize;
     ctx.registers_r
         .get(reg)
-        .copied()
         .ok_or(DispatchError::RegisterOutOfRange {
             pc: op.pc,
             reg,
@@ -4083,7 +4079,6 @@ fn read_int_reg<Sym: WalkSym>(
     let reg = code[byte_pc] as usize;
     ctx.registers_i
         .get(reg)
-        .copied()
         .ok_or(DispatchError::RegisterOutOfRange {
             pc: op.pc,
             reg,
@@ -4105,7 +4100,6 @@ fn read_float_reg<Sym: WalkSym>(
     let reg = code[byte_pc] as usize;
     ctx.registers_f
         .get(reg)
-        .copied()
         .ok_or(DispatchError::RegisterOutOfRange {
             pc: op.pc,
             reg,
@@ -4581,7 +4575,6 @@ fn read_ref_var_list<Sym: WalkSym>(
         let opref = ctx
             .registers_r
             .get(reg)
-            .copied()
             .ok_or(DispatchError::RegisterOutOfRange {
                 pc: op.pc,
                 reg,
@@ -4640,16 +4633,16 @@ fn write_ref_reg<Sym: WalkSym>(
     concrete: ConcreteValue,
 ) -> Result<(), DispatchError> {
     let len = ctx.registers_r.len();
-    let slot = ctx
+    let _ = ctx
         .registers_r
-        .get_mut(dst)
+        .get(dst)
         .ok_or(DispatchError::RegisterOutOfRange {
             pc,
             reg: dst,
             len,
             bank: "r",
         })?;
-    *slot = value;
+    ctx.registers_r.set(dst, value);
     // Snapshot is sized to `registers_r.len()` at dispatch entry, so
     // a dst-in-bounds OpRef write implies in-bounds for the shadow.
     // `get_mut` defensively to tolerate sub-walk shadows that lag the
@@ -4777,7 +4770,7 @@ pub(crate) fn read_float_reg_concrete<Sym: WalkSym>(
     let reg = code[byte_pc] as usize;
     ctx.registers_f
         .get(reg)
-        .and_then(|&value| ctx.trace_ctx.concrete_of_opref(value))
+        .and_then(|value| ctx.trace_ctx.concrete_of_opref(value))
         .map_or(ConcreteValue::Null, |value| match value {
             Value::Float(v) => ConcreteValue::Float(v),
             _ => ConcreteValue::Null,
@@ -4823,16 +4816,16 @@ fn write_int_reg<Sym: WalkSym>(
     concrete: ConcreteValue,
 ) -> Result<(), DispatchError> {
     let len = ctx.registers_i.len();
-    let slot = ctx
+    let _ = ctx
         .registers_i
-        .get_mut(dst)
+        .get(dst)
         .ok_or(DispatchError::RegisterOutOfRange {
             pc,
             reg: dst,
             len,
             bank: "i",
         })?;
-    *slot = value;
+    ctx.registers_i.set(dst, value);
     // Mirror `write_ref_reg`'s defensive get_mut.  Test fixtures pass
     // an empty `concrete_registers_i` slice; production callers
     // (Concrete shadow seeding) size it to `registers_i.len()` at dispatch entry.
@@ -4995,7 +4988,6 @@ fn read_int_var_list<Sym: WalkSym>(
         let opref = ctx
             .registers_i
             .get(reg)
-            .copied()
             .ok_or(DispatchError::RegisterOutOfRange {
                 pc: op.pc,
                 reg,
@@ -5023,7 +5015,6 @@ fn read_float_var_list<Sym: WalkSym>(
         let opref = ctx
             .registers_f
             .get(reg)
-            .copied()
             .ok_or(DispatchError::RegisterOutOfRange {
                 pc: op.pc,
                 reg,
@@ -5065,11 +5056,7 @@ fn dispatch_switch_id<Sym: WalkSym>(
                 .record_guard(OpCode::GuardValue, &[valuebox, expected], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             ctx.trace_ctx.replace_box(valuebox, expected);
-            for slot in ctx.registers_i.iter_mut() {
-                if *slot == valuebox {
-                    *slot = expected;
-                }
-            }
+            ctx.registers_i.replace_active_box(valuebox, expected);
         }
         return Ok((DispatchOutcome::Continue, target));
     }
@@ -5402,11 +5389,7 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
         .record_guard(OpCode::GuardValue, &[w_globals_op, expected], 0);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
     ctx.trace_ctx.replace_box(w_globals_op, expected);
-    for slot in ctx.registers_r.iter_mut() {
-        if *slot == w_globals_op {
-            *slot = expected;
-        }
-    }
+    ctx.registers_r.replace_active_box(w_globals_op, expected);
     Ok(true)
 }
 
@@ -5437,7 +5420,6 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
         let Some(frame) = ctx
             .registers_r
             .get(jitcode.metadata.portal_frame_reg as usize)
-            .copied()
             .filter(|frame| !frame.is_none())
         else {
             // The old single-frame inline path has no callee red to read.  Do
@@ -5951,9 +5933,9 @@ fn snapshot_diag_enabled() -> bool {
 fn collect_outer_active_boxes<Sym: WalkSym>(
     sym: &Sym,
     trace_ctx: &mut TraceCtx,
-    regs_i: &[OpRef],
-    regs_r: &[OpRef],
-    regs_f: &[OpRef],
+    regs_i: &(impl RegisterValues + ?Sized),
+    regs_r: &(impl RegisterValues + ?Sized),
+    regs_f: &(impl RegisterValues + ?Sized),
     outer_jitcode_index: u32,
     guard_present: bool,
     // The resume-carried coordinate remains the bank-liveness source. Entry
@@ -6148,8 +6130,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     };
     for &idx in &banks.int {
         let v = regs_i
-            .get(idx as usize)
-            .copied()
+            .get_box(idx as usize)
             .unwrap_or_else(|| panic!("{}", dump_ctx("int", idx)));
         if v == OpRef::NONE {
             panic!("{}", dump_ctx("int", idx));
@@ -6306,8 +6287,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         }
         let fallback = || {
             regs_r
-                .get(color)
-                .copied()
+                .get_box(color)
                 .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
         };
         let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
@@ -6338,8 +6318,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 || (color as u16 == portal_ec_reg && portal_ec_reg != u16::MAX));
         let value = if is_portal_red_scratch {
             let live_reg = regs_r
-                .get(color)
-                .copied()
+                .get_box(color)
                 .filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
             let red_field = if color as u16 == portal_frame_reg {
                 sym.frame()
@@ -6357,7 +6336,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 Some(s_idx) if s_idx < nlocals + valid_stack_only => {
                     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                     let vbox = trace_ctx.virtualizable_box_at(nvs + s_idx);
-                    let walk_box = regs_r.get(color).copied();
+                    let walk_box = regs_r.get_box(color);
                     if s_idx >= nlocals {
                         // Operand-stack slot.  `pyjitpl.py` snapshots
                         // `self.registers_r[index]`, but pyre's stack
@@ -6445,7 +6424,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 // this read is the same `get_list_of_active_boxes` parity the
                 // mapped arm above uses.  Under the walker (gate-off) each PC
                 // owns a depth-narrowed marker, so this arm never fires.
-                None => match regs_r.get(color).copied() {
+                None => match regs_r.get_box(color) {
                     Some(v) if v != OpRef::NONE => v,
                     _ => OpRef::const_ptr(majit_ir::GcRef(0)),
                 },
@@ -6464,7 +6443,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         // preference decided otherwise — the resume value and the register the
         // resumed bytecode reads then disagree.
         if snapshot_diag_enabled() {
-            let walk = regs_r.get(color).copied().unwrap_or(OpRef::NONE);
+            let walk = regs_r.get_box(color).unwrap_or(OpRef::NONE);
             if walk != OpRef::NONE && walk != value {
                 eprintln!(
                     "[snap] jc={outer_jitcode_index} carried={carried_jitcode_pc} \
@@ -6478,8 +6457,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     }
     for &idx in &banks.float {
         let v = regs_f
-            .get(idx as usize)
-            .copied()
+            .get_box(idx as usize)
             .unwrap_or_else(|| panic!("{}", dump_ctx("float", idx)));
         if v == OpRef::NONE {
             panic!("{}", dump_ctx("float", idx));
@@ -6707,6 +6685,79 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
 /// sub-walks unwind to the caller's level.
 struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);
 
+/// The translated stack root of this attempt's MetaInterp/framestack
+/// (warmstate.py WarmEnterState.make_entry_point.bound_reached). Borrow the
+/// stable RefCell for the whole attempt, including empty-stack intervals and
+/// post-walk snapshots. Frame guards may be stored in a Vec and retired in
+/// insertion order; none of them owns this publication's lifetime.
+pub(crate) struct WalkSessionRoots<'a> {
+    _area: majit_gc::shadow_stack::MutatorExtraAreaGuard,
+    _session: &'a std::cell::RefCell<WalkSession>,
+}
+
+impl<'a> WalkSessionRoots<'a> {
+    pub(crate) fn new(session: &'a std::cell::RefCell<WalkSession>) -> Self {
+        let area = unsafe {
+            // The returned guard's borrow prevents moving/dropping the cell
+            // before retirement. Collectors visit it only under mutator STW
+            // or synchronously on its owner; no session borrow spans a
+            // collecting call. The checked callback enforces that last rule.
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
+                walk_session_roots,
+                (session as *const std::cell::RefCell<WalkSession>).cast(),
+                "walk_session",
+            )
+        };
+        Self {
+            _area: area,
+            _session: session,
+        }
+    }
+}
+
+unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let cell = unsafe { &*(data as *const std::cell::RefCell<WalkSession>) };
+    let mut session = cell
+        .try_borrow_mut()
+        .expect("WalkSession borrow held across collection");
+    let walk_ptr = |ptr: &mut pyre_object::PyObjectRef,
+                    visitor: &mut dyn FnMut(&mut majit_ir::GcRef)| {
+        let mut root = majit_ir::GcRef(*ptr as usize);
+        visitor(&mut root);
+        *ptr = root.0 as pyre_object::PyObjectRef;
+    };
+    // MetaInterp.last_exc_value and blackhole.py tmpreg_r are owner fields,
+    // not merely roots when an inline frame happens to be on the stack.
+    if let Some(value) = session.last_exc_value.as_mut() {
+        value.walk_const_ptr_refs_mut(visitor);
+    }
+    if let ConcreteValue::Ref(value) = &mut session.last_exc_value_concrete {
+        walk_ptr(value, visitor);
+        unsafe { pyre_interpreter::eval::walk_raw_exception_roots(*value, visitor) };
+    }
+    session.tmpreg_r.walk_const_ptr_refs_mut(visitor);
+    if let ConcreteValue::Ref(value) = &mut session.tmpreg_r_concrete {
+        walk_ptr(value, visitor);
+    }
+    for frame in session.framestack.iter_mut() {
+        for parent in frame.parents.iter_mut() {
+            // history.py ConstPtr.value remains reachable through each
+            // paused frame's active boxes, including constructor tails.
+            for value in &mut parent.boxes {
+                value.walk_const_ptr_refs_mut(visitor);
+            }
+            for (_, value) in &mut parent.call_stack_overrides {
+                walk_ptr(value, visitor);
+            }
+            if let Some(blackhole) = parent.blackhole.as_mut() {
+                for (_, value) in &mut blackhole.ref_values {
+                    walk_ptr(value, visitor);
+                }
+            }
+        }
+    }
+}
+
 thread_local! {
     /// Top-level caller CALL native JitCode coordinate and concrete
     /// operand-stack slots stashed by
@@ -6719,15 +6770,6 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static FBW_ABORT_OUTER_STACK_OVERRIDES: std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// Raw pointer to the walk session whose framestack currently holds
-    /// inline frames, for [`fbw_store_journal_root_walker`]: the session
-    /// lives on the walk driver's Rust stack, which the GC cannot scan, and
-    /// each `InlineParentFrame::call_stack_overrides` slot holds a
-    /// nursery-resident ref across residual-call allocations.  Set by
-    /// [`InlineFrameGuard::enter`] and restored on drop; null outside any
-    /// inline sub-walk.
-    static ACTIVE_WALK_SESSION: std::cell::Cell<*const std::cell::RefCell<WalkSession>> =
-        const { std::cell::Cell::new(std::ptr::null()) };
 }
 
 impl<'a> InlineFrameGuard<'a> {
@@ -6762,7 +6804,6 @@ impl<'a> InlineFrameGuard<'a> {
         if fbw_depth_census_enabled() {
             fbw_depth_census_record(&session.borrow().framestack);
         }
-        ACTIVE_WALK_SESSION.with(|c| c.set(session as *const _));
         InlineFrameGuard(session)
     }
 }
@@ -6771,9 +6812,6 @@ impl Drop for InlineFrameGuard<'_> {
     fn drop(&mut self) {
         let mut session = self.0.borrow_mut();
         session.framestack.pop();
-        if session.framestack.is_empty() {
-            ACTIVE_WALK_SESSION.with(|c| c.set(std::ptr::null()));
-        }
     }
 }
 
@@ -7316,7 +7354,6 @@ struct FbwStoreJournalRootArea {
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
     bridge_iter: *const std::cell::RefCell<Vec<BridgeIterJournalEntry>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
-    active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
     escape_flush_undo: *const std::cell::RefCell<Option<EscapeFlushUndo>>,
     locals_mirror_undo: *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
@@ -7336,7 +7373,6 @@ thread_local! {
         foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
         bridge_iter: FBW_BRIDGE_ITER_JOURNAL.with(|value| value as *const _),
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
-        active_session: ACTIVE_WALK_SESSION.with(|value| value as *const _),
         escape_flush_undo: escape_flush_undo_cell_ptr(),
         locals_mirror_undo: locals_mirror_undo_cell_ptr(),
         single_frame_blackhole: single_frame_blackhole_cell_ptr(),
@@ -7648,28 +7684,6 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     let abort_overrides = unsafe { &mut *(*area.abort_overrides).as_ptr() };
     for (_slot, value) in abort_overrides.iter_mut() {
         visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
-    }
-    // Inline parent-frame stack overrides on the active walk session's
-    // framestack. The session lives on the walk driver's Rust stack (which the
-    // GC cannot scan) and each override slot holds a nursery-resident ref.
-    let session_ptr = unsafe { (*area.active_session).get() };
-    if !session_ptr.is_null() {
-        // SAFETY: `ACTIVE_WALK_SESSION` is set by `InlineFrameGuard::enter` and
-        // cleared when the last frame pops, so a non-null pointer refers to a
-        // session that is live for the duration of this quiesced walk.
-        let session = unsafe { &mut *(*session_ptr).as_ptr() };
-        for frame in session.framestack.iter_mut() {
-            for parent in frame.parents.iter_mut() {
-                for (_slot, value) in parent.call_stack_overrides.iter_mut() {
-                    visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
-                }
-                if let Some(blackhole) = parent.blackhole.as_mut() {
-                    for (_color, value) in blackhole.ref_values.iter_mut() {
-                        visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
-                    }
-                }
-            }
-        }
     }
     // Cell-store journal: the cell is immovable (`malloc_typed`) so no
     // forwarding happens, but a mid-walk rebind can drop the module dict's
@@ -11156,7 +11170,7 @@ fn guarded_branch_core<Sym: WalkSym>(
         let resolved_recovered: Option<Vec<(u16, OpRef)>> = kept_recovered.as_ref().map(|mv| {
             mv.iter()
                 .filter_map(|&(dst, src)| {
-                    let v = ctx.registers_r.get(src as usize).copied()?;
+                    let v = ctx.registers_r.get(src as usize)?;
                     (v != OpRef::NONE).then_some((dst, v))
                 })
                 .collect()
@@ -12482,16 +12496,16 @@ fn handle<Sym: WalkSym>(
                     .record_op_with_descr(OpCode::RawLoadF, &[base, offset], descr);
             let dst = code[op.pc + 5] as usize;
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc: op.pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = result;
+            ctx.registers_f.set(dst, result);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // `_opimpl_raw_store` delegates to `execute_raw_store`:
@@ -12941,16 +12955,16 @@ fn handle<Sym: WalkSym>(
             let src_val = read_float_reg(code, op, 0, ctx)?;
             let dst = code[op.pc + 2] as usize;
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc: op.pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = src_val;
+            ctx.registers_f.set(dst, src_val);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_push/r" => {
@@ -13031,16 +13045,16 @@ fn handle<Sym: WalkSym>(
             let val = ctx.session.borrow().tmpreg_f;
             let dst = code[op.pc + 1] as usize;
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc: op.pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = val;
+            ctx.registers_f.set(dst, val);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_copy/r>r" => {

@@ -866,7 +866,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // `pcdep_color_slots` map at the guard's own jitcode pc names the
             // Ref-bank color that holds operand-stack slot `nlocals + s` at THIS
             // guard PC (the same authoritative twin `collect_outer_active_boxes` reads),
-            // and `ctx.registers_r[color]` holds the live guard-state box.  This
+            // and `ctx.registers_r.get(color).expect("ref register in range")` holds the live guard-state box.  This
             // is the guard-PC color read (as `resolved_recovered` does for
             // `registers_r[src]`), NOT the retired stale merge-color read.
             // This ports `get_list_of_active_boxes`
@@ -906,7 +906,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     if let Some(color) =
                         crate::state::semantic_slot_color_for_ref_slot(&pcdep, nlocals + s)
                     {
-                        if let Some(&box_op) = ctx.registers_r.get(color) {
+                        if let Some(box_op) = ctx.registers_r.get(color) {
                             // Only a genuine Ref box may fill an operand-stack
                             // slot: the vable array is uniformly Ref-typed, and
                             // `build_vable_snapshot_boxes` reads each entry's
@@ -1198,7 +1198,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     {
                         continue;
                     }
-                    let Some(&value) = ctx.registers_r.get(color as usize) else {
+                    let Some(value) = ctx.registers_r.get(color as usize) else {
                         continue;
                     };
                     if value == OpRef::NONE || value.ty() != Some(majit_ir::Type::Ref) {
@@ -1526,7 +1526,7 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
             return Some(*ptr);
         }
     }
-    let opref = ctx.registers_r.get(color).copied()?;
+    let opref = ctx.registers_r.get(color)?;
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(Value::Ref(r)) if !r.is_null() => Some(r.as_usize() as pyre_object::PyObjectRef),
         _ => None,
@@ -1923,7 +1923,7 @@ fn report_caller_image_ref_box<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, col
     if !fbw_debug_abort_enabled() {
         return;
     }
-    let opref = ctx.registers_r.get(color).copied();
+    let opref = ctx.registers_r.get(color);
     let box_is_none = opref.map(|o| o.is_none()).unwrap_or(true);
     let recovered = opref
         .filter(|o| !o.is_none())
@@ -2042,7 +2042,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
             // refusing the image; this site is the one copy that never received
             // those answers.
             _ => {
-                let opref = ctx.registers_r.get(color).copied();
+                let opref = ctx.registers_r.get(color);
                 match opref {
                     // No box at this color at all.  A `-live-` set is the union
                     // over the paths INTO its coordinate and the walk took one
@@ -2111,7 +2111,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         if result_bank == 'f' && result_color == Some(color) {
             continue;
         }
-        let got = ctx.registers_f.get(color).copied();
+        let got = ctx.registers_f.get(color);
         let Some(opref) = got.filter(|&opref| opref != OpRef::NONE) else {
             report_caller_image_decline(
                 jitcode_index,
@@ -2137,7 +2137,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         if float_seeded[color] || (result_bank == 'f' && result_color == Some(color)) {
             continue;
         }
-        let Some(opref) = ctx.registers_f.get(color).copied() else {
+        let Some(opref) = ctx.registers_f.get(color) else {
             continue;
         };
         if opref == OpRef::NONE {
@@ -2379,9 +2379,9 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     // list, then restore the caller's register (the inlined callee, not the
     // walk, produces the result; the inner frame supplies it on resume).
     let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-    let saved = result_color.and_then(|color| ctx.registers_r.get(color).copied());
+    let saved = result_color.and_then(|color| ctx.registers_r.get(color));
     if let Some(result_color) = result_color.filter(|&color| color < ctx.registers_r.len()) {
-        ctx.registers_r[result_color] = null_ref;
+        ctx.registers_r.set(result_color, null_ref);
     }
     // Keep the caller at the immediate post-call `-live-`, matching the
     // paused `MIFrame.pc` used by RPython and the blackhole return ABI.
@@ -2409,7 +2409,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         result_color.filter(|&color| color < ctx.registers_r.len()),
         saved,
     ) {
-        ctx.registers_r[result_color] = saved;
+        ctx.registers_r.set(result_color, saved);
     }
     Ok(InlineParentFrame {
         jitcode_index,
@@ -2532,9 +2532,9 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // walk, produces the result; the inner frame supplies it on resume) — same
     // as the top-level `in_a_call=true` shape.
     let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-    let saved = result_color.and_then(|color| ctx.registers_r.get(color).copied());
+    let saved = result_color.and_then(|color| ctx.registers_r.get(color));
     if let Some(result_color) = result_color.filter(|&color| color < ctx.registers_r.len()) {
-        ctx.registers_r[result_color] = null_ref;
+        ctx.registers_r.set(result_color, null_ref);
     }
     // Keep the caller at the immediate post-call `-live-`, matching the
     // paused `MIFrame.pc` used by RPython and the blackhole return ABI.
@@ -2556,7 +2556,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         result_color.filter(|&color| color < ctx.registers_r.len()),
         saved,
     ) {
-        ctx.registers_r[result_color] = saved;
+        ctx.registers_r.set(result_color, saved);
     }
     let boxes = match boxes {
         Ok(b) => b,
@@ -2585,7 +2585,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > 1 {
             let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index as i32);
             let frame_red = (frame_reg != u16::MAX)
-                .then(|| ctx.registers_r.get(frame_reg as usize).copied())
+                .then(|| ctx.registers_r.get(frame_reg as usize))
                 .flatten()
                 .filter(|&r| r != OpRef::NONE);
             let locals_idx = crate::descr::pyframe_locals_cells_stack_descr().index();
@@ -2635,7 +2635,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                     if slot < nlocals || slot == pending_top_slot {
                         continue;
                     }
-                    let Some(&operand) = ctx.registers_r.get(color as usize) else {
+                    let Some(operand) = ctx.registers_r.get(color as usize) else {
                         continue;
                     };
                     if operand == OpRef::NONE {

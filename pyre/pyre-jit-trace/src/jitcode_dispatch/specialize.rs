@@ -13239,7 +13239,7 @@ fn next_op_is_f_locals_for_getframe_result<Sym: WalkSym>(
     if obj_reg as usize != getframe_dst {
         return false;
     }
-    let (Some(&name_op), Some(&code_op)) = (
+    let (Some(name_op), Some(code_op)) = (
         ctx.registers_i.get(name_reg as usize),
         ctx.registers_r.get(code_reg as usize),
     ) else {

@@ -7,6 +7,83 @@ static STATIC_REFUSAL_PREFIX_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[test]
+fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
+    let _runtime = crate::trace_ctx_for_test(0);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let outer = std::cell::RefCell::new(WalkSession::default());
+    let inner = std::cell::RefCell::new(WalkSession::default());
+    let outer_roots = WalkSessionRoots::new(&outer);
+    let inner_roots = WalkSessionRoots::new(&inner);
+    let parent = |word: usize| InlineParentFrame {
+        jitcode_index: 0,
+        call_jitcode_pc: None,
+        call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
+        blackhole: Some(InlineParentBlackhole {
+            resume_pc: 0,
+            int_values: Vec::new(),
+            ref_values: vec![(0, (word + 0x10) as pyre_object::PyObjectRef)],
+            float_values: Vec::new(),
+        }),
+        resume_coord: ParentResumeCoord::Backxlat(0),
+        resume_marker_jit_pc: None,
+        boxes: vec![OpRef::const_ptr(majit_ir::GcRef(word + 0x20))],
+    };
+    let frames = vec![
+        InlineFrameGuard::enter(&outer, 0, false, vec![parent(0x1000)]),
+        InlineFrameGuard::enter(&outer, 0, false, vec![parent(0x2000)]),
+    ];
+    let inner_frame = InlineFrameGuard::enter(&inner, 0, false, vec![parent(0x3000)]);
+    let forward = || {
+        let mut seen = Vec::new();
+        majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+            if (0x1000..0x5000).contains(&root.0) {
+                seen.push(root.0);
+                root.0 += 0x80;
+            }
+        });
+        seen.sort_unstable();
+        seen
+    };
+    assert_eq!(
+        forward(),
+        [
+            0x1000, 0x1010, 0x1020, 0x2000, 0x2010, 0x2020, 0x3000, 0x3010, 0x3020
+        ]
+    );
+    drop(inner_frame);
+    drop(inner_roots);
+    assert_eq!(forward(), [0x1080, 0x1090, 0x10a0, 0x2080, 0x2090, 0x20a0]);
+    // Bridge reconstruction stores frame guards in a Vec; their drop order
+    // must not control the session owner's root registration lifetime.
+    drop(frames);
+    assert!(outer.borrow().framestack.is_empty());
+    outer.borrow_mut().tmpreg_r = OpRef::const_ptr(majit_ir::GcRef(0x4000));
+    assert_eq!(forward(), [0x4000]);
+    assert_eq!(
+        outer.borrow().tmpreg_r,
+        OpRef::const_ptr(majit_ir::GcRef(0x4080))
+    );
+    drop(outer_roots);
+    assert!(forward().is_empty());
+}
+
+#[test]
+fn session_root_callback_rejects_a_borrow_across_collection() {
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let held = session.borrow();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        // Check the borrow contract without unwinding through a global
+        // root traversal.
+        walk_session_roots(
+            (&session as *const std::cell::RefCell<WalkSession>).cast(),
+            &mut |_| {},
+        );
+    }));
+    assert!(failed.is_err());
+    drop(held);
+}
+
+#[test]
 fn finish_payload_root_walker_writes_back_forwarded_const_ptr() {
     fbw_finish_payload_reset();
     fbw_terminate_with_raise(
@@ -665,9 +742,9 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
         inline_poison_pcs: None,
         fbw_mode: mode,
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut regs_f,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
         concrete_registers_r: &mut concrete_r,
         concrete_registers_i: &mut concrete_i,
         descr_refs: &[],
@@ -1218,9 +1295,9 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut concrete,
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -1274,9 +1351,20 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         pc: 0,
         next_pc: 2,
     };
-    assert_eq!(wc.trace_ctx.concrete_of_opref(wc.registers_r[1]), None);
     assert_eq!(
-        super::vable_ops::vable_value_concrete(&code, &op, 0, &wc, 'r', wc.registers_r[1]),
+        wc.trace_ctx
+            .concrete_of_opref(wc.registers_r.get(1).expect("ref register in range")),
+        None
+    );
+    assert_eq!(
+        super::vable_ops::vable_value_concrete(
+            &code,
+            &op,
+            0,
+            &wc,
+            'r',
+            wc.registers_r.get(1).expect("ref register in range")
+        ),
         Some(Value::Ref(majit_ir::GcRef(exc_obj_ptr as usize))),
         "vable writes must preserve the concrete half of a non-constant register Box",
     );
@@ -1287,8 +1375,8 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
             0,
             &wc,
             'r',
-            wc.registers_r[1],
-            wc.registers_r[0],
+            wc.registers_r.get(1).expect("ref register in range"),
+            wc.registers_r.get(0).expect("ref register in range"),
         ),
         Some(Value::Ref(majit_ir::GcRef(0xC0DE_0000))),
         "a TOS override must resolve its own box instead of the stale encoded register shadow",
@@ -1301,7 +1389,7 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
             0,
             &wc,
             'r',
-            wc.registers_r[2],
+            wc.registers_r.get(2).expect("ref register in range"),
         ),
         Some(Value::Ref(majit_ir::GcRef(forwarded_obj_ptr))),
         "a forwarded recorder Box must win over the stale raw Ref shadow",
@@ -1471,9 +1559,9 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -1527,9 +1615,9 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -1601,9 +1689,9 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
             inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
             session: &session,
-            registers_r: &mut regs_r,
-            registers_i: &mut regs_i,
-            registers_f: &mut [],
+            registers_r: &RegisterBank::new(regs_r.iter().copied()),
+            registers_i: &RegisterBank::new(regs_i.iter().copied()),
+            registers_f: &RegisterBank::default(),
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
@@ -1697,9 +1785,9 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
             inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
             session: &session,
-            registers_r: &mut regs_r,
-            registers_i: &mut regs_i,
-            registers_f: &mut [],
+            registers_r: &RegisterBank::new(regs_r.iter().copied()),
+            registers_i: &RegisterBank::new(regs_i.iter().copied()),
+            registers_f: &RegisterBank::default(),
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
@@ -1828,9 +1916,9 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
             inline_poison_pcs: None,
             fbw_mode: test_fbw_mode(),
             session: &session,
-            registers_r: &mut regs_r,
-            registers_i: &mut regs_i,
-            registers_f: &mut [],
+            registers_r: &RegisterBank::new(regs_r.iter().copied()),
+            registers_i: &RegisterBank::new(regs_i.iter().copied()),
+            registers_f: &RegisterBank::default(),
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
@@ -2099,9 +2187,9 @@ fn drive_int_add_jump_if_ovf(
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut concrete_i,
         descr_refs: &[],
@@ -2128,7 +2216,7 @@ fn drive_int_add_jump_if_ovf(
     };
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_add_jump_if_ovf must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
-    let dst = wc.registers_i[2];
+    let dst = wc.registers_i.get(2).expect("int register in range");
     drop(wc);
     let ops = tc.ops();
     let opcodes = ops.iter().map(|op| op.opcode).collect();
@@ -2256,9 +2344,9 @@ fn drive_alloc_with_descr(
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut concrete_r,
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -2286,7 +2374,7 @@ fn drive_alloc_with_descr(
     let (outcome, next_pc) =
         step(&code, 0, &mut wc).unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
     assert_eq!(outcome, DispatchOutcome::Continue);
-    let dst = wc.registers_r[0];
+    let dst = wc.registers_r.get(0).expect("ref register in range");
     drop(wc);
 
     let ops = tc.ops();
@@ -2482,9 +2570,9 @@ fn run_hint_step_full(
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: regs_r,
-        registers_i: regs_i,
-        registers_f: regs_f,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
         concrete_registers_r: concrete_r,
         concrete_registers_i: concrete_i,
         descr_refs: &descr_pool,
@@ -2509,7 +2597,11 @@ fn run_hint_step_full(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    step(code, 0, &mut wc)
+    let result = step(code, 0, &mut wc);
+    regs_f.copy_from_slice(&wc.registers_f.to_vec());
+    regs_i.copy_from_slice(&wc.registers_i.to_vec());
+    regs_r.copy_from_slice(&wc.registers_r.to_vec());
+    result
 }
 
 #[test]
@@ -3070,9 +3162,9 @@ fn switch_id_hit_jumps_to_matching_target() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -3127,9 +3219,9 @@ fn switch_id_miss_falls_through() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -3183,9 +3275,9 @@ fn switch_id_requires_concrete_int_value() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -3248,9 +3340,9 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -3305,9 +3397,9 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -3361,9 +3453,9 @@ fn goto_if_not_requires_concrete_int_value() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -3743,9 +3835,9 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -3784,6 +3876,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         ConcreteValue::Null,
         "normal inline return must clear the caller's concrete exception shadow",
     );
+    let regs_r = wc.registers_r.to_vec();
     drop(wc);
     // dst register r5 must equal the arg the caller passed (since
     // callee's `ref_return r0` returns its registers_r[0] which
@@ -3864,9 +3957,9 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -4062,9 +4155,9 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -4092,13 +4185,15 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     let (outcome, next_pc) = step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, caller_code.len());
+    let returned_int = wc.registers_i.get(3);
+    let regs_r = wc.registers_r.to_vec();
     drop(wc);
     // Callee's int_return[i0] surfaced SubReturn{Some(NONE)}; the
     // helper wrote that into caller's registers_i[3]. Sentinel is
     // gone, replaced by OpRef::NONE.
     assert_eq!(
-        regs_i[3],
-        OpRef::NONE,
+        returned_int,
+        Some(OpRef::NONE),
         "inline_call_r_i must write SubReturn value into caller registers_i[dst]",
     );
     // Wrong-bank check: registers_r[3] must remain its original
@@ -4178,9 +4273,9 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -4209,6 +4304,7 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
         step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, caller_code.len());
+    let regs_r = wc.registers_r.to_vec();
     drop(wc);
     // dst register r5 must equal the caller's R-list arg (which the
     // callee returned via ref_return r0).
@@ -4289,9 +4385,9 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut regs_f,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -4320,6 +4416,7 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
         step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, caller_code.len());
+    let regs_r = wc.registers_r.to_vec();
     drop(wc);
     // Smoking gun: dst register r5 must equal the caller's R-list
     // arg (passed through callee's `ref_return r0`). A list-byte
@@ -4389,9 +4486,9 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -4485,9 +4582,9 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -4563,9 +4660,9 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -4620,9 +4717,9 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -4673,9 +4770,9 @@ fn step_through_live_opcode_advances_by_offset_size() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -4735,9 +4832,9 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -4795,9 +4892,9 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -4856,9 +4953,9 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut registers_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(registers_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut concrete_registers_r,
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -4918,9 +5015,9 @@ fn step_through_int_return_records_finish_with_int_descr() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -4997,9 +5094,9 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5064,9 +5161,9 @@ fn step_through_void_return_stashes_void_finish_payload() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5132,9 +5229,9 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5188,9 +5285,9 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5247,9 +5344,9 @@ fn step_through_goto_jumps_to_label_target() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5306,9 +5403,9 @@ fn step_through_goto_handles_high_byte_of_label() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5419,9 +5516,9 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5473,9 +5570,9 @@ fn step_through_catch_exception_advances_past_label_operand() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5541,9 +5638,9 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5619,9 +5716,9 @@ fn top_level_raise_settles_the_vable_token() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5740,9 +5837,9 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut concrete,
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5846,9 +5943,9 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5923,9 +6020,9 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -5977,9 +6074,9 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6095,9 +6192,9 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -6215,9 +6312,9 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -6285,9 +6382,9 @@ fn step_through_int_copy_advances_past_operand_bytes() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6351,9 +6448,9 @@ fn int_copy_writes_src_value_into_dst_register() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6380,12 +6477,14 @@ fn int_copy_writes_src_value_into_dst_register() {
     };
     let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
     assert_eq!(
-        wc.registers_i[5], src_val_pre,
+        wc.registers_i.get(5).expect("int register in range"),
+        src_val_pre,
         "int_copy must copy registers_i[src] into registers_i[dst] \
              (RPython _opimpl_any_copy + `>i` result coding)",
     );
     assert_eq!(
-        wc.registers_i[2], src_val_pre,
+        wc.registers_i.get(2).expect("int register in range"),
+        src_val_pre,
         "src register must remain unchanged",
     );
 }
@@ -6408,9 +6507,9 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6464,9 +6563,9 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [], // empty — index 7 must surface OOR
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(), // empty — index 7 must surface OOR
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6540,9 +6639,9 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6604,9 +6703,9 @@ fn ref_copy_writes_src_value_into_dst_register() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6633,12 +6732,14 @@ fn ref_copy_writes_src_value_into_dst_register() {
     };
     let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
     assert_eq!(
-        wc.registers_r[5], src_val_pre,
+        wc.registers_r.get(5).expect("ref register in range"),
+        src_val_pre,
         "ref_copy must copy registers_r[src] into registers_r[dst] \
              (RPython _opimpl_any_copy + `>r` result coding)",
     );
     assert_eq!(
-        wc.registers_r[2], src_val_pre,
+        wc.registers_r.get(2).expect("ref register in range"),
+        src_val_pre,
         "src register must remain unchanged",
     );
 }
@@ -6659,9 +6760,9 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6713,9 +6814,9 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [], // empty — index 7 must surface OOR
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(), // empty — index 7 must surface OOR
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6778,9 +6879,9 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -6809,7 +6910,7 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 4, "`{opname}` operand layout `ii>i` = 3 bytes");
-    let dst_post = wc.registers_i[6];
+    let dst_post = wc.registers_i.get(6).expect("int register in range");
     assert_ne!(
         dst_post, dst_pre,
         "`{opname}` must write a fresh OpRef into registers_i[dst]",
@@ -7003,9 +7104,9 @@ fn drive_int_between(
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -7034,7 +7135,7 @@ fn drive_int_between(
         int_between_record(&code, &op, &mut wc).expect("int_between_record must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 5, "operand layout `iii>i` consumes 4 bytes");
-    let dst_post = wc.registers_i[8];
+    let dst_post = wc.registers_i.get(8).expect("int register in range");
     drop(wc);
     let new_ops: Vec<majit_ir::OpCode> = tc
         .ops()
@@ -7140,9 +7241,9 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut regs_f,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -7171,7 +7272,7 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 4, "`{opname}` operand layout `ff>f` = 3 bytes");
-    let dst_post = wc.registers_f[6];
+    let dst_post = wc.registers_f.get(6).expect("float register in range");
     assert_ne!(
         dst_post, dst_pre,
         "`{opname}` must write a fresh OpRef into registers_f[dst]",
@@ -7230,9 +7331,9 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut regs_f,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -7261,7 +7362,7 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         step(&code, 0, &mut wc).unwrap_or_else(|_| panic!("`{opname}` must dispatch"));
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 3, "`{opname}` operand layout `f>f` = 2 bytes");
-    let dst_post = wc.registers_f[5];
+    let dst_post = wc.registers_f.get(5).expect("float register in range");
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
@@ -7308,9 +7409,9 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -7339,7 +7440,7 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 3, "`{opname}` operand layout `i>i` = 2 bytes");
-    let dst_post = wc.registers_i[5];
+    let dst_post = wc.registers_i.get(5).expect("int register in range");
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
@@ -7421,9 +7522,9 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -7452,7 +7553,7 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
         .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 4, "`{opname}` operand layout `rr>i` = 3 bytes");
-    let dst_post = wc.registers_i[6];
+    let dst_post = wc.registers_i.get(6).expect("int register in range");
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
@@ -7592,9 +7693,9 @@ fn run_float_step(
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: regs_i,
-        registers_f: regs_f,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -7619,7 +7720,10 @@ fn run_float_step(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    step(code, 0, &mut wc)
+    let result = step(code, 0, &mut wc);
+    regs_f.copy_from_slice(&wc.registers_f.to_vec());
+    regs_i.copy_from_slice(&wc.registers_i.to_vec());
+    result
 }
 
 #[test]
@@ -7786,9 +7890,9 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -7841,9 +7945,9 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -7898,9 +8002,9 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -7972,9 +8076,9 @@ fn unsupported_opname_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -8113,9 +8217,9 @@ fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut registers_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(registers_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut concrete_registers_r,
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -8187,9 +8291,9 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -8247,7 +8351,10 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         wc.trace_ctx.const_type(last_args1.to_opref()),
         Some(Type::Ref)
     );
-    assert_ne!(wc.registers_i[0], OpRef::None);
+    assert_ne!(
+        wc.registers_i.get(0).expect("int register in range"),
+        OpRef::None
+    );
 }
 
 #[test]
@@ -8356,9 +8463,9 @@ fn abort_result_r_stops_the_walk() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -8421,9 +8528,9 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut concrete_r,
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -8473,7 +8580,7 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
         Some(Type::Ref)
     );
     assert_eq!(
-        wc.registers_r[0],
+        wc.registers_r.get(0).expect("ref register in range"),
         last_args1.to_opref(),
         "register slot still holding the original OpRef must be rewritten \
              to the promoted constant (pyjitpl.py:1923 replace_box)",
@@ -8505,9 +8612,9 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut concrete_i,
         descr_refs: &[],
@@ -8558,7 +8665,7 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
         Some(Type::Int)
     );
     assert_eq!(
-        wc.registers_i[0],
+        wc.registers_i.get(0).expect("int register in range"),
         last_args1.to_opref(),
         "register slot still holding the original OpRef must be rewritten \
          to the promoted constant (pyjitpl.py:1923 replace_box)",
@@ -8590,9 +8697,9 @@ fn ref_guard_value_on_const_records_nothing() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut concrete_r,
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -8625,7 +8732,10 @@ fn ref_guard_value_on_const_records_nothing() {
         baseline_ops,
         "no op should be recorded when input is already Const"
     );
-    assert_eq!(wc.registers_r[0], value_opref);
+    assert_eq!(
+        wc.registers_r.get(0).expect("ref register in range"),
+        value_opref
+    );
 }
 
 #[test]
@@ -8685,9 +8795,9 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -8856,9 +8966,9 @@ fn run_symbolic_box_str_dispatch(
             ..test_fbw_mode()
         },
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -8884,6 +8994,7 @@ fn run_symbolic_box_str_dispatch(
         live_after_jit_pc: usize::MAX,
     };
     let outcome = step(&code, 0, &mut wc);
+    let regs_r = wc.registers_r.to_vec();
     drop(wc);
     let dst = regs_r[1];
     let dst_value = tc.box_value(dst);
@@ -8996,9 +9107,9 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -9079,9 +9190,9 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -9151,9 +9262,9 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -9209,9 +9320,9 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -9281,9 +9392,9 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -9383,9 +9494,9 @@ fn may_force_with_active_vable_executes_and_clears_token() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -9484,9 +9595,9 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -9581,9 +9692,9 @@ fn run_not_in_trace(
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -9710,9 +9821,9 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -9767,9 +9878,9 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -9836,9 +9947,9 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -9907,9 +10018,9 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -9942,7 +10053,7 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
     // the test compare without re-deriving the index (input args
     // also occupy OpRef indices, so `ops.iter().position()` would
     // be off by `num_inputargs`).
-    let dst_ref = wc.registers_r[3];
+    let dst_ref = wc.registers_r.get(3).expect("ref register in range");
     assert_ne!(
         dst_ref, dst_val_pre,
         "dst must change from its pre-call value",
@@ -9998,9 +10109,9 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10028,6 +10139,7 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
     wc.outer_jitcode_index = test_outer_resume_jitcode_index();
     wc.outer_resume_marker_jit_pc = Some(0);
     let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
+    let regs_r = wc.registers_r.to_vec();
     drop(wc);
     let opcodes: Vec<_> = tc.ops().iter().skip(ops_before).map(|o| o.opcode).collect();
     assert_eq!(
@@ -10078,9 +10190,9 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10108,6 +10220,7 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
     wc.outer_jitcode_index = test_outer_resume_jitcode_index();
     wc.outer_resume_marker_jit_pc = Some(0);
     let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
+    let regs_r = wc.registers_r.to_vec();
     drop(wc);
     let opcodes: Vec<_> = tc.ops().iter().skip(ops_before).map(|o| o.opcode).collect();
     assert_eq!(
@@ -10157,9 +10270,9 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10216,9 +10329,9 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10313,9 +10426,9 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10373,7 +10486,7 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         "CallI descr must be descr_refs[1] (not decoy at index 0)",
     );
     // dst writeback into the int bank (NOT the r bank).
-    let dst_post = wc.registers_i[3];
+    let dst_post = wc.registers_i.get(3).expect("int register in range");
     assert_ne!(
         dst_post, dst_pre,
         "registers_i[dst] must change from its pre-call value",
@@ -10409,9 +10522,9 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10513,9 +10626,9 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10584,7 +10697,7 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         "CallR descr must be descr_refs[1] (not decoy at index 0)",
     );
     // dst writeback into registers_r[0].
-    let dst_post = wc.registers_r[0];
+    let dst_post = wc.registers_r.get(0).expect("ref register in range");
     assert_eq!(
         dst_post,
         call_op.pos.get(),
@@ -10649,9 +10762,9 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10721,9 +10834,9 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10779,9 +10892,9 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10861,9 +10974,9 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -10974,9 +11087,9 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11102,9 +11215,9 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
                 ..test_fbw_mode()
             },
             session: &session,
-            registers_r: &mut regs_r,
-            registers_i: &mut [],
-            registers_f: &mut [],
+            registers_r: &RegisterBank::new(regs_r.iter().copied()),
+            registers_i: &RegisterBank::default(),
+            registers_f: &RegisterBank::default(),
             concrete_registers_r: &mut [],
             concrete_registers_i: &mut [],
             descr_refs: &descr_pool,
@@ -11191,9 +11304,9 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11301,9 +11414,9 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11384,9 +11497,9 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11468,9 +11581,9 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11550,9 +11663,9 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11637,9 +11750,9 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut regs_f,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11722,9 +11835,9 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut regs_f,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11796,9 +11909,9 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11826,7 +11939,7 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 5, "getfield_gc_i/rd>i operand layout = 4 bytes");
-    let dst_post = wc.registers_i[5];
+    let dst_post = wc.registers_i.get(5).expect("int register in range");
     assert_ne!(
         dst_post, dst_pre,
         "cache miss must write a fresh recorder OpRef into registers_i[dst]",
@@ -11891,9 +12004,9 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11919,7 +12032,7 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
         live_after_jit_pc: usize::MAX,
     };
     let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
-    let dst_post = wc.registers_i[5];
+    let dst_post = wc.registers_i.get(5).expect("int register in range");
     drop(wc);
     assert_eq!(
         tc.num_ops(),
@@ -11964,9 +12077,9 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -11992,7 +12105,7 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         live_after_jit_pc: usize::MAX,
     };
     let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
-    let dst_post = wc.registers_r[6];
+    let dst_post = wc.registers_r.get(6).expect("ref register in range");
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
@@ -12025,9 +12138,9 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12098,9 +12211,9 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12128,7 +12241,7 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 5, "getfield_vable_i/rd>i operand layout = 4 bytes");
-    let dst_post = wc.registers_i[5];
+    let dst_post = wc.registers_i.get(5).expect("int register in range");
     assert_ne!(
         dst_post, dst_pre,
         "fallback must write a fresh recorder OpRef into registers_i[dst]",
@@ -12191,9 +12304,9 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12274,9 +12387,9 @@ fn setfield_gc_i_redundant_write_skips_recording() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12335,9 +12448,9 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12422,9 +12535,9 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12492,9 +12605,9 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12525,7 +12638,7 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
         next_pc, 6,
         "getarrayitem_gc_r/rid>r operand layout = 5 bytes"
     );
-    let dst_post = wc.registers_r[5];
+    let dst_post = wc.registers_r.get(5).expect("ref register in range");
     assert_ne!(dst_post, dst_pre);
     drop(wc);
     assert_eq!(tc.num_ops(), ops_before + 1);
@@ -12640,9 +12753,9 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12670,7 +12783,7 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_i_pure must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 6);
-    let dst_post = wc.registers_i[5];
+    let dst_post = wc.registers_i.get(5).expect("int register in range");
     drop(wc);
     assert!(dst_post.is_constant(), "the bypass substitutes a Const");
     assert_eq!(
@@ -12717,9 +12830,9 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12745,7 +12858,7 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
         live_after_jit_pc: usize::MAX,
     };
     let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
-    let dst_post = wc.registers_r[5];
+    let dst_post = wc.registers_r.get(5).expect("ref register in range");
     drop(wc);
     assert_eq!(
         tc.num_ops(),
@@ -12786,9 +12899,9 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
@@ -12860,8 +12973,8 @@ fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
     let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
     let expected_arg = tc.const_ref(0xCAFE_F00D);
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
-    *sym.registers_r_mut() = vec![OpRef::NONE; 8];
-    sym.registers_r_mut()[2] = expected_arg;
+    sym.registers_r_mut().replace(vec![OpRef::NONE; 8]);
+    sym.registers_r_mut().set(2, expected_arg);
 
     let miframe = MIFrame {
         ctx: &mut tc,
@@ -12942,8 +13055,8 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     // The walk now reads the concrete exception's traceback head.
     let exc_oprep = tc.const_ref(exc as i64);
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
-    *sym.registers_r_mut() = vec![OpRef::NONE; 8];
-    sym.registers_r_mut()[3] = exc_oprep;
+    sym.registers_r_mut().replace(vec![OpRef::NONE; 8]);
+    sym.registers_r_mut().set(3, exc_oprep);
     // Pre-condition: sym.last_exc_box is unset.
     assert!(sym.last_exc_box().is_none());
 
@@ -13028,8 +13141,8 @@ fn dispatch_via_miframe_leaves_class_of_last_exc_is_const_unchanged_when_no_rais
     let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
     let value = tc.const_ref(0xC0FFEE);
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
-    *sym.registers_r_mut() = vec![OpRef::NONE; 8];
-    sym.registers_r_mut()[2] = value;
+    sym.registers_r_mut().replace(vec![OpRef::NONE; 8]);
+    sym.registers_r_mut().set(2, value);
     // Pre-condition: simulate prior raise — class_of_last_exc_is_const
     // is true and last_exc_box is set.
     sym.set_class_of_last_exc_is_const(true);
@@ -13104,9 +13217,9 @@ fn walk_undecodable_byte_surfaces_typed_error() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -13182,9 +13295,9 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -13270,9 +13383,9 @@ fn loop_header_stamps_seen_flag() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -13338,9 +13451,9 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -13401,9 +13514,9 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -13792,9 +13905,9 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut concrete_i,
         descr_refs: &[],
@@ -13825,7 +13938,11 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
     let (outcome, next_pc) = step(&code, next_pc, &mut wc).expect("`int_pop/>i` must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, 4);
-    assert_eq!(wc.registers_i[1], src, "the pop moves the source OpRef");
+    assert_eq!(
+        wc.registers_i.get(1).expect("int register in range"),
+        src,
+        "the pop moves the source OpRef"
+    );
     assert_eq!(
         wc.concrete_registers_i[1],
         ConcreteValue::Int(7),
@@ -13983,9 +14100,9 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -14102,9 +14219,9 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -14195,9 +14312,9 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut regs_r,
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &[],
@@ -14425,9 +14542,9 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
         inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut [],
-        registers_f: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,

@@ -78,7 +78,7 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
                         'r' => write_ref_reg(ctx, op.pc, dst, folded, concrete)?,
                         _ => {
                             let len = ctx.registers_f.len();
-                            let slot = ctx.registers_f.get_mut(dst).ok_or(
+                            let _ = ctx.registers_f.get(dst).ok_or(
                                 DispatchError::RegisterOutOfRange {
                                     pc: op.pc,
                                     reg: dst,
@@ -86,7 +86,7 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
                                     bank: "f",
                                 },
                             )?;
-                            *slot = folded;
+                            ctx.registers_f.set(dst, folded);
                         }
                     }
                     return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -183,16 +183,16 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
         }
         'f' => {
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc: op.pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = result;
+            ctx.registers_f.set(dst, result);
         }
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     }
@@ -670,16 +670,16 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         }
         'f' => {
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc: op.pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = result;
+            ctx.registers_f.set(dst, result);
         }
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     }

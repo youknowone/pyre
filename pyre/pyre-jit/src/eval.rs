@@ -5087,11 +5087,6 @@ fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // Stored `PyError` carrier whose GC refs the precise collector cannot
     // reach through its raw TLS cell. Mirrors `walk_pending_call_error`.
     crate::call_jit::walk_last_ca_exception(visitor);
-    // Trace-time exception carriers held only in the active `PyreSym`
-    // (`trace_built_exc` / `last_exc_value` / `current_exc_value`): a
-    // trace-built exception is unreachable to the precise collector between its
-    // construction and the RAISE_VARARGS lift-out.
-    pyre_jit_trace::trace::walk_active_sym_exc_roots(visitor);
 }
 
 /// The immortal, process-global stores whose GC-heap slots nothing else
@@ -5196,11 +5191,6 @@ fn register_thread_root_areas() {
             walk_end_root_walker_area,
             pyre_jit_trace::trace::capture_walk_end_root_area(),
             "walk_end",
-        );
-        register(
-            active_sym_registers_root_walker_area,
-            pyre_jit_trace::trace::capture_active_sym_root_area(),
-            "active_sym_registers",
         );
         register(
             mapdict_root_walker_area,
@@ -6098,19 +6088,6 @@ unsafe fn fbw_finish_payload_root_walker_area(
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     unsafe { pyre_jit_trace::jitcode_dispatch::fbw_finish_payload_root_walker_area(data, visitor) };
-}
-
-/// The recording walk's own reference register banks, whose inline `ConstPtr`
-/// GcRefs nothing else forwards.  See
-/// `pyre_jit_trace::trace::walk_active_sym_register_area`.
-///
-/// # Safety
-/// `data` must be this mutator's `capture_active_sym_root_area()`.
-unsafe fn active_sym_registers_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    unsafe { pyre_jit_trace::trace::walk_active_sym_register_area(data, visitor) };
 }
 
 unsafe fn walk_end_root_walker_area(
@@ -16403,7 +16380,10 @@ mod tests {
             let stack_value = [stack0, stack1][depth];
             let semantic_idx = 2 + depth;
             assert_eq!(
-                state.symbolic_registers_r()[semantic_idx],
+                state
+                    .symbolic_registers_r()
+                    .get(semantic_idx)
+                    .expect("bound semantic register"),
                 stack_value,
                 "stack depth {} must be in semantic registers_r[{}]",
                 depth,
@@ -16948,8 +16928,11 @@ mod tests {
             "register file must cover the virtualizable window"
         );
         assert!(
-            state.symbolic_registers_r()[nlocals..nlocals + stack_only]
+            state
+                .symbolic_registers_r()
                 .iter()
+                .skip(nlocals)
+                .take(stack_only)
                 .all(|opref| !opref.is_none()),
             "live stack slots carried by the JUMP must be preserved"
         );

@@ -751,7 +751,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             continue;
         }
         let ConcreteValue::Int(value) = ctx.concrete_registers_i.get(color).copied()? else {
-            if ctx.registers_i.get(color).copied()?.is_none() {
+            if ctx.registers_i.get(color)?.is_none() {
                 continue;
             }
             return None;
@@ -772,7 +772,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             // never concretized in this frame's shadow); decline only when even
             // that cannot resolve it.
             _ => {
-                let opref = ctx.registers_r.get(color).copied()?;
+                let opref = ctx.registers_r.get(color)?;
                 if opref.is_none() {
                     continue;
                 }
@@ -789,7 +789,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         if miframe.float_values.get(color).copied().flatten().is_some() {
             continue;
         }
-        let opref = ctx.registers_f.get(color).copied()?;
+        let opref = ctx.registers_f.get(color)?;
         if opref.is_none() {
             continue;
         }
@@ -844,7 +844,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         if miframe.float_values[color].is_some() {
             continue;
         }
-        let Some(&opref) = ctx.registers_f.get(color) else {
+        let Some(opref) = ctx.registers_f.get(color) else {
             continue;
         };
         if let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) {
@@ -971,7 +971,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
             continue;
         }
         if miframe.int_values[color].is_none() {
-            let Some(opref) = ctx.registers_i.get(color).copied() else {
+            let Some(opref) = ctx.registers_i.get(color) else {
                 continue;
             };
             if opref == OpRef::NONE {
@@ -986,7 +986,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     }
 
     for color in 0..miframe.ref_values.len() {
-        let opref = ctx.registers_r.get(color).copied();
+        let opref = ctx.registers_r.get(color);
         let forwarded = opref
             .filter(|&value| value != OpRef::NONE)
             .and_then(|value| {
@@ -1026,7 +1026,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
         if miframe.float_values[color].is_some() {
             continue;
         }
-        let Some(opref) = ctx.registers_f.get(color).copied() else {
+        let Some(opref) = ctx.registers_f.get(color) else {
             continue;
         };
         if opref == OpRef::NONE {
@@ -2961,7 +2961,7 @@ pub(crate) fn probe_resid_decline_ctx<Sym: WalkSym>(
     // The declined arg's semantic register slot and its index-keyed concrete
     // shadow (`concrete_registers_r`): a `Null` shadow at a found slot with a
     // `None` box_value is the bridge-resume seed gap (neither store populated).
-    let reg_slot = ctx.registers_r.iter().position(|&r| r == arg);
+    let reg_slot = ctx.registers_r.iter().position(|r| r == arg);
     let shadow = reg_slot.and_then(|s| ctx.concrete_registers_r.get(s));
     eprintln!(
         "[fbw-resid-decline] {why} op_pc={op_pc} py_pc={py_pc:?} py_op={opcode:?} \
@@ -2984,7 +2984,7 @@ fn carrier_stack_box_for_ref_arg<Sym: WalkSym>(
         return None;
     }
     let consts = ctx.inline_callee_consts?;
-    let color = ctx.registers_r.iter().position(|&value| value == arg)?;
+    let color = ctx.registers_r.iter().position(|value| value == arg)?;
     let raw_code =
         unsafe { pyre_interpreter::w_code_get_ptr(consts.w_code as pyre_object::PyObjectRef) }
             as *const pyre_interpreter::CodeObject;
@@ -5050,7 +5050,7 @@ pub(crate) fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
         return;
     };
     let frame_reg = pjc.metadata.portal_frame_reg as usize;
-    let Some(&callee_frame) = ctx.registers_r.get(frame_reg) else {
+    let Some(callee_frame) = ctx.registers_r.get(frame_reg) else {
         return;
     };
     if callee_frame == OpRef::NONE {
@@ -5137,7 +5137,7 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
         return Ok(());
     }
     let frame_reg = pjc.metadata.portal_frame_reg as usize;
-    let Some(&callee_frame) = ctx.registers_r.get(frame_reg) else {
+    let Some(callee_frame) = ctx.registers_r.get(frame_reg) else {
         return Ok(());
     };
     if callee_frame != shadow.frame_box {
@@ -5240,16 +5240,16 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
         }
         'f' => {
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = result;
+            ctx.registers_f.set(dst, result);
         }
         // Void variants (`pyjitpl.py opimpl_residual_call_*_v`):
         // the operand layout has no `>X` dst byte and no register slot to

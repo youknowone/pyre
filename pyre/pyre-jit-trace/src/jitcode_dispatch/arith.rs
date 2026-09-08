@@ -658,25 +658,13 @@ pub(crate) fn guard_value_record<Sym: WalkSym>(
     ctx.trace_ctx.replace_box(value, expected);
     match bank {
         GuardValueBank::Int => {
-            for slot in ctx.registers_i.iter_mut() {
-                if *slot == value {
-                    *slot = expected;
-                }
-            }
+            ctx.registers_i.replace_active_box(value, expected);
         }
         GuardValueBank::Ref => {
-            for slot in ctx.registers_r.iter_mut() {
-                if *slot == value {
-                    *slot = expected;
-                }
-            }
+            ctx.registers_r.replace_active_box(value, expected);
         }
         GuardValueBank::Float => {
-            for slot in ctx.registers_f.iter_mut() {
-                if *slot == value {
-                    *slot = expected;
-                }
-            }
+            ctx.registers_f.replace_active_box(value, expected);
         }
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -822,16 +810,16 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
                 result
             };
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc: op.pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = result;
+            ctx.registers_f.set(dst, result);
         }
         // `cast_int_to_ptr/i>r`: Int-bank → Ref-bank. Bit-cast the
         // operand's Box.value (`BoxInt(n)` → `BoxRef(n as ptr)`).
@@ -896,16 +884,16 @@ pub(crate) fn binop_float_record<Sym: WalkSym>(
         let result = ctx.trace_ctx.const_float(bits);
         let dst = code[op.pc + 3] as usize;
         let len = ctx.registers_f.len();
-        let slot = ctx
+        let _ = ctx
             .registers_f
-            .get_mut(dst)
+            .get(dst)
             .ok_or(DispatchError::RegisterOutOfRange {
                 pc: op.pc,
                 reg: dst,
                 len,
                 bank: "f",
             })?;
-        *slot = result;
+        ctx.registers_f.set(dst, result);
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     count_ops_recorded(ctx, opcode);
@@ -921,16 +909,16 @@ pub(crate) fn binop_float_record<Sym: WalkSym>(
     }
     let dst = code[op.pc + 3] as usize;
     let len = ctx.registers_f.len();
-    let slot = ctx
+    let _ = ctx
         .registers_f
-        .get_mut(dst)
+        .get(dst)
         .ok_or(DispatchError::RegisterOutOfRange {
             pc: op.pc,
             reg: dst,
             len,
             bank: "f",
         })?;
-    *slot = result;
+    ctx.registers_f.set(dst, result);
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -954,16 +942,16 @@ pub(crate) fn unop_float_record<Sym: WalkSym>(
         let result = ctx.trace_ctx.const_float(bits);
         let dst = code[op.pc + 2] as usize;
         let len = ctx.registers_f.len();
-        let slot = ctx
+        let _ = ctx
             .registers_f
-            .get_mut(dst)
+            .get(dst)
             .ok_or(DispatchError::RegisterOutOfRange {
                 pc: op.pc,
                 reg: dst,
                 len,
                 bank: "f",
             })?;
-        *slot = result;
+        ctx.registers_f.set(dst, result);
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     count_ops_recorded(ctx, opcode);
@@ -977,16 +965,16 @@ pub(crate) fn unop_float_record<Sym: WalkSym>(
     }
     let dst = code[op.pc + 2] as usize;
     let len = ctx.registers_f.len();
-    let slot = ctx
+    let _ = ctx
         .registers_f
-        .get_mut(dst)
+        .get(dst)
         .ok_or(DispatchError::RegisterOutOfRange {
             pc: op.pc,
             reg: dst,
             len,
             bank: "f",
         })?;
-    *slot = result;
+    ctx.registers_f.set(dst, result);
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 

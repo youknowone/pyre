@@ -668,7 +668,7 @@ pub(crate) fn write_stack_slot(
         if reg_idx >= sym.registers_r.len() {
             sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
         }
-        sym.registers_r[reg_idx] = boxed;
+        sym.registers_r.set(reg_idx, boxed);
     }
     if stack_idx >= sym.symbolic_stack_types.len() {
         sym.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
@@ -775,15 +775,17 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
     if reg_idx >= sym.registers_r.len() {
         sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
     }
-    if sym.registers_r[reg_idx] == OpRef::NONE {
+    if sym.registers_r.get(reg_idx).expect("bound Ref register") == OpRef::NONE {
         if sym.locals_cells_stack_array_ref == OpRef::NONE {
             sym.locals_cells_stack_array_ref = frame_locals_cells_stack_array(ctx, sym.frame);
         }
         let idx_const = ctx.const_int(semantic_idx as i64);
-        sym.registers_r[reg_idx] =
-            trace_array_getitem_value(ctx, sym.locals_cells_stack_array_ref, idx_const);
+        sym.registers_r.set(
+            reg_idx,
+            trace_array_getitem_value(ctx, sym.locals_cells_stack_array_ref, idx_const),
+        );
     }
-    sym.registers_r[reg_idx]
+    sym.registers_r.get(reg_idx).expect("bound Ref register")
 }
 
 /// Swap two operand-stack slots — third member of the
@@ -979,7 +981,7 @@ impl MIFrame {
     }
 
     #[doc(hidden)]
-    pub fn symbolic_registers_r(&self) -> &[OpRef] {
+    pub fn symbolic_registers_r(&self) -> &crate::jitcode_dispatch::RegisterList {
         &self.sym().registers_r
     }
 
@@ -1308,11 +1310,7 @@ impl MIFrame {
                         .virtualizable_box_at(nvs + semantic_idx)
                         .expect("get_list_of_active_boxes: missing vable frame box");
                 }
-                let val = s
-                    .registers_r
-                    .get(semantic_idx)
-                    .copied()
-                    .unwrap_or(OpRef::NONE);
+                let val = s.registers_r.get(semantic_idx).unwrap_or(OpRef::NONE);
                 if val != OpRef::NONE {
                     return val;
                 }
@@ -1323,7 +1321,7 @@ impl MIFrame {
                 if semantic_idx < nlocals {
                     let value = MIFrame::load_local_value(self, ctx, semantic_idx)
                         .expect("get_list_of_active_boxes: failed to lazy-load live local");
-                    self.sym_mut().registers_r[color_idx] = value;
+                    self.sym_mut().registers_r.set(color_idx, value);
                 } else {
                     // Stack lazy-fill: heap read at semantic index,
                     // store in both the semantic mirror (read_live) and
@@ -1340,8 +1338,8 @@ impl MIFrame {
                     if semantic_idx >= s.registers_r.len() {
                         s.registers_r.resize(semantic_idx + 1, OpRef::NONE);
                     }
-                    s.registers_r[semantic_idx] = value;
-                    s.registers_r[color_idx] = value;
+                    s.registers_r.set(semantic_idx, value);
+                    s.registers_r.set(color_idx, value);
                 }
             }
             let live_value = if live_value_pre == OpRef::NONE {
@@ -1390,7 +1388,7 @@ impl MIFrame {
             };
             let valid_len = (s.nlocals + valid_stack_only).min(source_len);
             let mut registers_i = s.registers_i.clone();
-            let mut registers_r_bank = s.registers_r.clone();
+            let mut registers_r_bank = s.registers_r.to_vec();
             let mut registers_f = s.registers_f.clone();
             for &(bank, reg_idx, value) in &bank_materializations {
                 match bank {
@@ -1430,7 +1428,7 @@ impl MIFrame {
                         .map(|idx| ctx.virtualizable_box_at(nvs + idx).unwrap_or(OpRef::NONE))
                         .collect()
                 } else {
-                    s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
+                    s.registers_r.iter().take(valid_len).collect()
                 };
             if in_a_call {
                 if let Some(result_idx) = self.pending_result_stack_idx {
@@ -1717,7 +1715,7 @@ impl MIFrame {
         if idx >= s.registers_r.len() {
             return Err(PyError::type_error("local index out of range in trace"));
         }
-        if s.registers_r[idx] == OpRef::NONE {
+        if s.registers_r.get(idx).expect("bound Ref register") == OpRef::NONE {
             if s.bridge_local_oprefs.is_some() {
                 // Bridge trace: OpRef::NONE means this local is a constant
                 // or virtual from resume data, not a missing vable slot.
@@ -1752,7 +1750,8 @@ impl MIFrame {
                 let frame_ref = s.frame;
                 let array_ref = crate::state::frame_locals_cells_stack_array(ctx, frame_ref);
                 let idx_const = ctx.const_int(idx as i64);
-                s.registers_r[idx] = trace_array_getitem_value(ctx, array_ref, idx_const);
+                s.registers_r
+                    .set(idx, trace_array_getitem_value(ctx, array_ref, idx_const));
             } else {
                 // Active vable owner whose registers_r[idx] is NONE cannot
                 // exist: init_symbolic (state.rs) seeds
@@ -1767,11 +1766,13 @@ impl MIFrame {
                 // locals_cells_stack_w array (seeded by Stage 1 at
                 // the retired inline-call path).
                 let idx_const = ctx.const_int(idx as i64);
-                s.registers_r[idx] =
-                    trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
+                s.registers_r.set(
+                    idx,
+                    trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const),
+                );
             }
         }
-        Ok(s.registers_r[idx])
+        Ok(s.registers_r.get(idx).expect("bound Ref register"))
     }
 
     #[allow(dead_code)]
@@ -2327,8 +2328,7 @@ impl MIFrame {
                     .collect();
                 (locals_vec, stack_vec)
             } else {
-                let read_color =
-                    |color: usize| s.registers_r.get(color).copied().unwrap_or(OpRef::NONE);
+                let read_color = |color: usize| s.registers_r.get(color).unwrap_or(OpRef::NONE);
                 let locals_vec: Vec<OpRef> = (0..nlocals).map(|i| read_color(i)).collect();
                 let live_stack_len = stack_only.min(target_stack_capacity);
                 let stack_vec: Vec<OpRef> = (0..live_stack_len)
@@ -2550,7 +2550,7 @@ impl MIFrame {
                     // slot regardless of whether the dedup refers to a
                     // local or a stack entry.
                     if local_idx < s.registers_r.len() {
-                        s.registers_r[local_idx] = new_opref;
+                        s.registers_r.set(local_idx, new_opref);
                     }
                 }
             }
@@ -2994,7 +2994,7 @@ impl MIFrame {
                 pre_r[..pre_r.len().min(nlocals)].to_vec()
             } else {
                 let s = self.sym();
-                s.registers_r[..s.registers_r.len().min(nlocals)].to_vec()
+                s.registers_r.iter().take(nlocals).collect()
             };
             let mut diverge = 0usize;
             for i in 0..registers_r_src.len() {
@@ -3605,9 +3605,9 @@ mod tests {
         );
 
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.bridge_local_oprefs = Some(Vec::new()); // owns via the bridge half
+        sym.bridge_local_oprefs.replace(Vec::new()); // owns via the bridge half
         sym.nlocals = 0;
-        sym.registers_r = vec![OpRef::NONE; 2]; // swap's semantic mirror needs both slots
+        sym.registers_r.replace(vec![OpRef::NONE; 2]); // swap's semantic mirror needs both slots
         assert!(sym.owns_virtualizable_shadow());
 
         let ptr = 0xdead_beef_usize as *mut pyre_object::pyobject::PyObject;
@@ -3705,7 +3705,7 @@ mod tests {
         sym.valuestackdepth = 2;
         sym.execution_context = OpRef::input_arg_ref(0);
         sym.registers_i = vec![OpRef::NONE, OpRef::NONE, int_box];
-        sym.registers_r = vec![OpRef::NONE, ref_box];
+        sym.registers_r.replace(vec![OpRef::NONE, ref_box]);
         sym.registers_f = vec![OpRef::NONE, OpRef::NONE, OpRef::NONE, float_box];
 
         let mut ctx = crate::trace_ctx_for_test(1);
@@ -3800,7 +3800,7 @@ mod tests {
         // Semantic mirror: local0 is at slot 0, while stack depth 0 is at
         // semantic slot 2. Liveness color 0 belongs to the live stack slot,
         // reusing dead local0's color.
-        sym.registers_r = vec![local0, local1, stack0];
+        sym.registers_r.replace(vec![local0, local1, stack0]);
 
         let mut ctx = crate::trace_ctx_for_test(1);
         let mut frame = MIFrame {

@@ -2235,7 +2235,7 @@ pub fn seed_compiled_trace_jitcode_test_state(
         if reg_idx >= sym.registers_r.len() {
             sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
         }
-        sym.registers_r[reg_idx] = opref;
+        sym.registers_r.set(reg_idx, opref);
     }
 
     let banks = frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, live_jit_pc);
@@ -3120,7 +3120,7 @@ pub struct PyreSym {
     /// (mapped from RebuiltValue::Box(n) in rebuild_from_resumedata) instead
     /// of the vable_array_base-based layout. This ensures bridge traces see
     /// frame locals as symbolic InputArgs, not concrete values.
-    pub(crate) bridge_local_oprefs: Option<Vec<OpRef>>,
+    pub(crate) bridge_local_oprefs: crate::jitcode_dispatch::RegisterList,
     /// Bridge-specific override for the kept operand-stack slice of
     /// registers_r ([nlocals..nlocals+stack_only], semantic-slot == color
     /// in that prefix). resume.py:1042 parity: setup_bridge_sym resolves
@@ -3129,18 +3129,7 @@ pub struct PyreSym {
     /// in pyre's bridge launcher) does not clobber the rebuilt stack tail
     /// back to NONE, and so the full-body-walk argbox seed can recover the
     /// kept conditional-expression / short-circuit value (#124).
-    pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
-    /// Reference register banks of the inline sub-walks open under this trace,
-    /// as addresses.  `inline_call.rs` builds the callee `WalkContext` over a
-    /// local `Vec<OpRef>` and calls `walk` directly, without entering
-    /// `trace_bytecode`, so a `ConstPtr` a callee fold parks there sits in a
-    /// bank that is not `registers_r` and that
-    /// `walk_active_sym_register_area` would otherwise not reach.  Pushed and
-    /// popped by `trace::InlineRegisterBankGuard` around each sub-walk, so the
-    /// list holds only banks whose owning frame is live.  Each entry is the
-    /// bank's `(address, length)`: `WalkContext` holds the bank as a slice, so
-    /// one word does not describe it.
-    pub(crate) inline_register_banks: Vec<(usize, usize)>,
+    pub(crate) bridge_stack_oprefs: crate::jitcode_dispatch::RegisterList,
     /// Kept-stack branch-guard resume coordinate for the full-body walk: the
     /// guard's OWN jitcode byte offset (`frame0.jitcode_pc`, the mid-opcode
     /// `goto_if_not`), resolved the same way the blackhole resolves its
@@ -3179,7 +3168,7 @@ pub struct PyreSym {
     /// recover an operand live across a resumed call (e.g. `t1` in
     /// `return fib(n-1)+fib(n-2)`) that the semantic mirror does not carry
     /// by color.
-    pub(crate) bridge_registers_r: Option<Vec<OpRef>>,
+    pub(crate) bridge_registers_r: crate::jitcode_dispatch::RegisterList,
     /// Bridge-specific override for symbolic_local_types.
     /// virtualizable.py:44 + interp_jit.py:25-30: locals_cells_stack_w[*]
     /// is a W_Root array → all items are Type::Ref. setup_bridge_sym
@@ -3264,7 +3253,7 @@ pub struct PyreSym {
     /// RPython MetaInterp.last_exc_value (pyjitpl.py): concrete
     /// exception object pending during tracing. Set by execute_ll_raised
     /// (raise_varargs), consumed by handle_possible_exception.
-    pub(crate) last_exc_value: pyre_object::PyObjectRef,
+    pub(crate) last_exc_value: std::rc::Rc<std::cell::Cell<pyre_object::PyObjectRef>>,
     /// RPython MetaInterp.class_of_last_exc_is_const (pyjitpl.py):
     /// True after GUARD_EXCEPTION or GUARD_CLASS on the exception.
     pub(crate) class_of_last_exc_is_const: bool,
@@ -3273,24 +3262,9 @@ pub struct PyreSym {
     /// by handle_possible_exception after GUARD_EXCEPTION, then consumed
     /// by finishframe_exception for stack push.
     pub(crate) last_exc_box: OpRef,
-    /// Maps the OpRef of a trace-built (fresh `NewWithVtable`)
-    /// exception to its trace-time concrete instance.  `RAISE_VARARGS`
-    /// reuses the instance to take the instance fast path — skip the
-    /// residual `normalize_raise_varargs_jit` publish + `GUARD_EXCEPTION`
-    /// round-trip so the exception stays virtualizable — and to apply the
-    /// unconditional `__context__ = ec.sys_exc_value` chaining that is
-    /// valid only for a freshly constructed exception (w_context still
-    /// null, self-cycle impossible).
-    ///
-    /// The entry is dropped as soon as freshness can no longer be proven:
-    /// `RAISE_VARARGS` consumes it (a re-raise of the same object must
-    /// take the residual path — its `w_context` is set by then), and
-    /// the retired Python-helper boxing path removed any value escaping into a
-    /// python-helper residual call (which may mutate the exception).
-    pub(crate) trace_built_exc: indexmap::IndexMap<OpRef, pyre_object::PyObjectRef>,
     /// Symbolic mirror of executioncontext.current_exception/sys_exc_info.
     /// Used by PUSH_EXC_INFO / POP_EXCEPT to preserve nested handler state.
-    pub(crate) current_exc_value: pyre_object::PyObjectRef,
+    pub(crate) current_exc_value: std::rc::Rc<std::cell::Cell<pyre_object::PyObjectRef>>,
     pub(crate) current_exc_box: OpRef,
     // ── RPython MIFrame.registers_{i,r,f} port (pyjitpl.py) ──
     //
@@ -3316,7 +3290,7 @@ pub struct PyreSym {
     //     color-indexed Ref-bank snapshot before reading liveness.
     pub(crate) registers_i: Vec<OpRef>,
     #[vable(locals)]
-    pub(crate) registers_r: Vec<OpRef>,
+    pub(crate) registers_r: crate::jitcode_dispatch::RegisterList,
     pub(crate) registers_f: Vec<OpRef>,
 }
 
@@ -3326,8 +3300,8 @@ pub trait WalkSym {
     fn set_execution_context(&mut self, value: OpRef);
     fn registers_i(&self) -> &[OpRef];
     fn registers_i_mut(&mut self) -> &mut Vec<OpRef>;
-    fn registers_r(&self) -> &[OpRef];
-    fn registers_r_mut(&mut self) -> &mut Vec<OpRef>;
+    fn registers_r(&self) -> &crate::jitcode_dispatch::RegisterList;
+    fn registers_r_mut(&mut self) -> &crate::jitcode_dispatch::RegisterList;
     fn registers_f(&self) -> &[OpRef];
     fn registers_f_mut(&mut self) -> &mut Vec<OpRef>;
     fn nlocals(&self) -> usize;
@@ -3341,11 +3315,11 @@ pub trait WalkSym {
     fn set_live_vable_frame_addr(&mut self, value: usize);
     fn bridge_walk_entry_pc(&self) -> Option<usize>;
     fn bridge_walk_entry_jitcode_index(&self) -> i32;
-    fn bridge_registers_r(&self) -> Option<&Vec<OpRef>>;
-    fn bridge_registers_r_mut(&mut self) -> &mut Option<Vec<OpRef>>;
-    fn bridge_stack_oprefs(&self) -> Option<&Vec<OpRef>>;
-    fn bridge_stack_oprefs_mut(&mut self) -> &mut Option<Vec<OpRef>>;
-    fn bridge_local_oprefs_mut(&mut self) -> &mut Option<Vec<OpRef>>;
+    fn bridge_registers_r(&self) -> Option<&crate::jitcode_dispatch::RegisterList>;
+    fn bridge_registers_r_mut(&mut self) -> &crate::jitcode_dispatch::RegisterList;
+    fn bridge_stack_oprefs(&self) -> Option<&crate::jitcode_dispatch::RegisterList>;
+    fn bridge_stack_oprefs_mut(&mut self) -> &crate::jitcode_dispatch::RegisterList;
+    fn bridge_local_oprefs_mut(&mut self) -> &crate::jitcode_dispatch::RegisterList;
     fn vable_array_base(&self) -> Option<u32>;
     fn vable_last_instr(&self) -> OpRef;
     fn vable_valuestackdepth(&self) -> OpRef;
@@ -3358,15 +3332,10 @@ pub trait WalkSym {
     fn set_class_of_last_exc_is_const(&mut self, value: bool);
     fn set_current_exc_value(&mut self, value: pyre_object::PyObjectRef);
     fn set_current_exc_box(&mut self, value: OpRef);
-    fn trace_built_exc(&self) -> &indexmap::IndexMap<OpRef, pyre_object::PyObjectRef>;
-    fn trace_built_exc_mut(&mut self) -> &mut indexmap::IndexMap<OpRef, pyre_object::PyObjectRef>;
     fn owns_virtualizable_shadow(&self) -> bool;
-    /// The trace-time exception-carrier anchor to publish for GC rooting, or
-    /// `None` for syms holding no such carriers (novable drivers). Only
-    /// `PyreSym` carries `last_exc_value` / `current_exc_value` /
-    /// `trace_built_exc`, which a mid-trace collection reaches through
-    /// [`crate::trace::walk_active_sym_exc_roots`].
-    fn active_exc_anchor(&mut self) -> Option<*mut PyreSym> {
+    /// Publish independently owned tracing roots for the duration of this
+    /// attempt, as translated roots keep the MIFrame and its lists alive.
+    fn enter_trace_roots(&self) -> Option<crate::trace::TraceRoots> {
         None
     }
     fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize);
@@ -3409,13 +3378,13 @@ impl WalkSym for PyreSym {
     }
 
     #[inline]
-    fn registers_r(&self) -> &[OpRef] {
+    fn registers_r(&self) -> &crate::jitcode_dispatch::RegisterList {
         &self.registers_r
     }
 
     #[inline]
-    fn registers_r_mut(&mut self) -> &mut Vec<OpRef> {
-        &mut self.registers_r
+    fn registers_r_mut(&mut self) -> &crate::jitcode_dispatch::RegisterList {
+        &self.registers_r
     }
 
     #[inline]
@@ -3479,27 +3448,27 @@ impl WalkSym for PyreSym {
     }
 
     #[inline]
-    fn bridge_registers_r(&self) -> Option<&Vec<OpRef>> {
+    fn bridge_registers_r(&self) -> Option<&crate::jitcode_dispatch::RegisterList> {
         self.bridge_registers_r.as_ref()
     }
 
     #[inline]
-    fn bridge_registers_r_mut(&mut self) -> &mut Option<Vec<OpRef>> {
+    fn bridge_registers_r_mut(&mut self) -> &crate::jitcode_dispatch::RegisterList {
         &mut self.bridge_registers_r
     }
 
     #[inline]
-    fn bridge_stack_oprefs(&self) -> Option<&Vec<OpRef>> {
+    fn bridge_stack_oprefs(&self) -> Option<&crate::jitcode_dispatch::RegisterList> {
         self.bridge_stack_oprefs.as_ref()
     }
 
     #[inline]
-    fn bridge_stack_oprefs_mut(&mut self) -> &mut Option<Vec<OpRef>> {
+    fn bridge_stack_oprefs_mut(&mut self) -> &crate::jitcode_dispatch::RegisterList {
         &mut self.bridge_stack_oprefs
     }
 
     #[inline]
-    fn bridge_local_oprefs_mut(&mut self) -> &mut Option<Vec<OpRef>> {
+    fn bridge_local_oprefs_mut(&mut self) -> &crate::jitcode_dispatch::RegisterList {
         &mut self.bridge_local_oprefs
     }
 
@@ -3525,12 +3494,12 @@ impl WalkSym for PyreSym {
 
     #[inline]
     fn last_exc_value(&self) -> pyre_object::PyObjectRef {
-        self.last_exc_value
+        self.last_exc_value.get()
     }
 
     #[inline]
     fn set_last_exc_value(&mut self, value: pyre_object::PyObjectRef) {
-        self.last_exc_value = value;
+        self.last_exc_value.set(value);
     }
 
     #[inline]
@@ -3555,7 +3524,7 @@ impl WalkSym for PyreSym {
 
     #[inline]
     fn set_current_exc_value(&mut self, value: pyre_object::PyObjectRef) {
-        self.current_exc_value = value;
+        self.current_exc_value.set(value);
     }
 
     #[inline]
@@ -3564,23 +3533,13 @@ impl WalkSym for PyreSym {
     }
 
     #[inline]
-    fn trace_built_exc(&self) -> &indexmap::IndexMap<OpRef, pyre_object::PyObjectRef> {
-        &self.trace_built_exc
-    }
-
-    #[inline]
-    fn trace_built_exc_mut(&mut self) -> &mut indexmap::IndexMap<OpRef, pyre_object::PyObjectRef> {
-        &mut self.trace_built_exc
-    }
-
-    #[inline]
     fn owns_virtualizable_shadow(&self) -> bool {
         PyreSym::owns_virtualizable_shadow(self)
     }
 
     #[inline]
-    fn active_exc_anchor(&mut self) -> Option<*mut PyreSym> {
-        Some(self as *mut PyreSym)
+    fn enter_trace_roots(&self) -> Option<crate::trace::TraceRoots> {
+        Some(crate::trace::TraceRoots::enter(self))
     }
 
     #[inline]
@@ -6800,8 +6759,42 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
 ///        `resume.rs::ResumeDataLoopMemo`'s `large_ints` / `refs`
 ///        memo separately dedups constants when assigning
 ///        resume numbering tags.
-fn copy_constants<F>(registers: &mut Vec<OpRef>, constants: &[i64], targetindex: usize, mut mint: F)
-where
+trait ConstantRegisters {
+    fn len(&self) -> usize;
+    fn resize(&mut self, len: usize, value: OpRef);
+    fn set(&mut self, index: usize, value: OpRef);
+}
+
+impl ConstantRegisters for Vec<OpRef> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn resize(&mut self, len: usize, value: OpRef) {
+        Vec::resize(self, len, value);
+    }
+    fn set(&mut self, index: usize, value: OpRef) {
+        self[index] = value;
+    }
+}
+
+impl ConstantRegisters for crate::jitcode_dispatch::RegisterList {
+    fn len(&self) -> usize {
+        Self::len(self)
+    }
+    fn resize(&mut self, len: usize, value: OpRef) {
+        Self::resize(self, len, value);
+    }
+    fn set(&mut self, index: usize, value: OpRef) {
+        Self::set(self, index, value);
+    }
+}
+
+fn copy_constants<F>(
+    registers: &mut impl ConstantRegisters,
+    constants: &[i64],
+    targetindex: usize,
+    mut mint: F,
+) where
     F: FnMut(i64) -> OpRef,
 {
     let num_regs_and_consts = targetindex + constants.len();
@@ -6809,7 +6802,7 @@ where
         registers.resize(num_regs_and_consts, OpRef::NONE);
     }
     for (i, &val) in constants.iter().enumerate() {
-        registers[targetindex + i] = mint(val);
+        registers.set(targetindex + i, mint(val));
     }
 }
 
@@ -6824,12 +6817,11 @@ impl PyreSym {
             locals_cells_stack_array_ref: OpRef::NONE,
             valuestackdepth: 0,
             nlocals: 0,
-            bridge_local_oprefs: None,
-            bridge_stack_oprefs: None,
-            inline_register_banks: Vec::new(),
+            bridge_local_oprefs: Default::default(),
+            bridge_stack_oprefs: Default::default(),
             bridge_walk_entry_pc: None,
             bridge_walk_entry_jitcode_index: -1,
-            bridge_registers_r: None,
+            bridge_registers_r: Default::default(),
             bridge_local_types: None,
             vable_last_instr: OpRef::NONE,
             vable_pycode: OpRef::NONE,
@@ -6847,11 +6839,12 @@ impl PyreSym {
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
             live_vable_frame_addr: 0,
-            last_exc_value: std::ptr::null_mut(),
+            last_exc_value: Default::default(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
-            trace_built_exc: indexmap::IndexMap::new(),
-            current_exc_value: pyre_interpreter::eval::get_current_exception(),
+            current_exc_value: std::rc::Rc::new(std::cell::Cell::new(
+                pyre_interpreter::eval::get_current_exception(),
+            )),
             current_exc_box: OpRef::NONE,
             // RPython pyjitpl.py:74-78 init: registers_X[i] = CONST_NULL for
             // i in num_regs. Sized lazily here — `setup_kind_register_banks`
@@ -6860,7 +6853,7 @@ impl PyreSym {
             // semantic-slot logic; the encoder is not yet rewired to
             // per-bank reads for `registers_r`.
             registers_i: Vec::new(),
-            registers_r: Vec::new(),
+            registers_r: Default::default(),
             registers_f: Vec::new(),
         }
     }
@@ -7020,7 +7013,7 @@ impl PyreSym {
         sym.locals_cells_stack_array_ref = state.locals_cells_stack_array_ref;
         sym.symbolic_local_types = state.symbolic_local_types;
         sym.symbolic_stack_types = state.symbolic_stack_types;
-        sym.registers_r = state.registers_r;
+        sym.registers_r.replace(state.registers_r);
         sym.concrete_stack = state.concrete_stack;
         sym.concrete_namespace = state.concrete_namespace;
         sym.vable_last_instr = state.vable_last_instr;
@@ -7077,19 +7070,21 @@ impl PyreSym {
         // of registers_r. The bridge override / vable inputarg / NONE
         // shape is the per-trace seed; subsequent load_local_value /
         // store_local_value updates the per-color slot directly.
-        self.registers_r = if let Some(ref overrides) = self.bridge_local_oprefs {
-            // resume.py:1042 parity: bridge trace uses OpRefs derived from
-            // rebuild_from_resumedata (Box(n) → bridge InputArg OpRef::from_raw(n)).
-            let mut locals = overrides.clone();
-            locals.resize(nlocals, OpRef::NONE);
-            locals
-        } else if let Some(base) = self.vable_array_base {
-            (0..nlocals)
-                .map(|i| OpRef::input_arg_ref(base + i as u32))
-                .collect()
-        } else {
-            vec![OpRef::NONE; nlocals]
-        };
+        self.registers_r.replace(
+            if let Some(ref overrides) = self.bridge_local_oprefs.as_ref() {
+                // resume.py:1042 parity: bridge trace uses OpRefs derived from
+                // rebuild_from_resumedata (Box(n) → bridge InputArg OpRef::from_raw(n)).
+                let mut locals = overrides.to_vec();
+                locals.resize(nlocals, OpRef::NONE);
+                locals
+            } else if let Some(base) = self.vable_array_base {
+                (0..nlocals)
+                    .map(|i| OpRef::input_arg_ref(base + i as u32))
+                    .collect()
+            } else {
+                vec![OpRef::NONE; nlocals]
+            },
+        );
         // RPython resume.py:1042 parity: bridge traces enter with the
         // failing guard's saved boxes, NOT with the loop's full
         // virtualizable inputarg layout. Each `bridge_local_oprefs[i]`
@@ -7101,7 +7096,7 @@ impl PyreSym {
         //
         // Loop / function-entry traces still use vable_array_base because
         // their inputarg list is the full vable layout.
-        let inputarg_slot_types = if let Some(ref overrides) = self.bridge_local_oprefs {
+        let inputarg_slot_types = if let Some(ref overrides) = self.bridge_local_oprefs.as_ref() {
             let inputarg_types = ctx.inputarg_types();
             let locals: Vec<Type> = (0..nlocals)
                 .map(|i| {
@@ -7177,14 +7172,14 @@ impl PyreSym {
             (0..stack_only_depth)
                 .map(|i| OpRef::input_arg_ref(stack_base + i as u32))
                 .collect()
-        } else if let Some(ref bridge_stack) = self.bridge_stack_oprefs {
+        } else if let Some(ref bridge_stack) = self.bridge_stack_oprefs.as_ref() {
             // #124: a bridge resumes from a guard whose live operand stack
             // setup_bridge_sym already resolved into these OpRefs. The local
             // override (above) plus the comment at the bridge_local_oprefs
             // branch assume setup_bridge_sym overwrites the rebuilt tail,
             // but pyre's launcher runs setup_bridge_sym BEFORE this; so
             // preserve the kept temps here rather than reset them to NONE.
-            let mut seed = bridge_stack.clone();
+            let mut seed = bridge_stack.to_vec();
             seed.resize(stack_only_depth, OpRef::NONE);
             seed
         } else {
@@ -9140,7 +9135,8 @@ fn prepare_bridge_pending_fields(
                 continue;
             };
             sym.last_exc_box = value_box;
-            sym.last_exc_value = value_ref.as_usize() as pyre_object::PyObjectRef;
+            sym.last_exc_value
+                .set(value_ref.as_usize() as pyre_object::PyObjectRef);
             sym.class_of_last_exc_is_const = false;
         } else {
             // resume.py `_prepare_pendingfields`: replay ordinary
@@ -10225,16 +10221,16 @@ fn seed_bridge_standing_exception_from_current(
         return;
     }
 
-    let mut exc = sym.current_exc_value;
+    let mut exc = sym.current_exc_value.get();
     let exc_box = sym.current_exc_box;
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         let current = pyre_interpreter::eval::get_current_exception();
         if !current.is_null() && unsafe { pyre_object::is_exception(current) } {
             exc = current;
         } else {
-            sym.current_exc_value = std::ptr::null_mut();
+            sym.current_exc_value.set(std::ptr::null_mut());
             sym.current_exc_box = OpRef::NONE;
-            sym.last_exc_value = std::ptr::null_mut();
+            sym.last_exc_value.set(std::ptr::null_mut());
             sym.last_exc_box = OpRef::NONE;
             sym.class_of_last_exc_is_const = false;
             return;
@@ -10246,9 +10242,9 @@ fn seed_bridge_standing_exception_from_current(
     } else {
         exc_box
     };
-    sym.current_exc_value = exc;
+    sym.current_exc_value.set(exc);
     sym.current_exc_box = exc_box;
-    sym.last_exc_value = exc;
+    sym.last_exc_value.set(exc);
     sym.last_exc_box = exc_box;
     sym.class_of_last_exc_is_const = true;
 }
@@ -11263,7 +11259,7 @@ impl JitState for PyreJitState {
             }
         }
         seed_bridge_standing_exception_from_current(sym, ctx);
-        sym.registers_r = semantic_mirror;
+        sym.registers_r.replace(semantic_mirror);
         sym.symbolic_local_types = {
             let mut types = bridge_local_types.clone();
             types.resize(sym.nlocals, Type::Ref);
@@ -11393,7 +11389,7 @@ impl JitState for PyreJitState {
                 let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
                 bridge_array_items.resize(semantic_array_len, null_ref);
             }
-            for (slot, &opref) in sym
+            for (slot, opref) in sym
                 .registers_r
                 .iter()
                 .take(semantic_array_len)
@@ -11453,7 +11449,7 @@ impl JitState for PyreJitState {
         // subsequent LOAD_FAST / close_loop_args_at calls.
         sym.symbolic_stack_types = vec![Type::Ref; stack_only];
         sym.valuestackdepth = bridge_valuestackdepth;
-        sym.bridge_local_oprefs = Some(bridge_locals);
+        sym.bridge_local_oprefs.replace(bridge_locals);
         // #124: preserve the resolved kept operand-stack temps. `bridge_stack`
         // is the stack tail of the slot-indexed `semantic_mirror` (computed
         // above by inverting each live color to its slot), so it is correct
@@ -11462,7 +11458,7 @@ impl JitState for PyreJitState {
         // and would otherwise reset this tail to NONE; keeping it lets both the
         // rebuilt registers_r and the full-body-walk argbox seed recover the
         // kept conditional-expression / short-circuit value.
-        sym.bridge_stack_oprefs = Some(bridge_stack);
+        sym.bridge_stack_oprefs.replace(bridge_stack);
         // Kept-stack branch guards resume the full-body walk at the guard's OWN
         // mid-opcode jitcode offset — the same resolved coordinate stored in
         // the frame pc — instead of the opcode-entry marker for `py_pc`.
@@ -11478,7 +11474,7 @@ impl JitState for PyreJitState {
         // (`_get_list_of_active_boxes`, pyjitpl.py:216-233). `sym.registers_r`
         // is about to be overwritten with the slot-indexed semantic mirror and
         // then rebuilt by init_symbolic, losing this color decode.
-        sym.bridge_registers_r = Some(bridge_registers_r.clone());
+        sym.bridge_registers_r.replace(bridge_registers_r.clone());
 
         // pyjitpl.py `rebuild_state_after_failure` tail —
         // `consume_virtualref_boxes` (resume.py):
@@ -13649,6 +13645,28 @@ mod tests {
     }
 
     #[test]
+    fn collect_jump_args_rejects_locals_beyond_register_storage() {
+        let mut ctx = crate::trace_ctx_for_test(0);
+        let mut sym = PyreSym::new_uninit(ctx.const_ref(0));
+        sym.nlocals = 1;
+        sym.valuestackdepth = 1;
+        // Value-only iteration must retain the old slice's bounds check,
+        // including when the stack window itself is empty.
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sym.vable_collect_jump_args()
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sym.vable_collect_typed_jump_args()
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_pypyjit_collect_jump_args_inserts_ec_after_frame() {
         let mut ctx = crate::trace_ctx_for_test(0);
         let frame_ref = ctx.const_ref(0x1000);
@@ -13668,7 +13686,7 @@ mod tests {
         sym.vable_debugdata = ctx.const_ref(0);
         sym.frame_w_globals = namespace_ref;
         sym.execution_context = ec_ref;
-        sym.registers_r = vec![local0, stack0, stack1];
+        sym.registers_r.replace(vec![local0, stack0, stack1]);
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
 
@@ -13699,7 +13717,7 @@ mod tests {
 
         let mut sym = PyreSym::new_uninit(frame_ref);
         sym.execution_context = ec_ref;
-        sym.registers_r = vec![stale_local];
+        sym.registers_r.replace(vec![stale_local]);
 
         // TraceCtx::collect_virtualizable_typed_boxes order:
         // static fields, array items, trailing standard-vable identity.
@@ -13832,7 +13850,7 @@ mod tests {
         // registers_r[i] tracks locals_cells_stack_w[*] — W_Root array, Type::Ref.
         let obj = OpRef::input_arg_ref(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![obj];
+        sym.registers_r.replace(vec![obj]);
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
 
@@ -13873,7 +13891,7 @@ mod tests {
         // value_type is Ref per the comment above; registers_r[0] = inputarg slot 0.
         let int_obj = OpRef::input_arg_ref(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
-        sym.registers_r = vec![int_obj];
+        sym.registers_r.replace(vec![int_obj]);
         sym.symbolic_local_types = vec![Type::Ref];
         sym.nlocals = 1;
 
@@ -14298,7 +14316,11 @@ mod tests {
             assert_eq!(sym.registers_i[i], OpRef::NONE, "registers_i[{i}] reg-slot");
         }
         for i in 0..4 {
-            assert_eq!(sym.registers_r[i], OpRef::NONE, "registers_r[{i}] reg-slot");
+            assert_eq!(
+                sym.registers_r.get(i).expect("bound Ref register"),
+                OpRef::NONE,
+                "registers_r[{i}] reg-slot"
+            );
         }
         for i in 0..2 {
             assert_eq!(sym.registers_f[i], OpRef::NONE, "registers_f[{i}] reg-slot");
@@ -14314,7 +14336,7 @@ mod tests {
                 .expect("constants pool resolves trailing int slot");
             assert_eq!(val, majit_ir::Value::Int(100 + 100 * i as i64));
         }
-        let op_r = sym.registers_r[4];
+        let op_r = sym.registers_r.get(4).expect("bound Ref register");
         assert_ne!(op_r, OpRef::NONE);
         assert!(matches!(
             ctx.constants_get_value(op_r),
@@ -14337,7 +14359,7 @@ mod tests {
             .constants_get_value(sym.registers_i[3])
             .expect("first-call trailing int slot resolves to a constant");
         let trailing_r_value_before = ctx
-            .constants_get_value(sym.registers_r[4])
+            .constants_get_value(sym.registers_r.get(4).expect("bound Ref register"))
             .expect("first-call trailing ref slot resolves to a constant");
         let trailing_f_value_before = ctx
             .constants_get_value(sym.registers_f[2])
@@ -14351,7 +14373,7 @@ mod tests {
             Some(trailing_i_value_before),
         );
         assert_eq!(
-            ctx.constants_get_value(sym.registers_r[4]),
+            ctx.constants_get_value(sym.registers_r.get(4).expect("bound Ref register")),
             Some(trailing_r_value_before),
         );
         assert_eq!(
@@ -14575,7 +14597,7 @@ mod tests {
         // must match so variant-aware Eq lines up with the resolved
         // bridge inputarg list.
         assert_eq!(
-            sym.registers_r,
+            sym.registers_r.to_vec(),
             vec![
                 OpRef::input_arg_ref(6),
                 OpRef::input_arg_ref(7),
@@ -14586,7 +14608,7 @@ mod tests {
         assert_eq!(sym.symbolic_stack_types, vec![Type::Ref]);
         assert_eq!(sym.execution_context, OpRef::input_arg_ref(1));
         assert_eq!(
-            sym.bridge_local_oprefs,
+            sym.bridge_local_oprefs.as_ref().map(|regs| regs.to_vec()),
             Some(vec![OpRef::input_arg_ref(6), OpRef::input_arg_ref(7)])
         );
         assert_eq!(
@@ -14690,11 +14712,11 @@ mod tests {
         // local0 / stack0 / stack1 are Ref-typed per `symbolic_local_types`
         // / `symbolic_stack_types` below — the macro mints the matching
         // `InputArgRef` variant.
-        sym.registers_r = vec![
+        sym.registers_r.replace(vec![
             OpRef::input_arg_ref(6),
             OpRef::input_arg_ref(7),
             OpRef::input_arg_ref(8),
-        ];
+        ]);
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
         sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
@@ -14790,7 +14812,7 @@ mod tests {
         sym.vable_valuestackdepth = OpRef::input_arg_int(4);
         sym.vable_debugdata = OpRef::input_arg_ref(5);
         sym.frame_w_globals = ctx.const_ref(frame.get_w_globals() as usize as i64);
-        sym.registers_r = vec![OpRef::input_arg_ref(6)];
+        sym.registers_r.replace(vec![OpRef::input_arg_ref(6)]);
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = Vec::new();
         sym.concrete_vable_ptr = frame_ptr as *mut u8;
@@ -15078,7 +15100,7 @@ pub(crate) fn assemble_bridge_inline_pending(
     // The Ref bank IS the unified locals+stack register file decoded by
     // `reconstruct_inline_recipe`; int/float banks are empty (gated out).
     sym.registers_i = recipe.registers_i.clone();
-    sym.registers_r = recipe.registers_r.clone();
+    sym.registers_r.replace(recipe.registers_r.clone());
     sym.registers_f = recipe.registers_f.clone();
     // locals_cells_stack_w is a W_Root array — every live slot is Ref.
     sym.symbolic_local_types = vec![Type::Ref; nlocals];

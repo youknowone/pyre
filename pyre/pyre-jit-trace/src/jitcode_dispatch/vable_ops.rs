@@ -14,12 +14,11 @@ use super::*;
 /// walker frame. Resume snapshots (`InlineParentFrame.boxes`) are rewritten
 /// immediately, as `replace_box` walks `framestack`.
 ///
-/// Bound register banks are rewritten in place the same way
-/// `MIFrame.replace_active_box_in_frame` writes `registers_{i,r,f}`. The
-/// owner captures those slice pointers while it still holds the banks;
-/// a paused caller is not borrowed through `TraceCtx`. Walker-only extras
-/// (vstack, callee shadow) stay queued and `apply` before the owner
-/// executes again.
+/// All register banks share the frame's owned slots, so replacement follows
+/// `MIFrame.replace_active_box_in_frame` without a retained mutable slice or
+/// delayed replay. Ref-bank GC registration retains the same shared storage.
+/// Walker-only extras (vstack, callee shadow) remain
+/// queued and `apply` before the owner executes again.
 ///
 /// Delivery of the extras must precede the caller continuation, not the
 /// next opcode: trace rollback can reuse an OpRef id, and a later
@@ -33,43 +32,12 @@ use super::*;
 /// (#1731).
 pub(super) struct FrameBoxReplacements(std::rc::Rc<FrameBoxReplacementInbox>);
 
-#[derive(Clone, Copy)]
-struct BoundBank {
-    ptr: *mut OpRef,
-    len: usize,
-}
-
 pub(crate) struct FrameBoxReplacementInbox {
     pending: std::cell::RefCell<Vec<(OpRef, OpRef)>>,
     listening: std::cell::Cell<bool>,
-    banks_r: std::cell::Cell<BoundBank>,
-    banks_i: std::cell::Cell<BoundBank>,
-    banks_f: std::cell::Cell<BoundBank>,
-}
-
-impl BoundBank {
-    const EMPTY: Self = Self {
-        ptr: std::ptr::null_mut(),
-        len: 0,
-    };
-
-    fn from_slice(slots: &mut [OpRef]) -> Self {
-        Self {
-            ptr: slots.as_mut_ptr(),
-            len: slots.len(),
-        }
-    }
-
-    unsafe fn as_mut_slice(&self) -> Option<&mut [OpRef]> {
-        if self.ptr.is_null() || self.len == 0 {
-            None
-        } else {
-            // The owning walk frame captured this slice and is still
-            // listening, so the allocation is live and not reborrowed
-            // through a WalkContext.
-            Some(unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) })
-        }
-    }
+    banks_r: std::cell::RefCell<Option<RegisterBank>>,
+    banks_i: std::cell::RefCell<Option<RegisterBank>>,
+    banks_f: std::cell::RefCell<Option<RegisterBank>>,
 }
 
 impl FrameBoxReplacements {
@@ -77,9 +45,9 @@ impl FrameBoxReplacements {
         let pending = std::rc::Rc::new(FrameBoxReplacementInbox {
             pending: std::cell::RefCell::new(Vec::new()),
             listening: std::cell::Cell::new(true),
-            banks_r: std::cell::Cell::new(BoundBank::EMPTY),
-            banks_i: std::cell::Cell::new(BoundBank::EMPTY),
-            banks_f: std::cell::Cell::new(BoundBank::EMPTY),
+            banks_r: std::cell::RefCell::new(None),
+            banks_i: std::cell::RefCell::new(None),
+            banks_f: std::cell::RefCell::new(None),
         });
         let mut session = session.borrow_mut();
         session
@@ -91,17 +59,16 @@ impl FrameBoxReplacements {
         Self(pending)
     }
 
-    /// Capture the owner's register banks so `replace_box` can write them
-    /// without waiting for `apply`. The slices must stay allocated for as
-    /// long as this owner is listening.
-    pub(super) fn bind_banks(&self, r: &mut [OpRef], i: &mut [OpRef], f: &mut [OpRef]) {
-        self.0.banks_r.set(BoundBank::from_slice(r));
-        self.0.banks_i.set(BoundBank::from_slice(i));
-        self.0.banks_f.set(BoundBank::from_slice(f));
+    /// Share each frame-owned list; no captured mutable slice outlives a borrow.
+    pub(super) fn bind_banks(&self, r: &RegisterBank, i: &RegisterBank, f: &RegisterBank) {
+        *self.0.banks_r.borrow_mut() = Some(r.clone());
+        *self.0.banks_i.borrow_mut() = Some(i.clone());
+        *self.0.banks_f.borrow_mut() = Some(f.clone());
     }
 
     pub(super) fn apply<Sym: WalkSym>(&self, ctx: &mut WalkContext<'_, '_, Sym>) {
         for (oldbox, newbox) in self.0.pending.borrow_mut().drain(..) {
+            // Owned slots were updated at replace_box, not on resume.
             replace_box_in_walk_frame(ctx, oldbox, newbox);
         }
     }
@@ -124,9 +91,6 @@ fn replace_box_in_walk_frame<Sym: WalkSym>(
     oldbox: OpRef,
     newbox: OpRef,
 ) {
-    replace_slots(ctx.registers_r, oldbox, newbox);
-    replace_slots(ctx.registers_i, oldbox, newbox);
-    replace_slots(ctx.registers_f, oldbox, newbox);
     replace_slots(&mut ctx.outer_active_boxes, oldbox, newbox);
     replace_slots(&mut ctx.vstack_boxes, oldbox, newbox);
     replace_slots(
@@ -149,14 +113,14 @@ fn replace_box_in_walk_frame<Sym: WalkSym>(
 }
 
 fn replace_bound_banks(frame: &FrameBoxReplacementInbox, oldbox: OpRef, newbox: OpRef) {
-    for bank in [
-        frame.banks_r.get(),
-        frame.banks_i.get(),
-        frame.banks_f.get(),
-    ] {
-        if let Some(slots) = unsafe { bank.as_mut_slice() } {
-            replace_slots(slots, oldbox, newbox);
-        }
+    if let Some(bank) = frame.banks_r.borrow().as_ref() {
+        bank.replace_active_box(oldbox, newbox);
+    }
+    if let Some(bank) = frame.banks_i.borrow().as_ref() {
+        bank.replace_active_box(oldbox, newbox);
+    }
+    if let Some(bank) = frame.banks_f.borrow().as_ref() {
+        bank.replace_active_box(oldbox, newbox);
     }
 }
 
@@ -205,6 +169,9 @@ pub(super) fn apply_pending_vable_box_replace<Sym: WalkSym>(ctx: &mut WalkContex
         return;
     };
     replace_box_in_paused_frames(&mut ctx.session.borrow_mut(), oldbox, newbox);
+    ctx.registers_r.replace_active_box(oldbox, newbox);
+    ctx.registers_i.replace_active_box(oldbox, newbox);
+    ctx.registers_f.replace_active_box(oldbox, newbox);
     replace_box_in_walk_frame(ctx, oldbox, newbox);
 }
 
@@ -220,6 +187,18 @@ mod frame_replacement_tests {
         let session = std::cell::RefCell::new(WalkSession::default());
         let parent = FrameBoxReplacements::new(&session);
         let suspended = FrameBoxReplacements::new(&session);
+        let parent_regs = RegisterBank::new([old]);
+        let suspended_regs = RegisterBank::new([old]);
+        parent.bind_banks(
+            &parent_regs,
+            &RegisterBank::default(),
+            &RegisterBank::default(),
+        );
+        suspended.bind_banks(
+            &suspended_regs,
+            &RegisterBank::default(),
+            &RegisterBank::default(),
+        );
         let active = FrameBoxReplacements::new(&session);
         active.set_listening(false);
         session.borrow_mut().framestack.push(InlineFrame {
@@ -240,6 +219,8 @@ mod frame_replacement_tests {
         });
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, middle);
         replace_box_in_paused_frames(&mut session.borrow_mut(), middle, standard);
+        assert_eq!(parent_regs.get(0), Some(standard));
+        assert_eq!(suspended_regs.get(0), Some(standard));
         // The active frame is rewritten directly, never on a later replay
         // where the trace could have reused one of these operation ids.
         assert!(active.0.pending.borrow().is_empty());
@@ -250,9 +231,8 @@ mod frame_replacement_tests {
             vec![standard]
         );
         // Consuming one frame's mailbox must not consume another's.
-        for owner in [parent, suspended] {
+        for (owner, regs) in [(parent, parent_regs), (suspended, suspended_regs)] {
             let mut trace = TraceCtx::for_test_types(&[Type::Ref; 3]);
-            let mut regs = vec![old];
             let mut ints = Vec::new();
             let mut floats = Vec::new();
             let mut concrete_r = Vec::new();
@@ -266,9 +246,9 @@ mod frame_replacement_tests {
                 inline_poison_pcs: None,
                 fbw_mode: FbwWalkMode::<crate::state::PyreSym>::default(),
                 session: &session,
-                registers_r: &mut regs,
-                registers_i: &mut ints,
-                registers_f: &mut floats,
+                registers_r: &regs,
+                registers_i: &RegisterBank::new(ints.iter().copied()),
+                registers_f: &RegisterBank::new(floats.iter().copied()),
                 concrete_registers_r: &mut concrete_r,
                 concrete_registers_i: &mut concrete_i,
                 descr_refs: &[],
@@ -294,7 +274,7 @@ mod frame_replacement_tests {
                 live_after_jit_pc: usize::MAX,
             };
             owner.apply(&mut ctx);
-            assert_eq!(ctx.registers_r, &[standard]);
+            assert_eq!(ctx.registers_r.to_vec(), vec![standard]);
             assert_eq!(ctx.outer_active_boxes, vec![standard]);
             assert_eq!(ctx.vstack_boxes, vec![standard]);
             assert_eq!(ctx.callee_shadow.as_ref().unwrap().frame_box, standard);
@@ -304,7 +284,7 @@ mod frame_replacement_tests {
             // bytecode arms. An alias promoted there must rewrite registers
             // before the next writer can replace the single pending slot.
             owner.set_listening(false);
-            ctx.registers_r[0] = old;
+            ctx.registers_r.set(0, old);
             ctx.vstack_boxes[0] = old;
             let mut info =
                 majit_metainterp::virtualizable::VirtualizableInfo::without_vable_token();
@@ -337,7 +317,7 @@ mod frame_replacement_tests {
             )
             .unwrap();
             assert!(ctx.trace_ctx.num_guards() > guards_before);
-            assert_eq!(ctx.registers_r, &[standard]);
+            assert_eq!(ctx.registers_r.to_vec(), vec![standard]);
             assert_eq!(ctx.vstack_boxes, vec![standard]);
             assert!(ctx.trace_ctx.take_pending_box_replace().is_none());
         }
@@ -352,12 +332,34 @@ mod frame_replacement_tests {
         let standard = OpRef::input_arg_ref(1);
         let session = std::cell::RefCell::new(WalkSession::default());
         let parent = FrameBoxReplacements::new(&session);
-        let mut regs = vec![old];
-        let mut ints = Vec::new();
-        let mut floats = Vec::new();
-        parent.bind_banks(&mut regs, &mut ints, &mut floats);
+        let regs = RegisterBank::new([old]);
+        let ints = RegisterBank::default();
+        let floats = RegisterBank::default();
+        parent.bind_banks(&regs, &ints, &floats);
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, standard);
-        assert_eq!(regs, vec![standard]);
+        assert_eq!(regs.to_vec(), vec![standard]);
+    }
+
+    #[test]
+    fn paused_float_bank_keeps_ownership_across_active_writes() {
+        let old = OpRef::input_arg_float(0);
+        let new = OpRef::input_arg_float(1);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let parent = FrameBoxReplacements::new(&session);
+        let bank = RegisterBank::new([old]);
+        parent.bind_banks(&RegisterBank::default(), &RegisterBank::default(), &bank);
+        parent.set_listening(false);
+        bank.set(0, new);
+        parent.set_listening(true);
+        replace_box_in_paused_frames(&mut session.borrow_mut(), new, old);
+        assert_eq!(bank.get(0), Some(old));
+        drop(bank);
+        // Registration owns the storage, not a pointer into the dropped owner.
+        replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
+        assert_eq!(
+            parent.0.banks_f.borrow().as_ref().unwrap().get(0),
+            Some(new)
+        );
     }
 }
 
@@ -591,16 +593,16 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
         }
         'f' => {
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc: op.pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = result;
+            ctx.registers_f.set(dst, result);
         }
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     }
@@ -843,11 +845,7 @@ fn walker_promote_vable_array_index<Sym: WalkSym>(
         .record_guard(OpCode::GuardValue, &[index, expected], 0);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
     ctx.trace_ctx.replace_box(index, expected);
-    for slot in ctx.registers_i.iter_mut() {
-        if *slot == index {
-            *slot = expected;
-        }
-    }
+    ctx.registers_i.replace_active_box(index, expected);
     Ok(expected)
 }
 
@@ -892,15 +890,16 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
                     'r' => write_ref_reg(ctx, op.pc, dst, result, concrete)?,
                     'f' => {
                         let len = ctx.registers_f.len();
-                        let slot_ref = ctx.registers_f.get_mut(dst).ok_or(
-                            DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "f",
-                            },
-                        )?;
-                        *slot_ref = result;
+                        let _ =
+                            ctx.registers_f
+                                .get(dst)
+                                .ok_or(DispatchError::RegisterOutOfRange {
+                                    pc: op.pc,
+                                    reg: dst,
+                                    len,
+                                    bank: "f",
+                                })?;
+                        ctx.registers_f.set(dst, result);
                     }
                     _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
                 }
@@ -1033,16 +1032,16 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
         'r' => write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
         'f' => {
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc: op.pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = result;
+            ctx.registers_f.set(dst, result);
         }
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     }
