@@ -410,14 +410,14 @@ fn normalize_function_filter(function_names: &[&str]) -> Option<std::collections
 /// produces a [`LowerError`] that is captured per-function: whether it is
 /// a recognised, tracked gap (an uninitialised-local read that survives
 /// even the reverse-postorder re-lower) or any other unrecognised failure,
-/// the function degrades the program by dropping that one function to a
-/// residual call — never a correctness loss.  This mirrors
-/// `exceptiontransform.py` `transform_completely`, which transforms
-/// every graph and leaves an un-rewritable one to the residual-call ABI
-/// rather than aborting the build.  The coverage gate at the end of this
-/// function reports the shape-coverage gap (split by category under
-/// `MAJIT_MIR_FRONTEND_DEBUG=1`) and proceeds; the check.py suite is the
-/// regression net for a silent fallback.
+/// body is omitted and callers can take the residual path. This is
+/// PRE-EXISTING-ADAPTATION, not exceptiontransform.py parity:
+/// `ExceptionTransformer.transform_completely` transforms every graph
+/// without an exception-to-residual catch. A residual is executable only
+/// with a registered target and a compatible ABI; dropping a graph alone
+/// does not establish safety. #346 must close the lowering gaps and remove
+/// this per-function fallback. The coverage reporting below currently
+/// reports the gap and proceeds rather than enforcing that terminal gate.
 fn is_known_lowering_gap(msg: &str) -> bool {
     // The forward-reference shape: a body reads a MIR local on a path the
     // driver has not yet bound (`read of MIR local N before any Assign`).
@@ -1177,17 +1177,14 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // `is_known_lowering_gap` recognises; its arms are the only statement
     // of that set that cannot go stale. One of them, an "uninitialised local
     // read" that even RPO could not bind, needs a genuine loop-carried def.
-    // Such a function
-    // would degrade the program by being dropped to a residual call,
-    // never a correctness loss. Any *other* lowering failure likewise
-    // degrades to a residual call — matching `exceptiontransform.py:212`,
-    // which transforms every graph and leaves an un-rewritable one to the
-    // residual-call ABI — so the gate reports the shape-coverage gap and
-    // proceeds rather than failing the build; the check.py suite (and its
-    // perf comparison) is the regression net. NOTE the `regressions` bucket
-    // is every non-tracked skip, not only result-exception-lowering
-    // declines, so a genuinely unrelated new lowering error also degrades
-    // silently here — check.py must catch it.
+    // PRE-EXISTING-ADAPTATION: unlike flowcontext.py
+    // FlowContext.record_block, this whole-program boundary does not
+    // propagate unsupported lowering. Both tracked and untracked failures
+    // omit a body; surviving callers need a valid residual target/ABI.
+    // The `regressions` bucket includes EVERY non-tracked skip, not only
+    // result-exception-lowering declines. #346 retires this fallback after
+    // ordinary lowering handles the reachable closure; check.py remains
+    // necessary but is not a proof that every omitted body is safe.
     if !skipped.is_empty() {
         let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
             .iter()
@@ -1209,19 +1206,12 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             for (name, msg) in &regressions {
                 detail.push_str(&format!("\n  - {name}: {msg}"));
             }
-            // The un-tracked skips: a mix of `Result<T, PyError>` callees
-            // whose exception-link rewrite declined the caller / callee shape
-            // it does not yet recognise and any other MIR shape the driver
-            // cannot yet lower (e.g. a call block exit that does not carry the
-            // tracked value).  All are fail-safe — the graph degrades to a
-            // residual call, no miscompile — matching `exceptiontransform.py:212`,
-            // which transforms every graph and leaves an un-rewritable one to
-            // the residual-call ABI.  Report the shape-coverage gap and
-            // proceed; the check.py suite (and its perf comparison) is the
-            // regression net for a silent fallback.
+            // Report untracked body omissions too. No corresponding
+            // exception-to-residual catch exists in upstream
+            // ExceptionTransformer.transform_completely.
             eprintln!(
                 "[mir-coverage] {} function(s) with an unrecognised MIR shape \
-                 degraded to residual (fail-safe → no miscompile); \
+                 omitted; callers require a registered ABI-compatible residual; \
                  shape-coverage gap:{detail}",
                 regressions.len()
             );
@@ -9960,12 +9950,30 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<Atomic*>::load(&self, ordering)` — a relaxed read of a
-                // layout-transparent atomic.  `&self` already aliases the
-                // inner field read, so alias the destination to it (the
-                // `ordering` arg is discarded); the `load` name never
-                // reaches the rtyper as a `ptr.getattr`.
+                // Only the existing Relaxed scalar fold is available here.
+                // An Acquire/SeqCst (or unknown) ordering cannot be erased.
+                // Nor can it fall through to an ordinary Atomic::load call:
+                // `&self` may already alias the loaded value, NOT its address.
+                // FlowContext.record_block in flowcontext.py propagates an
+                // unsupported operation rather than publishing a wrong graph.
+                // Keep that boundary until atomic borrows preserve addresses
+                // and ordered accesses have an executable effectful lowering.
+                // This rejects the body, not the whole translation: the
+                // whole-program builder's pre-existing residual fallback is
+                // separate #346 work, not an implementation of atomic loads.
                 if args.len() == 2 && self.is_atomic_load(&reg) {
+                    let ordering = arg_locals
+                        .get(1)
+                        .copied()
+                        .flatten()
+                        .and_then(|local| self.atomic_ordering_locals.get(&local))
+                        .map(String::as_str);
+                    if ordering != Some("Relaxed") {
+                        return Err(LowerError::Unsupported(format!(
+                            "atomic load ordering {} requires address-preserving ordered lowering",
+                            ordering.unwrap_or("unknown")
+                        )));
+                    }
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -13028,8 +13036,10 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// `<core::sync::atomic::Atomic*>::load(&self, ordering)` — a relaxed
-    /// read of a std atomic.  The atomic types are layout-transparent
+    /// Recognize `<core::sync::atomic::Atomic*>::load(&self, ordering)`.
+    /// This is only method recognition; `lower_call` must check ordering
+    /// separately before applying the existing Relaxed fold.
+    /// The atomic types are layout-transparent
     /// over their inner scalar/pointer (asserted for the `PyType`
     /// `subclassrange_*` / `instantiate` vtable fields), so the JIT
     /// models the load as that inner value: [`tyref_atomic_inner_value_type`]

@@ -255,6 +255,26 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
     }
 }
 
+/// Initialize the complete interpreter vtable census once, independently
+/// of Python type-object allocation and GC construction.
+///
+/// RPython `ClassRepr.fill_vtable_root` (rclass.py) fills prebuilt vtables
+/// from `assign_inheritance_ids` (normalizecalls.py). This is the existing
+/// Rust startup adaptation's publication owner: interpreter-only startup
+/// and GC-first startup share it, and repeated GC builds only compare their
+/// numbering against it. The OnceLock publishes all cross-crate aliases.
+pub fn init_subclass_ranges() {
+    static INITIALIZED: OnceLock<()> = OnceLock::new();
+    INITIALIZED.get_or_init(|| {
+        let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
+        let interpreter_aliases = crate::all_subclass_range_aliases();
+        pyre_object::pyobject::initialize_subclass_ranges_from_hierarchy(
+            crate::active_subclass_range_hierarchy(),
+            &[&object_aliases, &interpreter_aliases],
+        );
+    });
+}
+
 /// Initialize the type registry with all builtin types.
 ///
 /// PyPy: each W_XxxObject.typedef = TypeDef("xxx", ...) is set at
@@ -279,23 +299,7 @@ pub fn init_typeobjects() {
     #[cfg(any(test, feature = "test-hooks"))]
     crate::test_hooks::install_hash_hook();
     TYPEOBJECT_CACHE.get_or_init(|| {
-        // Seed `subclassrange_{min,max}` on every registered PyType so
-        // `ll_isinstance` works on the interpreter-only test path that
-        // skips the JIT init. This uses the same registration-ordered
-        // reversed-MRO peer census as GC `assign_inheritance_ids`, so JIT
-        // init's later `gc.subclass_range` writeback is byte-identical.
-        // Calling
-        // `mark_subclass_ranges_initialized` afterwards stops the
-        // pyre-object-internal `is_exception` fallback from
-        // omitting the cross-crate `CODE_TYPE` / `PYTRACEBACK_TYPE`
-        // aliases from a later redundant write.
-        let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
-        let interpreter_aliases = crate::all_subclass_range_aliases();
-        pyre_object::pyobject::compute_subclass_ranges_from_hierarchy(
-            crate::active_subclass_range_hierarchy(),
-            &[&object_aliases, &interpreter_aliases],
-        );
-        pyre_object::pyobject::mark_subclass_ranges_initialized();
+        init_subclass_ranges();
         let mut reg: HashMap<usize, usize> = HashMap::new();
 
         // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef
