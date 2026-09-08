@@ -1310,6 +1310,7 @@ fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
                 jf_top_addr: jf_top_addr as u32,
                 jf_limit_addr: jf_limit_addr as u32,
                 jitframe_tid,
+                large_threshold: gc.max_nursery_object_size(),
             })
     })?
 }

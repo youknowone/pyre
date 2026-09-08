@@ -1998,6 +1998,85 @@ fn call_assembler_accepts_float_and_void_result_locals() {
     validate_wasm(&void);
 }
 
+#[test]
+fn call_assembler_inlines_malloc_cond_varsize_frame() {
+    let token = 0x5a5a_u64;
+    let nursery_free = 0x1000_u32;
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let call = make_op(
+        OpCode::CallAssemblerI,
+        &[OpRef::input_arg_int(0)],
+        OpRef::int_op(1),
+    );
+    call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
+        arg_types: vec![Type::Int],
+        result_type: Type::Int,
+        target_token: token,
+    }));
+    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams {
+            emit_ca: true,
+            targets: HashMap::from([(
+                token,
+                codegen::CaTarget {
+                    dispatch_entry: 1024,
+                },
+            )]),
+            deopt_helper_slot: 1,
+            ca_alloc_fn_ptr: 2,
+            ca_pop_fn_ptr: 3,
+            ca_reload_fn_ptr: 4,
+            ca_reload_caller_fn_ptr: 5,
+            inline: Some(codegen::CaInlineParams {
+                nursery_free_addr: nursery_free,
+                nursery_top_addr: 0x1008,
+                jf_top_addr: 0x2000,
+                jf_limit_addr: 0x2008,
+                jitframe_tid: 7,
+                large_threshold: 4096,
+            }),
+            ..codegen::CaParams::default()
+        },
+    };
+    let bytes = codegen::build_wasm_module(&inputs)
+        .expect("inline CA frame alloc should compile")
+        .0;
+    validate_wasm(&bytes);
+    let mut saw_nursery_free = false;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::I32Const { value } if *value == nursery_free as i32) {
+            saw_nursery_free = true;
+        }
+    });
+    assert!(
+        saw_nursery_free,
+        "malloc_cond_varsize_frame must load nursery_free"
+    );
+}
+
 /// A region's value ids are its own trace's, so they collide with the owner's.
 /// The merged stream has one local namespace, so an unrebased collision makes
 /// the region's entry moves land in locals the owner still holds live across
