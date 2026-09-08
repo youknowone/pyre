@@ -232,11 +232,6 @@ const MAJIT_ONLY: &[&str] = &[
     // this file exists to make visible.
     "arraybase_vable/rdd>i",
     "newlist_clear/idddd>r",
-    // `pyjitpl.py` `_opimpl_isconstant` / `_opimpl_isvirtual` live in the
-    // majit tracer (`dispatch.rs`); the pyre walker has no arm.
-    "int_isconstant/i>i",
-    "ref_isconstant/r>i",
-    "ref_isvirtual/r>i",
     "rvmprof_code/ii",
 ];
 
