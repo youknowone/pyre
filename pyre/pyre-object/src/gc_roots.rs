@@ -597,6 +597,46 @@ pub fn root_scope_close(scope: &RootScope) {
     shadow_stack_cell_truncate(shadow_stack_cell(), scope.save_point);
 }
 
+/// Word-ABI residual for the compiler's `RootScope::drop_in_place`.
+/// The glue is a one-word `*mut RootScope`; without this binding the
+/// residual stays a symbolic hash and interpret/blackhole abort.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub unsafe fn root_scope_drop_in_place(slot: *mut RootScope) {
+    if !slot.is_null() {
+        unsafe { std::ptr::drop_in_place(slot) };
+    }
+}
+
+/// Push one root on the cell `stack_slot` names; returns its index.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn publish_one_at(stack_slot: *const RootStack, root: PyObjectRef) -> usize {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    // SAFETY: caller hands the live thread cell a `RootScope` still owns.
+    unsafe {
+        let stack = &*stack_slot;
+        let index = stack.len();
+        *stack.incr_stack() = root;
+        index
+    }
+}
+
+/// Word-ABI residual for [`RootScope::get`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn get_at(stack_slot: *const RootStack, index: usize) -> PyObjectRef {
+    // SAFETY: same cell; `slot` bounds-checks `index`.
+    unsafe { *(*stack_slot).slot(index) }
+}
+
+/// Word-ABI residual for [`RootScope::normalize`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn normalize_at(stack_slot: *const RootStack, base: usize, len: usize) {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    // SAFETY: `publish_one_at` claimed every index in this range.
+    let _ = normalize_published_run(unsafe { &*stack_slot }, base, len);
+}
+
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to
 /// execute the matching `pop_roots(hop, livevars)`. See the module
 /// docstring for the multi-phase plan.

@@ -5191,6 +5191,17 @@ pub fn finditem_str_named(
         if !strategy.is_null() {
             return Ok(unsafe { (*strategy).getitem_str(obj, key) });
         }
+        // `finditem_str` / `getitem_str` take an rpython `str` (one GCREF).
+        // A realized `co_names_w` slot is that word; the borrowed `&str`
+        // spelling is two words and cannot be a residual argument.
+        let w_key = unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) };
+        if !w_key.is_null() {
+            let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_key) };
+            return unsafe {
+                pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed_w(obj, w_key, hash)
+            }
+            .map_err(|_| take_pending_dict_key_error(w_key));
+        }
         // `objspace.py StdObjSpace.finditem_str` — `w_obj.getitem_str(key)`
         // with no DictOperationGuard.  The lock lives on the user-facing
         // `w_dict_getitem_str` wrapper; taking it here is an effect in front
