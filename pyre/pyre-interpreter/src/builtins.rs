@@ -15086,6 +15086,13 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         }
         .to_owned();
     }
+    // Ruff 0.16 names the t-string mix with a leading capital.
+    if msg
+        .to_ascii_lowercase()
+        .starts_with("cannot mix t-string literals with string or bytes literals")
+    {
+        msg = "cannot mix t-string literals with string or bytes literals".to_owned();
+    }
     let raw_parse_start = match &e {
         crate::compile::CompileError::Parse(parse_error) => {
             Some(parse_error.raw_location.start().to_usize())
