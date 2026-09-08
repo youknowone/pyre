@@ -17,8 +17,6 @@ cover the condition they diagnose.
 | `MAJIT_CALLEE_CENSUS` | OFF | Reports resolved and unresolved translation callees; remove when every supported callee is classified. |
 | `MAJIT_CALLEE_CENSUS_ROWS` | value | Limits rows printed by `MAJIT_CALLEE_CENSUS`; remove with that census. |
 | `MAJIT_CALLEE_RCA` | OFF | Reports metainterpreter callee-resolution decisions; remove when those decisions are covered by focused tests. |
-| `MAJIT_CL_BRIDGE_MERGE` | OFF | Re-emits a bridge that closes onto its owner loop into that loop's own Cranelift function; off while fannkuch still grows `bridges_compiled` 24 → 93 and `guard_failures` 5450 → 19549 with the gate set. |
-| `MAJIT_CL_BRIDGE_MERGE_LOG` | OFF | Prints one line per merge attempt — merged, or the reason it was declined — for the gate above; remove it with that gate. |
 | `MAJIT_CL_NO_CLOSING_JUMP` | OFF | Disables Cranelift's in-code closing jump to exercise external jump dispatch; remove when that fallback no longer needs comparison coverage. |
 | `MAJIT_DESCR_POOL_CENSUS` | OFF | Reports descriptor interning and duplication; remove when descriptor identity is covered by ordinary tests. |
 | `MAJIT_DETERMINISM_TRACE` | OFF | Prints inputs used to diagnose nondeterministic translation output; remove when deterministic output is enforced structurally. |
