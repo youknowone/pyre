@@ -373,6 +373,10 @@ impl Trace {
             trb.record_input_arg(ia.tp);
         }
         self.unique_to_box = (0..n).collect();
+        // Bridge traces are tens of ops; grow the maps once instead of
+        // doubling through the 16/32/64-byte size classes on every record.
+        self.unique_to_box.reserve(128);
+        self.slots.reserve(128);
         self.trb = Some(Box::new(trb));
     }
 
