@@ -23,3 +23,7 @@ majit-backend-cranelift = { workspace = true, optional = true }
 majit-backend-dynasm = { workspace = true, optional = true }
 majit-gc = { workspace = true }
 majit-macros = { workspace = true }
+
+[[example]]
+name = "eager_vs_jit"
+required-features = ["dynasm"]
