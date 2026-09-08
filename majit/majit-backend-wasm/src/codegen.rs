@@ -2391,10 +2391,6 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_add();
 }
 
-fn emit_word_zero(sink: &mut PeepSink<'_, '_>) {
-    sink.i64_const(0);
-}
-
 fn emit_word_store(sink: &mut PeepSink<'_, '_>, offset: u64) {
     if majit_backend::jitframe::SIZEOFSIGNED == 4 {
         sink.i32_wrap_i64();
@@ -2437,10 +2433,7 @@ fn emit_ca_malloc_cond_varsize_frame(
     alloc_scratch_local: u32,
     alloc_size_local: u32,
 ) {
-    use majit_backend::jitframe::{
-        JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS, JF_FRAME_OFS,
-        JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE, SIZEOFSIGNED,
-    };
+    use majit_backend::jitframe::{JF_FRAME_OFS, JF_GCMAP_OFS, JITFRAME_FIXED_SIZE, SIZEOFSIGNED};
     let word = SIZEOFSIGNED as i32;
     let ss_word = std::mem::size_of::<usize>() as i32;
     let hdr = GcHeader::SIZE as i32;
@@ -2515,21 +2508,20 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.i32_const(hdr);
     sink.i32_add();
     sink.local_set(alloc_scratch_local);
-    // rewrite.rs after `gen_malloc_nursery_varsize_frame`: tid is already
-    // in the header; zero the GCREF fields `jitframe_allocate` leaves
-    // empty, write `jf_frame_info` / length / `jf_gcmap`.
-    for ofs in [
-        JF_FRAME_INFO_OFS,
-        JF_DESCR_OFS,
-        JF_FORCE_DESCR_OFS,
-        JF_SAVEDATA_OFS,
-        JF_GUARD_EXC_OFS,
-        JF_FORWARD_OFS,
-    ] {
-        sink.local_get(alloc_scratch_local);
-        emit_word_zero(sink);
-        emit_word_store(sink, ofs as u64);
-    }
+    // The bump returns recycled nursery bytes. We install `jf_gcmap`
+    // before the callee writes its homes, so those slots must be null
+    // or `jitframe_trace` walks leftover pointers
+    // (`invalid type_id` in `copy_nursery_object`). rewrite.py
+    // `clear_gc_fields` plus a zero `jf_frame` cover that; the helper
+    // path gets the same from `alloc_with_type` on a reset nursery.
+    sink.local_get(alloc_scratch_local);
+    sink.i32_const(0);
+    sink.local_get(alloc_size_local);
+    sink.i32_const(hdr);
+    sink.i32_sub();
+    sink.memory_fill(0);
+    // rewrite.rs after `gen_malloc_nursery_varsize_frame`: write
+    // `jf_frame` length and `jf_gcmap` over the cleared payload.
     sink.local_get(alloc_scratch_local);
     sink.local_get(ca_target_local);
     sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));

@@ -131,10 +131,15 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
         .unwrap_or_else(|err| panic!("invalid {name}= in wasm JIT stats: {err}\n{stderr}"))
 }
 
-/// The CALL_ASSEMBLER frame allocator returns a zeroed payload, so codegen
-/// must not clear that fresh frame again.  Entry prologues separately clear
-/// the current frame's GC Ref homes; #1683 deliberately coalesces those stores
-/// into `memory.fill`, identified by their local-0 (current frame) base.
+/// CALL_ASSEMBLER must not refill a frame the allocator already zeroed.
+/// Two fills are expected:
+///
+/// - Entry prologues clear the current frame's GC Ref homes. #1683
+///   coalesces those stores into `memory.fill` on local 0.
+/// - The inline `malloc_cond_varsize_frame` bump returns recycled
+///   nursery bytes, so it `memory.fill`s `total - HDR` at the payload
+///   (rewrite.py `clear_gc_fields` plus a zero `jf_frame`). The helper
+///   path still arrives already zero from a reset nursery.
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
     let lines: Vec<_> = stderr.lines().map(str::trim).collect();
@@ -148,8 +153,13 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3] == "i32.add"
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
+        let is_ca_payload_zero = index >= 4
+            && lines[index - 4] == "i32.const 0"
+            && lines[index - 3].starts_with("local.get ")
+            && lines[index - 2] == "i32.const 8"
+            && lines[index - 1] == "i32.sub";
         assert!(
-            is_entry_home_clear,
+            is_entry_home_clear || is_ca_payload_zero,
             "recursive CA refilled a nursery frame instead of relying on its zeroed payload:\n{stderr}"
         );
     }
@@ -2066,14 +2076,22 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         .0;
     validate_wasm(&bytes);
     let mut saw_nursery_free = false;
+    let mut saw_payload_fill = false;
     count_operators(&bytes, |op| {
         if matches!(op, wasmparser::Operator::I32Const { value } if *value == nursery_free as i32) {
             saw_nursery_free = true;
+        }
+        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
+            saw_payload_fill = true;
         }
     });
     assert!(
         saw_nursery_free,
         "malloc_cond_varsize_frame must load nursery_free"
+    );
+    assert!(
+        saw_payload_fill,
+        "malloc_cond_varsize_frame must memory.fill the recycled payload"
     );
 }
 
