@@ -1667,6 +1667,13 @@ impl Assembler {
                 pure,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "getfield_gc base must use the Ref register bank \
+                     (blackhole.py bhimpl_getfield_gc_* @arguments(\"cpu\", \"r\", \"d\", returns=\"X\")); \
+                     an Int-bank base is getfield_raw — graph {:?}",
+                    self.current_graph_name,
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
@@ -7713,6 +7720,94 @@ mod tests {
                 asm.insns.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// `bhimpl_getfield_gc_*` declares the struct as `r`.  An Int-bank
+    /// base is `getfield_raw`, not a GC field load.
+    #[test]
+    #[should_panic(expected = "getfield_gc base must use the Ref register bank")]
+    fn assemble_rejects_int_bank_getfield_gc_base() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("int_getfield_base");
+        let base_var = push_input_var(&mut graph, "obj", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field read has a result");
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+    }
+
+    /// `promote_gc_field_bases` rehomes a Signed GC FieldRead base so
+    /// the assembler emits the canonical `/rd>i` key.
+    #[test]
+    fn promote_then_assemble_emits_canonical_getfield_gc_rd() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("promoted_getfield");
+        let base_var = push_input_var(&mut graph, "obj", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field read has a result");
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+
+        crate::codewriter::type_state::promote_gc_field_bases(&graph, None);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.contains_key("getfield_gc_i/rd>i"),
+            "promoted GC base must assemble as getfield_gc_i/rd>i, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.contains("/id>")),
+            "promoted GC base must not emit an int-base getfield key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
     }
 
     /// Every upstream vable handler declares its base as `r`. An Int-bank

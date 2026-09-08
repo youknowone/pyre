@@ -776,6 +776,11 @@ impl CodeWriter {
         // already in SSI form (empty pending set), so non-split graphs are
         // unaffected.
         crate::model_ssa::ssa_to_ssi(rewritten_graph);
+        // `history.getkind(Ptr(GC))` is `"ref"`.  Stamp GC FieldRead /
+        // FieldWrite bases that still carry Signed so regalloc colours
+        // them in the Ref bank and the assembler emits `getfield_gc_*/rd>X`
+        // instead of the pyre-only `/id>X` form.
+        super::type_state::promote_gc_field_bases(rewritten_graph, Some(callcontrol));
         let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
             || crate::regalloc::perform_all_register_allocations(rewritten_graph),
