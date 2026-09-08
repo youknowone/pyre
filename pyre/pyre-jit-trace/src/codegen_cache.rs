@@ -19,14 +19,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// Workspace crates whose graphs reach the prepass through LLBC artefacts.
-/// Their sources are not hashed: a source-only edit is either refused by
-/// `fail_if_llbc_stale` or already rekeys via the artefact bytes.
+/// Crates whose Charon artefact the prepass consumes. The `.ullbc` and its
+/// `.fingerprint` stamp are both named after the crate. Pyre production
+/// configures the exact `eval::eval_loop_jit` portal, so unlike generic
+/// two-artefact consumers it requires `pyre-jit` too.
 ///
-/// `pyre-interpreter` is also a build-dep, but only so the script can
-/// sample the live fnaddr / static tables. Those sampled functions are
+/// Their sources are not hashed into the codegen cache key: a source-only
+/// edit is either refused by `fail_if_llbc_stale` or already rekeys via the
+/// artefact bytes. `pyre-interpreter` is also a build-dep, but only so the
+/// script can sample the live fnaddr / static tables; those functions are
 /// added as single files through [`interpreter_fn_calls`], not as a tree.
-const LLBC_OWNED_CRATES: &[&str] = &["majit-rlib", "pyre-interpreter", "pyre-jit", "pyre-object"];
+///
+/// Order is the production hash/load order. Changing it rekeys the cache.
+pub const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"];
 
 /// Repo-relative trees and files the cache key should hash, plus every
 /// manifest read while discovering them (for `cargo::rerun-if-changed`).
@@ -51,7 +56,7 @@ pub fn discover(repo_root: &Path, manifest_dir: &Path) -> CacheInputs {
     let mut pending: Vec<String> =
         section_workspace_deps(&read_to_string(&crate_toml), "build-dependencies")
             .into_iter()
-            .filter(|name| !LLBC_OWNED_CRATES.contains(&name.as_str()))
+            .filter(|name| !LLBC_CRATES.contains(&name.as_str()))
             .collect();
 
     let mut seen = BTreeSet::new();
@@ -71,7 +76,7 @@ pub fn discover(repo_root: &Path, manifest_dir: &Path) -> CacheInputs {
         if dep_toml.is_file() {
             manifests.insert(rel(repo_root, &dep_toml));
             for dep in section_workspace_deps(&read_to_string(&dep_toml), "dependencies") {
-                if !LLBC_OWNED_CRATES.contains(&dep.as_str()) {
+                if !LLBC_CRATES.contains(&dep.as_str()) {
                     pending.push(dep);
                 }
             }
@@ -401,6 +406,25 @@ mod tests {
             "missing translate manifest in {:?}",
             inputs.manifests
         );
+    }
+
+    #[test]
+    fn discover_excludes_every_llbc_crate_source_tree() {
+        let members = workspace_member_paths(&read_to_string(&repo_root().join("Cargo.toml")));
+        let trees: BTreeSet<_> = discover(&repo_root(), &crate_root())
+            .src_trees
+            .into_iter()
+            .collect();
+        for name in LLBC_CRATES {
+            let member = members
+                .get(*name)
+                .unwrap_or_else(|| panic!("{name} missing from workspace.dependencies"));
+            let tree = format!("{member}/src");
+            assert!(
+                !trees.contains(&tree),
+                "{tree} is an LLBC artefact input; hashing its sources re-runs the prepass on an unchanged artefact"
+            );
+        }
     }
 
     #[test]
