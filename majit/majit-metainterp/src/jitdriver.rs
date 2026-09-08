@@ -5173,8 +5173,8 @@ impl<S: JitState> JitDriver<S> {
                             )
                         });
                         // Standalone walks publish into `aborted_framestack`.
-                        // `MetaInterp::interpret` keeps the same stack on the
-                        // MetaInterp (`pyjitpl.py` `_interpret`).
+                        // `MetaInterp::interpret` publishes the same stack
+                        // before this arm (`pyjitpl.py` `_interpret`).
                         let staged = aborted
                             .or_else(|| {
                                 (!self.meta.framestack.is_empty()).then(|| {
