@@ -733,11 +733,7 @@ impl W_ListObject {
         // instead of manufacturing a Rust fat slice over the over-allocated
         // items block.
         //
-        // Its `@jit.look_inside_iff(lambda l: jit.isvirtual(l) and
-        // jit.isconstant(l.ll_length()))` is not carried: pyre has no
-        // `jit.isvirtual` / `jit.isconstant` intrinsic, so the predicate
-        // cannot be spelled — the same gap the four `look_inside_iff` notes
-        // in `dictmultiobject.rs` record.
+        // `rlist.py ll_reverse` look_inside_iff lives on [`w_list_reverse`].
         let base = items_block_items_base(this.items);
         let mut i = 0;
         let mut length_1_i = this.length_relaxed() as isize - 1;
@@ -1186,11 +1182,15 @@ unsafe fn float_to_int_or_float(list: &mut W_ListObject) -> bool {
 
 /// listobject.py AbstractUnwrappedStrategy.getitems_copy.
 ///
-/// The two hints on the same function -- `getitems_unroll =
-/// jit.unroll_safe(...)` and `getitems_copy = jit.look_inside_iff(lambda
-/// self, w_list: w_list._unrolling_heuristic())(...)` -- are absent;
-/// `look_inside_iff` needs `jit.isvirtual`/`isconstant`, which pyre has no
-/// intrinsic for yet.
+/// `listobject.py AbstractUnwrappedStrategy.getitems_copy`:
+/// `getitems_copy = jit.look_inside_iff(lambda self, w_list: w_list._unrolling_heuristic())`.
+/// Default `_unrolling_heuristic` is `size == 0 or (isconstant(size) and size <= UNROLL_CUTOFF)`.
+fn boxed_from_ints_iff(values: &[i64], _we_are_jitted: bool) -> bool {
+    let size = values.len();
+    size == 0 || (majit_rlib::jit::isconstant(&size) && size <= UNROLL_CUTOFF)
+}
+
+#[majit_macros::look_inside_iff(boxed_from_ints_iff)]
 fn boxed_from_ints(values: &[i64], we_are_jitted: bool) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
@@ -1544,8 +1544,18 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
 
 /// The strategy `w_list_new` picks for a given item set.
 ///
+/// `listobject.py UNROLL_CUTOFF`.
+const UNROLL_CUTOFF: usize = 5;
+
+/// `listobject.py _get_strategy_from_list_object_*`:
+/// `@jit.look_inside_iff(lambda space, list_w: jit.loop_unrolling_heuristic(list_w, len(list_w), UNROLL_CUTOFF))`.
+fn list_strategy_for_iff(items: &[PyObjectRef]) -> bool {
+    majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), UNROLL_CUTOFF)
+}
+
 /// listobject.py EmptyListStrategy: a freshly created list with no
 /// items uses Empty until first append picks a typed strategy.
+#[majit_macros::look_inside_iff(list_strategy_for_iff)]
 pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
     if items.is_empty() {
         ListStrategy::Empty
@@ -2971,6 +2981,15 @@ pub unsafe fn w_list_physical_size(obj: PyObjectRef) -> Option<usize> {
 /// permits a lying private hint to truncate the backing below live elements,
 /// but Rust slices require the same `length <= capacity` invariant that the
 /// real caller is documented to uphold.
+/// `rlist.py _ll_list_resize_hint`: `@jit.look_inside_iff(lambda l, newsize: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
+fn w_list_resize_hint_iff(obj: PyObjectRef, newsize: i64) -> bool {
+    unsafe {
+        let cap = strategy_capacity(&*(obj as *const W_ListObject)).unwrap_or(0);
+        majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&newsize)
+    }
+}
+
+#[majit_macros::look_inside_iff(w_list_resize_hint_iff)]
 pub unsafe fn w_list_resize_hint(obj: PyObjectRef, newsize: i64) -> bool {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
@@ -4218,11 +4237,20 @@ pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef
     crate::gc_roots::shadow_stack_get(root_base)
 }
 
+/// `rlist.py ll_reverse`: `@jit.look_inside_iff(lambda l: jit.isvirtual(l) and jit.isconstant(l.ll_length()))`.
+fn w_list_reverse_iff(obj: PyObjectRef) -> bool {
+    unsafe {
+        majit_rlib::jit::isvirtual(&*(obj as *const W_ListObject))
+            && majit_rlib::jit::isconstant(&(*(obj as *const W_ListObject)).live_len())
+    }
+}
+
 /// listobject.py IntegerListStrategy.reverse
 /// Strategy-preserving: reverses typed storage in place.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+#[majit_macros::look_inside_iff(w_list_reverse_iff)]
 pub unsafe fn w_list_reverse(obj: PyObjectRef) {
     let roots = crate::gc_roots::push_roots();
     let obj = roots.pin_root(obj);
@@ -5715,7 +5743,19 @@ mod tests {
                 crate::intobject::w_int_get_value(w_list_getitem(list, 2).unwrap()),
                 1
             );
+            // Residual `look_inside_iff` takes the orig arm (`!we_are_jitted()`).
+            assert!(!w_list_reverse_iff(list));
         }
+    }
+
+    #[test]
+    fn list_strategy_for_iff_uses_loop_unrolling_heuristic() {
+        // `rlib/jit.py loop_unrolling_heuristic`: empty unrolls; residual
+        // `isconstant` is false so a non-empty list does not.
+        assert!(list_strategy_for_iff(&[]));
+        let items = [w_int_new(1), w_int_new(2)];
+        assert!(!list_strategy_for_iff(&items));
+        assert_eq!(list_strategy_for(&items), ListStrategy::Integer);
     }
 
     #[test]

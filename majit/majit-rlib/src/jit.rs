@@ -40,3 +40,30 @@ pub fn isconstant<T: ?Sized>(_value: &T) -> bool {
 pub fn isvirtual<T: ?Sized>(_value: &T) -> bool {
     false
 }
+
+/// `rlib/jit.py loop_unrolling_heuristic`.
+///
+/// `isvirtual(lst)` is often lying for a resizable list (it reports the
+/// containing struct, not the whole list), so size must also be constant.
+pub fn loop_unrolling_heuristic<T: ?Sized>(lst: &T, size: usize, cutoff: usize) -> bool {
+    size == 0 || (isconstant(&size) && (isvirtual(lst) || size <= cutoff))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_unrolling_heuristic_empty_unrolls() {
+        // `rlib/jit.py loop_unrolling_heuristic`: size == 0 is always true.
+        let lst: &[i32] = &[];
+        assert!(loop_unrolling_heuristic(lst, 0, 2));
+    }
+
+    #[test]
+    fn loop_unrolling_heuristic_needs_constant_size() {
+        // Residual `isconstant` is false, so a non-empty list does not unroll.
+        let lst = &[1, 2];
+        assert!(!loop_unrolling_heuristic(lst, 2, 2));
+    }
+}
