@@ -2701,6 +2701,41 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
     })
 }
 
+/// One `(frame_ptr, stack_base)` per `framestack` level, outermost first.
+///
+/// `blackhole.py convert_and_run_from_pyjitpl` copies each MIFrame
+/// independently; pyre's extra `virtualizable_ptr` field has to be
+/// rebound to that level's own red frame so traceback recording and
+/// `executioncontext.py enter`/`leave` do not share the portal frame.
+/// A helper jitcode with no portal frame red, or an unstamped register,
+/// yields `(0, 0)` for that level.
+pub fn per_frame_vables_from_framestack(
+    framestack: &majit_metainterp::MIFrameStack,
+) -> Vec<(i64, usize)> {
+    framestack
+        .frames
+        .iter()
+        .map(|frame| {
+            let Ok(jitcode_index) = i32::try_from(frame.jitcode.index()) else {
+                return (0, 0);
+            };
+            let frame_reg = portal_red_regs_at(jitcode_index).0;
+            if frame_reg == u16::MAX {
+                return (0, 0);
+            }
+            let Some(frame_ptr) = frame.ref_values.get(frame_reg as usize).copied().flatten()
+            else {
+                return (0, 0);
+            };
+            if frame_ptr == 0 {
+                return (0, 0);
+            }
+            let stack_base = concrete_nlocals(frame_ptr as usize).unwrap_or(0);
+            (frame_ptr, stack_base)
+        })
+        .collect()
+}
+
 pub fn built_as_portal_at(jitcode_index: i32) -> bool {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
