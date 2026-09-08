@@ -4221,12 +4221,12 @@ impl MiniMarkGC {
     /// Schedule `drain_dead` for work PyPy's `rrc_invoke_callback` does not
     /// see: claimed `tp_finalize` blocks and C-only cycles.
     ///
-    /// `gcmodule.c finalize_garbage` runs before `delete_garbage`. A
-    /// collection that queued only those two would leave the drain unscheduled
-    /// if this sat inside `rrc_invoke_callback`. The sibling keeps that
-    /// function dealloc-only and is called from the same entry points.
-    /// Evidence: `cpyext/pyobject.rs drain_dead` drains finalize, then
-    /// `clear_garbage`, then dealloc.
+    /// Pyre's spec is the free-threaded build only. This is not the
+    /// GIL generational collector and must not grow into a second compiled
+    /// GC. `tp_finalize` and C-side cycles are still observables there; a
+    /// collection that queued only those two would leave the drain
+    /// unscheduled if this sat inside `rrc_invoke_callback`. Called from
+    /// the same entry points so that function stays dealloc-only.
     fn rrc_invoke_cpyext_drain(&mut self) {
         if self.rrc.enabled
             && (!self.rrc.finalize_pending.is_empty() || self.rrc.c_garbage)
