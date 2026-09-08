@@ -627,12 +627,22 @@ fn park_residual_call_exception() -> ParkedResidualException {
     let scope = pyre_object::gc_roots::push_roots();
     let save = pyre_object::gc_roots::shadow_stack_len();
     let bh_pinned = bh != 0;
-    if bh_pinned {
-        let _ = pyre_object::gc_roots::pin_root(bh as pyre_object::PyObjectRef);
-    }
     let backend_pinned = backend != 0;
+    // Publish both cells before any normalize: `pin_root` queries after the
+    // first write and a collection there would move the still-unrooted one.
+    let mut parked = [pyre_object::PY_NULL; 2];
+    let mut n = 0;
+    if bh_pinned {
+        parked[n] = bh as pyre_object::PyObjectRef;
+        n += 1;
+    }
     if backend_pinned {
-        let _ = pyre_object::gc_roots::pin_root(backend as pyre_object::PyObjectRef);
+        parked[n] = backend as pyre_object::PyObjectRef;
+        n += 1;
+    }
+    if n > 0 {
+        let base = scope.publish(&parked[..n]);
+        scope.normalize(base, n);
     }
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     drain_backend_jit_exc();
@@ -952,10 +962,10 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     let w_code = w_code_value as PyObjectRef;
     let w_globals = w_globals_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_code]);
-    let w_exc = pyre_object::gc_roots::shadow_stack_get(base);
-    let w_code = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+    let base = _roots.pin_roots(&[w_exc, w_code, w_globals]);
+    let w_exc = _roots.get(base);
+    let w_code = _roots.get(base + 1);
+    let w_globals = _roots.get(base + 2);
     // `record_application_traceback` requires the traceback's own frame
     // identity. The recording walker cannot force the optimizer's virtual
     // locals, so materialize a traceback-only frame from the promoted callee
@@ -1034,10 +1044,10 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
     let w_exc = exc_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_code]);
-    let w_exc = pyre_object::gc_roots::shadow_stack_get(base);
-    let w_code = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+    let base = _roots.pin_roots(&[w_exc, w_code, w_globals]);
+    let w_exc = _roots.get(base);
+    let w_code = _roots.get(base + 1);
+    let w_globals = _roots.get(base + 2);
     let Ok(mut frame) = pyre_interpreter::createframe_obj(
         w_code as *const (),
         w_globals,
@@ -5782,10 +5792,10 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             && unsafe { pyre_interpreter::builtin_code_get_fast_natural_arity(code) as usize }
                 == positional_count;
         if exact_fixed_arity {
-            let _ = _roots.pin_root(code);
-            let _ = _roots.pin_root(receiver);
-            let code_slot = root_base + 2 + args.len();
-            let receiver_slot = code_slot + 1;
+            let extra = _roots.publish(&[code, receiver]);
+            _roots.normalize(extra, 2);
+            let code_slot = extra;
+            let receiver_slot = extra + 1;
             let mut call_args = [pyre_object::PY_NULL; 4];
             call_args[0] = _roots.get(receiver_slot);
             for (index, slot) in call_args[1..positional_count].iter_mut().enumerate() {
