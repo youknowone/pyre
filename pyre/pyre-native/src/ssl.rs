@@ -262,7 +262,9 @@ enum EcdhCurve {
 #[cfg(feature = "host_env")]
 pub use host_ssl::{
     CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, PROTOCOL_TLS, PROTOCOL_TLS_CLIENT,
-    PROTOCOL_TLS_SERVER, PROTOCOL_TLSV1_2, PROTOCOL_TLSV1_3,
+    PROTOCOL_TLS_SERVER, PROTOCOL_TLSV1, PROTOCOL_TLSV1_1, PROTOCOL_TLSV1_2, PROTOCOL_TLSV1_3,
+    VERIFY_ALLOW_PROXY_CERTS, VERIFY_CRL_CHECK_CHAIN, VERIFY_CRL_CHECK_LEAF, VERIFY_DEFAULT,
+    VERIFY_X509_PARTIAL_CHAIN, VERIFY_X509_STRICT, VERIFY_X509_TRUSTED_FIRST,
 };
 
 #[cfg(not(feature = "host_env"))]
@@ -271,6 +273,10 @@ pub const PROTOCOL_TLS: i32 = 2;
 pub const PROTOCOL_TLS_CLIENT: i32 = 16;
 #[cfg(not(feature = "host_env"))]
 pub const PROTOCOL_TLS_SERVER: i32 = 17;
+#[cfg(not(feature = "host_env"))]
+pub const PROTOCOL_TLSV1: i32 = 3;
+#[cfg(not(feature = "host_env"))]
+pub const PROTOCOL_TLSV1_1: i32 = 4;
 #[cfg(not(feature = "host_env"))]
 pub const PROTOCOL_TLSV1_2: i32 = 5;
 #[cfg(not(feature = "host_env"))]
@@ -300,18 +306,20 @@ pub const DEFAULT_OPTIONS: u64 = OP_ALL
     | OP_ENABLE_MIDDLEBOX_COMPAT;
 
 /// `X509_V_FLAG_*` bits carried by `SSLContext.verify_flags`.
-#[cfg(feature = "host_env")]
-use host_ssl::{
-    VERIFY_CRL_CHECK_CHAIN, VERIFY_CRL_CHECK_LEAF, VERIFY_X509_PARTIAL_CHAIN, VERIFY_X509_STRICT,
-};
 #[cfg(not(feature = "host_env"))]
-const VERIFY_CRL_CHECK_LEAF: i32 = 4;
+pub const VERIFY_DEFAULT: i32 = 0;
 #[cfg(not(feature = "host_env"))]
-const VERIFY_CRL_CHECK_CHAIN: i32 = 12;
+pub const VERIFY_CRL_CHECK_LEAF: i32 = 4;
 #[cfg(not(feature = "host_env"))]
-const VERIFY_X509_STRICT: i32 = 32;
+pub const VERIFY_CRL_CHECK_CHAIN: i32 = 12;
 #[cfg(not(feature = "host_env"))]
-const VERIFY_X509_PARTIAL_CHAIN: i32 = 0x80000;
+pub const VERIFY_X509_STRICT: i32 = 32;
+#[cfg(not(feature = "host_env"))]
+pub const VERIFY_ALLOW_PROXY_CERTS: i32 = 64;
+#[cfg(not(feature = "host_env"))]
+pub const VERIFY_X509_TRUSTED_FIRST: i32 = 32768;
+#[cfg(not(feature = "host_env"))]
+pub const VERIFY_X509_PARTIAL_CHAIN: i32 = 0x80000;
 
 /// Revocation scope requested by `verify_flags`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1443,6 +1451,115 @@ pub unsafe fn certificate_san_directory_attribute_value(
         .clone()
 }
 
+/// One OpenSSL object, as `_ssl.txt2obj` / `nid2obj` report it.
+#[derive(Clone, Copy, Debug)]
+pub struct OidInfo {
+    pub nid: i32,
+    pub short_name: &'static str,
+    pub long_name: &'static str,
+    pub oid: Option<&'static str>,
+}
+
+#[cfg(feature = "host_env")]
+fn oid_info(entry: &'static host_ssl::oid::OidEntry) -> OidInfo {
+    OidInfo {
+        nid: entry.nid,
+        short_name: entry.short_name,
+        long_name: entry.long_name,
+        oid: entry.oid_string(),
+    }
+}
+
+#[cfg(not(feature = "host_env"))]
+const OIDS: &[OidInfo] = &[
+    OidInfo {
+        nid: 13,
+        short_name: "CN",
+        long_name: "commonName",
+        oid: Some("2.5.4.3"),
+    },
+    OidInfo {
+        nid: 14,
+        short_name: "C",
+        long_name: "countryName",
+        oid: Some("2.5.4.6"),
+    },
+    OidInfo {
+        nid: 15,
+        short_name: "L",
+        long_name: "localityName",
+        oid: Some("2.5.4.7"),
+    },
+    OidInfo {
+        nid: 16,
+        short_name: "ST",
+        long_name: "stateOrProvinceName",
+        oid: Some("2.5.4.8"),
+    },
+    OidInfo {
+        nid: 17,
+        short_name: "O",
+        long_name: "organizationName",
+        oid: Some("2.5.4.10"),
+    },
+    OidInfo {
+        nid: 18,
+        short_name: "OU",
+        long_name: "organizationalUnitName",
+        oid: Some("2.5.4.11"),
+    },
+    OidInfo {
+        nid: 129,
+        short_name: "serverAuth",
+        long_name: "TLS Web Server Authentication",
+        oid: Some("1.3.6.1.5.5.7.3.1"),
+    },
+    OidInfo {
+        nid: 130,
+        short_name: "clientAuth",
+        long_name: "TLS Web Client Authentication",
+        oid: Some("1.3.6.1.5.5.7.3.2"),
+    },
+];
+
+#[inline(never)]
+pub fn oid_by_nid(nid: i32) -> Option<OidInfo> {
+    #[cfg(feature = "host_env")]
+    {
+        host_ssl::oid::find_by_nid(nid).map(oid_info)
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        OIDS.iter().copied().find(|entry| entry.nid == nid)
+    }
+}
+
+#[inline(never)]
+pub fn oid_by_oid_string(oid: &str) -> Option<OidInfo> {
+    #[cfg(feature = "host_env")]
+    {
+        host_ssl::oid::find_by_oid_string(oid).map(oid_info)
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        OIDS.iter().copied().find(|entry| entry.oid == Some(oid))
+    }
+}
+
+#[inline(never)]
+pub fn oid_by_name(name: &str) -> Option<OidInfo> {
+    #[cfg(feature = "host_env")]
+    {
+        host_ssl::oid::find_by_name(name).map(oid_info)
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        OIDS.iter()
+            .copied()
+            .find(|entry| entry.short_name == name || entry.long_name == name)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CipherInfo {
     name: &'static str,
@@ -1570,6 +1687,19 @@ pub fn validate_cipher_string(pattern: &str) -> Result<(), &'static str> {
     parse_cipher_string(pattern).map(|_| ())
 }
 
+#[inline(never)]
+pub fn default_cipher_string() -> String {
+    #[cfg(feature = "host_env")]
+    {
+        ensure_provider();
+        cipher::default_cipher_string()
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        "rustls default cipher suites".to_string()
+    }
+}
+
 /// OpenSSL's name for each cipher suite rustls can negotiate.
 ///
 /// `rustls::CipherSuite` renders through `Debug`, which carries no stability
@@ -1580,21 +1710,30 @@ pub fn validate_cipher_string(pattern: &str) -> Result<(), &'static str> {
 /// A suite absent from this table is neither selectable nor reportable, so a
 /// provider gaining one has to be named here as well as in [`CIPHERS`].
 fn openssl_cipher_name(suite: rustls::SupportedCipherSuite) -> Option<&'static str> {
-    use rustls::CipherSuite;
-    Some(match suite.suite() {
-        CipherSuite::TLS13_AES_128_GCM_SHA256 => "TLS_AES_128_GCM_SHA256",
-        CipherSuite::TLS13_AES_256_GCM_SHA384 => "TLS_AES_256_GCM_SHA384",
-        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => "TLS_CHACHA20_POLY1305_SHA256",
-        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => "ECDHE-ECDSA-AES128-GCM-SHA256",
-        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => "ECDHE-ECDSA-AES256-GCM-SHA384",
-        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
-            "ECDHE-ECDSA-CHACHA20-POLY1305"
-        }
-        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => "ECDHE-RSA-AES128-GCM-SHA256",
-        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => "ECDHE-RSA-AES256-GCM-SHA384",
-        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => "ECDHE-RSA-CHACHA20-POLY1305",
-        _ => return None,
-    })
+    #[cfg(feature = "host_env")]
+    {
+        Some(cipher::describe(&suite).name)
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        use rustls::CipherSuite;
+        Some(match suite.suite() {
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => "TLS_AES_128_GCM_SHA256",
+            CipherSuite::TLS13_AES_256_GCM_SHA384 => "TLS_AES_256_GCM_SHA384",
+            CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => "TLS_CHACHA20_POLY1305_SHA256",
+            CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => "ECDHE-ECDSA-AES128-GCM-SHA256",
+            CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => "ECDHE-ECDSA-AES256-GCM-SHA384",
+            CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
+                "ECDHE-ECDSA-CHACHA20-POLY1305"
+            }
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => "ECDHE-RSA-AES128-GCM-SHA256",
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => "ECDHE-RSA-AES256-GCM-SHA384",
+            CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+                "ECDHE-RSA-CHACHA20-POLY1305"
+            }
+            _ => return None,
+        })
+    }
 }
 
 #[cfg(not(feature = "host_env"))]
@@ -3408,6 +3547,14 @@ impl TlsConnection {
         let Some(inner) = self.inner.as_ref() else {
             return;
         };
+        // rustls can report `handshake_kind() == Full` as soon as the
+        // ServerHello flight is processed, while `is_handshaking()` is still
+        // true and ClientKeyExchange has not been written. Capturing then
+        // freezes a client transcript that is missing CKE, so the two peers
+        // derive different RFC 5929 bindings.
+        if inner.is_handshaking() {
+            return;
+        }
         if inner.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_2) {
             return;
         }
@@ -4057,9 +4204,17 @@ pub unsafe fn connection_session(connection: *const TlsConnection) -> *mut Nativ
 #[inline(never)]
 pub unsafe fn connection_cipher(connection: *const TlsConnection) -> Option<(String, i32)> {
     let suite = unsafe { (&*connection).inner.as_ref() }?.negotiated_cipher_suite()?;
-    let name = openssl_cipher_name(suite)?;
-    let bits = if name.contains("AES128") { 128 } else { 256 };
-    Some((name.to_string(), bits))
+    #[cfg(feature = "host_env")]
+    {
+        let desc = cipher::describe(&suite);
+        Some((desc.name.to_string(), i32::from(desc.bits)))
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let name = openssl_cipher_name(suite)?;
+        let bits = if name.contains("AES128") { 128 } else { 256 };
+        Some((name.to_string(), bits))
+    }
 }
 
 #[cfg(test)]
@@ -4125,5 +4280,66 @@ mod tests {
             certificate_subject_hash(&server_der()).unwrap(),
             0x2aff_206c
         );
+    }
+
+    #[cfg(feature = "host_env")]
+    #[test]
+    fn tls_unique_matches_across_client_and_server() {
+        let cert_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../lib-python/3/test/certdata/keycert3.pem");
+        let client_ctx = context_new(PROTOCOL_TLS_CLIENT).unwrap();
+        let server_ctx = context_new(PROTOCOL_TLS_SERVER).unwrap();
+        unsafe {
+            context_set_verify_mode(client_ctx, CERT_NONE);
+            context_set_check_hostname(client_ctx, false);
+            context_set_maximum_version(client_ctx, 0x303);
+            context_set_maximum_version(server_ctx, 0x303);
+            context_load_cert_chain(server_ctx, &cert_path, &cert_path, None).unwrap();
+            let client =
+                connection_new(client_ctx, false, Some("localhost"), std::ptr::null()).unwrap();
+            let server = connection_new(server_ctx, true, None, std::ptr::null()).unwrap();
+            for _ in 0..16 {
+                let c2s = connection_take_tls(client).unwrap();
+                if !c2s.is_empty() {
+                    connection_receive_tls(server, &c2s).unwrap();
+                }
+                if connection_waiting_for_server_config(server) {
+                    connection_accept_server(server, server_ctx).unwrap();
+                }
+                let s2c = connection_take_tls(server).unwrap();
+                if !s2c.is_empty() {
+                    connection_receive_tls(client, &s2c).unwrap();
+                }
+                if !connection_is_handshaking(client) && !connection_is_handshaking(server) {
+                    break;
+                }
+                assert!(!c2s.is_empty() || !s2c.is_empty(), "handshake stalled");
+            }
+            let client_unique = connection_tls_unique(client);
+            let server_unique = connection_tls_unique(server);
+            connection_free(client);
+            connection_free(server);
+            context_free(client_ctx);
+            context_free(server_ctx);
+            assert_eq!(client_unique, server_unique);
+            assert_eq!(client_unique.as_ref().map(Vec::len), Some(12));
+        }
+    }
+
+    #[test]
+    fn oid_lookup_uses_openssl_object_database() {
+        let cn = oid_by_nid(13).unwrap();
+        assert_eq!(cn.short_name, "CN");
+        assert_eq!(cn.long_name, "commonName");
+        assert_eq!(cn.oid, Some("2.5.4.3"));
+        assert_eq!(oid_by_name("serverAuth").unwrap().nid, 129);
+        assert!(oid_by_name("serverauth").is_none());
+        assert_eq!(oid_by_oid_string("2.5.4.3").unwrap().nid, 13);
+        assert_eq!(oid_by_nid(130).unwrap().short_name, "clientAuth");
+        #[cfg(feature = "host_env")]
+        {
+            assert_eq!(oid_by_oid_string("2.005.004.003.").unwrap().nid, 13);
+            assert_eq!(oid_by_nid(181).unwrap().oid, None);
+        }
     }
 }

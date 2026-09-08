@@ -4,14 +4,13 @@
 //! `ssl.py`.  This module supplies its low-level primitives while the actual
 //! TLS engine lives in `pyre-native`, outside the translated interpreter.
 
+use pyre_native::ssl::{
+    CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, PROTOCOL_TLS, PROTOCOL_TLS_CLIENT,
+    PROTOCOL_TLS_SERVER, PROTOCOL_TLSV1, PROTOCOL_TLSV1_1, PROTOCOL_TLSV1_2, PROTOCOL_TLSV1_3,
+    VERIFY_ALLOW_PROXY_CERTS, VERIFY_CRL_CHECK_CHAIN, VERIFY_CRL_CHECK_LEAF, VERIFY_DEFAULT,
+    VERIFY_X509_PARTIAL_CHAIN, VERIFY_X509_STRICT, VERIFY_X509_TRUSTED_FIRST,
+};
 use pyre_object::*;
-
-const PROTOCOL_TLS: i32 = 2;
-const PROTOCOL_TLS_CLIENT: i32 = 16;
-const PROTOCOL_TLS_SERVER: i32 = 17;
-const CERT_NONE: i32 = 0;
-const CERT_OPTIONAL: i32 = 1;
-const CERT_REQUIRED: i32 = 2;
 
 /// The mapdict prefix is required because `ssl.SSLContext` is an app-level
 /// subclass of this native type.  PyPy composes `MapdictStorageMixin` into
@@ -666,14 +665,17 @@ mod context_methods {
             })?;
             let backend = pyre_native::ssl::context_new(protocol)
                 .map_err(|message| crate::PyError::value_error(message))?;
-            if matches!(protocol, PROTOCOL_TLS | 3 | 4 | 5) {
+            if matches!(
+                protocol,
+                PROTOCOL_TLS | PROTOCOL_TLSV1 | PROTOCOL_TLSV1_1 | PROTOCOL_TLSV1_2
+            ) {
                 crate::warn::warn_deprecation(&format!(
                     "ssl.PROTOCOL_{} is deprecated",
                     match protocol {
                         PROTOCOL_TLS => "TLS",
-                        3 => "TLSv1",
-                        4 => "TLSv1_1",
-                        5 => "TLSv1_2",
+                        PROTOCOL_TLSV1 => "TLSv1",
+                        PROTOCOL_TLSV1_1 => "TLSv1_1",
+                        PROTOCOL_TLSV1_2 => "TLSv1_2",
                         _ => unreachable!(),
                     }
                 ))?;
@@ -2814,71 +2816,12 @@ fn rand_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_bytes_from_bytes(&bytes))
 }
 
-#[derive(Clone, Copy)]
-struct OidEntry {
-    nid: i32,
-    short_name: &'static str,
-    long_name: &'static str,
-    oid: &'static str,
-}
-
-const OIDS: &[OidEntry] = &[
-    OidEntry {
-        nid: 13,
-        short_name: "CN",
-        long_name: "commonName",
-        oid: "2.5.4.3",
-    },
-    OidEntry {
-        nid: 14,
-        short_name: "C",
-        long_name: "countryName",
-        oid: "2.5.4.6",
-    },
-    OidEntry {
-        nid: 15,
-        short_name: "L",
-        long_name: "localityName",
-        oid: "2.5.4.7",
-    },
-    OidEntry {
-        nid: 16,
-        short_name: "ST",
-        long_name: "stateOrProvinceName",
-        oid: "2.5.4.8",
-    },
-    OidEntry {
-        nid: 17,
-        short_name: "O",
-        long_name: "organizationName",
-        oid: "2.5.4.10",
-    },
-    OidEntry {
-        nid: 18,
-        short_name: "OU",
-        long_name: "organizationalUnitName",
-        oid: "2.5.4.11",
-    },
-    OidEntry {
-        nid: 129,
-        short_name: "serverAuth",
-        long_name: "TLS Web Server Authentication",
-        oid: "1.3.6.1.5.5.7.3.1",
-    },
-    OidEntry {
-        nid: 130,
-        short_name: "clientAuth",
-        long_name: "TLS Web Client Authentication",
-        oid: "1.3.6.1.5.5.7.3.2",
-    },
-];
-
-fn oid_tuple(entry: OidEntry) -> PyObjectRef {
+fn oid_tuple(entry: pyre_native::ssl::OidInfo) -> PyObjectRef {
     w_tuple_new(vec![
-        w_int_new(entry.nid as i64),
+        w_int_new(i64::from(entry.nid)),
         w_str_new(entry.short_name),
         w_str_new(entry.long_name),
-        w_str_new(entry.oid),
+        entry.oid.map(w_str_new).unwrap_or_else(w_none),
     ])
 }
 
@@ -2896,12 +2839,18 @@ fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .map(crate::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
-    let name = value.as_ref();
-    let entry = OIDS.iter().copied().find(|entry| {
-        entry.oid == name
-            || (allow_names
-                && (entry.short_name == name || entry.long_name.eq_ignore_ascii_case(name)))
-    });
+    let name: &str = value.as_ref();
+    let entry = if name
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_digit())
+    {
+        pyre_native::ssl::oid_by_oid_string(name)
+    } else if allow_names {
+        pyre_native::ssl::oid_by_name(name)
+    } else {
+        None
+    };
     entry
         .map(oid_tuple)
         .ok_or_else(|| crate::PyError::value_error(format!("unknown object '{name}'")))
@@ -2909,9 +2858,10 @@ fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn nid2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let nid = crate::baseobjspace::int_w(args[0])?;
-    OIDS.iter()
-        .copied()
-        .find(|entry| entry.nid as i64 == nid)
+    let Ok(nid32) = i32::try_from(nid) else {
+        return Err(crate::PyError::value_error(format!("unknown NID {nid}")));
+    };
+    pyre_native::ssl::oid_by_nid(nid32)
         .map(oid_tuple)
         .ok_or_else(|| crate::PyError::value_error(format!("unknown NID {nid}")))
 }
@@ -3270,7 +3220,7 @@ crate::py_module! {
         "OPENSSL_VERSION_NUMBER" => w_int_new(0x3000_0000),
         "OPENSSL_VERSION_INFO" => w_tuple_new(vec![w_int_new(3), w_int_new(0), w_int_new(0), w_int_new(0), w_int_new(15)]),
         "_OPENSSL_API_VERSION" => w_tuple_new(vec![w_int_new(3), w_int_new(0), w_int_new(0), w_int_new(0), w_int_new(15)]),
-        "_DEFAULT_CIPHERS" => w_str_new("rustls default cipher suites"),
+        "_DEFAULT_CIPHERS" => w_str_new(&pyre_native::ssl::default_cipher_string()),
         "HAS_SNI" => w_bool_from(true),
         "HAS_ECDH" => w_bool_from(true),
         "HAS_NPN" => w_bool_from(false),
@@ -3289,10 +3239,10 @@ crate::py_module! {
         "PROTOCOL_TLS" => PROTOCOL_TLS,
         "PROTOCOL_TLS_CLIENT" => PROTOCOL_TLS_CLIENT,
         "PROTOCOL_TLS_SERVER" => PROTOCOL_TLS_SERVER,
-        "PROTOCOL_TLSv1" => 3,
-        "PROTOCOL_TLSv1_1" => 4,
-        "PROTOCOL_TLSv1_2" => 5,
-        "PROTOCOL_TLSv1_3" => 6,
+        "PROTOCOL_TLSv1" => PROTOCOL_TLSV1,
+        "PROTOCOL_TLSv1_1" => PROTOCOL_TLSV1_1,
+        "PROTOCOL_TLSv1_2" => PROTOCOL_TLSV1_2,
+        "PROTOCOL_TLSv1_3" => PROTOCOL_TLSV1_3,
         "PROTO_MINIMUM_SUPPORTED" => -2,
         "PROTO_MAXIMUM_SUPPORTED" => -1,
         "PROTO_SSLv3" => 0x300,
@@ -3303,13 +3253,13 @@ crate::py_module! {
         "CERT_NONE" => CERT_NONE,
         "CERT_OPTIONAL" => CERT_OPTIONAL,
         "CERT_REQUIRED" => CERT_REQUIRED,
-        "VERIFY_DEFAULT" => 0,
-        "VERIFY_CRL_CHECK_LEAF" => 4,
-        "VERIFY_CRL_CHECK_CHAIN" => 12,
-        "VERIFY_X509_STRICT" => 32,
-        "VERIFY_ALLOW_PROXY_CERTS" => 64,
-        "VERIFY_X509_TRUSTED_FIRST" => 32768,
-        "VERIFY_X509_PARTIAL_CHAIN" => 0x80000,
+        "VERIFY_DEFAULT" => VERIFY_DEFAULT,
+        "VERIFY_CRL_CHECK_LEAF" => VERIFY_CRL_CHECK_LEAF,
+        "VERIFY_CRL_CHECK_CHAIN" => VERIFY_CRL_CHECK_CHAIN,
+        "VERIFY_X509_STRICT" => VERIFY_X509_STRICT,
+        "VERIFY_ALLOW_PROXY_CERTS" => VERIFY_ALLOW_PROXY_CERTS,
+        "VERIFY_X509_TRUSTED_FIRST" => VERIFY_X509_TRUSTED_FIRST,
+        "VERIFY_X509_PARTIAL_CHAIN" => VERIFY_X509_PARTIAL_CHAIN,
         "OP_ALL" => 0x00000bfb,
         "OP_NO_SSLv2" => 0,
         "OP_NO_SSLv3" => 0x02000000,
