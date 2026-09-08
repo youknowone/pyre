@@ -10437,6 +10437,10 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
             majit_translate::insns::BC_CAST_PTR_TO_INT,
         ),
         (
+            "int_isconstant/i>i",
+            majit_translate::insns::BC_INT_ISCONSTANT,
+        ),
+        (
             "ref_isconstant/r>i",
             majit_translate::insns::BC_REF_ISCONSTANT,
         ),

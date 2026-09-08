@@ -9912,6 +9912,20 @@ where
                 // ── 5. bind the list header to the destination ref register. ──
                 self.set_ref_reg(dest, Some(sbox_op), Some(struct_ptr));
             }
+            // pyjitpl.py `_opimpl_isconstant` / `opimpl_int_isconstant`:
+            // `return ConstInt(isinstance(box, Const))`.  No IR op.
+            // Byte layout `[src][dst]` per `bhhandler_i_i!`.
+            jitcode::insns::BC_INT_ISCONSTANT => {
+                let (src, dest) = {
+                    let frame = self.frames.current_mut();
+                    let src = frame.next_reg() as usize;
+                    let dest = frame.next_reg() as usize;
+                    (src, dest)
+                };
+                let (opref, _) = self.read_int_reg(src);
+                let value = opref.is_constant() as i64;
+                self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
+            }
             // pyjitpl.py `_opimpl_isconstant` / `opimpl_ref_isconstant`:
             // `return ConstInt(isinstance(box, Const))`.  No IR op.
             // Byte layout `[src][dst]` per `bhhandler_r_i!`.
