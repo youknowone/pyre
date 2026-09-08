@@ -2404,6 +2404,22 @@ fn emit_word_store(sink: &mut PeepSink<'_, '_>, offset: u64) {
     }
 }
 
+/// assembler.py `_call_footer_shadowstack`: `SUB [rootstacktop], 2*WORD`.
+///
+/// The CA return used to call `wasm_jit_ca_pop_frame` on every level.
+/// That helper is the collecting footer (`finish_gcmap` + write barrier +
+/// pop). The happy path is the same one-instruction decrement x86 emits
+/// after a `CALL_ASSEMBLER` return; overflow/deopt still uses the helper.
+fn emit_ca_pop_footer(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
+    let ss_word = std::mem::size_of::<usize>() as i32;
+    sink.i32_const(top_addr as i32);
+    sink.i32_const(top_addr as i32);
+    sink.i32_load(mem32(0));
+    sink.i32_const(2 * ss_word);
+    sink.i32_sub();
+    sink.i32_store(mem32(0));
+}
+
 /// While a CA callee is pushed, its caller's `jf_ptr` is `top[-3 * WORD]`.
 fn emit_ca_reload_caller(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_const(top_addr as i32);
@@ -7889,10 +7905,13 @@ fn build_function(
                     }
                 }
                 // Pop the callee frame off the jitframe shadow stack (strict
-                // LIFO) via `wasm_jit_ca_pop_frame` — same direct-vs-trampoline
-                // split as the alloc above (the pop only shrinks the shadow
-                // stack; it never allocates or collects).
-                if let Some(base) = residual_type_base {
+                // LIFO).  `assembler.py` `_call_footer_shadowstack` is
+                // `SUB [rootstacktop], 2*WORD`; keep the helper only when
+                // the inline nursery path is off (it also publishes the
+                // finish gcmap).
+                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
+                    emit_ca_pop_footer(&mut sink, inline.jf_top_addr);
+                } else if let Some(base) = residual_type_base {
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
                     sink.i32_const(ca.ca_pop_fn_ptr as i32);
