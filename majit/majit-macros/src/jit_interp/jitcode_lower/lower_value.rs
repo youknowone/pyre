@@ -706,7 +706,7 @@ impl<'c> Lowerer<'c> {
                         quote! {},
                     ),
                 };
-                quote! {
+                quote! {{
                     #witness
                     (
                         ::core::mem::offset_of!(#struct_path, #member),
@@ -715,7 +715,7 @@ impl<'c> Lowerer<'c> {
                         #size,
                         #signed,
                     )
-                }
+                }}
             })
             .collect();
         let headerless = self
@@ -2861,6 +2861,23 @@ mod tests {
             .map(ToString::to_string)
             .collect::<String>();
         assert!(emitted.contains("93i64"));
+    }
+
+    #[test]
+    fn struct_layout_witnesses_are_array_element_blocks() {
+        let config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("v".into(), binding(1, BindingKind::Int));
+        let expr = syn::parse_str("Node { value: v }").unwrap();
+        lowerer.lower_value_expr(&expr).expect("struct lowers");
+        let statement = &lowerer.statements[0];
+        // Layout witnesses contain const items; each layout must remain one
+        // array expression when register allocation reparses builder calls.
+        syn::parse2::<syn::Block>(quote!({ #statement }))
+            .expect("new_struct with a field witness is valid Rust");
+        assert!(statement.to_string().contains("const _"));
     }
 
     #[test]

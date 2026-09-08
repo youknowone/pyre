@@ -1152,8 +1152,10 @@ impl MIFrame {
                 let tagged = if Some(idx) == clear_ref_idx {
                     SnapshotTagged::Const(0, Type::Ref)
                 } else if idx < num_regs_r {
-                    let opref = self.ref_regs[idx]
-                        .expect("get_list_of_active_snapshot_boxes: ref register uninitialized");
+                    let opref = self.ref_regs[idx].unwrap_or_else(|| panic!(
+                        "get_list_of_active_snapshot_boxes: ref register {idx} uninitialized in {} (pc={}, cursor={}, in_a_call={in_a_call}, after_residual_call={after_residual_call}, refs={:?})",
+                        self.jitcode.name(), self.pc, self.code_cursor, self.ref_regs,
+                    ));
                     let value = self.ref_values[idx]
                         .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
                     if opref.is_constant() {

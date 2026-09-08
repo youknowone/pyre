@@ -71,6 +71,9 @@ pub struct VableFieldInfo {
     pub field_type: Type,
     /// Byte offset in the heap object.
     pub offset: usize,
+    /// Physical storage, as in virtualizable.py FIELDTYPES / cpu.fielddescrof.
+    pub field_size: usize,
+    pub field_signed: bool,
     /// Whether this is an immutable field (can be constant-folded).
     pub is_immutable: bool,
 }
@@ -405,11 +408,15 @@ impl VirtualizableInfo {
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                let flag = majit_ir::ArrayFlag::from_field_type(f.field_type);
+                let flag = if f.field_type == Type::Int && !f.field_signed {
+                    majit_ir::ArrayFlag::Unsigned
+                } else {
+                    majit_ir::ArrayFlag::from_field_type(f.field_type)
+                };
                 Self::build_field_descr(
                     descr,
                     f.offset,
-                    item_size_for_type(f.field_type),
+                    f.field_size,
                     f.field_type,
                     flag,
                     1 + i,
@@ -608,10 +615,38 @@ impl VirtualizableInfo {
     /// virtualizable.py:61: num_static_extra_boxes = len(static_fields)
     /// ALL declared fields are included in snapshots.
     pub fn add_field(&mut self, name: impl Into<String>, field_type: Type, offset: usize) {
+        self.add_field_sized(
+            name,
+            field_type,
+            offset,
+            item_size_for_type(field_type),
+            true,
+        );
+    }
+
+    /// Preserve FIELDTYPES when constructing cpu.fielddescrof, as in
+    /// virtualizable.py VirtualizableInfo.__init__. IR kind alone does not
+    /// distinguish a narrow integer from a machine word.
+    pub fn add_field_sized(
+        &mut self,
+        name: impl Into<String>,
+        field_type: Type,
+        offset: usize,
+        field_size: usize,
+        field_signed: bool,
+    ) {
+        match field_type {
+            Type::Int => assert!(matches!(field_size, 1 | 2 | 4 | 8)),
+            Type::Ref => assert_eq!(field_size, std::mem::size_of::<usize>()),
+            Type::Float => assert_eq!(field_size, std::mem::size_of::<f64>()),
+            Type::Void => panic!("virtualizable fields cannot be void"),
+        }
         self.static_fields.push(VableFieldInfo {
             name: name.into(),
             field_type,
             offset,
+            field_size,
+            field_signed,
             is_immutable: false,
         });
         self.num_static_extra_boxes = self.static_fields.len();
@@ -1185,12 +1220,18 @@ impl VirtualizableInfo {
                     let ptr = obj_ptr.add(field.offset) as *const usize;
                     *ptr as i64
                 }
-                // Word-sized `Signed` field (`isize`/`usize`): 4 bytes on
-                // wasm32. Read at word width and sign-extend so a negative
-                // `last_instr` round-trips.
                 _ => {
-                    let ptr = obj_ptr.add(field.offset) as *const isize;
-                    *ptr as i64
+                    let ptr = obj_ptr.add(field.offset);
+                    match (field.field_size, field.field_signed) {
+                        (1, true) => ptr.cast::<i8>().read_unaligned() as i64,
+                        (1, false) => ptr.read_unaligned() as i64,
+                        (2, true) => ptr.cast::<i16>().read_unaligned() as i64,
+                        (2, false) => ptr.cast::<u16>().read_unaligned() as i64,
+                        (4, true) => ptr.cast::<i32>().read_unaligned() as i64,
+                        (4, false) => ptr.cast::<u32>().read_unaligned() as i64,
+                        (8, _) => ptr.cast::<i64>().read_unaligned(),
+                        _ => unreachable!("invalid virtualizable integer width"),
+                    }
                 }
             }
         }
@@ -1224,11 +1265,15 @@ impl VirtualizableInfo {
                         majit_gc::gc_write_barrier(majit_ir::GcRef(obj_ptr as usize));
                     }
                 }
-                // Word-sized `Signed` field (`isize`/`usize`): 4 bytes on
-                // wasm32. Writing 8 bytes would clobber the adjacent field.
                 _ => {
-                    let ptr = obj_ptr.add(field.offset) as *mut isize;
-                    *ptr = value as isize;
+                    let ptr = obj_ptr.add(field.offset);
+                    match field.field_size {
+                        1 => ptr.write_unaligned(value as u8),
+                        2 => ptr.cast::<u16>().write_unaligned(value as u16),
+                        4 => ptr.cast::<u32>().write_unaligned(value as u32),
+                        8 => ptr.cast::<i64>().write_unaligned(value),
+                        _ => unreachable!("invalid virtualizable integer width"),
+                    }
                 }
             }
         }
@@ -1564,23 +1609,8 @@ unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8)
         let mut boxes = Vec::with_capacity(info.num_static_extra_boxes);
 
         // Read static fields
-        for field in &info.static_fields {
-            let val = match field.field_type {
-                Type::Int => {
-                    let ptr = obj_ptr.add(field.offset) as *const i64;
-                    *ptr
-                }
-                Type::Float => {
-                    let ptr = obj_ptr.add(field.offset) as *const f64;
-                    f64::to_bits(*ptr) as i64
-                }
-                Type::Ref => {
-                    let ptr = obj_ptr.add(field.offset) as *const i64;
-                    *ptr
-                }
-                Type::Void => 0,
-            };
-            boxes.push(val);
+        for index in 0..info.static_fields.len() {
+            boxes.push(info.read_field(obj_ptr, index));
         }
 
         boxes
@@ -1597,21 +1627,11 @@ unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8)
 #[cfg(test)]
 unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut u8, boxes: &[i64]) {
     unsafe {
-        for (i, field) in info.static_fields.iter().enumerate() {
+        for i in 0..info.static_fields.len() {
             if i >= boxes.len() {
                 break;
             }
-            match field.field_type {
-                Type::Int | Type::Ref => {
-                    let ptr = obj_ptr.add(field.offset) as *mut i64;
-                    *ptr = boxes[i];
-                }
-                Type::Float => {
-                    let ptr = obj_ptr.add(field.offset) as *mut f64;
-                    *ptr = f64::from_bits(boxes[i] as u64);
-                }
-                Type::Void => {}
-            }
+            info.write_field(obj_ptr, i, boxes[i]);
         }
     }
 }
@@ -2511,6 +2531,36 @@ mod tests {
     }
 
     #[test]
+    fn static_field_storage_preserves_width_and_signedness() {
+        // VirtualizableInfo.__init__ read_boxes/write_boxes use FIELDTYPES,
+        // not the IR kind, for every field in the object.
+        let mut info = VirtualizableInfo::without_vable_token();
+        info.add_field_sized("signed", Type::Int, 1, 1, true);
+        info.add_field_sized("unsigned", Type::Int, 3, 4, false);
+        info.add_field_sized("wide", Type::Int, 9, 8, true);
+        let info = info.finalize_arc(majit_ir::descr::make_size_descr(24));
+        let mut bytes = [0xa5u8; 24];
+        let ptr = bytes.as_mut_ptr();
+        unsafe {
+            info.write_field(ptr, 0, -7);
+            info.write_field(ptr, 1, u32::MAX as i64);
+            info.write_field(ptr, 2, i64::MIN + 123);
+            assert_eq!(info.read_field(ptr, 0), -7);
+            assert_eq!(info.read_field(ptr, 1), u32::MAX as i64);
+            assert_eq!(info.read_field(ptr, 2), i64::MIN + 123);
+        }
+        for index in [0, 2, 7, 8, 17, 18, 19, 20, 21, 22, 23] {
+            assert_eq!(bytes[index], 0xa5, "neighbor byte {index} was overwritten");
+        }
+        for (index, size, signed) in [(0, 1, true), (1, 4, false), (2, 8, true)] {
+            let descr = info.static_field_descr(index);
+            let field = descr.as_field_descr().unwrap();
+            assert_eq!(field.field_size(), size);
+            assert_eq!(field.is_field_signed(), signed);
+        }
+    }
+
+    #[test]
     fn test_to_optimizer_config_preserves_offsets() {
         // RPython parity: test_to_optimizer_config
         // VirtualizableInfo → VirtualizableConfig, verify offsets match.
@@ -3000,7 +3050,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
 
     /// RPython keeps virtualizable array fields reachable through the
     /// GC-traced virtualizable object while resume data is decoded
-    /// (`rpython/jit/metainterp/resume.py:1399`). pyre stores the same
+    /// (`resume.py ResumeDataDirectReader.consume_vable_info`). pyre stores the same
     /// array pointers in raw frame fields, so expose the pointer slots to
     /// the resume-construction root stack before `write_from_resume_data_partial`
     /// and subsequent blackhole frame construction can allocate.
@@ -3044,12 +3094,9 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
                             }
                         }
                     }
-                    // One pointer-wide slot. `walk_resume_ref_roots` reinterprets
-                    // each entry as `&mut GcRef`, which is that same width, so a
-                    // one-element slice names exactly this field.
                     unsafe {
-                        majit_gc::shadow_stack::push_resume_ref_roots(
-                            std::slice::from_raw_parts_mut(slot as *mut i64, 1),
+                        majit_gc::shadow_stack::push_resume_ref_root(
+                            &mut *slot.cast::<majit_ir::GcRef>(),
                         );
                     }
                 }
