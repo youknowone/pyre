@@ -165,12 +165,10 @@ impl Op {
             .rd_pendingfields_arc()
     }
 
-    /// `resoperation.py/489 AbstractResOp/GuardResOp.getfailargs`
-    /// parity. Returns an owned `SmallVec` clone of the fail_args slot —
-    /// None for non-guard ops.  Clone is cheap because `Operand` is an `Rc`
-    /// bump and fail_args almost always fits inline (≤3 entries).  Owned
-    /// return avoids the `Ref<[T]>` ergonomics tax for callers that chain
-    /// through `.into_iter().flatten()` or `.iter()` patterns.
+    /// Owned snapshot of `GuardResOp.getfailargs` (`self._fail_args[:]`).
+    /// The live list is [`Op::guard_fail_args`]; use that on hot reads.
+    /// A `SmallVec<[; 3]>` clone heap-grows when resume failargs exceed
+    /// three live boxes, which is the common deopt shape.
     pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::operand::Operand; 3]>> {
         self.guard_fail_args()
             .map(|fa| fa.iter().cloned().collect())

@@ -5481,8 +5481,9 @@ impl Optimizer {
             // post-finish (mod.rs::store_final_boxes_in_guard).
             op = Self::store_final_boxes_in_guard(op, ctx, knowledge, pending_for_finish);
             // optimizer.py: force_box on each fail_arg for unrolling.
-            if let Some(fa) = op.getfailargs() {
+            if let Some(fa) = op.guard_fail_args() {
                 let fargs: Vec<OpRef> = fa.iter().map(|a| a.to_opref()).collect();
+                drop(fa);
                 for farg in fargs {
                     if !farg.is_none() {
                         self.force_box(farg, ctx);

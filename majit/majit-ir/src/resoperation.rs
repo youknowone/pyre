@@ -1650,7 +1650,7 @@ impl Op {
         self.setfailargs(boxes.into());
     }
 
-    pub(crate) fn guard_fail_args(&self) -> Option<std::cell::Ref<'_, [Operand]>> {
+    pub fn guard_fail_args(&self) -> Option<std::cell::Ref<'_, [Operand]>> {
         std::cell::Ref::filter_map(self.extra.borrow(), |extra| match extra.as_deref() {
             Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => {
                 g.fail_args.as_deref()
