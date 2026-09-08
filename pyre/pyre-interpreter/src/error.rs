@@ -1041,8 +1041,17 @@ impl PyError {
     /// undefined `name` so `e.name` reads back once the instance is
     /// materialised (Python 3.10+).
     pub fn name_error_with_name(msg: impl Into<Wtf8Buf>, name: &str) -> Self {
+        Self::name_error_with_name_obj(msg, pyre_object::w_str_new(name))
+    }
+
+    /// [`name_error_with_name`] for a name that is already a `str` object
+    /// (`pyopcode.py _load_global_failed` takes `w_varname`).
+    pub fn name_error_with_name_obj(
+        msg: impl Into<Wtf8Buf>,
+        w_name: pyre_object::PyObjectRef,
+    ) -> Self {
         let mut err = Self::new(PyErrorKind::NameError, msg);
-        err.w_name_context = pyre_object::w_str_new(name);
+        err.w_name_context = w_name;
         err
     }
 

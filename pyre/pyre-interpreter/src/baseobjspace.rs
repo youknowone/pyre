@@ -4625,6 +4625,17 @@ pub fn finditem_str_named(
     nameindex: usize,
 ) -> Result<Option<PyObjectRef>, PyError> {
     if is_shortcut_dict(obj) {
+        // `finditem_str` / `getitem_str` take an rpython `str` (one GCREF).
+        // A realized `co_names_w` slot is that word; the borrowed `&str`
+        // spelling is two words and cannot be a residual argument.
+        let w_key = unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) };
+        if !w_key.is_null() {
+            let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_key) };
+            return unsafe {
+                pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed_w(obj, w_key, hash)
+            }
+            .map_err(|_| take_pending_dict_key_error(w_key));
+        }
         let hash = named_key_hash(key, pycode, nameindex);
         return unsafe {
             pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(obj, key, hash)

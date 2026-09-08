@@ -30642,9 +30642,10 @@ mod tests {
 
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
-    /// interpreter LLBC.  `constant_at` must project the wrapper's sole field
-    /// and index that list; `code_getdocstring` must project the same field
-    /// for its slice view.  Neither accessor may survive as a residual call.
+    /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
+    /// (`w_code_const` on `co_consts_w`); it must not project the compiler
+    /// `Constants` wrapper.  `code_getdocstring` still projects that
+    /// wrapper for its slice view.
     ///
     /// `#[ignore]` is deliberate and has a precondition, not a verdict: this
     /// loads a 667 MB artefact that only exists after `extract-llbc.py` has run,
@@ -30757,24 +30758,21 @@ mod tests {
                     )
                 })
                 .count(),
-            1
+            0,
+            "getconstant_w reads co_consts_w, not compiler Constants.__pos_0"
         );
-        assert_eq!(
-            constant_ops
-                .iter()
-                .filter(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
-                .count(),
-            1
+        assert!(
+            constant_ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["w_code_const"])
+                )
+            }),
+            "PyFrame.constant_at must call w_code_const"
         );
-        assert!(!constant_ops.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    ..
-                } if segments.ends_with(&["Constants".to_string(), "index".to_string()])
-            )
-        }));
 
         let getdocstring =
             super::lower_function(&llbc, "code_getdocstring").expect("lower code_getdocstring");

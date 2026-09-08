@@ -2891,13 +2891,13 @@ impl NamespaceOpcodeHandler for PyFrame {
         let _ = roots.pin_root(value);
         let locals_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(self.get_or_create_w_locals());
-        let hash = crate::baseobjspace::named_key_hash(name, self.pycode as PyObjectRef, nameindex);
-        if store_name_into_dict(roots.get(locals_slot), name, hash, roots.get(value_slot)) {
-            return Ok(());
-        }
         let key = unsafe {
             crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
         };
+        let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(key) };
+        if store_name_into_dict_w(roots.get(locals_slot), key, hash, roots.get(value_slot)) {
+            return Ok(());
+        }
         crate::baseobjspace::setitem(roots.get(locals_slot), key, roots.get(value_slot))?;
         Ok(())
     }
@@ -2915,11 +2915,11 @@ impl NamespaceOpcodeHandler for PyFrame {
         value: Self::Value,
     ) -> Result<(), PyError> {
         let w_globals = self.get_w_globals();
-        let hash = crate::baseobjspace::named_key_hash(name, self.pycode as PyObjectRef, nameindex);
-        if !w_globals.is_null() && !store_name_into_dict(w_globals, name, hash, value) {
-            let key = unsafe {
-                crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-            };
+        let key = unsafe {
+            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+        };
+        let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(key) };
+        if !w_globals.is_null() && !store_name_into_dict_w(w_globals, key, hash, value) {
             crate::baseobjspace::setitem(w_globals, key, value)?;
         }
         Ok(())
@@ -3015,16 +3015,29 @@ impl NamespaceOpcodeHandler for PyFrame {
                 return Ok(value);
             }
         }
-        // `pyopcode.py _load_global_failed`: NameError.
-        Err(PyError::name_error_with_name(
-            format!("name '{name}' is not defined"),
-            name,
-        ))
+        // `pyopcode.py _load_global_failed`: `@dont_inline` so the
+        // `oefmt` / `format!` concat stays off the `_load_global` graph.
+        let w_varname = unsafe {
+            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+        };
+        Err(load_global_failed(w_varname))
     }
 
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
         Ok(PY_NULL)
     }
+}
+
+/// `pyopcode.py _load_global_failed` — `@dont_inline`.
+///
+/// `_load_global` wraps `varname` with `space.newtext` and hands the
+/// `W_Root` to this helper. Formatting here keeps `format!` /
+/// `stroruni.concat` out of the inlined lookup graph: a borrowed `&str`
+/// name is two words and a residual concat would see a null GCREF.
+#[majit_macros::dont_look_inside]
+fn load_global_failed(w_varname: PyObjectRef) -> PyError {
+    let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_varname) };
+    PyError::name_error_with_name_obj(format!("name '{name}' is not defined"), w_varname)
 }
 
 impl StackOpcodeHandler for PyFrame {
@@ -3088,28 +3101,23 @@ pub unsafe fn load_global_via_cache_extern(
     }
 }
 
-/// `pyopcode.py:855-859 space.setitem_str(w_ns, varname, w_value)` on a real
-/// `W_DictObject` / `W_ModuleDictObject`: stores by borrowed `&str` through the
-/// strategy without materializing a throwaway `w_str` (an overwrite reuses the
-/// stored key; only a new name allocates one).  This is the raw mapping store,
-/// not `__setitem__`, exactly as the object-keyed `setitem` resolves a dict.
+/// `pyopcode.py space.setitem_str(w_ns, varname, w_value)` on a real
+/// `W_DictObject` / `W_ModuleDictObject`. `varname` is an rpython `str`
+/// (one GCREF); the wrapped `co_names_w` name is that word.
 ///
 /// Answers `false` when `w_ns` is not a dict, leaving the caller on the
-/// object-keyed path: a dict subclass is an ordinary instance in pyre and must
-/// keep its mapping identity and any `__setitem__` override, and a non-dict
-/// mapping (`exec(src, g, mapping)`) has no strategy to store into.
-///
-/// `hash` is `name`'s digest when the caller holds it — the memo
-/// `rstr.py ll_strhash` keeps in the shared `co_names_w` string
-/// (`crate::baseobjspace::named_key_hash`), so a stored name is hashed once per
-/// string rather than once per opcode.  Zero leaves the strategy to hash the
-/// borrowed bytes.
-fn store_name_into_dict(w_ns: PyObjectRef, name: &str, hash: i64, value: PyObjectRef) -> bool {
+/// object-keyed path. `hash` is `ll_strhash` of the shared name string.
+fn store_name_into_dict_w(
+    w_ns: PyObjectRef,
+    w_name: PyObjectRef,
+    hash: i64,
+    value: PyObjectRef,
+) -> bool {
     if !unsafe { pyre_object::is_dict(w_ns) } {
         return false;
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_hashed(w_ns, name, hash, value);
+        pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w(w_ns, w_name, hash, value);
     }
     true
 }
@@ -3145,7 +3153,7 @@ pub unsafe fn store_name_value_w(
     // string object on every execution — `rstr.py ll_strhash`'s memo
     // makes it hashed once rather than once per store.
     let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
-    if store_name_into_dict(w_locals, name, hash, value) {
+    if store_name_into_dict_w(w_locals, w_name, hash, value) {
         return Ok(());
     }
     crate::baseobjspace::setitem(w_locals, w_name, value)?;
@@ -3186,10 +3194,9 @@ pub unsafe fn store_global_value_w(
     w_name: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), PyError> {
-    let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
     let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
     let w_globals = frame.get_w_globals();
-    if !w_globals.is_null() && !store_name_into_dict(w_globals, name, hash, value) {
+    if !w_globals.is_null() && !store_name_into_dict_w(w_globals, w_name, hash, value) {
         crate::baseobjspace::setitem(w_globals, w_name, value)?;
     }
     Ok(())
@@ -3223,7 +3230,7 @@ unsafe fn load_global_via_cache(
 ) -> Result<Option<PyObjectRef>, PyError> {
     use pyre_object::celldict::unwrap_cell;
     use pyre_object::dictmultiobject::{DictOperationGuard, W_ModuleDictObject};
-    let module_guard = DictOperationGuard::new(w_module_dict, &[w_builtin, pycode]);
+    let module_guard = DictOperationGuard::new2(w_module_dict, w_builtin, pycode);
     let w_module_dict = module_guard.root(0);
     let w_builtin = module_guard.root(1);
     let pycode = module_guard.root(2);
@@ -3814,12 +3821,10 @@ impl ConstantOpcodeHandler for PyFrame {
         // realize a wrapper directly.  Top-level `LOAD_CONST` of a code constant
         // goes through `constant_at` below.
         //
-        // Defensive: the compiler does not emit that shape, and both routes into
-        // here are narrow.  `load_const_value` is entered either from the trait
-        // default `constant_at` — which `PyFrame`, the only implementor,
-        // overrides — or from `opcode_load_const` by way of
-        // `OpcodeStepExecutor::load_const`, which no caller in the tree invokes
-        // today, though `opcode_load_const` is registered as a JIT call target.
+        // Defensive: the compiler does not emit that shape.  Nested code
+        // constants reach here from `opcode_load_const` /
+        // `OpcodeStepExecutor::load_const` (no caller in the tree today,
+        // though `opcode_load_const` is registered as a JIT call target).
         // So the copy this makes is not on a measured path; see
         // `box_code_constant` for why removing it is not worth its price.
         Ok(crate::pycode::box_code_constant(code))

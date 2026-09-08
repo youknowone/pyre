@@ -1573,6 +1573,55 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "gc_roots::RootScope::get",
         scope_get,
     );
+    pa2(
+        &mut entries,
+        "pyre_object::gc_roots::publish_one_at",
+        "gc_roots::publish_one_at",
+        pyre_object::gc_roots::publish_one_at,
+    );
+    let root_scope_drop_in_place: unsafe fn(*mut pyre_object::gc_roots::RootScope) =
+        pyre_object::gc_roots::root_scope_drop_in_place;
+    upa1(
+        &mut entries,
+        "gc_roots::RootScope::drop_in_place",
+        "pyre_object::gc_roots::RootScope::drop_in_place",
+        root_scope_drop_in_place,
+    );
+    let w_dict_setitem_str_hashed_w: unsafe fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+        pyre_object::PyObjectRef,
+    ) = pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w;
+    upa4(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w",
+        "pyre_object::w_dict_setitem_str_hashed_w",
+        w_dict_setitem_str_hashed_w,
+    );
+    let w_dict_getitem_str_hashed_w: unsafe fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef = pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w;
+    upa3(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w",
+        "pyre_object::w_dict_getitem_str_hashed_w",
+        w_dict_getitem_str_hashed_w,
+    );
+    pa2(
+        &mut entries,
+        "pyre_object::gc_roots::get_at",
+        "gc_roots::get_at",
+        pyre_object::gc_roots::get_at,
+    );
+    pa3(
+        &mut entries,
+        "pyre_object::gc_roots::normalize_at",
+        "gc_roots::normalize_at",
+        pyre_object::gc_roots::normalize_at,
+    );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
     // state the tracer cannot model (the `pin_root` / `try_gc_write_barrier`
@@ -5402,6 +5451,45 @@ mod tests {
             "these wrapper descriptors cannot join the BuiltinCode.func PBC \
              family, so they get no jitcode: {stray:?}",
         );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_dict_setitem_str_hashed_w() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w"],
+            expected,
+        );
+        let drop_expected =
+            pyre_object::gc_roots::root_scope_drop_in_place as *const () as usize as i64;
+        assert_eq!(
+            bindings["gc_roots::RootScope::drop_in_place"],
+            drop_expected,
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_dict_getitem_str_hashed_w() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w"],
+            expected,
+        );
+        assert_eq!(bindings["pyre_object::w_dict_getitem_str_hashed_w"], expected);
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_root_scope_publish_one() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = pyre_object::gc_roots::publish_one_at as *const () as usize as i64;
+        assert_eq!(bindings["pyre_object::gc_roots::publish_one_at"], expected,);
+        assert_eq!(bindings["gc_roots::publish_one_at"], expected);
+        let normalize = pyre_object::gc_roots::normalize_at as *const () as usize as i64;
+        assert_eq!(bindings["pyre_object::gc_roots::normalize_at"], normalize);
     }
 
     #[test]
