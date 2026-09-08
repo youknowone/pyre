@@ -133,7 +133,6 @@ KNOWN_SKIPS = {
     "test.test__interpchannels": "CPython subinterpreter API; PyPy has no owner",
     "test.test__interpreters": "CPython subinterpreter API; PyPy has no owner",
     "test.test_crossinterp": "CPython subinterpreter API; PyPy has no owner",
-    "test.test_free_threading": "CPython free-threading internals",
     "test.test_thread_local_bytecode": "CPython specializing-interpreter internals",
     "test.test_generated_cases": "CPython bytecode case generator",
     "test.test_optimizer": "CPython specializing optimizer",
