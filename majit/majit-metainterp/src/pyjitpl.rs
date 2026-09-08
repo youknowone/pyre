@@ -21530,9 +21530,6 @@ mod metainterp_static_data_tests {
             fn loop_header_pc(&self) -> usize {
                 0
             }
-            fn fail_args(&self) -> Option<Vec<OpRef>> {
-                None
-            }
         }
         assert!(matches!(
             meta.interpret(&mut Sym, 0),
@@ -21584,9 +21581,6 @@ mod metainterp_static_data_tests {
                 }
                 fn loop_header_pc(&self) -> usize {
                     0
-                }
-                fn fail_args(&self) -> Option<Vec<OpRef>> {
-                    None
                 }
             }
             assert!(matches!(
