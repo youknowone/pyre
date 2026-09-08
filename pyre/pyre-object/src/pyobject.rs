@@ -4,9 +4,8 @@
 //! Concrete types (W_IntObject, W_BoolObject, etc.) embed this header as their
 //! first field, enabling safe pointer casts between `*mut PyObject` and typed pointers.
 
-use parking_lot::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 
 /// Type descriptor for Python objects — corresponds to RPython's OBJECT_VTABLE
 /// (rclass.py:167-174).
@@ -293,37 +292,32 @@ pub unsafe fn ll_type(obj: PyObjectRef) -> *const PyType {
 /// the arguments and the call cannot raise.
 ///
 /// # Safety
-/// Both pointers must be non-null pointers to static `PyType`s.
+/// Both pointers must be non-null pointers to static `PyType`s whose startup
+/// publication has completed before the calling thread begins reading them.
 #[majit_macros::elidable_cannot_raise]
 #[inline]
 pub unsafe fn ll_issubclass(subcls: *const PyType, cls: *const PyType) -> bool {
     let subcls = unsafe { &*subcls };
     let cls = unsafe { &*cls };
-    // Seqlock read: a concurrent one-time batch re-stamp must not be observed
-    // half-applied, or `cls`/`subcls` could temporarily carry ranges from
-    // different completed batches.
-    subclass_range_read(|| {
-        let cls_min = cls.subclassrange_min.load(Ordering::Relaxed);
-        let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
-        let cls_max = cls.subclassrange_max.load(Ordering::Relaxed);
-        // int_between(a, b, c) ≡ a <= b < c
-        cls_min <= subcls_min && subcls_min < cls_max
-    })
+    // rclass.py ll_issubclass: startup has published the immutable vtables
+    // before any reader runs. No runtime writer can restamp their numbering.
+    let cls_min = cls.subclassrange_min.load(Ordering::Relaxed);
+    let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
+    let cls_max = cls.subclassrange_max.load(Ordering::Relaxed);
+    // int_between(a, b, c) ≡ a <= b < c
+    cls_min <= subcls_min && subcls_min < cls_max
 }
 
 /// rclass.py `ll_issubclass_const(subcls, minid, maxid)`.
 ///
 /// Variant of `ll_issubclass` where the class bounds are already known
 /// constants. Used by the JIT when the target class is constant-folded.
+/// The caller must have completed vtable startup publication.
 #[inline]
 pub fn ll_issubclass_const(subcls: &PyType, minid: i64, maxid: i64) -> bool {
-    // Seqlock read: `minid`/`maxid` are baked from one numbering, so
-    // `subcls_min` must be read from a matching (fully-published) batch.
-    subclass_range_read(|| {
-        let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
-        // int_between(a, b, c) ≡ a <= b < c
-        minid <= subcls_min && subcls_min < maxid
-    })
+    let subcls_min = subcls.subclassrange_min.load(Ordering::Relaxed);
+    // int_between(a, b, c) ≡ a <= b < c
+    minid <= subcls_min && subcls_min < maxid
 }
 
 /// rclass.py `ll_isinstance(obj, cls)`.
@@ -384,81 +378,9 @@ pub unsafe fn ll_inst_type(obj: PyObjectRef) -> *const PyType {
 ///
 /// Uses `Relaxed` ordering: ranges are written once at init time
 /// before any concurrent reads.
-pub fn assign_subclass_range(tp: &PyType, min: i64, max: i64) {
+fn assign_subclass_range(tp: &PyType, min: i64, max: i64) {
     tp.subclassrange_min.store(min, Ordering::Relaxed);
     tp.subclassrange_max.store(max, Ordering::Relaxed);
-}
-
-/// Sequence lock (seqlock) guarding the batch (re)stamping of the static
-/// `subclassrange_{min,max}` fields. Full interpreter startup publishes the
-/// registration-ordered `TotalOrderSymbolic` numbering; GC only verifies it.
-/// Object-only unit tests can also seed a partial alias set, so their later
-/// full publication must not expose a partially written batch to readers.
-///
-/// A seqlock, not a mutex/rwlock, because this is free-threaded (`nogil`):
-/// the writes happen once at startup while `ll_issubclass` is a hot,
-/// concurrently-read path.  Optimistic readers touch only `SUBCLASS_RANGE_SEQ`
-/// with plain loads (no read-side atomic RMW), so once startup publication
-/// settles and the sequence stops changing, concurrent readers share that
-/// cache line read-only with no cross-core contention.  Even = stable,
-/// odd = a batch write is in flight.
-static SUBCLASS_RANGE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Serializes the (rare, one-time) writers against each other so the seqlock
-/// parity stays well-formed; readers never touch it.
-static SUBCLASS_RANGE_WRITER_LOCK: Mutex<()> = Mutex::new(());
-
-/// RAII write section for a batch subclass-range update. Held by
-/// `compute_subclass_ranges_from_hierarchy` for the whole batch; GC rebuilds
-/// validate published ranges and do not enter it. Entering makes the sequence
-/// odd (optimistic readers retry), dropping publishes the writes and makes it
-/// even again.
-pub struct SubclassRangeWriteGuard {
-    _writers: parking_lot::MutexGuard<'static, ()>,
-    seq: u64,
-}
-
-/// Enter a subclass-range write section (see [`SubclassRangeWriteGuard`]).
-pub fn subclass_range_write_guard() -> SubclassRangeWriteGuard {
-    let writers = SUBCLASS_RANGE_WRITER_LOCK.lock();
-    // Serialized by the writer lock, so this load/store pair is race-free.
-    let seq = SUBCLASS_RANGE_SEQ.load(Ordering::Relaxed).wrapping_add(1);
-    SUBCLASS_RANGE_SEQ.store(seq, Ordering::Relaxed);
-    std::sync::atomic::fence(Ordering::Release);
-    SubclassRangeWriteGuard {
-        _writers: writers,
-        seq,
-    }
-}
-
-impl Drop for SubclassRangeWriteGuard {
-    fn drop(&mut self) {
-        // Publish the batch, then leave the write section (sequence even).
-        std::sync::atomic::fence(Ordering::Release);
-        SUBCLASS_RANGE_SEQ.store(self.seq.wrapping_add(1), Ordering::Release);
-    }
-}
-
-/// Optimistic seqlock read: run `read` (which loads the relevant
-/// `subclassrange_*` atomics) and retry until it lands in a window with no
-/// concurrent batch write, so the returned value reflects one coherent
-/// numbering.  In steady state (sequence stable) this is two plain loads of
-/// `SUBCLASS_RANGE_SEQ` plus one acquire fence — no read-side RMW.
-#[inline]
-fn subclass_range_read<T>(read: impl Fn() -> T) -> T {
-    loop {
-        let seq1 = SUBCLASS_RANGE_SEQ.load(Ordering::Acquire);
-        if seq1 & 1 != 0 {
-            std::hint::spin_loop();
-            continue;
-        }
-        let value = read();
-        std::sync::atomic::fence(Ordering::Acquire);
-        let seq2 = SUBCLASS_RANGE_SEQ.load(Ordering::Relaxed);
-        if seq1 == seq2 {
-            return value;
-        }
-    }
 }
 
 /// One static `PyType` alias for an `rclass.OBJECT` typeid.
@@ -779,23 +701,18 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (CFFI_HIERARCHY_FIRST_TYPE_ID + 12, Some(0)),
 ];
 
-/// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
+/// Compute subclass IDs from the active hierarchy and write every
 /// supplied PyType alias via `assign_subclass_range`.
 ///
 /// This mirrors RPython `TotalOrderSymbolic.compute_fn`
-/// (`normalizecalls.py:302-354`): build each reversed-MRO witness, add its
+/// (`normalizecalls.py`): build each reversed-MRO witness, add its
 /// Min and `witness + [MAX]` peers, lexicographically sort all peers, then
 /// assign their 0-based `enumerate()` positions. The root Min peer is 0.
 ///
-/// Pyre's interpreter-only paths (tests + `run_exec_frame`) skip the
-/// JIT init that normally seeds ranges via `gc.subclass_range`, so
-/// without this helper `ll_isinstance(obj, &EXCEPTION_TYPE)` returns
-/// false (every range stays at the static `0` default). Callers must
-/// invoke this once at startup before any `is_exception` /
-/// `ll_isinstance` call (typically from `init_typeobjects` on the
-/// interpreter side). The GC consumes the same hierarchy and verifies its
-/// ranges against the publication; it does not write them back.
-pub fn compute_subclass_ranges_from_hierarchy(
+/// Private writer called only inside the startup publication gate, before
+/// any `is_exception` / `ll_isinstance` reader. Interpreter-only and GC-first
+/// startup share that gate; GC verifies the result without writing it back.
+fn compute_subclass_ranges_from_hierarchy(
     hierarchy: &[(u32, Option<u32>)],
     alias_chains: &[&[SubclassRangeAlias]],
 ) {
@@ -857,10 +774,8 @@ pub fn compute_subclass_ranges_from_hierarchy(
         }
     }
 
-    // Serialize initializers and publish the batch atomically w.r.t.
-    // seqlock readers. The object-first/full-interpreter extension still
-    // needs this protocol; GC reconstruction is no longer a writer.
-    let _range_guard = subclass_range_write_guard();
+    // Only the publication OnceLock calls this writer. Readers start after
+    // that gate completes; GC reconstruction never writes these fields.
     for aliases in alias_chains {
         for alias in *aliases {
             let range = ranges
@@ -876,13 +791,6 @@ pub fn compute_subclass_ranges_from_hierarchy(
     }
 }
 
-/// Seed standalone tests from the complete object-model census. Production
-/// startup supplies its active hierarchy through the full publication owner.
-#[cfg(test)]
-fn compute_subclass_ranges_from(alias_chains: &[&[SubclassRangeAlias]]) {
-    compute_subclass_ranges_from_hierarchy(SUBCLASS_RANGE_HIERARCHY, alias_chains);
-}
-
 /// Publication gate shared by full interpreter startup and the standalone
 /// object unit-test initializer. There is no object-only runtime fallback:
 /// production readers follow `typedef::init_subclass_ranges`, which supplies
@@ -894,37 +802,25 @@ static SUBCLASS_RANGES_INIT: OnceLock<()> = OnceLock::new();
 /// reads values prebuilt by `ClassRepr.fill_vtable_root` without a lazy call.
 #[cfg(test)]
 pub(crate) fn ensure_object_subclass_ranges_initialized() {
-    SUBCLASS_RANGES_INIT.get_or_init(|| {
-        let aliases = all_subclass_range_aliases();
-        compute_subclass_ranges_from(&[&aliases]);
-    });
+    let aliases = all_subclass_range_aliases();
+    initialize_subclass_ranges_from_hierarchy(SUBCLASS_RANGE_HIERARCHY, &[&aliases]);
 }
 
-/// Publish the interpreter's complete alias set, coordinating with the
-/// object-only lazy initializer. The interpreter calls this through its
-/// own once gate; GC construction only verifies the resulting vtables.
+/// Publish all vtable ranges once, before starting any readers. Every caller
+/// in a process must supply the same complete hierarchy and alias census.
+/// Standalone object unit tests have their own process and seed only that
+/// binary's aliases; partial-to-full extension is deliberately unsupported.
 ///
-/// Rust startup boundary for rclass.py `ClassRepr.fill_vtable_root`:
-/// if full initialization wins, lazy readers wait for that publication.
-/// If the object-only initializer wins, wait for it BEFORE extending the
-/// aliases. Setting a marker after writing would let an in-flight lazy
-/// initializer overwrite the full publication afterwards.
-///
-/// The object-first extension still needs the existing seqlock. This is
-/// not yet proof that every alias has exactly one writer: removing the
-/// partial-init path remains part of #346's immutable-vtable cutover.
+/// Startup adaptation of rclass.py `ClassRepr.fill_vtable_root`: the OnceLock
+/// publishes the entire batch, and repeated/concurrent startup calls wait for
+/// it without ever restamping a live vtable. Raw writer helpers are private.
 pub fn initialize_subclass_ranges_from_hierarchy(
     hierarchy: &[(u32, Option<u32>)],
     alias_chains: &[&[SubclassRangeAlias]],
 ) {
-    let mut published_full = false;
     SUBCLASS_RANGES_INIT.get_or_init(|| {
         compute_subclass_ranges_from_hierarchy(hierarchy, alias_chains);
-        published_full = true;
     });
-    if !published_full {
-        compute_subclass_ranges_from_hierarchy(hierarchy, alias_chains);
-    }
 }
 
 #[cfg(test)]
@@ -935,22 +831,21 @@ mod subclass_range_publication_tests {
 
     #[test]
     fn initialization_orders_use_one_gate() {
-        // The once gate and real vtables are process-global. Isolate each
-        // order rather than resetting state beneath other test threads.
-        for order in ["full-first", "object-first", "concurrent"] {
+        // Each binary has one complete census, never a partial-to-full update.
+        for mode in ["full", "object", "concurrent"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "pyobject::subclass_range_publication_tests::publication_child",
                     "--nocapture",
                 ])
-                .env(CHILD_MODE, order)
+                .env(CHILD_MODE, mode)
                 .output()
-                .expect("run isolated publication order");
+                .expect("run isolated publication");
+            let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
-                output.status.success(),
-                "{order}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
+                output.status.success() && stdout.contains("1 passed"),
+                "{mode}: {stdout}{}",
                 String::from_utf8_lossy(&output.stderr),
             );
         }
@@ -958,68 +853,60 @@ mod subclass_range_publication_tests {
 
     #[test]
     fn publication_child() {
-        let Ok(order) = std::env::var(CHILD_MODE) else {
-            return; // Invoked by initialization_orders_use_one_gate above.
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            return; // Invoked by initialization_orders_use_one_gate.
         };
-        assert_eq!(SUBCLASS_RANGE_SEQ.load(Ordering::Relaxed), 0);
-        // A second alias for the root models the interpreter-owned aliases
-        // absent from object-only initialization, without depending upward
-        // on pyre-interpreter or inventing a second hierarchy.
+        assert!(SUBCLASS_RANGES_INIT.get().is_none());
         static EXTRA_ALIAS: PyType = new_pytype("extra_publication_alias");
         let object_aliases = all_subclass_range_aliases();
         let extra = [subclass_range_alias(0, &EXTRA_ALIAS)];
-        // Model a configuration omitting an interpreter-only tail class.
-        // An object-only write AFTER full publication would now visibly
-        // overwrite the root's maxid with a different value.
-        let full_hierarchy = &SUBCLASS_RANGE_HIERARCHY[..SUBCLASS_RANGE_HIERARCHY.len() - 1];
-        let omitted = SUBCLASS_RANGE_HIERARCHY.last().unwrap().0;
-        assert!(object_aliases.iter().all(|alias| alias.type_id != omitted));
-        if order == "object-first" {
+        if mode == "object" {
             ensure_object_subclass_ranges_initialized();
-            assert_eq!(EXTRA_ALIAS.subclassrange_max.load(Ordering::Relaxed), 0);
-        }
-        if order == "concurrent" {
-            let start = std::sync::Barrier::new(2);
-            std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    start.wait();
-                    ensure_object_subclass_ranges_initialized();
-                });
-                start.wait();
-                initialize_subclass_ranges_from_hierarchy(
-                    full_hierarchy,
-                    &[&object_aliases, &extra],
-                );
-            });
+            ensure_object_subclass_ranges_initialized();
+            assert!(unsafe { ll_issubclass(&BOOL_TYPE, &INT_TYPE) });
         } else {
-            assert!(order == "full-first" || order == "object-first");
-            initialize_subclass_ranges_from_hierarchy(full_hierarchy, &[&object_aliases, &extra]);
+            // A full configuration can omit an interpreter-only tail class.
+            let hierarchy = &SUBCLASS_RANGE_HIERARCHY[..SUBCLASS_RANGE_HIERARCHY.len() - 1];
+            let omitted = SUBCLASS_RANGE_HIERARCHY.last().unwrap().0;
+            assert!(object_aliases.iter().all(|alias| alias.type_id != omitted));
+            let initialize_and_read = || {
+                initialize_subclass_ranges_from_hierarchy(hierarchy, &[&object_aliases, &extra]);
+                assert_eq!(
+                    EXTRA_ALIAS.subclassrange_max.load(Ordering::Relaxed),
+                    (hierarchy.len() * 2 - 1) as i64,
+                );
+                assert!(unsafe { ll_issubclass(&INSTANCE_TYPE, &EXTRA_ALIAS) });
+                assert!(ll_issubclass_const(
+                    &EXTRA_ALIAS,
+                    0,
+                    (hierarchy.len() * 2 - 1) as i64
+                ));
+            };
+            if mode == "concurrent" {
+                let start = std::sync::Barrier::new(4);
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        scope.spawn(|| {
+                            start.wait();
+                            initialize_and_read();
+                        });
+                    }
+                });
+            } else {
+                assert_eq!(mode, "full");
+                initialize_and_read();
+            }
+            initialize_and_read();
         }
+        assert!(SUBCLASS_RANGES_INIT.get().is_some());
+        let before = INSTANCE_TYPE.subclassrange_max.load(Ordering::Relaxed);
+        // Deliberately invalid input after publication: if the private writer
+        // runs again, the alias has no hierarchy entry and this call panics.
+        // Unlike a proxy counter, this detects actual recomputation.
+        initialize_subclass_ranges_from_hierarchy(&[], &[&extra]);
         assert_eq!(
-            EXTRA_ALIAS.subclassrange_min.load(Ordering::Relaxed),
-            INSTANCE_TYPE.subclassrange_min.load(Ordering::Relaxed),
-        );
-        assert_eq!(
-            EXTRA_ALIAS.subclassrange_max.load(Ordering::Relaxed),
             INSTANCE_TYPE.subclassrange_max.load(Ordering::Relaxed),
-        );
-        assert_eq!(
-            EXTRA_ALIAS.subclassrange_max.load(Ordering::Relaxed),
-            (full_hierarchy.len() * 2 - 1) as i64,
-        );
-        let published_sequence = SUBCLASS_RANGE_SEQ.load(Ordering::Relaxed);
-        match order.as_str() {
-            "full-first" => assert_eq!(published_sequence, 2),
-            "object-first" => assert_eq!(published_sequence, 4),
-            "concurrent" => assert!(published_sequence == 2 || published_sequence == 4),
-            _ => unreachable!(),
-        }
-        // The actual write-section sequence, not a new proxy counter:
-        // late object-only calls must not enter any write section.
-        ensure_object_subclass_ranges_initialized();
-        assert_eq!(
-            SUBCLASS_RANGE_SEQ.load(Ordering::Relaxed),
-            published_sequence
+            before
         );
     }
 }

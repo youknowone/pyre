@@ -3849,9 +3849,10 @@ impl Repr for InstanceRepr {
         // getfield+int_between helper that reads the ranges off the PyType
         // ptr, mirroring `ll_isinstance` (rclass.py) on the pyre
         // `PyObject`/`PyType` structs. The class arg (`&EXCEPTION_TYPE`) is
-        // an opaque host-address `_ptr` whose ranges are re-stamped at
-        // runtime under a seqlock, so it is read at runtime rather than
-        // const-folded through `make_ll_isinstance`.
+        // an opaque host-address `_ptr`, not an annotator-owned prebuilt
+        // vtable, so it is read at runtime rather than const-folded through
+        // `make_ll_isinstance`. Ranges are now once-published: the remaining
+        // blocker is prebuilt representation, not runtime renumbering.
         let r_cls = hop.args_r.borrow().get(1).cloned().flatten();
         if let Some(r_cls) = &r_cls {
             let cls_is_pytype = (r_cls.as_ref() as &dyn std::any::Any)

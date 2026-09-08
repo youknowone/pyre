@@ -2565,13 +2565,13 @@ pub fn translate_op(
                         ]);
                     }
                     // `ll_issubclass(subcls, cls)` / `ll_isinstance(obj, cls)`
-                    // (`pyre-object/src/pyobject.rs`, ports of `rclass.py:1133`
-                    // / `:1143`).  Their bodies read `subclassrange_{min,max}`
-                    // through a pyre-only seqlock (`subclass_range_read` over
-                    // `SUBCLASS_RANGE_SEQ`, an adaptation for the two-pass
-                    // startup renumbering that has no upstream analog); tracing
-                    // into that body stalls at the unmodellable static load.
-                    // Upstream never lets the JIT see the call: the rtyper
+                    // (`pyre-object/src/pyobject.rs`, ports of rclass.py
+                    // ll_issubclass / ll_isinstance).
+                    // PRE-EXISTING-ADAPTATION: runtime reads now follow the
+                    // once-published vtable directly. #346 still needs to
+                    // replace this call-site rewrite with ordinary helper
+                    // translation, together with cutover's body exclusion.
+                    // Upstream's rtyper
                     // lowers `issubtype`/`isinstance` to `ll_issubclass`/
                     // `ll_isinstance` and the inliner folds the helper into a
                     // single `int_between` over the immutable vtable fields
@@ -2580,7 +2580,7 @@ pub fn translate_op(
                     // recognised call back into the high-level operation, so
                     // `ClassRepr.rtype_issubtype` (`rclass.rs`) /
                     // `InstanceRepr.rtype_isinstance` (`rclass.rs`) emit
-                    // the seqlock-free `int_between` helper the same as a
+                    // the `int_between` helper the same as a
                     // Python-level `issubtype`/`isinstance`.
                     if segments.len() >= 2 && segments[segments.len() - 2] == "pyobject" {
                         let leaf = segments[segments.len() - 1].as_str();
@@ -6323,8 +6323,8 @@ mod tests {
     fn translate_op_ll_issubclass_call_rewrites_to_issubtype() {
         // `ll_issubclass(subcls, cls)` (rclass.py) must be recognised
         // and rewritten to the flowspace `issubtype` op so the rtyper lowers
-        // it to `int_between` over the immutable subclassrange fields, rather
-        // than tracing into the pyre-only seqlock body.
+        // it to `int_between` over the immutable subclassrange fields. This
+        // pins the existing rewrite until ordinary helper translation replaces it.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 4);
@@ -6368,7 +6368,7 @@ mod tests {
     #[test]
     fn translate_op_ll_isinstance_call_rewrites_to_isinstance() {
         // `ll_isinstance(obj, cls)` (rclass.py) recognised and rewritten
-        // to the flowspace `isinstance` op — same seqlock-free lowering path.
+        // to the flowspace `isinstance` op — same existing helper rewrite.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 4);

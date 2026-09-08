@@ -1915,8 +1915,7 @@ pub fn standard_exc_instance(kind: ExcKind) -> PyObjectRef {
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_exception(obj: PyObjectRef) -> bool {
-    // `ll_issubclass` reads the ranges under the seqlock, so a concurrent
-    // one-time batch re-stamp cannot make this spuriously false.
+    // rclass.py ll_isinstance reads the once-published vtable directly.
     unsafe { ll_isinstance(obj, &EXCEPTION_TYPE) }
 }
 

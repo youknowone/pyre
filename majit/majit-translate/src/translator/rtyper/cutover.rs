@@ -2039,21 +2039,18 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             continue;
         }
         // The `pyobject::ll_issubclass` / `ll_issubclass_const` / `ll_isinstance`
-        // runtime helpers and their shared `subclass_range_read` seqlock body
-        // are never lifted: `flowspace_adapter::translate_op` rewrites every
+        // runtime helpers remain excluded while `flowspace_adapter::translate_op` rewrites
         // `ll_issubclass`/`ll_isinstance` call site into the high-level
         // `issubtype`/`isinstance` op, which the rtyper lowers to a fresh
         // `int_between`-over-`subclassrange` helper graph
-        // (`lowlevel_issubclass_helper_graph`, the `rclass.py:1133` body).  The
-        // pyre-object bodies additionally read `SUBCLASS_RANGE_SEQ` through a
-        // startup-only seqlock (an adaptation with no upstream analog) that the
-        // tracer cannot model; with all call sites rewritten these graphs are
-        // dead, so skip registering them rather than record a poison lift-error
-        // (the same shape as the `malloc_typed` skip above).
+        // (`lowlevel_issubclass_helper_graph`, rclass.py ll_issubclass).
+        // PRE-EXISTING-ADAPTATION: the runtime seqlock has been removed;
+        // #346 must next close ordinary helper translation and retire this
+        // call-site rewrite/body exclusion together. No synchronization
+        // obstacle remains to justify keeping it permanently.
         if canonical_strip == ["pyobject", "ll_issubclass"]
             || canonical_strip == ["pyobject", "ll_issubclass_const"]
             || canonical_strip == ["pyobject", "ll_isinstance"]
-            || canonical_strip == ["pyobject", "subclass_range_read"]
         {
             crate::decline::record(
                 REGISTRY_GATE,
