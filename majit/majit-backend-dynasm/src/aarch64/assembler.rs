@@ -21,7 +21,7 @@ pub(crate) type Assembler = dynasmrt::VecAssembler<dynasmrt::aarch64::Aarch64Rel
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
-use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type};
+use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
 use crate::codebuf;
@@ -497,7 +497,7 @@ pub struct AssemblerARM64<'a> {
     inputargs: &'a [InputArg],
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
-    operations: &'a [Op],
+    operations: &'a [OpRc],
     /// `arg.index` raw -> idx in inputargs, sentinel
     /// [`OpTypeIndex::NO_POS`] for unset slots. Mirrors
     /// `OpTypeIndex::inputarg_pos`.
@@ -749,7 +749,7 @@ impl<'a> AssemblerARM64<'a> {
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
         inputargs: &'a [InputArg],
-        operations: &'a [Op],
+        operations: &'a [OpRc],
     ) -> Self {
         let inputarg_pos = OpTypeIndex::<Op>::build_inputarg_pos(inputargs);
         let op_pos = OpTypeIndex::build_op_pos(operations);
@@ -2074,7 +2074,7 @@ impl<'a> AssemblerARM64<'a> {
     /// old frame-slot model where every value went through [rbp+offset].
     fn _assemble(&mut self, emit_prologue: bool) -> Result<(), BackendError> {
         let inputargs: &'a [InputArg] = self.inputargs;
-        let ops: &'a [Op] = self.operations;
+        let ops: &'a [OpRc] = self.operations;
         self.short_guard_branch_offsets.clear();
         self.guard_reach_violations.clear();
         self.unrelocated_jump_target = None;
@@ -2338,7 +2338,7 @@ impl<'a> AssemblerARM64<'a> {
         arglocs: &[Loc],
         result_loc: Option<&Loc>,
         fail_index: u32,
-        ops: &[Op],
+        ops: &[OpRc],
     ) {
         // Only an ADJACENT comparison/guard pair may share NZCV; anything
         // emitted in between invalidates the record (the comparison arms
@@ -5387,7 +5387,7 @@ impl<'a> AssemblerARM64<'a> {
     /// assembler.py _store_force_index: before a call that may force,
     /// store the next GUARD_NOT_FORCED's fail descr ptr to jf_force_descr,
     /// and zero jf_descr so GUARD_NOT_FORCED's CMP [jf_descr], 0 starts clean.
-    fn _store_force_index_if_next_guard(&mut self, ops: &[Op], op_idx: usize, fail_index: u32) {
+    fn _store_force_index_if_next_guard(&mut self, ops: &[OpRc], op_idx: usize, fail_index: u32) {
         // assembler.py _find_nearby_operation(+1)
         let next_idx = op_idx + 1;
         if next_idx >= ops.len() {

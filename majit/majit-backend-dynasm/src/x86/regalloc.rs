@@ -347,7 +347,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let argloc = self.loc(arg, Type::Int);
-        let ops_ref: &[Op] = self.operations;
+        let ops_ref: &[OpRc] = self.operations;
         let resloc = self.force_allocate_reg_or_cc(dst, ops_ref, i);
         self.perform(i, vec![argloc], Some(resloc), output);
     }

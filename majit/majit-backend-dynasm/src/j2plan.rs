@@ -173,11 +173,11 @@ pub(crate) struct TracePlan {
 impl TracePlan {
     /// Production lowering entry point. Register allocation uses only lowered
     /// operations, while reverse liveness is for diagnostics.
-    pub(crate) fn lower_ops(ops: &[Op]) -> Vec<LirOp> {
-        ops.iter().map(lower_op).collect()
+    pub(crate) fn lower_ops<T: AsRef<Op>>(ops: &[T]) -> Vec<LirOp> {
+        ops.iter().map(|op| lower_op(op.as_ref())).collect()
     }
 
-    pub(crate) fn build(inputargs: &[InputArg], ops: &[Op]) -> Self {
+    pub(crate) fn build<T: AsRef<Op>>(inputargs: &[InputArg], ops: &[T]) -> Self {
         let lowered = Self::lower_ops(ops);
         let live_points = compute_live_points(&lowered);
         let max_live = live_points

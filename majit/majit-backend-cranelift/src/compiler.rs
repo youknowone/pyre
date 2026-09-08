@@ -9249,10 +9249,14 @@ impl CraneliftBackend {
         inject_builtin_string_descrs(&mut normalized);
         {
             let rewriter = self.gc_rewriter();
+            // The rewriter takes/returns `OpRc`; cranelift still owns a
+            // `Vec<Op>` past this boundary, so wrap and unwrap here.
+            let boxed: Vec<OpRc> = normalized.into_iter().map(OpRc::new).collect();
             // The rewriter takes the typed `Const` pool directly; each box
             // variant carries its own type (`Const::get_type`).
             let (result, new_constants, gcrefs) =
-                rewriter.rewrite_for_gc_with_constants(&normalized, constants);
+                rewriter.rewrite_for_gc_with_constants(&boxed, constants);
+            let result: Vec<Op> = result.iter().map(|rc| (**rc).clone()).collect();
             // rewrite.py creates fresh ConstInt boxes for sizes, offsets
             // and helper addresses; `new_constants` is the full typed pool.
             // Pre-existing keys `or_insert`-no-op, keeping their original

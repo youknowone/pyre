@@ -17,7 +17,7 @@ use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 // `gc_sync` hands out the concrete collector; the trait must be in scope for
 // its methods to resolve on that type.
 use majit_gc::GcAllocator;
-use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, OpRef, Type, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
@@ -2039,35 +2039,32 @@ impl DynasmBackend {
     fn prepare_ops_for_compile(
         &mut self,
         inputargs: &[InputArg],
-        ops: &[Op],
-    ) -> (Vec<Op>, Vec<GcRef>) {
+        ops: &[OpRc],
+    ) -> (Vec<OpRc>, Vec<GcRef>) {
         let num_inputs = inputargs.len() as u32;
-        let mut normalized: Vec<Op> = ops
-            .iter()
-            .enumerate()
-            .map(|(op_idx, op)| {
-                let n = op.clone();
-                if n.result_type() != Type::Void && n.pos.get().is_none() {
-                    let pos = num_inputs + op_idx as u32;
-                    n.pos.set(match n.result_type() {
-                        Type::Int => OpRef::int_op(pos),
-                        Type::Float => OpRef::float_op(pos),
-                        Type::Ref => OpRef::ref_op(pos),
-                        Type::Void => unreachable!("filtered above"),
-                    });
-                }
-                n
-            })
-            .collect();
+        // rewrite.py assemble_loop mutates the same ResOperation objects.
+        // `pos` and `descr` are interior-mutable, so the incoming `OpRc`
+        // identities stay shared with the optimizer — no `Op` clone.
+        for (op_idx, op) in ops.iter().enumerate() {
+            if op.result_type() != Type::Void && op.pos.get().is_none() {
+                let pos = num_inputs + op_idx as u32;
+                op.pos.set(match op.result_type() {
+                    Type::Int => OpRef::int_op(pos),
+                    Type::Float => OpRef::float_op(pos),
+                    Type::Ref => OpRef::ref_op(pos),
+                    Type::Void => unreachable!("filtered above"),
+                });
+            }
+        }
         // rewrite.py:489 parity: inject str_descr/unicode_descr for NEWSTR/NEWUNICODE
-        inject_builtin_string_descrs(&mut normalized);
+        inject_builtin_string_descrs(ops);
         {
             let rewriter = self.gc_rewriter();
             use majit_gc::GcRewriter;
             // The rewriter takes the typed `Const` pool directly; each box
             // variant carries its own type (`Const::get_type`).
             let (result, new_constants, gcrefs) =
-                rewriter.rewrite_for_gc_with_constants(&normalized, &self.constants);
+                rewriter.rewrite_for_gc_with_constants(ops, &self.constants);
             // `new_constants` is the full typed pool: the rewriter clones the
             // current pool and only appends fresh ConstInts (size/offset/
             // helper-address keys minted above the existing max index — see
@@ -2148,7 +2145,7 @@ impl DynasmBackend {
     /// the resolver as a IndexMap up front.
     fn collect_classptr_typeid_table(
         &self,
-        ops: &[Op],
+        ops: &[OpRc],
         const_pool: &majit_ir::ConstMap<majit_ir::Const>,
     ) -> indexmap::IndexMap<i64, u32> {
         let mut table = indexmap::IndexMap::new();
@@ -2192,7 +2189,7 @@ impl DynasmBackend {
     /// per-box side table.
     fn collect_classptr_subclass_range_table(
         &self,
-        ops: &[Op],
+        ops: &[OpRc],
     ) -> indexmap::IndexMap<i64, (i64, i64)> {
         let mut table = indexmap::IndexMap::new();
         if with_dynasm_active_gc(|_| ()).is_none() {
@@ -2465,18 +2462,12 @@ impl Backend for DynasmBackend {
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
-        // Deep-clone Op out of OpRc for the internal pipeline. Backend
-        // stages do not depend on shared `_forwarded` identity with the
-        // trace; the optimizer has already resolved forwarding by the
-        // time ops reach `compile_loop` (history.py:528 vs. the
-        // backend-emit `Vec<Op>` boundary).
-        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
         // gc.py rewrite_assembler parity: run GC rewriter before regalloc.
-        let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, &ops_owned);
+        let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, ops);
         // The assembler stores the typed `Const` pool directly; each box
         // variant carries its own type (`Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
@@ -2721,13 +2712,10 @@ impl Backend for DynasmBackend {
         if let Some(clt) = original_token.compiled_loop_token() {
             clt.compiling_a_bridge(&self.cpu_tracker);
         }
-        // Deep-clone Op out of OpRc for the internal pipeline (see
-        // compile_loop above for rationale).
-        let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
 
-        let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, &ops_owned);
+        let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, ops);
         // format_trace reads raw `i64` values; the assembler stores the
         // typed `Const` pool directly (type rides on `Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
@@ -4144,7 +4132,8 @@ mod tests {
     use majit_ir::descr::SimpleArrayDescr;
     use majit_ir::operand::Operand;
     use majit_ir::{
-        CallDescr, DescrRef, EffectInfo, ExtraEffect, InputArg, OopSpecIndex, OpCode, Type, Value,
+        CallDescr, DescrRef, EffectInfo, ExtraEffect, InputArg, OopSpecIndex, Op, OpCode, Type,
+        Value,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -5331,7 +5320,7 @@ fn builtin_string_hash_field_descr(opcode: majit_ir::OpCode) -> Option<majit_ir:
     }))
 }
 
-fn inject_builtin_string_descrs(ops: &mut [Op]) {
+fn inject_builtin_string_descrs(ops: &[OpRc]) {
     for op in ops {
         if op.has_descr() {
             continue;
