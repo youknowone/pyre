@@ -7794,7 +7794,17 @@ fn newstr_without_a_descr_injects_the_builtin_layout() {
     let (bytes, _, _) =
         codegen::build_wasm_module(&inputs).expect("Newstr without descr should inject and lower");
     validate_wasm(&bytes);
-    assert!(const_immediates(&bytes).contains(&0x22));
+    let immediates = const_immediates(&bytes);
+    assert!(
+        immediates.contains(&0x22),
+        "Newstr uses the array allocator"
+    );
+    let base_size = (2 * std::mem::size_of::<usize>() + 1) as i64;
+    let len_offset = std::mem::size_of::<usize>() as i64;
+    assert!(
+        immediates.contains(&base_size) && immediates.contains(&len_offset),
+        "the injected builtin str descr must supply the base size and length offset: {immediates:?}"
+    );
 }
 
 #[test]

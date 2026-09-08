@@ -1736,7 +1736,12 @@ pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
 /// Headerless nursery overflow helper. Returns the raw allocation base with
 /// no GC header, matching cranelift's `gc_alloc_nursery_headerless_shim`.
 pub extern "C" fn wasm_jit_alloc_headerless(size: i64) -> i64 {
-    let size = usize::try_from(size).unwrap_or(0);
+    let Ok(size) = usize::try_from(size) else {
+        return oom_signal_if_zero(0);
+    };
+    if size == 0 {
+        return oom_signal_if_zero(0);
+    }
     let size = size.saturating_add(7) & !7;
     let obj = with_wasm_active_gc_mut(|gc| {
         if let Some(base) = try_headerless_nursery_bump(gc, size) {
@@ -2026,35 +2031,28 @@ pub extern "C" fn wasm_jit_ca_reload_caller_frame() -> i64 {
         + majit_backend::jitframe::FIRST_ITEM_OFFSET as i64
 }
 
-/// Build the per-frame `jf_gcmap` for a CA callee frame: mark the input slots
-/// (at `FRAME_SLOT_BASE`) and the home slots (at `HOME_SLOT_BASE`), in the
-/// `JitFrame`'s Signed-granular item indexing (see [`build_home_gcmap`] for the
-/// wasm32 layout). The collector's `is_nursery_object_start` gate skips any
-/// marked slot that does not hold a live nursery object base, so a slot holding
-/// a scalar or an already-promoted Ref is traced harmlessly.
+/// Build the per-frame `jf_gcmap` for a CA callee frame: mark only the home
+/// slots, in the `JitFrame`'s Signed-granular item indexing (see
+/// [`build_home_gcmap`] for the wasm32 layout).
+///
+/// Ref inputs are copied into those homes in the callee prologue before any
+/// later allocation. `FRAME_SLOT_BASE` is the value/fail-arg area and is
+/// reused by guard spills, so a static bit there would offer the collector an
+/// integer. `is_nursery_object_start` is only `non-null && in nursery`, so
+/// that integer is copied as an object if it happens to land in range.
 ///
 /// Returned buffer is leaked by the caller (one per bridge) and lives for the
 /// program's life.
-fn build_callee_gcmap(
-    input_types: &[majit_ir::Type],
-    frame: codegen::FrameGeometry,
-) -> Box<[usize]> {
+fn build_callee_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;
-    let mut indices: Vec<usize> = Vec::with_capacity(input_types.len() + frame.home_slots);
-    for (i, &tp) in input_types.iter().enumerate() {
-        if tp == majit_ir::Type::Ref {
-            indices.push((codegen::FRAME_SLOT_BASE as usize + i * 8) / sign);
-        }
-    }
+    let mut indices: Vec<usize> = Vec::with_capacity(frame.home_slots);
     for h in 0..frame.home_slots {
         indices.push((frame.home_slot_base as usize + h * 8) / sign);
     }
     let max_index = indices.iter().copied().max().unwrap_or(0);
     // `wasm_jit_ca_alloc_frame` sets `jf_frame` from `ca_frame_bytes`, not the
-    // full geometry. Inputs and homes must therefore fit that actual item
-    // allocation; fail/deopt outputs live in the low value slots and are
-    // covered by the same bound.
+    // full geometry. Homes must therefore fit that actual item allocation.
     debug_assert!(
         max_index < frame.ca_frame_bytes as usize / sign,
         "CA gcmap exceeds the allocated JitFrame item area"
@@ -4370,9 +4368,7 @@ impl majit_backend::Backend for WasmBackend {
                     .find(|(target_token, _)| *target_token == token.number)
                     .map(|(_, target)| target.callee_gcmap_ptr)
             })
-            .unwrap_or_else(|| {
-                Box::leak(build_callee_gcmap(&compiled.input_types, compiled.frame)).as_ptr() as i64
-            });
+            .unwrap_or_else(|| Box::leak(build_callee_gcmap(compiled.frame)).as_ptr() as i64);
         // The module has now acquired its host-appended shared-table slot and
         // its finish index. Publish those mutable pieces before exposing the
         // immutable geometry metadata: previously compiled CALL_ASSEMBLER
@@ -5922,6 +5918,39 @@ mod tests {
             assert!((*(forwarded.0 as *const JitFrame)).jf_gcmap.is_null());
             assert_eq!((*(old.0 as *const JitFrame)).jf_gcmap, map.as_ptr().cast());
         }
+    }
+
+    fn gcmap_has_index(buf: &[usize], index: usize) -> bool {
+        let bits = usize::BITS as usize;
+        let word = 1 + index / bits;
+        word < buf.len() && buf[word] & (1usize << (index % bits)) != 0
+    }
+
+    #[test]
+    fn callee_gcmap_marks_homes_not_overwritable_input_slots() {
+        // FRAME_SLOT_BASE is the value/fail-arg area. A static gcmap bit there
+        // stays set after a guard spill overwrites the slot with an integer,
+        // and `is_nursery_object_start` is only a nursery range check.
+        let frame = codegen::FrameGeometry::compact(4, 2, 0);
+        let buf = build_callee_gcmap(frame);
+        let sign = std::mem::size_of::<isize>();
+        let input0 = codegen::FRAME_SLOT_BASE as usize / sign;
+        let home0 = frame.home_slot_base as usize / sign;
+        let home1 = (frame.home_slot_base as usize + 8) / sign;
+        assert!(
+            !gcmap_has_index(&buf, input0),
+            "Ref input slot {input0} must not stay marked; fail-arg spills reuse it"
+        );
+        assert!(gcmap_has_index(&buf, home0), "home 0 (item {home0})");
+        assert!(gcmap_has_index(&buf, home1), "home 1 (item {home1})");
+    }
+
+    #[test]
+    fn headerless_helper_rejects_non_positive_size() {
+        let gc = MiniMarkGC::new();
+        install_gc_box(Box::new(gc));
+        assert_eq!(wasm_jit_alloc_headerless(-1), 0);
+        assert_eq!(wasm_jit_alloc_headerless(0), 0);
     }
 
     #[test]

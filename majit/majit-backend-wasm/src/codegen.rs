@@ -3640,7 +3640,7 @@ fn aligned_nursery_size(payload: i64) -> Option<usize> {
 /// misaligned.
 fn aligned_varsize_frame_bump(size: i64) -> Option<u32> {
     let size = u32::try_from(size).ok()?;
-    Some(size.saturating_add(7) & !7)
+    Some(size.checked_add(7)? & !7)
 }
 
 const BUILTIN_STRING_HASH_OFFSET: usize = 0;
@@ -11961,6 +11961,12 @@ fn emit_unary_vi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aligned_varsize_frame_bump_rejects_u32_overflow() {
+        assert_eq!(aligned_varsize_frame_bump(20), Some(24));
+        assert_eq!(aligned_varsize_frame_bump(0xffff_fffc), None);
+    }
 
     #[test]
     fn peep_sink_applies_all_local_folds() {
