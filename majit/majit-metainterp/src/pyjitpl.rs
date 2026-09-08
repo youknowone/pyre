@@ -6854,18 +6854,43 @@ impl<M: Clone> MetaInterp<M> {
         self.last_exc_box = last_exc_box;
         self.last_exc_value = last_exc_value;
         // pyjitpl.py `_compile_and_run_once` `except SwitchToBlackhole`:
-        // `run_blackhole_interp_to_cancel_tracing` reads `self.framestack`.
-        // Stamp `MIFrame.pc` so `copy_data_from_miframe` resumes where the
-        // walk stopped (`blackhole.py`). Leave the stack on the MetaInterp;
-        // `aborted_framestack` is only the standalone walker's handoff.
+        // `run_blackhole_interp_to_cancel_tracing` reads the staged
+        // framestack. Stamp `MIFrame.pc` so `copy_data_from_miframe`
+        // resumes where the walk stopped (`blackhole.py`).
         if matches!(
             action,
             crate::TraceAction::Abort | crate::TraceAction::SwitchToBlackhole(_)
-        ) && let Some(top) = self.framestack.frames.last_mut()
-        {
-            top.pc = top.code_cursor;
+        ) {
+            self.publish_interpret_abort_framestack();
         }
         action
+    }
+
+    /// Hand the aborting `framestack` to the merge_point Abort arm as
+    /// `TraceCtx.aborted_framestack`.
+    ///
+    /// `publish_walk_abort_handoff` does this for the standalone
+    /// `JitCodeMachine`; `interpret()` walks `MetaInterp.framestack`
+    /// instead and must publish it itself. `MIFrame.pc` is set to
+    /// `code_cursor` so `copy_data_from_miframe` resumes where the walk
+    /// stopped (`blackhole.py`).
+    fn publish_interpret_abort_framestack(&mut self) {
+        if self.framestack.is_empty() {
+            return;
+        }
+        if let Some(top) = self.framestack.frames.last_mut() {
+            top.pc = top.code_cursor;
+        }
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        if ctx.aborted_framestack.is_some() {
+            return;
+        }
+        ctx.aborted_framestack = Some(std::mem::replace(
+            &mut self.framestack,
+            crate::pyjitpl::MIFrameStack::empty(),
+        ));
     }
 
     /// `pyjitpl.py MetaInterp.run_blackhole_interp_to_cancel_tracing`.
