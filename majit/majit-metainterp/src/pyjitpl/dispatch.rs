@@ -3262,7 +3262,11 @@ where
                         action,
                         ctx.num_recorded_ops(),
                         fr.code_cursor,
-                        fr.jitcode.code.get(fr.last_opcode_position).copied().unwrap_or(0xff),
+                        fr.jitcode
+                            .code
+                            .get(fr.last_opcode_position)
+                            .copied()
+                            .unwrap_or(0xff),
                         fr.jitcode.name(),
                     );
                 }

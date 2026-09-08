@@ -11637,6 +11637,12 @@ fn compile_and_run_once(
 
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     let mut propagated_exception = None;
+    // Residuals mutate the live PyFrame. If interpret aborts and the
+    // blackhole cannot finish the opcode (`BailToInterpreter`), restore
+    // this snapshot so the interpreter can replay the opcode. RPython
+    // never needs the snapshot: `convert_and_run_from_pyjitpl` always
+    // raises. pyre still has unbound residuals the blackhole declines.
+    let abort_snapshot = frame_root.frame().snapshot_for_tracing();
     // pyjitpl.py `_compile_and_run_once`: `interpret()` on the seeded
     // portal framestack.
     let outcome = driver.jit_merge_point_keyed(
@@ -11654,7 +11660,12 @@ fn compile_and_run_once(
                     ("<empty>".to_owned(), 0, 0u8)
                 } else {
                     let frame = meta.framestack.current_mut();
-                    let first = frame.jitcode.code.get(frame.code_cursor).copied().unwrap_or(0);
+                    let first = frame
+                        .jitcode
+                        .code
+                        .get(frame.code_cursor)
+                        .copied()
+                        .unwrap_or(0);
                     (frame.jitcode.name().to_owned(), frame.code_cursor, first)
                 };
                 eprintln!(
@@ -11665,7 +11676,7 @@ fn compile_and_run_once(
                     meta.trace_ctx().map(|c| c.num_recorded_ops()).unwrap_or(0),
                 );
             }
-            let action = meta.interpret(&mut portal_sym);
+            let action = meta.interpret(&mut portal_sym, target_pc);
             if majit_metainterp::majit_log_enabled() {
                 let (name, cursor) = if meta.framestack.is_empty() {
                     ("<empty>".to_owned(), 0)
@@ -11685,6 +11696,32 @@ fn compile_and_run_once(
             action
         },
     );
+    // pyjitpl.py:2910-2911 `except SwitchToBlackhole`:
+    // `run_blackhole_interp_to_cancel_tracing` →
+    // `convert_and_run_from_pyjitpl`. Residuals already mutated the
+    // live PyFrame; finishing the remaining jitcode in the blackhole
+    // is what makes `ContinueRunningNormally` safe. Returning to the
+    // interpreter at the same `last_instr` replays the opcode.
+    if let Some(bh_pc) = driver.run_pending_abort_blackhole(&mut jit_state, env) {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!("[interpret] abort blackhole resume_pc={bh_pc}");
+        }
+        if bh_pc != usize::MAX {
+            frame_root.frame().set_last_instr_from_next_instr(bh_pc);
+            correct_resume_vsd(frame_root.frame(), bh_pc);
+        } else {
+            // Blackhole declined a residual and bailed. The opcode is
+            // half-applied; rewind so replay is sound.
+            frame_root
+                .frame()
+                .restore_resume_state_from(&abort_snapshot);
+        }
+    } else if outcome.is_none() && !driver.has_compiled_loop(green_key) {
+        // Abort arm did not stage a blackhole. Rewind so replay is sound.
+        frame_root
+            .frame()
+            .restore_resume_state_from(&abort_snapshot);
+    }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
     if tracing_finished
