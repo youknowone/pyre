@@ -2736,7 +2736,12 @@ impl TraceCtx {
     /// frame state. Returns a snapshot_id for use as rd_resume_position.
     pub fn capture_resumedata(&mut self, snapshot: crate::recorder::Snapshot) -> i32 {
         if self.recorder.has_byte_buffer() {
-            return self.recorder.encode_captured_snapshot(&snapshot);
+            let id = self.recorder.encode_captured_snapshot(&snapshot);
+            // A later `snapshots()` / `take_snapshots` must see this
+            // capture. RPython has no cache: it always reads
+            // `_snapshot_data`. Drop any earlier decode.
+            self.snapshots.clear();
+            return id;
         }
         let id = self.snapshots.len() as i32;
         self.snapshots.push(snapshot);

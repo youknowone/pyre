@@ -420,33 +420,30 @@ impl Trace {
         }
     }
 
-    fn box_index_to_opref(&self, box_index: u32) -> OpRef {
+    fn box_index_to_opref(&self, box_index: u32, box_to_unique: &[u32]) -> OpRef {
         let n = self.inputargs.len() as u32;
         if box_index < n {
             return OpRef::input_arg_typed(box_index, self.inputargs[box_index as usize].tp);
         }
-        for (unique, &mapped) in self.unique_to_box.iter().enumerate() {
-            if mapped != box_index {
-                continue;
-            }
-            let unique = unique as u32;
-            if unique < n {
-                return OpRef::input_arg_typed(unique, self.inputargs[unique as usize].tp);
-            }
-            let slot = &self.slots[(unique - n) as usize];
-            return OpRef::op_typed(unique, slot.opcode.result_type());
+        let unique = *box_to_unique.get(box_index as usize).unwrap_or(&u32::MAX);
+        if unique == u32::MAX {
+            panic!("decode snapshot: TAGBOX({box_index}) has no unique OpRef");
         }
-        panic!("decode snapshot: TAGBOX({box_index}) has no unique OpRef")
+        if unique < n {
+            return OpRef::input_arg_typed(unique, self.inputargs[unique as usize].tp);
+        }
+        let slot = &self.slots[(unique - n) as usize];
+        OpRef::op_typed(unique, slot.opcode.result_type())
     }
 
-    fn untag_snapshot(&self, tagged: i64) -> SnapshotTagged {
+    fn untag_snapshot(&self, tagged: i64, box_to_unique: &[u32]) -> SnapshotTagged {
         use crate::opencoder::{TAG_MASK, TAG_SHIFT, TAGBOX, TAGCONSTOTHER, TAGCONSTPTR, TAGINT};
         let tag = (tagged & TAG_MASK as i64) as u8;
         let v = tagged >> TAG_SHIFT;
         match tag {
             TAGBOX => {
                 debug_assert!(v >= 0, "TAGBOX value must be non-negative, got {v}");
-                let opref = self.box_index_to_opref(v as u32);
+                let opref = self.box_index_to_opref(v as u32, box_to_unique);
                 SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
             }
             TAGINT => SnapshotTagged::Const(v, Type::Int),
@@ -561,6 +558,16 @@ impl Trace {
     /// Rebuild `Vec<Snapshot>` from `_snapshot_data` in capture order.
     pub fn decode_captured_snapshots(&self) -> Option<Vec<Snapshot>> {
         let trb = self.trb.as_ref()?;
+        let mut box_to_unique = Vec::new();
+        for (unique, &mapped) in self.unique_to_box.iter().enumerate() {
+            if mapped == u32::MAX {
+                continue;
+            }
+            if box_to_unique.len() <= mapped as usize {
+                box_to_unique.resize(mapped as usize + 1, u32::MAX);
+            }
+            box_to_unique[mapped as usize] = unique as u32;
+        }
         let mut out = Vec::with_capacity(self.snapshot_offsets.len());
         for (i, &offset) in self.snapshot_offsets.iter().enumerate() {
             let (vable_t, vref_t, frames_t) = {
@@ -591,16 +598,22 @@ impl Trace {
                     jitcode_index: Self::decode_jitcode_index(jc),
                     pc: pc as u32,
                     py_pc: py_pcs.get(fi).copied().unwrap_or(pc as u32),
-                    boxes: boxes.into_iter().map(|t| self.untag_snapshot(t)).collect(),
+                    boxes: boxes
+                        .into_iter()
+                        .map(|t| self.untag_snapshot(t, &box_to_unique))
+                        .collect(),
                 })
                 .collect();
             out.push(Snapshot {
                 frames,
                 vable_boxes: vable_t
                     .into_iter()
-                    .map(|t| self.untag_snapshot(t))
+                    .map(|t| self.untag_snapshot(t, &box_to_unique))
                     .collect(),
-                vref_boxes: vref_t.into_iter().map(|t| self.untag_snapshot(t)).collect(),
+                vref_boxes: vref_t
+                    .into_iter()
+                    .map(|t| self.untag_snapshot(t, &box_to_unique))
+                    .collect(),
             });
         }
         Some(out)
