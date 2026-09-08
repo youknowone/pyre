@@ -1184,10 +1184,10 @@ unsafe fn float_to_int_or_float(list: &mut W_ListObject) -> bool {
 ///
 /// `listobject.py AbstractUnwrappedStrategy.getitems_copy`:
 /// `getitems_copy = jit.look_inside_iff(lambda self, w_list: w_list._unrolling_heuristic())`.
-/// Default `_unrolling_heuristic` is `size == 0 or (isconstant(size) and size <= UNROLL_CUTOFF)`.
+/// `AbstractUnwrappedStrategy._unrolling_heuristic` is
+/// `loop_unrolling_heuristic(storage, len(storage), UNROLL_CUTOFF)`.
 fn boxed_from_ints_iff(values: &[i64], _we_are_jitted: bool) -> bool {
-    let size = values.len();
-    size == 0 || (majit_rlib::jit::isconstant(&size) && size <= UNROLL_CUTOFF)
+    majit_rlib::jit::loop_unrolling_heuristic(values, values.len(), UNROLL_CUTOFF)
 }
 
 #[majit_macros::look_inside_iff(boxed_from_ints_iff)]
