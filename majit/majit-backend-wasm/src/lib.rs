@@ -3816,6 +3816,14 @@ fn install_post_finish_force_gcmap(jf: *mut majit_backend::jitframe::JitFrame) {
     unsafe { (*jf).jf_gcmap = fail_descr.force_gcmap_ptr as *const u8 };
 }
 
+/// Drop the host execution root the way `wasm_jit_ca_pop_frame` drops a
+/// callee: remember the (old-gen) frame so a virtualizable token that still
+/// points at it can find young homes after the shadow-stack root is gone.
+fn remember_and_drop_execution_frame(jf: *mut majit_backend::jitframe::JitFrame, saved: usize) {
+    wasm_jit_write_barrier(jf as i64);
+    majit_gc::shadow_stack::pop_jf_to(saved);
+}
+
 impl majit_backend::Backend for WasmBackend {
     /// `force(token)` where the token is what `FORCE_TOKEN` parked in the
     /// virtualizable: the running frame's `JitFrame`, whose data region starts
@@ -5590,7 +5598,7 @@ impl majit_backend::Backend for WasmBackend {
                 // virtualizable token is an independent edge to this JITFRAME;
                 // its lazy force may arrive after the execution root is gone.
                 install_post_finish_force_gcmap(jf);
-                majit_gc::shadow_stack::pop_jf_to(saved);
+                remember_and_drop_execution_frame(jf, saved);
 
                 return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
             }
@@ -6228,5 +6236,42 @@ mod tests {
         // in place, so a wasm local holding frame_ptr would remain valid.
         let len_after = unsafe { *((frame_ptr as *const u8).add(JF_FRAME_OFS) as *const isize) };
         assert_eq!(len_after, depth as isize, "old-gen frame moved/corrupted");
+    }
+
+    /// Host `execute_token` pops the old-gen JitFrame after FINISH. A
+    /// virtualizable token may still hold that frame, so the pop must
+    /// remember it first — the same footer `wasm_jit_ca_pop_frame` already
+    /// runs. Without the barrier the next minor collection never walks the
+    /// homes and a recycled nursery address is left in a gcmap slot.
+    #[test]
+    fn oldgen_jitframe_must_be_remembered_before_host_pop() {
+        use majit_backend::jitframe::{
+            FIRST_ITEM_OFFSET, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
+        };
+        use majit_gc::GcAllocator;
+
+        let mut gc = MiniMarkGC::new();
+        let jf_tid = gc.register_type(jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let frame = gc.alloc_oldgen_typed(jf_tid, JitFrame::alloc_size(2));
+        let frame_ptr = frame.0 as *mut JitFrame;
+        unsafe { JitFrame::init(frame_ptr, std::ptr::null(), 2) };
+        let young_before = gc.alloc_nursery_typed(payload_tid, 16).0;
+        let gcmap: [usize; 2] = [1, 0b1];
+        unsafe {
+            *((frame_ptr as *mut u8).add(FIRST_ITEM_OFFSET) as *mut usize) = young_before;
+            *((frame_ptr as *mut u8).add(JF_GCMAP_OFS as usize) as *mut *const u8) =
+                gcmap.as_ptr() as *const u8;
+        }
+        install_gc_box(Box::new(gc));
+        let saved = majit_gc::shadow_stack::push_jf(frame);
+        remember_and_drop_execution_frame(frame_ptr, saved);
+        with_wasm_active_gc_mut(|gc| gc.collect_nursery());
+        let item0 = unsafe { *((frame_ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const usize) };
+        assert_ne!(item0, 0, "young home cleared after host pop");
+        assert_ne!(
+            item0, young_before,
+            "young home not forwarded: frame was not in the remembered set"
+        );
     }
 }
