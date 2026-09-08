@@ -1959,15 +1959,23 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
     // own execution. Steady recursive frames die young; only frames that live
     // through a collection are promoted instead of inflating the old-gen major
     // collection threshold on every call.
-    let jf_ref = with_wasm_active_gc_mut(|gc| {
-        gc.alloc_nursery_typed(wasm_jitframe_tid(), JitFrame::alloc_size(depth))
-    })
-    .unwrap_or(GcRef(0));
+    let alloc_size = JitFrame::alloc_size(depth);
+    let jf_ref =
+        with_wasm_active_gc_mut(|gc| gc.alloc_nursery_typed(wasm_jitframe_tid(), alloc_size))
+            .unwrap_or(GcRef(0));
     if jf_ref.0 == 0 {
         return 0;
     }
     let jf = jf_ref.0 as *mut JitFrame;
     unsafe {
+        // `JitFrame::init` requires a zeroed fixed header. Native execute
+        // uses calloc; wasm used to get the same from nursery reset. Reset
+        // now leaves recycled bytes dirty (`malloc_zero_filled = False`),
+        // and wasm skips rewrite's `emit_setfield` zeros of jf_descr /
+        // jf_force_descr / jf_savedata / jf_guard_exc / jf_forward. A
+        // leftover word in those slots is traced as a young object or
+        // decoded as a fail-index by `install_post_finish_force_gcmap`.
+        std::ptr::write_bytes(jf as *mut u8, 0, alloc_size);
         JitFrame::init(jf, std::ptr::null(), depth);
         (*jf).jf_gcmap = gcmap_ptr as *const u8;
     }
@@ -5532,9 +5540,8 @@ impl majit_backend::Backend for WasmBackend {
                 assert!(jf_ref.0 != 0, "wasm JitFrame allocation failed");
                 let jf = jf_ref.0 as *mut JitFrame;
                 // `JitFrame::init` requires zero-filled storage, which the
-                // native `calloc` entry (`runner.rs` `execute_token`) and the
-                // wasm nursery reset (`nursery.rs` `reset`) both provide but
-                // the old-gen arena does not — `ArenaCollection::malloc`
+                // native `calloc` entry (`runner.rs` `execute_token`) provides
+                // but the old-gen arena does not — `ArenaCollection::malloc`
                 // deliberately returns recycled bytes. `build_home_gcmap`
                 // marks every Ref home of the frozen geometry, so a home the
                 // trace has not defined yet when a collection lands must read
@@ -5910,6 +5917,36 @@ mod tests {
             assert!((*(forwarded.0 as *const JitFrame)).jf_gcmap.is_null());
             assert_eq!((*(old.0 as *const JitFrame)).jf_gcmap, map.as_ptr().cast());
         }
+    }
+
+    #[test]
+    fn ca_alloc_frame_zeros_recycled_nursery_bytes() {
+        use majit_backend::jitframe::{JitFrame, jitframe_type_info};
+        use majit_gc::GcAllocator;
+
+        let mut gc = MiniMarkGC::new();
+        let tid = gc.register_type(jitframe_type_info());
+        let poison = gc.alloc_nursery_typed(tid, JitFrame::alloc_size(1));
+        assert_ne!(poison.0, 0);
+        unsafe {
+            std::ptr::write_bytes(poison.0 as *mut u8, 0xAA, JitFrame::alloc_size(1));
+        }
+        gc.collect_nursery();
+
+        set_wasm_jitframe_tid(tid);
+        install_gc_box(Box::new(gc));
+        let frame = wasm_jit_ca_alloc_frame(std::mem::size_of::<isize>() as i64, 0);
+        assert_ne!(frame, 0);
+        unsafe {
+            let jf = frame as *const JitFrame;
+            assert_eq!((*jf).jf_descr, 0);
+            assert_eq!((*jf).jf_force_descr, 0);
+            assert_eq!((*jf).jf_savedata, 0);
+            assert_eq!((*jf).jf_guard_exc, 0);
+            assert!((*jf).jf_forward.is_null());
+        }
+        wasm_jit_ca_pop_frame(0);
+        set_wasm_jitframe_tid(0);
     }
 
     #[test]
