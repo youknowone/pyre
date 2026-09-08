@@ -4828,7 +4828,7 @@ impl majit_backend::Backend for WasmBackend {
             });
         // Set by the inline block below to the owner of a merge candidate whose
         // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
-        let mut defer_inline: Option<(Arc<JitCellToken>, u32)> = None;
+        let mut defer_inline: Option<(Arc<JitCellToken>, u32, bool)> = None;
         if inline_bridge_enabled() {
             // `model.py`: a bridge compiled after `invalidate_loop`
             // starts valid, and only a later invalidation activates its
@@ -4988,7 +4988,7 @@ impl majit_backend::Backend for WasmBackend {
                         // bypasses that cost decision entirely. Everything else
                         // about this compile is the ordinary out-of-line path
                         // below.
-                        defer_inline = Some((owner, merged_fail_index));
+                        defer_inline = Some((owner, merged_fail_index, outside_loop));
                         diag_bump(54);
                         decline("deferred");
                     } else if region_external.is_some() {
@@ -5106,16 +5106,17 @@ impl majit_backend::Backend for WasmBackend {
         // the sub-bridges chained onto this bridge's guards
         // (`chained_bridge_slots`, keyed by that id) are replayed into the
         // merged region's cells when the owner is finally rebuilt.
-        let inline_trip = defer_inline.map(|(owner, merged_fail_index)| {
+        let inline_trip = defer_inline.map(|(owner, merged_fail_index, outside_loop)| {
             if region_external.is_some() {
                 diag_bump(51);
             }
             let region = codegen::InlinedBridge {
                 source_fail_index: merged_fail_index,
                 external_jump: region_external.clone(),
-                // Decided against the candidate as it stands when the merge
-                // actually runs, which may have taken more regions by then.
-                outside_loop: false,
+                // This region's own placement (`!resumes_at_loop_header` /
+                // preamble) cannot change later. Install still ORs in any
+                // outside sibling that landed first.
+                outside_loop,
                 trace_id,
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                 ops: ops_owned.clone(),

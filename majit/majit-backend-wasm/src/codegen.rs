@@ -1884,8 +1884,7 @@ fn emit_write_barrier_if_needed(
 }
 
 /// `rewrite.rs remember_wb` after a nursery allocation whose every arm is
-/// young. CallMallocNursery / headerless and a non-`non_moving` `New*` use
-/// the collecting nursery helper on overflow, not old-gen.
+/// young. Headerless overflow stays in the nursery (raw bump or 0).
 fn remember_nursery_wb(
     wb_applied: &mut indexmap::IndexSet<OpRef>,
     result: OpRef,
@@ -3635,18 +3634,13 @@ fn aligned_nursery_size(payload: i64) -> Option<usize> {
     Some(((GcHeader::SIZE + payload).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7)
 }
 
-/// `Nursery::alloc` 8-aligns the total. The inline VarsizeFrame bump writes
-/// `nursery_free` itself, so a wasm32 `jfi_frame_size` that is only word-aligned
-/// has to be raised here or the next object header is misaligned.
+/// `Nursery::alloc` 8-aligns the total. The inline VarsizeFrame and
+/// headerless bumps write `nursery_free` themselves, so a wasm32 size that
+/// is only word-aligned has to be raised here or the next object header is
+/// misaligned.
 fn aligned_varsize_frame_bump(size: i64) -> Option<u32> {
     let size = u32::try_from(size).ok()?;
     Some(size.saturating_add(7) & !7)
-}
-
-/// Headerless nursery bumps write `nursery_free` themselves. An unaligned
-/// size would leave the next headered object off `GcHeader::ALIGN`.
-fn aligned_headerless_bump(size: i64) -> Option<u32> {
-    aligned_varsize_frame_bump(size)
 }
 
 const BUILTIN_STRING_HASH_OFFSET: usize = 0;
@@ -7957,12 +7951,13 @@ fn build_function(
                         frame,
                     );
                 }
-                remember_nursery_wb(&mut wb_applied, op.pos.get(), &same_as_forwardings);
+                // Same spill as `New*`: `wasm_jit_alloc` can return old-gen
+                // when the nursery cannot hold the request.
             }
             OpCode::CallMallocNurseryHeaderless => {
                 let vi = op.pos.get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
-                let bump_size = size_const.and_then(aligned_headerless_bump);
+                let bump_size = size_const.and_then(aligned_varsize_frame_bump);
                 let Some(base) = residual_type_base else {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: CallMallocNurseryHeaderless needs a residual alloc helper"
@@ -8064,6 +8059,8 @@ fn build_function(
                 remember_nursery_wb(&mut wb_applied, op.pos.get(), &same_as_forwardings);
             }
             OpCode::CallMallocNurseryVarsize => {
+                // The arity-5 array helper can return old-gen, so this arm
+                // does not seed `wb_applied` — same reason as `NewArray`.
                 let vi = op.pos.get().raw();
                 let Some(base) = residual_type_base else {
                     return Err(BackendError::Unsupported(
@@ -8236,7 +8233,8 @@ fn build_function(
                         frame,
                     );
                 }
-                remember_nursery_wb(&mut wb_applied, op.pos.get(), &same_as_forwardings);
+                // `wasm_jit_alloc` can return old-gen when the nursery cannot
+                // hold the frame. Do not seed `wb_applied`.
             }
             // `GcRewriterImpl::_gen_call_malloc_gc` emits this after a residual
             // malloc. Use the same propagate-exception exit as the wasm

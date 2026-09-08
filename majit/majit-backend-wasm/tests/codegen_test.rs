@@ -7112,6 +7112,11 @@ fn fused_cond_call_value_consumes_the_comparison_i32() {
         Some("I64ExtendI32U"),
         "fused CondCallValue consumes the comparison i32 directly: {seq:#?}"
     );
+    assert!(
+        seq.get(eq_at + 2)
+            .is_some_and(|o| o.starts_with("LocalTee")),
+        "fused arm tees the result; unfused would LocalSet the compare: {seq:#?}"
+    );
 }
 
 #[test]
@@ -7752,7 +7757,7 @@ fn call_malloc_nursery_variants_lower() {
 
     let frame = make_op(
         OpCode::CallMallocNurseryVarsizeFrame,
-        &[OpRef::const_int(64)],
+        &[OpRef::const_int(60)],
         OpRef::ref_op(1),
     );
     let inputs = nursery_new_inputs(vec![frame, finish_int_arg0()], 53);
@@ -7760,6 +7765,10 @@ fn call_malloc_nursery_variants_lower() {
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
     assert!(const_immediates(&bytes).contains(&0x11));
+    assert!(
+        const_immediates(&bytes).contains(&64),
+        "odd jfi_frame_size must 8-align before the nursery bump"
+    );
 
     let varsize = make_op(
         OpCode::CallMallocNurseryVarsize,
