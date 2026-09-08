@@ -1,10 +1,10 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
-# The compiled loop is at pypy parity on darwin-aarch64 (dynasm 0.9x,
-# cranelift 1.0x) and 2.4x on ubuntu-24.04 cranelift. The ceiling is
-# twice that slowest host, rounded up. A 6x ceiling would put the
-# derived floor at 1x and fail the darwin 0.9x reading again.
-# cpython is not gated on — only pypy is.
+# Topology matches pypy (8 loops, 0 bridges). Native ratios: darwin
+# 0.9-1.2x, ubuntu 2.2-2.5x (main's own ubuntu jobs are 2.2-2.3x). 3
+# covers the ubuntu cranelift 2.5x reading; 2 does not. Floor is 0.5x
+# so darwin 0.9x still passes. A 6x ceiling would put the derived
+# floor at 1x. cpython is not gated on — only pypy is.
 # Exercises JIT global-cache invalidation, for both cell kinds.
 #
 # `run_int` reads a module global reassigned to another int between calls: the
