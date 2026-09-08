@@ -17,6 +17,7 @@ mod pypyjit_driver_layout;
 #[path = "../src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
+use codegen_cache::LLBC_CRATES;
 use walkdir::WalkDir;
 
 /// The translation prepass churns the whole graph universe through short-lived
@@ -287,12 +288,6 @@ pub fn main() {
     // would STATUS_STACK_OVERFLOW).
     run_worker();
 }
-
-/// Crates whose Charon artefact this build consumes.  The `.ullbc` and its
-/// `.fingerprint` stamp are both named after the crate.  Pyre production
-/// configures the exact `eval::eval_loop_jit` portal, so unlike generic
-/// two-artefact consumers it requires `pyre-jit` too.
-const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"];
 
 /// pyre's fallible-return carrier: a bare `PyError`, materialised through
 /// the published `pyerror_to_exc_object` free function and rebuilt through
