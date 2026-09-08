@@ -9,10 +9,12 @@
 //!
 //! ## Dependency-blocked paths
 //!
-//! * `specialize.memo` (specialize.py) requires evaluating
-//!   `value = func(*args)` at annotation time — impossible without a
-//!   Python runtime. The [`Specializer::Memo`] variant surfaces as
-//!   [`AnnotatorError`] matching upstream's `pyobj is None` path.
+//! * `specialize.memo` (specialize.py) evaluates `value = func(*args)`
+//!   at annotation time through the function's
+//!   [`crate::flowspace::model::HostCall`] hook. The memo tables and
+//!   dispatch graphs are implemented in [`super::specialize::memo`].
+//!   A function without a registered hook is still rejected; importing
+//!   its graph alone does not make it callable at annotation time.
 //! * `specialize__ll` / `specialize__ll_and_arg` — forward to
 //!   [`LowLevelAnnotatorPolicy`] in
 //!   [`crate::translator::rtyper::annlowlevel`], wired through the

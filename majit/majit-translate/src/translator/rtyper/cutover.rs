@@ -2038,27 +2038,6 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             );
             continue;
         }
-        // The `pyobject::ll_issubclass` / `ll_issubclass_const` / `ll_isinstance`
-        // runtime helpers remain excluded while `flowspace_adapter::translate_op` rewrites
-        // `ll_issubclass`/`ll_isinstance` call site into the high-level
-        // `issubtype`/`isinstance` op, which the rtyper lowers to a fresh
-        // `int_between`-over-`subclassrange` helper graph
-        // (`lowlevel_issubclass_helper_graph`, rclass.py ll_issubclass).
-        // PRE-EXISTING-ADAPTATION: the runtime seqlock has been removed;
-        // #346 must next close ordinary helper translation and retire this
-        // call-site rewrite/body exclusion together. No synchronization
-        // obstacle remains to justify keeping it permanently.
-        if canonical_strip == ["pyobject", "ll_issubclass"]
-            || canonical_strip == ["pyobject", "ll_issubclass_const"]
-            || canonical_strip == ["pyobject", "ll_isinstance"]
-        {
-            crate::decline::record(
-                REGISTRY_GATE,
-                "skip-issubclass-helper-body",
-                format_args!("{path}"),
-            );
-            continue;
-        }
         let signature = function_graphs
             .signature(path)
             .expect("iter() path resolves to a stored slot");

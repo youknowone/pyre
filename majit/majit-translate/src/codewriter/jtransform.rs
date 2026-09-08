@@ -1289,26 +1289,16 @@ impl<'a> Transformer<'a> {
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
 
-        // `jtransform.py transform_graph` opens with
-        // `constant_fold_ll_issubclass(graph, cpu)`, which folds a
-        // `direct_call` to `exceptiondata.fn_exception_match` whose
-        // arguments are all `Constant`.  It has no counterpart here, and
-        // cannot acquire one without two upstream pieces pyre does not
-        // have:
-        //
-        // * The calls it folds are the ones `inline.py`'s
-        //   `rewire_exceptblock_with_guard` / `generic_exception_matching`
-        //   insert.  `Inliner::inline_once` refuses that whole path with
-        //   `CannotInline`, so no such call is ever inserted.
-        // * `rclass::ll_issubclass`, `ll_issubclass_const` and
-        //   `ll_isinstance` are not lifted at all — `cutover` skips their
-        //   bodies (`skip-issubclass-helper-body`) because
-        //   `flowspace_adapter::translate_op` has already rewritten every
-        //   call site into the high-level `issubtype` / `isinstance` op,
-        //   which the rtyper lowers to an `int_between`-over-
-        //   `subclassrange` helper graph.  A constant-argument class check
-        //   therefore reaches this pass as a range test on constants, not
-        //   as a call to fold.
+        // PRE-EXISTING-ADAPTATION: jtransform.py transform_graph starts with
+        // constant_fold_ll_issubclass(graph, cpu), folding constant calls to
+        // exceptiondata.fn_exception_match. Its counterpart remains unported.
+        // Class helper bodies now use ordinary registration/translation; the
+        // old name-based body exclusions and high-level call rewrites are gone.
+        // Convergence still needs the actual exception-match callable identity
+        // and prebuilt vtable representation, plus inline.py's
+        // rewire_exceptblock_with_guard / generic_exception_matching path
+        // currently refused by Inliner::inline_once. Do not replace the fold
+        // with a name-based class-helper shortcut.
 
         // RPython `rtyper/rpbc.py::SingleFrozenPBCRepr` resolves
         // zero-arg unit-variant PBC ctors to a singleton
