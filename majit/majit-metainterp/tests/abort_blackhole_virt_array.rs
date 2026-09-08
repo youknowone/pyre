@@ -19,6 +19,7 @@
 //! index is N` from `PUSH`, or reach a `stackpos` of `usize::MAX` from `POP`:
 //! a torn stack pointer.
 
+use majit_metainterp::virt_array::VirtArray;
 pub type Bytecode = [u8];
 
 const PUSH: u8 = 2; // [PUSH, imm]: push a signed-byte immediate
@@ -33,7 +34,7 @@ const PUSHARG: u8 = 22; // push the input argument
 
 struct StackState {
     stackpos: i64,
-    stack: Vec<i64>,
+    stack: VirtArray<i64>,
 }
 
 #[majit_macros::jit_interp(
@@ -53,7 +54,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let mut pc: usize = 0;
     let mut state = StackState {
         stackpos: 0,
-        stack: vec![0i64; program.len()],
+        stack: VirtArray::filled(0i64, program.len()),
     };
     {
         use majit_metainterp::JitState as _;

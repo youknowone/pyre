@@ -5,6 +5,7 @@
 /// Greens: [pc, bytecode]
 /// Reds:   [a, regs]  (tracked via state_fields)
 use majit_metainterp::embed::Census;
+use majit_metainterp::virt_array::VirtArray;
 
 pub type Bytecode = [u8];
 
@@ -23,7 +24,7 @@ impl BytecodeExt for [u8] {
 
 struct TlrState {
     a: i64,
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
 }
 
 const MOV_A_R: u8 = 1;
@@ -53,7 +54,7 @@ const DEFAULT_THRESHOLD: u32 = 3;
 // (virtualizable), not plain `[int]`: a loop-carried plain `[int]` element is
 // kept in a trace register and is *not* restored to the array on a CloseLoop
 // guard deopt, so the post-loop value reads back as the pre-loop one. A virt
-// array writes through to the heap-backing Vec, which the deopt path reads
+// array writes through to the heap-backing block, which the deopt path reads
 // directly — the same mechanism braininterp relies on. (`a` is a plain scalar
 // red, which is restored correctly.)
 #[majit_macros::jit_interp(
@@ -75,7 +76,7 @@ fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
     let _stacksize: i32 = 0;
     let mut state = TlrState {
         a: initial_a,
-        regs: Vec::new(),
+        regs: VirtArray::new(),
     };
 
     // RPython warmspot.py:281-289 canonical-liveness install hook.
@@ -134,7 +135,7 @@ fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
             ALLOCATE => {
                 let n = program[pc] as usize;
                 pc += 1;
-                state.regs = vec![0; n];
+                state.regs = VirtArray::filled(0, n);
             }
             NEG_A => {
                 state.a = 0 - state.a;

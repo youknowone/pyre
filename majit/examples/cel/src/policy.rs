@@ -6,6 +6,7 @@
 //! interpreter, and JIT-disabled execution.
 
 use crate::common::*;
+use majit_metainterp::virt_array::VirtArray;
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -24,7 +25,7 @@ const LO: i64 = i64::MIN + 1; // `bal >= LO` ~always true, not foldable
 const HI: i64 = i64::MAX; // `draw >= HI` ~always false, not foldable
 
 struct VmState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
     /// What `OP_RETURN` hands back.
     ///
     /// The `; state` merge point leaves the loop through `break` before it
@@ -53,7 +54,7 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     let mut pc: usize = 0;
     let _stacksize: i32 = 0;
     let mut state = VmState {
-        regs: vec![0; num_regs],
+        regs: VirtArray::filled(0, num_regs),
         ret: 0,
     };
 
@@ -152,7 +153,7 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
 }
 
 fn clean_interp(program: &Code, num_regs: usize) -> i64 {
-    let mut regs = vec![0i64; num_regs];
+    let mut regs = VirtArray::filled(0i64, num_regs);
     let mut pc = 0usize;
     loop {
         match program[pc] {

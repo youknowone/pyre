@@ -5,6 +5,7 @@
 //! the header and the blackhole's green program counter.
 
 use core::sync::atomic::{AtomicU32, Ordering};
+use majit_metainterp::virt_array::VirtArray;
 
 pub type Bytecode = [i64];
 
@@ -49,7 +50,7 @@ static COMPILES: AtomicU32 = AtomicU32::new(0);
 static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct VmState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
     ret: i64,
 }
 
@@ -71,7 +72,7 @@ fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
     });
     let mut pc: usize = 0;
     let mut state = VmState {
-        regs: vec![0; NUM_REGS],
+        regs: VirtArray::filled(0, NUM_REGS),
         ret: 0,
     };
     {
@@ -128,7 +129,7 @@ fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
 
 /// The same bytecode with no driver, no merge point and no `can_enter_jit`.
 fn clean_interp(program: &Bytecode) -> i64 {
-    let mut regs = vec![0i64; NUM_REGS];
+    let mut regs = VirtArray::filled(0i64, NUM_REGS);
     let mut pc = 0usize;
     loop {
         match program[pc] {

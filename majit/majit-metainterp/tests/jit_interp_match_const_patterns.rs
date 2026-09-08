@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::OpCode;
 use majit_metainterp::JitDriver;
+use majit_metainterp::virt_array::VirtArray;
 
 static COMPILES: AtomicUsize = AtomicUsize::new(0);
 static COMPILED: Mutex<Vec<OpCode>> = Mutex::new(Vec::new());
@@ -57,7 +58,7 @@ fn classify(tag: i64) -> i64 {
 }
 
 struct TagState {
-    tags: Vec<i64>,
+    tags: VirtArray<i64>,
     pos: i64,
     acc: i64,
     ticks: i64,
@@ -96,7 +97,7 @@ fn dispatch_tags(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     });
     let mut pc: usize = 0;
     let mut state = TagState {
-        tags: TAGS.to_vec(),
+        tags: VirtArray::from_slice(&TAGS),
         pos: 0i64,
         acc: 0i64,
         ticks,

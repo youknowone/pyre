@@ -4,6 +4,7 @@
 /// The program counter and bytecode are green inputs. The pointer and tape are
 /// red state, with tape cells represented as symbolic values while tracing.
 /// A backward `]` branch identifies the loop header.
+use majit_metainterp::virt_array::VirtArray;
 pub type Bytecode = [u8];
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -63,7 +64,7 @@ const DEFAULT_THRESHOLD: u32 = 3;
 
 struct BfState {
     pointer: i64,
-    tape: Vec<i64>,
+    tape: VirtArray<i64>,
 }
 
 #[majit_macros::jit_interp(
@@ -90,7 +91,7 @@ fn mainloop(program: &Bytecode, threshold: u32) -> String {
     let _stacksize: i32 = 0;
     let mut state = BfState {
         pointer: 0,
-        tape: vec![0i64; TAPE_SIZE],
+        tape: VirtArray::filled(0i64, TAPE_SIZE),
     };
     let mut output = String::new();
 

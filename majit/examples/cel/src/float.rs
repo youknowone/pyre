@@ -18,6 +18,7 @@
 //!   COMPUTE: sum(a*b - a*a + b*b), two loads and five arithmetic operations.
 
 use crate::common::{ABORTS, COMPILES, Code, JIT_OFF, JIT_ON, majit_raw_load_f, median};
+use majit_metainterp::virt_array::VirtArray;
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -55,7 +56,7 @@ struct VmState {
     n: i64,
     base_a: i64,
     base_b: i64,
-    regs: Vec<f64>,
+    regs: VirtArray<f64>,
 }
 
 #[majit_macros::jit_interp(
@@ -86,7 +87,7 @@ fn mainloop(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) ->
         n,
         base_a,
         base_b,
-        regs: vec![0.0; NUM_REGS + 1],
+        regs: VirtArray::filled(0.0, NUM_REGS + 1),
     };
 
     {
@@ -425,8 +426,8 @@ mod twobank {
     const BODY_PC: usize = 21; // 7 LOADs * 3
 
     struct TwoBankState {
-        regs: Vec<i64>,
-        fregs: Vec<f64>,
+        regs: VirtArray<i64>,
+        fregs: VirtArray<f64>,
         /// What `OP_RETURN` hands back.
         ///
         /// The `; state` merge point leaves the loop through `break` before it
@@ -461,8 +462,8 @@ mod twobank {
 
         let mut pc: usize = 0;
         let mut state = TwoBankState {
-            regs: vec![0; NUM_INT],
-            fregs: vec![0.0; NUM_FLOAT],
+            regs: VirtArray::filled(0, NUM_INT),
+            fregs: VirtArray::filled(0.0, NUM_FLOAT),
             ret: 0,
         };
 

@@ -22,6 +22,7 @@
 //! `impl JitState for #state_type` (E0119). Unique idents buy co-residence only
 //! for machines whose `state` types differ.
 
+use majit_metainterp::virt_array::VirtArray;
 pub type Bytecode = [u8];
 
 const C_ADD: u8 = 1; // acc += n; n -= 1
@@ -116,7 +117,7 @@ fn counter_program() -> Vec<u8> {
 // emitted here and nowhere else in this file.
 struct StackState {
     stackpos: i64,
-    stack: Vec<i64>,
+    stack: VirtArray<i64>,
 }
 
 #[majit_macros::jit_interp(
@@ -136,7 +137,7 @@ pub fn mainloop_stack(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 
     let mut pc: usize = 0;
     let mut state = StackState {
         stackpos: 0,
-        stack: vec![0i64; program.len()],
+        stack: VirtArray::filled(0i64, program.len()),
     };
     {
         use majit_metainterp::JitState as _;

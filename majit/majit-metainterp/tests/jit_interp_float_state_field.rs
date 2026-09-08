@@ -166,10 +166,11 @@ mod scalar_toplevel {
 mod virt_array {
     use super::{Bytecode, all_jitcode_bodies};
     use majit_metainterp::jitcode::insns::{BC_GETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_F};
+    use majit_metainterp::virt_array::VirtArray;
     use majit_metainterp::{Assembler, JitDriver};
 
     struct FloatArrayState {
-        regs: Vec<f64>,
+        regs: VirtArray<f64>,
     }
 
     const OP_NOP: u8 = 0;
@@ -185,7 +186,9 @@ mod virt_array {
     fn float_array_minimal(program: &Bytecode, threshold: u32) -> i64 {
         let mut driver: JitDriver<FloatArrayState> = JitDriver::new(threshold);
         let mut pc: usize = 0;
-        let mut state = FloatArrayState { regs: vec![0.0; 2] };
+        let mut state = FloatArrayState {
+            regs: VirtArray::filled(0.0, 2),
+        };
         {
             use majit_metainterp::JitState as _;
             state
@@ -398,13 +401,14 @@ mod scalar_float_slot_reserve {
 // downstream catches it. Pin the suffix relation directly.
 mod virt_array_with_float_scalar {
     use super::Bytecode;
+    use majit_metainterp::virt_array::VirtArray;
     use majit_metainterp::{JitDriver, JitState};
 
     struct MixedState {
         sp: i64,
         cells: Vec<i64>,
         acc: f64,
-        stack: Vec<i64>,
+        stack: VirtArray<i64>,
     }
 
     const OP_NOP: u8 = 0;
@@ -428,7 +432,7 @@ mod virt_array_with_float_scalar {
             sp: 0,
             cells: vec![0; 2],
             acc: 0.0,
-            stack: vec![0; 2],
+            stack: VirtArray::filled(0, 2),
         };
         {
             use majit_metainterp::JitState as _;
@@ -462,7 +466,7 @@ mod virt_array_with_float_scalar {
             sp: 0,
             cells: vec![0; 2],
             acc: 0.0,
-            stack: vec![0; 2],
+            stack: VirtArray::filled(0, 2),
         };
         let program: &Bytecode = &[OP_NOP, OP_STEP];
         let meta = state.build_meta(0, program);
@@ -512,7 +516,7 @@ mod virt_array_with_float_scalar {
             sp: 0,
             cells: vec![0; 2],
             acc: 0.0,
-            stack: vec![0; 2],
+            stack: VirtArray::filled(0, 2),
         };
         let program: &Bytecode = &[OP_NOP, OP_STEP];
         let meta = state.build_meta(0, program);
@@ -536,7 +540,7 @@ mod virt_array_with_float_scalar {
             sp: 7,
             cells: vec![11, 13],
             acc: 1.5,
-            stack: vec![0; 2],
+            stack: VirtArray::filled(0, 2),
         };
         let program: &Bytecode = &[OP_NOP, OP_STEP];
         let meta = state.build_meta(0, program);

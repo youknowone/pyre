@@ -8469,56 +8469,73 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
     )
 }
 
-/// Read a VableArray descriptor and resolve to a synthesized BhDescr::Field
-/// with the resolved field_offset via VirtualizableInfo.
-/// RPython: fielddescr carries byte offset for the array pointer field.
-/// pyre: VableArray.index → vinfo.array_fields[index].field_offset.
-#[inline]
-#[allow(dead_code)]
-fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
-    let (descr, pos) = read_descr(bh, code, pos);
-    let array_index = descr.as_vable_array_index();
-    let vinfo = if bh.virtualizable_info.is_null() {
-        panic!(
-            "read_descr_vable_array: virtualizable_info must be set for VableArray index {} \
-             (RPython blackhole.py:1374 fielddescr.get_vinfo() parity)",
-            array_index
-        );
-    } else {
-        unsafe { &*bh.virtualizable_info }
-    };
+/// Synthesize the field descr `cpu.bh_getfield_gc_r` uses to load a
+/// virtualizable array pointer. RPython's `fielddescr` already carries that
+/// byte offset; pyre's `BhDescr::VableArray` is only an index into
+/// `vinfo.array_fields`.
+fn vable_array_field_descr(
+    vinfo: &crate::virtualizable::VirtualizableInfo,
+    array_index: usize,
+) -> BhDescr {
     let offset = vinfo
         .array_fields
         .get(array_index)
         .unwrap_or_else(|| {
             panic!(
-                "read_descr_vable_array: VableArray index {} out of bounds for {} array fields",
+                "vable_array_field_descr: VableArray index {} out of bounds for {} array fields",
                 array_index,
                 vinfo.array_fields.len()
             )
         })
         .field_offset;
+    BhDescr::Field {
+        offset,
+        // The array field is a pointer, so its width is the target word
+        // like the scalars above.  Latent rather than live: the `_gc_r`
+        // accessors this descr reaches take `as_offset()` and store at
+        // pointer width without consulting the size.
+        field_size: std::mem::size_of::<usize>(),
+        field_type: majit_ir::value::Type::Ref,
+        field_flag: majit_ir::descr::ArrayFlag::Pointer,
+        is_field_signed: false,
+        is_immutable: false,
+        is_quasi_immutable: false,
+        // No parent list, so there is no slot to claim — `None` rather than a
+        // `0` that reads as a claim on the first field of a list that does
+        // not exist here.
+        index_in_parent: None,
+        parent: None,
+        name: String::new(),
+        owner: String::new(),
+    }
+}
+
+/// Read a VableArray descriptor and resolve to a synthesized BhDescr::Field
+/// with the resolved field_offset via VirtualizableInfo.
+/// RPython: fielddescr carries byte offset for the array pointer field.
+/// pyre: VableArray.index → vinfo.array_fields[index].field_offset.
+///
+/// Returns `(field_descr, array_index, next_pos)`.
+#[inline]
+fn read_descr_vable_array(
+    bh: &BlackholeInterpreter,
+    code: &[u8],
+    pos: usize,
+) -> (BhDescr, usize, usize) {
+    let (descr, pos) = read_descr(bh, code, pos);
+    let array_index = descr.as_vable_array_index();
+    let vinfo = if bh.virtualizable_info.is_null() {
+        panic!(
+            "read_descr_vable_array: virtualizable_info must be set for VableArray index {} \
+             (RPython `bhimpl_getarrayitem_vable_*` `fielddescr.get_vinfo()` parity)",
+            array_index
+        );
+    } else {
+        unsafe { &*bh.virtualizable_info }
+    };
     (
-        BhDescr::Field {
-            offset,
-            // The array field is a pointer, so its width is the target word
-            // like the scalars above.  Latent rather than live: the `_gc_r`
-            // accessors this descr reaches take `as_offset()` and store at
-            // pointer width without consulting the size.
-            field_size: std::mem::size_of::<usize>(),
-            field_type: majit_ir::value::Type::Ref,
-            field_flag: majit_ir::descr::ArrayFlag::Pointer,
-            is_field_signed: false,
-            is_immutable: false,
-            is_quasi_immutable: false,
-            // No parent list, so there is no slot to claim — `None` rather than a
-            // `0` that reads as a claim on the first field of a list that does
-            // not exist here.
-            index_in_parent: None,
-            parent: None,
-            name: String::new(),
-            owner: String::new(),
-        },
+        vable_array_field_descr(vinfo, array_index),
+        array_index,
         pos,
     )
 }
@@ -10089,18 +10106,13 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // vable family (full 14-key coverage).  Path 3 (single-indirection
-    // `getfield_vable_*` / `setfield_vable_*` / `hint_force_virtualizable`)
-    // routes through the canonical `cpu.bh_getfield_gc_*` /
-    // `bh_setfield_gc_*` chain — both `runner.rs` (dynasm) and
-    // `compiler.rs::bh_getfield_gc_*` (cranelift) implement
-    // the chain via direct `*(struct_ptr + descr.as_offset())` reads,
-    // matching the old inline vinfo offset path.  Path 2
-    // (2-level indirection `getarrayitem_vable_*` /
-    // `setarrayitem_vable_*` / `arraylen_vable`) bypasses the cpu chain
-    // and calls `vable_*_array_item` / `bhimpl_arraylen_vable` directly
-    // to handle pyre's `EmbeddedArray` storage — see
-    // TODO header at `handler_getarrayitem_vable_i`.
+    // vable family (full 14-key coverage).  Scalar
+    // `getfield_vable_*` / `setfield_vable_*` / `hint_force_virtualizable`
+    // and `getarrayitem_vable_*` / `setarrayitem_vable_*` /
+    // `arraylen_vable` route through the canonical
+    // `cpu.bh_getfield_gc_*` / `bh_getarrayitem_gc_*` /
+    // `bh_setarrayitem_gc_*` / `bh_arraylen_gc` chain
+    // (`bhimpl_getarrayitem_vable_*`).
     // Together this makes the vable family strict-dispatch ready.
     insns.insert(
         "getfield_vable_i/rd>i".to_string(),
@@ -11578,25 +11590,10 @@ fn handler_setfield_vable_f(
 
 // @arguments("cpu", "r", "i", "d", "d", returns="X")
 // Two descriptors: fielddescr (VableArray) + arraydescr (Array).
-// RPython: fielddescr.get_vinfo().clear_vable_token(vable)
-//          array = cpu.bh_getfield_gc_r(vable, fielddescr)
-//          return cpu.bh_getarrayitem_gc_*(array, index, arraydescr)
-//
-// TODO: pyre's W_ListObject `EmbeddedArray` storage
-// (`virtualizable.rs`'s `VableArrayInfo`) reaches the array data via two pointer
-// dereferences from the vable (vable→container→data + `ptr_offset`),
-// while `cpu.bh_getfield_gc_r + cpu.bh_setarrayitem_gc_*`
-// (`runner.rs`) only does a single indirection.  The chain
-// therefore cannot reach EmbeddedArray items.  Resolve `array_idx`
-// from the `BhDescr::VableArray` index and delegate to
-// `vable_read_array_item` / `vable_write_array_item` /
-// `bhimpl_arraylen_vable` (`virtualizable.rs`) — these
-// dispatch on `VableArrayStorage` and handle both EmbeddedArray and
-// DirectPointer modes.  This keeps the same direct vable-array helper
-// path under strict dispatch.
-// Convergence path: redesign W_ListObject to
-// single-indirection storage so the canonical cpu chain works
-// directly.
+// RPython `bhimpl_getarrayitem_vable_*`:
+//   fielddescr.get_vinfo().clear_vable_token(vable)
+//   array = cpu.bh_getfield_gc_r(vable, fielddescr)
+//   return cpu.bh_getarrayitem_gc_*(array, index, arraydescr)
 /// Resolve `bh.virtualizable_info` to a non-null reference and clear the
 /// vable token on `vable`.  RPython parity: every
 /// `BlackholeInterpreter.bhimpl_{get,set}field_vable_*` and
@@ -11626,7 +11623,26 @@ fn vable_clear_token_and_get_vinfo(
     vinfo
 }
 
-// Virtualizable array operations (`blackhole.py:1374-1409`)
+/// Decode the vable-array descr pair after the register operands and
+/// clear the token.
+///
+/// `bhimpl_getarrayitem_vable_*` / `bhimpl_setarrayitem_vable_*` /
+/// `bhimpl_arraylen_vable` all start
+/// `fielddescr.get_vinfo().clear_vable_token(vable)` then load the array
+/// through `cpu.bh_getfield_gc_r`.
+fn take_vable_array_descrs<'a>(
+    bh: &'a BlackholeInterpreter,
+    vable: i64,
+    code: &[u8],
+    descr_pos: usize,
+) -> (BhDescr, &'a BhDescr, usize) {
+    vable_clear_token_and_get_vinfo(bh, vable);
+    let (field_descr, _array_idx, p) = read_descr_vable_array(bh, code, descr_pos);
+    let (array_descr, pos) = read_descr(bh, code, p);
+    (field_descr, array_descr, pos)
+}
+
+// Virtualizable array operations (`bhimpl_getarrayitem_vable_*`)
 fn handler_getarrayitem_vable_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -11634,14 +11650,11 @@ fn handler_getarrayitem_vable_i(
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
-    let (field_descr, p) = read_descr(bh, code, p + 2);
-    let array_idx = field_descr.as_vable_array_index();
-    let (_, p) = read_descr(bh, code, p);
-    let ainfo = &vinfo.array_fields[array_idx];
-    let value =
-        unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
-    bh.registers_i[code[p] as usize] = value;
+    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 2);
+    let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
+    bh.registers_i[code[p] as usize] =
+        bh.cpu()
+            .bh_getarrayitem_gc_i(array.0 as i64, index, array_descr);
     Ok(p + 1)
 }
 fn handler_getarrayitem_vable_r(
@@ -11652,13 +11665,12 @@ fn handler_getarrayitem_vable_r(
     let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
-    let (field_descr, p) = read_descr(bh, code, p + 2);
-    let array_idx = field_descr.as_vable_array_index();
-    let (_, p) = read_descr(bh, code, p);
-    let ainfo = &vinfo.array_fields[array_idx];
-    let value =
-        unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
+    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 2);
+    let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
+    let value = bh
+        .cpu()
+        .bh_getarrayitem_gc_r(array.0 as i64, index, array_descr)
+        .0 as i64;
     if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
         eprintln!(
             "[nbody-debug][bh-vable-get-r] position={} last_opcode_position={} index={} value={:#x}",
@@ -11676,14 +11688,10 @@ fn handler_setarrayitem_vable_i(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
-    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
-    let (field_descr, p) = read_descr(bh, code, p + 3);
-    let array_idx = field_descr.as_vable_array_index();
-    let (_, p) = read_descr(bh, code, p);
-    let ainfo = &vinfo.array_fields[array_idx];
-    unsafe {
-        crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
-    }
+    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 3);
+    let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
+    bh.cpu()
+        .bh_setarrayitem_gc_i(array.0 as i64, index, value, array_descr);
     Ok(p)
 }
 fn handler_setarrayitem_vable_r(
@@ -11695,20 +11703,20 @@ fn handler_setarrayitem_vable_r(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
-    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
-    let (field_descr, p) = read_descr(bh, code, p + 3);
-    let array_idx = field_descr.as_vable_array_index();
-    let (_, p) = read_descr(bh, code, p);
-    let ainfo = &vinfo.array_fields[array_idx];
+    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 3);
     if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
         eprintln!(
             "[nbody-debug][bh-vable-set-r] position={} last_opcode_position={} index={} value={:#x}",
             bh.position, bh.last_opcode_position, index, value as usize
         );
     }
-    unsafe {
-        crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
-    }
+    let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
+    bh.cpu().bh_setarrayitem_gc_r(
+        array.0 as i64,
+        index,
+        majit_ir::GcRef(value as usize),
+        array_descr,
+    );
     Ok(p)
 }
 fn handler_arraylen_vable(
@@ -11717,13 +11725,9 @@ fn handler_arraylen_vable(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
-    let (field_descr, p) = read_descr(bh, code, p + 1);
-    let array_idx = field_descr.as_vable_array_index();
-    let (_, p) = read_descr(bh, code, p);
-    let ainfo = &vinfo.array_fields[array_idx];
-    let len = unsafe { crate::virtualizable::bhimpl_arraylen_vable(vable as *const u8, ainfo) };
-    bh.registers_i[code[p] as usize] = len as i64;
+    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 1);
+    let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
+    bh.registers_i[code[p] as usize] = bh.cpu().bh_arraylen_gc(array.0 as i64, array_descr);
     Ok(p + 1)
 }
 
@@ -12304,10 +12308,6 @@ fn handler_newlist_hint(
     Ok(p + 1)
 }
 // blackhole.py bhimpl_getarrayitem_vable_f
-// TODO mirrored from `handler_getarrayitem_vable_i`
-// header — pyre's W_ListObject EmbeddedArray storage requires direct
-// `vable_read_array_item`.  `registers_f` stores the f64 bit-pattern
-// in i64, so the universal i64 read path round-trips losslessly.
 fn handler_getarrayitem_vable_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -12315,14 +12315,12 @@ fn handler_getarrayitem_vable_f(
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
-    let (field_descr, p) = read_descr(bh, code, p + 2);
-    let array_idx = field_descr.as_vable_array_index();
-    let (_, p) = read_descr(bh, code, p);
-    let ainfo = &vinfo.array_fields[array_idx];
-    let value =
-        unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
-    bh.registers_f[code[p] as usize] = value;
+    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 2);
+    let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
+    bh.registers_f[code[p] as usize] = bh
+        .cpu()
+        .bh_getarrayitem_gc_f(array.0 as i64, index, array_descr)
+        .to_bits() as i64;
     Ok(p + 1)
 }
 // blackhole.py bhimpl_setarrayitem_vable_f
@@ -12334,14 +12332,14 @@ fn handler_setarrayitem_vable_f(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_f[code[p + 2] as usize];
-    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
-    let (field_descr, p) = read_descr(bh, code, p + 3);
-    let array_idx = field_descr.as_vable_array_index();
-    let (_, p) = read_descr(bh, code, p);
-    let ainfo = &vinfo.array_fields[array_idx];
-    unsafe {
-        crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
-    }
+    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 3);
+    let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
+    bh.cpu().bh_setarrayitem_gc_f(
+        array.0 as i64,
+        index,
+        f64::from_bits(value as u64),
+        array_descr,
+    );
     Ok(p)
 }
 // blackhole.py bhimpl_getlistitem_gc_f

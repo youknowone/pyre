@@ -1,6 +1,7 @@
 //! Verifies that an arm with multiple lowering blockers records every refusal
 //! in encounter order and that refusal classification handles each member.
 
+use majit_metainterp::virt_array::VirtArray;
 use majit_metainterp::{
     Assembler, JitCode, JitDriver, REFUSAL_SEPARATOR, RefusalKind, refusal_kind, refusal_kinds,
 };
@@ -17,7 +18,7 @@ const OP_BACK: u8 = 2;
 const OP_REALLOC_THEN_BREAK: u8 = 3;
 
 struct AccumState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
 }
 
 #[majit_macros::jit_interp(
@@ -33,7 +34,7 @@ fn dispatch_accum(program: &Bytecode, threshold: u32) -> i64 {
     let mut driver: JitDriver<AccumState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut state = AccumState {
-        regs: vec![0i64; 2],
+        regs: VirtArray::filled(0i64, 2),
     };
     state.regs[0] = program[program.len() - 1] as i64;
     {
@@ -61,7 +62,7 @@ fn dispatch_accum(program: &Bytecode, threshold: u32) -> i64 {
             OP_REALLOC_THEN_BREAK => {
                 // Blocker 1 — whole-array reallocation has no lowering.
                 // `UnlowerableStmt`, the chain's 4th test.
-                state.regs = vec![0i64; 2];
+                state.regs = VirtArray::filled(0i64, 2);
                 // Blocker 2 — an enclosed `break` cannot be lowered in place.
                 // `EnclosedBreakContinue`, the chain's 2nd test.
                 if state.regs[0] == 0 {
@@ -122,7 +123,7 @@ fn both_blockers_are_reported() {
          and the `break` inside the `if`; reason={reason:?}"
     );
     assert!(
-        reason.contains("state.regs = vec!") && reason.contains("break"),
+        reason.contains("state.regs =") && reason.contains("filled") && reason.contains("break"),
         "each member must still name its own offending statement; reason={reason:?}"
     );
 }

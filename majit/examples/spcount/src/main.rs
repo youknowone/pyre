@@ -6,6 +6,7 @@
 //! execution by both the trace walk and the native interpreter.
 
 /// Bytecode stream. Byte-wide opcodes/operands, same shape as the tl env.
+use majit_metainterp::virt_array::VirtArray;
 pub type Bytecode = [u8];
 
 // Opcodes
@@ -49,7 +50,7 @@ extern "C" fn touch(stackpos: i64) {
 /// Virtualizable stack: a scalar `stackpos` plus a loop-carried virt array.
 struct StackState {
     stackpos: i64,
-    stack: Vec<i64>,
+    stack: VirtArray<i64>,
 }
 
 // ── JIT mainloop ──
@@ -84,7 +85,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let stacksize: i32 = 0;
     let mut state = StackState {
         stackpos: 0,
-        stack: vec![0i64; program.len()],
+        stack: VirtArray::filled(0i64, program.len()),
     };
 
     // warmspot.py:281-289 canonical-liveness install hook.

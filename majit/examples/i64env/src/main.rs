@@ -11,6 +11,7 @@
 //! `[int]` array element is not restored on a CloseLoop guard deopt. (See the
 //! macro's loop-carried-plain-array diagnostic.)
 
+use majit_metainterp::virt_array::VirtArray;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The env: an i64-word bytecode stream. The whole point of this example is
@@ -43,7 +44,7 @@ pub static LAST_HAS_JUMP: AtomicBool = AtomicBool::new(false);
 pub static LAST_ALWAYS_FAILS: AtomicBool = AtomicBool::new(false);
 
 struct VmState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
     /// What `OP_RETURN` hands back. The `; state` merge point leaves the
     /// dispatch loop through `break` before the in-arm `return` can run, so the
     /// result has to arrive in `state` and be returned by the post-loop tail.
@@ -72,7 +73,7 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     let mut pc: usize = 0;
     let _stacksize: i32 = 0;
     let mut state = VmState {
-        regs: vec![0; num_regs],
+        regs: VirtArray::filled(0, num_regs),
         ret: 0,
     };
 

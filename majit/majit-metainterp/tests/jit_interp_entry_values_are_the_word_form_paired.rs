@@ -9,6 +9,7 @@
 //! routes — int scalar, virt array (its identity slot), ref scalar, float
 //! scalar.
 
+use majit_metainterp::virt_array::VirtArray;
 use majit_metainterp::{JitDriver, JitState};
 
 pub type Bytecode = [u8];
@@ -20,7 +21,7 @@ struct Cell {
 
 struct EveryKindState {
     total: i64,
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
     head: usize,
     weight: f64,
 }
@@ -46,7 +47,7 @@ fn dispatch_every_kind(program: &Bytecode, threshold: u32) -> i64 {
     let mut pc: usize = 0;
     let mut state = EveryKindState {
         total: 0,
-        regs: vec![0i64; 2],
+        regs: VirtArray::filled(0i64, 2),
         head: 0,
         weight: 0.0,
     };
@@ -72,7 +73,7 @@ fn the_entry_values_are_the_word_form_paired() {
     };
     let state = EveryKindState {
         total: -3,
-        regs: vec![11, i64::MIN],
+        regs: VirtArray::from_slice(&[11, i64::MIN]),
         head: &mut cell as *mut Cell as usize,
         weight: -0.75,
     };
