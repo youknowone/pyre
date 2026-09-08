@@ -59,6 +59,30 @@ fn trace_pairs_publish_replace_and_free() {
 }
 
 #[test]
+fn replace_and_free_reject_a_wide_slot_without_touching_the_next_pair() {
+    with_caller(|caller| {
+        let module = Module::new(
+            caller.engine(),
+            r#"(module
+            (func (export "trace") (param i32) (result i32) i32.const 7)
+            (func (export "trace_wide") (param i32) (result i32) i32.const 8))"#,
+        )
+        .unwrap();
+        let (trace, wide, _) = instantiate(caller, &module, |_, _, _| Ok(())).unwrap();
+        let first = publish(caller, trace, wide).unwrap();
+        let second = publish(caller, trace, wide).unwrap();
+        assert_eq!(first, 2);
+        assert_eq!(second, 4);
+        assert!(replace(caller, first + 1, trace, wide).is_err());
+        assert_eq!(execute(caller, first, 0).unwrap(), 7);
+        assert_eq!(execute(caller, second, 0).unwrap(), 7);
+        assert!(free(caller, first + 1).is_err());
+        assert_eq!(execute(caller, first, 0).unwrap(), 7);
+        assert_eq!(execute(caller, second, 0).unwrap(), 7);
+    });
+}
+
+#[test]
 fn reflective_call_uses_declared_width_and_zero_extends_result() {
     with_caller(|caller| {
         let target = Func::wrap(&mut *caller, |value: i32, wide: i64| -> i32 {
