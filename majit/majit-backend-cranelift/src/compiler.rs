@@ -4136,6 +4136,17 @@ extern "C" fn gc_alloc_typed_nursery_shim(type_id: u64, size: u64) -> u64 {
     })
 }
 
+/// Leftover `New` / `NewWithVtable` twin of [`gc_alloc_typed_nursery_shim`]
+/// for a `non_moving` size descr. Rewrite normally lowers those to
+/// `malloc_big_fixedsize_oldgen`; this is the same allocator if a
+/// `NewWithVtable` still reaches the backend.
+extern "C" fn gc_alloc_typed_oldgen_shim(type_id: u64, size: u64) -> u64 {
+    oom_signal_if_zero(active_runtime_alloc_oldgen_typed(
+        type_id as u32,
+        size as usize,
+    ))
+}
+
 extern "C" fn gc_alloc_varsize_shim(
     base_size: u64,
     item_size: u64,
@@ -15618,9 +15629,15 @@ impl CraneliftBackend {
                 OpCode::New | OpCode::NewWithVtable => {
                     let __descr_arc_sd = op.getdescr();
                     let sd = __descr_arc_sd.as_ref().and_then(|d| d.as_size_descr());
-                    let (size, type_id, vtable) = sd.map_or((16, 0, 0usize), |sd| {
-                        (sd.size() as i64, sd.type_id() as i64, sd.vtable())
-                    });
+                    let (size, type_id, vtable, non_moving) =
+                        sd.map_or((16, 0, 0usize, false), |sd| {
+                            (
+                                sd.size() as i64,
+                                sd.type_id() as i64,
+                                sd.vtable(),
+                                sd.non_moving(),
+                            )
+                        });
                     let size_val = builder.ins().iconst(cl_types::I64, size);
                     let type_id_val = builder.ins().iconst(cl_types::I64, type_id);
                     // llmodel.py bh_new_with_vtable:
@@ -15637,6 +15654,15 @@ impl CraneliftBackend {
                         && vtable_offset.is_some();
                     let vtable_off_i32 = vtable_offset.unwrap_or(0) as i32;
                     if cranelift_gc_active() {
+                        // `rewrite.rs handle_new`: a `non_moving` descr declines
+                        // the nursery and allocates through the old-generation
+                        // twin. Honor the same flag if NewWithVtable still
+                        // reaches the backend (wasm leftover New does this).
+                        let alloc_shim = if non_moving {
+                            gc_alloc_typed_oldgen_shim as *const () as usize
+                        } else {
+                            gc_alloc_typed_nursery_shim as *const () as usize
+                        };
                         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         let result = emit_collecting_gc_call(
                             &mut builder,
@@ -15649,7 +15675,7 @@ impl CraneliftBackend {
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
                             per_call_gcmap,
-                            gc_alloc_typed_nursery_shim as *const () as usize,
+                            alloc_shim,
                             &[type_id_val, size_val],
                             Some(cl_types::I64),
                         )

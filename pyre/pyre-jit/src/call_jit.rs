@@ -2431,6 +2431,9 @@ fn exit_frame_exception_ref(
 ///
 /// Never returns: the caller is about to classify the value by its `ExcKind`
 /// tag, and there is no correct classification for a value that has no tag.
+/// Name lookups through `ob_type` / `w_class` are intentionally omitted —
+/// an aligned word is not a live type, and following one is how this
+/// reporter SIGSEGVed after already printing the header dump.
 fn reject_non_exception_channel_value(
     obj: PyObjectRef,
     site: &str,
@@ -2467,23 +2470,15 @@ fn reject_non_exception_channel_value(
     pyre_interpreter::host_seam::emit_stderr(
         format!("[jit][BUG] {site}: context: {}\n", context()).as_bytes(),
     );
-    // `words[0]` is `ob_type` and `words[1]` is `w_class`; only read through
-    // either when the pointer has the shape of one.  `ob_type` names the
-    // built-in layout ("object" for every instance of a Python class), so the
-    // `w_class` name is the one that identifies the value.
-    let type_name = if words[0] != 0 && words[0].is_multiple_of(8) {
-        unsafe { pyre_object::pyobject::type_name_of(obj) }
-    } else {
-        "<unreadable>"
-    };
-    let class_name = if words[1] != 0 && words[1].is_multiple_of(8) {
-        unsafe { pyre_object::w_type_get_name(words[1] as PyObjectRef).to_string() }
-    } else {
-        "<none>".to_string()
-    };
+    // Do not follow `ob_type` / `w_class`. Alignment is not a type proof —
+    // a reused nursery word that happens to be 8-aligned still faults
+    // `type_name_of` / `w_type_get_name`, which is how this reporter turned
+    // a classification abort into SIGSEGV on macos cranelift.
     panic!(
         "{site}: exception channel value is not a W_BaseException \
-         (obj={obj:p} tag_byte={tag} type={type_name} class={class_name})"
+         (obj={obj:p} tag_byte={tag} \
+         words=[{:#018x} {:#018x} {:#018x} {:#018x}])",
+        words[0], words[1], words[2], words[3]
     );
 }
 

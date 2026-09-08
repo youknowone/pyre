@@ -5090,7 +5090,7 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// is written separately by the raise lowering; the remaining pointer slots
 /// stay zeroed by GC pointer clearing (PY_NULL), matching `w_exception_new_empty`.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
-    build_object_descr_group_keyed_only(
+    let group = build_object_descr_group_keyed_only(
         W_BASE_EXCEPTION_SIZE,
         W_BASE_EXCEPTION_GC_TYPE_ID,
         exc_kind_to_pytype(kind) as *const _ as usize,
@@ -5460,7 +5460,15 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
         // kind shares one layout and one `W_BASE_EXCEPTION_GC_TYPE_ID`, so one
         // key for all of them is exactly the STRUCT identity they have.
         "W_BaseException",
-    )
+    );
+    // `w_exception_new_empty_impl` allocates in the non-moving oldgen so
+    // accessors can deref a bare `*W_BaseException` and residual helpers
+    // can carry it as a raw i64 across allocating opcodes. A JIT-emitted
+    // exception has to agree: nursery allocation plus a later residual
+    // collection moves it, after which `publish_residual_call_exception`
+    // classifies the dead pre-move copy.
+    group.size_descr.set_non_moving(true);
+    group
 }
 
 static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
@@ -6533,6 +6541,15 @@ mod tests {
         assert!(
             storage_array.non_moving(),
             "the mapdict custom tracer marks raw storage pointers but cannot rewrite them"
+        );
+
+        let (exc_descr, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let exc_size = exc_descr
+            .as_size_descr()
+            .expect("W_BaseException SizeDescr");
+        assert!(
+            exc_size.non_moving(),
+            "w_exception_new_empty_impl is try_gc_alloc_stable_raw; JIT NewWithVtable must match"
         );
     }
 
