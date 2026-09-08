@@ -242,6 +242,7 @@ fn jitframe_layout_descrs() -> majit_gc::rewrite::JitFrameDescrs {
 mod tests {
     use super::jitframe_layout_descrs;
     use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
+    use pyre_interpreter::pyframe::PyFrame;
 
     #[test]
     fn jitframe_layout_descrs_uses_frame_relative_offsets() {
@@ -262,6 +263,56 @@ mod tests {
             super::leave_resumed_blackhole_frame(&bh, false);
             super::leave_resumed_blackhole_frame(&bh, true);
             assert!(ec.topframeref.is_null());
+            pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Stack `PyFrame` whose Drop-owned pointers stay null.
+    fn stack_pyframe() -> PyFrame {
+        unsafe { std::mem::zeroed::<PyFrame>() }
+    }
+
+    #[test]
+    fn blackhole_leave_marks_an_on_chain_parent_without_rewriting_top() {
+        std::thread::spawn(|| {
+            let mut ec = pyre_interpreter::PyExecutionContext::default();
+            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            let mut parent = stack_pyframe();
+            let mut child = stack_pyframe();
+            child.f_backref = &mut parent;
+            ec.topframeref = &mut child;
+            let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
+            bh.virtualizable_ptr = std::ptr::from_mut(&mut parent) as i64;
+            super::leave_resumed_blackhole_frame(&bh, false);
+            assert!(parent.frame_finished_execution());
+            assert!(!child.frame_finished_execution());
+            assert!(std::ptr::eq(ec.topframeref, std::ptr::from_mut(&mut child)));
+            pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn blackhole_leave_closes_the_open_scope() {
+        std::thread::spawn(|| {
+            let mut ec = pyre_interpreter::PyExecutionContext::default();
+            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            let mut parent = stack_pyframe();
+            let mut child = stack_pyframe();
+            child.f_backref = &mut parent;
+            ec.topframeref = &mut child;
+            let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
+            bh.virtualizable_ptr = std::ptr::from_mut(&mut child) as i64;
+            super::leave_resumed_blackhole_frame(&bh, false);
+            assert!(child.frame_finished_execution());
+            assert!(!parent.frame_finished_execution());
+            assert!(std::ptr::eq(
+                ec.topframeref,
+                std::ptr::from_mut(&mut parent)
+            ));
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
         })
         .join()
@@ -2420,11 +2471,52 @@ fn leave_resumed_blackhole_frame(
     frame: &majit_metainterp::blackhole::BlackholeInterpreter,
     got_exception: bool,
 ) {
-    let frame_ptr = frame.virtualizable_ptr as *mut PyFrame;
-    if frame_ptr.is_null() {
+    let recovered = frame.virtualizable_ptr as *mut PyFrame;
+    if recovered.is_null() {
         return;
     }
-    leave_compiled_frame_chain(frame_ptr, got_exception);
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    if ec.is_null() {
+        return;
+    }
+    let open = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+    if std::ptr::eq(open, recovered) {
+        // `leave(frame)` is given the current top. The recovered red is that
+        // frame, so run the chain half in full.
+        leave_compiled_frame_chain(recovered, got_exception);
+        return;
+    }
+    // Not the open scope. `leave` must not rewrite `topframeref` or it
+    // would drop an inlined callee still sitting there. The blackhole's
+    // own frame still needs the `dispatch_bytecode` / `handle_operation_error`
+    // finish mark if it is a live chain member (the portal under that
+    // callee). A garbage red is not on the chain and is not dereferenced.
+    if frame_is_on_unforced_ec_chain(ec, recovered) {
+        unsafe {
+            (*recovered).set_frame_finished_execution(true);
+        }
+    }
+}
+
+/// Walk `topframeref` / `f_backref` without forcing, the way
+/// `executioncontext.py` moves those slots (no parens) rather than
+/// `frame.f_backref()`.
+fn frame_is_on_unforced_ec_chain(
+    ec: *mut pyre_interpreter::PyExecutionContext,
+    frame_ptr: *mut PyFrame,
+) -> bool {
+    let mut cur = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+    for _ in 0..1024 {
+        if cur.is_null() {
+            return false;
+        }
+        if std::ptr::eq(cur, frame_ptr) {
+            return true;
+        }
+        cur = unsafe { pyre_interpreter::executioncontext::vref_referent((*cur).f_backref) };
+    }
+    false
 }
 
 /// `executioncontext.py ExecutionContext.leave`'s frame-chain half for a frame

@@ -91,6 +91,29 @@ extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
     majit_gc::shadow_stack::try_pop_to(depth as usize);
 }
 
+/// One-word residual ABI for `w_list_pop_end`. Empty is NULL; the generated
+/// `descr_pop` graph still owns the IndexError. `Option<PyObjectRef>` is two
+/// words with no pointer niche, so publishing the Rust function would return
+/// the `Some` discriminant instead of the popped object.
+extern "C" fn w_list_pop_end_word(obj: i64) -> i64 {
+    match unsafe {
+        pyre_object::listobject::w_list_pop_end(obj as usize as pyre_object::PyObjectRef)
+    } {
+        Some(item) => item as usize as i64,
+        None => 0,
+    }
+}
+
+/// One-word residual ABI for the descended `w_list_pop_end_inner` body.
+extern "C" fn w_list_pop_end_inner_word(obj: i64) -> i64 {
+    match unsafe {
+        pyre_object::listobject::w_list_pop_end_inner(obj as usize as pyre_object::PyObjectRef)
+    } {
+        Some(item) => item as usize as i64,
+        None => 0,
+    }
+}
+
 /// Word-ABI bridge for the scalar bytecode read used by translated residual
 /// calls.  The backends call integer helpers uniformly as `(i64, ..) -> i64`;
 /// the raw Rust function is `(pointer, usize) -> u16`, which is a different
@@ -2835,25 +2858,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_list_append",
         w_list_append,
     );
-    let w_list_pop_end_inner: unsafe fn(
-        pyre_object::PyObjectRef,
-    ) -> Option<pyre_object::PyObjectRef> = pyre_object::listobject::w_list_pop_end_inner;
-    // ABI-UNSOUND: same two-word Option as `w_list_pop_end` below. The empty
-    // check now lives in this descended body (`W_ListObject.descr_pop`).
-    push_abi_unsound_alias_pair(
+    // The fold descends the Option-returning Rust body. Residual/blackhole
+    // calls use the one-word bridges: `Option<PyObjectRef>` has no pointer
+    // niche, so the raw function would return the Some discriminant.
+    cpa1(
         &mut entries,
         "pyre_object::listobject::w_list_pop_end_inner",
         "pyre_object::w_list_pop_end_inner",
-        w_list_pop_end_inner as *const (),
+        w_list_pop_end_inner_word,
     );
-    let w_list_pop_end: unsafe fn(pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> =
-        pyre_object::listobject::w_list_pop_end;
-    // ABI-UNSOUND: `Option<PyObjectRef>` is two words: a raw pointer has no niche.
-    push_abi_unsound_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::listobject::w_list_pop_end",
         "pyre_object::w_list_pop_end",
-        w_list_pop_end as *const (),
+        w_list_pop_end_word,
     );
     let w_list_len: unsafe fn(pyre_object::PyObjectRef) -> usize =
         pyre_object::listobject::w_list_len;
@@ -4864,6 +4882,7 @@ mod tests {
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
         jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
+        w_list_pop_end_inner_word, w_list_pop_end_word,
     };
     use std::collections::HashMap;
 
@@ -4989,6 +5008,41 @@ mod tests {
         try_pop_to(depth);
         assert_eq!(push(marker), depth, "try_pop_to left the depth unrestored");
         try_pop_to(depth);
+    }
+
+    #[test]
+    fn list_pop_fnaddrs_are_the_one_word_bridges() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for (path, expected) in [
+            (
+                "pyre_object::listobject::w_list_pop_end",
+                w_list_pop_end_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::w_list_pop_end",
+                w_list_pop_end_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::listobject::w_list_pop_end_inner",
+                w_list_pop_end_inner_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::w_list_pop_end_inner",
+                w_list_pop_end_inner_word as *const () as usize as i64,
+            ),
+        ] {
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+        }
+        let raw_inner = pyre_object::listobject::w_list_pop_end_inner as *const () as usize as i64;
+        let raw_end = pyre_object::listobject::w_list_pop_end as *const () as usize as i64;
+        assert_ne!(
+            bindings["pyre_object::listobject::w_list_pop_end_inner"], raw_inner,
+            "must not publish the Option-returning Rust item"
+        );
+        assert_ne!(
+            bindings["pyre_object::listobject::w_list_pop_end"], raw_end,
+            "must not publish the Option-returning Rust item"
+        );
     }
 
     /// Two registered functions must never share an address.
