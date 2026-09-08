@@ -1194,9 +1194,10 @@ impl MIFrame {
                     if let Some(portal) = self.portal_red_ref_at(idx) {
                         SnapshotTagged::Box(portal, Type::Ref)
                     } else {
-                        let opref = self.ref_regs[idx].expect(
-                            "get_list_of_active_snapshot_boxes: ref register uninitialized",
-                        );
+                        let opref = self.ref_regs[idx].unwrap_or_else(|| panic!(
+                            "get_list_of_active_snapshot_boxes: ref register {idx} uninitialized in {} (pc={}, cursor={}, in_a_call={in_a_call}, after_residual_call={after_residual_call}, refs={:?})",
+                            self.jitcode.name(), self.pc, self.code_cursor, self.ref_regs,
+                        ));
                         let value = self.ref_values[idx]
                             .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
                         if opref.is_constant() {

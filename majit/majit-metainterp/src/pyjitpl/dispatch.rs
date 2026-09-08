@@ -4619,7 +4619,16 @@ where
                 let loaded = if struct_ptr == 0 {
                     0
                 } else if is_ref {
-                    unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
+                    // llmodel.py bh_getfield_gc_r / read_ref_at_mem use GCREF,
+                    // whose width is the target pointer width, not FLOATSTORAGE.
+                    self.cpu
+                        .bh_getfield_gc_r(
+                            struct_ptr as usize,
+                            fielddescr
+                                .as_field_descr()
+                                .expect("GC ref field descriptor"),
+                        )
+                        .0 as i64
                 } else {
                     let addr = (struct_ptr as usize).wrapping_add(offset);
                     unsafe {
@@ -5189,7 +5198,7 @@ where
             //
             // Ref-result element read for a raw-pointer array (a
             // `pools[selected]`-shaped read).  Mirrors BC_GETARRAYITEM_GC_I
-            // but loads an 8-byte GC pointer and writes the ref bank.  Unlike
+            // but loads a target-sized GC pointer and writes the ref bank. Unlike
             // the int arm there is NO all-constant fold: the array base is a
             // live state pointer and the result must stay a `GetarrayitemGcR`
             // op so the short preamble re-produces it each loop entry (the
@@ -5210,22 +5219,20 @@ where
                 let Some(descr) = self.dispatch_array_descr_ref(ctx, descr_idx) else {
                     return TraceAction::Abort;
                 };
-                let Some((base_size, itemsize, _is_signed)) =
-                    self.dispatch_array_geometry(descr_idx)
-                else {
-                    return TraceAction::Abort;
-                };
                 let (array_opref, array_addr) = self.read_ref_reg(array_reg);
                 let (index_opref, index_value) = self.read_int_reg(index_reg);
                 let descr_index = descr.index();
                 let cached = ctx.heapcache_getarrayitem(array_opref, index_opref, descr_index);
-                // SAFETY: `array_addr` is the live pools-array base ref;
-                // `index_value` is the `selected` slot, bounded by
-                // STORAGE_COUNT. Pointer elements are 8 bytes (base_size=0).
-                let item_addr = (array_addr as usize)
-                    .wrapping_add(base_size)
-                    .wrapping_add((index_value as usize).wrapping_mul(itemsize));
-                let concrete = unsafe { *(item_addr as *const i64) };
+                // blackhole.py bhimpl_getarrayitem_gc_r reads GCREF through
+                // the CPU; both the array stride and pointer width are typed.
+                let concrete = self
+                    .cpu
+                    .bh_getarrayitem_gc_r(
+                        majit_ir::GcRef(array_addr as usize),
+                        index_value,
+                        descr.as_array_descr().expect("GC ref array descriptor"),
+                    )
+                    .0 as i64;
                 let (opref, reg_concrete) = if let Some(cached) = cached {
                     ctx.profiler().count_ops(
                         OpCode::GetarrayitemGcR,

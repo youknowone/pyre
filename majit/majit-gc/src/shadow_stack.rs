@@ -259,7 +259,7 @@ thread_local! {
     /// traces these through the GC-managed reader/blackhole objects; pyre
     /// stores raw `i64`, so the slices are registered here for the
     /// construction window and popped when it ends.
-    static RESUME_REF_ROOTS_STACK: RefCell<Vec<(*mut i64, usize)>> =
+    static RESUME_REF_ROOTS_STACK: RefCell<Vec<ResumeRefRoots>> =
         RefCell::new(Vec::with_capacity(16));
 }
 
@@ -276,7 +276,7 @@ struct MutatorEntry {
     jf_root_stack: *const RefCell<JitFrameShadowStack>,
     bh_regs_stack: *const RefCell<Vec<BhRegsEntry>>,
     bh_interp_roots: *const RefCell<Vec<BhInterpEntry>>,
-    resume_ref_roots_stack: *const RefCell<Vec<(*mut i64, usize)>>,
+    resume_ref_roots_stack: *const RefCell<Vec<ResumeRefRoots>>,
     extra_areas: Vec<Option<MutatorExtraArea>>,
     pruners: Vec<MutatorPruner>,
 }
@@ -1407,7 +1407,53 @@ pub fn resume_ref_roots_depth() -> usize {
 /// precondition — the cache slice they write into has to be forwardable in
 /// place by a collection their allocations trigger — instead of arguing it.
 pub fn resume_ref_slice_registered(ptr: *const i64) -> bool {
-    RESUME_REF_ROOTS_STACK.with(|ss| ss.borrow().iter().any(|&(p, _)| std::ptr::eq(p, ptr)))
+    RESUME_REF_ROOTS_STACK.with(|ss| {
+        ss.borrow()
+            .iter()
+            .any(|entry| entry.ptr == ptr.cast_mut().cast())
+    })
+}
+
+struct ResumeRefRoots {
+    ptr: *mut u8,
+    len: usize,
+    stride: usize,
+}
+
+impl ResumeRefRoots {
+    unsafe fn walk(&self, visitor: &mut impl FnMut(&mut GcRef)) {
+        for index in 0..self.len {
+            visitor(unsafe { &mut *self.ptr.add(index * self.stride).cast::<GcRef>() });
+        }
+    }
+}
+
+/// Register a pointer-width field, as opposed to an i64 JIT register bank.
+/// RPython's `ResumeDataDirectReader` keeps these fields on GC-traced objects;
+/// stationary Rust virtualizables expose their actual GCREF slots instead.
+///
+/// # Safety
+/// The slot must remain alive and stationary until `pop_resume_ref_roots_to`.
+#[track_caller]
+pub unsafe fn push_resume_ref_root(slot: &mut GcRef) {
+    assert!(
+        !crate::gc_is_nursery_object(slot as *mut GcRef as usize),
+        "GC BUG: resume root field points inside the movable nursery",
+    );
+    if crate::gc_nursery_poison_enabled() {
+        assert_ne!(
+            slot.0,
+            (usize::MAX / 0xff) * 0xaa,
+            "GC BUG: poisoned resume root field"
+        );
+    }
+    RESUME_REF_ROOTS_STACK.with(|ss| {
+        ss.borrow_mut().push(ResumeRefRoots {
+            ptr: (slot as *mut GcRef).cast(),
+            len: 1,
+            stride: std::mem::size_of::<GcRef>(),
+        });
+    });
 }
 
 /// Register a ref slice as a GC root for the blackhole resume
@@ -1441,7 +1487,11 @@ pub unsafe fn push_resume_ref_roots(slice: &mut [i64]) {
         }
     }
     RESUME_REF_ROOTS_STACK.with(|ss| {
-        ss.borrow_mut().push((slice.as_mut_ptr(), slice.len()));
+        ss.borrow_mut().push(ResumeRefRoots {
+            ptr: slice.as_mut_ptr().cast(),
+            len: slice.len(),
+            stride: std::mem::size_of::<i64>(),
+        });
     });
 }
 
@@ -1459,12 +1509,8 @@ pub fn pop_resume_ref_roots_to(depth: usize) {
 /// visitor's `copy_nursery_object` guard unchanged.
 pub fn walk_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
     RESUME_REF_ROOTS_STACK.with(|ss| {
-        for &(ptr, len) in ss.borrow().iter() {
-            let slots = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-            for slot in slots.iter_mut() {
-                let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
-                visitor(gcref);
-            }
+        for entry in ss.borrow().iter() {
+            unsafe { entry.walk(&mut visitor) };
         }
     });
 }
@@ -1513,12 +1559,8 @@ pub fn walk_all_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
         // SAFETY: the owner is quiesced and the registered slices stay pinned
         // for the complete resume-construction window.
         let entries = unsafe { &*(*mutator.resume_ref_roots_stack).as_ptr() };
-        for &(ptr, len) in entries.iter() {
-            let slots = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-            for slot in slots.iter_mut() {
-                let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
-                visitor(gcref);
-            }
+        for entry in entries.iter() {
+            unsafe { entry.walk(&mut visitor) };
         }
     }
 }
@@ -1894,6 +1936,27 @@ mod tests {
     // Keep these tests serialized because some of them intentionally shrink
     // the current thread's capacity and then re-raise an expected panic.
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn resume_roots_preserve_pointer_fields_and_register_stride() {
+        let _lock = TEST_MUTEX.lock();
+        #[repr(C, align(8))]
+        struct Fields([usize; 3]);
+        let mut fields = Fields([0x1111, 0x2000, 0x3333]);
+        let mut registers = [0x4000_i64, 0x5000];
+        let depth = resume_ref_roots_depth();
+        // On wasm32 this field is only four-byte aligned and has a live
+        // neighbouring word: neither an i64 reference nor slice is valid.
+        unsafe {
+            push_resume_ref_root(&mut *(&mut fields.0[1] as *mut usize).cast::<GcRef>());
+            push_resume_ref_roots(&mut registers);
+        }
+        assert!(resume_ref_slice_registered(registers.as_ptr()));
+        walk_resume_ref_roots(|slot| slot.0 += 0x10);
+        pop_resume_ref_roots_to(depth);
+        assert_eq!(fields.0, [0x1111, 0x2010, 0x3333]);
+        assert_eq!(registers, [0x4010, 0x5010]);
+    }
 
     fn jf_root_stack_base_for_test() -> usize {
         JF_ROOT_STACK.with(|stack| {

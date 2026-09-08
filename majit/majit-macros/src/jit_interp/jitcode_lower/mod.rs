@@ -159,7 +159,8 @@ pub struct LowererConfig {
     /// Array name → (array_index, item_type).
     /// RPython: `vinfo.array_field_counter[fieldname]` → index.
     pub(super) vable_arrays: HashMap<String, (usize, ValueKind)>,
-    /// State field scalars: field_name → global_field_index.
+    /// Scalar declarations: field_name → legacy state-slot index. Fields also
+    /// present in `vable_fields` use that object's field index instead.
     pub(super) state_scalars: HashMap<String, usize>,
     /// State field arrays (flattened): field_name → global_array_index.
     pub(super) state_arrays: HashMap<String, usize>,
@@ -168,8 +169,8 @@ pub struct LowererConfig {
     pub(super) state_virt_arrays: HashMap<String, (usize, ValueKind)>,
     /// State field ref scalars: field_name → (ref_scalar_index, struct Path).
     /// The index is 0-based in its own space (separate from `state_scalars`);
-    /// these lower to load_state_field_ref/store_state_field_ref in the ref
-    /// register bank.  The `ref(T)` struct Path `T` is retained so a field
+    /// fields in `vable_fields` use the live object's field instead of a
+    /// legacy state slot. The `ref(T)` struct Path `T` is retained so a field
     /// read/write through the ref (`state.<ref_scalar>.<member>`) can emit
     /// `getfield_gc_*`/`setfield_gc_*` with `offset_of!(T, member)` + the
     /// matching `struct_type_id(T)`.
@@ -1104,7 +1105,7 @@ impl LowererConfig {
                 (canonical_path_segments(&entry.path), spec)
             })
             .collect();
-        let (mut vable_var, mut vable_input_ref_reg, vable_fields, mut vable_arrays) =
+        let (mut vable_var, mut vable_input_ref_reg, mut vable_fields, mut vable_arrays) =
             if let Some(decl) = vable_decl {
                 let var = Some(decl.var_name.to_string());
                 let fields = decl
@@ -1204,6 +1205,19 @@ impl LowererConfig {
             vable_input_ref_reg = Some(1);
             for (name, &(idx, kind)) in &state_virt_arrays {
                 vable_arrays.insert(name.clone(), (idx, kind));
+            }
+            // jtransform.py rewrite_op_getfield: all redirected fields use
+            // the live virtualizable argument, including in inline callees.
+            for f in &state_fields_cfg.unwrap().fields {
+                let kind = match &f.kind {
+                    crate::jit_interp::StateFieldKind::Scalar { ir_type, .. } => {
+                        ValueKind::from_ident(ir_type)
+                    }
+                    crate::jit_interp::StateFieldKind::Ref(_) => ValueKind::Ref,
+                    _ => continue,
+                };
+                let index = vable_fields.len();
+                vable_fields.insert(f.name.to_string(), (index, kind));
             }
         }
         // Fail closed: a `residual_writes` ref_scalar or a `pool_arrays` name
