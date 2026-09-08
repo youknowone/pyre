@@ -185,3 +185,136 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Varia
 // `regalloc::perform_register_allocation`'s internal
 // `concretetype_to_regkind`, matching RPython's
 // `getkind(v.concretetype)` access pattern bit for bit.
+
+/// Stamp GC `getfield`/`setfield` bases into the Ref bank before regalloc.
+///
+/// RPython `history.getkind`: a `Ptr` whose `TO._gckind != 'raw'` is
+/// `"ref"`, so `bhimpl_getfield_gc_*` is always
+/// `@arguments("cpu", "r", "d", returns="X")`.  Pyre's MIR sometimes
+/// leaves a GC object pointer as `Signed` (a Rust raw pointer /
+/// address-sized word).  The assembler then keys the first argcode off
+/// that bank and emits the pyre-only `getfield_gc_*/id>X` form.
+///
+/// Walk every surviving `FieldRead`/`FieldWrite` of a GC owner
+/// (unknown owner defaults to `_gckind='gc'`, matching
+/// `jtransform.py rewrite_op_getfield`'s `getattr(STRUCT, '_gckind',
+/// 'gc')`) and publish `GcRef` on a `Signed`/`Unknown`/`Void` base.
+///
+/// Raw owners (`CallControl::struct_storage_for` →
+/// `is_gc_managed=false`) are left alone: a `Signed` base stays an
+/// address, a `GcRef` base stays a Ref-banked raw struct (`PyType` /
+/// `CLASSTYPE` travels through the Ref bank even though its storage
+/// is not a GC object).
+pub(crate) fn promote_gc_field_bases(
+    graph: &FunctionGraph,
+    callcontrol: Option<&crate::call::CallControl>,
+) {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let (base, force_gc) = match &op.kind {
+                OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
+                    (base, field_owner_is_gc(field, callcontrol))
+                }
+                OpKind::VableFieldRead { base, .. } | OpKind::VableFieldWrite { base, .. } => {
+                    (base, true)
+                }
+                _ => continue,
+            };
+            if !force_gc {
+                continue;
+            }
+            match FunctionGraph::concretetype_of(base) {
+                ConcreteType::GcRef => {}
+                ConcreteType::Float => panic!(
+                    "GC field base {base:?} has Float concretetype — \
+                     history.getkind(Ptr(GC)) is 'ref' (graph {})",
+                    graph.name
+                ),
+                ConcreteType::Signed | ConcreteType::Unknown | ConcreteType::Void => {
+                    FunctionGraph::set_concretetype_of_inline(base, ConcreteType::GcRef);
+                }
+            }
+        }
+    }
+}
+
+fn field_owner_is_gc(
+    field: &crate::model::FieldDescriptor,
+    callcontrol: Option<&crate::call::CallControl>,
+) -> bool {
+    let Some(owner) = field.owner_root.as_deref() else {
+        return true;
+    };
+    callcontrol
+        .and_then(|cc| cc.struct_storage_for(owner))
+        .map(|(is_gc, _)| is_gc)
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{FieldDescriptor, OpKind, ValueType};
+
+    fn push_input(
+        graph: &mut FunctionGraph,
+        name: &str,
+        ty: ValueType,
+    ) -> crate::flowspace::model::Variable {
+        let var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: name.into(),
+                    ty,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, var.clone());
+        var
+    }
+
+    #[test]
+    fn promote_gc_field_bases_lifts_a_signed_gc_owner_into_the_ref_bank() {
+        let mut graph = FunctionGraph::new("int_base_getfield");
+        let base = push_input(&mut graph, "obj", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+
+        promote_gc_field_bases(&graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::GcRef,
+            "a GC FieldRead base that arrived as Signed must be published as GcRef"
+        );
+    }
+
+    #[test]
+    fn field_owner_is_gc_defaults_unknown_owners_to_gc() {
+        let named = FieldDescriptor::new("x", Some("Point".into()));
+        let unnamed = FieldDescriptor::new("x", None);
+        assert!(
+            field_owner_is_gc(&named, None),
+            "jtransform.py getattr(STRUCT, '_gckind', 'gc') defaults to gc"
+        );
+        assert!(
+            field_owner_is_gc(&unnamed, None),
+            "a descriptor with no owner_root is treated as GC"
+        );
+    }
+}

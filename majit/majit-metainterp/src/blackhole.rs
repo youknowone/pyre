@@ -5908,23 +5908,20 @@ mod tests {
 
         #[test]
         fn wire_bhimpl_handlers_wires_non_vable_int_base_access_aliases() {
-            // Raw/tagged-pointer getfield/setfield/array operations may carry
-            // their base in the Int bank.  Virtualizable operations may not:
-            // every PyPy `bhimpl_*_vable_*` declares its base as `"r"`, and
-            // only the Ref bank is GC-forwarded.
+            // setfield/array int-base forms still exist (FieldWrite /
+            // ArrayRead emit has not been rehomed).  getfield_gc is
+            // Ref-bank only — an Int-bank base is getfield_raw.
             let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
-            insns.insert("getfield_gc_i/id>i".to_string(), 0u8);
-            insns.insert("getfield_gc_r/id>r".to_string(), 1u8);
-            insns.insert("setfield_gc_i/iid".to_string(), 2u8);
-            insns.insert("setfield_gc_r/ird".to_string(), 3u8);
-            insns.insert("getarrayitem_gc_i/iid>i".to_string(), 4u8);
+            insns.insert("setfield_gc_i/iid".to_string(), 0u8);
+            insns.insert("setfield_gc_r/ird".to_string(), 1u8);
+            insns.insert("getarrayitem_gc_i/iid>i".to_string(), 2u8);
 
             let mut builder = BlackholeInterpBuilder::new();
             builder.setup_insns(&insns);
             super::wire_bhimpl_handlers(&mut builder);
 
             let placeholder = super::unwired_handler_placeholder as *const () as usize;
-            for slot in 0usize..=4 {
+            for slot in 0usize..=2 {
                 assert_ne!(
                     builder.dispatch_table[slot] as *const () as usize, placeholder,
                     "slot {slot} must be wired",
@@ -5935,9 +5932,11 @@ mod tests {
         #[test]
         fn wire_bhimpl_handlers_rejects_vable_int_base_aliases() {
             let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
-            insns.insert("getfield_vable_i/id>i".to_string(), 0u8);
-            insns.insert("setfield_vable_i/iid".to_string(), 1u8);
-            insns.insert("setfield_vable_r/ird".to_string(), 2u8);
+            insns.insert("getfield_gc_i/id>i".to_string(), 0u8);
+            insns.insert("getfield_gc_r/id>r".to_string(), 1u8);
+            insns.insert("getfield_vable_i/id>i".to_string(), 2u8);
+            insns.insert("setfield_vable_i/iid".to_string(), 3u8);
+            insns.insert("setfield_vable_r/ird".to_string(), 4u8);
 
             let mut builder = BlackholeInterpBuilder::new();
             builder.setup_insns(&insns);
@@ -5946,6 +5945,8 @@ mod tests {
             assert_eq!(
                 builder.unwired_opnames(),
                 vec![
+                    "getfield_gc_i/id>i",
+                    "getfield_gc_r/id>r",
                     "getfield_vable_i/id>i",
                     "setfield_vable_i/iid",
                     "setfield_vable_r/ird",
@@ -8530,36 +8531,12 @@ fn handler_getfield_gc_i(
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
 }
-fn handler_getfield_gc_i_intbase(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[position] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    let result = cpu.bh_getfield_gc_i(struct_ptr, descr);
-    bh.registers_i[code[pos] as usize] = result;
-    Ok(pos + 1)
-}
 fn handler_getfield_gc_r(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
-    bh.registers_r[code[pos] as usize] = result.0 as i64;
-    Ok(pos + 1)
-}
-fn handler_getfield_gc_r_intbase(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
     let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
@@ -8578,19 +8555,6 @@ fn handler_getfield_gc_f(
     bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
     Ok(pos + 1)
 }
-fn handler_getfield_gc_f_intbase(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    position: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[position] as usize];
-    let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
-    bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
-    Ok(pos + 1)
-}
-
 // bhimpl_setfield_gc_i: @arguments("cpu", "r", "i", "d")
 fn handler_setfield_gc_i(
     bh: &mut BlackholeInterpreter,
@@ -10003,8 +9967,9 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // (an int field store, `setfield_gc_i/rid` = BC_SETFIELD_GC_I 0xac)
     // landed on the unwired-opcode placeholder.
     // Canonical `rd`/`r{i,r,f}d` argcodes only (these access fields off a
-    // ref base); intbase (`id`/`iid`/`ird`) forms have no canonical byte
-    // and are not emitted here.  Additive: every byte is currently unwired.
+    // ref base).  `getfield_gc` intbase (`id`) is no longer a handler;
+    // `promote_gc_field_bases` rehomes a Signed GC pointer so the
+    // assembler emits `/rd>X`.  Additive: every byte is currently unwired.
     for (key, byte) in [
         (
             "getfield_gc_i/rd>i",
@@ -10751,21 +10716,16 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // Field operations (blackhole.py:1432-1481).
     //
-    // Canonical `/rd>X` and `/rXd` are the RPython-exact keys. The
-    // `/id>X` / `/iXd` variants carry a pyre tagged-int base in an int
-    // register (same backend primitive `bh_{get,set}field_gc_*`, only
-    // the base's register class differs). The emit side at
-    // `majit-translate/src/codewriter/assembler.rs` OpKind::FieldRead/
-    // FieldWrite derives the opname kind suffix from the VALUE / RESULT
-    // register kind and the argcodes from each register's class, so the
-    // tagged-int variant is indistinguishable from the canonical one
-    // except at the first argcode character.
+    // Canonical `/rd>X` and `/rXd` are the RPython-exact keys.
+    // `bhimpl_getfield_gc_*` takes the struct in the Ref bank
+    // (`@arguments("cpu", "r", "d", returns="X")`).  An Int-bank base
+    // is `getfield_raw_*` (`@arguments("cpu", "i", "d", returns="X")`),
+    // not a `getfield_gc` alias — `promote_gc_field_bases` rehomes a
+    // GC pointer that arrived as Signed so the assembler never emits
+    // `/id>X` for `getfield_gc`.
     builder.wire_handler("getfield_gc_i/rd>i", handler_getfield_gc_i);
     builder.wire_handler("getfield_gc_r/rd>r", handler_getfield_gc_r);
     builder.wire_handler("getfield_gc_f/rd>f", handler_getfield_gc_f);
-    builder.wire_handler("getfield_gc_i/id>i", handler_getfield_gc_i_intbase);
-    builder.wire_handler("getfield_gc_r/id>r", handler_getfield_gc_r_intbase);
-    builder.wire_handler("getfield_gc_f/id>f", handler_getfield_gc_f_intbase);
     builder.wire_handler("getfield_gc_i_pure/rd>i", handler_getfield_gc_i);
     builder.wire_handler("getfield_gc_r_pure/rd>r", handler_getfield_gc_r);
     builder.wire_handler("getfield_gc_f_pure/rd>f", handler_getfield_gc_f);
