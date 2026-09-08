@@ -6706,15 +6706,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     String::new(),
                     std::env::consts::ARCH.to_string(),
                 );
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_str_new_managed(&sysname));
+                fields.push(pyre_object::w_str_new_managed(&nodename));
+                fields.push(pyre_object::w_str_new_managed(&release));
+                fields.push(pyre_object::w_str_new_managed(&version));
+                fields.push(pyre_object::w_str_new_managed(&machine));
                 Ok(crate::_structseq::new_instance(
                     uname_result_seq_type(),
-                    vec![
-                        pyre_object::w_str_new_managed(&sysname),
-                        pyre_object::w_str_new_managed(&nodename),
-                        pyre_object::w_str_new_managed(&release),
-                        pyre_object::w_str_new_managed(&version),
-                        pyre_object::w_str_new_managed(&machine),
-                    ],
+                    fields.take(),
                 ))
             },
             0,

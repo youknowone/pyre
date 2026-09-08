@@ -29,20 +29,24 @@ fn struct_group_type() -> pyre_object::PyObjectRef {
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     #[cfg(feature = "host_env")]
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
-        let mem_items: Vec<pyre_object::PyObjectRef> = g
-            .mem
-            .iter()
-            .map(|s| pyre_object::w_str_new_managed(s))
-            .collect();
-        crate::_structseq::new_instance(
-            struct_group_type(),
-            vec![
-                pyre_object::w_str_new_managed(&g.name),
-                pyre_object::w_str_new_managed(&g.passwd),
-                pyre_object::w_int_new(g.gid as i64),
-                pyre_object::w_list_new(mem_items),
-            ],
-        )
+        // Each `w_str_new_managed` is collectable.  A plain Vec is not a
+        // root, so later member/name allocations can sweep earlier strings
+        // before `new_instance` pins its argument vector.  Pin each mint
+        // as it is produced; close the member bracket before the field
+        // bracket (`RootedItems` cannot grow under another open set).
+        let mem_list = {
+            let mut mem = pyre_object::gc_roots::RootedItems::new();
+            for s in &g.mem {
+                mem.push(pyre_object::w_str_new_managed(s));
+            }
+            pyre_object::w_list_new(mem.take())
+        };
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_str_new_managed(&g.name));
+        fields.push(pyre_object::w_str_new_managed(&g.passwd));
+        fields.push(pyre_object::w_int_new(g.gid as i64));
+        fields.push(mem_list);
+        crate::_structseq::new_instance(struct_group_type(), fields.take())
     }
     // `lib_pypy/grp.py:21-34 _group_from_gstruct` libc backend, used when
     // the host_env abstraction layer is disabled.
@@ -55,23 +59,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
             }
         }
-        let mut mem_items: Vec<pyre_object::PyObjectRef> = Vec::new();
-        let mut p = (*g).gr_mem;
-        if !p.is_null() {
-            while !(*p).is_null() {
-                mem_items.push(pyre_object::w_str_new_managed(&cstr(*p)));
-                p = p.add(1);
+        let mem_list = {
+            let mut mem = pyre_object::gc_roots::RootedItems::new();
+            let mut p = (*g).gr_mem;
+            if !p.is_null() {
+                while !(*p).is_null() {
+                    mem.push(pyre_object::w_str_new_managed(&cstr(*p)));
+                    p = p.add(1);
+                }
             }
-        }
-        crate::_structseq::new_instance(
-            struct_group_type(),
-            vec![
-                pyre_object::w_str_new_managed(&cstr((*g).gr_name)),
-                pyre_object::w_str_new_managed(&cstr((*g).gr_passwd)),
-                pyre_object::w_int_new((*g).gr_gid as i64),
-                pyre_object::w_list_new(mem_items),
-            ],
-        )
+            pyre_object::w_list_new(mem.take())
+        };
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_str_new_managed(&cstr((*g).gr_name)));
+        fields.push(pyre_object::w_str_new_managed(&cstr((*g).gr_passwd)));
+        fields.push(pyre_object::w_int_new((*g).gr_gid as i64));
+        fields.push(mem_list);
+        crate::_structseq::new_instance(struct_group_type(), fields.take())
     }
     // `lib_pypy/grp.py:14-20 class struct_group` — exposed as
     // `grp.struct_group`; every result type uses this same class.

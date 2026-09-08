@@ -78,18 +78,15 @@ fn pwd_uid_converter(w_uid: pyre_object::PyObjectRef) -> Result<libc::uid_t, cra
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     #[cfg(feature = "host_env")]
     fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
-        crate::_structseq::new_instance(
-            struct_passwd_type(),
-            vec![
-                pyre_object::w_str_new_managed(&pw.name),
-                pyre_object::w_str_new_managed(&pw.passwd),
-                pyre_object::w_int_new(pw.uid as i64),
-                pyre_object::w_int_new(pw.gid as i64),
-                pyre_object::w_str_new_managed(&pw.gecos),
-                pyre_object::w_str_new_managed(&pw.dir),
-                pyre_object::w_str_new_managed(&pw.shell),
-            ],
-        )
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_str_new_managed(&pw.name));
+        fields.push(pyre_object::w_str_new_managed(&pw.passwd));
+        fields.push(pyre_object::w_int_new(pw.uid as i64));
+        fields.push(pyre_object::w_int_new(pw.gid as i64));
+        fields.push(pyre_object::w_str_new_managed(&pw.gecos));
+        fields.push(pyre_object::w_str_new_managed(&pw.dir));
+        fields.push(pyre_object::w_str_new_managed(&pw.shell));
+        crate::_structseq::new_instance(struct_passwd_type(), fields.take())
     }
     // `interp_pwd.py make_struct_passwd` libc backend, used when
     // the host_env abstraction layer is disabled.  Mirrors the same
@@ -103,18 +100,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
             }
         }
-        crate::_structseq::new_instance(
-            struct_passwd_type(),
-            vec![
-                pyre_object::w_str_new_managed(&cstr((*pw).pw_name)),
-                pyre_object::w_str_new_managed(&cstr((*pw).pw_passwd)),
-                pyre_object::w_int_new((*pw).pw_uid as i64),
-                pyre_object::w_int_new((*pw).pw_gid as i64),
-                pyre_object::w_str_new_managed(&cstr((*pw).pw_gecos)),
-                pyre_object::w_str_new_managed(&cstr((*pw).pw_dir)),
-                pyre_object::w_str_new_managed(&cstr((*pw).pw_shell)),
-            ],
-        )
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_name)));
+        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_passwd)));
+        fields.push(pyre_object::w_int_new((*pw).pw_uid as i64));
+        fields.push(pyre_object::w_int_new((*pw).pw_gid as i64));
+        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_gecos)));
+        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_dir)));
+        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_shell)));
+        crate::_structseq::new_instance(struct_passwd_type(), fields.take())
     }
     // `app_pwd.py class struct_passwd(metaclass=structseqtype)`.
     crate::module_ns_store(ns, "struct_passwd", struct_passwd_type());

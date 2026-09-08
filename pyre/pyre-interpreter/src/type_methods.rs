@@ -7312,12 +7312,15 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
     if err.kind != crate::PyErrorKind::TypeError {
         return err;
     }
-    let exc = err.to_exc_object();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let exc = _roots.pin_root(err.to_exc_object());
     err.exc_object = exc;
-    let note = w_str_new_managed(&format!(
+    let note = _roots.pin_root(w_str_new_managed(&format!(
         "Cannot convert dictionary update sequence element #{idx} to a sequence"
-    ));
+    )));
     unsafe {
+        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         let dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
         let notes = match w_dict_getitem_str(dict, "__notes__") {
             Some(notes) if crate::baseobjspace::isinstance_list_w(notes) => notes,
@@ -7332,6 +7335,7 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
         };
         w_list_append(notes, note);
     }
+    err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     err
 }
 
