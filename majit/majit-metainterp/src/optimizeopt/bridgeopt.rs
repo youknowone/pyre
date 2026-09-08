@@ -74,7 +74,7 @@ pub fn serialize_optimizer_knowledge(
     // membership set (values are always None). Pyre uses a Vec scanned
     // linearly: the no-HashMap rule precludes a hash-backed mirror, and
     // available_boxes per bridge is bounded by the live-box set.
-    let available_boxes: Vec<OpRef> = liveboxes
+    let available_boxes: smallvec::SmallVec<[OpRef; 16]> = liveboxes
         .iter()
         .filter_map(|opt| *opt)
         // #160: liveboxes is box-keyed; resolve each backend position to
@@ -149,61 +149,66 @@ pub fn serialize_optimizer_knowledge(
         return Ok(());
     };
     // bridgeopt.py:93: triples_struct = optimizer.optheap.serialize_optheap(available_boxes)
-    let filtered_fields: Vec<(OpRef, i32, OpRef)> = knowledge
-        .heap_fields
-        .iter()
-        .copied()
-        .filter(|&(obj, _, val)| {
-            let obj_ok = env.is_const(obj) || available_boxes.contains(&obj);
-            let val_ok = env.is_const(val) || available_boxes.contains(&val);
-            obj_ok && val_ok
-        })
-        .collect();
-    numb_state.append_int(filtered_fields.len() as i64);
-    for (obj, descr_idx, val) in &filtered_fields {
-        let obj_tag = tag_box(*obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
+    let field_ok = |obj: OpRef, val: OpRef| {
+        (env.is_const(obj) || available_boxes.contains(&obj))
+            && (env.is_const(val) || available_boxes.contains(&val))
+    };
+    numb_state.append_int(
+        knowledge
+            .heap_fields
+            .iter()
+            .filter(|&&(obj, _, val)| field_ok(obj, val))
+            .count() as i64,
+    );
+    for &(obj, descr_idx, val) in &knowledge.heap_fields {
+        if !field_ok(obj, val) {
+            continue;
+        }
+        let obj_tag = tag_box(obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(obj_tag as i32);
-        numb_state.append_int(*descr_idx as i64);
-        let val_tag = tag_box(*val, &numb_state.liveboxes, memo, env, new_liveboxes)?;
+        numb_state.append_int(descr_idx as i64);
+        let val_tag = tag_box(val, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(val_tag as i32);
     }
     // bridgeopt.py:102-108: array items
-    let filtered_arrayitems: Vec<(OpRef, i64, i32, OpRef)> = knowledge
-        .heap_arrayitems
-        .iter()
-        .copied()
-        .filter(|&(obj, _, _, val)| {
-            let obj_ok = env.is_const(obj) || available_boxes.contains(&obj);
-            let val_ok = env.is_const(val) || available_boxes.contains(&val);
-            obj_ok && val_ok
-        })
-        .collect();
-    numb_state.append_int(filtered_arrayitems.len() as i64);
-    for (obj, index, descr_idx, val) in &filtered_arrayitems {
-        let obj_tag = tag_box(*obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
+    numb_state.append_int(
+        knowledge
+            .heap_arrayitems
+            .iter()
+            .filter(|&&(obj, _, _, val)| field_ok(obj, val))
+            .count() as i64,
+    );
+    for &(obj, index, descr_idx, val) in &knowledge.heap_arrayitems {
+        if !field_ok(obj, val) {
+            continue;
+        }
+        let obj_tag = tag_box(obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(obj_tag as i32);
         // bridgeopt.py:106 numb_state.append_int(index) — pass the original
         // index unchanged; resumecode.py:90-93 enforces SHORT range on the
         // i64 value, panicking instead of silently wrapping a too-large
         // index into an i32.
-        numb_state.append_int(*index);
-        numb_state.append_int(*descr_idx as i64);
-        let val_tag = tag_box(*val, &numb_state.liveboxes, memo, env, new_liveboxes)?;
+        numb_state.append_int(index);
+        numb_state.append_int(descr_idx as i64);
+        let val_tag = tag_box(val, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(val_tag as i32);
     }
 
     // bridgeopt.py:113-122: loopinvariant results
-    let filtered_loopinvariant: Vec<(i64, OpRef)> = knowledge
-        .loopinvariant_results
-        .iter()
-        .copied()
-        .filter(|&(_, result)| env.is_const(result) || available_boxes.contains(&result))
-        .collect();
-    numb_state.append_int(filtered_loopinvariant.len() as i64);
-    for (const_ptr, result) in &filtered_loopinvariant {
-        let const_tag = memo.getconst_int(*const_ptr)?;
+    numb_state.append_int(
+        knowledge
+            .loopinvariant_results
+            .iter()
+            .filter(|&&(_, result)| env.is_const(result) || available_boxes.contains(&result))
+            .count() as i64,
+    );
+    for &(const_ptr, result) in &knowledge.loopinvariant_results {
+        if !(env.is_const(result) || available_boxes.contains(&result)) {
+            continue;
+        }
+        let const_tag = memo.getconst_int(const_ptr)?;
         numb_state.writer.append_short(const_tag as i32);
-        let result_tag = tag_box(*result, &numb_state.liveboxes, memo, env, new_liveboxes)?;
+        let result_tag = tag_box(result, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(result_tag as i32);
     }
     Ok(())

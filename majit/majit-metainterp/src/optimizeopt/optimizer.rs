@@ -4669,10 +4669,9 @@ impl Optimizer {
         _start_pass: usize,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        let mut pending = std::collections::VecDeque::new();
-        while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
-            pending.push_back((start, op));
-        }
+        // RPython `send_extra_operation` walks the list in place. Take the
+        // queued deque instead of copying each entry into a fresh one.
+        let pending = std::mem::take(&mut ctx.extra_operations_after);
         // The level is parked on the context so `flush_queued_producer` can
         // pull one entry out of it; this function runs nested inside itself
         // (`propagate_from_pass_range` drains after every pass), and only the
