@@ -12686,11 +12686,12 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         | Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
             cut_declined_subwalk(ctx, pre_fold_pos);
             // A declined helper walk must not become an opaque
-            // `CallMayForce` when the callee is BINARY: the exact-int
-            // descent emits `int_add`/`int_sub` the way PyPy's fib
-            // bridges do (`int_add_ovf` on the `n>=3` bridge).
+            // `CallMayForce` when the callee is `int_add` / `add` /
+            // `binary_value_from_tag`.  Emit the machine-int body
+            // (`int_add_ovf` + box) the walk would have recorded —
+            // do not re-enter `binary_value_from_tag`, which inlines
+            // `add` and recurses.
             if ref_args.len() == 2
-                && int_args.len() == 1
                 && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(
                     sub_index,
                     int_arg_concretes,
@@ -12698,13 +12699,28 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 && let Some((dst_bank, dst, _)) = call_opcode_result_dst(code, pc)
                 && dst_bank == 'r'
             {
+                if fbw_debug_abort_enabled() {
+                    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+                        .map(|jc| jc.name.as_str())
+                        .unwrap_or("<missing>");
+                    eprintln!("[bin-emit] pc={pc} name={name} tag={op_tag}");
+                }
                 if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
-                    super::specialize::try_walker_orthodox_binary_op(
-                        ctx, pc, op_tag, int_args[0], ref_args, dst, dst_bank,
+                    super::specialize::try_emit_exact_int_binop(
+                        ctx, pc, op_tag, ref_args, dst, dst_bank,
                     )
                 })? {
                     return Ok(outcome);
                 }
+            } else if fbw_debug_abort_enabled() {
+                let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+                    .map(|jc| jc.name.as_str())
+                    .unwrap_or("<missing>");
+                eprintln!(
+                    "[bin-emit] miss pc={pc} name={name} i={} r={}",
+                    int_args.len(),
+                    ref_args.len()
+                );
             }
             residualize_inline_call_via_fnaddr(
                 ctx,
