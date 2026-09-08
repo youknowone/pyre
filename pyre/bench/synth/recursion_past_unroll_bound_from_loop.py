@@ -1,4 +1,8 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=4.2
+#
+# Ceiling 6 derived floor 1.0x; after N=4300000, macos dynasm reads 0.8x
+# (PR 1736: exec 0.21s vs pypy 0.26s). 4.2 keeps ubuntu dynasm 1.1x and
+# cranelift 1.4x under the ceiling and drops the floor to 0.7x.
 #
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #
