@@ -15622,6 +15622,7 @@ impl<M: Clone> MetaInterp<M> {
             trace_id,
             fail_index,
             fail_values,
+            None,
             &crate::resume::NullAllocator,
         )
     }
@@ -15637,6 +15638,7 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
+        identity_override: Option<i64>,
         allocator: &dyn crate::resume::BlackholeAllocator,
     ) -> Option<(Vec<i64>, Vec<i64>)> {
         if crate::majit_log_enabled() {
@@ -15715,6 +15717,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
                 vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
                 None, // ginfo — pyre has no greenfield mechanism
+                identity_override,
                 allocator,
             );
         if crate::majit_log_enabled() {
@@ -15741,6 +15744,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn force_virtualizable_token_with_allocator(
         &mut self,
         token: u64,
+        identity_override: Option<i64>,
         allocator: &dyn crate::resume::BlackholeAllocator,
     ) {
         // `ResumeGuardForcedDescr.force_now`: the critical interval includes
@@ -15778,6 +15782,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 &fail_values,
+                identity_override,
                 allocator,
             )
             .expect("forced guard must have resume data");

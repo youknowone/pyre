@@ -5723,7 +5723,7 @@ unsafe extern "C" fn force_pyframe_vref(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[jit][force-hook] vref token=0x{token:x}");
             }
-            driver.force_virtualizable_token(token);
+            driver.force_virtualizable_token(token, None);
         })
     };
     // `virtualref.py:174-176` — `token == TOKEN_NONE` with no `forced` means
@@ -5810,7 +5810,7 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!("[jit][force-hook] frame token=0x{token:x} frame={ptr:p}");
                 }
-                driver.force_virtualizable_token(token);
+                driver.force_virtualizable_token(token, Some(ptr as i64));
             });
         };
         // Force the traced frame only when the frame handed to Python belongs
@@ -7656,6 +7656,7 @@ fn drive_unpack_iterable_trace(
                 // jd1 is novable: it has no virtualizable to force.
                 None,
                 true,
+                None,
             );
             match bh {
                 // Merge point reached: re-enter the compiled drain.
@@ -11030,6 +11031,9 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // `unpackiterable_driver`): its resume data has no vable section, so the
     // decode must not consume one. jd0 guards pass `false`.
     novable: bool,
+    // Live portal PyFrame for jd0. Used when the encoded vable identity is
+    // empty (`NULLREF` / unread failarg slot). Novable resumes pass `None`.
+    identity_override: Option<i64>,
 ) -> crate::call_jit::BlackholeResult {
     // compile.py ResumeGuardForcedDescr.handle_fail keeps `deadframe` alive
     // while it reads `cpu.get_savedata_ref(deadframe)` and passes the revealed
@@ -11099,6 +11103,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             Some(exit_layout.exit_types.as_slice()),
             guard_exc,
             novable,
+            identity_override,
             all_virtuals,
             Some(deadframe_roots),
         );
@@ -11484,6 +11489,7 @@ fn execute_assembler(
                         guard_exc,
                         descr_arc.is_guard_forced().then_some(savedata).flatten(),
                         false,
+                        Some(frame_root.frame() as *mut PyFrame as i64),
                     );
                     publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
@@ -11859,6 +11865,7 @@ fn bound_reached(
                         guard_exc,
                         descr_arc.is_guard_forced().then_some(savedata).flatten(),
                         false,
+                        Some(frame_root.frame() as *mut PyFrame as i64),
                     );
                     publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
@@ -12177,6 +12184,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                         guard_exc,
                         descr_arc.is_guard_forced().then_some(savedata).flatten(),
                         false,
+                        Some(frame_root.frame() as *mut PyFrame as i64),
                     );
                     publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {

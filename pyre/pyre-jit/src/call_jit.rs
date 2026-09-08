@@ -2255,6 +2255,7 @@ fn jit_blackhole_resume_from_guard(
             Some(deadframe_types.as_slice()),
             guard_exc,
             false, // CALL_ASSEMBLER portal is jd0 (virtualizable)
+            raw_deadframe.first().copied().filter(|&ptr| ptr != 0),
             all_virtuals,
             None, // `raw_deadframe` is rooted only by the copy made inside
         );
@@ -2670,6 +2671,10 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // consume a phantom vable and dereference garbage; a novable resume passes
     // `None` for both the vinfo and the per-frame virtualizable handle.
     novable: bool,
+    // Live portal / callee PyFrame when the vable identity item decoded to
+    // empty (`NULLREF` after a cut remapped the snapshot box, or a TAGBOX
+    // whose failarg slot was never stored). `None` for novable resumes.
+    identity_override: Option<i64>,
     // compile.py — the cache `handle_async_forcing` already
     // materialized, when this resume is the GUARD_NOT_FORCED that follows a
     // force. `None` for every other guard.
@@ -2814,7 +2819,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             Some(vrefinfo_dyn),     // resume.py:1314 metainterp_sd.virtualref_info
             vinfo_arg,              // resume.py:1312 self.jitdriver_sd.virtualizable_info
             None,                   // resume.py:1316 greenfield_info unused in pyre
-            None,                   // heap PyFrame identity remains the live TAGBOX
+            identity_override,      // live portal frame when the encoded identity is empty
             all_virtuals,           // resume.py:1373-1374 GUARD_NOT_FORCED cache
             &allocator,
         )
@@ -4876,6 +4881,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 guard_exc,
                 descr_arc.is_guard_forced().then_some(savedata).flatten(),
                 false,
+                Some(frame_ptr).filter(|&ptr| ptr != 0),
             );
             handle_blackhole_result(bh, green_key).unwrap_or(0)
         }
