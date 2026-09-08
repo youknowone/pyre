@@ -2748,6 +2748,29 @@ impl TraceCtx {
         id
     }
 
+    /// opencoder.py `history.trace.capture_resumedata(framestack, ...)`.
+    pub fn capture_resumedata_from_framestack(
+        &mut self,
+        framestack: &mut [crate::pyjitpl::MIFrame],
+        after_residual_call: bool,
+    ) -> i32 {
+        let op_live = self.metainterp_sd.op_live as u8;
+        let recorder = &mut self.recorder;
+        let vable = self.virtualizable_boxes.as_deref().unwrap_or(&[]);
+        let vref = self.virtualref_boxes.as_slice();
+        let liveness = self.metainterp_sd.liveness_info.as_slice();
+        let id = recorder.capture_resumedata_from_framestack(
+            framestack,
+            vable,
+            vref,
+            after_residual_call,
+            op_live,
+            liveness,
+        );
+        self.snapshots.clear();
+        id
+    }
+
     /// Look up a captured snapshot by id.
     pub fn get_snapshot(&self, id: i32) -> Option<&crate::recorder::Snapshot> {
         if id >= 0 {

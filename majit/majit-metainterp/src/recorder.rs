@@ -298,8 +298,9 @@ pub struct Trace {
     snapshot_offsets: Vec<usize>,
     /// Per-snapshot `py_pc` words, outermost-first. RPython's
     /// `_encode_snapshot` has no twin; resume still reads this pyre
-    /// extra after decode.
-    snapshot_py_pcs: Vec<Vec<u32>>,
+    /// extra after decode. Inline capacity covers the usual 1-frame
+    /// portal (regex) plus a few inlines without a heap `Vec`.
+    snapshot_py_pcs: Vec<smallvec::SmallVec<[u32; 4]>>,
 }
 
 impl Trace {
@@ -489,7 +490,8 @@ impl Trace {
     /// `rd_resume_position`; the byte offset lives in `snapshot_offsets`.
     pub fn encode_captured_snapshot(&mut self, snapshot: &Snapshot) -> i32 {
         let id = self.snapshot_offsets.len() as i32;
-        let py_pcs: Vec<u32> = snapshot.frames.iter().map(|f| f.py_pc).collect();
+        let py_pcs: smallvec::SmallVec<[u32; 4]> =
+            snapshot.frames.iter().map(|f| f.py_pc).collect();
 
         // Write `_snapshot_data` only. `create_top_snapshot` also patches
         // the last op's descr slot (`opencoder.py`); that slot is the
@@ -546,6 +548,56 @@ impl Trace {
         id
     }
 
+    /// opencoder.py `Trace.capture_resumedata(framestack, ...)`.
+    /// Writes `_snapshot_data` from the live framestack — no
+    /// `Vec<Snapshot>` / `SnapshotTagged` on the record path.
+    pub fn capture_resumedata_from_framestack(
+        &mut self,
+        framestack: &mut [crate::pyjitpl::MIFrame],
+        virtualizable_boxes: &[OpRef],
+        virtualref_boxes: &[(OpRef, usize)],
+        after_residual_call: bool,
+        op_live: u8,
+        all_liveness: &[u8],
+    ) -> i32 {
+        let id = self.snapshot_offsets.len() as i32;
+        let py_pcs: smallvec::SmallVec<[u32; 4]> = framestack.iter().map(|f| f.pc as u32).collect();
+        let vable: smallvec::SmallVec<[OcBox; 8]> = virtualizable_boxes
+            .iter()
+            .map(|r| self.arg_to_box(*r))
+            .collect();
+        let vref: smallvec::SmallVec<[OcBox; 8]> = virtualref_boxes
+            .iter()
+            .map(|(r, _)| self.arg_to_box(*r))
+            .collect();
+        // opencoder.Trace owns both `_index` and `_snapshot_data`.
+        // unique_to_box is not written during the snapshot walk.
+        let remap = self.unique_to_box.as_slice() as *const [u32];
+        let offset = {
+            let trb = self
+                .trb
+                .as_mut()
+                .expect("capture_resumedata_from_framestack requires attach_byte_buffer");
+            // SAFETY: `unique_to_box` and `trb` are sibling fields of
+            // the same Trace; capture does not push unique_to_box.
+            let remap = unsafe { &*remap };
+            trb.capture_resumedata_mapped(
+                framestack,
+                &vable,
+                &vref,
+                /* clear_result_register */ true,
+                op_live,
+                all_liveness,
+                after_residual_call,
+                Some(remap),
+                /* patch_guard_descr */ false,
+            )
+        };
+        self.snapshot_offsets.push(offset as usize);
+        self.snapshot_py_pcs.push(py_pcs);
+        id
+    }
+
     /// Rebuild `Vec<Snapshot>` from `_snapshot_data` in capture order.
     pub fn decode_captured_snapshots(&self) -> Option<Vec<Snapshot>> {
         let trb = self.trb.as_ref()?;
@@ -563,24 +615,25 @@ impl Trace {
         for (i, &offset) in self.snapshot_offsets.iter().enumerate() {
             let (vable_t, vref_t, frames_t) = {
                 let it = trb.get_snapshot_iter(offset);
-                let vable_t: Vec<i64> = it.iter_vable_array().collect();
-                let vref_t: Vec<i64> = it.iter_vref_array().collect();
-                let frames_t: Vec<(i64, i64, Vec<i64>)> = it
-                    .framestack
-                    .iter()
-                    .copied()
-                    .map(|snap_idx| {
-                        let (jc, pc) = it.unpack_jitcode_pc(snap_idx);
-                        let boxes: Vec<i64> = it.iter_array(snap_idx).collect();
-                        (jc, pc, boxes)
-                    })
-                    .collect();
+                let vable_t: smallvec::SmallVec<[i64; 8]> = it.iter_vable_array().collect();
+                let vref_t: smallvec::SmallVec<[i64; 8]> = it.iter_vref_array().collect();
+                let frames_t: smallvec::SmallVec<[(i64, i64, smallvec::SmallVec<[i64; 8]>); 4]> =
+                    it.framestack
+                        .iter()
+                        .copied()
+                        .map(|snap_idx| {
+                            let (jc, pc) = it.unpack_jitcode_pc(snap_idx);
+                            let boxes: smallvec::SmallVec<[i64; 8]> =
+                                it.iter_array(snap_idx).collect();
+                            (jc, pc, boxes)
+                        })
+                        .collect();
                 (vable_t, vref_t, frames_t)
             };
             let py_pcs = self
                 .snapshot_py_pcs
                 .get(i)
-                .map(Vec::as_slice)
+                .map(smallvec::SmallVec::as_slice)
                 .unwrap_or(&[]);
             let frames = frames_t
                 .into_iter()
