@@ -3659,16 +3659,11 @@ fn call_with_kwargs_in_ctx_impl(
             if crate::pyframe::code_flags_make_generator(code.flags) {
                 return frame_into_generator_for_function(func_frame, current_callable());
             }
-            let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
-            let eval_fn = if plain_mode {
-                crate::eval::eval_frame_plain
-            } else {
-                EVAL_OVERRIDE
-                    .get()
-                    .copied()
-                    .unwrap_or(crate::eval::eval_frame_plain)
-            };
-            return eval_fn(&mut func_frame, None);
+            // Same callee `FrameLocalsRoot` the positional portal sites
+            // install.  `Function.call_args` keeps the new frame as a GC
+            // local; this ABI boundary is outside that transform.
+            let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
+            return get_eval_fn()(&mut func_frame, None);
         } // end user function branch
     } // end is_function
 
