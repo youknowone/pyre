@@ -12673,6 +12673,32 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx.trace_record_exact_class(opref, cls);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        // `pyjitpl.py` `_opimpl_isconstant` / `_opimpl_isvirtual`: write
+        // `ConstInt(...)` and record no IR.  Operand layout `[src][dst]`.
+        "int_isconstant/i>i" => {
+            let src = read_int_reg(code, op, 0, ctx)?;
+            let value = i64::from(src.is_constant());
+            let result = ctx.trace_ctx.const_int(value);
+            let dst = code[op.pc + 2] as usize;
+            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(value))?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "ref_isconstant/r>i" => {
+            let src = read_ref_reg(code, op, 0, ctx)?;
+            let value = i64::from(src.is_constant());
+            let result = ctx.trace_ctx.const_int(value);
+            let dst = code[op.pc + 2] as usize;
+            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(value))?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "ref_isvirtual/r>i" => {
+            let src = read_ref_reg(code, op, 0, ctx)?;
+            let value = i64::from(ctx.trace_ctx.is_likely_virtual(src));
+            let result = ctx.trace_ctx.const_int(value);
+            let dst = code[op.pc + 2] as usize;
+            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(value))?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // RPython `pyjitpl.py opimpl_new` delegates to `execute_new`:
         //
         //   resbox = self.execute_and_record(rop.NEW, typedescr)

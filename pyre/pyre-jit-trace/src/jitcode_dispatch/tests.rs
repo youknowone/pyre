@@ -2765,6 +2765,98 @@ fn assert_not_none_uses_known_nonnull_heapcache_without_a_ref_shadow() {
 }
 
 #[test]
+fn int_isconstant_writes_constint_and_records_no_ir() {
+    let byte = *insns_opname_to_byte()
+        .get("int_isconstant/i>i")
+        .expect("`int_isconstant/i>i` must be in insns table");
+    let code = [byte, 0x00, 0x01];
+    let mut tc = fresh_trace_ctx();
+    let src = tc.const_int(5);
+    let ops_before = tc.num_ops();
+    let mut regs_i = [src, OpRef::NONE];
+    let mut concrete_i = [ConcreteValue::Int(5), ConcreteValue::Null];
+    let (outcome, next_pc) = run_hint_step_full(
+        &code,
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &[],
+    )
+    .expect("`int_isconstant/i>i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3);
+    assert_eq!(regs_i[1], tc.const_int(1));
+    assert_eq!(concrete_i[1], ConcreteValue::Int(1));
+    assert_eq!(tc.num_ops(), ops_before, "isconstant records no IR");
+}
+
+#[test]
+fn ref_isconstant_is_false_for_a_recorded_box() {
+    let byte = *insns_opname_to_byte()
+        .get("ref_isconstant/r>i")
+        .expect("`ref_isconstant/r>i` must be in insns table");
+    let code = [byte, 0x00, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let src = tc.record_op(majit_ir::OpCode::New, &[]);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [src];
+    let mut concrete_r = [ConcreteValue::Null];
+    let mut regs_i = [OpRef::NONE];
+    let mut concrete_i = [ConcreteValue::Null];
+    let (outcome, next_pc) = run_hint_step_full(
+        &code,
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &[],
+    )
+    .expect("`ref_isconstant/r>i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3);
+    assert_eq!(regs_i[0], tc.const_int(0));
+    assert_eq!(concrete_i[0], ConcreteValue::Int(0));
+    assert_eq!(tc.num_ops(), ops_before, "isconstant records no IR");
+}
+
+#[test]
+fn ref_isvirtual_follows_the_heapcache() {
+    let byte = *insns_opname_to_byte()
+        .get("ref_isvirtual/r>i")
+        .expect("`ref_isvirtual/r>i` must be in insns table");
+    let code = [byte, 0x00, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let src = tc.record_op(majit_ir::OpCode::New, &[]);
+    tc.heap_cache_mut().new_object(src);
+    let ops_before = tc.num_ops();
+    let mut regs_r = [src];
+    let mut concrete_r = [ConcreteValue::Null];
+    let mut regs_i = [OpRef::NONE];
+    let mut concrete_i = [ConcreteValue::Null];
+    let (outcome, next_pc) = run_hint_step_full(
+        &code,
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &[],
+    )
+    .expect("`ref_isvirtual/r>i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3);
+    assert_eq!(regs_i[0], tc.const_int(1));
+    assert_eq!(concrete_i[0], ConcreteValue::Int(1));
+    assert_eq!(tc.num_ops(), ops_before, "isvirtual records no IR");
+}
+
+#[test]
 fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_int_eq/iiL")
