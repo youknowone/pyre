@@ -8107,7 +8107,19 @@ impl<'a> ResumeDataDirectReader<'a> {
         // never a trace-time pointer or an unrelated deadframe slot.
         let tagged_identity = self.resumecodereader.next_item() as i16;
         let encoded_identity = self.decode_ref(tagged_identity);
-        let virtualizable = identity_override.unwrap_or(encoded_identity);
+        // Override is only the recovery for an empty identity (`NULLREF` /
+        // unread failarg). A live TAGBOX is the virtualizable of *this*
+        // jitcode — an inlined callee's own PyFrame, not the portal. Using
+        // a caller-supplied portal/JITFRAME here restores the callee's
+        // payload onto the wrong object (`get_total_size` then disagrees
+        // with `vable_size - 1`). State-field hosts fold `&state` out of
+        // failargs, so they encode `NULLREF` and still take the override.
+        let encoded_empty = tagged_eq(tagged_identity, NULLREF) || encoded_identity == 0;
+        let virtualizable = if encoded_empty {
+            identity_override.unwrap_or(encoded_identity)
+        } else {
+            encoded_identity
+        };
         // MAJIT_LEAF3_PROV census. The assert below refuses ONE value on ONE
         // arm; this reports the whole distribution on every call, because
         // "NULLREF cannot occur here" and "NULLREF was not observed here" are

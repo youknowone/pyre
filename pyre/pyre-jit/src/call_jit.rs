@@ -4886,7 +4886,11 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 guard_exc,
                 descr_arc.is_guard_forced().then_some(savedata).flatten(),
                 false,
-                Some(frame_ptr).filter(|&ptr| ptr != 0),
+                // `frame_ptr` is the compiled JITFRAME, not a PyFrame.
+                // CA failargs put the callee PyFrame at slot 0; that is
+                // the only sound identity override when the encoded
+                // vable identity is empty.
+                Some(callee_frame as i64).filter(|&ptr| ptr != 0),
             );
             handle_blackhole_result(bh, green_key).unwrap_or(0)
         }
