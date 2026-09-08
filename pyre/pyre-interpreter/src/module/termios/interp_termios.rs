@@ -287,16 +287,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     ));
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
-                if ret != 0 {
-                    let e = std::io::Error::last_os_error();
-                    return Err(termios_converted_error(e.raw_os_error().unwrap_or(0)));
-                }
-                // `interp_termios.py:99-101` returns `(ws_row, ws_col)`.
+                let (rows, cols) = host_termios::tcgetwinsize(fd).map_err(|e| {
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
+                })?;
+                // PyPy `interp_termios.tcgetwinsize` returns
+                // `(ws_row, ws_col)`.
                 Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_int_new(ws.ws_row as i64),
-                    pyre_object::w_int_new(ws.ws_col as i64),
+                    pyre_object::w_int_new(rows as i64),
+                    pyre_object::w_int_new(cols as i64),
                 ]))
             },
             1,
@@ -329,27 +327,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 })?;
                 let rows = crate::baseobjspace::int_w(winsz[0])?;
                 let cols = crate::baseobjspace::int_w(winsz[1])?;
-                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                // `interp_termios.py:120` reads the current winsize first so
-                // `ws_xpixel` / `ws_ypixel` are preserved across the set.
-                let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
-                if ret != 0 {
-                    let e = std::io::Error::last_os_error();
-                    return Err(termios_converted_error(e.raw_os_error().unwrap_or(0)));
-                }
-                ws.ws_row = rows as libc::c_ushort;
-                ws.ws_col = cols as libc::c_ushort;
-                // `interp_termios.py:126-128` overflow guard.
-                if ws.ws_row as i64 != rows || ws.ws_col as i64 != cols {
-                    return Err(crate::PyError::overflow_error(
-                        "winsize value(s) out of range",
-                    ));
-                }
-                let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &mut ws) };
-                if ret != 0 {
-                    let e = std::io::Error::last_os_error();
-                    return Err(termios_converted_error(e.raw_os_error().unwrap_or(0)));
-                }
+                // PyPy `interp_termios.tcsetwinsize` performs this overflow
+                // guard before setting the window size.
+                let rows = u16::try_from(rows).map_err(|_| {
+                    crate::PyError::overflow_error("winsize value(s) out of range")
+                })?;
+                let cols = u16::try_from(cols).map_err(|_| {
+                    crate::PyError::overflow_error("winsize value(s) out of range")
+                })?;
+                // `host_termios::tcsetwinsize` performs the same initial
+                // TIOCGWINSZ that `interp_termios.tcsetwinsize` does,
+                // preserving `ws_xpixel` / `ws_ypixel` across the set.
+                host_termios::tcsetwinsize(fd, rows, cols).map_err(|e| {
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
+                })?;
                 Ok(pyre_object::w_none())
             },
             2,

@@ -195,6 +195,8 @@ def _assert_runtime_library_items_opaque(path: Path) -> None:
     # targets rather than the current ones.
     common_engine_prefixes = (
         common_prefix + b'},{"Ident":["binascii",0]',
+        common_prefix + b'},{"Ident":["compression",0]',
+        common_prefix + b'},{"Ident":["hashlib",0]',
         common_prefix + b'},{"Ident":["inet",0]',
         common_prefix + b'},{"Ident":["json",0]',
         common_prefix + b'},{"Ident":["encodings",0]},{"Ident":["cjk",0]',

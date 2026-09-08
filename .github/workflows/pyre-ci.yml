@@ -118,6 +118,13 @@ jobs:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         persist-credentials: false
+    - name: Allow long git checkout paths
+      # rustpython-ruff 0.16.5 carries flake8_builtins snapshots whose
+      # checkout path exceeds Windows MAX_PATH. cargo's libgit2 fetch
+      # then fails with Filesystem (30); git.exe honours core.longpaths.
+      if: runner.os == 'Windows'
+      shell: bash
+      run: git config --global core.longpaths true
     - name: Check the LLBC fingerprint input walk
       # Ahead of the Charon install so a regression reports in seconds. An
       # `include*!` spelling the walk cannot resolve widens no digest and fails
@@ -333,7 +340,10 @@ jobs:
     runs-on: windows-latest
     # See prepare-charon-llbc-macos for why `cargo-fmt` is the only wait.
     needs: cargo-fmt
-    env: *charon-llbc-env
+    env:
+      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
+      CHARON_VERSION: nightly-2026.05.29
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps: *prepare-charon-llbc-steps
 
   cargo-test-linux:
@@ -354,6 +364,10 @@ jobs:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         persist-credentials: false
+    - name: Allow long git checkout paths
+      if: runner.os == 'Windows'
+      shell: bash
+      run: git config --global core.longpaths true
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
@@ -522,6 +536,7 @@ jobs:
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps: *cargo-test-steps
 
   dispatcher-graph-linux:
@@ -821,6 +836,10 @@ jobs:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         persist-credentials: false
+    - name: Allow long git checkout paths
+      if: runner.os == 'Windows'
+      shell: bash
+      run: git config --global core.longpaths true
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
     - name: Set up CPython
       id: cpython
@@ -1155,6 +1174,7 @@ jobs:
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps: *pyre-check-steps
 
   sandbox-build:

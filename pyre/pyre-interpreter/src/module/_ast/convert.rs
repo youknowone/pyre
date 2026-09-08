@@ -12,6 +12,7 @@ use rustpython_compiler::codegen::{
 use rustpython_compiler::core::{SourceFile, SourceFileBuilder};
 use rustpython_compiler::{ast, parser};
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
+use thin_vec::ThinVec;
 
 type AstResult<T> = Result<T, crate::PyError>;
 
@@ -795,7 +796,7 @@ impl ObjectConverter {
                     node_index: Default::default(),
                     range,
                     args: bases.into_boxed_slice(),
-                    keywords: keywords.into_boxed_slice(),
+                    keywords: keywords.into(),
                     runtime_args: None,
                     runtime_bases: None,
                 }))
@@ -918,7 +919,7 @@ impl ObjectConverter {
                             self.require_node(value, "statement")?;
                             self.recurse(|this| this.stmt(value))
                         })
-                        .collect::<Result<Vec<_>, _>>()?;
+                        .collect::<Result<ThinVec<_>, _>>()?;
                     elif_else_clauses.push(ast::ElifElseClause {
                         range,
                         node_index: Default::default(),
@@ -1137,10 +1138,10 @@ impl ObjectConverter {
         Ok(ast::Parameters {
             range: Default::default(),
             node_index: Default::default(),
-            posonlyargs,
-            args,
+            posonlyargs: posonlyargs.into(),
+            args: args.into(),
             vararg,
-            kwonlyargs: kwonly,
+            kwonlyargs: kwonly.into(),
             kwarg,
             runtime_defaults: None,
         })
@@ -1252,7 +1253,11 @@ impl ObjectConverter {
             .collect()
     }
 
-    fn decorators(&mut self, object: PyObjectRef, node: &str) -> AstResult<Vec<ast::Decorator>> {
+    fn decorators(
+        &mut self,
+        object: PyObjectRef,
+        node: &str,
+    ) -> AstResult<ThinVec<ast::Decorator>> {
         self.list(object, "decorator_list", node)?
             .into_iter()
             .map(|value| {
@@ -1397,7 +1402,7 @@ impl ObjectConverter {
             Ok(ast::Pattern::MatchSequence(ast::PatternMatchSequence {
                 node_index: Default::default(),
                 range,
-                patterns: self.patterns(object, "patterns", "MatchSequence")?,
+                patterns: self.patterns(object, "patterns", "MatchSequence")?.into(),
                 runtime_patterns: None,
             }))
         } else if self.is_node(object, "MatchMapping")? {
@@ -1406,8 +1411,8 @@ impl ObjectConverter {
             Ok(ast::Pattern::MatchMapping(ast::PatternMatchMapping {
                 node_index: Default::default(),
                 range,
-                keys,
-                patterns,
+                keys: keys.into(),
+                patterns: patterns.into(),
                 rest: self.opt_identifier(object, "rest")?,
                 runtime_keys: None,
                 runtime_patterns: None,
@@ -1439,7 +1444,7 @@ impl ObjectConverter {
                 arguments: ast::PatternArguments {
                     range,
                     node_index: Default::default(),
-                    patterns,
+                    patterns: patterns.into(),
                     keywords,
                 },
                 runtime_patterns: None,
@@ -1492,7 +1497,12 @@ impl ObjectConverter {
         Ok(())
     }
 
-    fn body(&mut self, object: PyObjectRef, field: &str, node: &str) -> AstResult<Vec<ast::Stmt>> {
+    fn body(
+        &mut self,
+        object: PyObjectRef,
+        field: &str,
+        node: &str,
+    ) -> AstResult<ThinVec<ast::Stmt>> {
         self.list(object, field, node)?
             .into_iter()
             .map(|value| {
@@ -1645,13 +1655,13 @@ impl ObjectConverter {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ast::Expr::Call(ast::ExprCall {
                 node_index: Default::default(),
-                range,
+                range_start: range.start(),
                 func: Box::new(self.recurse(|this| this.expr(func))?),
                 arguments: ast::Arguments {
                     node_index: Default::default(),
                     range,
                     args: args.into_boxed_slice(),
-                    keywords: keywords.into_boxed_slice(),
+                    keywords: keywords.into(),
                     runtime_args: None,
                     runtime_bases: None,
                 },
@@ -1817,7 +1827,7 @@ impl ObjectConverter {
             Ok(ast::Expr::DictComp(ast::ExprDictComp {
                 node_index: Default::default(),
                 range,
-                key,
+                key: Some(key),
                 value,
                 generators,
             }))
@@ -3251,6 +3261,7 @@ impl Converter<'_> {
 
     fn expr(&self, expr: &ast::Expr) -> RootedResult {
         use ast::Expr;
+        use ruff_text_size::Ranged;
         match expr {
             Expr::BoolOp(n) => self.node(
                 "BoolOp",
@@ -3346,15 +3357,20 @@ impl Converter<'_> {
                     ("generators", self.comprehensions(&n.generators)?),
                 ],
             ),
-            Expr::DictComp(n) => self.node(
-                "DictComp",
-                Some(range(n.range)),
-                &[
-                    ("key", self.expr(&n.key)?),
-                    ("value", self.expr(&n.value)?),
-                    ("generators", self.comprehensions(&n.generators)?),
-                ],
-            ),
+            Expr::DictComp(n) => {
+                let key = n.key.as_deref().ok_or_else(|| {
+                    crate::PyError::value_error("field 'key' is required for DictComp")
+                })?;
+                self.node(
+                    "DictComp",
+                    Some(range(n.range)),
+                    &[
+                        ("key", self.expr(key)?),
+                        ("value", self.expr(&n.value)?),
+                        ("generators", self.comprehensions(&n.generators)?),
+                    ],
+                )
+            }
             Expr::Generator(n) => self.node(
                 "GeneratorExp",
                 Some(range(n.range)),
@@ -3399,7 +3415,7 @@ impl Converter<'_> {
             }
             Expr::Call(n) => self.node(
                 "Call",
-                Some(range(n.range)),
+                Some(range(n.range())),
                 &[
                     ("func", self.expr(&n.func)?),
                     ("args", self.expr_list(&n.arguments.args)?),
@@ -3668,9 +3684,9 @@ impl Converter<'_> {
                             let expression = self.source[start as usize..end as usize].to_owned();
                             self.string(&strip_interpolation_expr(
                                 &[
-                                    debug_text.leading.as_str(),
+                                    debug_text.leading(),
                                     expression.as_str(),
-                                    debug_text.trailing.as_str(),
+                                    debug_text.trailing(),
                                 ]
                                 .concat(),
                             ))
@@ -3828,8 +3844,8 @@ impl Converter<'_> {
     ) {
         use ruff_text_size::Ranged;
         let (start, end) = range(interpolation.expression.range());
-        let leading = strip_debug_comments(&debug_text.leading);
-        let trailing = strip_debug_comments(&debug_text.trailing);
+        let leading = strip_debug_comments(debug_text.leading());
+        let trailing = strip_debug_comments(debug_text.trailing());
         let expression = &self.source[start as usize..end as usize];
         push_literal(
             parts,

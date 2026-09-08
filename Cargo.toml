@@ -82,18 +82,24 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 #
 # Pinned to RustPython/RustPython main (ssl keylog #8655). CJK tables in
 # rustpython-common are unchanged from #8631; the bump is the rest of the
-# workspace crates that share this rev.
+# workspace crates that share this rev. `bz2` is the #8638 stream engine.
 #
-rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad", features = ["binascii", "cjk-codecs", "inet", "json", "zlib"] }
-rustpython-literal = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
-rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
-rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
-ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
+# Repinned through #8655: shared hashlib engine, POSIX helpers, and AppendLog.
+# Then through #8664: compression::lzma compiles on every target, so `_lzma`
+# needs no pyre-local wasm fallback.
+# Repinned to RustPython/RustPython main (#8665: shared rustls engine in
+# host_env).
+#
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "85fd93230fecf4eb7c6a8c670bb706ceeb556425", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "85fd93230fecf4eb7c6a8c670bb706ceeb556425" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "85fd93230fecf4eb7c6a8c670bb706ceeb556425" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "85fd93230fecf4eb7c6a8c670bb706ceeb556425" }
+ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.16.5-rustpython" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
-rustpython-wtf8 = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
-rustpython-unicode = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "85fd93230fecf4eb7c6a8c670bb706ceeb556425" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "85fd93230fecf4eb7c6a8c670bb706ceeb556425" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "85fd93230fecf4eb7c6a8c670bb706ceeb556425" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "85fd93230fecf4eb7c6a8c670bb706ceeb556425" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -178,22 +184,11 @@ stacker = "0.1"
 
 # string / hash
 siphasher = "1.0"
+thin-vec = "0.2.19"
 rustc-hash = "2.1.3"
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
-sha3 = "0.10"
-blake2b_simd = { version = "1.0.4" }
-blake2s_simd = { version = "1.0.4" }
-scrypt = { version = "0.11", default-features = false }
-# bzip2 backend (pyre-native only): the crate's default feature selects
-# libbz2-rs-sys, the pure-Rust libbz2 port from the same source as zlib-rs,
-# whose output is byte-identical to the reference C libbz2.
-bzip2 = "0.6.1"
-# liblzma backend (pyre-native only): xz-core is the pure-Rust port of
-# liblzma, with the same entry points `Modules/_lzmamodule.c` calls, so
-# `_lzma` needs no C toolchain and builds for wasm32 like the others.
-xz-core = "0.1.0-rc.0"
 
 # TLS backend (pyre-native only).  The interpreter sees opaque, non-inlined
 # entry points so rustls and its crypto provider stay outside Charon/LLBC.
@@ -228,28 +223,29 @@ tempfile = "3"
 walkdir = "2"
 insta = "1"
 
-# xz-core 0.1.0-rc.0 files its `lzma12_optmap` static initializer in the MSVC
-# `.CRT$XIB` group.  `_initterm_e` walks that table as `int (__cdecl *)(void)`
-# and `__scrt_common_main_seh` returns 255 when an entry reports non-zero, but
-# the initializer's Rust signature returns `()`, so nothing defines the value
-# that is read.  Every pyre invocation on windows-latest exited 255 with empty
-# stdout and stderr.  The fork moves the table to `.CRT$XCU`, which `_initterm`
-# walks as `_PVFV` and whose result is discarded; the change is
-# simnalamburt/xz-rs#20 and this pin drops when it is released.
+# xz-core 0.1.0-rc.0 as published carries two defects.
 #
-# A second defect lives at this rev and is worth fixing before the pin drops:
-# `alone_decoder.rs` validates a picky LZMA-alone dictionary size by smearing
-# `dict_size - 1` down and then adding 1 back.  When the smear saturates to
-# `0xFFFF_FFFF` — `dict_size == 0` is the reachable case — that `+ 1` is an
-# overflow.  The C it ports from wraps, and so does a release build, but a
-# DEBUG build panics "attempt to add with overflow", which takes the whole
+# It files its `lzma12_optmap` static initializer in the MSVC `.CRT$XIB`
+# group.  `_initterm_e` walks that table as `int (__cdecl *)(void)` and
+# `__scrt_common_main_seh` returns 255 when an entry reports non-zero, but the
+# initializer's Rust signature returns `()`, so nothing defines the value that
+# is read: every pyre invocation on windows-latest exited 255 with empty stdout
+# and stderr.
+#
+# And `alone_decoder.rs` validates a picky LZMA-alone dictionary size by
+# smearing `dict_size - 1` down and then adding 1 back.  When the smear
+# saturates to `0xFFFF_FFFF` -- `dict_size == 0` is the reachable case -- that
+# `+ 1` overflows.  The C it ports from wraps, and so does a release build, but
+# a debug build panics "attempt to add with overflow" and takes the whole
 # process down: `test.test_tarfile` dies before its first Lzma test on a debug
-# `pyre`, identically with the JIT on and off, and so do any tarfile classes
-# whose module setup builds an lzma archive.  Release CI never sees it.  The
-# fix is to spell the add as wrapping, matching the surrounding ported
-# arithmetic.
+# `pyre`, identically with the JIT on and off.  Release CI never sees it.
+#
+# simnalamburt/xz-rs#21 fixes both -- the option map is now a compile-time
+# constant, so there is no runtime initializer to place, and the add is
+# spelled wrapping -- and is merged, so the pin follows upstream main until a
+# release carrying it reaches crates.io.
 [patch.crates-io]
-xz-core = { git = "https://github.com/youknowone/xz-rs-simnalamburt", rev = "9c5cc27154e90b48348f713e28ab02bb2c5b52b4" }
+xz-core = { git = "https://github.com/simnalamburt/xz-rs", rev = "5bf95411d0307e052ca2aeb06f0d75565c9a7362" }
 
 # `cargo run --release` is the benchmark/developer performance surface too.
 # Give it the same cross-crate optimization used by distributable binaries;

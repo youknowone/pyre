@@ -657,7 +657,11 @@ impl AstValidator {
             }
             ast::Expr::DictComp(node) => {
                 self.validate_comprehension(&node.generators)?;
-                self.validate_expr(&node.key, ast::ExprContext::Load)?;
+                let key = node
+                    .key
+                    .as_deref()
+                    .ok_or_else(|| validation_error("field 'key' is required for DictComp"))?;
+                self.validate_expr(key, ast::ExprContext::Load)?;
                 self.validate_expr(&node.value, ast::ExprContext::Load)
             }
             ast::Expr::Await(node) => self.validate_expr(&node.value, ast::ExprContext::Load),
@@ -804,7 +808,7 @@ mod tests {
         validate_ast(&ast::Mod::Module(ast::ModModule {
             node_index: Default::default(),
             range: Default::default(),
-            body,
+            body: body.into(),
             runtime_body: None,
         }))
     }
@@ -845,7 +849,7 @@ mod tests {
                 range: Default::default(),
                 pattern,
                 guard: None,
-                body: vec![pass()],
+                body: vec![pass()].into(),
                 runtime_body: None,
             }],
         })]
@@ -855,8 +859,8 @@ mod tests {
         ast::Pattern::MatchMapping(ast::PatternMatchMapping {
             node_index: Default::default(),
             range: Default::default(),
-            keys,
-            patterns,
+            keys: keys.into(),
+            patterns: patterns.into(),
             rest: None,
             runtime_keys: None,
             runtime_patterns: None,
@@ -1041,12 +1045,12 @@ mod tests {
                 node_index: Default::default(),
                 range: Default::default(),
                 is_async: false,
-                decorator_list: Vec::new(),
+                decorator_list: thin_vec::ThinVec::new(),
                 name: ast::Identifier::new("f", Default::default()),
                 type_params: type_params(type_param),
                 parameters: Box::new(ast::Parameters::default()),
                 returns: None,
-                body: vec![pass()],
+                body: vec![pass()].into(),
                 runtime_decorator_list: None,
                 runtime_type_comment: None,
                 runtime_type_comment_bytes: None,

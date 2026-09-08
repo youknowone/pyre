@@ -368,14 +368,13 @@ fn mmap_file_size(obj: pyre_object::PyObjectRef) -> Result<i64, crate::PyError> 
             "mmap: cannot find file size for anonymous map",
         ));
     }
-    let mut st: libc::stat = unsafe { core::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st as *mut libc::stat) } != 0 {
-        return Err(crate::PyError::os_error_with_errno(
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    let fd = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+    host_mmap::file_len(fd).map_err(|error| {
+        crate::PyError::os_error_with_errno(
+            error.raw_os_error().unwrap_or(0),
             "mmap.size: fstat failed",
-        ));
-    }
-    Ok(st.st_size as i64)
+        )
+    })
 }
 
 /// `rmmap.py:511-520` — `GetFileSize` on the handle the map owns.  An
@@ -1542,14 +1541,17 @@ fn mmap_resize_mapping(
         ));
     }
     let mapped = if fd >= 0 {
-        let r = unsafe { libc::ftruncate(fd, (offset as libc::off_t) + newsize as libc::off_t) };
-        if r != 0 {
-            return Err(crate::PyError::os_error_with_errno(
-                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                "ftruncate",
-            ));
-        }
         let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+        rustpython_host_env::crt_fd::ftruncate(
+            borrowed,
+            (offset as libc::off_t) + newsize as libc::off_t,
+        )
+        .map_err(|error| {
+            crate::PyError::os_error_with_errno(
+                error.raw_os_error().unwrap_or(0),
+                "ftruncate",
+            )
+        })?;
         // `mremap` keeps the mapping's protection, so remap with the one the
         // original mapping resolved to (`rmmap.py:729-745`); `_access` alone
         // does not preserve a PROT_READ map.
@@ -1883,9 +1885,9 @@ fn mmap_construct(
         host_mmap::AccessMode::Read
     };
     if real_fd != -1 {
-        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-        if unsafe { libc::fstat(real_fd, &mut st) } == 0
-            && st.st_mode & libc::S_IFMT == libc::S_IFREG
+        let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(real_fd) };
+        if let Ok(st) = rustpython_host_env::fileutils::fstat(borrowed)
+            && st.st_mode as libc::mode_t & libc::S_IFMT == libc::S_IFREG
         {
             let file_size = usize::try_from(st.st_size).unwrap_or(usize::MAX);
             let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
@@ -2304,20 +2306,20 @@ fn register_posix_constants(ns: pyre_object::PyObjectRef) {
                     crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
                 };
             }
-            cst!("MADV_FREE", libc::MADV_FREE);
+            cst!("MADV_FREE", host_mmap::MADV_FREE);
             cst!("MADV_FREE_REUSABLE", libc::MADV_FREE_REUSABLE);
             cst!("MADV_FREE_REUSE", libc::MADV_FREE_REUSE);
-            cst!("MAP_32BIT", 32768);
-            cst!("MAP_HASSEMAPHORE", libc::MAP_HASSEMAPHORE);
-            cst!("MAP_JIT", libc::MAP_JIT);
-            cst!("MAP_NOCACHE", libc::MAP_NOCACHE);
-            cst!("MAP_NOEXTEND", libc::MAP_NOEXTEND);
-            cst!("MAP_NORESERVE", libc::MAP_NORESERVE);
-            cst!("MAP_RESILIENT_CODESIGN", 8192);
-            cst!("MAP_RESILIENT_MEDIA", 16384);
-            cst!("MAP_TPRO", 524288);
-            cst!("MAP_TRANSLATED_ALLOW_EXECUTE", 131072);
-            cst!("MAP_UNIX03", 262144);
+            cst!("MAP_32BIT", host_mmap::MAP_32BIT);
+            cst!("MAP_HASSEMAPHORE", host_mmap::MAP_HASSEMAPHORE);
+            cst!("MAP_JIT", host_mmap::MAP_JIT);
+            cst!("MAP_NOCACHE", host_mmap::MAP_NOCACHE);
+            cst!("MAP_NOEXTEND", host_mmap::MAP_NOEXTEND);
+            cst!("MAP_NORESERVE", host_mmap::MAP_NORESERVE);
+            cst!("MAP_RESILIENT_CODESIGN", host_mmap::MAP_RESILIENT_CODESIGN);
+            cst!("MAP_RESILIENT_MEDIA", host_mmap::MAP_RESILIENT_MEDIA);
+            cst!("MAP_TPRO", host_mmap::MAP_TPRO);
+            cst!("MAP_TRANSLATED_ALLOW_EXECUTE", host_mmap::MAP_TRANSLATED_ALLOW_EXECUTE);
+            cst!("MAP_UNIX03", host_mmap::MAP_UNIX03);
         }
     }
 }

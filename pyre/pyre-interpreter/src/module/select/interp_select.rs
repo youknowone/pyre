@@ -527,16 +527,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
-        ev!("POLLIN", libc::POLLIN);
-        ev!("POLLPRI", libc::POLLPRI);
-        ev!("POLLOUT", libc::POLLOUT);
-        ev!("POLLERR", libc::POLLERR);
-        ev!("POLLHUP", libc::POLLHUP);
-        ev!("POLLNVAL", libc::POLLNVAL);
-        ev!("POLLRDNORM", libc::POLLRDNORM);
-        ev!("POLLRDBAND", libc::POLLRDBAND);
-        ev!("POLLWRNORM", libc::POLLWRNORM);
-        ev!("POLLWRBAND", libc::POLLWRBAND);
+        ev!("POLLIN", rustpython_host_env::select::POLLIN);
+        ev!("POLLPRI", rustpython_host_env::select::POLLPRI);
+        ev!("POLLOUT", rustpython_host_env::select::POLLOUT);
+        ev!("POLLERR", rustpython_host_env::select::POLLERR);
+        ev!("POLLHUP", rustpython_host_env::select::POLLHUP);
+        ev!("POLLNVAL", rustpython_host_env::select::POLLNVAL);
+        ev!("POLLRDNORM", rustpython_host_env::select::POLLRDNORM);
+        ev!("POLLRDBAND", rustpython_host_env::select::POLLRDBAND);
+        ev!("POLLWRNORM", rustpython_host_env::select::POLLWRNORM);
+        ev!("POLLWRBAND", rustpython_host_env::select::POLLWRBAND);
     }
 
     // `interp_kqueue.py` — kqueue() / kevent objects plus the KQ_* event

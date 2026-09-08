@@ -2,15 +2,15 @@
 //!
 //! CRC-32 / Adler-32 checksums plus the DEFLATE compress/decompress surface.
 //! The DEFLATE machinery is shared with RustPython through
-//! `rustpython_common::compression::zlib`.  `pyre_native::zlib` keeps an opaque
-//! adapter outside LLBC extraction; this module is the W_Root object glue.
+//! `rustpython_common::compression::zlib`, which Charon never enters because it
+//! is a git dependency; this module is the W_Root object glue.
 //!
 //! `Compress` / `Decompress` / `_ZlibDecompressor` own their native stream
 //! directly, matching `interp_zlib.py`'s `self.stream`.  Each stream also owns
 //! its PyPy-style per-object lock; there is no process-global side table.
 
-use pyre_native::zlib as backend;
 use pyre_object::*;
+use rustpython_common::compression::zlib as backend;
 
 use parking_lot::Mutex;
 
@@ -132,6 +132,18 @@ fn init_error(error: backend::InitError) -> crate::PyError {
         }
         backend::InitError::Zlib(message) => zlib_error(message),
     }
+}
+
+/// `interp_zlib.py` `compress` / `decompress` wrap the `deflateInit` /
+/// `inflateInit` call in `except ValueError` and re-raise it as `zlib.error`
+/// carrying their own message; the object constructors let the `ValueError`
+/// through instead.
+fn oneshot_init_error(error: backend::InitError, bad_option: &str) -> crate::PyError {
+    let message = match error {
+        backend::InitError::InvalidOption => bad_option.to_owned(),
+        backend::InitError::Zlib(message) => message,
+    };
+    zlib_error(message)
 }
 
 fn eof_error(msg: &str) -> crate::PyError {
@@ -901,7 +913,8 @@ crate::py_module! {
         ) -> Result<PyObjectRef, crate::PyError> {
             let level = int_or_default(level, -1)? as i32;
             let wbits = to_wbits(int_or_default(wbits, backend::MAX_WBITS as i64)?);
-            let out = backend::compress(&data, level, wbits).map_err(init_error)?;
+            let out = backend::compress(&data, level, wbits)
+                .map_err(|e| oneshot_init_error(e, "Bad compression level"))?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
         // interp_zlib.py `decompress(string, __posonly__=None, wbits, bufsize)`.
@@ -918,7 +931,8 @@ crate::py_module! {
             if bufsize < 0 {
                 return Err(crate::PyError::value_error("bufsize must be non-negative"));
             }
-            let out = backend::decompress(&data, wbits, bufsize as usize).map_err(init_error)?;
+            let out = backend::decompress(&data, wbits, bufsize as usize)
+                .map_err(|e| oneshot_init_error(e, "Bad window buffer size"))?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
         // interp_zlib.py `Compress___new__(level, method, wbits, memLevel,

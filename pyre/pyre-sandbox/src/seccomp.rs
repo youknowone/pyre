@@ -13,11 +13,14 @@
 //! curated set of host-neutral runtime syscalls (memory, signals, time, and I/O
 //! on the already-open marshalling fds 0/1/2) and TRAPs anything else to a
 //! SIGSYS handler that names the blocked syscall and exits — so
-//! `open`/`openat`/`socket`/`connect`/`execve`/`ptrace` and the rest of the
-//! host-affecting surface are simply unreachable. It is
+//! `socket`/`connect`/`execve`/`ptrace` and the rest of the host-affecting
+//! surface are simply unreachable. It is
 //! installed in the child *after* interpreter startup (which legitimately opens
 //! files, allocates, seeds hashing, …) and *before* the first byte of untrusted
 //! code, so those startup syscalls run unfiltered while user code does not.
+//! `openat` stays on the allowlist only so the Rust runtime can reread
+//! `/proc/self/maps`; landlock is installed first and names that one file, so
+//! any other pathname is `EACCES` rather than a host-path escape.
 //!
 //! `fork` is NOT among them, despite what this list used to claim. The JIT
 //! needs threads, so `clone`/`clone3` are allowlisted, and glibc builds `fork`
@@ -133,8 +136,183 @@ extern "C" fn report_blocked_syscall(
     len += 1;
     unsafe {
         libc::write(2, buf.as_ptr() as *const libc::c_void, len);
+        // openat(2) path is the most common lockdown miss; print it so the
+        // next failure names the file instead of only syscall 257.
+        if i64::from(nr) == libc::SYS_openat {
+            write_openat_path(_ctx);
+        }
         libc::_exit(159);
     }
+}
+
+/// Best-effort, async-signal-safe dump of `openat`'s pathname argument.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn write_openat_path(ctx: *mut libc::c_void) {
+    if ctx.is_null() {
+        return;
+    }
+    let path = unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // `REG_RSI` is openat's pathname pointer.
+            let uc = ctx as *const libc::ucontext_t;
+            (*uc).uc_mcontext.gregs[libc::REG_RSI as usize] as *const u8
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // x1 is openat's pathname pointer.
+            let uc = ctx as *const libc::ucontext_t;
+            (*uc).uc_mcontext.regs[1] as *const u8
+        }
+    };
+    if path.is_null() {
+        return;
+    }
+    let prefix = b"pyre: sandbox seccomp openat path ";
+    unsafe { libc::write(2, prefix.as_ptr() as *const libc::c_void, prefix.len()) };
+    let mut n = 0usize;
+    while n < 256 && unsafe { *path.add(n) } != 0 {
+        n += 1;
+    }
+    unsafe { libc::write(2, path as *const libc::c_void, n) };
+    let nl = b"\n";
+    unsafe { libc::write(2, nl.as_ptr() as *const libc::c_void, 1) };
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn write_openat_path(_ctx: *mut libc::c_void) {}
+
+// landlock(2) numbers are the same on every Linux architecture this crate
+// builds for. libc 0.2 does not yet re-export the UAPI, so the syscalls and
+// the ABI-1 access bits are spelled here.
+const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
+const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
+const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
+const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
+const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
+const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
+const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
+const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
+const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
+const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
+const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
+
+const LANDLOCK_ABI1_FS: u64 = LANDLOCK_ACCESS_FS_EXECUTE
+    | LANDLOCK_ACCESS_FS_WRITE_FILE
+    | LANDLOCK_ACCESS_FS_READ_FILE
+    | LANDLOCK_ACCESS_FS_READ_DIR
+    | LANDLOCK_ACCESS_FS_REMOVE_DIR
+    | LANDLOCK_ACCESS_FS_REMOVE_FILE
+    | LANDLOCK_ACCESS_FS_MAKE_CHAR
+    | LANDLOCK_ACCESS_FS_MAKE_DIR
+    | LANDLOCK_ACCESS_FS_MAKE_REG
+    | LANDLOCK_ACCESS_FS_MAKE_SOCK
+    | LANDLOCK_ACCESS_FS_MAKE_FIFO
+    | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+    | LANDLOCK_ACCESS_FS_MAKE_SYM;
+
+#[repr(C)]
+struct LandlockRulesetAttr {
+    handled_access_fs: u64,
+}
+
+#[repr(C, packed)]
+struct LandlockPathBeneath {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+fn landlock_handled_fs(abi: i64) -> u64 {
+    let mut access = LANDLOCK_ABI1_FS;
+    if abi >= 2 {
+        access |= LANDLOCK_ACCESS_FS_REFER;
+    }
+    if abi >= 3 {
+        access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+    if abi >= 5 {
+        access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    }
+    access
+}
+
+/// Fence every pathname `openat` except `/proc/self/maps`.
+///
+/// rustc and glibc reread that file after lockdown (backtrace symbolizer,
+/// `pthread_getattr_np` on the main thread). Classic BPF cannot match a
+/// pathname, so the syscall is allowlisted and this ruleset is what stops
+/// `/etc/passwd` and `/proc/self/root/...` from becoming host escapes.
+fn restrict_filesystem_to_proc_maps() -> io::Result<()> {
+    let abi = unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            core::ptr::null::<u8>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if abi < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let attr = LandlockRulesetAttr {
+        handled_access_fs: landlock_handled_fs(abi),
+    };
+    let ruleset = unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            &attr as *const LandlockRulesetAttr,
+            core::mem::size_of::<LandlockRulesetAttr>(),
+            0u32,
+        )
+    };
+    if ruleset < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let ruleset_fd = ruleset as i32;
+    let maps = unsafe {
+        libc::open(
+            b"/proc/self/maps\0".as_ptr().cast(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if maps < 0 {
+        unsafe { libc::close(ruleset_fd) };
+        return Err(io::Error::last_os_error());
+    }
+    let path_attr = LandlockPathBeneath {
+        allowed_access: LANDLOCK_ACCESS_FS_READ_FILE,
+        parent_fd: maps,
+    };
+    let added = unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_ADD_RULE,
+            ruleset_fd,
+            LANDLOCK_RULE_PATH_BENEATH,
+            &path_attr as *const LandlockPathBeneath,
+            0u32,
+        )
+    };
+    unsafe { libc::close(maps) };
+    if added < 0 {
+        unsafe { libc::close(ruleset_fd) };
+        return Err(io::Error::last_os_error());
+    }
+    let restricted = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0u32) };
+    unsafe { libc::close(ruleset_fd) };
+    if restricted < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn stmt(code: u16, k: u32) -> libc::sock_filter {
@@ -176,6 +354,12 @@ fn allowed_syscalls() -> Vec<u32> {
         libc::SYS_lseek,
         libc::SYS_fstat,
         libc::SYS_fcntl,
+        // rustc's backtrace symbolizer and glibc `pthread_getattr_np` both
+        // `openat` `/proc/self/maps` on the main thread after lockdown, and
+        // neither call is cached. Landlock (see
+        // [`restrict_filesystem_to_proc_maps`]) is what keeps this from
+        // becoming a general host-path open.
+        libc::SYS_openat,
         // Python 3.14's standard-stream construction probes the inherited
         // descriptors with isatty(), which glibc implements as ioctl(TCGETS).
         // The sandbox cannot open host paths, so this is limited to descriptors
@@ -324,6 +508,23 @@ pub fn install_runtime_filter() -> io::Result<()> {
         let t: libc::time_t = 0;
         let mut tm: libc::tm = core::mem::zeroed();
         libc::gmtime_r(&t, &mut tm);
+        // `gmtime_r` is UTC and does not load `/etc/localtime`. `localtime_r`
+        // and `mktime` do; rustpython_host_env's calendar helpers call them,
+        // and a first use after lockdown is an `openat` the filter refuses.
+        libc::localtime_r(&t, &mut tm);
+    }
+
+    // rustc's backtrace symbolizer and glibc `pthread_getattr_np` both
+    // `openat` `/proc/self/maps` after lockdown, and neither call is
+    // cached. Drive them once here so a later miss is not the first
+    // open; landlock plus an allowlisted `openat` is what actually
+    // lets a subsequent reread succeed without opening host paths.
+    let _ = format!("{}", std::backtrace::Backtrace::force_capture());
+    unsafe {
+        let mut attr: libc::pthread_attr_t = core::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) == 0 {
+            libc::pthread_attr_destroy(&mut attr);
+        }
     }
 
     // mimalloc defers its NUMA detection to the first thread it builds a TLD
@@ -362,11 +563,14 @@ pub fn install_runtime_filter() -> io::Result<()> {
 
     let mut prog = build_filter_program(&allowed_syscalls());
 
-    // A non-privileged process may only install a filter after NO_NEW_PRIVS, so
-    // the filter can never be used to gain privileges via a set-uid exec.
+    // A non-privileged process may only install a filter (and a landlock
+    // ruleset) after NO_NEW_PRIVS, so neither can be used to gain privileges
+    // via a set-uid exec. Landlock must be in place before the filter admits
+    // `openat`, or that syscall would be an unrestricted host-path open.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    restrict_filesystem_to_proc_maps()?;
     let fprog = libc::sock_fprog {
         len: prog.len() as libc::c_ushort,
         filter: prog.as_mut_ptr(),
@@ -433,9 +637,10 @@ mod tests {
                 "syscall {sc} should be allowed",
             );
         }
-        // An unlisted host-access call traps.
+        // An unlisted host-access call traps. `openat` is allowlisted and
+        // fenced by landlock, so the trap probe is `execve`.
         assert_eq!(
-            run_filter(&prog, AUDIT_ARCH, libc::SYS_openat as u32, 0),
+            run_filter(&prog, AUDIT_ARCH, libc::SYS_execve as u32, 0),
             libc::SECCOMP_RET_TRAP,
         );
         // A foreign syscall personality is killed outright, whatever the number.
