@@ -569,39 +569,19 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     let save_point = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(bases);
     let _ = crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
-    // `space.allocate_instance(W_TypeObject, w_typetype)` — a heap type is an
-    // ordinary `GcStruct`, not a non-moving residual.  The list header already
-    // takes `try_gc_alloc_collecting_rooted`; the type header is the same
-    // shape.  `bases` / the namespace sit on the shadow stack; the extra
-    // rooted child is unused.
-    let mut allocation_root = std::ptr::null_mut();
-    let mut needs_write_barrier = true;
-    let raw = unsafe {
-        crate::gc_hook::try_gc_alloc_collecting_rooted(
-            W_TYPE_GC_TYPE_ID,
-            W_TYPE_OBJECT_SIZE,
-            &mut allocation_root,
-            &mut needs_write_barrier,
-        )
-    };
-    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
-        .allocated_or_abort(W_TYPE_OBJECT_SIZE)
-        .unwrap_or(std::ptr::null_mut());
-    // Name storage is a nursery box and can collect; pin the empty header
-    // first so a minor forwards it before the write below.
-    let type_slot = if !raw.is_null() {
-        let slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
-        Some(slot)
-    } else {
-        None
-    };
+    // Heap types stay in the non-moving old generation.  Callers cache the
+    // resulting pointer in `OnceLock<usize>` (structseq types, sys.flags)
+    // and the JIT caches `w_class`; a nursery type would move and leave
+    // those addresses stale (`getfield_gc_r` sanity check, "no field
+    // verbose").  Full nursery types need those caches to follow
+    // forwarding first (#1449).
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
     // A mortal (GC-managed) heap type boxes its name in a GC-managed storage box
     // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
     // `name` slot in `type_object_custom_trace`. The immortal fallback (pre-GC /
     // snapshot tools) keeps a `malloc_raw` name that an immortal holder can never
-    // grey — pin the header above so a collecting name box cannot sweep it
-    // before it is stored into the type below.
+    // grey — the non-collecting old-gen alloc above cannot sweep this box before
+    // it is stored into the type below.
     let name_value = name.to_string();
     let (name, qualname) = if raw.is_null() {
         (
@@ -614,16 +594,13 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         let _ = crate::gc_roots::pin_root(name as PyObjectRef);
         let qualname =
             crate::gc_storage::gc_alloc_storage_box(name_value, name_storage_gc_type_id());
-        let name = crate::gc_roots::shadow_stack_get(save_point + 3) as *mut String;
+        let name = crate::gc_roots::shadow_stack_get(save_point + 2) as *mut String;
         (name, qualname)
     };
     // Install the forwarded bases and managed namespace addresses rather than the
     // pre-collection arguments (the pins survive any collection the alloc forces).
     let bases = crate::gc_roots::shadow_stack_get(save_point);
     let dict_ptr = crate::gc_roots::shadow_stack_get(save_point + 1) as *mut u8;
-    let raw = type_slot.map_or(raw, |slot| {
-        crate::gc_roots::shadow_stack_get(slot) as *mut u8
-    });
     let value = W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
@@ -682,11 +659,10 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // No GC hook yet (pre-init / snapshot tools): fall back to an immortal box.
         (crate::lltype::malloc_typed(value) as PyObjectRef, false)
     };
-    if gc_managed && needs_write_barrier {
-        // An old-gen spill stores young `bases`/namespace into an old object;
-        // remember it so the next minor collection scans it and its custom trace
-        // (`W_TYPE_GC_TYPE_ID`) forwards those young children.  A nursery
-        // header needs no creation barrier.
+    if gc_managed {
+        // A stable header is old-gen; `bases` / name boxes may still be
+        // young.  Remember the type so the next minor collection scans it
+        // and `type_object_custom_trace` forwards those children.
         crate::gc_hook::try_gc_write_barrier(w_type as *mut u8);
     } else {
         // Immortal fallback type (pre-GC): its trace never fires, so root its
