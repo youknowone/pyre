@@ -624,27 +624,29 @@ fn branch_guard_snapshot_rechecks_the_condition_before_either_arm() {
     // a later shared-snapshot guard can still see it.
     let live = crate::state::op_live();
     let goto = insns_opname_to_byte()["goto_if_not/iL"];
-    let code = vec![live, 0, 0, goto, 0, 7, 0, live, 4, 0];
+    // pc 3: goto_if_not; fall-through/taken is 7, not-taken target is 11.
+    let code = vec![live, 0, 0, goto, 0, 11, 0, live, 4, 0, 0, live, 7, 0];
     let runtime_jc = majit_metainterp::jitcode::JitCode::new("branch_orgpc_test");
     runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
         code: code.clone(),
         c_num_regs_i: 1,
-        startpoints: Some([0_usize, 3, 7].into_iter().collect()),
+        startpoints: Some([0_usize, 3, 7, 11].into_iter().collect()),
         ..Default::default()
     });
     let mut insns = indexmap::IndexMap::new();
     insns.insert("live/".to_string(), live);
     insns.insert("goto_if_not/iL".to_string(), goto);
-    // At orgpc the condition is live; at the other arm it is dead.
-    crate::assembler::publish_state(&insns, &[1, 0, 0, 1, 0, 0, 0], 7, 2);
+    // At orgpc the condition is live; at both arms it is dead.
+    crate::assembler::publish_state(&insns, &[1, 0, 0, 1, 0, 0, 0, 0, 0, 0], 10, 3);
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.jitcode = std::sync::Arc::new(runtime_jc);
     pyjit.metadata.is_drained = true;
     pyjit.metadata.n_py_instrs = 2;
-    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0), (7, 1)];
-    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0), (7, 1)];
-    pyjit.metadata.resume_marker_marker_by_jit_pc = vec![(0, Some(0)), (7, Some(7))];
-    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![(0, Some(0)), (7, Some(7))];
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0), (7, 1), (11, 1)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0), (7, 1), (11, 1)];
+    pyjit.metadata.resume_marker_marker_by_jit_pc =
+        vec![(0, Some(0)), (7, Some(7)), (11, Some(11))];
+    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![(0, Some(0)), (7, Some(7)), (11, Some(11))];
     let installed = crate::state::install_jitcode_for(std::ptr::null(), std::sync::Arc::new(pyjit))
         as *const crate::state::JitCode;
     let mut sym = crate::state::PyreSym::new_uninit(OpRef::NONE);
@@ -689,12 +691,12 @@ fn branch_guard_snapshot_rechecks_the_condition_before_either_arm() {
         live_after_jit_pc: usize::MAX,
     };
     let op = decode_op_at(&code, 3).unwrap();
-    goto_if_not_branch_on(&code, &op, &mut wc, condbox, 1, 7).unwrap();
+    goto_if_not_branch_on(&code, &op, &mut wc, condbox, 1, 11).unwrap();
     drop(wc);
     let guard = tc.ops().last().unwrap();
     let snapshot = tc.get_snapshot(guard.rd_resume_position.get()).unwrap();
     assert_eq!(
-        snapshot.frames[0].pc, 7,
+        snapshot.frames[0].pc, 11,
         "resume must enter the not-taken arm"
     );
     assert_eq!(

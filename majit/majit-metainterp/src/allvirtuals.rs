@@ -94,21 +94,37 @@ pub fn allocate(ptrs: Vec<i64>, ints: Vec<i64>) -> GcRef {
         )
     };
     assert!(!object.is_null(), "AllVirtuals allocation failed");
-    if needs_write_barrier && !ptrs.is_empty() {
-        majit_gc::gc_write_barrier(object);
+    // The collecting allocator unregisters `roots` before returning. Root
+    // the new object and the forwarded cache across initialization and the
+    // old-gen write barrier; the caller's `DeadFrameRefRoots` is created
+    // only after this function returns. Init first, then the barrier —
+    // `alloc_rbigint_nursery_collecting` does the same — so the card marks
+    // the stores rather than an empty shell.
+    let object_root = majit_gc::shadow_stack::OwnerRootGuard::new(object);
+    let mut cache_slots: Vec<i64> = roots.iter().map(|value| value.0 as i64).collect();
+    let cache_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    if !cache_slots.is_empty() {
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(&mut cache_slots);
+        }
     }
+    let object = object_root.get();
     unsafe {
         let header = object.0 as *mut AllVirtuals;
         (*header).ptr_count = ptrs.len();
         (*header).int_count = ints.len();
         (*header).length = length;
         let items = (header as *mut u8).add(ITEMS_OFFSET) as *mut i64;
-        for (index, value) in roots.iter().enumerate() {
-            *items.add(index) = value.0 as i64;
+        for (index, value) in cache_slots.iter().enumerate() {
+            *items.add(index) = *value;
         }
         std::ptr::copy_nonoverlapping(ints.as_ptr(), items.add(ptrs.len()), ints.len());
     }
-    object
+    if needs_write_barrier && !ptrs.is_empty() {
+        majit_gc::gc_write_barrier(object_root.get());
+    }
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(cache_root_depth);
+    object_root.get()
 }
 
 /// `ResumeGuardForcedDescr.handle_fail`: reveal the cache stored in
