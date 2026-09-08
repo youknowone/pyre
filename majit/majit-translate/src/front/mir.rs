@@ -8713,7 +8713,7 @@ impl<'a> Lowering<'a> {
                 // phaseA lift and drop the whole graph to the legacy walker.
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
-                    && fd.item_meta.name_path().ends_with("jit::we_are_jitted")
+                    && path_ends_with_segments(&fd.item_meta.name_path(), "jit::we_are_jitted")
                 {
                     let res = self
                         .graph
