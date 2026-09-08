@@ -612,25 +612,13 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             ctx.frame_state
                 .borrow_mut()
                 .vstack_boxes
-                .truncate(new_depth);
-            if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
-                ctx.frame_state
-                    .borrow_mut()
-                    .vstack_boxes
-                    .resize(new_depth, OpRef::NONE);
-            }
+                .resize(new_depth, OpRef::NONE);
         }
         VstackOpClass::ResultToTos => {
             ctx.frame_state
                 .borrow_mut()
                 .vstack_boxes
-                .truncate(new_depth);
-            if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
-                ctx.frame_state
-                    .borrow_mut()
-                    .vstack_boxes
-                    .resize(new_depth, OpRef::NONE);
-            }
+                .resize(new_depth, OpRef::NONE);
             if new_depth > 0 {
                 // `NONE` means the result was produced in an unboxed bank;
                 // leave an intentional hole so the capture overlay around
@@ -696,13 +684,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             ctx.frame_state
                 .borrow_mut()
                 .vstack_boxes
-                .truncate(new_depth);
-            if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
-                ctx.frame_state
-                    .borrow_mut()
-                    .vstack_boxes
-                    .resize(new_depth, OpRef::NONE);
-            }
+                .resize(new_depth, OpRef::NONE);
             if repeat_boundary {
                 // The retiring boundary performs the exchange.
             } else if new_depth >= 1 && i >= 1 && i <= new_depth {
@@ -729,13 +711,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                     ctx.frame_state
                         .borrow_mut()
                         .vstack_boxes
-                        .truncate(new_depth);
-                    if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
-                        ctx.frame_state
-                            .borrow_mut()
-                            .vstack_boxes
-                            .resize(new_depth, OpRef::NONE);
-                    }
+                        .resize(new_depth, OpRef::NONE);
                     ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = src;
                 }
                 _ => ctx.vstack_valid = false,
@@ -781,13 +757,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             ctx.frame_state
                 .borrow_mut()
                 .vstack_boxes
-                .truncate(new_depth);
-            if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
-                ctx.frame_state
-                    .borrow_mut()
-                    .vstack_boxes
-                    .resize(new_depth, OpRef::NONE);
-            }
+                .resize(new_depth, OpRef::NONE);
             for s in pop_point..new_depth {
                 ctx.frame_state.borrow_mut().vstack_boxes[s] = OpRef::NONE;
             }

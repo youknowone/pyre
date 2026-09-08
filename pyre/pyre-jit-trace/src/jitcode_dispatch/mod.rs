@@ -1105,11 +1105,7 @@ fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
     frame: *mut pyre_interpreter::PyFrame,
     frame_reg: u16,
 ) -> bool {
-    let state = ctx.frame_state.borrow();
-    let Some(shadow) = state.callee_shadow.as_ref() else {
-        return false;
-    };
-    flush_callee_locals_region(shadow, frame, frame_reg)
+    flush_callee_locals_region(&ctx.frame_state, frame, frame_reg)
 }
 
 /// [`flush_callee_locals_region_to_frame`] against a shadow reached without a
@@ -1117,7 +1113,7 @@ fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
 /// the `TraceCtx`, so the level's shadow is published for the duration of the
 /// residual instead (`residual_call.rs`).
 pub(crate) fn flush_callee_locals_region(
-    shadow: &CalleeLocalsShadow,
+    state: &WalkFrameState,
     frame: *mut pyre_interpreter::PyFrame,
     frame_reg: u16,
 ) -> bool {
@@ -1129,9 +1125,6 @@ pub(crate) fn flush_callee_locals_region(
     };
     // Validation pass first: it allocates nothing, so a decline leaves the
     // frame untouched (same all-or-nothing discipline as the top-level twin).
-    if !callee_locals_region_is_publishable(shadow, nlocals, frame_reg) {
-        return false;
-    }
     let frame_ptr = frame as *const u8;
     let arr_ptr = unsafe {
         *(frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET)
@@ -1140,19 +1133,22 @@ pub(crate) fn flush_callee_locals_region(
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
         return false;
     }
-    for abs in 0..nlocals {
-        let Some(concrete) = shadow.concrete.get(&(abs as i64)) else {
-            continue;
-        };
-        let boxed = crate::state::boxed_slot_value_for_type(Type::Ref, &concrete.value);
+    // `virtualizable.py write_boxes` keeps the source boxes and destination
+    // array live throughout writeback. Native boxing can collect: retain roots
+    // for both destinations and read each source from its shared owner after
+    // the preceding allocation, with no frame-state borrow across boxing.
+    let frame_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame as usize));
+    let array_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(arr_ptr as usize));
+    state.write_callee_locals(nlocals, frame_reg, |abs, value| {
+        let boxed = crate::state::boxed_slot_value_for_type(Type::Ref, &value);
+        let arr_ptr = array_root.get().0 as *mut pyre_object::FixedObjectArray;
         unsafe {
             (*arr_ptr).as_mut_slice()[abs] = boxed;
         }
         // Boxing an Int/Float slot allocates, and each minor collection
         // consumes the array's remembered-set entry, so re-arm per store.
-        crate::state::frame_array_write_barrier(frame as *mut u8, arr_ptr);
-    }
-    true
+        crate::state::frame_array_write_barrier(frame_root.get().0 as *mut u8, arr_ptr);
+    })
 }
 
 /// Publish `PyFrame.frame_finished_execution = True` on the current

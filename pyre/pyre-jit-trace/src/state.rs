@@ -7072,7 +7072,7 @@ impl PyreSym {
         // store_local_value updates the per-color slot directly.
         self.registers_r.replace(
             if let Some(ref overrides) = self.bridge_local_oprefs.as_ref() {
-                // resume.py:1042 parity: bridge trace uses OpRefs derived from
+                // resume.py `rebuild_from_resumedata`: bridge trace uses OpRefs derived from
                 // rebuild_from_resumedata (Box(n) → bridge InputArg OpRef::from_raw(n)).
                 let mut locals = overrides.to_vec();
                 locals.resize(nlocals, OpRef::NONE);

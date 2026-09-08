@@ -148,6 +148,42 @@ impl WalkFrameState {
         self.0.borrow_mut()
     }
 
+    /// `virtualizable.py write_boxes`: validate the sparse native shadow, then
+    /// read each live value immediately before its write. The writer may box
+    /// Int/Float values and collect; neither a borrow nor a copied Ref list may
+    /// span that allocation. Ref values themselves require no boxing allocation.
+    pub(crate) fn write_callee_locals(
+        &self,
+        nlocals: usize,
+        frame_reg: u16,
+        mut write: impl FnMut(usize, Value),
+    ) -> bool {
+        {
+            let data = self.borrow();
+            let Some(shadow) = data.callee_shadow.as_ref() else {
+                return false;
+            };
+            if !super::callee_locals_region_is_publishable(shadow, nlocals, frame_reg) {
+                return false;
+            }
+        }
+        for slot in 0..nlocals {
+            let value = {
+                let data = self.borrow();
+                data.callee_shadow
+                    .as_ref()
+                    .expect("callee shadow retired during writeback")
+                    .concrete
+                    .get(&(slot as i64))
+                    .map(|entry| entry.value)
+            };
+            if let Some(value) = value {
+                write(slot, value);
+            }
+        }
+        true
+    }
+
     pub(crate) fn replace_active_box(&self, oldbox: OpRef, newbox: OpRef) {
         let mut data = self.borrow_mut();
         let replace = |slot: &mut OpRef| {
@@ -338,6 +374,60 @@ mod tests {
         assert_refs(&paused, 0x1080);
         assert_refs(&inner, 0x2100);
         drop(inner_root);
+    }
+
+    #[test]
+    fn callee_writeback_releases_borrows_and_reads_forwarded_later_slots() {
+        let _runtime = crate::trace_ctx_for_test(0);
+        let _stw = majit_gc::gc_sync::quiesce_mutators();
+        let mut shadow = CalleeLocalsShadow::default();
+        shadow.set_concrete(1, 0, Value::Int(1000));
+        shadow.set_concrete(1, 1, Value::Ref(GcRef(0x1000)));
+        shadow.set_concrete(1, 2, Value::Float(2.5));
+        shadow.set_concrete(1, 3, Value::Ref(GcRef(0x2000)));
+        let state = WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            ..WalkFrameStateData::default()
+        });
+        let _root = state.root();
+        let published = state.clone();
+        let mut written = Vec::new();
+        assert!(published.write_callee_locals(5, 1, |slot, value| {
+            // Boxing a scalar can collect before a later Ref is loaded. Walk
+            // the real registered owner, so a retained borrow panics here and
+            // an unrooted shadow copy returns a stale later value.
+            if matches!(value, Value::Int(_) | Value::Float(_)) {
+                majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+                    if (0x1000..0x3000).contains(&root.0) {
+                        root.0 += 0x80;
+                    }
+                });
+            }
+            written.push((slot, value));
+        }));
+        assert_eq!(
+            written,
+            vec![
+                (0, Value::Int(1000)),
+                (1, Value::Ref(GcRef(0x1080))),
+                (2, Value::Float(2.5)),
+                (3, Value::Ref(GcRef(0x2100))),
+            ]
+        );
+    }
+
+    #[test]
+    fn callee_writeback_validates_all_slots_before_writing() {
+        let mut shadow = CalleeLocalsShadow::default();
+        shadow.set_concrete(1, 0, Value::Int(1000));
+        shadow.set_opref(1, OpRef::ref_op(7));
+        let state = WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            ..WalkFrameStateData::default()
+        });
+        assert!(!state.write_callee_locals(2, 1, |_, _| panic!("partial write")));
+        assert!(!state.write_callee_locals(1, 2, |_, _| panic!("wrong frame")));
+        assert!(!WalkFrameState::default().write_callee_locals(1, 1, |_, _| panic!("no shadow")));
     }
 
     #[test]

@@ -1231,10 +1231,10 @@ thread_local! {
     /// A force inside the residual runs from `force_pyframe`, which reaches
     /// only the `TraceCtx`; `virtualizable.py write_boxes` writes the array of
     /// the virtualizable it forces, so the level's own slot source has to be
-    /// reachable there.  The pointer is valid exactly while the guard that set
-    /// it is alive, which brackets the residual.
-    static PUBLISHED_INLINE_SHADOW: std::cell::Cell<Option<(*const super::CalleeLocalsShadow, u16)>> =
-        const { std::cell::Cell::new(None) };
+    /// reachable there. Publish the shared owner, not a raw pointer into its
+    /// RefCell: writeback may collect and forward the same shadow's fields.
+    static PUBLISHED_INLINE_SHADOW: std::cell::RefCell<Option<(super::WalkFrameState, u16)>> =
+        const { std::cell::RefCell::new(None) };
 
     /// The frame a live [`LiveLastInstrGuard`] published the executing pc onto,
     /// with the resume coordinate it displaced.
@@ -1412,17 +1412,14 @@ struct ResidualFrameChainGuard {
     /// residual publishes across this scope.
     frame_root: majit_gc::shadow_stack::OwnerRootGuard,
     previous_published: *mut pyre_interpreter::PyFrame,
-    previous_shadow: Option<(*const super::CalleeLocalsShadow, u16)>,
+    previous_shadow: Option<(super::WalkFrameState, u16)>,
     /// Whether this guard performed the chain write, so `Drop` restores only
     /// what it changed.  False when the chain already named `frame`.
     entered: bool,
 }
 
 impl ResidualFrameChainGuard {
-    fn enter(
-        frame: usize,
-        shadow: Option<(*const super::CalleeLocalsShadow, u16)>,
-    ) -> Option<Self> {
+    fn enter(frame: usize, shadow: Option<(super::WalkFrameState, u16)>) -> Option<Self> {
         let frame = frame as *mut pyre_interpreter::PyFrame;
         if frame.is_null() {
             return None;
@@ -1492,7 +1489,7 @@ impl Drop for ResidualFrameChainGuard {
             // dropping that propagation would leave the escape recorded only on
             // a frame the walk owns privately.
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
-            PUBLISHED_INLINE_SHADOW.with(|slot| slot.set(self.previous_shadow));
+            PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(self.previous_shadow.take()));
             if self.entered {
                 // The value `enter` displaced, read back off the frame it was
                 // written to, so a collection during the residual forwarded it
@@ -1641,19 +1638,18 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                         // suppression is scoped to this residual.
                         let written = PUBLISHED_INLINE_SHADOW
                             .with(|slot| slot.take())
-                            .is_some_and(|(shadow, frame_reg)| {
-                                // SAFETY: the pointer is published by
-                                // `ResidualFrameChainGuard`, which brackets the
-                                // residual this force runs inside of, and
-                                // restores the previous entry on drop.
-                                let shadow = unsafe { &*shadow };
+                            .is_some_and(|(state, frame_reg)| {
                                 // The shadow describes ONE level's frame.  Only
                                 // that frame may be written from it: a nested
                                 // residual publishes its own, and writing one
                                 // level's slots onto another's array would
                                 // replace live values with unrelated ones.
-                                shadow.concrete_frame == frame as usize
-                                    && super::flush_callee_locals_region(shadow, frame, frame_reg)
+                                let matches_frame =
+                                    state.borrow().callee_shadow.as_ref().is_some_and(|shadow| {
+                                        shadow.concrete_frame == frame as usize
+                                    });
+                                matches_frame
+                                    && super::flush_callee_locals_region(&state, frame, frame_reg)
                             });
                         if !written {
                             UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.set(frame as usize));
@@ -4179,14 +4175,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             .borrow()
             .callee_shadow
             .as_ref()
-            .and_then(|shadow| {
+            .and_then(|_| {
                 let frame_reg = ctx
                     .inline_callee_consts
                     .and_then(|consts| {
                         crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
                     })
                     .map(|jitcode| jitcode.metadata.portal_frame_reg)?;
-                Some((shadow as *const super::CalleeLocalsShadow, frame_reg))
+                Some((ctx.frame_state.clone(), frame_reg))
             });
         let _frame_chain = ResidualFrameChainGuard::enter(concrete_inline_frame, published_shadow);
         let live_py_pc = if ctx.fbw_mode.inline_subwalk {
