@@ -2165,7 +2165,7 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// `compile.py:710-716 resume_in_blackhole(descr, deadframe)` parity:
 /// callback to resume execution from the guard failure point using the
 /// blackhole interpreter.  Args: `(descr_addr, rebuilt_values_ptr,
-/// num_rebuilt, raw_deadframe_ptr, num_raw, guard_exc)` →
+/// num_rebuilt, raw_deadframe_ptr, num_raw, guard_exc, savedata)` →
 /// `Option<result>`.  The receiver recovers the failed descr from
 /// `descr_addr` via `Backend::fail_descr_arc_from_addr`
 /// (`history.py:125` `cpu.get_latest_descr` parity) and derives
@@ -2177,14 +2177,20 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// stub staged into `jf_guard_exc`, handed to the blackhole resume per
 /// `blackhole.py _prepare_resume_from_failure`.  `0` = no pending
 /// exception.
+///
+/// `savedata` is `cpu.get_savedata_ref(deadframe)` (`llmodel.py`): the
+/// `jf_savedata` AllVirtuals cache a `GUARD_NOT_FORCED` force already
+/// materialized.  `0` = no cache.
 type CallAssemblerBlackholeFn =
     fn(usize, *mut majit_backend::jitframe::JitFrame, i64) -> Option<i64>;
 static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<CallAssemblerBlackholeFn> = OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
-/// The trailing `i64` is `cpu.grab_exc_value(deadframe)` (llmodel.py):
-/// the callee's `jf_guard_exc` slot, forwarded so the blackhole resume can
-/// seed `_prepare_resume_from_failure` (blackhole.py).
+/// The last two arguments are `cpu.grab_exc_value(deadframe)` (`i64`) and
+/// `cpu.get_savedata_ref(deadframe)` (`usize`): the callee's `jf_guard_exc`
+/// and `jf_savedata` slots, forwarded so the blackhole resume can seed
+/// `_prepare_resume_from_failure` (blackhole.py) and reuse a
+/// `GUARD_NOT_FORCED` AllVirtuals cache.
 pub fn register_call_assembler_blackhole(f: CallAssemblerBlackholeFn) {
     let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
 }
