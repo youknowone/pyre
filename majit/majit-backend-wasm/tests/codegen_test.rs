@@ -136,10 +136,9 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
 ///
 /// - Entry prologues clear the current frame's GC Ref homes. #1683
 ///   coalesces those stores into `memory.fill` on local 0.
-/// - The inline `malloc_cond_varsize_frame` bump returns recycled
-///   nursery bytes, so it `memory.fill`s `total - HDR` at the payload
-///   (rewrite.py `clear_gc_fields` plus a zero `jf_frame`). The helper
-///   path still arrives already zero from a reset nursery.
+/// - The inline bump installs `build_callee_gcmap` before the callee
+///   writes homes, so it `memory.fill`s the `jf_frame` items. rewrite.py
+///   `gen_malloc_frame` only nulls the five GCREF header fields.
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
     let lines: Vec<_> = stderr.lines().map(str::trim).collect();
@@ -153,13 +152,16 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3] == "i32.add"
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
-        let is_ca_payload_zero = index >= 4
+        let is_ca_item_zero = index >= 7
+            && lines[index - 7].starts_with("local.get ")
+            && lines[index - 6].starts_with("i32.const ")
+            && lines[index - 5] == "i32.add"
             && lines[index - 4] == "i32.const 0"
             && lines[index - 3].starts_with("local.get ")
-            && lines[index - 2] == "i32.const 8"
-            && lines[index - 1] == "i32.sub";
+            && lines[index - 2].starts_with("i64.load32_u")
+            && lines[index - 1] == "i32.wrap_i64";
         assert!(
-            is_entry_home_clear || is_ca_payload_zero,
+            is_entry_home_clear || is_ca_item_zero,
             "recursive CA refilled a nursery frame instead of relying on its zeroed payload:\n{stderr}"
         );
     }
@@ -2091,7 +2093,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     );
     assert!(
         saw_payload_fill,
-        "malloc_cond_varsize_frame must memory.fill the recycled payload"
+        "malloc_cond_varsize_frame must memory.fill the jf_frame items"
     );
 }
 

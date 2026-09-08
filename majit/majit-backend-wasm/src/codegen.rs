@@ -2433,7 +2433,10 @@ fn emit_ca_malloc_cond_varsize_frame(
     alloc_scratch_local: u32,
     alloc_size_local: u32,
 ) {
-    use majit_backend::jitframe::{JF_FRAME_OFS, JF_GCMAP_OFS, JITFRAME_FIXED_SIZE, SIZEOFSIGNED};
+    use majit_backend::jitframe::{
+        FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
+        JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE, SIZEOFSIGNED,
+    };
     let word = SIZEOFSIGNED as i32;
     let ss_word = std::mem::size_of::<usize>() as i32;
     let hdr = GcHeader::SIZE as i32;
@@ -2508,20 +2511,22 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.i32_const(hdr);
     sink.i32_add();
     sink.local_set(alloc_scratch_local);
-    // The bump returns recycled nursery bytes. We install `jf_gcmap`
-    // before the callee writes its homes, so those slots must be null
-    // or `jitframe_trace` walks leftover pointers
-    // (`invalid type_id` in `copy_nursery_object`). rewrite.py
-    // `clear_gc_fields` plus a zero `jf_frame` cover that; the helper
-    // path gets the same from `alloc_with_type` on a reset nursery.
-    sink.local_get(alloc_scratch_local);
-    sink.i32_const(0);
-    sink.local_get(alloc_size_local);
-    sink.i32_const(hdr);
-    sink.i32_sub();
-    sink.memory_fill(0);
+    // rewrite.py `gen_malloc_frame`: zero the GCREF fields because of
+    // the unusual malloc pattern. `jf_frame_info` is raw and stays
+    // null here the way `JitFrame::init` leaves it.
+    for ofs in [
+        JF_SAVEDATA_OFS,
+        JF_FORCE_DESCR_OFS,
+        JF_DESCR_OFS,
+        JF_GUARD_EXC_OFS,
+        JF_FORWARD_OFS,
+    ] {
+        sink.local_get(alloc_scratch_local);
+        sink.i64_const(0);
+        emit_word_store(sink, ofs as u64);
+    }
     // rewrite.rs after `gen_malloc_nursery_varsize_frame`: write
-    // `jf_frame` length and `jf_gcmap` over the cleared payload.
+    // `jf_frame` length and `jf_gcmap`.
     sink.local_get(alloc_scratch_local);
     sink.local_get(ca_target_local);
     sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
@@ -2534,6 +2539,20 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.local_get(ca_target_local);
     sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
     emit_word_store(sink, JF_GCMAP_OFS as u64);
+    // `build_callee_gcmap` is installed now, before the callee prologue
+    // writes homes. Host MiniMarkGC reset does not zero
+    // (`malloc_zero_filled = False`; the wasm32 fill is guest-only), so
+    // `jitframe_trace` would walk leftover item pointers. PyPy never
+    // does this fill: its assembler writes `jf_gcmap` at safepoints
+    // once those slots are live.
+    sink.local_get(alloc_scratch_local);
+    sink.i32_const(FIRST_ITEM_OFFSET as i32);
+    sink.i32_add();
+    sink.i32_const(0);
+    sink.local_get(ca_target_local);
+    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
+    sink.i32_wrap_i64();
+    sink.memory_fill(0);
     // assembler.py `_call_header_shadowstack`: [is_minor=1, jf_ptr], then
     // advance top by 2*WORD.
     sink.i32_const(inline.jf_top_addr as i32);
