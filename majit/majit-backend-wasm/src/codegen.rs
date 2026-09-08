@@ -2434,8 +2434,9 @@ fn emit_ca_malloc_cond_varsize_frame(
     alloc_size_local: u32,
 ) {
     use majit_backend::jitframe::{
-        FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
-        JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE, SIZEOFSIGNED,
+        FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS,
+        JF_FRAME_OFS, JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE,
+        SIZEOFSIGNED,
     };
     let word = SIZEOFSIGNED as i32;
     let ss_word = std::mem::size_of::<usize>() as i32;
@@ -2511,9 +2512,15 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.i32_const(hdr);
     sink.i32_add();
     sink.local_set(alloc_scratch_local);
+    // Recycled nursery bytes do not start null. `JitFrame::init` and
+    // `wasm_jit_ca_alloc_frame` write a null `jf_frame_info`; PyPy's
+    // `handle_call_assembler` then stores `llfi`. This path has no
+    // frame-info pointer on the dispatch entry, so write null.
+    sink.local_get(alloc_scratch_local);
+    sink.i64_const(0);
+    emit_word_store(sink, JF_FRAME_INFO_OFS as u64);
     // rewrite.py `gen_malloc_frame`: zero the GCREF fields because of
-    // the unusual malloc pattern. `jf_frame_info` is raw and stays
-    // null here the way `JitFrame::init` leaves it.
+    // the unusual malloc pattern.
     for ofs in [
         JF_SAVEDATA_OFS,
         JF_FORCE_DESCR_OFS,
