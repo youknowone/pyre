@@ -9259,6 +9259,90 @@ pub(crate) fn binary_op_tag_for_helper_index(
     binary_op_tag_for_helper_name(name)
 }
 
+/// The machine-int body of `int_add` / `int_sub` / `int_mul` / bitwise
+/// (`descroperation.rs`): unbox, `int_*_ovf` or `int_and`/`or`/`xor`,
+/// rebox.  Used when a helper walk cannot stamp its resume word
+/// (`GuardResumeCoordinateUnavailable`) so the call would otherwise
+/// become `CallMayForce`.  Does not walk `binary_value_from_tag` —
+/// that re-enters the same `add` inline and recurses.
+pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let (Some(lhs_obj), Some(rhs_obj)) = (
+        walker_concrete_ref_object(ctx, r_args[0]),
+        walker_concrete_ref_object(ctx, r_args[1]),
+    ) else {
+        return Ok(None);
+    };
+    unsafe {
+        for obj in [lhs_obj, rhs_obj] {
+            if !pyre_object::is_int(obj) || !pyre_object::is_exact_builtin_instance(obj) {
+                return Ok(None);
+            }
+        }
+    }
+    let la = unsafe { pyre_object::w_int_get_value(lhs_obj) };
+    let rb = unsafe { pyre_object::w_int_get_value(rhs_obj) };
+    use pyre_interpreter::bytecode::BinaryOperator as B;
+    let opcode = match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
+        Some(B::Add | B::InplaceAdd) => OpCode::IntAddOvf,
+        Some(B::Subtract | B::InplaceSubtract) => OpCode::IntSubOvf,
+        Some(B::Multiply | B::InplaceMultiply) => OpCode::IntMulOvf,
+        Some(B::And | B::InplaceAnd) => OpCode::IntAnd,
+        Some(B::Or | B::InplaceOr) => OpCode::IntOr,
+        Some(B::Xor | B::InplaceXor) => OpCode::IntXor,
+        _ => return Ok(None),
+    };
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let lhs_raw = walker_unbox_int(ctx, op_pc, r_args[0], int_type_addr)?;
+    let rhs_raw = walker_unbox_int(ctx, op_pc, r_args[1], int_type_addr)?;
+    let (raw, concrete) = if matches!(
+        opcode,
+        OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
+    ) {
+        let Some(raw) = record_int_ovf_guarded(ctx, op_pc, opcode, lhs_raw, rhs_raw)? else {
+            return Ok(None);
+        };
+        let concrete = match opcode {
+            OpCode::IntAddOvf => la.checked_add(rb),
+            OpCode::IntSubOvf => la.checked_sub(rb),
+            OpCode::IntMulOvf => la.checked_mul(rb),
+            _ => None,
+        };
+        let Some(concrete) = concrete else {
+            return Ok(None);
+        };
+        (raw, concrete)
+    } else {
+        let raw = ctx.trace_ctx.record_op(opcode, &[lhs_raw, rhs_raw]);
+        let concrete = match opcode {
+            OpCode::IntAnd => la & rb,
+            OpCode::IntOr => la | rb,
+            OpCode::IntXor => la ^ rb,
+            _ => return Ok(None),
+        };
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Int(concrete));
+        (raw, concrete)
+    };
+    let boxed_ptr = pyre_object::w_int_new(concrete) as i64;
+    let boxed = walker_box_int(ctx, op_pc, raw, concrete)?;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(concrete, boxed_ptr));
+    let _ = (dst, dst_bank);
+    Ok(Some(DispatchOutcome::SubReturn {
+        result: Some(boxed),
+    }))
+}
+
 fn binary_op_tag_for_helper_name(name: &str) -> Option<i64> {
     use pyre_interpreter::bytecode::BinaryOperator as B;
     let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
