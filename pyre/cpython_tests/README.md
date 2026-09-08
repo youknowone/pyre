@@ -104,11 +104,13 @@ before any test, a denied resource, or a suite whose every case was skipped).
 
 ## Current state and backlog (Phase 0)
 
-The baseline records **223 `PASS`**, 138 `IMPORTERROR`, 34 `SKIP`,
-25 `FAIL`, 7 `CRASH`, and 7 `TIMEOUT` (434 modules, stdlib 3.14.6). These are a
-snapshot counted from `baseline.json`, which is the authority when they disagree. The
-`PASS` set grows as the gaps below are closed; non-passing modules include both
-import/stdlib gaps and tests that reach semantic failures, crashes, or timeouts.
+The baseline records **262 `PASS`**, 32 `IMPORTERROR`, 62 `SKIP`,
+69 `FAIL`, 7 `CRASH`, and 7 `TIMEOUT` (439 recorded rows, stdlib 3.14.6). These are a
+snapshot counted from `baseline.json`, which is the authority when they disagree.
+`IMPORTERROR` here means unittest never printed a summary — many of those
+labels are stale (the modules now import and run). Re-measure with
+`--full --report` before treating one as an import gap. The `PASS` set grows
+as the gaps below are closed.
 (It was 0 `PASS` / 414 `IMPORTERROR` before the
 `-m`/`STORE_SLICE`/submodule-binding/`_ast`/PEP-709-hidden-locals fixes
 below.)
@@ -143,16 +145,15 @@ Building this infra already surfaced and fixed five interpreter gaps:
 Known remaining blockers (the backlog the suite tracks), highest-leverage
 first:
 
-1. **`from package import submodule` fallback.** `from test import support`
-   fails when `support` isn't already an attribute; IMPORT_FROM must fall back
-   to importing the submodule. Also `from unittest import mock`
-   (`unittest.mock` submodule).
-2. **Compile-time `SyntaxWarning` is never raised.** `test_grammar` fails 16
-   assertions across `test_assert_syntax_warnings`,
-   `test_assert_warning_promotes_to_syntax_error`,
-   `test_comparison_is_literal`, `test_end_of_numerical_literals`,
-   `test_former_statements_refer_to_builtins` and `test_warn_missed_comma` —
-   every one of them waits for a warning the compiler does not emit.
-3. **Assorted stdlib-compat gaps** surfaced per module (e.g. `datetime.date`,
-   `genericpath._splitext`, `typing`'s `_idfunc`, complex `re` patterns). Run
-   `--full --report` to enumerate the current set.
+1. **Stale `IMPORTERROR` labels.** `handle_fromlist` / `IMPORT_FROM` already
+   implement `from package import submodule`. `test.support` and
+   `unittest.mock` import. Re-run `--full` and promote modules that now
+   PASS or FAIL. CPython-only / Windows / display suites are curated
+   `KNOWN_SKIPS` or `PLATFORM_GATED`, not import work.
+2. **Semantic FAILs** already inside unittest (`test_xml_etree` self-closing
+   reparse, `test_syntax` `expected ':'`, POSIX `pwd`/`grp`/`select`,
+   `bz2`/`lzma`, `shutil`/`traceback`/`zoneinfo`). `test_site` is the
+   PyPy-shaped `lib/pyre3.14t` layout, not a path bug.
+3. **Missing PyPy product modules**, ported natively (do not put `lib_pypy`
+   on `sys.path`): `_sqlite3`, `_curses`, `_gdbm`/`_dbm`, Linux `crypt`.
+   Do not implement `_datetime`, `_zstd`, or the subinterpreter modules.

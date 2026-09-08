@@ -127,6 +127,33 @@ KNOWN_SKIPS = {
     # `AGENTS.md` rules out; the module stays blocked on a decision about the
     # module inventory rather than on an interpreter gap.
     "test.test_types": "imports `_datetime`, an extension module PyPy does not provide",
+    # CPython-only internals / helpers.  PyPy's conftest skips the same
+    # class of modules; none of these have a PyPy owner, so they are not
+    # a pyre porting target (AGENTS.md module-presence rule).
+    "test.test__interpchannels": "CPython subinterpreter API; PyPy has no owner",
+    "test.test__interpreters": "CPython subinterpreter API; PyPy has no owner",
+    "test.test_crossinterp": "CPython subinterpreter API; PyPy has no owner",
+    "test.test_free_threading": "CPython free-threading internals",
+    "test.test_thread_local_bytecode": "CPython specializing-interpreter internals",
+    "test.test_generated_cases": "CPython bytecode case generator",
+    "test.test_optimizer": "CPython specializing optimizer",
+    "test.test_external_inspection": "CPython remote-debugging helper",
+    "test.test_clinic": "CPython Argument Clinic",
+    "test.test_asdl_parser": "CPython Parser/asdl internals",
+    "test.test_build_details": "CPython build metadata",
+    "test.test_getpath": "CPython internal details",
+    "test.test_launcher": "CPython Windows py.exe launcher",
+    "test.test_gdb": "CPython gdb hooks",
+    "test.test_perf_profiler": "CPython perf profiler hooks",
+    "test.test_perfmaps": "CPython perf map hooks",
+    "test.test_xxlimited": "CPython internal details",
+    "test.test_xxtestfuzz": "CPython internal details",
+    "test.test_android": "Android-only",
+    "test.test_zstd": "no PyPy owner for the _zstd accelerator",
+    # Display-backed Tk.  Headless `test_tcl` / `test_ttk_textonly` /
+    # `test_turtle` stay off this table: PyPy runs them, and they do not
+    # need a screen.
+    "test.test_tkinter": "needs display",
 }
 
 # Whole modules that CPython skips at import on some platforms. Off-platform
@@ -191,6 +218,34 @@ PLATFORM_GATED = {
     "test.test_tty": (
         lambda p: p not in ("win32", "emscripten", "wasi"),
         "no termios module",
+    ),
+    # Windows-only modules.  Each file raises SkipTest or uses
+    # `import_module(..., required_on=['win'])` on a POSIX host; keep them
+    # out of the shared baseline so a POSIX IMPORTERROR is not recorded as
+    # an interpreter gap.
+    "test.test_msvcrt": (
+        lambda p: p == "win32",
+        "windows related tests",
+    ),
+    "test.test_winconsoleio": (
+        lambda p: p == "win32",
+        "test only relevant on win32",
+    ),
+    "test.test_winapi": (
+        lambda p: p == "win32",
+        "Windows-only _winapi",
+    ),
+    "test.test_winreg": (
+        lambda p: p == "win32",
+        "Windows-only winreg",
+    ),
+    "test.test_wmi": (
+        lambda p: p == "win32",
+        "Windows-only _wmi",
+    ),
+    "test.test_startfile": (
+        lambda p: p == "win32",
+        "Windows-only os.startfile",
     ),
 }
 

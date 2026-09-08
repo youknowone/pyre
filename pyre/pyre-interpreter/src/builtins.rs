@@ -14982,8 +14982,19 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             // exactly `invalid syntax`, and a keyword typo reaches the parser
             // as a name opening a second statement on the line.
             ParseErrorType::SimpleStatementsOnSameLine
-            | ParseErrorType::SimpleAndCompoundStatementOnSameLine
-            | ParseErrorType::ExpectedToken { .. } => "invalid syntax".to_owned(),
+            | ParseErrorType::SimpleAndCompoundStatementOnSameLine => "invalid syntax".to_owned(),
+            // `invalid_colon` in the 3.14 grammar (`Parser/parser.c`) and
+            // pypy3 both spell a missing suite-header colon as `expected
+            // ':'`.  Other `Colon` expectations stay generic: `lambda x x`
+            // and `{1 2}` are `invalid syntax` (the latter then rewritten
+            // below to the forgot-a-comma form).
+            ParseErrorType::ExpectedToken {
+                expected: rustpython_compiler::ast::token::TokenKind::Colon,
+                ..
+            } if compound_suite_header_at(source, parse_err.raw_location.start().to_usize()) => {
+                "expected ':'".to_owned()
+            }
+            ParseErrorType::ExpectedToken { .. } => "invalid syntax".to_owned(),
             ParseErrorType::OtherError(message) if message == "Expected a statement" => {
                 "invalid syntax".to_owned()
             }
@@ -15671,6 +15682,32 @@ fn scan_line_nesting(bytes: &[u8], depth: &mut usize, in_triple: &mut Option<u8>
         i += 1;
     }
     Some(())
+}
+
+/// Whether `loc` sits on a compound suite header that is missing its `:`.
+///
+/// The 3.14 `invalid_colon` rule names `try`/`if`/`def`/…, not every
+/// colon the parser can demand (`lambda`, dict displays).
+fn compound_suite_header_at(source: &str, loc: usize) -> bool {
+    let loc = loc.min(source.len());
+    let line_start = source[..loc].rfind('\n').map_or(0, |i| i + 1);
+    let mut rest = source[line_start..].trim_start();
+    if let Some(after) = rest.strip_prefix("async") {
+        if after.starts_with(|c: char| c.is_whitespace()) {
+            rest = after.trim_start();
+        }
+    }
+    const HEADERS: &[&str] = &[
+        "try", "if", "elif", "else", "for", "while", "with", "class", "def", "except", "finally",
+        "match", "case",
+    ];
+    HEADERS.iter().any(|kw| {
+        rest.starts_with(kw)
+            && !rest
+                .as_bytes()
+                .get(kw.len())
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    })
 }
 
 /// The `SyntaxError` subclass a compile failure belongs to.  3.14 raises
