@@ -12,24 +12,64 @@ use super::*;
 
 /// Register-bank half of `pyjitpl.MetaInterp.replace_box`, owned by a live
 /// walker frame. Resume snapshots (`InlineParentFrame.boxes`) are rewritten
-/// immediately, as `replace_box` walks `framestack`. Register banks stay
-/// queued: Rust cannot borrow a paused caller's banks while its child holds
-/// `TraceCtx`. Convergence is one red frame per inlined call (#1731) so
-/// replace can write those banks in place.
+/// immediately, as `replace_box` walks `framestack`.
 ///
-/// Apply the queue before that frame executes again. Delivery must precede
-/// the caller continuation, not the next opcode: trace rollback can reuse
-/// an OpRef id, and a later delivery could rewrite a new value that was
-/// never present in the paused caller.
+/// Bound register banks are rewritten in place the same way
+/// `MIFrame.replace_active_box_in_frame` writes `registers_{i,r,f}`. The
+/// owner captures those slice pointers while it still holds the banks;
+/// a paused caller is not borrowed through `TraceCtx`. Walker-only extras
+/// (vstack, callee shadow) stay queued and `apply` before the owner
+/// executes again.
+///
+/// Delivery of the extras must precede the caller continuation, not the
+/// next opcode: trace rollback can reuse an OpRef id, and a later
+/// delivery could rewrite a new value that was never present in the
+/// paused caller.
 ///
 /// Weak registration neither extends a frame's lifetime nor leaks aliases
 /// into a nested trace session. Heap-owned SubWalkFrames keep this owner
 /// across suspension; recursive callers keep it for precisely the child call.
+/// Convergence for the remaining extras is one red frame per inlined call
+/// (#1731).
 pub(super) struct FrameBoxReplacements(std::rc::Rc<FrameBoxReplacementInbox>);
+
+#[derive(Clone, Copy)]
+struct BoundBank {
+    ptr: *mut OpRef,
+    len: usize,
+}
 
 pub(crate) struct FrameBoxReplacementInbox {
     pending: std::cell::RefCell<Vec<(OpRef, OpRef)>>,
     listening: std::cell::Cell<bool>,
+    banks_r: std::cell::Cell<BoundBank>,
+    banks_i: std::cell::Cell<BoundBank>,
+    banks_f: std::cell::Cell<BoundBank>,
+}
+
+impl BoundBank {
+    const EMPTY: Self = Self {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+    };
+
+    fn from_slice(slots: &mut [OpRef]) -> Self {
+        Self {
+            ptr: slots.as_mut_ptr(),
+            len: slots.len(),
+        }
+    }
+
+    unsafe fn as_mut_slice(&self) -> Option<&mut [OpRef]> {
+        if self.ptr.is_null() || self.len == 0 {
+            None
+        } else {
+            // The owning walk frame captured this slice and is still
+            // listening, so the allocation is live and not reborrowed
+            // through a WalkContext.
+            Some(unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) })
+        }
+    }
 }
 
 impl FrameBoxReplacements {
@@ -37,6 +77,9 @@ impl FrameBoxReplacements {
         let pending = std::rc::Rc::new(FrameBoxReplacementInbox {
             pending: std::cell::RefCell::new(Vec::new()),
             listening: std::cell::Cell::new(true),
+            banks_r: std::cell::Cell::new(BoundBank::EMPTY),
+            banks_i: std::cell::Cell::new(BoundBank::EMPTY),
+            banks_f: std::cell::Cell::new(BoundBank::EMPTY),
         });
         let mut session = session.borrow_mut();
         session
@@ -46,6 +89,15 @@ impl FrameBoxReplacements {
             .box_replacement_frames
             .push(std::rc::Rc::downgrade(&pending));
         Self(pending)
+    }
+
+    /// Capture the owner's register banks so `replace_box` can write them
+    /// without waiting for `apply`. The slices must stay allocated for as
+    /// long as this owner is listening.
+    pub(super) fn bind_banks(&self, r: &mut [OpRef], i: &mut [OpRef], f: &mut [OpRef]) {
+        self.0.banks_r.set(BoundBank::from_slice(r));
+        self.0.banks_i.set(BoundBank::from_slice(i));
+        self.0.banks_f.set(BoundBank::from_slice(f));
     }
 
     pub(super) fn apply<Sym: WalkSym>(&self, ctx: &mut WalkContext<'_, '_, Sym>) {
@@ -96,10 +148,25 @@ fn replace_box_in_walk_frame<Sym: WalkSym>(
     }
 }
 
+fn replace_bound_banks(frame: &FrameBoxReplacementInbox, oldbox: OpRef, newbox: OpRef) {
+    for bank in [
+        frame.banks_r.get(),
+        frame.banks_i.get(),
+        frame.banks_f.get(),
+    ] {
+        if let Some(slots) = unsafe { bank.as_mut_slice() } {
+            replace_slots(slots, oldbox, newbox);
+        }
+    }
+}
+
 fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox: OpRef) {
     session.box_replacement_frames.retain(|frame| {
         if let Some(frame) = frame.upgrade() {
             if frame.listening.get() {
+                // `MIFrame.replace_active_box_in_frame`: write the bound
+                // banks now. Walker extras stay on `pending` for `apply`.
+                replace_bound_banks(&frame, oldbox, newbox);
                 frame.pending.borrow_mut().push((oldbox, newbox));
             }
             true
@@ -277,6 +344,20 @@ mod frame_replacement_tests {
         // Re-entering after the frames die does not retain their aliases.
         let _next = FrameBoxReplacements::new(&session);
         assert_eq!(session.borrow().box_replacement_frames.len(), 1);
+    }
+
+    #[test]
+    fn replace_box_rewrites_bound_paused_banks_immediately() {
+        let old = OpRef::input_arg_ref(0);
+        let standard = OpRef::input_arg_ref(1);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let parent = FrameBoxReplacements::new(&session);
+        let mut regs = vec![old];
+        let mut ints = Vec::new();
+        let mut floats = Vec::new();
+        parent.bind_banks(&mut regs, &mut ints, &mut floats);
+        replace_box_in_paused_frames(&mut session.borrow_mut(), old, standard);
+        assert_eq!(regs, vec![standard]);
     }
 }
 

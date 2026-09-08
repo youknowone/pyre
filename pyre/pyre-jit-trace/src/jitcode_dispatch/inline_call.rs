@@ -6974,6 +6974,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         None
     };
     let caller_replacements = FrameBoxReplacements::new(ctx.session);
+    caller_replacements.bind_banks(ctx.registers_r, ctx.registers_i, ctx.registers_f);
     let (callee_outcome, callee_class_of_last_exc_is_const) = {
         let mut sub_wc = WalkContext {
             callee_shadow: Some(super::CalleeLocalsShadow {
@@ -12104,7 +12105,7 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         exchange.next_frame_id += 1;
         id
     };
-    let frame = SubWalkFrame {
+    let mut frame = SubWalkFrame {
         box_replacements: FrameBoxReplacements::new(ctx.session),
         id: frame_id,
         caller_pc: pc,
@@ -12148,6 +12149,11 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
+    frame.box_replacements.bind_banks(
+        &mut frame.registers_r,
+        &mut frame.registers_i,
+        &mut frame.registers_f,
+    );
 
     if !driver_pointer.is_null() {
         // Nested descent: publish the heap frame and yield the parent at its
@@ -12163,6 +12169,7 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
     let mut driver = SubWalkDriver::new(frame);
     let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
     let caller_replacements = FrameBoxReplacements::new(ctx.session);
+    caller_replacements.bind_banks(ctx.registers_r, ctx.registers_i, ctx.registers_f);
     let result = driver.drive(ctx.trace_ctx);
     caller_replacements.apply(ctx);
     drop(caller_replacements);
