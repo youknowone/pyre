@@ -807,6 +807,49 @@ pub(crate) fn fbw_arm_durable_frame_undo(frame: usize) {
     fbw_note_locals_mirror_undo(frame, whole_array);
 }
 
+/// Put one resumed generator frame back without taking the parent walk's
+/// undo notes.  The three `*_rollback` helpers `take()` the whole TLS list,
+/// which would also revert the caller's `last_instr` / locals while the
+/// `FOR_ITER` walk is still running.
+pub(crate) fn fbw_durable_frame_rollback_one(frame: usize) {
+    if frame == 0 {
+        return;
+    }
+    let frame = live_frame_addr(frame);
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| {
+        let mut undo = c.borrow_mut();
+        if let Some(i) = undo.iter().position(|(f, _)| *f == frame) {
+            let (_, before) = undo.remove(i);
+            unsafe {
+                *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) = before;
+            }
+        }
+    });
+    FBW_FRAME_VSD_UNDO.with(|c| {
+        let mut undo = c.borrow_mut();
+        if let Some(i) = undo.iter().position(|(f, _)| *f == frame) {
+            let (_, before) = undo.remove(i);
+            crate::state::set_concrete_stack_depth(frame, before);
+        }
+    });
+    FBW_LOCALS_MIRROR_UNDO.with(|c| {
+        let mut undo = c.borrow_mut();
+        if let Some(i) = undo.iter().position(|entry| entry.frame == frame) {
+            let entry = undo.remove(i);
+            unsafe {
+                let pf = &mut *(frame as *mut pyre_interpreter::PyFrame);
+                let arr_ptr = pf.locals_cells_stack_w;
+                let dst = pyre_interpreter::locals_w_mut!(pf);
+                let n = entry.slots.len().min(dst.as_slice().len());
+                for (j, &value) in entry.slots.iter().take(n).enumerate() {
+                    dst[j] = value;
+                }
+                crate::state::frame_array_write_barrier(frame as *mut u8, arr_ptr);
+            }
+        }
+    });
+}
+
 /// GC: a pre-fold image can be the ONLY reference to a value the mirror
 /// displaced, so the root area forwards them (see
 /// [`capture_fbw_store_journal_root_area`]).

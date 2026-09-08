@@ -11070,6 +11070,7 @@ fn walk_generator_resume<Sym: WalkSym>(
                     op.pc, resume_marker, yield_marker,
                 );
             }
+            fbw_durable_frame_rollback_one(gen_frame as usize);
             if fbw_executed_effect_count() != executed_effects_before {
                 return Err(error);
             }
@@ -11085,6 +11086,7 @@ fn walk_generator_resume<Sym: WalkSym>(
                 op.pc, resume_marker, yield_marker,
             );
         }
+        fbw_durable_frame_rollback_one(gen_frame as usize);
         if fbw_executed_effect_count() != executed_effects_before {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
@@ -11093,6 +11095,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         return Ok(None);
     };
     let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
+        fbw_durable_frame_rollback_one(gen_frame as usize);
         if fbw_executed_effect_count() != executed_effects_before {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
