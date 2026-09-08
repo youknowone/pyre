@@ -33,12 +33,12 @@ pub struct W_SRE_Pattern {
 /// Every `W_SRE_Pattern` ever allocated.  PyPy's compiled patterns are normal
 /// interpreter objects, shared by all threads; the root owner must therefore
 /// be process-global too.  The addresses are stored as `usize` because the
-/// immortal raw pointer itself is not `Send`.
+/// raw pointer itself is not `Send`.
 ///
-/// Patterns are `malloc_typed` (immortal, off-GC), so the collector never
-/// traces into them: their GC-heap `w_pattern` / `w_groupindex` /
-/// `w_indexgroup` slots would otherwise be reclaimed or relocated without
-/// updating the slot.
+/// Allocation is `malloc_typed_stable` (old-gen, non-moving). The stable
+/// hook can still fall back to movable `malloc_typed`, so the side table
+/// must itself be a root: a minor that moves a nursery-born pattern has
+/// to rewrite the stored address before the field walk.
 static SRE_PATTERNS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
     std::sync::OnceLock::new();
 
@@ -46,15 +46,19 @@ fn sre_patterns() -> &'static parking_lot::Mutex<Vec<usize>> {
     SRE_PATTERNS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
-/// Visit each immortal pattern's GC-heap `PyObjectRef` slots as roots.
+/// Visit each pattern object, then its GC-heap `PyObjectRef` slots.
 #[majit_macros::dont_look_inside]
 pub fn walk_sre_pattern_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let patterns = sre_patterns().lock();
-    for &addr in patterns.iter() {
-        if addr == 0 {
+    let mut patterns = sre_patterns().lock();
+    for addr in patterns.iter_mut() {
+        if *addr == 0 {
             continue;
         }
-        let pattern = addr as *mut W_SRE_Pattern;
+        visitor(unsafe { &mut *std::ptr::from_mut(addr).cast::<PyObjectRef>() });
+        if *addr == 0 {
+            continue;
+        }
+        let pattern = *addr as *mut W_SRE_Pattern;
         visitor(unsafe { &mut (*pattern).w_pattern });
         visitor(unsafe { &mut (*pattern).w_groupindex });
         visitor(unsafe { &mut (*pattern).w_indexgroup });
