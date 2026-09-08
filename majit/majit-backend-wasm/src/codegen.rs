@@ -3643,6 +3643,12 @@ fn aligned_varsize_frame_bump(size: i64) -> Option<u32> {
     Some(size.saturating_add(7) & !7)
 }
 
+/// Headerless nursery bumps write `nursery_free` themselves. An unaligned
+/// size would leave the next headered object off `GcHeader::ALIGN`.
+fn aligned_headerless_bump(size: i64) -> Option<u32> {
+    aligned_varsize_frame_bump(size)
+}
+
 const BUILTIN_STRING_HASH_OFFSET: usize = 0;
 const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
 const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
@@ -7956,7 +7962,7 @@ fn build_function(
             OpCode::CallMallocNurseryHeaderless => {
                 let vi = op.pos.get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
-                let bump_size = size_const.and_then(|size| u32::try_from(size).ok());
+                let bump_size = size_const.and_then(aligned_headerless_bump);
                 let Some(base) = residual_type_base else {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: CallMallocNurseryHeaderless needs a residual alloc helper"
@@ -8467,6 +8473,14 @@ fn build_function(
                     sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
                 }
                 sink.i32_wrap_i64();
+                sink.local_tee(ca_cfp_local);
+                emit_memory_error_if_i32_zero(
+                    &mut sink,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
+                sink.local_get(ca_cfp_local);
                 sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
                 sink.i32_add();
                 sink.local_set(ca_cfp_local);
@@ -11254,6 +11268,25 @@ fn emit_memory_error_check(
 ) {
     emit_resolve(sink, constants, value_types, value);
     sink.i64_eqz();
+    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+}
+
+fn emit_memory_error_if_i32_zero(
+    sink: &mut PeepSink<'_, '_>,
+    residual_type_base: Option<u32>,
+    ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
+) {
+    sink.i32_eqz();
+    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+}
+
+fn emit_memory_error_on_truthy(
+    sink: &mut PeepSink<'_, '_>,
+    residual_type_base: Option<u32>,
+    ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
+) {
     sink.if_(BlockType::Empty);
     if crate::failguard::exit_frame_with_exception_attached() {
         emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);

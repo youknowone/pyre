@@ -1737,6 +1737,7 @@ pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
 /// no GC header, matching cranelift's `gc_alloc_nursery_headerless_shim`.
 pub extern "C" fn wasm_jit_alloc_headerless(size: i64) -> i64 {
     let size = usize::try_from(size).unwrap_or(0);
+    let size = size.saturating_add(7) & !7;
     let obj = with_wasm_active_gc_mut(|gc| {
         if let Some(base) = try_headerless_nursery_bump(gc, size) {
             return base as i64;
@@ -1964,7 +1965,7 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
         with_wasm_active_gc_mut(|gc| gc.alloc_nursery_typed(wasm_jitframe_tid(), alloc_size))
             .unwrap_or(GcRef(0));
     if jf_ref.0 == 0 {
-        return 0;
+        return oom_signal_if_zero(0);
     }
     let jf = jf_ref.0 as *mut JitFrame;
     unsafe {
@@ -1996,6 +1997,9 @@ pub extern "C" fn wasm_jit_ca_pop_frame(_items_base: i64) -> i64 {
     // generated caller last refreshed its callee local. The shadow-stack root
     // is forwarded by that collection; the argument may still name old space.
     let jf = majit_gc::shadow_stack::jf_top_ptr().0 as *mut majit_backend::jitframe::JitFrame;
+    if jf.is_null() {
+        return 0;
+    }
     install_post_finish_force_gcmap(jf);
     wasm_jit_write_barrier(jf as i64);
     majit_gc::shadow_stack::pop_jf_top();

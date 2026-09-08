@@ -7736,6 +7736,20 @@ fn call_malloc_nursery_variants_lower() {
     assert_eq!(nursery_top_compare_count(&bytes), 1);
     assert!(const_immediates(&bytes).contains(&0x55));
 
+    let headerless_odd = make_op(
+        OpCode::CallMallocNurseryHeaderless,
+        &[OpRef::const_int(20)],
+        OpRef::ref_op(1),
+    );
+    let inputs = nursery_new_inputs(vec![headerless_odd, finish_int_arg0()], 53);
+    let (bytes, _, _) =
+        codegen::build_wasm_module(&inputs).expect("unaligned headerless should lower");
+    validate_wasm(&bytes);
+    assert!(
+        const_immediates(&bytes).contains(&24),
+        "headerless bump must 8-align so the next header is aligned"
+    );
+
     let frame = make_op(
         OpCode::CallMallocNurseryVarsizeFrame,
         &[OpRef::const_int(64)],
