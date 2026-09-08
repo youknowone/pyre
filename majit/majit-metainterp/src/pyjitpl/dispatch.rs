@@ -9912,6 +9912,33 @@ where
                 // ── 5. bind the list header to the destination ref register. ──
                 self.set_ref_reg(dest, Some(sbox_op), Some(struct_ptr));
             }
+            // pyjitpl.py `_opimpl_isconstant` / `opimpl_ref_isconstant`:
+            // `return ConstInt(isinstance(box, Const))`.  No IR op.
+            // Byte layout `[src][dst]` per `bhhandler_r_i!`.
+            jitcode::insns::BC_REF_ISCONSTANT => {
+                let (src, dest) = {
+                    let frame = self.frames.current_mut();
+                    let src = frame.next_reg() as usize;
+                    let dest = frame.next_reg() as usize;
+                    (src, dest)
+                };
+                let (opref, _) = self.read_ref_reg(src);
+                let value = opref.is_constant() as i64;
+                self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
+            }
+            // pyjitpl.py `_opimpl_isvirtual` / `opimpl_ref_isvirtual`:
+            // `return ConstInt(heapcache.is_likely_virtual(box))`.  No IR op.
+            jitcode::insns::BC_REF_ISVIRTUAL => {
+                let (src, dest) = {
+                    let frame = self.frames.current_mut();
+                    let src = frame.next_reg() as usize;
+                    let dest = frame.next_reg() as usize;
+                    (src, dest)
+                };
+                let (opref, _) = self.read_ref_reg(src);
+                let value = ctx.is_likely_virtual(opref) as i64;
+                self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
+            }
             other => panic!("unknown jitcode bytecode {other}"),
         }
 

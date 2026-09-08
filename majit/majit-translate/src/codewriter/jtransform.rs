@@ -4313,12 +4313,14 @@ impl<'a> Transformer<'a> {
         // `jtransform.py rewrite_op_cast_opaque_ptr` returns None (alias
         // args[0]).  The same identity applies to the Rust spelling of
         // that op: `cast_int_to_ptr(cast_ptr_to_int(p))`.
+        // Match the `lltype.cast_*` host path `cast_call_segments` emits,
+        // not a bare leaf — a user function named `cast_int_to_ptr` is
+        // an ordinary call (`pointer_cast_function_names_do_not_alias`).
         if let CallTarget::FunctionPath { segments } = target {
-            let leaf = segments.last().map(String::as_str);
-            if leaf == Some("cast_opaque_ptr") && args.len() == 1 {
+            if is_lltype_cast_path(segments, "cast_opaque_ptr") && args.len() == 1 {
                 return RewriteResult::Identity(args[0].clone());
             }
-            if leaf == Some("cast_ptr_to_int") && args.len() == 1 {
+            if is_lltype_cast_path(segments, "cast_ptr_to_int") && args.len() == 1 {
                 if let Some(res) = op.result.clone() {
                     let src = resolve_alias(&args[0], &self.aliases);
                     self.cast_ptr_to_int_src.insert(res, src);
@@ -4327,7 +4329,7 @@ impl<'a> Transformer<'a> {
                 // fall through so the existing Call residual path still
                 // emits it.
             }
-            if leaf == Some("cast_int_to_ptr") && args.len() == 1 {
+            if is_lltype_cast_path(segments, "cast_int_to_ptr") && args.len() == 1 {
                 let arg = resolve_alias(&args[0], &self.aliases);
                 if let Some(src) = self.cast_ptr_to_int_src.get(&arg).cloned() {
                     return RewriteResult::Identity(src);
@@ -8826,6 +8828,17 @@ fn remap_op(
         result: op.result.clone(),
         kind,
     }
+}
+
+/// `rpython.rtyper.lltypesystem.lltype.cast_*` — the host-callable path
+/// `front::mir::cast_call_segments` emits for a bank-crossing cast.
+fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
+    segments.len() == 5
+        && segments[0] == "rpython"
+        && segments[1] == "rtyper"
+        && segments[2] == "lltypesystem"
+        && segments[3] == "lltype"
+        && segments[4] == name
 }
 
 /// Rewrite `we_are_jitted()` calls to the `_we_are_jitted` symbolic
