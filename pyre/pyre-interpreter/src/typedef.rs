@@ -11894,7 +11894,7 @@ fn patch_getset_descriptor_metadata() {
                                 "<generic property>".to_string()
                             };
                             let combined =
-                                pyre_object::w_str_new(&format!("{type_qualname}.{name}"));
+                                pyre_object::w_str_new_managed(&format!("{type_qualname}.{name}"));
                             pyre_object::typedef::w_getset_set_qualname(descr, combined);
                             Ok(combined)
                         }
@@ -24796,7 +24796,7 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             for &byte in data {
                 out.push_str(&format!("{byte:02x}"));
             }
-            return Ok(pyre_object::w_str_new(&out));
+            return Ok(pyre_object::w_str_new_managed(&out));
         };
 
         // `pypy/objspace/std/bytearrayobject.py:645-687 _binascii_hexstr`
@@ -24846,7 +24846,7 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             }
             out.push_str(&format!("{byte:02x}"));
         }
-        Ok(pyre_object::w_str_new(&out))
+        Ok(pyre_object::w_str_new_managed(&out))
     })();
     receiver.release();
     result
@@ -25697,7 +25697,7 @@ fn bytes_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         }
     }
     out.push(quote);
-    Ok(pyre_object::w_str_new(&out))
+    Ok(pyre_object::w_str_new_managed(&out))
 }
 
 fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

@@ -155,7 +155,7 @@ mod imp {
                 // The type keeps `object.__repr__`, so `repr` and `str` of a
                 // handle read differently.
                 let raw = get_handle(self_obj) as usize;
-                w_str_new(&format!(
+                w_str_new_managed(&format!(
                     "<PyHKEY:0x{raw:0width$X}>",
                     width = core::mem::size_of::<usize>() * 2
                 ))

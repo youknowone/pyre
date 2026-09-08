@@ -530,7 +530,7 @@ pub(crate) fn show_warning(
             if !visible.is_empty() {
                 crate::call::call_function_impl_result(
                     pyre_object::gc_roots::shadow_stack_get(write_slot),
-                    &[w_str_new(&format!("  {visible}\n"))],
+                    &[w_str_new_managed(&format!("  {visible}\n"))],
                 )?;
             }
         }

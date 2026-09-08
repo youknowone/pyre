@@ -1318,7 +1318,7 @@ impl PyError {
                 arg_slots.push(slot);
             };
             push(pyre_object::w_int_new(errno as i64));
-            push(pyre_object::w_str_new(&strerror));
+            push(pyre_object::w_str_new_managed(&strerror));
             if let Some(code) = winerror.filter(|_| filename_slot.is_none()) {
                 push(pyre_object::w_none());
                 push(pyre_object::w_int_new(code as i64));
@@ -1338,7 +1338,7 @@ impl PyError {
             // rather than the one that existed before it.
             let w_errno = pyre_object::w_int_new(errno as i64);
             pyre_object::interp_exceptions::w_exception_set_errno(exc(), w_errno);
-            let w_strerror = pyre_object::w_str_new(&strerror);
+            let w_strerror = pyre_object::w_str_new_managed(&strerror);
             pyre_object::interp_exceptions::w_exception_set_strerror(exc(), w_strerror);
             #[cfg(windows)]
             if let Some(code) = winerror {
@@ -1402,7 +1402,7 @@ impl PyError {
         let errno_slot = exc_slot + 1;
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(errno as i64));
         let strerror_slot = errno_slot + 1;
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&strerror));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&strerror));
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::gc_roots::shadow_stack_get(errno_slot),
             pyre_object::gc_roots::shadow_stack_get(strerror_slot),
@@ -4735,7 +4735,7 @@ pub fn exception_from_errno(
     let w_type = _roots.pin_root(w_type);
     let w_errno = pyre_object::w_int_new(errno as i64);
     let w_errno = _roots.pin_root(w_errno);
-    let w_msg = pyre_object::w_str_new(&msg);
+    let w_msg = pyre_object::w_str_new_managed(&msg);
     let w_msg = _roots.pin_root(w_msg);
     let (w_type, w_errno, w_msg) = (_roots.get(base), _roots.get(base + 1), _roots.get(base + 2));
     operation_error_from_instance(
@@ -4921,7 +4921,7 @@ pub fn wrap_oserror2(
     let base = _roots.base();
     let _ = _roots.pin_root(w_exc);
     let _ = _roots.pin_root(pyre_object::w_int_new(errno as i64));
-    let _ = _roots.pin_root(pyre_object::w_str_new(&msg));
+    let _ = _roots.pin_root(pyre_object::w_str_new_managed(&msg));
     let _ = _roots.pin_root(w_filename.unwrap_or_else(pyre_object::w_none));
     let _ = _roots.pin_root(w_filename2.unwrap_or_else(pyre_object::w_none));
     // The five the constructor takes, in `_wrap_oserror2_impl`'s order.  A

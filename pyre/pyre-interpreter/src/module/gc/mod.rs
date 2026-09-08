@@ -1105,7 +1105,7 @@ fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     } else {
         String::new()
     };
-    Ok(w_str_new(&format!(
+    Ok(w_str_new_managed(&format!(
         concat!(
             "Total memory consumed:\n",
             "    GC used:                 {total_gc_memory} (peak: {peak_memory})\n",

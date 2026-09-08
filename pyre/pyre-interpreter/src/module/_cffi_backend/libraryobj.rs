@@ -197,7 +197,7 @@ fn variable_address(lib: &W_Library, name: &str) -> Result<*const u8, PyError> {
 /// `W_Library.repr`.
 fn library_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let lib = library_arg(args[0])?;
-    Ok(pyre_object::w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<clibrary '{}'>",
         lib.name()
     )))

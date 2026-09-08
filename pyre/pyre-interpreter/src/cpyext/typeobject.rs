@@ -2847,7 +2847,7 @@ fn defining_class(
 fn descr_repr(args: &[PyObjectRef], kind: &str) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
     let owner = owner_name(carrier);
-    Ok(pyre_object::w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<{kind} '{}' of '{owner}' objects>",
         descriptor_name(carrier)
     )))

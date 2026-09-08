@@ -11087,16 +11087,16 @@ pub(crate) fn py_ascii_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyErr
     let out = ascii_escape_wtf8(r_wtf8);
     let changed = r_wtf8.as_str().map(|s| s != out).unwrap_or(true);
     if unsafe { is_exact_type(r, &STR_TYPE) } || changed {
-        return Ok(w_str_new(&out));
+        return Ok(w_str_new_managed(&out));
     }
     let Some(tp) = (unsafe { crate::typedef::r#type(r) }) else {
-        return Ok(w_str_new(&out));
+        return Ok(w_str_new_managed(&out));
     };
     let Some(new_fn) = (unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__new__") })
     else {
-        return Ok(w_str_new(&out));
+        return Ok(w_str_new_managed(&out));
     };
-    crate::builtins::call_and_check(new_fn, &[tp.as_ptr(), w_str_new(&out)])
+    crate::builtins::call_and_check(new_fn, &[tp.as_ptr(), w_str_new_managed(&out)])
 }
 
 /// `bltinmodule.c:builtin_ascii` — like `repr`, but escape every
@@ -22919,7 +22919,7 @@ fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         )));
     }
     let s = format_index_radix(args[0], 16, "0x")?;
-    Ok(w_str_new(&s))
+    Ok(w_str_new_managed(&s))
 }
 
 /// `oct(x)` — PyPy: operation.py oct
@@ -22937,7 +22937,7 @@ fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         )));
     }
     let s = format_index_radix(args[0], 8, "0o")?;
-    Ok(w_str_new(&s))
+    Ok(w_str_new_managed(&s))
 }
 
 /// `bin(x)` — PyPy: operation.py bin
@@ -22955,7 +22955,7 @@ fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         )));
     }
     let s = format_index_radix(args[0], 2, "0b")?;
-    Ok(w_str_new(&s))
+    Ok(w_str_new_managed(&s))
 }
 
 /// Parse a complex literal string into `(real, imag)`, delegated to
