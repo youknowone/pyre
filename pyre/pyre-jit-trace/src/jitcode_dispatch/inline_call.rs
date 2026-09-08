@@ -10759,6 +10759,23 @@ fn gen_resume_decline(reason: &str) {
     }
 }
 
+/// Whether this tracer can look inside `execute_frame` the way
+/// `_opimpl_recursive_call` does.
+///
+/// `can_inline_callable` (`warmstate.py`) is true only when `perform_call`
+/// (`pyjitpl.py`) can `newframe` and `capture_resumedata` the resulting
+/// MIFrame, and the walk's yield is `dispatch`'s `except Yield` `popvalue()`.
+/// A `newframe` without that `popvalue` compiled `FOR_ITER` to hand the
+/// iterator back as the item (`int + generator` on
+/// `generator_iteration__main`).  Until the TOS is that `popvalue`, this
+/// is false: residual `do_residual_call`, and do not install a
+/// portal-shaped body whose yield `abort_permanent` aborts a later
+/// independent trace.
+#[inline(never)]
+fn generator_resume_can_perform_call<Sym: WalkSym>(_ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    false
+}
+
 /// Resume a suspended generator into the trace at a `FOR_ITER`, in place of
 /// the opaque `jit_next` residual.
 ///
@@ -10770,14 +10787,11 @@ fn gen_resume_decline(reason: &str) {
 /// `CO_GENERATOR`.  The walk ends at `YIELD_VALUE`, where `dispatch`'s
 /// `except Yield` arm forces the virtualizable and returns the value.
 ///
-/// Pyre records from a portal-shaped per-CodeObject jitcode, not from the
-/// shared `eval_loop_jit` portal.  The resume therefore walks that already
-/// installed body from `resume_execute_frame` (`last_instr + 1`, send `None`
-/// on the stack) with the existing generator `PyFrame` as a *nonstandard*
-/// virtualizable — the caller's frame stays the standard one — and turns the
-/// body's `yield` marker into `SubReturn`.  It does not call
-/// `sub_jitcode_body_for_code`, which would build a payload a default run
-/// must not install.
+/// That look-inside is `_opimpl_recursive_call` → `perform_call` →
+/// `newframe` (`pyjitpl.py`) and ends at `except Yield` `popvalue()`.
+/// Until `generator_resume_can_perform_call` is true, the residual
+/// `jit_next` stays in place — `do_residual_call`, not a start-then-abort
+/// of the parent `FOR_ITER` loop and not a miscompiled item.
 pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -10886,6 +10900,19 @@ fn walk_generator_resume<Sym: WalkSym>(
     }
     if !generator_table_is_only_the_stopiteration_wrapper(code) {
         gen_resume_decline("real_exception_table");
+        return Ok(None);
+    }
+    // `_opimpl_recursive_call` (`pyjitpl.py`): `can_inline_callable` then
+    // `perform_call` → `newframe` → `framestack.append`, and the walk
+    // ends at `dispatch`'s `except Yield` `popvalue()`.  `newframe`
+    // without that `popvalue` compiled the iterator as the `FOR_ITER`
+    // item.  `sub_jitcode_body_for_code` also *installs* a portal-shaped
+    // body; doing that without a successful `perform_call` lets the
+    // generator's own `while` start traces that die on the yield
+    // `abort_permanent` (SNAPDIFF `loops_aborted` 1→11).  Residual like
+    // `do_residual_call`, and do not install.
+    if !generator_resume_can_perform_call(ctx) {
+        gen_resume_decline("cannot_capture_resumedata");
         return Ok(None);
     }
     let w_pycode = shape.w_pycode as *const ();
