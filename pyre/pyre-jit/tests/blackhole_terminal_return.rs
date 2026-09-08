@@ -90,6 +90,7 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
                     Some(&[Type::Ref]),
                     0,
                     false,
+                    Some(frame_ptr as i64),
                     None,
                     None,
                 );
