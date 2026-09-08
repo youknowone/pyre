@@ -2190,6 +2190,8 @@ impl Trace {
         all_liveness: &[u8],
         after_residual_call: bool,
         is_last: bool,
+        unique_to_box: Option<&[u32]>,
+        patch_guard_descr: bool,
     ) -> i64 {
         self._total_snapshots += 1;
         // opencoder.py:769 frame.get_list_of_active_boxes(False, ...).
@@ -2202,6 +2204,7 @@ impl Trace {
             op_live,
             all_liveness,
             after_residual_call,
+            unique_to_box,
         );
         // opencoder.py:771-780 — write vable / vref arrays, then the
         // snapshot record. `s` captures the snapshot_data offset
@@ -2215,7 +2218,11 @@ impl Trace {
         let jitcode_index = frame.jitcode.try_index().map(|i| i as i64).unwrap_or(-1);
         let pc = frame.pc as i64;
         self._encode_snapshot(jitcode_index, pc, array, is_last);
-        self.patch_last_guard_descr_slot(s);
+        // Live pyre keeps the sequential resume id on FrontendSlot
+        // and must not grow the guard's 2-byte 0-placeholder.
+        if patch_guard_descr {
+            self.patch_last_guard_descr_slot(s);
+        }
         s
     }
 
@@ -2241,6 +2248,7 @@ impl Trace {
         op_live: u8,
         all_liveness: &[u8],
         is_last: bool,
+        unique_to_box: Option<&[u32]>,
     ) -> i64 {
         self._total_snapshots += 1;
         let array = frame.get_list_of_active_boxes(
@@ -2250,6 +2258,7 @@ impl Trace {
             op_live,
             all_liveness,
             /* after_residual_call */ false,
+            unique_to_box,
         );
         self.snapshot_add_prev(SNAPSHOT_PREV_COMES_NEXT);
         let jitcode_index = frame.jitcode.try_index().map(|i| i as i64).unwrap_or(-1);
@@ -2279,6 +2288,35 @@ impl Trace {
         all_liveness: &[u8],
         after_residual_call: bool,
     ) -> i64 {
+        self.capture_resumedata_mapped(
+            framestack,
+            virtualizable_boxes,
+            virtualref_boxes,
+            clear_result_register,
+            op_live,
+            all_liveness,
+            after_residual_call,
+            None,
+            true,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
+    pub(crate) fn capture_resumedata_mapped(
+        &mut self,
+        framestack: &mut [crate::pyjitpl::MIFrame],
+        virtualizable_boxes: &[Box],
+        virtualref_boxes: &[Box],
+        clear_result_register: bool,
+        op_live: u8,
+        all_liveness: &[u8],
+        after_residual_call: bool,
+        unique_to_box: Option<&[u32]>,
+        patch_guard_descr: bool,
+    ) -> i64 {
         // opencoder.py `n = len(framestack) - 1`.
         let framestack_len = framestack.len();
         if framestack_len >= 1 {
@@ -2297,6 +2335,8 @@ impl Trace {
                     all_liveness,
                     after_residual_call,
                     /* is_last */ n == 0,
+                    unique_to_box,
+                    patch_guard_descr,
                 )
             };
             // opencoder.py self._ensure_parent_resumedata(framestack, n).
@@ -2308,13 +2348,18 @@ impl Trace {
                 clear_result_register,
                 op_live,
                 all_liveness,
+                unique_to_box,
             );
             result
         } else {
             // opencoder.py:829-831 — empty framestack → empty top
             // snapshot.
             let _ = clear_result_register;
-            self.create_empty_top_snapshot_from_boxes(virtualizable_boxes, virtualref_boxes)
+            self.create_empty_top_snapshot_from_boxes(
+                virtualizable_boxes,
+                virtualref_boxes,
+                patch_guard_descr,
+            )
         }
     }
 
@@ -2335,6 +2380,7 @@ impl Trace {
         clear_result_register: bool,
         op_live: u8,
         all_liveness: &[u8],
+        unique_to_box: Option<&[u32]>,
     ) {
         let mut n = n;
         while n > 0 {
@@ -2354,6 +2400,7 @@ impl Trace {
                     op_live,
                     all_liveness,
                     is_last,
+                    unique_to_box,
                 )
             };
             // opencoder.py `target.parent_snapshot = s`.
@@ -2396,6 +2443,7 @@ impl Trace {
         &mut self,
         vable_boxes: &[Box],
         vref_boxes: &[Box],
+        patch_guard_descr: bool,
     ) -> i64 {
         self._total_snapshots += 1;
         let s = self._snapshot_data.len() as i64;
@@ -2405,7 +2453,9 @@ impl Trace {
         self.append_snapshot_data_int(vable_array);
         self.append_snapshot_data_int(vref_array);
         self._encode_snapshot(-1, 0, empty_array, true);
-        self.patch_last_guard_descr_slot(s);
+        if patch_guard_descr {
+            self.patch_last_guard_descr_slot(s);
+        }
         s
     }
 

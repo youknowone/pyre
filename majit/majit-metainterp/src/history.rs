@@ -2736,10 +2736,38 @@ impl TraceCtx {
     /// frame state. Returns a snapshot_id for use as rd_resume_position.
     pub fn capture_resumedata(&mut self, snapshot: crate::recorder::Snapshot) -> i32 {
         if self.recorder.has_byte_buffer() {
-            return self.recorder.encode_captured_snapshot(&snapshot);
+            let id = self.recorder.encode_captured_snapshot(&snapshot);
+            // A later `snapshots()` / `take_snapshots` must see this
+            // capture. RPython has no cache: it always reads
+            // `_snapshot_data`. Drop any earlier decode.
+            self.snapshots.clear();
+            return id;
         }
         let id = self.snapshots.len() as i32;
         self.snapshots.push(snapshot);
+        id
+    }
+
+    /// opencoder.py `history.trace.capture_resumedata(framestack, ...)`.
+    pub fn capture_resumedata_from_framestack(
+        &mut self,
+        framestack: &mut [crate::pyjitpl::MIFrame],
+        after_residual_call: bool,
+    ) -> i32 {
+        let op_live = self.metainterp_sd.op_live as u8;
+        let recorder = &mut self.recorder;
+        let vable = self.virtualizable_boxes.as_deref().unwrap_or(&[]);
+        let vref = self.virtualref_boxes.as_slice();
+        let liveness = self.metainterp_sd.liveness_info.as_slice();
+        let id = recorder.capture_resumedata_from_framestack(
+            framestack,
+            vable,
+            vref,
+            after_residual_call,
+            op_live,
+            liveness,
+        );
+        self.snapshots.clear();
         id
     }
 

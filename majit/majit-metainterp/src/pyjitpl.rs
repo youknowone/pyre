@@ -4791,7 +4791,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:269: cross-loop cut uses the inner loop's merge point.
         // Lookup by inner_key (not ctx.green_key which is the outer loop).
         ctx.get_merge_point_at(inner_key, ctx.header_pc)
-            .filter(|mp| mp.position._pos > 0)
+            .filter(|mp| mp.position.has_prefix_ops(ctx.num_inputargs()))
             .map(|mp| (mp.header_pc, mp.green_boxes.clone()))
     }
 
@@ -9145,9 +9145,9 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 return false;
             };
-            let retrace_merge_point = ctx
-                .get_merge_point_at(green_key, header_pc)
-                .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0);
+            let retrace_merge_point = ctx.get_merge_point_at(green_key, header_pc).filter(|mp| {
+                mp.position == retrace_pos && mp.position.has_prefix_ops(ctx.num_inputargs())
+            });
             // compile.py:347 `trace = metainterp.history.trace.cut_trace_from(
             // start, inputargs)` is UNCONDITIONAL. `start` is read once, at the
             // caller's single merge-point selection (pyjitpl.py:3019), and

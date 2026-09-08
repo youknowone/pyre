@@ -1835,13 +1835,29 @@ where
         let n = sym
             .int_identity_slots_end()
             .min(self.frames.frames[0].int_regs.len());
-        let saved_int_regs: Vec<Option<OpRef>> = self.frames.frames[0].int_regs[..n].to_vec();
-        let saved_int_values: Vec<Option<i64>> = self.frames.frames[0].int_values[..n].to_vec();
+        let saved_int_regs: smallvec::SmallVec<[Option<OpRef>; 8]> = self.frames.frames[0].int_regs
+            [..n]
+            .iter()
+            .copied()
+            .collect();
+        let saved_int_values: smallvec::SmallVec<[Option<i64>; 8]> = self.frames.frames[0]
+            .int_values[..n]
+            .iter()
+            .copied()
+            .collect();
         let rn = sym
             .ref_identity_slots_end()
             .min(self.frames.frames[0].ref_regs.len());
-        let saved_ref_regs: Vec<Option<OpRef>> = self.frames.frames[0].ref_regs[..rn].to_vec();
-        let saved_ref_values: Vec<Option<i64>> = self.frames.frames[0].ref_values[..rn].to_vec();
+        let saved_ref_regs: smallvec::SmallVec<[Option<OpRef>; 8]> = self.frames.frames[0].ref_regs
+            [..rn]
+            .iter()
+            .copied()
+            .collect();
+        let saved_ref_values: smallvec::SmallVec<[Option<i64>; 8]> = self.frames.frames[0]
+            .ref_values[..rn]
+            .iter()
+            .copied()
+            .collect();
         let root_inflight_int_result =
             if self.frames.frames.len() > 1 && self.frames.frames[0]._result_argcode == b'i' {
                 self.frames.frames[0].result_arg_index.or_else(|| {
@@ -1865,16 +1881,9 @@ where
                 None
             };
         sym.populate_frame_int_regs(&mut self.frames.frames[0]);
-        let op_live = ctx.metainterp_sd().op_live as u8;
-        let all_liveness = ctx.metainterp_sd().liveness_info.clone();
-        // `pyjitpl.py:2610` `_snapshot_box_list` — clone the per-trace
-        // virtualizable / virtualref boxes so the snapshot builder
-        // can read them without keeping a `&TraceCtx` borrow alive.
-        // Both vectors are short (one per live `@jit.virtualizable`,
-        // two per live vref).
-        let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
-        let virtualref_snapshot = ctx.virtualref_boxes.clone();
         if crate::callee_rca_enabled() {
+            let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
+            let virtualref_snapshot = ctx.virtualref_boxes.clone();
             let vable_payload: Vec<_> = virtualizable_snapshot
                 .iter()
                 .enumerate()
@@ -1898,18 +1907,30 @@ where
             );
             eprintln!("[callee-rca][record-guard-vable] {:?}", vable_payload);
         }
-        let snapshot = build_state_field_snapshot(
-            self.frames,
-            op_live,
-            &all_liveness,
-            after_residual_call,
-            &virtualizable_snapshot,
-            &virtualref_snapshot,
-            Some((
-                sym.int_identity_slots_base(),
-                sym.int_identity_reserved_end(),
-            )),
-        );
+        // opencoder.py capture_resumedata writes `_snapshot_data` from
+        // the framestack. The Vec<Snapshot> path stays for unit tests
+        // that never attach the byte buffer.
+        let snapshot_id = if ctx.recorder.has_byte_buffer() {
+            ctx.capture_resumedata_from_framestack(&mut self.frames.frames, after_residual_call)
+        } else {
+            let op_live = ctx.metainterp_sd().op_live as u8;
+            let all_liveness = ctx.metainterp_sd().liveness_info.clone();
+            let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
+            let virtualref_snapshot = ctx.virtualref_boxes.clone();
+            let snapshot = build_state_field_snapshot(
+                self.frames,
+                op_live,
+                &all_liveness,
+                after_residual_call,
+                &virtualizable_snapshot,
+                &virtualref_snapshot,
+                Some((
+                    sym.int_identity_slots_base(),
+                    sym.int_identity_reserved_end(),
+                )),
+            );
+            ctx.capture_resumedata(snapshot)
+        };
         for idx in 0..n {
             // RPython pyjitpl.py:180-193 leaves the parent frame's
             // in-flight int result slot cleared after get_list_of_active_boxes(True).
@@ -1933,7 +1954,6 @@ where
             }
         }
         self.frames.frames[top_idx].pc = saved_top_pc;
-        let snapshot_id = ctx.capture_resumedata(snapshot);
         match target {
             GuardStampTarget::LastOp => ctx.set_last_guard_resume_position(snapshot_id),
             GuardStampTarget::GuardFromEnd(from_end) => {
