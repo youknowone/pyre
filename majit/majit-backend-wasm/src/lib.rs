@@ -3361,6 +3361,8 @@ impl WasmBackend {
                 target.callee_frame_bytes,
                 target.dispatch_key_ofs as u32,
                 target.callee_gcmap_ptr,
+                target.home_slot_base,
+                target.home_slots,
             );
             publish_call_assembler_target(token.number, target);
         }
@@ -3573,6 +3575,8 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
                 registered.callee_frame_bytes,
                 registered.dispatch_key_ofs as u32,
                 registered.callee_gcmap_ptr,
+                registered.home_slot_base,
+                registered.home_slots,
             );
             publish_call_assembler_target(target_token, registered.clone());
         }
@@ -4438,6 +4442,8 @@ impl majit_backend::Backend for WasmBackend {
             compiled.frame.ca_frame_bytes,
             compiled.frame.dispatch_key_ofs as u32,
             callee_gcmap_ptr,
+            compiled.frame.home_slot_base as u32,
+            compiled.frame.home_slots as u32,
         );
         publish_call_assembler_target(
             token.number,
@@ -4449,6 +4455,8 @@ impl majit_backend::Backend for WasmBackend {
                 callee_frame_bytes: compiled.frame.ca_frame_bytes,
                 callee_gcmap_ptr,
                 compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
+                home_slot_base: compiled.frame.home_slot_base as u32,
+                home_slots: compiled.frame.home_slots as u32,
             },
         );
         if let Some(targets) = ca_targets.as_ref() {
@@ -5878,6 +5886,8 @@ impl majit_backend::Backend for WasmBackend {
                 new_target.callee_frame_bytes,
                 new_target.dispatch_key_ofs as u32,
                 new_target.callee_gcmap_ptr,
+                new_target.home_slot_base,
+                new_target.home_slots,
             );
             publish_call_assembler_target(new.number, new_target.clone());
         }
@@ -5918,6 +5928,8 @@ impl majit_backend::Backend for WasmBackend {
             new_target.callee_frame_bytes,
             new_target.dispatch_key_ofs as u32,
             new_target.callee_gcmap_ptr,
+            new_target.home_slot_base,
+            new_target.home_slots,
         );
         transfer_call_assembler_target_activity(&old_target, &new_target);
         new_target.token_number = old.number;
@@ -6114,8 +6126,8 @@ mod tests {
     fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let token_number = 9_900_000;
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
+        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0);
+        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table

@@ -419,6 +419,11 @@ pub struct CallAssemblerTarget {
     pub callee_frame_bytes: u32,
     pub callee_gcmap_ptr: i64,
     pub compiled_ptr: u64,
+    /// Callee Ref-home origin, in item-base bytes. Redirects may replace a
+    /// temporary callback with a differently laid-out loop, so this is
+    /// loaded with the other runtime snapshot fields.
+    pub home_slot_base: u32,
+    pub home_slots: u32,
 }
 
 /// Compiled loop targets keyed by their `JitCellToken` number. Unlike label
@@ -451,6 +456,8 @@ pub struct WasmCaRuntimeTarget {
     /// Current callee GC map.  It must change together with frame depth when
     /// `redirect_call_assembler` installs the real loop.
     pub callee_gcmap_ptr: i64,
+    pub home_slot_base: u32,
+    pub home_slots: u32,
 }
 
 /// Stable cell baked by callers.  A redirect publishes one pointer to an
@@ -476,6 +483,10 @@ pub const WASM_CA_TARGET_DISPATCH_KEY_OFS_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, dispatch_key_ofs) as u64;
 pub const WASM_CA_TARGET_GCMAP_PTR_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, callee_gcmap_ptr) as u64;
+pub const WASM_CA_TARGET_HOME_SLOT_BASE_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, home_slot_base) as u64;
+pub const WASM_CA_TARGET_HOME_SLOTS_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, home_slots) as u64;
 
 /// `make_and_attach_done_descrs` gives every cpu one `DoneWithThisFrame*` per
 /// result kind plus one `ExitFrameWithExceptionDescrRef`, and
@@ -638,6 +649,8 @@ pub fn ca_dispatch_publish(
     callee_frame_bytes: u32,
     dispatch_key_ofs: u32,
     callee_gcmap_ptr: i64,
+    home_slot_base: u32,
+    home_slots: u32,
 ) {
     let _ = ca_dispatch_slot(number);
     let table = WASM_CA_DISPATCH.lock();
@@ -652,6 +665,8 @@ pub fn ca_dispatch_publish(
             && current.callee_frame_bytes == callee_frame_bytes
             && current.dispatch_key_ofs == dispatch_key_ofs
             && current.callee_gcmap_ptr == callee_gcmap_ptr
+            && current.home_slot_base == home_slot_base
+            && current.home_slots == home_slots
     }) {
         return;
     }
@@ -661,6 +676,8 @@ pub fn ca_dispatch_publish(
         callee_frame_bytes,
         dispatch_key_ofs,
         callee_gcmap_ptr,
+        home_slot_base,
+        home_slots,
     });
     let target_ptr = (&*target as *const WasmCaRuntimeTarget as usize) as u32;
     targets.push(target);
@@ -675,6 +692,8 @@ pub fn ca_dispatch_redirect(
     callee_frame_bytes: u32,
     dispatch_key_ofs: u32,
     callee_gcmap_ptr: i64,
+    home_slot_base: u32,
+    home_slots: u32,
 ) {
     ca_dispatch_publish(
         old_number,
@@ -683,6 +702,8 @@ pub fn ca_dispatch_redirect(
         callee_frame_bytes,
         dispatch_key_ofs,
         callee_gcmap_ptr,
+        home_slot_base,
+        home_slots,
     );
 }
 
