@@ -133,10 +133,10 @@ pub type DescrRef = Arc<dyn Descr>;
 /// Rust's `Arc<dyn Descr>` is a fat pointer (data + vtable).  Codegen can
 /// only bake the data half, so reconstructing the fat Arc at recovery
 /// time needs a side-channel for the vtable.  `FailDescrCell` is a
-/// concrete-typed wrapper: `Box<FailDescrCell>` is a 16 B payload (the
-/// inner `DescrRef`) so `thin_ptr` bakes a complete identity and
+/// concrete-typed wrapper: the cell is the 16 B fat `DescrRef`, and
+/// [`FailDescrStore`] keeps many cells in one `Vec` so `thin_ptr` still
+/// bakes a complete identity without a 16 B `Box` per guard.
 /// [`recover_fail_descr_cell`] reads the descr back without a registry.
-/// An `Arc` header on the cell would put every guard in the 32-byte class.
 ///
 /// The cell is the unit kept alive by
 /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py`);
@@ -146,13 +146,55 @@ pub struct FailDescrCell {
 }
 
 impl FailDescrCell {
+    pub fn new(descr: DescrRef) -> Self {
+        Self { descr }
+    }
+
     pub fn wrap(descr: DescrRef) -> Box<Self> {
-        Box::new(Self { descr })
+        Box::new(Self::new(descr))
     }
 
     /// Address baked into `jf_descr` / `jf_force_descr`.
     pub fn thin_ptr(cell: &Self) -> usize {
         cell as *const Self as usize
+    }
+}
+
+/// Keep-alive for baked [`FailDescrCell`] addresses.
+///
+/// One `Vec` of inline 16 B fat pointers instead of one `Box` per guard:
+/// `with_capacity(n)` is a single `n * 16` heap, so the 16-byte class
+/// is not hit on every guard. Chunks never reallocate once a thin
+/// pointer has been handed out.
+#[derive(Default)]
+pub struct FailDescrStore {
+    chunks: Vec<Vec<FailDescrCell>>,
+}
+
+impl FailDescrStore {
+    pub fn with_capacity(n: usize) -> Self {
+        let mut chunks = Vec::new();
+        if n > 0 {
+            chunks.push(Vec::with_capacity(n));
+        }
+        Self { chunks }
+    }
+
+    pub fn push(&mut self, descr: DescrRef) -> usize {
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() == chunk.capacity())
+        {
+            self.chunks.push(Vec::with_capacity(8));
+        }
+        let last = self.chunks.last_mut().expect("fail descr chunk");
+        last.push(FailDescrCell::new(descr));
+        FailDescrCell::thin_ptr(last.last().expect("just pushed"))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &FailDescrCell> {
+        self.chunks.iter().flatten()
     }
 }
 
@@ -178,7 +220,7 @@ impl std::fmt::Debug for FailDescrCell {
 ///
 /// # Safety
 /// `addr` MUST be [`FailDescrCell::thin_ptr`] of a live cell whose
-/// `Box` is held by `CompiledLoopToken.asmmemmgr_gcreftracers`
+/// cell is held by `CompiledLoopToken.asmmemmgr_gcreftracers`
 /// (or an equivalent keep-alive collection) while the baked JIT code
 /// references this address.  Calling with any other address — including
 /// the address of a different concrete type — is undefined behavior.
@@ -8108,6 +8150,19 @@ mod tests {
         let ptr = FailDescrCell::thin_ptr(&cell);
         let recovered = unsafe { recover_fail_descr_cell(ptr) };
         assert!(Arc::ptr_eq(&descr, &recovered));
+    }
+
+    #[test]
+    fn fail_descr_store_keeps_thin_ptrs_stable() {
+        let a: DescrRef = Arc::new(SimpleFailDescr::new(1, 2, vec![Type::Int]));
+        let b: DescrRef = Arc::new(SimpleFailDescr::new(3, 4, vec![Type::Int]));
+        let mut store = FailDescrStore::with_capacity(2);
+        let pa = store.push(a.clone());
+        let pb = store.push(b.clone());
+        let ra = unsafe { recover_fail_descr_cell(pa) };
+        let rb = unsafe { recover_fail_descr_cell(pb) };
+        assert!(Arc::ptr_eq(&a, &ra));
+        assert!(Arc::ptr_eq(&b, &rb));
     }
 
     /// `class_word_field()` is the layout's own answer, and "this layout has

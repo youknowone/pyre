@@ -30,8 +30,8 @@ pub mod value;
 // Re-export key types at crate root for convenience.
 pub use descr::{
     AccumInfo, ArrayDescr, ArrayFlag, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr,
-    DescrRef, FailDescr, FailDescrCell, FieldDescr, GcCache, InteriorFieldDescr, JitCodeDescr,
-    LLType, LoopTargetDescr, LoopTokenDescr, QuasiImmutDescr, QuasiImmutHandle,
+    DescrRef, FailDescr, FailDescrCell, FailDescrStore, FieldDescr, GcCache, InteriorFieldDescr,
+    JitCodeDescr, LLType, LoopTargetDescr, LoopTokenDescr, QuasiImmutDescr, QuasiImmutHandle,
     QuasiImmutLoopToken, RdLocs, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr,
     SwitchDescr, TargetArgLoc, UnpackAtExitInfo, descr_identity, make_array_descr,
     make_array_descr_signed, make_call_descr, make_field_descr, make_field_descr_full,

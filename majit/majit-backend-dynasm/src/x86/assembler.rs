@@ -22,7 +22,9 @@ pub(crate) type Assembler = dynasmrt::VecAssembler<dynasmrt::x64::X64Relocation>
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
-use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type};
+use majit_ir::{
+    FailDescr, FailDescrStore, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
+};
 
 use crate::arch::*;
 use crate::codebuf;
@@ -828,7 +830,7 @@ pub struct Assembler386<'a> {
     /// Fail descriptors built during assembly — wrapped in `FailDescrCell`
     /// so `Arc::as_ptr` is a thin pointer suitable for direct
     /// `Arc::from_raw` recovery (`history.py AbstractDescr.show`).
-    fail_descrs: Vec<Box<majit_ir::FailDescrCell>>,
+    fail_descrs: FailDescrStore,
     /// trace_id for this compilation.
     trace_id: u64,
     /// header_pc (green_key) for this compilation.
@@ -908,7 +910,7 @@ pub struct Assembler386<'a> {
     /// fat-pointer mismatch a bare `Arc<dyn Descr>` ptr would cause.
     /// The same cell is consumed by `append_guard_token_with_faillocs`
     /// so jf_force_descr and jf_descr resolve to the same identity.
-    pending_force_cell: Option<Box<majit_ir::FailDescrCell>>,
+    pending_force_cell: Option<usize>,
     /// `compile.py:665-674` + `pyjitpl.py:2283`: construction-time
     /// snapshot of the six descr pointers attached to the owning cpu
     /// instance.  Retained for constructor signature stability across
@@ -1005,6 +1007,24 @@ struct RecoveryStub {
     pos_jump_offset: Option<usize>,
 }
 
+fn fail_cell_capacity(ra_ops: &[RegAllocOp], ops: &[OpRc]) -> usize {
+    let mut n = 0;
+    for ra in ra_ops {
+        match ra {
+            RegAllocOp::PerformGuard { .. } => n += 1,
+            RegAllocOp::Perform { op_index, .. }
+            | RegAllocOp::PerformDiscard { op_index, .. }
+            | RegAllocOp::PerformDiscardGcStore { op_index, .. } => {
+                if ops[*op_index].opcode == OpCode::Finish {
+                    n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
 /// Compiled output from assemble_loop/assemble_bridge.
 pub struct CompiledCode {
     /// Executable memory buffer (keeps code alive).
@@ -1016,7 +1036,7 @@ pub struct CompiledCode {
     /// contract (compile.py record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at conversion
     /// from the in-progress `Assembler386.fail_descrs` Vec.
-    pub fail_descrs: std::sync::Arc<Vec<Box<majit_ir::FailDescrCell>>>,
+    pub fail_descrs: std::sync::Arc<FailDescrStore>,
     /// Input argument types.
     pub input_types: Vec<Type>,
     /// `compile.py` parity: `Arc` clone of the owning cpu's
@@ -1108,7 +1128,7 @@ impl<'a> Assembler386<'a> {
             pending_guard_tokens: Vec::new(),
             pending_malloc_nursery_gcmap: None,
             frame_depth: JITFRAME_FIXED_SIZE,
-            fail_descrs: Vec::new(),
+            fail_descrs: FailDescrStore::default(),
             trace_id,
             header_pc,
             input_types: Vec::new(),
@@ -2702,6 +2722,7 @@ impl<'a> Assembler386<'a> {
         }
         // assembler.py:374 walk_operations — get allocation decisions.
         let ra_ops = ra.walk_operations();
+        self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(&ra_ops, ops));
         // ra.get_final_frame_depth() returns a USER-position count; convert
         // to absolute by adding JITFRAME_FIXED_SIZE before comparing.
         let frame_slot_depth =
@@ -4284,8 +4305,7 @@ impl<'a> Assembler386<'a> {
                 // and `handle_fail_exit_frame_with_exception` match by
                 // ptr-equality on the singleton, so the cell only carries
                 // the keep-alive identity for `clt.asmmemmgr_gcreftracers`.
-                self.fail_descrs
-                    .push(majit_ir::FailDescrCell::wrap(descr.clone()));
+                self.fail_descrs.push(descr.clone());
             }
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
@@ -5688,11 +5708,10 @@ impl<'a> Assembler386<'a> {
         // when this guard is paired with a CALL_ASSEMBLER's force-store —
         // jf_force_descr and jf_descr then resolve to the same cell, and
         // `fail_descrs[fail_index]` carries exactly one entry per guard.
-        let cell = self
+        let fail_cell_ptr = self
             .pending_force_cell
             .take()
-            .unwrap_or_else(|| majit_ir::FailDescrCell::wrap(descr.clone()));
-        let fail_cell_ptr = majit_ir::FailDescrCell::thin_ptr(&cell);
+            .unwrap_or_else(|| self.fail_descrs.push(descr.clone()));
         self.pending_guard_tokens.push(GuardToken {
             fail_label,
             fail_descr: descr.clone(),
@@ -5708,7 +5727,6 @@ impl<'a> Assembler386<'a> {
         if op.opcode == OpCode::GuardNotForced2 {
             self.finish_gcmap = Some(gcmap);
         }
-        self.fail_descrs.push(cell);
     }
 
     /// x86/assembler.py `store_force_descr`: GUARD_NOT_FORCED_2 is not a
@@ -6460,10 +6478,9 @@ impl<'a> Assembler386<'a> {
         // here (not the bare `Arc<dyn Descr>` fat-pointer data half) and
         // hand the cell off to `append_guard_token_with_faillocs` so the
         // inline guard-exit path bakes the same identity into jf_descr.
-        let cell = majit_ir::FailDescrCell::wrap(descr.clone());
-        let descr_ptr = majit_ir::FailDescrCell::thin_ptr(&cell) as i64;
+        let descr_ptr = self.fail_descrs.push(descr.clone()) as i64;
         self.pending_force_descr = Some(descr);
-        self.pending_force_cell = Some(cell);
+        self.pending_force_cell = Some(descr_ptr as usize);
 
         // x86/assembler.py:2210-2222: store descr to jf_force_descr,
         // zero jf_descr.  The 64-bit descr pointer needs a register to reach
@@ -6570,8 +6587,7 @@ impl<'a> Assembler386<'a> {
 
         // Singleton: jf_descr bakes the cpu-attached `global_descr_ptr`,
         // not the cell pointer (see OpCode::Finish comment above).
-        self.fail_descrs
-            .push(majit_ir::FailDescrCell::wrap(descr.clone()));
+        self.fail_descrs.push(descr.clone());
     }
 
     // genop_* — type conversions

@@ -1860,7 +1860,7 @@ impl DynasmBackend {
     pub fn register_fail_descrs(
         &self,
         token: &majit_backend::JitCellToken,
-        cells: &Arc<Vec<Box<majit_ir::FailDescrCell>>>,
+        cells: &Arc<majit_ir::FailDescrStore>,
     ) {
         // `assembler.py:820-823` parity: each call appends one tracer.
         // `clt.asmmemmgr_gcreftracers` is the sole lifetime root for the
