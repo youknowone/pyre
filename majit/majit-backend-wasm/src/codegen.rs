@@ -2400,6 +2400,70 @@ fn emit_word_store(sink: &mut PeepSink<'_, '_>, offset: u64) {
     }
 }
 
+/// assembler.py `_call_footer_shadowstack`: `SUB [rootstacktop], 2*WORD`.
+fn emit_ca_pop_shadowstack(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
+    let ss_word = std::mem::size_of::<usize>() as i32;
+    sink.i32_const(top_addr as i32);
+    sink.i32_const(top_addr as i32);
+    sink.i32_load(mem32(0));
+    sink.i32_const(2 * ss_word);
+    sink.i32_sub();
+    sink.i32_store(mem32(0));
+}
+
+/// CA return footer: `execute_token`'s post-FINISH gcmap publish, then
+/// `_call_footer_shadowstack`.
+///
+/// A CA callee's `FINISH` returns inside generated wasm, so it never
+/// reaches `execute_token`'s `install_post_finish_force_gcmap`.  When
+/// `jf_force_descr` is clear the publish is `jf_gcmap = NULL` and the
+/// pop is the x86 `SUB`.  A `GUARD_NOT_FORCED_2` token keeps the frame
+/// reachable after the shadow-stack pop, so that arm keeps
+/// `wasm_jit_ca_pop_frame` (finish map + write barrier + pop).
+fn emit_ca_pop_footer(
+    sink: &mut PeepSink<'_, '_>,
+    inline: CaInlineParams,
+    residual_type_base: u32,
+    ca_pop_fn_ptr: i64,
+    ca_cfp_local: u32,
+    scratch: u32,
+) {
+    use majit_backend::jitframe::{JF_FORCE_DESCR_OFS, JF_GCMAP_OFS, SIZEOFSIGNED};
+    let ss_word = std::mem::size_of::<usize>() as i32;
+    // `assembler.py` `_reload_frame_if_necessary`: `top[-WORD]` is the
+    // jitframe, not the CA items base (which a collection may have moved).
+    sink.i32_const(inline.jf_top_addr as i32);
+    sink.i32_load(mem32(0));
+    sink.i32_const(ss_word);
+    sink.i32_sub();
+    sink.i32_load(mem32(0));
+    sink.local_tee(scratch);
+    if SIZEOFSIGNED == 4 {
+        sink.i32_load(memarg(JF_FORCE_DESCR_OFS as u64, 2));
+        sink.i32_eqz();
+    } else {
+        sink.i64_load(memarg(JF_FORCE_DESCR_OFS as u64, 3));
+        sink.i64_eqz();
+    }
+    sink.if_(BlockType::Empty);
+    sink.local_get(scratch);
+    if SIZEOFSIGNED == 4 {
+        sink.i32_const(0);
+        sink.i32_store(memarg(JF_GCMAP_OFS as u64, 2));
+    } else {
+        sink.i64_const(0);
+        sink.i64_store(memarg(JF_GCMAP_OFS as u64, 3));
+    }
+    emit_ca_pop_shadowstack(sink, inline.jf_top_addr);
+    sink.else_();
+    sink.local_get(ca_cfp_local);
+    sink.i64_extend_i32_u();
+    sink.i32_const(ca_pop_fn_ptr as i32);
+    sink.call_indirect(0, residual_type_base + 1);
+    sink.drop();
+    sink.end();
+}
+
 /// While a CA callee is pushed, its caller's `jf_ptr` is `top[-3 * WORD]`.
 fn emit_ca_reload_caller(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_const(top_addr as i32);
@@ -7907,10 +7971,20 @@ fn build_function(
                     }
                 }
                 // Pop the callee frame off the jitframe shadow stack (strict
-                // LIFO) via `wasm_jit_ca_pop_frame` — same direct-vs-trampoline
-                // split as the alloc above (the pop only shrinks the shadow
-                // stack; it never allocates or collects).
-                if let Some(base) = residual_type_base {
+                // LIFO).  `assembler.py` `_call_footer_shadowstack` is
+                // `SUB [rootstacktop], 2*WORD`; keep the helper only when
+                // the inline nursery path is off (it also publishes the
+                // finish gcmap).
+                if let (Some(base), Some(inline)) = (residual_type_base, ca.inline) {
+                    emit_ca_pop_footer(
+                        &mut sink,
+                        inline,
+                        base,
+                        ca.ca_pop_fn_ptr,
+                        ca_cfp_local,
+                        alloc_scratch_local,
+                    );
+                } else if let Some(base) = residual_type_base {
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
                     sink.i32_const(ca.ca_pop_fn_ptr as i32);

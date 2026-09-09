@@ -22,16 +22,19 @@
 
 def main():
     # Case A: canonical array-backed tuple (arity 5 > 2).
+    # Iteration counts are sized so pypy's own execution clears Windows
+    # `FLOOR_GATE_MIN_BASELINE_S` (~0.16s).  Below that the same binary
+    # read 1.6x-9.5x in the `?` band and crossed the ceiling of 6.
     t = (10, 20, 30, 40, 50)
     s = 0
-    for _ in range(1600000):
+    for _ in range(4300000):
         s += t[0] + t[1] + t[2] + t[3] + t[4]
     print(s)
 
     # Case B: 2-element tuple (specialised-tuple path must be safe + correct).
     t2 = (1, 2)
     s2 = 0
-    for _ in range(1600000):
+    for _ in range(4300000):
         s2 += t2[0] + t2[1]
     print(s2)
 
@@ -50,4 +53,4 @@ def hot_specialised_pair(n):
     return s
 
 
-print(hot_specialised_pair(160000000))
+print(hot_specialised_pair(430000000))

@@ -1677,6 +1677,12 @@ pub(crate) fn sub_jitcode_body_for_code(
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
+    sub_jitcode_body_from_payload(&pjc)
+}
+
+fn sub_jitcode_body_from_payload(
+    pjc: &crate::PyJitCode,
+) -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
     let jc = &pjc.jitcode;
     // SAFETY: the payload lives for the program in the append-only jitcodes
     // store (a second Arc keeps the allocation alive after this local clone
@@ -1744,12 +1750,16 @@ pub(crate) type SubDescrPool = (
 /// refinements, not per trace attempt). `'static` coerces to the walker's
 /// `'static_a`.
 pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDescrPool> {
-    use majit_metainterp::jitcode::RuntimeBhDescr;
     if code.is_null() || jitcode_for(code).is_null() {
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    Some(*pjc.sub_descr_pool.get_or_init(|| {
+    Some(sub_descr_pool_for_payload(&pjc))
+}
+
+fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+    *pjc.sub_descr_pool.get_or_init(|| {
         // SAFETY: the borrow is valid for `'static` because the payload is
         // retained for the program lifetime by the append-only
         // `MetaInterpStaticData.jitcodes` store, and `exec.descrs` is
@@ -1790,7 +1800,7 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
         });
         let lookup: &'static crate::jitcode_dispatch::SubJitCodeLookup = Box::leak(lookup);
         (descr_refs, perfn_descrs, lookup)
-    }))
+    })
 }
 
 /// `resume.py` `consume_one_section` → `enumerate_vars` parity:

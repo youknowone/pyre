@@ -5,7 +5,11 @@
 # gh#495 guard: a callee's mutation must not be replayed or dropped, for a
 # constant-int and for a float return value.  Each return kind keeps its own
 # driver so the call stays a direct global call rather than an indirect one.
-N = 61620000
+#
+# N is 3x the previous 61620000 so a 10ms pypy swing cannot flip 2.58x
+# through the 2.6 ceiling (ubuntu cranelift 0.31/0.12 passed on main;
+# 0.30/0.11 failed on PR 1736). The ceiling is unchanged.
+N = 184860000
 
 
 class C:

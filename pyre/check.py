@@ -5682,22 +5682,10 @@ def main():
         # pyre 0.32s, and the reported ratio still moved 1.1x -> 1.5x.  Only
         # the arithmetic changed.
         #
-        # The ceiling is fitted to hold the SENSITIVITY the row had, not to
-        # clear the readings with room to spare.  Ubuntu derives pypy exec
-        # 0.207s, true work 0.228s and a fixed 0.079s of pyre startup now left
-        # in the numerator, so the work may grow by `(c * 0.207 - 0.079) /
-        # 0.228 - 1` before the gate fires: 36% at the old arithmetic's 1.5,
-        # and 38% at 1.9.  2.2 would tolerate 65% and 2.4 would tolerate 83%.
-        # Sizing the workload up would dilute the surcharge instead, which is
-        # what this file does elsewhere, but codspeed.yml execs this bench, so
-        # a longer loop reads there as a regression of exactly the factor.
-        #
-        # dynasm is left at 1.5: it has not failed on any host -- ubuntu 1.5x,
-        # macos 1.2x-1.3x, and windows 1.9x passes because `_compare_buffer`
-        # grants two scheduler ticks there.  Cranelift is the leg that failed,
-        # 1.6x-1.7x on runs 33720513664, 33748975755, 33750103555 and
-        # 33764632493, two of them `main`'s own; macos reads 1.2x-1.5x, and
-        # the 0.317x floor 1.9 derives stays far under it.
+        # The leftover pyre startup in the numerator is a fixed surcharge; the
+        # loop is 150e6 so that term is a small fraction of a 1.5x budget.
+        # Cranelift stays at 1.9: it is the leg that failed at 1.5 before the
+        # lengthening, and 1.9 still derives a floor far under macos.
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.5,     None,    1.9)
         # fib_recursive's pypy ceilings of 6 and 8 both derive a floor capped at
         # parity, and macos dynasm reads 0.9x.  Run 33300212586 measured dynasm

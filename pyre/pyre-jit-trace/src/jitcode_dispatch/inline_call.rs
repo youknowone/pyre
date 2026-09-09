@@ -15,6 +15,7 @@
 //! opname arms stay in `handle` (mod.rs) and call into these.
 
 use majit_translate::codewriter::jitcode::DescentBlockerSummary;
+use pyre_interpreter::locals_w;
 use rustpython_wtf8::Wtf8;
 
 use super::*;
@@ -10367,13 +10368,6 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
     if op_pc != resume.yield_marker_jit_pc {
         return Ok(None);
     }
-    // The suspension is published through the virtualizable shadow, and that
-    // shadow tracks exactly one frame.  When it is on some other frame — the
-    // caller's, in a walk where the generator is not the trace's virtualizable
-    // — the publish would land there instead, so leave the marker to abort.
-    if ctx.trace_ctx.diag_virtualizable_heap_ptr() != resume.frame {
-        return Ok(None);
-    }
     // `valuestackdepth` is absolute (`stack_base_absolute + stack length`), so
     // the value the opcode pops is the slot below the published depth.
     let Some(top) =
@@ -10396,28 +10390,54 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
     // on that: the note is first-write-per-frame wins, so a redundant call
     // keeps the earlier, pre-walk image.
     fbw_arm_durable_frame_undo(resume.frame);
-    publish_suspension_field(ctx, "valuestackdepth", top as i64);
-    publish_suspension_field(ctx, "last_instr", resume.yield_py_pc as i64);
+    // The generator frame is a nonstandard virtualizable: the trace's
+    // standard vable stays the caller's.  Write the suspension through
+    // SETFIELD_GC on the generator frame so the compiled loop updates that
+    // object, not the caller's `last_instr` / `valuestackdepth` slots.
+    publish_generator_suspension(
+        ctx,
+        resume.frame,
+        resume.frame_box,
+        "valuestackdepth",
+        top as i64,
+    );
+    publish_generator_suspension(
+        ctx,
+        resume.frame,
+        resume.frame_box,
+        "last_instr",
+        resume.yield_py_pc as i64,
+    );
     Ok(Some(store.value))
 }
 
-/// Write one static virtualizable field of the frame the shadow tracks.
+/// Write one static field of the suspended generator frame.
 ///
-/// The mirror carries both halves: the boxes a compiled run writes back at a
-/// force, and — through the `synchronize_virtualizable` it pairs with — the
-/// live frame this walk's own residuals and its interpreter resume read.
-fn publish_suspension_field<Sym: WalkSym>(
+/// The generator is not the trace's standard virtualizable — that stays the
+/// caller's frame — so this is a SETFIELD_GC on the generator object plus the
+/// matching live-frame store, not a `mirror_vable_static_to_boxes` into the
+/// caller's shadow.
+fn publish_generator_suspension<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    frame: usize,
+    frame_box: OpRef,
     static_field_name: &str,
     value: i64,
 ) {
+    let field_index = match static_field_name {
+        "last_instr" => 0,
+        "valuestackdepth" => 2,
+        _ => return,
+    };
+    crate::state::store_live_frame_static_int(frame, field_index, value);
+    let descr = match static_field_name {
+        "last_instr" => crate::descr::pyframe_next_instr_descr(),
+        "valuestackdepth" => crate::descr::pyframe_stack_depth_descr(),
+        _ => return,
+    };
     let value_op = ctx.trace_ctx.const_int(value);
-    crate::trace_opcode::mirror_vable_static_to_boxes(
-        ctx.trace_ctx,
-        static_field_name,
-        value_op,
-        majit_ir::Value::Int(value),
-    );
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[frame_box, value_op], descr);
 }
 
 /// Why a `FOR_ITER` over a suspended generator was not resumed into the trace.
@@ -10742,6 +10762,29 @@ fn gen_census_enabled() -> bool {
     *ON
 }
 
+fn gen_resume_decline(reason: &str) {
+    if gen_census_enabled() || fbw_debug_abort_enabled() {
+        eprintln!("[gen-resume] decline {reason}");
+    }
+}
+
+/// Whether this tracer can look inside `execute_frame` the way
+/// `_opimpl_recursive_call` does.
+///
+/// `can_inline_callable` (`warmstate.py`) is true only when `perform_call`
+/// (`pyjitpl.py`) can `newframe` and `capture_resumedata` the resulting
+/// MIFrame, and the walk's yield is `dispatch`'s `except Yield` `popvalue()`.
+/// A `newframe` without that `popvalue` compiled `FOR_ITER` to hand the
+/// iterator back as the item (`int + generator` on
+/// `generator_iteration__main`).  Until the TOS is that `popvalue`, this
+/// is false: residual `do_residual_call`, and do not install a
+/// portal-shaped body whose yield `abort_permanent` aborts a later
+/// independent trace.
+#[inline(never)]
+fn generator_resume_can_perform_call<Sym: WalkSym>(_ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    false
+}
+
 /// Resume a suspended generator into the trace at a `FOR_ITER`, in place of
 /// the opaque `jit_next` residual.
 ///
@@ -10753,24 +10796,19 @@ fn gen_census_enabled() -> bool {
 /// `CO_GENERATOR`.  The walk ends at `YIELD_VALUE`, where `dispatch`'s
 /// `except Yield` arm forces the virtualizable and returns the value.
 ///
-/// Pyre has none of those three hooks reachable from the walker yet, so this
-/// currently decides admissibility and declines; the census names what the
-/// resume would have to serve.
+/// That look-inside is `_opimpl_recursive_call` → `perform_call` →
+/// `newframe` (`pyjitpl.py`) and ends at `except Yield` `popvalue()`.
+/// Until `generator_resume_can_perform_call` is true, the residual
+/// `jit_next` stays in place — `do_residual_call`, not a start-then-abort
+/// of the parent `FOR_ITER` loop and not a miscompiled item.
 pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     r_args: &[OpRef],
+    dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
-        return Ok(None);
-    }
-    // Behind the census switch, not merely printing behind it: asking the
-    // verdict is not free.  `sub_jitcode_body_for_code` BUILDS and installs the
-    // per-fn jitcode on demand, which a default run must not do for a code
-    // object nothing inlines — it is exactly the kind of shift a `.jitstats`
-    // baseline records.
-    if !gen_census_enabled() {
         return Ok(None);
     }
     let Some(iter_obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
@@ -10779,8 +10817,8 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
     if !unsafe { pyre_object::generator::is_generator(iter_obj) } {
         return Ok(None);
     }
-    let census = generator_resume_verdict(iter_obj);
-    {
+    if gen_census_enabled() {
+        let census = generator_resume_verdict(iter_obj);
         let (ops, merge_points, residual_calls) = census.ops_to_yield;
         eprintln!(
             "[gen-census] pc={} {} resume_py={} n_py={} tables={:?} marker={:?} \
@@ -10810,7 +10848,302 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
             census.replay.is_some_and(|r| r.unscannable),
         );
     }
-    Ok(None)
+    walk_generator_resume(ctx, op, r_args[0], iter_obj, dst)
+}
+
+/// `'static` `DescrRefTable` for an already-leaked per-fn descr slice.
+///
+/// `&[DescrRef]` cannot be unsized-cast to `&dyn DescrRefTable` (the blanket
+/// impl is on the slice itself); `&&[DescrRef]` can.  Memoize one fat pointer
+/// per distinct pool so a resume does not leak on every `FOR_ITER`.
+fn static_descr_table(refs: &'static [DescrRef]) -> &'static dyn DescrRefTable {
+    thread_local! {
+        static TABLES: std::cell::RefCell<Vec<(usize, *const dyn DescrRefTable)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = refs.as_ptr() as usize;
+    TABLES.with(|tables| {
+        let mut tables = tables.borrow_mut();
+        if let Some((_, table)) = tables.iter().find(|(k, _)| *k == key) {
+            // SAFETY: leaked Box<&'static [DescrRef]> lives for the process.
+            return unsafe { &**table };
+        }
+        let table: &'static dyn DescrRefTable = Box::leak(Box::new(refs));
+        tables.push((key, table));
+        table
+    })
+}
+
+/// Walk the already-installed portal-shaped body of a suspended generator
+/// from `resume_execute_frame` to its next `yield`.
+fn walk_generator_resume<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    iter_op: OpRef,
+    iter_obj: pyre_object::PyObjectRef,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(shape) =
+        (unsafe { pyre_interpreter::baseobjspace::generator_resume_fast_path(iter_obj) })
+    else {
+        gen_resume_decline("not_resumable");
+        return Ok(None);
+    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(shape.w_pycode) }
+        as *const pyre_interpreter::CodeObject;
+    if raw.is_null() {
+        gen_resume_decline("no_code");
+        return Ok(None);
+    }
+    let code = unsafe { &*raw };
+    // `should_unroll_one_iteration` (`interp_jit.py`) is true for every
+    // `CO_GENERATOR` body; `should_not_inline` is the 2+ yield case that
+    // upstream sends to `generatorentry_driver` instead.
+    if pyre_interpreter::baseobjspace::should_not_inline(code) {
+        gen_resume_decline("several_yields");
+        return Ok(None);
+    }
+    if !code.cellvars.is_empty() || !code.freevars.is_empty() {
+        gen_resume_decline("cells_or_freevars");
+        return Ok(None);
+    }
+    if !generator_table_is_only_the_stopiteration_wrapper(code) {
+        gen_resume_decline("real_exception_table");
+        return Ok(None);
+    }
+    // `_opimpl_recursive_call` (`pyjitpl.py`): `can_inline_callable` then
+    // `perform_call` → `newframe` → `framestack.append`, and the walk
+    // ends at `dispatch`'s `except Yield` `popvalue()`.  `newframe`
+    // without that `popvalue` compiled the iterator as the `FOR_ITER`
+    // item.  `sub_jitcode_body_for_code` also *installs* a portal-shaped
+    // body; doing that without a successful `perform_call` lets the
+    // generator's own `while` start traces that die on the yield
+    // `abort_permanent` (SNAPDIFF `loops_aborted` 1→11).  Residual like
+    // `do_residual_call`, and do not install.
+    if !generator_resume_can_perform_call(ctx) {
+        gen_resume_decline("cannot_capture_resumedata");
+        return Ok(None);
+    }
+    let w_pycode = shape.w_pycode as *const ();
+    // Same on-demand install as a user-call inline: the body is the thing
+    // we are about to walk.  Census-only must not take this path; the walk
+    // itself is the reason to install.
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_pycode) else {
+        gen_resume_decline("no_jitcode");
+        return Ok(None);
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
+        gen_resume_decline("no_pjc");
+        return Ok(None);
+    };
+    if !pjc.metadata.built_as_portal {
+        gen_resume_decline("not_portal_shaped");
+        return Ok(None);
+    }
+    let resume_py_pc = shape.last_instr as usize + 1;
+    let Some(resume_marker) = generator_resume_marker_offset(&pjc, resume_py_pc) else {
+        gen_resume_decline("no_resume_marker");
+        return Ok(None);
+    };
+    let Some(yield_marker) = pjc
+        .metadata
+        .abort_permanent_py_pc_by_jit_pc
+        .iter()
+        .find(|&&(_, py)| py as usize == shape.last_instr as usize)
+        .map(|&(off, _)| off as usize)
+    else {
+        gen_resume_decline("no_yield_marker");
+        return Ok(None);
+    };
+    if pjc.metadata.portal_frame_reg == u16::MAX {
+        gen_resume_decline("no_portal_frame_reg");
+        return Ok(None);
+    }
+    let Some((callee_descr_refs, callee_perfn_descrs, callee_lookup)) =
+        crate::state::sub_jitcode_descr_pool_for_code(w_pycode)
+    else {
+        gen_resume_decline("no_descr_pool");
+        return Ok(None);
+    };
+
+    let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+    fbw_foriter_inflight_mark_attempt(body_coord);
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+    let executed_effects_before = fbw_executed_effect_count();
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iter_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(iter_obj);
+    let frame_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(shape.frame as pyre_object::PyObjectRef);
+    let code_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(shape.w_pycode);
+    let iter_obj = pyre_object::gc_roots::shadow_stack_get(iter_root);
+    let gen_frame =
+        pyre_object::gc_roots::shadow_stack_get(frame_root) as *mut pyre_interpreter::PyFrame;
+    if gen_frame.is_null() {
+        gen_resume_decline("null_frame");
+        return Ok(None);
+    }
+
+    if !iter_op.is_constant() {
+        let type_const = ctx
+            .trace_ctx
+            .const_int(unsafe { (*iter_obj).ob_type } as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        let gen_const = ctx.trace_ctx.const_ref(iter_obj as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[iter_op, gen_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+
+    // `resume_execute_frame`: push the sent `None` and start at
+    // `last_instr + 1`.  Arm the durable undo first so a declined walk
+    // puts the frame back whole.
+    fbw_arm_durable_frame_undo(gen_frame as usize);
+    unsafe { (*gen_frame).pushvalue_none() };
+
+    let saved_fbw_mode = ctx.fbw_mode;
+    ctx.fbw_mode.inline_subwalk = true;
+
+    // Load `gen.frame` from the guarded iterator so the compiled loop
+    // re-reads the suspended frame each iteration instead of baking the
+    // address from this recording.
+    let frame_offset = std::mem::offset_of!(pyre_object::generator::GeneratorIterator, frame_ptr);
+    let frame_descr = crate::descr::make_field_descr(
+        frame_offset,
+        std::mem::size_of::<*mut u8>(),
+        majit_ir::Type::Ref,
+        false,
+    );
+    let frame_box =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::GetfieldGcR, &[iter_op], frame_descr);
+    ctx.trace_ctx.set_opref_concrete(
+        frame_box,
+        majit_ir::Value::Ref(majit_ir::GcRef(gen_frame as usize)),
+    );
+    ctx.fbw_mode.generator_resume = Some(GeneratorResumeSubwalk {
+        frame: gen_frame as usize,
+        frame_box,
+        yield_marker_jit_pc: yield_marker,
+        yield_py_pc: shape.last_instr as u32,
+    });
+    let ec_box = ctx
+        .trace_ctx
+        .const_ref(pyre_interpreter::call::getexecutioncontext() as i64);
+    let mut extra_ref_seeds: Vec<(usize, OpRef, ConcreteValue)> = Vec::new();
+    let portal_frame_reg = pjc.metadata.portal_frame_reg;
+    let portal_ec_reg = pjc.metadata.portal_ec_reg;
+    if portal_frame_reg != u16::MAX {
+        extra_ref_seeds.push((
+            portal_frame_reg as usize,
+            frame_box,
+            ConcreteValue::Ref(gen_frame as pyre_object::PyObjectRef),
+        ));
+    }
+    if portal_ec_reg != u16::MAX {
+        extra_ref_seeds.push((
+            portal_ec_reg as usize,
+            ec_box,
+            ConcreteValue::Ref(
+                pyre_interpreter::call::getexecutioncontext() as pyre_object::PyObjectRef
+            ),
+        ));
+    }
+    if let Some(pcdep) =
+        crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, resume_marker as i32)
+    {
+        let frame_ref = unsafe { &*gen_frame };
+        for &(bank, color, slot) in &pcdep {
+            if bank != 1 {
+                continue;
+            }
+            if let Some(&value) = locals_w!(frame_ref).as_slice().get(slot as usize)
+                && !value.is_null()
+            {
+                let opref = ctx.trace_ctx.const_ref(value as i64);
+                extra_ref_seeds.push((color as usize, opref, ConcreteValue::Ref(value)));
+            }
+        }
+    }
+
+    let saved_descr_refs = ctx.descr_refs;
+    let saved_raw_descrs = ctx.raw_descrs;
+    let saved_lookup = ctx.sub_jitcode_lookup;
+    ctx.descr_refs = static_descr_table(callee_descr_refs);
+    ctx.raw_descrs = RawDescrPool::PerFn(callee_perfn_descrs);
+    ctx.sub_jitcode_lookup = callee_lookup;
+
+    let _inline_concrete = InlineConcreteFrameGuard::enter(gen_frame);
+    let walk_result = run_sub_jitcode_walk_from(
+        ctx,
+        op.pc,
+        resume_marker,
+        &body,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &extra_ref_seeds,
+    );
+
+    ctx.fbw_mode = saved_fbw_mode;
+    ctx.descr_refs = saved_descr_refs;
+    ctx.raw_descrs = saved_raw_descrs;
+    ctx.sub_jitcode_lookup = saved_lookup;
+
+    let walk_result = match walk_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[gen-resume] walk err pc={} resume_marker={} yield_marker={} err={error:?}",
+                    op.pc, resume_marker, yield_marker,
+                );
+            }
+            fbw_durable_frame_rollback_one(gen_frame as usize);
+            if fbw_executed_effect_count() != executed_effects_before {
+                return Err(error);
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+    };
+    let DispatchOutcome::SubReturn { result: Some(item) } = walk_result else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[gen-resume] walk outcome pc={} resume_marker={} yield_marker={} outcome={walk_result:?}",
+                op.pc, resume_marker, yield_marker,
+            );
+        }
+        fbw_durable_frame_rollback_one(gen_frame as usize);
+        if fbw_executed_effect_count() != executed_effects_before {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        }
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    };
+    let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
+        fbw_durable_frame_rollback_one(gen_frame as usize);
+        if fbw_executed_effect_count() != executed_effects_before {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        }
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    };
+    write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
+    fbw_foriter_inflight_capture(concrete_item, body_coord);
+    ctx.vstack_last_ref = item;
+    let _ = code_root;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Forward dunder selected by `try_dispatch_binary_special` for a non-inplace
@@ -12000,6 +12333,39 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<DispatchOutcome, DispatchError> {
+    run_sub_jitcode_walk_from(
+        ctx,
+        pc,
+        0,
+        sub_body,
+        int_args,
+        int_arg_concretes,
+        ref_args,
+        ref_arg_concretes,
+        float_args,
+        &[],
+    )
+}
+
+/// Same as [`run_sub_jitcode_walk`], but enter the callee body at
+/// `start_pc` and seed extra Ref-bank registers after the call args.
+///
+/// A generator resume starts at `resume_execute_frame` (`last_instr + 1`),
+/// not at function entry, and needs the portal frame / ec colors plus the
+/// live locals the resume block reads.  `extra_ref_seeds` is `(reg, box,
+/// concrete)` — later entries overwrite earlier ones at the same color.
+pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
+    ctx: &mut WalkContext<'frame, 'a, Sym>,
+    pc: usize,
+    start_pc: usize,
+    sub_body: &SubJitCodeBody,
+    int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+    float_args: &[OpRef],
+    extra_ref_seeds: &[(usize, OpRef, ConcreteValue)],
+) -> Result<DispatchOutcome, DispatchError> {
     // A parent frame re-enters its inline_call opcode after the explicit
     // driver popped the callee. Consume that result before allocating or
     // reseeding anything, exactly as PyPy's `_interpret` delivers the value to
@@ -12094,6 +12460,21 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
             );
         }
     }
+    for &(reg, opref, concrete) in extra_ref_seeds {
+        if reg >= callee_regs_r.len() {
+            continue;
+        }
+        callee_regs_r[reg] = opref;
+        callee_concrete_r[reg] = concrete;
+        if let ConcreteValue::Ref(value) = concrete
+            && !value.is_null()
+        {
+            ctx.trace_ctx.try_set_opref_concrete(
+                opref,
+                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
+            );
+        }
+    }
 
     let frame_id = if driver_pointer.is_null() {
         0
@@ -12108,9 +12489,9 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         box_replacements: FrameBoxReplacements::new(ctx.session),
         id: frame_id,
         caller_pc: pc,
-        pc: 0,
+        pc: start_pc,
         body: sub_body.clone(),
-        seed_from_active_resume: true,
+        seed_from_active_resume: start_pc == 0,
         registers_r: callee_regs_r,
         registers_i: callee_regs_i,
         registers_f: callee_regs_f,

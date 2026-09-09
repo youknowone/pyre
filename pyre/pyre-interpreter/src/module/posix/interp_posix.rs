@@ -9,7 +9,6 @@ use crate::importing::host::fs as host_fs;
 use crate::importing::host::os as host_os;
 use parking_lot::Mutex;
 use pyre_object::PyObjectRef;
-use std::sync::LazyLock;
 // Under sandbox, name libc through the seam facade so any direct syscall call
 // in this module is a compile error (only types/constants/pure fns resolve).
 #[cfg(feature = "sandbox")]
@@ -24,6 +23,16 @@ struct ApplevelForkCallbacks {
     before_w: Vec<usize>,
     parent_w: Vec<usize>,
     child_w: Vec<usize>,
+}
+
+impl ApplevelForkCallbacks {
+    const fn new_empty() -> Self {
+        Self {
+            before_w: Vec::new(),
+            parent_w: Vec::new(),
+            child_w: Vec::new(),
+        }
+    }
 }
 
 /// `posix.DirEntry` — native layout `[PyObject | w_name | w_path | w_stat |
@@ -105,11 +114,23 @@ pub struct W_ScandirIterator {
     pub in_next: bool,
 }
 
-static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
-    LazyLock::new(|| Mutex::new(ApplevelForkCallbacks::default()));
+static APPLEVEL_FORK_CALLBACKS: crate::module::thread::ForkMutex<ApplevelForkCallbacks> =
+    crate::module::thread::ForkMutex::new(ApplevelForkCallbacks::new_empty());
 // PyPy's GIL serializes concurrent fork entry.  Pyre is free-threaded, so the
-// corresponding process operation has its own narrow serializer.
-static FORK_SERIALIZER: Mutex<()> = Mutex::new(());
+// corresponding process operation has its own narrow serializer.  This lock is
+// held across `fork()` by the surviving thread, the same discipline
+// `fork_under_stw` uses for `GcSync::quiesce`: an OS-backed mutex, owned on
+// both sides, dropped on both sides.  A `parking_lot` mutex would carry the
+// parent's userspace waiter queue into the child.
+static FORK_SERIALIZER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `rpy_init_mutexes` half for the posix fork tables.  Writes only.
+/// `FORK_SERIALIZER` is not in this set: the surviving thread still holds it.
+pub(crate) unsafe fn reinit_fork_tables_after_fork() {
+    unsafe {
+        APPLEVEL_FORK_CALLBACKS.reinit_after_fork();
+    }
+}
 
 // `_in_next`'s test-and-set is indivisible under PyPy's GIL. Pyre is
 // free-threaded, so every borrow of the native scandir iterator takes this
@@ -7846,6 +7867,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::make_builtin_function_with_arity(
                 "fork",
                 |_| {
+                    crate::module::thread::ensure_thread_atfork();
                     guard_fork_finalization()?;
                     if majit_gc::gc_sync::registered_threads() > 1 {
                         crate::warn::warn_deprecation(
@@ -7853,7 +7875,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         )?;
                     }
                     let blocked = crate::module::thread::before_external_block();
-                    let fork_serial = FORK_SERIALIZER.lock();
+                    let fork_serial = FORK_SERIALIZER
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     drop(blocked);
                     run_fork_callbacks("before");
                     // pypy/module/imp/moduledef.py:45-47 registers the import
@@ -7919,6 +7943,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::make_builtin_function_with_arity(
                 "forkpty",
                 |_| {
+                    crate::module::thread::ensure_thread_atfork();
                     guard_fork_finalization()?;
                     if majit_gc::gc_sync::registered_threads() > 1 {
                         crate::warn::warn_deprecation(
@@ -7926,7 +7951,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         )?;
                     }
                     let blocked = crate::module::thread::before_external_block();
-                    let fork_serial = FORK_SERIALIZER.lock();
+                    let fork_serial = FORK_SERIALIZER
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     drop(blocked);
                     run_fork_callbacks("before");
                     let mut master_fd = -1;

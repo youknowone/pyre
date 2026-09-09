@@ -13,9 +13,9 @@
 # (majit-trace/src/counter.rs), so guard_failures tracks collection count during
 # each guard's warm-up rather than a compile decision. One host measured
 # 3648..3661 across nursery sizes before the lifecycle fix; decay=0 now pins
-# 7378 everywhere, while loops_compiled=3 and bridges_compiled=48 remain
-# gated exactly. The fixture sets decay=0 itself, so the band covers the pinned
-# run, not that 13-wide unpinned spread; width 8 is margin (0.22%). Real
+# 4606 everywhere at this length, while loops_compiled=3 and bridges_compiled=34
+# remain gated exactly. The fixture sets decay=0 itself, so the band covers the pinned
+# run, not that 13-wide unpinned spread; width 8 is margin (0.17%). Real
 # regressions this gate caught moved by hundreds to thousands (828 -> 4923,
 # 404 -> 812, 937 -> 7408).
 # Generator-driven accumulation over recursive tree/linear results. The
@@ -80,7 +80,10 @@ def gen_values(limit):
 def main():
     acc = 0
     cnt = 0
-    for v in gen_values(9000):
+    # Sized so pypy's own execution clears Windows `FLOOR_GATE_MIN_BASELINE_S`
+    # (~0.16s).  At 9000 the baseline sat in the `?` band and macos cranelift
+    # crossed 14.
+    for v in gen_values(280000):
         acc = (acc + v) % MOD
         cnt += 1
         if cnt % 1800 == 0:

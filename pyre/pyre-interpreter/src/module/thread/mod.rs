@@ -7,6 +7,7 @@
 
 use parking_lot::{Condvar, Mutex};
 use pyre_object::*;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
@@ -56,20 +57,84 @@ static MAIN_THREAD_IDENT: AtomicI64 = AtomicI64::new(0);
 static ASYNC_EXCEPTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TRACE_ALL_GENERATION: AtomicUsize = AtomicUsize::new(0);
 static PROFILE_ALL_GENERATION: AtomicUsize = AtomicUsize::new(0);
-static TRACE_ALL_HOOK: Mutex<usize> = parking_lot::const_mutex(0);
-static PROFILE_ALL_HOOK: Mutex<usize> = parking_lot::const_mutex(0);
+static TRACE_ALL_HOOK: ForkMutex<usize> = ForkMutex::new(0);
+static PROFILE_ALL_HOOK: ForkMutex<usize> = ForkMutex::new(0);
 // CPython 3.14's `_thread._shutdown` registry, corresponding to PyPy's
 // bootstrapper/threadlocals-owned live-thread set.  Values are handle object
 // slots, not a parallel copy of handle state.
-static SHUTDOWN_HANDLES: Mutex<Vec<usize>> = parking_lot::const_mutex(Vec::new());
-// CPython's native thread-handle list, used by `_PyThread_AfterFork()` to
-// mark handles owned by vanished threads done before `threading._after_fork`
-// walks the Python Thread objects.
-static ACTIVE_HANDLES: Mutex<Vec<usize>> = parking_lot::const_mutex(Vec::new());
+static SHUTDOWN_HANDLES: ForkMutex<Vec<usize>> = ForkMutex::new(Vec::new());
+// CPython's native thread-handle list, used by `_PyThread_AfterFork()` /
+// `RPyThreadAfterFork` (`thread_pthread.c` `alllocks`) to mark handles
+// owned by vanished threads done before `threading._after_fork` walks
+// the Python Thread objects.
+static ACTIVE_HANDLES: ForkMutex<Vec<usize>> = ForkMutex::new(Vec::new());
 // `OSThreadLocals._valuedict`: process/interpreter-owned mapping from native
 // thread identifiers to their live ExecutionContexts.
-static EXECUTION_CONTEXTS: LazyLock<Mutex<indexmap::IndexMap<i64, usize>>> =
-    LazyLock::new(|| Mutex::new(indexmap::IndexMap::new()));
+static EXECUTION_CONTEXTS: LazyLock<ForkMutex<indexmap::IndexMap<i64, usize>>> =
+    LazyLock::new(|| ForkMutex::new(indexmap::IndexMap::new()));
+static THREAD_ATFORK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// `listobject.rs ForkListLock`: a process-global `parking_lot` mutex whose
+/// native state is rebuilt after `fork` without taking the inherited lock.
+///
+/// `RPyThreadAfterFork` (`thread_pthread.c`) walks `alllocks` and calls
+/// `RPyThreadLockInit` because "the state of mutexes is not really
+/// preserved across a fork()".  `rpy_init_mutexes` does the same for the
+/// GIL, from `pthread_atfork`.  These tables have no RPython owner — they
+/// exist because pyre is free-threaded — so they get the same rebuild.
+pub(crate) struct ForkMutex<T> {
+    inner: UnsafeCell<Mutex<T>>,
+}
+
+unsafe impl<T: Send> Sync for ForkMutex<T> {}
+
+impl<T> ForkMutex<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self {
+            inner: UnsafeCell::new(Mutex::new(value)),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> parking_lot::MutexGuard<'_, T> {
+        unsafe { (*self.inner.get()).lock() }
+    }
+
+    /// Write a fresh mutex around the live payload.  Must not lock: the
+    /// inherited waiter table can hang on Linux.  Same write as
+    /// `cpyext::ForkMutex::reinit_after_fork` / `ForkListLock::reinit_after_fork`.
+    pub(crate) unsafe fn reinit_after_fork(&self) {
+        let value = unsafe { (*self.inner.get()).data_ptr().read() };
+        unsafe { self.inner.get().write(Mutex::new(value)) };
+    }
+}
+
+/// `RPyGilAllocate`'s `pthread_atfork(NULL, NULL, rpy_init_mutexes)`.
+/// Registered once, so a fork that never reaches `os.fork`'s child arm
+/// (`_posixsubprocess.fork_exec`, a C library) still rebuilds the tables.
+pub(crate) fn ensure_thread_atfork() {
+    if THREAD_ATFORK_REGISTERED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // Force the LazyLock so the child handler never constructs it.
+    let _ = &*EXECUTION_CONTEXTS;
+    #[cfg(unix)]
+    unsafe {
+        libc::pthread_atfork(None, None, Some(atfork_child_reinit_thread_tables));
+    }
+}
+
+/// `rpy_init_mutexes`: writes only, no lock, no allocation.
+#[cfg(unix)]
+unsafe extern "C" fn atfork_child_reinit_thread_tables() {
+    unsafe {
+        EXECUTION_CONTEXTS.reinit_after_fork();
+        ACTIVE_HANDLES.reinit_after_fork();
+        SHUTDOWN_HANDLES.reinit_after_fork();
+        TRACE_ALL_HOOK.reinit_after_fork();
+        PROFILE_ALL_HOOK.reinit_after_fork();
+        crate::module::posix::reinit_fork_tables_after_fork();
+    }
+}
 
 pub mod gil;
 
@@ -286,6 +351,7 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 }
 
 pub(crate) fn register_execution_context(ec: *const crate::PyExecutionContext) {
+    ensure_thread_atfork();
     let ident = current_ident();
     let mut main_ident = MAIN_THREAD_IDENT.load(Ordering::Acquire);
     if main_ident == 0 {
@@ -644,8 +710,25 @@ pub(crate) fn after_fork_child() {
     // and the RUNNING count still describe threads that did not survive, so a
     // collection taken here would wait in `quiesce_mutators` for them to park,
     // and an STW root walk would read their vanished root areas.
+    //
+    // Process-global `parking_lot` tables were rebuilt by
+    // `atfork_child_reinit_thread_tables` (`rpy_init_mutexes`).
     majit_gc::shadow_stack::after_fork_child();
     majit_gc::gc_sync::after_fork_child();
+    // Stripe locks next: anything below can reach a Python object and collect.
+    pyre_object::listobject::list_locks_after_fork_child();
+    pyre_object::setobject::set_locks_after_fork_child();
+    pyre_object::interp_itertools::count_locks_after_fork_child();
+    pyre_object::typeobject::subclasses_locks_after_fork_child();
+    crate::objspace::std::mapdict::after_fork_child();
+    pyre_object::dictmultiobject::module_dict_locks_after_fork_child();
+    crate::module::_collections::deque_locks_after_fork_child();
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    crate::cpyext::after_fork_child();
     {
         let mut contexts = EXECUTION_CONTEXTS.lock();
         // threadlocals.py `reinit_threads`: a fork can leave a worker
@@ -682,19 +765,6 @@ pub(crate) fn after_fork_child() {
     }
     SHUTDOWN_HANDLES.lock().clear();
     THREAD_COUNT.store(0, Ordering::SeqCst);
-    pyre_object::listobject::list_locks_after_fork_child();
-    pyre_object::setobject::set_locks_after_fork_child();
-    pyre_object::interp_itertools::count_locks_after_fork_child();
-    pyre_object::typeobject::subclasses_locks_after_fork_child();
-    crate::objspace::std::mapdict::after_fork_child();
-    pyre_object::dictmultiobject::module_dict_locks_after_fork_child();
-    crate::module::_collections::deque_locks_after_fork_child();
-    #[cfg(all(
-        feature = "cpyext",
-        not(feature = "sandbox"),
-        any(target_os = "macos", target_os = "linux")
-    ))]
-    crate::cpyext::after_fork_child();
 }
 
 // os_lock.py `RPY_LOCK_FAILURE, RPY_LOCK_ACQUIRED, RPY_LOCK_INTR`.
@@ -2704,7 +2774,14 @@ crate::py_module! {
         "exit"                   / 0 = exit_thread,
         "exit_thread"            / 0 = exit_thread,
         "_excepthook"            / 1 = thread_excepthook,
-        "_get_main_thread_ident" / 0 = |_| Ok(w_int_new(current_ident())),
+        "_get_main_thread_ident" / 0 = |_| {
+            let ident = MAIN_THREAD_IDENT.load(Ordering::Acquire);
+            Ok(w_int_new(if ident == 0 {
+                current_ident()
+            } else {
+                ident
+            }))
+        },
         "start_joinable_thread"  / * = start_joinable_thread,
         "start_new_thread"       / * = start_new_thread,
         "start_new"              / * = start_new_thread,

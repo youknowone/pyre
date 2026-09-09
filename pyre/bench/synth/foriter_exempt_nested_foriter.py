@@ -3,18 +3,15 @@
 # while the door read another cell's answer, asked to trace at every call and
 # never entered the compiled loop.
 #
-# The ceiling is NOT the measured ratio.  pypy's execution-only time here lands
-# either side of EXEC_TIME_FLOOR_S, and check.py gates the ratio whenever it
-# lands above (`?`) and skips it whenever it is clamped to the floor (`~`), so
-# the same binary reads 17.7x on one runner and 27.9x on the next.  Size the
-# ceiling for the worst denominator in the gated band instead: dynasm's
-# execution-only time over `2 * EXEC_TIME_FLOOR_S` -- the floor plus the grace
-# `_compare_buffer` adds for a floor-sized baseline -- which is 0.14s / 0.01s,
-# plus room for the run-to-run spread of that numerator.
 # gh#495 guard: fbw_abort_nested_unjournaled_residual prevents the ForIterNext exemption double-advance.
 # branch-bearing callee with a SECOND FOR_ITER (nested), not the loop header.
 # Two shared generators; inner FOR_ITER advance is a non-header foriter (Finding #2).
 # Post-inner declining residual forces abort while inner item in-flight.
+# N cannot be raised to clear `FLOOR_GATE_MIN_BASELINE_S`: generator resume
+# has no merge point (`caro_no_merge_entry`), so gouter/ginner stay
+# interpreted and the true ratio is ~100x.  Lengthening only makes that
+# honest.  20000 is the original size; the 20x ceiling is the compiled
+# `run()` loop's budget, not the residual generator path.
 N = 20000
 
 

@@ -1666,6 +1666,10 @@ pub struct GeneratorResumeSubwalk {
     /// resumed from again after this yield.  Durable, so every walk-time write
     /// to it is journalled (`fbw_arm_durable_frame_undo`).
     pub frame: usize,
+    /// The OpRef that names that frame in the trace — a `GetfieldGc` off the
+    /// generator, not a baked address — so suspension stores land on the
+    /// same box the compiled loop re-reads.
+    pub frame_box: OpRef,
     /// JitCode offset of the `abort_permanent` the body's `yield` lowered to.
     /// Exact rather than "any `abort_permanent`": a body can carry markers for
     /// unported opcodes too, and those still abort.
