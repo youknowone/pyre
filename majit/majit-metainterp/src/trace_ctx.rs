@@ -2434,6 +2434,7 @@ impl TraceCtx {
                     Operand::Op(o) => format!("{:?}", o.pos.get()),
                     Operand::InputArg(ia) => format!("IA{}", ia.index),
                     Operand::SmallInt(_) => format!("C{:?}", a.const_value().unwrap()),
+                    Operand::SmallWide(_) => format!("C{:?}", a.const_value().unwrap()),
                     Operand::NullRef => "CRef(NULL)".to_string(),
                     Operand::Const(c) => format!("C{:?}", c.get()),
                     Operand::None => "_".to_string(),

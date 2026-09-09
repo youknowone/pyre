@@ -29,8 +29,9 @@ use crate::ptr_info::PtrInfo;
 use crate::resoperation::{OpRc, OpRef};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::cell::{Cell, RefCell};
+use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 /// Allocation-free identity source for the small-`ConstInt` arm below.
 ///
@@ -57,6 +58,72 @@ pub(crate) fn small_int_value(encoded: u64) -> i64 {
     (encoded as u32 as i32) as i64
 }
 
+/// Allocation-free identity for `ConstFloat` / `ConstPtr` / out-of-i32
+/// `ConstInt`. The token is the slab index; a clone keeps it, a fresh mint
+/// gets a new one — the same `is` identity `SmallInt` keeps, without an
+/// `Rc<Cell<Value>>` (32 B). Values live in leaked chunks so a GC walk can
+/// forward a `ConstPtr` in place. Not a value intern: two mints of the same
+/// bits are unequal.
+const WIDE_CHUNK: usize = 512;
+const WIDE_MAX_CHUNKS: usize = 8192;
+
+static NEXT_WIDE_ID: AtomicU32 = AtomicU32::new(1);
+static WIDE_CHUNKS: [AtomicPtr<Cell<Value>>; WIDE_MAX_CHUNKS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; WIDE_MAX_CHUNKS];
+
+fn init_wide_chunk(chunk_i: usize) -> *mut Cell<Value> {
+    let boxed: Box<[Cell<Value>]> = (0..WIDE_CHUNK)
+        .map(|_| Cell::new(Value::Void))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let raw = Box::into_raw(boxed) as *mut Cell<Value>;
+    match WIDE_CHUNKS[chunk_i].compare_exchange(
+        ptr::null_mut(),
+        raw,
+        Ordering::Release,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => raw,
+        Err(existing) => {
+            unsafe {
+                drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
+                    raw, WIDE_CHUNK,
+                )));
+            }
+            existing
+        }
+    }
+}
+
+fn wide_slot(id: u32) -> &'static Cell<Value> {
+    let idx = id as usize;
+    let chunk_i = idx / WIDE_CHUNK;
+    assert!(
+        chunk_i < WIDE_MAX_CHUNKS,
+        "wide Const identity space exhausted"
+    );
+    let off = idx % WIDE_CHUNK;
+    let p = WIDE_CHUNKS[chunk_i].load(Ordering::Acquire);
+    let p = if p.is_null() {
+        init_wide_chunk(chunk_i)
+    } else {
+        p
+    };
+    unsafe { &*p.add(off) }
+}
+
+fn fresh_wide(value: Value) -> u64 {
+    let id = NEXT_WIDE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .unwrap_or_else(|_| panic!("wide Const identity space exhausted"));
+    wide_slot(id).set(value);
+    u64::from(id)
+}
+
+fn wide_value(id: u64) -> Value {
+    wide_slot(id as u32).get()
+}
+
 /// An operand stored in `Op.args` / `Op.fail_args`.
 ///
 /// Mirror of `OpRef`'s four logical cases, but carrying the producer by
@@ -76,6 +143,11 @@ pub enum Operand {
     /// same one-word payload as an `Rc`, so it does not enlarge `Operand` or
     /// the three inline operand slots in every [`Op`](crate::resoperation::Op).
     SmallInt(u64),
+    /// `ConstFloat` / `ConstPtr` / out-of-i32 `ConstInt` with the same
+    /// unique-token identity as [`Self::SmallInt`]. The `u64` is the slab
+    /// index; it has the same one-word payload as an `Rc`, so `Operand`
+    /// stays 16 bytes.
+    SmallWide(u64),
     /// `opencoder.py Trace._cached_const_ptr`: null is encoded as ref-pool
     /// index zero without adding an entry. It is immutable and needs no GC
     /// forwarding cell, so keep the global null constant allocation-free.
@@ -108,7 +180,7 @@ impl Operand {
         {
             return Operand::SmallInt(encoded);
         }
-        Operand::Const(Rc::new(Cell::new(value)))
+        Operand::SmallWide(fresh_wide(value))
     }
 
     /// Wrap a bound op as `Operand::Op` (`Rc::clone`, cheap). The successor
@@ -156,9 +228,9 @@ impl Operand {
         match r {
             OpRef::None => Operand::None,
             OpRef::ConstInt(v) => Self::fresh_const_value(Value::Int(v)),
-            OpRef::ConstFloat(v) => Operand::Const(Rc::new(Cell::new(Value::Float(v)))),
+            OpRef::ConstFloat(v) => Self::fresh_const_value(Value::Float(v)),
             OpRef::ConstPtr(v) if v.is_null() => Operand::NullRef,
-            OpRef::ConstPtr(v) => Operand::Const(Rc::new(Cell::new(Value::Ref(v)))),
+            OpRef::ConstPtr(v) => Self::fresh_const_value(Value::Ref(v)),
             _ => panic!(
                 "from_opref: position-only ref {r:?} has no producer to bind — \
                  every operand source must carry a bound producer or a const (#9)"
@@ -218,6 +290,12 @@ impl Operand {
             Operand::Op(op) => op.pos.get(),
             Operand::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
             Operand::SmallInt(encoded) => OpRef::const_int(small_int_value(*encoded)),
+            Operand::SmallWide(id) => match wide_value(*id) {
+                Value::Int(v) => OpRef::const_int(v),
+                Value::Float(v) => OpRef::const_float(v),
+                Value::Ref(v) => OpRef::const_ptr(v),
+                Value::Void => OpRef::NONE,
+            },
             Operand::NullRef => OpRef::const_ptr(GcRef::NULL),
             // Re-encodes from the live `Cell` value, so a GC-moved `ConstPtr`
             // reads back at its post-move address (forwarding.rs parity).
@@ -236,7 +314,11 @@ impl Operand {
         match self {
             Operand::Op(op) => Some(op.pos.get().raw()),
             Operand::InputArg(ia) => Some(ia.index),
-            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => None,
+            Operand::SmallInt(_)
+            | Operand::SmallWide(_)
+            | Operand::NullRef
+            | Operand::Const(_)
+            | Operand::None => None,
         }
     }
 
@@ -246,6 +328,7 @@ impl Operand {
             Operand::Op(op) => op.pos.get().ty().unwrap_or(Type::Void),
             Operand::InputArg(ia) => ia.tp,
             Operand::SmallInt(_) => Type::Int,
+            Operand::SmallWide(id) => wide_value(*id).get_type(),
             Operand::NullRef => Type::Ref,
             Operand::Const(cell) => cell.get().get_type(),
             Operand::None => Type::Void,
@@ -257,6 +340,7 @@ impl Operand {
     pub fn const_value(&self) -> Option<Value> {
         match self {
             Operand::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
+            Operand::SmallWide(id) => Some(wide_value(*id)),
             Operand::NullRef => Some(Value::Ref(GcRef::NULL)),
             Operand::Const(cell) => Some(cell.get()),
             _ => None,
@@ -271,6 +355,7 @@ impl Operand {
     pub fn get_value(&self) -> Option<Value> {
         match self {
             Operand::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
+            Operand::SmallWide(id) => Some(wide_value(*id)),
             Operand::NullRef => Some(Value::Ref(GcRef::NULL)),
             Operand::Const(cell) => Some(cell.get()),
             Operand::Op(op) => op.get_value(),
@@ -284,6 +369,10 @@ impl Operand {
     pub fn const_int(&self) -> Option<i64> {
         match self {
             Operand::SmallInt(encoded) => Some(small_int_value(*encoded)),
+            Operand::SmallWide(id) => match wide_value(*id) {
+                Value::Int(v) => Some(v),
+                _ => None,
+            },
             Operand::Const(cell) => match cell.get() {
                 Value::Int(v) => Some(v),
                 _ => None,
@@ -296,7 +385,7 @@ impl Operand {
     pub fn is_constant(&self) -> bool {
         matches!(
             self,
-            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_)
+            Operand::SmallInt(_) | Operand::SmallWide(_) | Operand::NullRef | Operand::Const(_)
         )
     }
 
@@ -352,7 +441,11 @@ impl Operand {
             let forwarded = match &cur {
                 Operand::Op(op) => op.get_forwarded(),
                 Operand::InputArg(ia) => ia.get_forwarded(),
-                Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => {
+                Operand::SmallInt(_)
+                | Operand::SmallWide(_)
+                | Operand::NullRef
+                | Operand::Const(_)
+                | Operand::None => {
                     return cur;
                 }
             };
@@ -406,7 +499,11 @@ impl Operand {
         match self {
             Operand::Op(op) => f(&**op),
             Operand::InputArg(ia) => f(&**ia),
-            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => default,
+            Operand::SmallInt(_)
+            | Operand::SmallWide(_)
+            | Operand::NullRef
+            | Operand::Const(_)
+            | Operand::None => default,
         }
     }
 
@@ -417,7 +514,11 @@ impl Operand {
         match self {
             Operand::Op(op) => f(&**op),
             Operand::InputArg(ia) => f(&**ia),
-            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => panic!(
+            Operand::SmallInt(_)
+            | Operand::SmallWide(_)
+            | Operand::NullRef
+            | Operand::Const(_)
+            | Operand::None => panic!(
                 "Operand::{what} on a non-producer operand — only a bound \
                  Op/InputArg carries a _forwarded slot (box identity precondition)"
             ),
@@ -555,6 +656,14 @@ impl Operand {
                     cell.set(v);
                 }
             }
+            Operand::SmallWide(id) => {
+                let cell = wide_slot(*id as u32);
+                let mut v = cell.get();
+                if let Value::Ref(gcref) = &mut v {
+                    visitor(gcref);
+                    cell.set(v);
+                }
+            }
             Operand::None
             | Operand::Op(_)
             | Operand::InputArg(_)
@@ -580,6 +689,7 @@ impl PartialEq for Operand {
             (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
             (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
             (Operand::SmallInt(a), Operand::SmallInt(b)) => a == b,
+            (Operand::SmallWide(a), Operand::SmallWide(b)) => a == b,
             (Operand::NullRef, Operand::NullRef) => true,
             (Operand::Const(a), Operand::Const(b)) => Rc::ptr_eq(a, b),
             _ => false,
@@ -608,6 +718,10 @@ impl std::hash::Hash for Operand {
             Operand::SmallInt(encoded) => {
                 3u8.hash(state);
                 encoded.hash(state);
+            }
+            Operand::SmallWide(id) => {
+                6u8.hash(state);
+                id.hash(state);
             }
             Operand::NullRef => 4u8.hash(state),
             Operand::Const(cell) => {
@@ -957,11 +1071,33 @@ mod tests {
         let edge = Operand::const_(Const::Int(i32::MAX as i64));
         let outside = Operand::const_(Const::Int(i32::MAX as i64 + 1));
         assert!(matches!(edge, Operand::SmallInt(_)));
-        assert!(matches!(outside, Operand::Const(_)));
+        assert!(matches!(outside, Operand::SmallWide(_)));
 
         // SmallInt deliberately replaces an Rc-sized payload. Pin this on the
         // two 64-bit production hosts so adding it cannot silently grow the
         // three inline Operand slots embedded in every Op.
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(std::mem::size_of::<Operand>(), 16);
+    }
+
+    #[test]
+    fn wide_const_keeps_fresh_object_identity_without_rc() {
+        let f1 = Operand::const_(Const::Float(1.5));
+        let f2 = Operand::const_(Const::Float(1.5));
+        assert!(matches!(f1, Operand::SmallWide(_)));
+        assert!(matches!(f2, Operand::SmallWide(_)));
+        assert_ne!(f1, f2, "fresh ConstFloat objects have distinct identity");
+        assert_eq!(f1, f1.clone(), "cloning preserves ConstFloat identity");
+        assert!(f1.same_box(&f2), "ConstFloat.same_box compares bits");
+
+        let p1 = Operand::const_(Const::Ref(GcRef(0x1000)));
+        let p2 = Operand::const_(Const::Ref(GcRef(0x1000)));
+        assert!(matches!(p1, Operand::SmallWide(_)));
+        assert_ne!(p1, p2, "fresh ConstPtr objects have distinct identity");
+        assert_eq!(p1, p1.clone());
+        assert!(p1.same_box(&p2));
+        assert_eq!(p1.to_opref(), OpRef::const_ptr(GcRef(0x1000)));
+
         #[cfg(target_pointer_width = "64")]
         assert_eq!(std::mem::size_of::<Operand>(), 16);
     }
