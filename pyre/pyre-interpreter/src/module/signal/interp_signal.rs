@@ -9,8 +9,8 @@ use crate::executioncontext::{
 };
 use crate::pyframe::PyFrame;
 use pyre_object::PyObjectRef;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The signal numbers and names `<signal.h>` supplies elsewhere.
 ///
@@ -420,6 +420,28 @@ pub struct CheckSignalAction {
 }
 
 impl CheckSignalAction {
+    /// interp_signal.py `CheckSignalAction._after_thread_switch`.
+    ///
+    /// `rgc.no_collect`: only reads the current EC and arms the ticker.
+    fn after_thread_switch() {
+        let action = check_signal_action();
+        if action.is_null() {
+            return;
+        }
+        let ec = crate::call::getexecutioncontext();
+        if !ec.is_null() && !unsafe { (*ec).w_async_exception_type }.is_null() {
+            signalstate::rearm_ticker();
+            return;
+        }
+        if unsafe { (*action).fire_in_another_thread }
+            && !ec.is_null()
+            && unsafe { (*ec).signals_enabled } != 0
+        {
+            unsafe { (*action).fire_in_another_thread = false };
+            signalstate::rearm_ticker();
+        }
+    }
+
     /// interp_signal.py `CheckSignalAction.__init__`.
     pub fn new(space: PyObjectRef) -> Box<Self> {
         Box::new(Self {
@@ -522,9 +544,10 @@ fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError
         &[w_n, pyre_object::gc_roots::shadow_stack_get(frame_slot)],
     );
     if res.is_null()
-        && let Some(err) = crate::call::take_call_error() {
-            return Err(err);
-        }
+        && let Some(err) = crate::call::take_call_error()
+    {
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -551,15 +574,28 @@ fn report_wakeup_fd_error(errno_val: i32) {
 }
 
 impl AsyncActionOps for CheckSignalAction {
-    /// interp_signal.py `perform`.  The
-    /// `w_async_exception_type` arm only fires across threads, which pyre
-    /// does not have, so it stays a no-op guard and we proceed straight
-    /// to polling.
+    /// interp_signal.py `perform`.
     fn perform(
         &mut self,
         ec: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, crate::PyError> {
+        let w_exc = crate::module::thread::take_async_exception(ec as *mut ExecutionContext);
+        if !w_exc.is_null() {
+            // interp_signal.py `perform`: raise oefmt(w_exc, "asynchronous
+            // exception triggered from another thread"). Pin the type across
+            // the message allocation.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let cls_slot = pyre_object::gc_roots::pin_roots(&[w_exc]);
+            let w_msg =
+                pyre_object::w_str_new("asynchronous exception triggered from another thread");
+            let msg_slot = pyre_object::gc_roots::pin_roots(&[w_msg]);
+            let w_obj = crate::builtins::exc_exception_new(&[
+                pyre_object::gc_roots::shadow_stack_get(cls_slot),
+                pyre_object::gc_roots::shadow_stack_get(msg_slot),
+            ])?;
+            return Err(unsafe { crate::PyError::from_exc_object(w_obj) });
+        }
         self.poll_for_signals(ec)?;
         Ok(AsyncActionControl::Continue)
     }
@@ -588,9 +624,7 @@ fn check_signal_action() -> *mut CheckSignalAction {
 /// Trace the object-space-owned signal action's managed `space` slot.  PyPy's
 /// translated object graph reaches it through `space.check_signal_action`;
 /// pyre's process-owned Rust allocation needs that edge forwarded explicitly.
-pub(crate) fn walk_check_signal_action_roots(
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
+pub(crate) fn walk_check_signal_action_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let action = check_signal_action();
     if action.is_null() {
         return;
@@ -614,12 +648,14 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
     let action_addr = *CHECK_SIGNAL_ACTION.get_or_init(|| {
         // moduledef.py:64-66 — construct and register the one signal action
         // owned by the process object space.
-        let action: &'static mut CheckSignalAction =
-            Box::leak(CheckSignalAction::new(ec.space));
+        let action: &'static mut CheckSignalAction = Box::leak(CheckSignalAction::new(ec.space));
         action.register_periodic_action(ec.actionflag.shared_mut(), false);
+        // CheckSignalAction.startup — register after a GIL switch so a
+        // signal seen on a worker rearms the main ticker promptly.
+        majit_gc::rgil::invoke_after_thread_switch(CheckSignalAction::after_thread_switch);
 
-        // Hand the ticker cell address to the OS handler (rsignal.py:31-32
-        // `pypysig_getaddr_occurred`).  The handler itself only arms the
+        // Hand the ticker cell address to the OS handler
+        // (`pypysig_getaddr_occurred`).  The handler itself only arms the
         // eval-breaker's async bit, which is a lock-free atomic RMW and so
         // async-signal-safe; `ExecutionContext::bytecode_trace` is what turns
         // that request into a negative ticker, under the GIL.  Writing this
@@ -719,10 +755,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             };
             // `PYPYSIG_USE_SEND` — set by the Windows probe below, which is
             // the only place a descriptor is asked whether it is a socket.
-            #[cfg_attr(
-                not(all(windows, not(feature = "sandbox"))),
-                expect(unused_mut)
-            )]
+            #[cfg_attr(not(all(windows, not(feature = "sandbox"))), expect(unused_mut))]
             let mut use_send = false;
             // interp_signal.py:343-360 — a real fd is validated with
             // `os.fstat` then `get_status_flags`: a bad fd is a ValueError
@@ -895,12 +928,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             checksignals_now()?;
                             Ok(pyre_object::w_none())
                         }
-                        Err(e) => {
-                            Err(crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("raise_signal: {e}"),
-                            ))
-                        }
+                        Err(e) => Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("raise_signal: {e}"),
+                        )),
                     }
                 }
                 #[cfg(not(feature = "host_env"))]
@@ -970,10 +1001,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // The bound is `NSIG`, exclusive: `sigfillset` sets the
                     // bit for `NSIG - 1` and one past it too on darwin, so a
                     // wider bound answers with a signal that has no name.
-                    let sigs = rustpython_host_env::signal::valid_signals(
-                        signalstate::NSIG as usize,
-                    )
-                    .unwrap_or_default();
+                    let sigs =
+                        rustpython_host_env::signal::valid_signals(signalstate::NSIG as usize)
+                            .unwrap_or_default();
                     let items: Vec<pyre_object::PyObjectRef> = sigs
                         .into_iter()
                         .map(|n| pyre_object::w_int_new(n as i64))
@@ -1099,8 +1129,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             rustpython_host_env::signal::double_to_timeval(0.0)
                         },
                     };
-                    let old = rustpython_host_env::signal::setitimer(which, &new_value)
-                        .map_err(|e| {
+                    let old =
+                        rustpython_host_env::signal::setitimer(which, &new_value).map_err(|e| {
                             errno_exception("signal.ItimerError", e.raw_os_error().unwrap_or(0))
                         })?;
                     let (delay, interval) = rustpython_host_env::signal::itimerval_to_tuple(&old);
@@ -1232,13 +1262,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 "sigwait() takes exactly one argument (0 given)",
                             ));
                         }
-                        let mut set =
-                            rustpython_host_env::signal::sigemptyset().map_err(|e| {
-                                crate::PyError::os_error_with_errno(
-                                    e.raw_os_error().unwrap_or(0),
-                                    format!("sigemptyset: {e}"),
-                                )
-                            })?;
+                        let mut set = rustpython_host_env::signal::sigemptyset().map_err(|e| {
+                            crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("sigemptyset: {e}"),
+                            )
+                        })?;
                         for it in signal_set_items(args[0])? {
                             // Range-check before narrowing, or a number that
                             // aliases a valid signal in its low 32 bits passes.
@@ -1294,9 +1323,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                         // interp_signal.py _sigset_to_signals
                         let items: Vec<pyre_object::PyObjectRef> = (1..signalstate::NSIG)
-                            .filter(|s| {
-                                rustpython_host_env::signal::sigset_contains(mask, *s)
-                            })
+                            .filter(|s| rustpython_host_env::signal::sigset_contains(mask, *s))
                             .map(|s| pyre_object::w_int_new(s as i64))
                             .collect();
                         Ok(pyre_object::w_set_from_items(&items))
@@ -1328,12 +1355,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 "pthread_kill() takes exactly 2 arguments",
                             ));
                         }
-                        let tid =
-                            (unsafe { pyre_object::w_int_get_value(args[0]) }) as u64;
-                        let signum =
-                            (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                        let ret =
-                            unsafe { libc::pthread_kill(tid as libc::pthread_t, signum) };
+                        let tid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u64;
+                        let signum = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                        let ret = unsafe { libc::pthread_kill(tid as libc::pthread_t, signum) };
                         if ret != 0 {
                             return Err(errno_exception("OSError", ret));
                         }
@@ -1429,9 +1453,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         // unblocked, their handlers may now be pending.
                         checksignals_now()?;
                         let out: Vec<pyre_object::PyObjectRef> = (1..=64)
-                            .filter(|s| {
-                                rustpython_host_env::signal::sigset_contains(prev, *s)
-                            })
+                            .filter(|s| rustpython_host_env::signal::sigset_contains(prev, *s))
                             .map(|s| pyre_object::w_int_new(s as i64))
                             .collect();
                         Ok(pyre_object::w_set_from_items(&out))

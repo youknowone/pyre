@@ -30,37 +30,6 @@ pub struct W_SRE_Pattern {
     pub w_indexgroup: PyObjectRef,
 }
 
-/// Every `W_SRE_Pattern` ever allocated.  PyPy's compiled patterns are normal
-/// interpreter objects, shared by all threads; the root owner must therefore
-/// be process-global too.  The addresses are stored as `usize` because the
-/// immortal raw pointer itself is not `Send`.
-///
-/// Patterns are `malloc_typed` (immortal, off-GC), so the collector never
-/// traces into them: their GC-heap `w_pattern` / `w_groupindex` /
-/// `w_indexgroup` slots would otherwise be reclaimed or relocated without
-/// updating the slot.
-static SRE_PATTERNS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
-    std::sync::OnceLock::new();
-
-fn sre_patterns() -> &'static parking_lot::Mutex<Vec<usize>> {
-    SRE_PATTERNS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
-}
-
-/// Visit each immortal pattern's GC-heap `PyObjectRef` slots as roots.
-#[majit_macros::dont_look_inside]
-pub fn walk_sre_pattern_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let patterns = sre_patterns().lock();
-    for &addr in patterns.iter() {
-        if addr == 0 {
-            continue;
-        }
-        let pattern = addr as *mut W_SRE_Pattern;
-        visitor(unsafe { &mut (*pattern).w_pattern });
-        visitor(unsafe { &mut (*pattern).w_groupindex });
-        visitor(unsafe { &mut (*pattern).w_indexgroup });
-    }
-}
-
 /// Allocate a `W_SRE_Pattern` — `SRE_Pattern__new__` field stamping
 /// (interp_sre.py:624-639).
 pub fn w_sre_pattern_new(
@@ -89,10 +58,6 @@ pub fn w_sre_pattern_new(
         w_groupindex,
         w_indexgroup,
     });
-    // This is a prebuilt-family root store: make the collector rescan it after
-    // publishing a newly allocated pattern.
-    crate::gc_roots::mark_prebuilt_roots_dirty();
-    sre_patterns().lock().push(obj as usize);
     obj
 }
 

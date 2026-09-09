@@ -146,11 +146,12 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
             let items = unsafe {
                 pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(dict_slot))
             };
-            let items_slot = pyre_object::gc_roots::shadow_stack_len();
+            let mut live = Vec::with_capacity(items.len() * 2);
             for (k, v) in &items {
-                let _ = pyre_object::gc_roots::pin_root(*k);
-                let _ = pyre_object::gc_roots::pin_root(*v);
+                live.push(*k);
+                live.push(*v);
             }
+            let items_slot = pyre_object::gc_roots::pin_roots(&live);
             let mut count = 0usize;
             for index in 0..items.len() {
                 let k = pyre_object::gc_roots::shadow_stack_get(items_slot + 2 * index);
@@ -326,10 +327,7 @@ fn reduce_2(
     // Same as `reduce_1`: boxing `proto` allocates, and here it would move
     // three already-copied references.
     let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_obj);
-    let _ = pyre_object::gc_roots::pin_root(w_args);
-    let _ = pyre_object::gc_roots::pin_root(w_kwargs);
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj, w_args, w_kwargs]);
     let w_proto = pyre_object::w_int_new(proto);
     let proto_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_proto);
@@ -409,9 +407,7 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
             )));
         }
         let (hasargs, w_args, w_kwargs) = getnewargs(current_obj())?;
-        let args_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_args);
-        let _ = pyre_object::gc_roots::pin_root(w_kwargs);
+        let args_slot = pyre_object::gc_roots::pin_roots(&[w_args, w_kwargs]);
         // CPython 3.14 `object_getstate_default(required)`: when no
         // `__getnewargs__` supplied constructor state, a native layout whose
         // basicsize exceeds the plain object + managed dict/weakref/slots

@@ -100,15 +100,17 @@ pub mod frame_locals_proxy {
     /// bounded by the green `locals_plus_names`.  `contains_loop` therefore
     /// declines this graph and the extras walk stays one residual call.
     fn pin_extra_locals_entries(extra: PyObjectRef) -> usize {
-        let mut count = 0;
-        // Nothing here allocates, so the pairs still queued in this native
-        // snapshot stay reachable through the dict itself.
-        for (key, value) in unsafe { pyre_object::dictmultiobject::w_dict_items(extra) } {
-            let _ = pyre_object::gc_roots::pin_root(key);
-            let _ = pyre_object::gc_roots::pin_root(value);
-            count += 1;
+        // `pin_root` itself is a forwarding query, so a sequential pin of
+        // the remaining pairs would leave them unrooted across that
+        // safepoint. Publish the whole snapshot first.
+        let items = unsafe { pyre_object::dictmultiobject::w_dict_items(extra) };
+        let mut live = Vec::with_capacity(items.len() * 2);
+        for (key, value) in items {
+            live.push(key);
+            live.push(value);
         }
-        count
+        let _ = pyre_object::gc_roots::pin_roots(&live);
+        live.len() / 2
     }
 
     impl FrameLocalsProxy {
@@ -1042,14 +1044,15 @@ fn merge_extra_locals(snapshot: PyObjectRef, extra: PyObjectRef) -> Result<(), c
     // queued in this native snapshot are published first and read back per
     // store.
     let roots = pyre_object::gc_roots::push_roots();
-    let snapshot_slot = roots.base();
-    let _ = roots.pin_root(snapshot);
-    let items_base = pyre_object::gc_roots::shadow_stack_len();
     let items = unsafe { pyre_object::dictmultiobject::w_dict_items(extra) };
+    let mut live = Vec::with_capacity(1 + items.len() * 2);
+    live.push(snapshot);
     for &(key, value) in &items {
-        let _ = roots.pin_root(key);
-        let _ = roots.pin_root(value);
+        live.push(key);
+        live.push(value);
     }
+    let snapshot_slot = roots.pin_roots(&live);
+    let items_base = snapshot_slot + 1;
     for index in 0..items.len() {
         let key = roots.get(items_base + index * 2);
         if crate::baseobjspace::contains(roots.get(snapshot_slot), key)? {
@@ -5171,9 +5174,10 @@ impl PyFrame {
         if !self.w_yielding_from.is_null() {
             released.push(majit_ir::GcRef(self.w_yielding_from as usize));
         }
-        if !self.f_backref.is_null() {
-            released.push(majit_ir::GcRef(self.f_backref as usize));
-        }
+        // `f_backref` is the caller frame, still on the stack.  CPython's
+        // refcount drop is only the generator frame's own locals;
+        // walking the caller here treats live test-method objects as
+        // released and forces a heap collect on every `close()`.
         if let Some(debug) = self.getdebug_data() {
             released.extend(
                 [debug.w_locals, debug.w_extra_locals, debug.w_f_trace]
@@ -5981,13 +5985,12 @@ impl PyFrame {
         // values here; after a collection only the gcmap/shadow slots are
         // forwarded, so never carry the original slice across that call.
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(code as PyObjectRef);
-        let _ = _roots.pin_root(w_globals);
-        let _ = _roots.pin_root(closure);
-        for &arg in args {
-            let _ = _roots.pin_root(arg);
-        }
+        let mut live = Vec::with_capacity(3 + args.len());
+        live.push(code as PyObjectRef);
+        live.push(w_globals);
+        live.push(closure);
+        live.extend_from_slice(args);
+        let root_base = _roots.pin_roots(&live);
         let w_builtin = crate::baseobjspace::frame_builtin_obj_checked(
             _roots.get(root_base + 1),
             execution_context,
@@ -6024,13 +6027,12 @@ impl PyFrame {
         allocation: FrameLocalsArrayAllocation,
     ) -> Self {
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(code as PyObjectRef);
-        let _ = _roots.pin_root(w_globals);
-        let _ = _roots.pin_root(closure);
-        for &arg in args {
-            let _ = _roots.pin_root(arg);
-        }
+        let mut live = Vec::with_capacity(3 + args.len());
+        live.push(code as PyObjectRef);
+        live.push(w_globals);
+        live.push(closure);
+        live.extend_from_slice(args);
+        let root_base = _roots.pin_roots(&live);
         let w_builtin =
             crate::baseobjspace::frame_builtin_obj(_roots.get(root_base + 1), execution_context);
         let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());

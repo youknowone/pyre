@@ -21,6 +21,14 @@ pub const TYPE_ID_MASK: u64 = (1u64 << TYPE_ID_BITS) - 1;
 /// logical header word. `GcFlags` declares each flag at position 0..N.
 pub const FLAG_SHIFT: u32 = TYPE_ID_BITS;
 
+/// `llarena.round_up_for_allocation` / `memory_alignment()`: objects align
+/// to the wider of the physical header and a machine word.
+pub const MEMORY_ALIGNMENT: usize = if GcHeader::ALIGN > std::mem::size_of::<usize>() {
+    GcHeader::ALIGN
+} else {
+    std::mem::size_of::<usize>()
+};
+
 /// The sentinel value written into a forwarded nursery object's header.
 /// Equivalent to incminimark's `tid = -42` in a native Signed word.
 pub const FORWARDED_MARKER: u64 = (usize::MAX - 41) as u64;

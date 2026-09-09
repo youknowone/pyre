@@ -952,8 +952,9 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     let w_code = w_code_value as PyObjectRef;
     let w_globals = w_globals_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_exc = pyre_object::gc_roots::pin_root(w_exc);
-    let w_code = pyre_object::gc_roots::pin_root(w_code);
+    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_code]);
+    let w_exc = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_globals = pyre_object::gc_roots::pin_root(w_globals);
     // `record_application_traceback` requires the traceback's own frame
     // identity. The recording walker cannot force the optimizer's virtual
@@ -1033,8 +1034,9 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
     let w_exc = exc_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_exc = pyre_object::gc_roots::pin_root(w_exc);
-    let w_code = pyre_object::gc_roots::pin_root(w_code);
+    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_code]);
+    let w_exc = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_globals = pyre_object::gc_roots::pin_root(w_globals);
     let Ok(mut frame) = pyre_interpreter::createframe_obj(
         w_code as *const (),
@@ -5673,12 +5675,11 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     // rewrite these copied native parameters.  Root them immediately and
     // dispatch only values reloaded from the forwarded slots.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = _roots.base();
-    let _ = _roots.pin_root(callable);
-    let _ = _roots.pin_root(null_or_self);
-    for &arg in args {
-        let _ = _roots.pin_root(arg);
-    }
+    let mut live = Vec::with_capacity(2 + args.len());
+    live.push(callable);
+    live.push(null_or_self);
+    live.extend_from_slice(args);
+    let root_base = _roots.pin_roots(&live);
     // `eval.rs`'s `PyFrame::call` — a non-null null_or_self is the method receiver
     // (load_method_fast_path pushes `[w_descr, w_obj]`); the call proceeds
     // as `callable(null_or_self, *args)`.

@@ -654,9 +654,8 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
             // below can write through a relocated (stale) pointer.  Its
             // digest keys the store, so the element is hashed once.
             let _roots = pyre_object::gc_roots::push_roots();
-            let sp = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(set);
-            let value = pyre_object::gc_roots::pin_root(value);
+            let sp = _roots.pin_roots(&[set, value]);
+            let value = _roots.get(sp + 1);
             let hash = crate::builtins::try_hash_value(value).map_err(|err| {
                 crate::baseobjspace::wrap_set_element_hash_error(
                     pyre_object::gc_roots::shadow_stack_get(sp + 1),
@@ -741,10 +740,8 @@ pub fn map_add_value(
         // user `__hash__`) and reload before the store, mirroring
         // `set_add_value`.
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(dict);
-        let key = pyre_object::gc_roots::pin_root(key);
-        let _ = pyre_object::gc_roots::pin_root(value);
+        let sp = _roots.pin_roots(&[dict, key, value]);
+        let key = _roots.get(sp + 1);
         let hash = crate::builtins::try_hash_value(key)
             .map_err(|err| crate::baseobjspace::wrap_dict_key_hash_error(key, err))?;
         let dict = pyre_object::gc_roots::shadow_stack_get(sp);
@@ -794,9 +791,7 @@ pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError
     // and `dict` is a `W_DictObject`, which relocates.  Pinning the pair below
     // the fetch published the words that were live before it.
     let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(dict);
-    let _ = pyre_object::gc_roots::pin_root(source);
+    let sp = _roots.pin_roots(&[dict, source]);
     let source_now = || pyre_object::gc_roots::shadow_stack_get(sp + 1);
     let keys_method = crate::baseobjspace::getattr_str(source_now(), "keys")?;
     let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
@@ -810,11 +805,8 @@ pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError
         // duration: `getitem` (arbitrary `__getitem__`) and
         // `try_hash_value` (arbitrary `__hash__`) both may allocate and
         // move them.
-        let key_base = pyre_object::gc_roots::shadow_stack_len();
-        for index in 0..keys.len() {
-            let _ = pyre_object::gc_roots::pin_root(keys[index]);
-        }
-        let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+        let key_base = pyre_object::gc_roots::pin_roots(&keys);
+        let key_len = keys.len();
         for i in 0..key_len {
             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
             let val = crate::baseobjspace::getitem(source_now(), key)?;
@@ -843,9 +835,7 @@ pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError
 /// `dict_update` and the JIT residual `bh_dict_update_fn`.
 pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.base();
-    let _ = roots.pin_root(dict);
-    let _ = roots.pin_root(source);
+    let base = roots.pin_roots(&[dict, source]);
     match dict_update(roots.get(base), roots.get(base + 1)) {
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
             // The update ran Python, so the operand is named at the address it
@@ -880,10 +870,7 @@ pub fn dict_merge_value(
     // and a stale source is read as a mapping it no longer is.  `dict_update`
     // above brackets the same walk.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(dict);
-    let _ = pyre_object::gc_roots::pin_root(source);
-    let _ = pyre_object::gc_roots::pin_root(w_callable);
+    let root_base = _roots.pin_roots(&[dict, source, w_callable]);
     let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let source = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let w_callable = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
@@ -921,11 +908,12 @@ pub fn dict_merge_value(
             // A store into the target allocates the storage it grows into, so
             // the snapshot has to be published too.
             let items = unsafe { pyre_object::w_dict_items(source()) };
-            let items_base = pyre_object::gc_roots::shadow_stack_len();
+            let mut live = Vec::with_capacity(items.len() * 2);
             for &(k, v) in &items {
-                let _ = pyre_object::gc_roots::pin_root(k);
-                let _ = pyre_object::gc_roots::pin_root(v);
+                live.push(k);
+                live.push(v);
             }
+            let items_base = pyre_object::gc_roots::pin_roots(&live);
             for index in 0..items.len() {
                 unsafe {
                     pyre_object::w_dict_store(

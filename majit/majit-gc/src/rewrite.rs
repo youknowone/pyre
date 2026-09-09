@@ -2741,10 +2741,11 @@ impl GcRewriterImpl {
             .wb_descr
             .as_ref()
             .expect("gen_write_barrier_array reached with no write barrier descriptor");
-        if wb_descr.jit_wb_cards_set != 0 {
-            // If we know statically the length of 'v_base', and it is not
-            // too big, then produce a regular write_barrier. If it's
-            // unknown or too big, produce a write_barrier_from_array.
+        if wb_descr.has_write_barrier_from_array() {
+            // rewrite.py `gen_write_barrier_array`. If we know
+            // statically the length of 'v_base', and it is not too big,
+            // then produce a regular write_barrier. If it's unknown or
+            // too big, produce a write_barrier_from_array.
             const LARGE: usize = 130;
             let length = st.known_length(&v_base, LARGE);
             if length >= LARGE {

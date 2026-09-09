@@ -233,8 +233,8 @@ impl Nursery {
     pub fn alloc(&mut self, total_size: usize) -> *mut u8 {
         // Ensure minimum size for forwarding during collection.
         let total_size = total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE);
-        // Align to 8 bytes.
-        let total_size = (total_size + 7) & !7;
+        let total_size = (total_size + crate::header::MEMORY_ALIGNMENT - 1)
+            & !(crate::header::MEMORY_ALIGNMENT - 1);
 
         let result = self.ptrs.free;
         // Use wrapping_add for the bound probe: when the nursery is already

@@ -5093,19 +5093,20 @@ fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// forwards, as one root source.
 ///
 /// Every holder here is `malloc_typed` or a plain static, so the marker skips
-/// it and this walk is the only path to its contents. All four are
+/// it and this walk is the only path to its contents. All three are
 /// process-global rather than per-mutator for the same reason: each outlives
 /// the thread that filled it. `w_globals` (`pycode.py:159-165
-/// frame_stores_global`) is first-store-wins, `_mapdict_caches[i].w_method`
-/// (mapdict.py:1418) is filled once, and a compiled `W_SRE_Pattern` outlives
-/// its compiling thread — as per-mutator areas their slots would lose their
-/// root at that thread's `unregister_mutator` while the holder stayed live.
+/// frame_stores_global`) is first-store-wins and `_mapdict_caches[i].w_method`
+/// (mapdict.py:1418) is filled once — as per-mutator areas their slots would
+/// lose their root at that thread's `unregister_mutator` while the holder
+/// stayed live. Compiled `W_SRE_Pattern` objects are ordinary managed
+/// instances (`interp_sre.py SRE_Pattern__new__`); their fields are traced
+/// from the object, not from a side table.
 fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_rbigint_parts_cache(visitor);
     pyre_interpreter::module::_io::walk_autoflusher_roots(|slot| {
         visit_pyobject_root(slot, visitor)
     });
-    sre_pattern_root_walker(visitor);
     w_globals_stamped_code_root_walker(visitor);
     mapdict_method_cache_root_walker(visitor);
 }
@@ -6143,12 +6144,6 @@ fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir
 #[allow(dead_code)]
 fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
-        visit_pyobject_root(slot, visitor);
-    });
-}
-
-fn sre_pattern_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_object::interp_sre::walk_sre_pattern_roots(|slot| {
         visit_pyobject_root(slot, visitor);
     });
 }
@@ -7547,8 +7542,8 @@ fn drive_unpack_iterable_trace(
         // scope guard truncates both entries on the way out; `pin_root` without
         // one grows `ln`'s shadow stack by two per jd1 crossing.
         let _enter_roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(w_iterator);
-        let items = pyre_object::gc_roots::pin_root(items);
+        let base = pyre_object::gc_roots::pin_roots(&[w_iterator, items]);
+        let items = pyre_object::gc_roots::shadow_stack_get(base + 1);
         let before = unsafe { pyre_object::listobject::w_list_len(items) };
         // A drain-time error that is not the loop-exit StopIteration has to
         // travel out of the unpack; `ln` cannot re-derive it, because calling

@@ -3925,12 +3925,11 @@ pub fn funccall_valuestack(
         // `[code, w_obj, ...rest]` set has to be published here and read back
         // for the call.
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(code as PyObjectRef);
-        let _ = _roots.pin_root(w_obj);
-        for &w_arg in &rest {
-            let _ = _roots.pin_root(w_arg);
-        }
+        let mut live = Vec::with_capacity(2 + rest.len());
+        live.push(code as PyObjectRef);
+        live.push(w_obj);
+        live.extend_from_slice(&rest);
+        let root_base = _roots.pin_roots(&live);
         frame.dropvalues(dropvalues);
         let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
         return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) } {

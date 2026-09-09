@@ -993,7 +993,7 @@ pub unsafe extern "C" fn PyBuffer_SizeFromFormat(format: *const c_char) -> isize
     let format = format_of(format);
     let sized = super::import_::import_module("_struct").and_then(|module| {
         let roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::shadow_stack_len();
+        let base = roots.base();
         let _ = roots.pin_root(module);
         let _ = roots.pin_root(pyre_object::w_str_new(&format));
         let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
