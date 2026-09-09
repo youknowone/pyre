@@ -749,9 +749,21 @@ pub fn compile_with_codegen_warnings(
         &source,
         mode,
         filename,
-        opts,
+        opts.clone(),
         &mut handler,
     );
+    let result = match result {
+        Err(error) => crate::compile::retry_named_escape_parse(&source, error, |rewritten| {
+            crate::compile::rp_compile_with_syntax_warning_handler(
+                rewritten,
+                mode,
+                filename,
+                opts,
+                &mut handler,
+            )
+        }),
+        Ok(code) => Ok(code),
+    };
     match escalated.take() {
         Some(error) => Err(SourceCompileError::Warning(error)),
         None => result.map_err(SourceCompileError::Compile),

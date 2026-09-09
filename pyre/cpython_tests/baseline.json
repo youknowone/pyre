@@ -124,6 +124,10 @@
     "test.test_builtin": {
       "dynasm": "FAIL"
     },
+    "test.test_bytecode_helper": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
     "test.test_bytes": {
       "dynasm": "IMPORTERROR"
     },
@@ -356,6 +360,10 @@
     "test.test_dict": {
       "dynasm": "PASS"
     },
+    "test.test_dict_version": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
     "test.test_dictcomps": {
       "dynasm": "PASS"
     },
@@ -503,7 +511,7 @@
       "reason": "implementation detail"
     },
     "test.test_fstring": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_ftplib": {
       "dynasm": "PASS"
@@ -650,7 +658,7 @@
       "reason": "package skips itself on a free-threaded build (Py_GIL_DISABLED)"
     },
     "test.test_io": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_ioctl": {
       "dynasm": "FAIL"
@@ -826,12 +834,16 @@
     "test.test_os": {
       "dynasm": "PASS"
     },
+    "test.test_ossaudiodev": {
+      "dynasm": "SKIP",
+      "reason": "needs low level audio"
+    },
     "test.test_osx_env": {
       "cranelift": "SKIP",
       "dynasm": "SKIP"
     },
     "test.test_pathlib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_patma": {
       "dynasm": "IMPORTERROR"
@@ -971,6 +983,10 @@
     "test.test_readline": {
       "dynasm": "IMPORTERROR"
     },
+    "test.test_refcounting": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail (refcount semantics)"
+    },
     "test.test_regrtest": {
       "dynasm": "PASS"
     },
@@ -1081,7 +1097,7 @@
       "dynasm": "PASS"
     },
     "test.test_statistics": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_str": {
       "dynasm": "PASS"
@@ -1204,12 +1220,16 @@
     "test.test_timeout": {
       "dynasm": "TIMEOUT"
     },
+    "test.test_tk": {
+      "dynasm": "SKIP",
+      "reason": "needs display"
+    },
     "test.test_tkinter": {
       "dynasm": "SKIP",
       "reason": "needs display"
     },
     "test.test_tokenize": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_tomllib": {
       "dynasm": "PASS"
@@ -1308,7 +1328,7 @@
       "dynasm": "FAIL"
     },
     "test.test_unparse": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_urllib": {
       "dynasm": "PASS"
@@ -1448,26 +1468,6 @@
     "test.test_zstd": {
       "dynasm": "SKIP",
       "reason": "no PyPy owner for the _zstd accelerator"
-    },
-    "test.test_dict_version": {
-      "dynasm": "SKIP",
-      "reason": "implementation detail"
-    },
-    "test.test_bytecode_helper": {
-      "dynasm": "SKIP",
-      "reason": "implementation detail"
-    },
-    "test.test_refcounting": {
-      "dynasm": "SKIP",
-      "reason": "implementation detail (refcount semantics)"
-    },
-    "test.test_ossaudiodev": {
-      "dynasm": "SKIP",
-      "reason": "needs low level audio"
-    },
-    "test.test_tk": {
-      "dynasm": "SKIP",
-      "reason": "needs display"
     }
   },
   "stdlib_version": "3.14.6"
