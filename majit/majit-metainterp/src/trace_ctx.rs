@@ -606,10 +606,10 @@ pub struct TraceCtx {
     /// TraceCtx because TraceCtx is freshly created per trace and the
     /// MetaInterp is reused across traces.
     forced_virtualizable: Option<OpRef>,
-    /// pyjitpl.py:2397: call_pure_results — maps constant argument tuples
-    /// to their concrete result values, recorded during tracing.
-    /// Passed to the optimizer for cross-iteration CALL_PURE folding.
-    pub(crate) call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
+    /// pyjitpl.py MetaInterp.__init__ creates one args_dict per attempt.
+    /// TraceCtx is the native attempt owner; compilation and optimization
+    /// share this dictionary and its rooted constants, not address snapshots.
+    pub(crate) call_pure_results: crate::optimizeopt::util::ArgsDict,
     /// Cached `warmstate.trace_limit` snapshot for this tracing session.
     /// pyjitpl.py:2789 reads `self.jitdriver_sd.warmstate.trace_limit` each
     /// call; pyre snapshots it at `setup_tracing` time (warmstate owns the
@@ -1869,7 +1869,7 @@ impl TraceCtx {
             merge_point_resumed: false,
             walk_resume_pc: None,
             callinfocollection: None,
-            call_pure_results: indexmap::IndexMap::new(),
+            call_pure_results: crate::optimizeopt::util::args_dict(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
@@ -1970,7 +1970,7 @@ impl TraceCtx {
             merge_point_resumed: false,
             walk_resume_pc: None,
             callinfocollection: None,
-            call_pure_results: indexmap::IndexMap::new(),
+            call_pure_results: crate::optimizeopt::util::args_dict(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,

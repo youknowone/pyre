@@ -602,7 +602,10 @@ fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
         reset_single_frame_blackhole();
         let _ = latch_abort_blackhole(ctx, resume_pc, "force-qmut");
     } else if ctx.vstack_valid && !ctx.trace_ctx.is_bridge_trace {
-        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
+        fbw_qmut_abort_stack_latch(
+            ctx.vstack_cur_pypc as usize,
+            ctx.frame_state.borrow().vstack_boxes.clone(),
+        );
     }
     // The session flag survives recovered sub-walks; always overwrite it at
     // the raise site so a later root-frame abort cannot inherit `true`.

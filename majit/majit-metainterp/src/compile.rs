@@ -420,7 +420,7 @@ pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
     #[allow(dead_code)]
     pub runtime_boxes: &'a [OpRef],
-    pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
     #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
@@ -429,7 +429,7 @@ impl<'a> PreambleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
-        call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -446,7 +446,7 @@ pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
     #[allow(dead_code)]
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
     #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
@@ -455,7 +455,7 @@ impl<'a> SimpleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -474,7 +474,7 @@ pub struct BridgeCompileData<'a> {
     pub runtime_boxes: &'a [OpRef],
     #[allow(dead_code)]
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
     pub inline_short_preamble: bool,
     #[allow(dead_code)]
     pub enable_opts: &'a [String],
@@ -485,7 +485,7 @@ impl<'a> BridgeCompileData<'a> {
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
         inline_short_preamble: bool,
         enable_opts: &'a [String],
     ) -> Self {
@@ -508,7 +508,7 @@ pub struct UnrolledLoopData<'a> {
     #[allow(dead_code)]
     pub state: &'a crate::optimizeopt::unroll::ExportedState,
     #[allow(dead_code)]
-    pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
     #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
@@ -518,7 +518,7 @@ impl<'a> UnrolledLoopData<'a> {
         trace: &'a TreeLoop,
         celltoken: &'a Arc<JitCellToken>,
         state: &'a crate::optimizeopt::unroll::ExportedState,
-        call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
         enable_opts: &'a [String],
     ) -> Self {
         Self {

@@ -337,7 +337,7 @@ pub struct OptPure {
     /// optimizer.py: call_pure_results passed into propagate_all_forward.
     /// RPython keys are lists of constant boxes (value-based equality).
     /// Keys are the constant Values that _can_optimize_call_pure builds.
-    call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
+    call_pure_results: crate::optimizeopt::util::ArgsDict,
     /// shortpreamble.py: PureOp.produce_op stores PreambleOp in
     /// optpure's cache. In majit, PreambleOp entries stored here are
     /// searched with forwarding-aware matching (force_preamble_op pattern).
@@ -370,7 +370,7 @@ impl OptPure {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: indexmap::IndexMap::new(),
+            call_pure_results: crate::optimizeopt::util::args_dict(),
             preamble_pure_ops: Vec::new(),
         }
     }
@@ -842,10 +842,7 @@ impl OptPure {
                 .and_then(|b| ctx.get_constant_box(&b))?;
             arg_consts.push(const_value);
         }
-        self.call_pure_results
-            .iter()
-            .find(|(k, _)| k.as_slice() == arg_consts.as_slice())
-            .map(|(_, v)| *v)
+        self.call_pure_results.get(&arg_consts)
     }
 }
 
@@ -1276,7 +1273,7 @@ impl Optimization for OptPure {
         // preamble_pure_ops also NOT cleared — populated during import.
     }
 
-    fn set_call_pure_results(&mut self, results: &indexmap::IndexMap<Vec<Value>, Value>) {
+    fn set_call_pure_results(&mut self, results: &crate::optimizeopt::util::ArgsDict) {
         self.call_pure_results = results.clone();
     }
 
@@ -1890,7 +1887,7 @@ mod tests {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: indexmap::IndexMap::new(),
+            call_pure_results: crate::optimizeopt::util::args_dict(),
             preamble_pure_ops: Vec::new(),
         }));
         let result = opt
