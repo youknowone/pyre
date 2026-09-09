@@ -21,6 +21,7 @@ use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::j2plan::{GuardKind, IntBinKind, IntUnaryKind, LirOp, LoadKind, StoreKind};
 use crate::regloc::*;
 use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, descr_identity};
+use smallvec::SmallVec;
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -56,8 +57,10 @@ pub struct Lifetime {
     pub definition_pos: i32,
     /// regalloc.py:918 position where the variable is last used (including failargs/jump)
     pub last_usage: i32,
-    /// regalloc.py:921 *real* usages (as op argument, excluding jump/failargs)
-    pub real_usages: Option<Vec<i32>>,
+    /// `Lifetime.real_usages` — *real* usages (as op argument, excluding
+    /// jump/failargs). Four inline slots cover the common SSA use-count
+    /// so the first `push` does not heap-grow 16 B per live box.
+    pub real_usages: Option<SmallVec<[i32; 4]>>,
     /// regalloc.py:925 positions requiring specific registers
     pub fixed_positions: Option<Vec<(i32, RegLoc)>>,
     /// regalloc.py another Lifetime that wants to share a register
@@ -455,7 +458,7 @@ pub fn compute_vars_longevity<T: AsRef<Op>>(
             // real_usages: exclude JUMP and LABEL
             if opnum != OpCode::Jump && opnum != OpCode::Label {
                 if lifetime.real_usages.is_none() {
-                    lifetime.real_usages = Some(Vec::new());
+                    lifetime.real_usages = Some(SmallVec::new());
                 }
                 lifetime.real_usages.as_mut().unwrap().push(i);
             }
@@ -6330,19 +6333,19 @@ mod tests {
         // (used twice as arg to int_add at position 0)
         let lt_i0 = longevity.get(i0).unwrap();
         assert_eq!(lt_i0.last_usage, 1);
-        assert_eq!(lt_i0.real_usages.as_ref().unwrap(), &[0, 0]);
+        assert_eq!(lt_i0.real_usages.as_ref().unwrap().as_slice(), &[0, 0]);
 
         // i1: defined at 0, last used at 2 (jump), real usages: [1]
         let lt_i1 = longevity.get(i1).unwrap();
         assert_eq!(lt_i1.definition_pos, 0);
         assert_eq!(lt_i1.last_usage, 2);
-        assert_eq!(lt_i1.real_usages.as_ref().unwrap(), &[1]);
+        assert_eq!(lt_i1.real_usages.as_ref().unwrap().as_slice(), &[1]);
     }
 
     #[test]
     fn test_lifetime_next_real_usage() {
         let mut lt = Lifetime::new(0, 10);
-        lt.real_usages = Some(vec![2, 5, 8]);
+        lt.real_usages = Some(SmallVec::from_slice(&[2, 5, 8]));
 
         assert_eq!(lt.next_real_usage(0), 2);
         assert_eq!(lt.next_real_usage(1), 2);
@@ -6408,11 +6411,11 @@ mod tests {
     fn test_register_spill() {
         let mut longevity = LifetimeManager::new();
         let mut lt0 = Lifetime::new(0, 10);
-        lt0.real_usages = Some(vec![5]);
+        lt0.real_usages = Some(SmallVec::from_slice(&[5]));
         let mut lt1 = Lifetime::new(1, 10);
-        lt1.real_usages = Some(vec![6]);
+        lt1.real_usages = Some(SmallVec::from_slice(&[6]));
         let mut lt2 = Lifetime::new(2, 10);
-        lt2.real_usages = Some(vec![7]);
+        lt2.real_usages = Some(SmallVec::from_slice(&[7]));
         longevity.set(OpRef::int_op(0), lt0);
         longevity.set(OpRef::int_op(1), lt1);
         longevity.set(OpRef::int_op(2), lt2);

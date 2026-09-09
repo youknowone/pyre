@@ -4,6 +4,7 @@
 use indexmap::IndexMap;
 use majit_ir::operand::Operand;
 use majit_ir::{InputArg, OPCODE_COUNT, OpCode, OpRc, OpRef, Type, Value};
+use smallvec::SmallVec;
 
 #[allow(dead_code)]
 fn u16_to_opcode(v: u16) -> OpCode {
@@ -1217,7 +1218,9 @@ pub struct SnapshotIterator<'a> {
     /// opencoder.py:211,214-217 self.framestack — snapshot byte
     /// offsets in bottom-up order (outermost frame first, innermost
     /// frame last), built by reversing the top-down iterator.
-    pub framestack: Vec<usize>,
+    /// Four inline slots cover the usual one-to-few frame chain so
+    /// `SnapshotIterator.__init__` does not heap-grow 32 B per snapshot.
+    pub framestack: SmallVec<[usize; 4]>,
     /// Back-reference to `_snapshot_array_data` so callers can
     /// construct fresh `BoxArrayIter` values without rethreading the
     /// buffer. Matches RPython's implicit `main_iter.trace._snapshot_array_data`
@@ -1240,7 +1243,7 @@ impl<'a> SnapshotIterator<'a> {
         let vref_len = BoxArrayIter::new(snapshot_array_data, vref_idx).total_length;
         // opencoder.py:210 `size = vable.total_length + vref.total_length + 3`.
         let mut size = vable_len + vref_len + 3;
-        let mut framestack = Vec::new();
+        let mut framestack = SmallVec::new();
         // opencoder.py:212-213 early return for empty top snapshot.
         if !it.is_empty_snapshot(snapshot_index) {
             // opencoder.py:214-216 `for snapshot_index in it: ...`
