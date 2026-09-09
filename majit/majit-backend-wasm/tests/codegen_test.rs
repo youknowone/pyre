@@ -511,14 +511,15 @@ fn build_module(
     vtable_offset: Option<usize>,
     gc_info: &codegen::GuardGcTypeInfo,
 ) -> (Vec<u8>, Vec<codegen::GuardExit>) {
-    build_module_with_frame(
-        inputargs,
-        ops,
-        constants,
-        vtable_offset,
-        gc_info,
-        codegen::FrameGeometry::fixed(),
-    )
+    let homes = codegen::count_ref_homes(inputargs, ops);
+    let frame = if homes == 0 {
+        codegen::FrameGeometry::fixed()
+    } else {
+        let values = codegen::frame_value_slots(inputargs, ops)
+            .max(codegen::FrameGeometry::fixed().value_slots);
+        codegen::FrameGeometry::compact(values, homes, 0)
+    };
+    build_module_with_frame(inputargs, ops, constants, vtable_offset, gc_info, frame)
 }
 
 fn build_module_with_frame(
