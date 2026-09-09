@@ -2458,15 +2458,27 @@ fn emit_ca_pop_shadowstack(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_store(mem32(0));
 }
 
-/// CA return footer: `execute_token`'s post-FINISH gcmap publish, then
-/// `_call_footer_shadowstack`.
+/// x86 `genop_finish` else-arm: `MOV [jf_gcmap], 0` when the assembler has
+/// no `_finish_gcmap`. That field is only retained for `GUARD_NOT_FORCED_2`;
+/// a leftover `jf_force_descr` from the `GUARD_NOT_FORCED` that follows
+/// `CALL_ASSEMBLER` is not `_finish_gcmap`.
+fn emit_publish_finish_gcmap_null(sink: &mut PeepSink<'_, '_>) {
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_GCMAP_OFS};
+    sink.local_get(0);
+    sink.i32_const(FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+    emit_word_zero(sink);
+    emit_word_store(sink, JF_GCMAP_OFS as u64);
+}
+
+/// CA return footer: `_call_footer_shadowstack`.
 ///
-/// A CA callee's `FINISH` returns inside generated wasm, so it never
-/// reaches `execute_token`'s `install_post_finish_force_gcmap`.  When
-/// `jf_force_descr` is clear the publish is `jf_gcmap = NULL` and the
-/// pop is the x86 `SUB`.  A `GUARD_NOT_FORCED_2` token keeps the frame
-/// reachable after the shadow-stack pop, so that arm keeps
-/// `wasm_jit_ca_pop_frame` (finish map + write barrier + pop).
+/// `genop_finish` publishes `_finish_gcmap` (or NULL) before the footer.
+/// A CA callee's `FINISH` now does that publish inside generated wasm, so
+/// the caller footer is the x86 `SUB`. A `GUARD_NOT_FORCED_2` token still
+/// keeps the frame reachable after the pop; those traces keep
+/// `wasm_jit_ca_pop_frame` (finish map + write barrier + pop) until
+/// Finish grows the `_finish_gcmap` store.
 fn emit_ca_pop_footer(
     sink: &mut PeepSink<'_, '_>,
     inline: CaInlineParams,
@@ -2474,8 +2486,13 @@ fn emit_ca_pop_footer(
     ca_pop_fn_ptr: i64,
     ca_cfp_local: u32,
     scratch: u32,
+    has_guard_not_forced_2: bool,
 ) {
     use majit_backend::jitframe::{JF_FORCE_DESCR_OFS, JF_GCMAP_OFS, SIZEOFSIGNED};
+    if !has_guard_not_forced_2 {
+        emit_ca_pop_shadowstack(sink, inline.jf_top_addr);
+        return;
+    }
     let ss_word = std::mem::size_of::<usize>() as i32;
     // `assembler.py` `_reload_frame_if_necessary`: `top[-WORD]` is the
     // jitframe, not the CA items base (which a collection may have moved).
@@ -2608,6 +2625,14 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
     sink.i32_const(ca_alloc_fn_ptr as i32);
     sink.call_indirect(0, residual_type_base + 2);
+    // The helper may have collected. Reload the caller ITEMS into local 0
+    // here so the bump path can leave local 0 untouched.
+    sink.i32_wrap_i64();
+    sink.local_set(alloc_scratch_local);
+    emit_ca_reload_caller(sink, inline.jf_top_addr);
+    sink.local_set(0);
+    sink.local_get(alloc_scratch_local);
+    sink.i64_extend_i32_u();
     sink.else_();
     // Commit the bump. Result is the payload pointer (`free + HDR`).
     sink.i32_const(inline.nursery_free_addr as i32);
@@ -5688,6 +5713,10 @@ fn build_function(
     let frame_can_escape = ops
         .iter()
         .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2));
+    // `_finish_gcmap` is retained only for GUARD_NOT_FORCED_2
+    // (`store_force_descr` / `genop_finish`). A leftover `jf_force_descr`
+    // from the GUARD_NOT_FORCED that follows CALL_ASSEMBLER is not that map.
+    let has_guard_not_forced_2 = ops.iter().any(|op| op.opcode == OpCode::GuardNotForced2);
 
     // A merged region whose closing JUMP names a LABEL published by another
     // module leaves this function the way its out-of-line bridge did — by
@@ -6139,6 +6168,16 @@ fn build_function(
             }
 
             OpCode::Finish => {
+                // x86 `genop_finish` else-arm: no `_finish_gcmap` →
+                // `jf_gcmap = 0` before `_call_footer`. A CA callee
+                // returns inside generated wasm, so this publish is what
+                // `execute_token` would have done for a host-entered loop.
+                // Only CA modules write it: unit-test traces have no
+                // jitframe at local 0, and a host-entered loop still
+                // publishes in `execute_token`.
+                if ca.emit_ca && !has_guard_not_forced_2 {
+                    emit_publish_finish_gcmap_null(&mut sink);
+                }
                 emit_guard_exit(
                     &mut sink,
                     constants,
@@ -8513,18 +8552,17 @@ fn build_function(
                 sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
                 sink.i32_add();
                 sink.local_set(ca_cfp_local);
-                // The collecting callee allocation ran while this invocation's
-                // own frame was the shadow-stack top. Now that the callee is
-                // pushed, reload local 0 from the entry beneath it before
-                // resolving inputs through local-0-relative homes. The
-                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
-                    emit_ca_reload_caller(&mut sink, inline.jf_top_addr);
-                    sink.local_set(0);
-                } else if let Some(base) = residual_type_base {
-                    sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
-                    sink.call_indirect(0, base);
-                    sink.i32_wrap_i64();
-                    sink.local_set(0);
+                // The collecting helper may have moved this invocation's
+                // frame. The inline bump path reloads only on that arm
+                // (`emit_ca_malloc_cond_varsize_frame`); a non-inline
+                // allocation always goes through the helper.
+                if ca.inline.is_none() {
+                    if let Some(base) = residual_type_base {
+                        sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
+                        sink.call_indirect(0, base);
+                        sink.i32_wrap_i64();
+                        sink.local_set(0);
+                    }
                 }
                 emit_reload_ca_input_refs_from_homes(
                     &mut sink,
@@ -8670,6 +8708,7 @@ fn build_function(
                         ca.ca_pop_fn_ptr,
                         ca_cfp_local,
                         alloc_scratch_local,
+                        has_guard_not_forced_2,
                     );
                 } else if let Some(base) = residual_type_base {
                     sink.local_get(ca_cfp_local);
@@ -8698,12 +8737,16 @@ fn build_function(
                 // and its home is not written until the store-on-def below, so a
                 // reload would clobber it with the home's pre-call (stale) value.
                 let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                emit_reload_ca_frame_if_necessary(
-                    &mut sink,
-                    residual_type_base,
-                    ca.ca_reload_fn_ptr,
-                    ca.inline,
-                );
+                // Simple `_call_footer_shadowstack` does not collect, and
+                // local 0 already holds the caller from the post-call reload.
+                if ca.inline.is_none() || has_guard_not_forced_2 {
+                    emit_reload_ca_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.inline,
+                    );
+                }
                 emit_reload_refs_from_homes(
                     &mut sink,
                     value_types,
