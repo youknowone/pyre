@@ -54,24 +54,26 @@ impl core::fmt::Display for BytecodeCorruption {
 
 impl std::error::Error for BytecodeCorruption {}
 
+/// RPython: `bytecode.py:CO_NEWLOCALS` (0x0002).
+pub const CO_NEWLOCALS: u32 = 0x0002;
+/// RPython: `bytecode.py:CO_VARARGS` (0x0004).
+pub const CO_VARARGS: u32 = 0x0004;
+/// RPython: `bytecode.py:CO_VARKEYWORDS` (0x0008).
+pub const CO_VARKEYWORDS: u32 = 0x0008;
+/// RPython: `bytecode.py:CO_GENERATOR` (0x0020).
+pub const CO_GENERATOR: u32 = 0x0020;
+
 bitflags::bitflags! {
     /// RPython `bytecode.py` `CO_*` compile flags.
     #[repr(transparent)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct CoFlags: u32 {
-        const NEWLOCALS = 0x0002;
-        const VARARGS = 0x0004;
-        const VARKEYWORDS = 0x0008;
-        const GENERATOR = 0x0020;
+        const NEWLOCALS = CO_NEWLOCALS;
+        const VARARGS = CO_VARARGS;
+        const VARKEYWORDS = CO_VARKEYWORDS;
+        const GENERATOR = CO_GENERATOR;
     }
 }
-
-/// RPython: `bytecode.py:CO_GENERATOR` (0x0020).
-pub const CO_GENERATOR: u32 = CoFlags::GENERATOR.bits();
-/// RPython: `bytecode.py:CO_VARARGS` (0x0004).
-pub const CO_VARARGS: u32 = CoFlags::VARARGS.bits();
-/// RPython: `bytecode.py:CO_VARKEYWORDS` (0x0008).
-pub const CO_VARKEYWORDS: u32 = CoFlags::VARKEYWORDS.bits();
 
 /// Compute `([list-of-arg-names], vararg-name-or-None, kwarg-name-or-None)`.
 ///

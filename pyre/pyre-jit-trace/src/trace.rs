@@ -7424,18 +7424,21 @@ pub mod fbw_diag {
     pub const NAME_SLOTS: usize = 4;
 
     /// Bit positions inside a ring entry's counter slot.
+    ///
+    /// These stay decimal literals so `fbw_diag_mirror` can parse the
+    /// same spellings out of the wasm runner.
+    pub const FLAG_VALID: u64 = 1;
+    pub const FLAG_COMMITTED: u64 = 2;
+    pub const FLAG_BRIDGE: u64 = 4;
     bitflags::bitflags! {
         #[repr(transparent)]
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         pub struct RingFlags: u64 {
-            const VALID = 1 << 0;
-            const COMMITTED = 1 << 1;
-            const BRIDGE = 1 << 2;
+            const VALID = FLAG_VALID;
+            const COMMITTED = FLAG_COMMITTED;
+            const BRIDGE = FLAG_BRIDGE;
         }
     }
-    pub const FLAG_VALID: u64 = RingFlags::VALID.bits();
-    pub const FLAG_COMMITTED: u64 = RingFlags::COMMITTED.bits();
-    pub const FLAG_BRIDGE: u64 = RingFlags::BRIDGE.bits();
     pub const SHIFT_EFFECTS: u32 = 8;
     pub const SHIFT_JOURNAL: u32 = 24;
     pub const SHIFT_EXEC_MF: u32 = 40;

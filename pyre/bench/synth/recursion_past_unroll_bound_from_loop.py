@@ -1,8 +1,14 @@
 # pyre-check: max-pypy-ratio=4.2
+# pyre-check: max-wasm-ratio=6.1
 #
 # Ceiling 6 derived floor 1.0x; after N=4300000, macos dynasm reads 0.8x
 # (PR 1736: exec 0.21s vs pypy 0.26s). 4.2 keeps ubuntu dynasm 1.1x and
 # cranelift 1.4x under the ceiling and drops the floor to 0.7x.
+#
+# The walker stops unrolling `step` two frames past `FBW_MAX_INLINE_RECURSION`,
+# so each loop iteration is a residual recursive call. wasm compiles one
+# module per residual trace; ubuntu-24.04 measured 5.0x on main and 5.3x
+# here, so 6.1x is the higher reading plus WASM_RATIO_FIT_HEADROOM (15%).
 #
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #

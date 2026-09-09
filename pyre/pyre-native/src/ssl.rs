@@ -2995,7 +2995,7 @@ fn enabled_versions(
     }
     #[cfg(feature = "host_env")]
     {
-        let options = i32::try_from(context.options).unwrap_or(i32::MAX);
+        let options = (context.options & (OP_NO_TLSV1_2 | OP_NO_TLSV1_3)) as i32;
         Ok(host_ssl::rustls_versions(minimum, maximum, options))
     }
     #[cfg(not(feature = "host_env"))]

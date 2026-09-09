@@ -1000,9 +1000,9 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
-            const FLAG_VALID: u64 = FbwRingFlags::VALID.bits();
-            const FLAG_COMMITTED: u64 = FbwRingFlags::COMMITTED.bits();
-            const FLAG_BRIDGE: u64 = FbwRingFlags::BRIDGE.bits();
+            const FLAG_VALID: u64 = 1;
+            const FLAG_COMMITTED: u64 = 2;
+            const FLAG_BRIDGE: u64 = 4;
             const SHIFT_EFFECTS: u32 = 8;
             const SHIFT_JOURNAL: u32 = 24;
             const SHIFT_EXEC_MF: u32 = 40;
