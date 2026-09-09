@@ -1820,6 +1820,23 @@ fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
 /// at trace time.
 pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     ensure_finish_setup();
+    // Interpret snapshots stamp the helper's build-time `JitCode::index`.
+    // The matching runtime slot is reserved as a skeleton until a portal
+    // or `ensure_build_time_jitcode_at` installs the frozen body
+    // (`reserve_build_time_index_space`). Compile then looks the index
+    // up in `METAINTERP_SD.jitcodes` — a still-empty skeleton has no
+    // `-live-` bytes, so materialize the body first.
+    if let Ok(idx) = usize::try_from(jitcode_index) {
+        let skeleton = METAINTERP_SD.with(|r| {
+            r.borrow()
+                .jitcodes
+                .get(idx)
+                .is_some_and(|jc| jc.payload.is_skeleton())
+        });
+        if skeleton {
+            let _ = ensure_build_time_jitcode_at(idx);
+        }
+    }
     METAINTERP_SD.with(|r| {
         let idx = jitcode_index as usize;
         let runtime = {
