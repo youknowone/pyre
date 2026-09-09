@@ -11,6 +11,7 @@
 ///   redirect_call_assembler — assembler.py:1138
 use crate::regloc::ebp_loc_pat;
 use indexmap::IndexMap;
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 // x86/assembler.py parity: x86_64-only backend.
@@ -5520,7 +5521,6 @@ impl<'a> Assembler386<'a> {
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
-        let fail_arg_types = self.infer_fail_arg_types(op, Some(op_index));
         // assembler.py _store_force_index parity:
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
         // (stored in pending_force_descr), reuse it — same Arc, same ptr
@@ -5546,15 +5546,16 @@ impl<'a> Assembler386<'a> {
             pre
         } else if let Some(d) = descr_arc {
             // Guard exit — `compile.py` ResumeGuardDescr family.
-            // Use the metainterp `AbstractFailDescr` Arc from `op.descr`
-            // directly; per-trace fail_index / trace_id were stamped above.
-            let _unused = fail_arg_types; // already stored on op.descr's types slot
+            // Types already live on `op.descr`; do not
+            // `infer_fail_arg_types().to_vec()` a second copy.
             d
         } else {
             // Test scaffold: tests synthesise guard ops without op.descr.
             // Mint a fresh metainterp ResumeGuardDescr to carry the
             // codegen-time identity (fail_index / trace_id / fail_arg_types).
-            let fresh = majit_backend::make_resume_guard_descr_typed(fail_arg_types);
+            let fresh = majit_backend::make_resume_guard_descr_typed(
+                self.infer_fail_arg_types(op, Some(op_index)).into_vec(),
+            );
             if let Some(fd) = fresh.as_fail_descr() {
                 fd.set_fail_index_per_trace(fail_index);
                 fd.set_trace_id(self.trace_id);
@@ -6229,12 +6230,16 @@ impl<'a> Assembler386<'a> {
 
     /// Infer fail_arg_types from `op.type_` (via `opref_type`) or
     /// `op.fail_arg_types`.
-    fn infer_fail_arg_types(&self, op: &Op, op_index: Option<usize>) -> Vec<Type> {
+    fn infer_fail_arg_types(&self, op: &Op, op_index: Option<usize>) -> SmallVec<[Type; 8]> {
         if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-            if let Some(descr_types) = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()) {
-                if !descr_types.is_empty() {
-                    return descr_types;
-                }
+            if let Some(descr_types) = op
+                .with_fail_descr(|fd| {
+                    let dt = fd.fail_arg_types();
+                    (!dt.is_empty()).then(|| SmallVec::from_slice(dt))
+                })
+                .flatten()
+            {
+                return descr_types;
             }
         }
         let descr_arc = op.getdescr();
@@ -6250,7 +6255,7 @@ impl<'a> Assembler386<'a> {
             let dt = fd.fail_arg_types();
             let expected_len = op.guard_fail_args().map(|fa| fa.len()).unwrap_or(0);
             if dt.len() == expected_len && !dt.is_empty() {
-                return dt.to_vec();
+                return SmallVec::from_slice(dt);
             }
         }
         if let Some(ts) = op.get_fail_arg_types() {
@@ -6260,7 +6265,7 @@ impl<'a> Assembler386<'a> {
                 op.guard_fail_args().map(|fa| fa.len()).unwrap_or(0)
             };
             if ts.len() == expected_len {
-                ts.to_vec()
+                SmallVec::from_slice(&ts)
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
                 op.getarglist()
                     .iter()
@@ -6305,7 +6310,7 @@ impl<'a> Assembler386<'a> {
                     })
                     .collect()
             } else {
-                Vec::new()
+                SmallVec::new()
             }
         } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
             // Finish/Jump carry no failargs; their result kind comes from
@@ -6351,7 +6356,7 @@ impl<'a> Assembler386<'a> {
                 })
                 .collect()
         } else {
-            Vec::new()
+            SmallVec::new()
         }
     }
 
@@ -6383,7 +6388,6 @@ impl<'a> Assembler386<'a> {
         // Pre-allocate the fail descr for the next GUARD_NOT_FORCED.
         // The full metadata (faillocs, rd_numb, etc.) will be filled in
         // when the guard is actually emitted in append_guard_token_with_faillocs.
-        let fail_arg_types = self.infer_fail_arg_types(next_op, Some(next_idx));
         // Pre-allocated GuardNotForced descr — ResumeGuardDescr family.
         // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
         // here so `append_guard_token_with_faillocs` does not need a second
@@ -6398,10 +6402,12 @@ impl<'a> Assembler386<'a> {
             }
         }
         let descr: majit_ir::DescrRef = if let Some(d) = descr_arc {
-            let _unused = fail_arg_types;
             d
         } else {
-            let fresh = majit_backend::make_resume_guard_descr_typed(fail_arg_types);
+            let fresh = majit_backend::make_resume_guard_descr_typed(
+                self.infer_fail_arg_types(next_op, Some(next_idx))
+                    .into_vec(),
+            );
             if let Some(fd) = fresh.as_fail_descr() {
                 fd.set_fail_index_per_trace(fail_index);
                 fd.set_trace_id(self.trace_id);
