@@ -1103,15 +1103,12 @@ impl ExecutionContext {
             frame = anchor.live();
         }
         if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
-            let w_async_exception_type =
-                crate::module::thread::take_async_exception(self as *mut ExecutionContext);
-            if !w_async_exception_type.is_null() {
-                let w_exc = crate::builtins::exc_exception_new(&[w_async_exception_type])?;
-                return Err(unsafe { crate::PyError::from_exc_object(w_exc) });
-            }
             // The OS signal handler may only touch atomics.  Copy its breaker
-            // request into the ordinary ActionFlag ticker here, under the GIL,
-            // before the upstream decrement-and-dispatch sequence below.
+            // request into the ordinary ActionFlag ticker here, before the
+            // upstream decrement-and-dispatch sequence below.
+            // interp_signal.py `perform` raises the pending async exception
+            // once `action_dispatcher` runs; consuming the type here skipped
+            // that path and built the exception with no message.
             self.actionflag.sync_async_ticker();
         }
         // executioncontext.py bytecode_trace:
