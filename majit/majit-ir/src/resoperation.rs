@@ -1387,78 +1387,372 @@ const VALUE_VOID: u8 = 4;
 /// the shared ResOp with no extra word).
 pub type OpArgVec = SmallVec<[Operand; 4]>;
 
-/// `ResOpWithDescr._descr` slot. `UnsafeCell` matches RPython's
-/// unrestricted `op.setdescr(...)` on a shared ResOp; a `RefCell` flag
-/// would push `OpArgVec` back into the 192-byte `Rc<Op>` class.
-#[derive(Debug)]
-pub struct DescrSlot(std::cell::UnsafeCell<Option<DescrRef>>);
+const ARG_INLINE: usize = 4;
+
+/// Packed `N_aryOp._args`. `SmallVec<[Operand; 4]>` is 80 B (len+cap+inline);
+/// a one-byte length plus the same four inline slots is 72 B, which with
+/// the packed descr/extra slot keeps `Op` at 128 B (`RcBox` 144).
+#[repr(C)]
+struct ArgHeap {
+    ptr: *mut Operand,
+    cap: usize,
+}
+
+#[repr(C)]
+union ArgData {
+    inline: std::mem::ManuallyDrop<[std::mem::MaybeUninit<Operand>; ARG_INLINE]>,
+    heap: std::mem::ManuallyDrop<ArgHeap>,
+}
+
+struct ArgInner {
+    len: u8,
+    data: ArgData,
+}
+
+/// `N_aryOp._args` slot. `UnsafeCell` matches RPython's unrestricted
+/// `op._args[i] = ...` on a shared ResOp; a `RefCell` flag would keep
+/// `Rc<Op>` in the 176-byte class.
+pub struct ArgSlot(std::cell::UnsafeCell<ArgInner>);
+
+impl ArgSlot {
+    pub fn new(v: OpArgVec) -> Self {
+        ArgSlot(std::cell::UnsafeCell::new(Self::pack_inner(v)))
+    }
+
+    fn pack_inner(v: OpArgVec) -> ArgInner {
+        let len_us = v.len();
+        let len = u8::try_from(len_us).expect("ResOp arg count fits u8");
+        if len_us <= ARG_INLINE {
+            let mut inline: [std::mem::MaybeUninit<Operand>; ARG_INLINE] =
+                unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+            for (i, arg) in v.into_iter().enumerate() {
+                inline[i].write(arg);
+            }
+            ArgInner {
+                len,
+                data: ArgData {
+                    inline: std::mem::ManuallyDrop::new(inline),
+                },
+            }
+        } else {
+            let mut vec = v.into_vec();
+            let heap = ArgHeap {
+                ptr: vec.as_mut_ptr(),
+                cap: vec.capacity(),
+            };
+            std::mem::forget(vec);
+            ArgInner {
+                len,
+                data: ArgData {
+                    heap: std::mem::ManuallyDrop::new(heap),
+                },
+            }
+        }
+    }
+
+    #[inline]
+    pub fn borrow(&self) -> &[Operand] {
+        unsafe {
+            let inner = &*self.0.get();
+            let len = inner.len as usize;
+            if len <= ARG_INLINE {
+                std::slice::from_raw_parts((*inner.data.inline).as_ptr().cast::<Operand>(), len)
+            } else {
+                std::slice::from_raw_parts(inner.data.heap.ptr, len)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn borrow_mut(&self) -> &mut [Operand] {
+        unsafe {
+            let inner = &mut *self.0.get();
+            let len = inner.len as usize;
+            if len <= ARG_INLINE {
+                std::slice::from_raw_parts_mut(
+                    (*inner.data.inline).as_mut_ptr().cast::<Operand>(),
+                    len,
+                )
+            } else {
+                std::slice::from_raw_parts_mut(inner.data.heap.ptr, len)
+            }
+        }
+    }
+
+    pub fn clone_vec(&self) -> OpArgVec {
+        self.borrow().iter().cloned().collect()
+    }
+
+    pub fn replace(&self, v: OpArgVec) {
+        unsafe {
+            let inner = &mut *self.0.get();
+            drop_arg_inner(inner);
+            std::ptr::write(inner, Self::pack_inner(v));
+        }
+    }
+}
+
+unsafe fn drop_arg_inner(inner: &mut ArgInner) {
+    unsafe {
+        let len = inner.len as usize;
+        if len <= ARG_INLINE {
+            for slot in (*inner.data.inline).iter_mut().take(len) {
+                slot.assume_init_drop();
+            }
+        } else {
+            let heap = std::mem::ManuallyDrop::take(&mut inner.data.heap);
+            let _ = Vec::from_raw_parts(heap.ptr, len, heap.cap);
+        }
+    }
+}
+
+impl Clone for ArgSlot {
+    fn clone(&self) -> Self {
+        ArgSlot::new(self.clone_vec())
+    }
+}
+
+impl Drop for ArgSlot {
+    fn drop(&mut self) {
+        unsafe { drop_arg_inner(self.0.get_mut()) }
+    }
+}
+
+impl std::fmt::Debug for ArgSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.borrow()).finish()
+    }
+}
+
+/// Packed `_descr` + `extra` (16 B). RPython keeps the attributes
+/// separate; this is storage only so `Rc<Op>` leaves the 160-byte class.
+///
+/// `(lo, hi)` encoding:
+/// - `(0, 0)` — neither
+/// - `(data, vtable)` with `hi > 2` — descr only (`Arc<dyn Descr>`)
+/// - `(box, 1)` — extra only
+/// - `(box, 2)` — `Box<(Option<DescrRef>, OpKindExtra)>`
+const EXTRA_TAG: usize = 1;
+const BOTH_TAG: usize = 2;
+
+struct BothPayload {
+    descr: Option<DescrRef>,
+    extra: OpKindExtra,
+}
+
+/// `ResOpWithDescr._descr` slot. Also carries `extra` so the pair fits
+/// in 16 B. `UnsafeCell` matches RPython's unrestricted `op.setdescr`.
+pub struct DescrSlot {
+    lo: std::cell::UnsafeCell<usize>,
+    hi: std::cell::UnsafeCell<usize>,
+}
 
 impl DescrSlot {
     pub fn new(v: Option<DescrRef>) -> Self {
-        DescrSlot(std::cell::UnsafeCell::new(v))
+        Self::from_parts(v, None)
     }
 
-    #[inline]
-    pub fn borrow(&self) -> &Option<DescrRef> {
-        unsafe { &*self.0.get() }
+    fn from_parts(descr: Option<DescrRef>, extra: Option<Box<OpKindExtra>>) -> Self {
+        let slot = DescrSlot {
+            lo: std::cell::UnsafeCell::new(0),
+            hi: std::cell::UnsafeCell::new(0),
+        };
+        slot.write_parts(descr, extra);
+        slot
     }
 
-    #[inline]
-    pub fn borrow_mut(&self) -> &mut Option<DescrRef> {
-        unsafe { &mut *self.0.get() }
+    fn bits(&self) -> (usize, usize) {
+        unsafe { (*self.lo.get(), *self.hi.get()) }
+    }
+
+    fn set_bits(&self, lo: usize, hi: usize) {
+        unsafe {
+            *self.lo.get() = lo;
+            *self.hi.get() = hi;
+        }
+    }
+
+    fn write_parts(&self, descr: Option<DescrRef>, extra: Option<Box<OpKindExtra>>) {
+        match (descr, extra) {
+            (None, None) => self.set_bits(0, 0),
+            (Some(d), None) => {
+                let (lo, hi) = descr_arc_to_bits(d);
+                debug_assert!(hi > BOTH_TAG, "descr vtable collides with extra tags");
+                self.set_bits(lo, hi);
+            }
+            (None, Some(e)) => {
+                let ptr = Box::into_raw(e);
+                self.set_bits(ptr as usize, EXTRA_TAG);
+            }
+            (Some(d), Some(e)) => {
+                let ptr = Box::into_raw(Box::new(BothPayload {
+                    descr: Some(d),
+                    extra: *e,
+                }));
+                self.set_bits(ptr as usize, BOTH_TAG);
+            }
+        }
+    }
+
+    fn take_parts(&self) -> (Option<DescrRef>, Option<Box<OpKindExtra>>) {
+        let (lo, hi) = self.bits();
+        self.set_bits(0, 0);
+        unsafe { decode_descr_extra(lo, hi) }
+    }
+
+    pub fn borrow(&self) -> Option<DescrRef> {
+        let (lo, hi) = self.bits();
+        unsafe { peek_descr(lo, hi) }
+    }
+
+    pub fn set_descr(&self, v: Option<DescrRef>) {
+        let (_, extra) = self.take_parts();
+        self.write_parts(v, extra);
+    }
+
+    pub(crate) fn extra_ref(&self) -> Option<&OpKindExtra> {
+        let (lo, hi) = self.bits();
+        unsafe { peek_extra(lo, hi) }
+    }
+
+    pub(crate) fn extra_mut(&self) -> Option<&mut OpKindExtra> {
+        let (lo, hi) = self.bits();
+        unsafe { peek_extra_mut(lo, hi) }
+    }
+
+    pub(crate) fn extra_replace(&self, extra: Option<Box<OpKindExtra>>) {
+        let (descr, old) = self.take_parts();
+        drop(old);
+        self.write_parts(descr, extra);
+    }
+
+    pub(crate) fn extra_clone_box(&self) -> Option<Box<OpKindExtra>> {
+        self.extra_ref().map(|e| Box::new(e.clone()))
+    }
+}
+
+unsafe fn decode_descr_extra(lo: usize, hi: usize) -> (Option<DescrRef>, Option<Box<OpKindExtra>>) {
+    unsafe {
+        if lo == 0 && hi == 0 {
+            (None, None)
+        } else if hi == EXTRA_TAG {
+            (None, Some(Box::from_raw(lo as *mut OpKindExtra)))
+        } else if hi == BOTH_TAG {
+            let both = Box::from_raw(lo as *mut BothPayload);
+            (both.descr, Some(Box::new(both.extra)))
+        } else {
+            (Some(descr_arc_from_bits(lo, hi)), None)
+        }
+    }
+}
+
+unsafe fn peek_descr(lo: usize, hi: usize) -> Option<DescrRef> {
+    unsafe {
+        if lo == 0 && hi == 0 {
+            None
+        } else if hi == EXTRA_TAG {
+            None
+        } else if hi == BOTH_TAG {
+            (*(lo as *const BothPayload)).descr.clone()
+        } else {
+            Some(descr_arc_clone_from_bits(lo, hi))
+        }
+    }
+}
+
+fn descr_arc_to_bits(d: DescrRef) -> (usize, usize) {
+    let raw = std::sync::Arc::into_raw(d);
+    let (data, vtable): (*const u8, *const u8) = unsafe { std::mem::transmute(raw) };
+    (data as usize, vtable as usize)
+}
+
+fn descr_arc_from_bits(lo: usize, hi: usize) -> DescrRef {
+    let raw: *const dyn crate::descr::Descr =
+        unsafe { std::mem::transmute((lo as *const u8, hi as *const u8)) };
+    unsafe { std::sync::Arc::from_raw(raw) }
+}
+
+fn descr_arc_clone_from_bits(lo: usize, hi: usize) -> DescrRef {
+    let raw: *const dyn crate::descr::Descr =
+        unsafe { std::mem::transmute((lo as *const u8, hi as *const u8)) };
+    unsafe {
+        std::sync::Arc::increment_strong_count(raw);
+        std::sync::Arc::from_raw(raw)
+    }
+}
+
+unsafe fn peek_extra<'a>(lo: usize, hi: usize) -> Option<&'a OpKindExtra> {
+    unsafe {
+        if hi == EXTRA_TAG {
+            Some(&*(lo as *const OpKindExtra))
+        } else if hi == BOTH_TAG {
+            Some(&(*(lo as *const BothPayload)).extra)
+        } else {
+            None
+        }
+    }
+}
+
+unsafe fn peek_extra_mut<'a>(lo: usize, hi: usize) -> Option<&'a mut OpKindExtra> {
+    unsafe {
+        if hi == EXTRA_TAG {
+            Some(&mut *(lo as *mut OpKindExtra))
+        } else if hi == BOTH_TAG {
+            Some(&mut (*(lo as *mut BothPayload)).extra)
+        } else {
+            None
+        }
+    }
+}
+
+impl Clone for DescrSlot {
+    fn clone(&self) -> Self {
+        let (d, e) = (self.borrow(), self.extra_clone_box());
+        Self::from_parts(d, e)
+    }
+}
+
+impl Drop for DescrSlot {
+    fn drop(&mut self) {
+        drop(self.take_parts());
+    }
+}
+
+impl std::fmt::Debug for DescrSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DescrSlot")
+            .field("descr", &self.borrow())
+            .field("extra", &self.extra_ref())
+            .finish()
+    }
+}
+
+/// Guard / vector extras. Same packed storage as [`DescrSlot`]; the
+/// field stays so existing `Op { extra: ExtraSlot::new(...) }` literals
+/// still type-check. The bits live on `descr`.
+pub(crate) struct ExtraSlot;
+
+impl ExtraSlot {
+    pub(crate) fn new(_v: Option<Box<OpKindExtra>>) -> Self {
+        ExtraSlot
+    }
+}
+
+impl Clone for ExtraSlot {
+    fn clone(&self) -> Self {
+        ExtraSlot
+    }
+}
+
+impl std::fmt::Debug for ExtraSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExtraSlot")
     }
 }
 
 /// `_forwarded` slot. Same `UnsafeCell` trade as [`DescrSlot`].
 #[derive(Debug)]
 pub struct ForwardedSlot(std::cell::UnsafeCell<crate::forwarding::Forwarded>);
-
-/// `N_aryOp._args` slot. `UnsafeCell` matches RPython's unrestricted
-/// `op._args[i] = ...` on a shared ResOp; a `RefCell` flag would keep
-/// `Rc<Op>` in the 176-byte class.
-#[derive(Debug)]
-pub struct ArgSlot(std::cell::UnsafeCell<OpArgVec>);
-
-impl ArgSlot {
-    pub fn new(v: OpArgVec) -> Self {
-        ArgSlot(std::cell::UnsafeCell::new(v))
-    }
-
-    #[inline]
-    pub fn borrow(&self) -> &OpArgVec {
-        unsafe { &*self.0.get() }
-    }
-
-    #[inline]
-    pub fn borrow_mut(&self) -> &mut OpArgVec {
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-/// Guard / vector extras. Same `UnsafeCell` trade as [`DescrSlot`].
-#[derive(Debug)]
-pub(crate) struct ExtraSlot(std::cell::UnsafeCell<Option<Box<OpKindExtra>>>);
-
-impl ExtraSlot {
-    pub(crate) fn new(v: Option<Box<OpKindExtra>>) -> Self {
-        ExtraSlot(std::cell::UnsafeCell::new(v))
-    }
-
-    #[inline]
-    pub(crate) fn borrow(&self) -> &Option<Box<OpKindExtra>> {
-        unsafe { &*self.0.get() }
-    }
-
-    #[inline]
-    pub(crate) fn borrow_mut(&self) -> &mut Option<Box<OpKindExtra>> {
-        unsafe { &mut *self.0.get() }
-    }
-
-    #[inline]
-    pub(crate) fn get_mut(&mut self) -> &mut Option<Box<OpKindExtra>> {
-        self.0.get_mut()
-    }
-}
 
 impl ForwardedSlot {
     pub fn new(v: crate::forwarding::Forwarded) -> Self {
@@ -1527,6 +1821,7 @@ pub struct Op {
     /// `fail_arg_types`, `rd_resume_position`, and `VectorOp` /
     /// `VectorGuardOp` vector shape. `PlainResOp` / `ResOpWithDescr`
     /// leave this `None` so ordinary ops do not embed those fields.
+    #[allow(dead_code)]
     pub(crate) extra: ExtraSlot,
 
     /// `resoperation.py AbstractResOpOrInputArg._forwarded` parity
@@ -1550,9 +1845,9 @@ impl Clone for Op {
             value_kind: std::cell::Cell::new(VALUE_UNSET),
             pos: OpPos::new(self.pos.get()),
             value_bits: std::cell::Cell::new(0),
-            args: ArgSlot::new(self.args.borrow().clone()),
-            descr: DescrSlot::new(self.descr.borrow().clone()),
-            extra: ExtraSlot::new(self.extra.borrow().clone()),
+            args: ArgSlot::new(self.args.clone_vec()),
+            descr: DescrSlot::from_parts(self.descr.borrow(), self.descr.extra_clone_box()),
+            extra: ExtraSlot::new(None),
             forwarded: ForwardedSlot::new(Forwarded::None),
         }
     }
@@ -1751,7 +2046,7 @@ impl Op {
     /// op is not a guard or the slot is unset.
     #[inline]
     pub fn rd_resume_position(&self) -> i32 {
-        match self.extra.borrow().as_deref() {
+        match self.descr.extra_ref() {
             Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => {
                 g.rd_resume_position
             }
@@ -1792,11 +2087,11 @@ impl Op {
     ) -> Op {
         let new_args: OpArgVec = match args {
             Some(a) => a.iter().cloned().collect(),
-            None => self.args.borrow().clone(),
+            None => self.args.clone_vec(),
         };
         let new_descr = match descr {
             Some(d) => d,
-            None => self.descr.borrow().clone(),
+            None => self.descr.borrow(),
         };
         let newop = Op {
             opcode,
@@ -1805,8 +2100,8 @@ impl Op {
             pos: OpPos::new(self.pos.get()),
             value_bits: std::cell::Cell::new(0),
             args: ArgSlot::new(new_args),
-            descr: DescrSlot::new(new_descr),
-            extra: ExtraSlot::new(self.extra.borrow().clone()),
+            descr: DescrSlot::from_parts(new_descr, self.descr.extra_clone_box()),
+            extra: ExtraSlot::new(None),
             forwarded: ForwardedSlot::new(Forwarded::None),
         };
         // resoperation.py GuardResOp.copy_and_change:
@@ -1867,7 +2162,7 @@ impl Op {
     }
 
     pub fn guard_fail_args(&self) -> Option<&[Operand]> {
-        match self.extra.borrow().as_deref() {
+        match self.descr.extra_ref() {
             Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => {
                 g.fail_args.as_deref()
             }
@@ -1885,66 +2180,57 @@ impl Op {
     }
 
     pub(crate) fn strip_guard_extra(&self) {
-        let mut extra = self.extra.borrow_mut();
-        match extra.as_deref() {
+        match self.descr.extra_ref() {
             Some(OpKindExtra::VectorGuard { vec, .. }) => {
-                *extra = Some(Box::new(OpKindExtra::Vector(vec.clone())));
+                let vec = vec.clone();
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::Vector(vec))));
             }
             Some(OpKindExtra::Guard(_)) => {
-                *extra = None;
+                self.descr.extra_replace(None);
             }
             _ => {}
         }
     }
 
     pub(crate) fn try_guard_extra(&self) -> Option<&GuardExtra> {
-        match self.extra.borrow().as_deref() {
+        match self.descr.extra_ref() {
             Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => Some(g),
             _ => None,
         }
     }
 
     pub(crate) fn try_guard_extra_mut(&self) -> Option<&mut GuardExtra> {
-        match self.extra.borrow_mut().as_mut() {
-            Some(b) => match b.as_mut() {
-                OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. } => Some(g),
-                OpKindExtra::Vector(_) => None,
-            },
-            None => None,
+        match self.descr.extra_mut() {
+            Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => Some(g),
+            _ => None,
         }
     }
 
     pub(crate) fn ensure_guard_extra(&self) -> &mut GuardExtra {
-        {
-            let extra = self.extra.borrow_mut();
-            match extra.as_deref() {
-                Some(OpKindExtra::Guard(_) | OpKindExtra::VectorGuard { .. }) => {}
-                Some(OpKindExtra::Vector(v)) => {
-                    let vec = v.clone();
-                    *extra = Some(Box::new(OpKindExtra::VectorGuard {
+        match self.descr.extra_ref() {
+            Some(OpKindExtra::Guard(_) | OpKindExtra::VectorGuard { .. }) => {}
+            Some(OpKindExtra::Vector(v)) => {
+                let vec = v.clone();
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard {
                         guard: GuardExtra::new(),
                         vec,
-                    }));
-                }
-                None => {
-                    *extra = Some(Box::new(OpKindExtra::Guard(GuardExtra::new())));
-                }
+                    })));
+            }
+            None => {
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::Guard(GuardExtra::new()))));
             }
         }
-        match self
-            .extra
-            .borrow_mut()
-            .as_mut()
-            .expect("ensure_guard_extra")
-            .as_mut()
-        {
+        match self.descr.extra_mut().expect("ensure_guard_extra") {
             OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. } => g,
             OpKindExtra::Vector(_) => unreachable!("ensure_guard_extra upgraded Vector"),
         }
     }
 
     pub(crate) fn vecinfo_slot(&self) -> Option<VectorizationInfo> {
-        match self.extra.borrow().as_deref() {
+        match self.descr.extra_ref() {
             Some(OpKindExtra::Vector(v) | OpKindExtra::VectorGuard { vec: v, .. }) => {
                 Some(v.clone())
             }
@@ -1953,25 +2239,31 @@ impl Op {
     }
 
     pub(crate) fn set_vecinfo_slot(&self, info: VectorizationInfo) {
-        let mut extra = self.extra.borrow_mut();
-        match extra.as_deref_mut() {
+        match self.descr.extra_mut() {
             Some(OpKindExtra::Vector(v)) => *v = info,
             Some(OpKindExtra::VectorGuard { vec, .. }) => *vec = info,
             Some(OpKindExtra::Guard(g)) => {
                 let guard = g.clone();
-                *extra = Some(Box::new(OpKindExtra::VectorGuard { guard, vec: info }));
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard {
+                        guard,
+                        vec: info,
+                    })));
             }
-            None => *extra = Some(Box::new(OpKindExtra::Vector(info))),
+            None => self
+                .descr
+                .extra_replace(Some(Box::new(OpKindExtra::Vector(info)))),
         }
     }
 
     pub(crate) fn clear_vecinfo_slot(&self) {
-        let mut extra = self.extra.borrow_mut();
-        match extra.as_deref() {
+        match self.descr.extra_ref() {
             Some(OpKindExtra::VectorGuard { guard, .. }) => {
-                *extra = Some(Box::new(OpKindExtra::Guard(guard.clone())));
+                let guard = guard.clone();
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::Guard(guard))));
             }
-            Some(OpKindExtra::Vector(_)) => *extra = None,
+            Some(OpKindExtra::Vector(_)) => self.descr.extra_replace(None),
             _ => {}
         }
     }
@@ -4054,14 +4346,19 @@ mod tests {
             let op = std::mem::size_of::<Op>();
             let rc_box = op + 2 * std::mem::size_of::<usize>();
             assert!(
-                op <= 144,
-                "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 176-byte class"
+                op <= 128,
+                "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 160-byte class"
             );
             let extra = std::mem::size_of::<GuardExtra>();
             assert!(
                 extra <= 48,
                 "GuardExtra grew to {extra} bytes; keep Box<GuardExtra> out of the 64-byte class"
             );
+            assert!(
+                std::mem::size_of::<ArgSlot>() <= 72,
+                "ArgSlot grew; four inline operands must stay in 72 B"
+            );
+            assert_eq!(std::mem::size_of::<DescrSlot>(), 16);
         }
     }
 

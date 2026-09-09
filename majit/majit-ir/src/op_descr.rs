@@ -25,7 +25,7 @@ impl Op {
     /// the `DescrRef` so callers can chain `.as_ref()`, `.expect()`, or
     /// pattern-match without holding a `RefCell` borrow across the call.
     pub fn getdescr(&self) -> Option<DescrRef> {
-        self.descr.borrow().clone()
+        self.descr.borrow()
     }
 
     /// `resoperation.py ResOpWithDescr.setdescr` parity — overwrites
@@ -34,13 +34,13 @@ impl Op {
     /// descr the same way RPython's `op.setdescr(d)` writes on a shared
     /// Python object.
     pub fn setdescr(&self, descr: DescrRef) {
-        *self.descr.borrow_mut() = Some(descr);
+        self.descr.set_descr(Some(descr));
     }
 
     /// `resoperation.py ResOpWithDescr.cleardescr` parity — clears
     /// the descr slot.
     pub fn cleardescr(&self) {
-        *self.descr.borrow_mut() = None;
+        self.descr.set_descr(None);
     }
 
     // `has_descr` lives in `resoperation.rs` so the build-script
@@ -230,7 +230,7 @@ impl Op {
     /// shared-`Op` callers should clone via `getfailargs_copy`, mutate
     /// the copy, and call `setfailargs`.
     pub fn fail_args_mut(&mut self) -> Option<&mut Vec<crate::operand::Operand>> {
-        match self.extra.get_mut().as_mut()?.as_mut() {
+        match self.descr.extra_mut()? {
             crate::resoperation::OpKindExtra::Guard(g)
             | crate::resoperation::OpKindExtra::VectorGuard { guard: g, .. } => {
                 g.fail_args.as_mut()
@@ -301,7 +301,7 @@ impl Op {
     /// rather than borrowing the slot, dropping the `RefCell` borrow at
     /// the call boundary so a caller may freely `setarg` afterwards.
     pub fn getarglist(&self) -> crate::resoperation::OpArgVec {
-        self.args.borrow().iter().cloned().collect()
+        self.args.clone_vec()
     }
 
     /// `resoperation.py AbstractResOp.getarglist` parity for a reader
@@ -316,14 +316,14 @@ impl Op {
     /// is live for its body, which is the invariant the copying accessor buys
     /// its callers.
     pub fn with_arglist<R>(&self, f: impl FnOnce(&[crate::operand::Operand]) -> R) -> R {
-        f(&self.args.borrow())
+        f(self.args.borrow())
     }
 
     /// `resoperation.py AbstractResOp.getarglist_copy` parity —
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
     /// an owned `SmallVec` of the stored operands.
     pub fn getarglist_copy(&self) -> crate::resoperation::OpArgVec {
-        self.args.borrow().iter().cloned().collect()
+        self.args.clone_vec()
     }
 
     /// `resoperation.py AbstractResOp.initarglist` parity — bulk
@@ -337,7 +337,7 @@ impl Op {
     /// peel pass.  pyre's matching call lives in `unroll.rs` and
     /// rebuilds the SmallVec rather than pushing onto `args`.
     pub fn initarglist(&self, args: impl IntoIterator<Item = crate::operand::Operand>) {
-        *self.args.borrow_mut() = args.into_iter().collect();
+        self.args.replace(args.into_iter().collect());
     }
 
     /// `resoperation.py AbstractResOp.setarg` parity — position-wise
