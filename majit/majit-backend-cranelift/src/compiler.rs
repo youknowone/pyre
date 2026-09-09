@@ -9814,7 +9814,7 @@ impl CraneliftBackend {
         for info in &mut guard_infos {
             match ops[info.source_op_index].opcode {
                 OpCode::GuardNotForced2 => {
-                    let rd_locs: Vec<u16> = info
+                    let rd_locs: majit_ir::RdLocs = info
                         .fail_arg_refs
                         .iter()
                         .enumerate()

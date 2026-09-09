@@ -32,7 +32,7 @@ pub use descr::{
     AccumInfo, ArrayDescr, ArrayFlag, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr,
     DescrRef, FailDescr, FailDescrCell, FieldDescr, GcCache, InteriorFieldDescr, JitCodeDescr,
     LLType, LoopTargetDescr, LoopTokenDescr, QuasiImmutDescr, QuasiImmutHandle,
-    QuasiImmutLoopToken, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr,
+    QuasiImmutLoopToken, RdLocs, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr,
     SwitchDescr, TargetArgLoc, UnpackAtExitInfo, descr_identity, make_array_descr,
     make_array_descr_signed, make_call_descr, make_field_descr, make_field_descr_full,
     make_loop_target_descr, make_malloc_array_calldescr, make_malloc_array_nonstandard_calldescr,

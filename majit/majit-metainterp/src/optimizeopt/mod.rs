@@ -47,7 +47,73 @@ use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 use rustc_hash::{FxBuildHasher, FxHashMap};
-use std::collections::VecDeque;
+
+/// `optimizer.py` extra-operations list. Almost always 0–2 ops (one
+/// lazy SETFIELD / force). Inline those so the first `VecDeque` grow
+/// (64 B) is gone.
+#[derive(Default)]
+pub(crate) struct ExtraQueue(smallvec::SmallVec<[(usize, majit_ir::OpRc); 2]>);
+
+impl ExtraQueue {
+    pub(crate) fn new() -> Self {
+        Self(smallvec::SmallVec::new())
+    }
+
+    pub(crate) fn push_back(&mut self, item: (usize, majit_ir::OpRc)) {
+        self.0.push(item);
+    }
+
+    pub(crate) fn push_front(&mut self, item: (usize, majit_ir::OpRc)) {
+        self.0.insert(0, item);
+    }
+
+    pub(crate) fn pop_front(&mut self) -> Option<(usize, majit_ir::OpRc)> {
+        if self.0.is_empty() {
+            None
+        } else {
+            Some(self.0.remove(0))
+        }
+    }
+
+    pub(crate) fn front(&self) -> Option<&(usize, majit_ir::OpRc)> {
+        self.0.first()
+    }
+
+    pub(crate) fn back(&self) -> Option<&(usize, majit_ir::OpRc)> {
+        self.0.last()
+    }
+
+    pub(crate) fn remove(&mut self, at: usize) -> Option<(usize, majit_ir::OpRc)> {
+        (at < self.0.len()).then(|| self.0.remove(at))
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, (usize, majit_ir::OpRc)> {
+        self.0.iter()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Extend<(usize, majit_ir::OpRc)> for ExtraQueue {
+    fn extend<T: IntoIterator<Item = (usize, majit_ir::OpRc)>>(&mut self, iter: T) {
+        self.0.extend(iter);
+    }
+}
+
+impl IntoIterator for ExtraQueue {
+    type Item = (usize, majit_ir::OpRc);
+    type IntoIter = smallvec::IntoIter<[(usize, majit_ir::OpRc); 2]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
 
 pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
 pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;
@@ -641,7 +707,7 @@ pub struct OptContext {
     /// without re-entering the heap pass itself.
     /// Held as `OpRc` (resoperation.py: emit_extra appends a ResOperation
     /// object) so the queued op carries object identity into the drain.
-    pub(crate) extra_operations_after: VecDeque<(usize, majit_ir::OpRc)>,
+    pub(crate) extra_operations_after: ExtraQueue,
     /// The queues `Optimizer::drain_extra_operations_from` is working through,
     /// innermost last. The drain moves `extra_operations_after` aside before it
     /// starts so that a nested drain only sees what was queued after it began —
@@ -653,7 +719,7 @@ pub struct OptContext {
     /// emits the allocation as one step, while pyre's `emit_op` only queues the
     /// allocation when the force runs from a pass, so a store can be emitted
     /// while the `NEW_WITH_VTABLE` that defines it is still parked.
-    pub(crate) extra_pending: Vec<VecDeque<(usize, majit_ir::OpRc)>>,
+    pub(crate) extra_pending: Vec<ExtraQueue>,
     /// optimizer.py:47-54: deferred postprocess for GUARD_CLASS.
     /// Set by rewrite pass, executed by emit_operation after the guard
     /// is added to new_operations (matching RPython's callback pattern).
@@ -1822,7 +1888,7 @@ impl OptContext {
             num_inputs: 0,
             inputarg_base: 0,
             next_pos: 0,
-            extra_operations_after: VecDeque::new(),
+            extra_operations_after: ExtraQueue::new(),
             extra_pending: Vec::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
@@ -2449,7 +2515,7 @@ impl OptContext {
             num_inputs: num_inputs as u32,
             inputarg_base,
             next_pos: start_next_pos,
-            extra_operations_after: VecDeque::new(),
+            extra_operations_after: ExtraQueue::new(),
             extra_pending: Vec::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
@@ -6914,7 +6980,7 @@ impl OptContext {
                     .unwrap_or_else(|| Operand::from_opref(*a))
             })
             .collect();
-        let logical_rd_locs: Vec<u16> = final_operands
+        let logical_rd_locs: majit_ir::RdLocs = final_operands
             .iter()
             .enumerate()
             .map(|(index, operand)| {

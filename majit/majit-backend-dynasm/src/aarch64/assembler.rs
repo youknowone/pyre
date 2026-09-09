@@ -4520,7 +4520,7 @@ impl<'a> AssemblerARM64<'a> {
         // the slot into rd_locs so the deopt path reads it via PyPy's
         // stack-position decode (`llmodel.py:422-424`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
-        let rd_locs: Vec<u16> = faillocs
+        let rd_locs: majit_ir::RdLocs = faillocs
             .iter()
             .map(|fl| match fl {
                 None => 0xFFFF,

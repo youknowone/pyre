@@ -4168,7 +4168,7 @@ mod tests {
         let descr =
             majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Ref, Type::Int]);
         let fail_descr = descr.as_fail_descr().expect("resume guard fail descr");
-        fail_descr.set_rd_locs(vec![0, 0xFFFF, 1]);
+        fail_descr.set_rd_locs(vec![0, 0xFFFF, 1].into());
         // pyjitpl.py initialize_state_from_guard_failure filters the hole
         // before the history is built, so only the two live boxes reach the
         // backend bridge.

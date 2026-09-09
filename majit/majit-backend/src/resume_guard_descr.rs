@@ -173,7 +173,7 @@ pub struct ResumeGuardDescr {
     /// 'rd_locs', 'rd_loop_token', 'rd_vector_info')`.
     pub adr_jump_offset: UnsafeCell<usize>,
     /// `history.py` `AbstractFailDescr._attrs_` `rd_locs`.
-    pub rd_locs: UnsafeCell<Vec<u16>>,
+    pub rd_locs: UnsafeCell<majit_ir::RdLocs>,
     /// `compile.py` `AbstractResumeGuardDescr._attrs_ = ('status',)`.
     pub status: AtomicU64,
     /// Pyre-only: identifier of the compiled trace that owns this guard.
@@ -384,7 +384,7 @@ impl Descr for ResumeGuardDescr {
             // the `_attrs_` slots reset to their initial values when this
             // fresh descr reaches backend codegen.
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -506,7 +506,7 @@ impl FailDescr for ResumeGuardDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -649,7 +649,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),

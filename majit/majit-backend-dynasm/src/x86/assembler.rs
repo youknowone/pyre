@@ -5587,7 +5587,7 @@ impl<'a> Assembler386<'a> {
         // into `rd_locs` so the deopt path treats it as a normal stack
         // position (`_decode_pos` in `llmodel.py`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
-        let rd_locs: Vec<u16> = faillocs
+        let rd_locs: majit_ir::RdLocs = faillocs
             .iter()
             .map(|fl| match fl {
                 None => 0xFFFF,

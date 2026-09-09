@@ -3266,7 +3266,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
@@ -3350,7 +3350,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
@@ -3583,7 +3583,7 @@ impl FailDescr for ResumeAtPositionDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.inner.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -3672,7 +3672,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -3858,7 +3858,7 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.inner.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -3947,7 +3947,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -4114,7 +4114,7 @@ impl FailDescr for ResumeGuardExcDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.inner.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -4203,7 +4203,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -4264,7 +4264,7 @@ pub struct ResumeGuardCopiedDescr {
     adr_jump_offset: UnsafeCell<usize>,
     /// `history.py` `_attrs_` `rd_locs` — same per-fail scoping
     /// as `adr_jump_offset`.
-    rd_locs: UnsafeCell<Vec<u16>>,
+    rd_locs: UnsafeCell<majit_ir::RdLocs>,
     /// `compile.py` `AbstractResumeGuardDescr._attrs_` `status` —
     /// each copied descr carries its own status (the copied receiver is
     /// retraced independently of the donor).
@@ -4407,7 +4407,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             prev: UnsafeCell::new(self.prev().clone()),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -4556,7 +4556,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -4738,7 +4738,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 prev: UnsafeCell::new(self.inner.prev().clone()),
                 vector_info: UnsafeCell::new(None),
                 adr_jump_offset: UnsafeCell::new(0),
-                rd_locs: UnsafeCell::new(Vec::new()),
+                rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
                 status: AtomicU64::new(0),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
@@ -4844,7 +4844,7 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn rd_locs(&self) -> &[u16] {
         self.inner.rd_locs()
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         self.inner.set_rd_locs(locs);
     }
     fn get_status(&self) -> u64 {
@@ -4950,7 +4950,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         prev: UnsafeCell::new(prev),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
@@ -4988,7 +4988,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             prev: UnsafeCell::new(prev),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -5165,7 +5165,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 payload: self.inner.payload.deep_clone(),
                 vector_info: UnsafeCell::new(unsafe { (&*self.inner.vector_info.get()).clone() }),
                 adr_jump_offset: UnsafeCell::new(0),
-                rd_locs: UnsafeCell::new(Vec::new()),
+                rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
                 status: AtomicU64::new(0),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
@@ -5294,7 +5294,7 @@ impl FailDescr for CompileLoopVersionDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.inner.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -5381,7 +5381,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             payload,
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -5959,7 +5959,7 @@ mod fail_descr_tests {
                 payload: RdPayload::empty(),
                 vector_info: UnsafeCell::new(None),
                 adr_jump_offset: UnsafeCell::new(0),
-                rd_locs: UnsafeCell::new(Vec::new()),
+                rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
                 status: AtomicU64::new(0),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),

@@ -3855,6 +3855,11 @@ impl Descr for QuasiImmutDescr {
     }
 }
 
+/// `history.py` `AbstractFailDescr.rd_locs` — per-fail-arg jitframe
+/// slots. Eight `u16`s stay inline so `append_guard_token` does not
+/// mint a 16 B `Vec` for the common guard.
+pub type RdLocs = smallvec::SmallVec<[u16; 8]>;
+
 /// Descriptor for guard failures — carries resume information.
 ///
 /// Mirrors rpython/jit/metainterp/history.py AbstractFailDescr.
@@ -4226,22 +4231,20 @@ pub trait FailDescr: Descr {
     }
 
     /// `history.py` `AbstractFailDescr._attrs_` `rd_locs` —
-    /// `llsupport/assembler.py:279 guardtok.faildescr.rd_locs =
-    /// positions` writes the per-fail-arg jitframe slot positions as a
-    /// `Vec<u16>`.  `llsupport/llmodel.py:424 descr.rd_locs[index] *
-    /// WORD` reads to compute the absolute jitframe offset during
-    /// `get_value_direct`.
+    /// `llsupport/assembler.py` writes the per-fail-arg jitframe slot
+    /// positions as `rd_locs`. `llsupport/llmodel.py` reads
+    /// `descr.rd_locs[index] * WORD` during `get_value_direct`.
     ///
     /// Default `&[]` — every `AbstractFailDescr` instance has the slot,
     /// empty by default; populated by
-    /// `llsupport/assembler.py:225 write_failure_recovery_description`.
+    /// `write_failure_recovery_description`.
     fn rd_locs(&self) -> &[u16] {
         &[]
     }
 
-    /// `llsupport/assembler.py:279` write side.  Default panics — only
+    /// `llsupport/assembler.py` write side.  Default panics — only
     /// `ResumeGuardDescr`-family guards reach this writer.
-    fn set_rd_locs(&self, _locs: Vec<u16>) {
+    fn set_rd_locs(&self, _locs: RdLocs) {
         panic!(
             "set_rd_locs invoked on a FailDescr that does not carry \
              the AbstractFailDescr.rd_locs slot (history.py:132)"

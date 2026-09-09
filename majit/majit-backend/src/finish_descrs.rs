@@ -108,7 +108,7 @@ struct DoneWithThisFrameDescrBase {
     adr_jump_offset: UnsafeCell<usize>,
     /// `history.py` `AbstractFailDescr._attrs_` `rd_locs`.  Written
     /// by `llsupport/assembler.py:279`.  Empty until codegen stamps it.
-    rd_locs: UnsafeCell<Vec<u16>>,
+    rd_locs: UnsafeCell<majit_ir::RdLocs>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -121,7 +121,7 @@ impl DoneWithThisFrameDescrBase {
             descr_index: AtomicI32::new(-1),
             fail_arg_types,
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         }
     }
     fn adr_jump_offset(&self) -> usize {
@@ -133,7 +133,7 @@ impl DoneWithThisFrameDescrBase {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.rd_locs.get() = locs };
     }
 }
@@ -186,7 +186,7 @@ impl FailDescr for DoneWithThisFrameDescrVoid {
     fn rd_locs(&self) -> &[u16] {
         self.0.rd_locs()
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         self.0.set_rd_locs(locs);
     }
 }
@@ -238,7 +238,7 @@ impl FailDescr for DoneWithThisFrameDescrInt {
     fn rd_locs(&self) -> &[u16] {
         self.0.rd_locs()
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         self.0.set_rd_locs(locs);
     }
 }
@@ -290,7 +290,7 @@ impl FailDescr for DoneWithThisFrameDescrRef {
     fn rd_locs(&self) -> &[u16] {
         self.0.rd_locs()
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         self.0.set_rd_locs(locs);
     }
 }
@@ -342,7 +342,7 @@ impl FailDescr for DoneWithThisFrameDescrFloat {
     fn rd_locs(&self) -> &[u16] {
         self.0.rd_locs()
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         self.0.set_rd_locs(locs);
     }
 }
@@ -426,7 +426,7 @@ impl FailDescr for DoneWithThisFrameDescrMulti {
     fn rd_locs(&self) -> &[u16] {
         self.0.rd_locs()
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         self.0.set_rd_locs(locs);
     }
 }
@@ -484,7 +484,7 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
     fn rd_locs(&self) -> &[u16] {
         self.0.rd_locs()
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         self.0.set_rd_locs(locs);
     }
 }
@@ -509,7 +509,7 @@ pub struct PropagateExceptionDescr {
     /// finalised.
     adr_jump_offset: UnsafeCell<usize>,
     /// `history.py` `_attrs_` `rd_locs` — same inheritance path.
-    rd_locs: UnsafeCell<Vec<u16>>,
+    rd_locs: UnsafeCell<majit_ir::RdLocs>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -527,7 +527,7 @@ impl PropagateExceptionDescr {
         Self {
             descr_index: AtomicI32::new(-1),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         }
     }
 }
@@ -570,7 +570,7 @@ impl FailDescr for PropagateExceptionDescr {
         // Safety: single-threaded JIT (RPython GIL parity).
         unsafe { &*self.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         // Safety: single-threaded JIT (RPython GIL parity).
         unsafe { *self.rd_locs.get() = locs };
     }
