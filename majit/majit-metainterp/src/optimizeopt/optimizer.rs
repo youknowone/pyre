@@ -4882,8 +4882,13 @@ impl Optimizer {
                     }
                     // heap.py optimize_SETFIELD_GC ends in emit(op) of the
                     // same ResOperation. Reuse that Rc instead of cls().
-                    let existing = (op.opcode == op_rc.opcode).then(|| std::rc::Rc::clone(op_rc));
-                    self.emit_operation_inner(op.clone(), ctx, false, existing)?;
+                    let emit_rc = if op.opcode == op_rc.opcode {
+                        OptContext::stamp_emitted_op(&op, op_rc);
+                        std::rc::Rc::clone(op_rc)
+                    } else {
+                        std::rc::Rc::new(op.clone())
+                    };
+                    self.emit_operation_inner(emit_rc, ctx, false)?;
                     // optimizer.py:585-589: invoke postprocess callbacks
                     // in reverse order after emission.
                     for &pp_idx in postprocess_passes.iter().rev() {
@@ -4989,12 +4994,7 @@ impl Optimizer {
         // recorder input op verbatim (args re-resolved), so emit may append
         // that same Rc — no second ResOperation().
         if !replaced {
-            self.emit_operation_inner(
-                (*current_op).clone(),
-                ctx,
-                true,
-                Some(std::rc::Rc::clone(op_rc)),
-            )?;
+            self.emit_operation_inner(std::rc::Rc::clone(op_rc), ctx, true)?;
         } else {
             self.emit_operation((*current_op).clone(), ctx, false)?;
         }
@@ -5023,15 +5023,14 @@ impl Optimizer {
         ctx: &mut OptContext,
         reuse: bool,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        self.emit_operation_inner(op, ctx, reuse, None)
+        self.emit_operation_inner(std::rc::Rc::new(op), ctx, reuse)
     }
 
     fn emit_operation_inner(
         &mut self,
-        mut op: Op,
+        mut op: majit_ir::OpRc,
         ctx: &mut OptContext,
         reuse: bool,
-        existing: Option<majit_ir::OpRc>,
     ) -> Result<(), crate::optimize::InvalidLoop> {
         // RPython optimizer.py: _emit_operation is on the Optimizer (last
         // "pass" in the chain). Any force_box called here should emit directly,
@@ -5159,14 +5158,16 @@ impl Optimizer {
                              replacement guard has no descr",
                     );
                     crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
-                    ctx.replace_new_operation(target_pos, std::rc::Rc::new(op.clone()));
+                    ctx.replace_new_operation(target_pos, std::rc::Rc::clone(&op));
                     ctx.in_final_emission = saved_in_final_emission;
                     return Ok(());
                 }
             }
 
             // optimizer.py: op = self.emit_guard_operation(op, pendingfields)
-            op = self.emit_guard_operation(op, ctx);
+            if let Some(newop) = self.emit_guard_operation(&op, ctx) {
+                op = std::rc::Rc::new(newop);
+            }
             // emit_guard_operation may defer an `InvalidLoop` (e.g. a pending
             // SETARRAYITEM index that is not a non-negative constant).
             if let Some(e) = ctx.take_invalid_loop() {
@@ -5206,20 +5207,8 @@ impl Optimizer {
         // `debug_assert_box_type_invariant`).
         let op_opcode = op.opcode;
         let op_result_type = op.result_type();
-        let emitted = if let Some(rc) = existing {
-            if rc.opcode == op.opcode {
-                OptContext::stamp_emitted_op(&op, &rc);
-                ctx.emit_rc(rc)
-            } else {
-                // `_maybe_replace_guard_value` / similar rewrites change
-                // the opcode; the recorded Rc cannot follow.
-                ctx.emit(op)
-            }
-        } else if reuse {
-            ctx.emit_reusing(op)
-        } else {
-            ctx.emit(op)
-        };
+        let _ = reuse;
+        let emitted = ctx.emit_rc(op);
         // optimizer.py `self._emittedoperations[op] = None` — record
         // the freshly emitted op so `as_operation` can later confirm it
         // is in the emit set before downstream callers reason about
@@ -5334,7 +5323,7 @@ impl Optimizer {
     /// `_copy_resume_data_from` (descrless follow-up guard, e.g.
     /// `GUARD_NO_EXCEPTION` after a `CALL_MAY_FORCE`) or to
     /// `store_final_boxes_in_guard` for fresh guards.
-    fn emit_guard_operation(&mut self, mut op: Op, ctx: &mut OptContext) -> Op {
+    fn emit_guard_operation(&mut self, op: &Op, ctx: &mut OptContext) -> Option<Op> {
         let opcode = op.opcode;
         // optimizer.py `_emit_operation`.  A side-effecting op emitted straight into
         // `new_operations` (a forced virtual's NEW/SETFIELD_GC, a flushed lazy
@@ -5403,7 +5392,11 @@ impl Optimizer {
             //   self.metainterp_sd.profiler.count_ops(
             //       opnum, jitprof.Counters.OPT_GUARDS_SHARED)
             self.opt_guards_shared_emitted = self.opt_guards_shared_emitted.saturating_add(1);
-            op = self._copy_resume_data_from(op, ctx);
+            let replaced = self._copy_resume_data_from(op, ctx);
+            if opcode == OpCode::GuardException {
+                self.last_guard_op_idx = None;
+            }
+            return replaced;
         } else {
             // optimizer.py:630-631 + resume.py:428-445 + 520-558:
             // RPython passes `pendingfields` INTO finish() so
@@ -5499,7 +5492,7 @@ impl Optimizer {
             // tags target_tagged/value_tagged in place during finish();
             // the descr's set_rd_pendingfields receives the tagged slice
             // post-finish (mod.rs::store_final_boxes_in_guard).
-            op = Self::store_final_boxes_in_guard(op, ctx, knowledge, pending_for_finish);
+            Self::store_final_boxes_in_guard(op, ctx, knowledge, pending_for_finish);
             // optimizer.py: force_box on each fail_arg for unrolling.
             if let Some(fa) = op.guard_fail_args() {
                 let fargs: smallvec::SmallVec<[OpRef; 8]> =
@@ -5514,24 +5507,23 @@ impl Optimizer {
             // optimizer.py (called from store_final_boxes_in_guard):
             // GUARD_VALUE → bool replacement. We invoke it here so descr is
             // already set when _maybe_replace_guard_value reads it.
-            if op.opcode == OpCode::GuardValue {
-                op = Self::_maybe_replace_guard_value(op, ctx);
-            }
-        }
-
-        // optimizer.py:679: update last_guard_op only on the fresh-guard path.
-        // The op has not yet been pushed to `ctx.new_operations` (the
-        // surrounding `emit_operation` does so at `ctx.emit(op.clone())`
-        // shortly after we return), so the predicted donor index is
-        // exactly `ctx.new_operations.len()` at this point.
-        if !shared {
+            let replaced = if op.opcode == OpCode::GuardValue {
+                Self::_maybe_replace_guard_value_if_changed(op, ctx)
+            } else {
+                None
+            };
+            // optimizer.py: update last_guard_op only on the fresh-guard path.
+            // The op has not yet been pushed to `ctx.new_operations` (the
+            // surrounding `emit_operation` does so at `ctx.emit(op.clone())`
+            // shortly after we return), so the predicted donor index is
+            // exactly `ctx.new_operations.len()` at this point.
             self.last_guard_op_idx = Some(ctx.new_operations.len());
+            // optimizer.py: GUARD_EXCEPTION breaks the chain.
+            if opcode == OpCode::GuardException {
+                self.last_guard_op_idx = None;
+            }
+            return replaced;
         }
-        // optimizer.py:684-685: GUARD_EXCEPTION breaks the chain.
-        if opcode == OpCode::GuardException {
-            self.last_guard_op_idx = None;
-        }
-        op
     }
 
     /// optimizer.py _copy_resume_data_from
@@ -5546,7 +5538,7 @@ impl Optimizer {
     /// `prev` references the donor's `ResumeGuardDescr`.  Readers
     /// go through `FailDescr::rd_*()` which chases `prev` automatically
     /// (compile.py `get_resumestorage(): return prev`).
-    fn _copy_resume_data_from(&mut self, mut op: Op, ctx: &mut OptContext) -> Op {
+    fn _copy_resume_data_from(&mut self, op: &Op, ctx: &mut OptContext) -> Option<Op> {
         let donor_idx = self
             .last_guard_op_idx
             .expect("_copy_resume_data_from requires last_guard_op_idx");
@@ -5615,9 +5607,9 @@ impl Optimizer {
         let _ = donor_idx;
         // optimizer.py:698-699: if guard_op.opnum == GUARD_VALUE: ...
         if op.opcode == OpCode::GuardValue {
-            op = Self::_maybe_replace_guard_value(op, ctx);
+            return Self::_maybe_replace_guard_value_if_changed(op, ctx);
         }
-        op
+        None
     }
 
     /// optimizer.py store_final_boxes_in_guard
@@ -5632,11 +5624,11 @@ impl Optimizer {
     /// case internally (silent return for guards without rd_resume_position
     /// or snapshot_boxes entry).
     fn store_final_boxes_in_guard(
-        mut op: Op,
+        op: &Op,
         ctx: &mut OptContext,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
-    ) -> Op {
+    ) {
         // optimizer.py:732-748 + resume.py:389-452:
         // RPython finish() handles virtuals without forcing.
         // _number_boxes tags virtual fail_args as TAGVIRTUAL,
@@ -5661,8 +5653,7 @@ impl Optimizer {
                 }
             }
         }
-        ctx.finalize_guard_resume_data(&mut op, knowledge, pending_setfields);
-        op
+        ctx.finalize_guard_resume_data(op, knowledge, pending_setfields);
     }
 
     /// bridgeopt.py serialize_optimizer_knowledge parity:
@@ -5716,7 +5707,7 @@ impl Optimizer {
         } else {
             Some(knowledge_for_resume)
         };
-        let guard_op = Self::store_final_boxes_in_guard(guard_op, ctx, knowledge, Vec::new());
+        Self::store_final_boxes_in_guard(&guard_op, ctx, knowledge, Vec::new());
         // virtualize.py:88-90 `i = len(_newoperations) - 1; assert i >= 0;
         // insert(i, guard_op)` — the FINISH this postprocess belongs to is the
         // last element, so the guard lands immediately in front of it.
@@ -5809,11 +5800,11 @@ impl Optimizer {
     ///             return newop
     ///     return op
     /// ```
-    fn _maybe_replace_guard_value(op: Op, ctx: &mut OptContext) -> Op {
+    fn _maybe_replace_guard_value_if_changed(op: &Op, ctx: &mut OptContext) -> Option<Op> {
         // optimizer.py:755: if op.getarg(0).type == 'i'
         let arg0 = op.arg(0);
         if ctx.opref_type(arg0.to_opref()) != Some(majit_ir::Type::Int) {
-            return op;
+            return None;
         }
         // optimizer.py: b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = {
@@ -5821,17 +5812,15 @@ impl Optimizer {
             ctx.getintbound_handle(&b).borrow().clone()
         };
         if !b.is_bool() {
-            return op;
+            return None;
         }
         // optimizer.py:762: constvalue = op.getarg(1).getint()
-        let Some(constvalue) = op.arg(1).get_box_replacement(false).const_int() else {
-            return op;
-        };
+        let constvalue = op.arg(1).get_box_replacement(false).const_int()?;
         // optimizer.py:763-775: 0 → GUARD_FALSE, 1 → GUARD_TRUE, else give up.
         let new_opcode = match constvalue {
             0 => OpCode::GuardFalse,
             1 => OpCode::GuardTrue,
-            _ => return op,
+            _ => return None,
         };
         // optimizer.py: replace_op_with(op, opnum, [op.getarg(0)], descr)
         let mut newop = Op::new(new_opcode, &[arg0]);
@@ -5851,7 +5840,7 @@ impl Optimizer {
         // op.descr above shares the donor's RdPayload, so newop's
         // FailDescr::rd_* readers see the same data.
         newop.set_rd_resume_position(op.rd_resume_position());
-        newop
+        Some(newop)
     }
 }
 

@@ -234,12 +234,11 @@ impl Op {
     }
 
     /// In-place mutable view of the fail_args slot.  Lets callers iterate
-    /// the SmallVec mutably (`fa.iter_mut()`, `fa[i] = …`) without going
+    /// the slice mutably (`fa.iter_mut()`, `fa[i] = …`) without going
     /// through a clone/setfailargs round-trip.  Returns `None` when the
-    /// slot is empty.  Uses `RefCell::get_mut` so it requires `&mut Op`;
-    /// shared-`Op` callers should clone via `getfailargs_copy`, mutate
-    /// the copy, and call `setfailargs`.
-    pub fn fail_args_mut(&mut self) -> Option<&mut [crate::operand::Operand]> {
+    /// slot is empty.  Routes through [`DescrSlot::extra_mut`] so a
+    /// shared `Rc<Op>` can rewrite failargs on the same ResOperation.
+    pub fn fail_args_mut(&self) -> Option<&mut [crate::operand::Operand]> {
         match self.descr.extra_mut()? {
             crate::resoperation::OpKindExtra::Guard(g)
             | crate::resoperation::OpKindExtra::VectorGuard { guard: g, .. } => g.fail_args_mut(),

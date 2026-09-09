@@ -3035,9 +3035,7 @@ impl OptContext {
         let pos_ref = op.pos.get();
         if op.opcode.is_guard() {
             if !self.in_final_emission {
-                let mut owned = (*op).clone();
-                self.emit_guard_operation(&mut owned);
-                Self::stamp_emitted_op(&owned, &op);
+                let _ = self.emit_guard_operation(&op);
             }
         } else {
             let dominated_by_side_effect = !((op.opcode.has_no_side_effect()
@@ -3179,7 +3177,9 @@ impl OptContext {
         // `Optimizer::last_guard_op_idx` instead.
         if op.opcode.is_guard() {
             if !self.in_final_emission {
-                self.emit_guard_operation(&mut op);
+                if let Some(newop) = self.emit_guard_operation(&op) {
+                    op = newop;
+                }
             }
         } else {
             // optimizer.py `_emit_operation` — the test runs for every emitted non-guard
@@ -6425,7 +6425,7 @@ impl OptContext {
     /// optimizer.py emit_guard_operation — decide whether to share
     /// resume data from the previous guard (_copy_resume_data_from) or build
     /// new resume data (store_final_boxes_in_guard).
-    fn emit_guard_operation(&mut self, op: &mut Op) {
+    fn emit_guard_operation(&mut self, op: &Op) -> Option<Op> {
         let opnum = op.opcode;
 
         // optimizer.py:655-664: GUARD_(NO_)EXCEPTION following a guard that
@@ -6519,10 +6519,16 @@ impl OptContext {
                 None => op.clear_fail_arg_types(),
             }
             // optimizer.py: _maybe_replace_guard_value after copy.
-            if op.opcode == OpCode::GuardValue {
-                self.maybe_replace_guard_value(op);
-            }
+            let replaced = if op.opcode == OpCode::GuardValue {
+                self.maybe_replace_guard_value(op)
+            } else {
+                None
+            };
             // Don't update last_guard_idx — copied guards don't become sources.
+            if opnum == OpCode::GuardException {
+                self.last_guard_idx = None;
+            }
+            return replaced;
         } else {
             // optimizer.py: store_final_boxes_in_guard.  This is
             // the standalone OptContext path (used by tests and the
@@ -6554,54 +6560,53 @@ impl OptContext {
                 }
             }
             // optimizer.py: _maybe_replace_guard_value after store.
-            if op.opcode == OpCode::GuardValue {
-                self.maybe_replace_guard_value(op);
+            let replaced = if op.opcode == OpCode::GuardValue {
+                self.maybe_replace_guard_value(op)
+            } else {
+                None
+            };
+            // optimizer.py: GUARD_EXCEPTION clears sharing.
+            if opnum == OpCode::GuardException {
+                self.last_guard_idx = None;
             }
-        }
-
-        // optimizer.py:684-685: GUARD_EXCEPTION clears sharing.
-        if opnum == OpCode::GuardException {
-            self.last_guard_idx = None;
+            return replaced;
         }
     }
 
     /// optimizer.py _maybe_replace_guard_value — turn
     /// guard_value(bool) into guard_true/guard_false.
-    fn maybe_replace_guard_value(&self, op: &mut Op) {
+    fn maybe_replace_guard_value(&self, op: &Op) -> Option<Op> {
         let arg0 = op.arg(0);
         // optimizer.py:755: if op.getarg(0).type == 'i'
         let arg0_resolved = self.resolve_operand_operand(&arg0).to_opref();
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
-            return;
+            return None;
         }
         // optimizer.py: b = self.getintbound(op.getarg(0))
         let Some(bound) = self
             .get_box_replacement_operand_opt(arg0_resolved)
             .and_then(|b| self.peek_intbound_box(&b))
         else {
-            return;
+            return None;
         };
         if !bound.is_bool() {
-            return;
+            return None;
         }
         let arg1 = op.arg(1);
-        let Some(constvalue) = self
+        let constvalue = self
             .resolve_operand_operand_opt(&arg1)
-            .and_then(|cb| cb.const_int())
-        else {
-            return;
-        };
+            .and_then(|cb| cb.const_int())?;
         let new_opcode = match constvalue {
             0 => OpCode::GuardFalse,
             1 => OpCode::GuardTrue,
-            _ => return, // optimizer.py:775: strange code, just disable
+            _ => return None, // optimizer.py: strange code, just disable
         };
         // optimizer.py newop = self.replace_op_with(op, opnum,
         //                                  [op.getarg(0)], descr)
         // — produce a fresh op with new opcode and trimmed args, descr
         // unchanged.  copy_and_change preserves fail_args / rd_resume_position
         // / fail_arg_types for guard ops (resoperation.py:498-503).
-        *op = op.copy_and_change(new_opcode, Some(&[arg0]), None);
+        Some(op.copy_and_change(new_opcode, Some(&[arg0]), None))
     }
 
     /// optimizer.py force_box — inline equivalent for
@@ -6671,7 +6676,7 @@ impl OptContext {
     /// Uses snapshot data (vable_boxes, frame_pcs, multi-frame) when available.
     pub fn finalize_guard_resume_data(
         &mut self,
-        op: &mut Op,
+        op: &Op,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) {
@@ -6680,7 +6685,7 @@ impl OptContext {
 
     fn store_final_boxes_in_guard(
         &mut self,
-        op: &mut Op,
+        op: &Op,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         mut pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) {
