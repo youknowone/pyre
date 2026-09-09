@@ -4551,7 +4551,10 @@ impl FrameGcMaps {
         if op.opcode == OpCode::Finish {
             // assembler.py `genop_finish`: preserve only the forced guard's
             // map, plus the Ref return slot. Ordinary temporary homes die.
-            indices.extend(self.finish_gcmap.borrow_mut().drain(..));
+            // Copy, do not drain: one module can emit more than one FINISH
+            // (merged inline regions), and the second must keep the same
+            // GUARD_NOT_FORCED_2 homes.
+            indices.extend(self.finish_gcmap.borrow().iter().copied());
         }
         self.emit_push_gcmap(sink, &indices);
     }
@@ -13472,9 +13475,10 @@ mod tests {
                 maps.home_index(1)
             ]
         );
-        assert!(
-            maps.finish_gcmap.borrow().is_empty(),
-            "a later trace must not inherit this finish map"
+        assert_eq!(
+            maps.finish_gcmap.borrow().as_slice(),
+            &[maps.home_index(1)],
+            "a later FINISH in this module must keep the force map"
         );
     }
 

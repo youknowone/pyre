@@ -1915,9 +1915,13 @@ impl MiniMarkGC {
         // the same way the nursery-full arm does.
         if total_size >= self.config.large_object_threshold {
             unsafe { *needs_write_barrier = true };
-            unsafe { self.roots.add(root) };
+            for i in 0..root_count {
+                unsafe { self.roots.add(roots.add(i)) };
+            }
             let oom = self.maybe_collect_for_external_malloc(total_size);
-            self.roots.remove(root);
+            for i in (0..root_count).rev() {
+                self.roots.remove(unsafe { roots.add(i) });
+            }
             if oom {
                 return GcRef(0);
             }

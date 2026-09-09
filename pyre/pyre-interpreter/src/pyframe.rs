@@ -6136,11 +6136,12 @@ impl PyFrame {
         // slot is the only thing that keeps it off the next sweep. It joins the
         // bracket the call inputs already opened: its lifetime is the rest of
         // this function body, so it needs no owner of its own.
-        let _ = pyre_object::gc_roots::pin_root(locals_cells_stack_w as PyObjectRef);
+        let locals_idx = _roots.publish(&[locals_cells_stack_w as PyObjectRef]);
+        _roots.normalize(locals_idx, 1);
 
         {
             // Populate the freshly-allocated array via its mutable slice.
-            let arr = unsafe { &mut *locals_cells_stack_w };
+            let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
 
             // Bind positional arguments directly -- no intermediate Vec.
             let nargs = args.len().min(num_locals);
@@ -6148,10 +6149,9 @@ impl PyFrame {
                 arr[i] = _roots.get(args_base + i);
             }
 
-            // CPython 3.11+ `co_localsplusnames` unified slot layout:
-            // each cellvar that ALSO appears in varnames shares its
+            // Each cellvar that also appears in varnames shares its
             // varname slot (MAKE_CELL wraps the local). Only cellvars
-            // NOT in varnames take a fresh slot in the cell region.
+            // not in varnames take a fresh slot in the cell region.
             // Allocating cells for the overlap would shift freevar
             // indices and break LOAD_DEREF on `def repeat(n): def
             // wrap(fn): def inner(): return (n, fn)` style closures.
@@ -6161,11 +6161,13 @@ impl PyFrame {
                 let family = unsafe {
                     crate::pycode::w_code_cell_family(_roots.get(root_base), num_locals + i)
                 };
+                let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
                 arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL, family);
             }
             let closure = _roots.get(root_base + 2);
             if !closure.is_null() {
                 let nfreevars = code_ref.freevars.len();
+                let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
                 for i in 0..nfreevars {
                     let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
                     arr[num_locals + npure + i] = cell;
@@ -6174,8 +6176,9 @@ impl PyFrame {
         }
 
         // Stable frame-locals arrays are filled before their owning frame is
-        // published. `w_cell_new` uses the non-collecting old-gen allocator;
-        // remember the completed array before the next allocating operation.
+        // published. Reload after the cell allocations: the pin slot is the
+        // only root until the frame stores the array.
+        let locals_cells_stack_w = _roots.get(locals_idx) as *mut FixedObjectArray;
         remember_frame_locals_array(locals_cells_stack_w);
 
         let frame_stores_global = unsafe {
