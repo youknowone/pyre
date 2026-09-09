@@ -194,7 +194,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     let total_r = top_num_regs_r + top_constants_r.len();
     let total_i = top_num_regs_i + top_constants_i.len();
     let total_f = top_num_regs_f + top_constants_f.len();
-    let mut top_regs_r = vec![OpRef::NONE; total_r];
+    let top_regs_r = RegisterBank::with_constants(vec![OpRef::NONE; total_r], top_num_regs_r);
+    let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&top_regs_r);
     let mut top_regs_i = vec![OpRef::NONE; total_i];
     let mut top_regs_f = vec![OpRef::NONE; total_f];
     let mut top_concrete_r = vec![ConcreteValue::Null; total_r];
@@ -217,7 +218,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // slot).
     for (i, v) in top_constants_r.iter().enumerate() {
         let v = v.get();
-        top_regs_r[top_num_regs_r + i] = trace_ctx.const_ref(v);
+        top_regs_r.set(top_num_regs_r + i, trace_ctx.const_ref(v));
         top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in top_constants_f.iter().enumerate() {
@@ -260,7 +261,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         });
     }
     for (i, &box_ref) in argboxes_r.iter().enumerate() {
-        top_regs_r[i] = box_ref;
+        top_regs_r.set(i, box_ref);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = trace_ctx.box_value(box_ref) {
             top_concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
@@ -350,11 +351,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
 
     let result = {
         let mut wc = WalkContext {
-            callee_shadow: None,
-            inline_callee_consts: None,
-            inline_poison_pcs: None,
-            fbw_mode: FbwWalkMode {
-                snapshot_sym: sym_ptr,
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: None,
+                concrete_registers_r: top_concrete_r,
                 current_exception_seed: (trace_ctx.is_bridge_trace
                     && !sym.last_exc_box().is_none())
                 .then_some(sym.last_exc_box()),
@@ -363,6 +362,17 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 } else {
                     pyre_object::PY_NULL
                 },
+                outer_active_boxes: Vec::new(),
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
+                ..Default::default()
+            }),
+            inline_callee_consts: None,
+            inline_poison_pcs: None,
+            fbw_mode: FbwWalkMode {
+                snapshot_sym: sym_ptr,
+
                 class_of_last_exc_is_const: sym.class_of_last_exc_is_const(),
                 // A guard-failure bridge resumes at the opcode boundary, so
                 // its first `jit_merge_point` crossing at this python-pc is
@@ -376,10 +386,10 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 ..Default::default()
             },
             session,
-            registers_r: &mut top_regs_r,
-            registers_i: &mut top_regs_i,
-            registers_f: &mut top_regs_f,
-            concrete_registers_r: &mut top_concrete_r,
+            registers_r: &top_regs_r,
+            registers_i: &RegisterBank::with_constants(top_regs_i, top_num_regs_i),
+            registers_f: &RegisterBank::with_constants(top_regs_f, top_num_regs_f),
+
             concrete_registers_i: &mut top_concrete_i,
             descr_refs: &descr_refs,
             raw_descrs,
@@ -390,7 +400,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             entry_py_pc,
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
-            outer_active_boxes: Vec::new(),
+
             // This entry (test/fixture) hard-codes
             // `outer_jitcode_index = 0` and an empty `outer_active_boxes`
             // rather than seeding them from `sym.jitcode` /
@@ -399,17 +409,18 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // `walker_capture_snapshot_for_last_guard` would attach
             // resume data pointing at the wrong frame.
             pending_guard_snapshot_error: None,
-            vstack_boxes: Vec::new(),
+
             vstack_depth: 0,
             vstack_cur_pypc: 0,
             vstack_valid: false,
-            vstack_last_ref: OpRef::NONE,
+
             vstack_reorder_ceiling: u32::MAX,
-            vstack_reorder_saved: None,
+
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
         };
+        let _frame_state_root = crate::trace::InlineFrameStateGuard::enter(&wc.frame_state);
         // #73: seed the walk-level operand-stack box mirror
         // at entry.  The mirror is only enabled when the outer sym owns the
         // virtualizable shadow (the production full-body loop trace) — the
@@ -650,8 +661,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // `sym.registers_r`, so publish it for the length of the walk or a
             // fold's freshly minted `ConstPtr` sits in a bank no root area
             // reaches.
-            let _bank_guard =
-                crate::trace::InlineRegisterBankGuard::enter(&raw mut *wc.registers_r);
+            let _bank_guard = crate::trace::InlineRegisterBankGuard::enter(wc.registers_r);
             walk(jitcode_code, walk_position, &mut wc)
         };
         if matches!(
@@ -659,7 +669,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. })
                 | Err(DispatchError::BranchGuardKeptStackUnsupported { .. })
         ) && wc.vstack_valid
-            && wc.vstack_depth <= wc.vstack_boxes.len()
+            && wc.vstack_depth <= wc.frame_state.borrow().vstack_boxes.len()
         {
             // `MIFrame.registers_r` is the authoritative source upstream when
             // an abort converts the metainterp framestack to blackholes
@@ -668,7 +678,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // the decoded abort resume pc before it mutates the live frame.
             fbw_branch_abort_stack_latch(
                 wc.vstack_cur_pypc as usize,
-                wc.vstack_boxes[..wc.vstack_depth].to_vec(),
+                wc.frame_state.borrow().vstack_boxes[..wc.vstack_depth].to_vec(),
             );
         }
         // Read final last_exc_value before wc drops so the borrow
@@ -803,7 +813,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     // non-bridge callers (`bridge_registers_r == None`).
     let mut regs_r = root_sym
         .bridge_registers_r()
-        .cloned()
+        .map(|regs| regs.to_vec())
         .unwrap_or_else(|| root_sym.registers_r().to_vec());
     let result_color = unsafe { &(*root_sym.jitcode()).payload }
         .result_color_trivia_for_jitcode_pc(root_pc)
@@ -1165,7 +1175,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let total_r = num_regs_r + jc.constants_r.len();
     let total_i = num_regs_i + jc.constants_i.len();
     let total_f = num_regs_f + jc.constants_f.len();
-    let mut regs_r = vec![OpRef::NONE; total_r];
+    let regs_r = RegisterBank::with_constants(vec![OpRef::NONE; total_r], num_regs_r);
+    let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&regs_r);
     let mut regs_i = vec![OpRef::NONE; total_i];
     let mut regs_f = vec![OpRef::NONE; total_f];
     let mut concrete_r = vec![ConcreteValue::Null; total_r];
@@ -1178,7 +1189,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     // reading as the top-level seeding above and as `build_callee_banks`.
     for (i, v) in jc.constants_r.iter().enumerate() {
         let v = v.get();
-        regs_r[num_regs_r + i] = ctx.const_ref(v);
+        regs_r.set(num_regs_r + i, ctx.const_ref(v));
         concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in jc.constants_f.iter().enumerate() {
@@ -1192,7 +1203,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         }));
     }
     for (i, &box_ref) in argboxes_r.iter().enumerate() {
-        regs_r[i] = box_ref;
+        regs_r.set(i, box_ref);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(box_ref) {
             concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
@@ -1230,7 +1241,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 callee_num_regs_r: regs_r.len(),
             }));
         }
-        regs_r[call_dst_reg] = result;
+        regs_r.set(call_dst_reg, result);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
             concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
@@ -1312,16 +1323,27 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
 
     let outcome = {
         let mut sub_wc = WalkContext {
-            callee_shadow: Some(super::CalleeLocalsShadow {
-                code_ptr: callee_pjc.code_ptr,
-                // `resume.py:1042-1057` rebuilds one concrete frame for every
-                // resumed MIFrame.  Keep that identity on this callee's own
-                // walk context so residual execution can enter precisely this
-                // frame on the ExecutionContext chain.  It deliberately does
-                // not use `InlineConcreteFrameGuard`: that TLS also selects
-                // the standard-virtualizable heap-sync target, which remains
-                // the bridge root for a reconstructed carrier.
-                concrete_frame: concrete_callee_frame,
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: Some(super::CalleeLocalsShadow {
+                    code_ptr: callee_pjc.code_ptr,
+                    // `resume.py rebuild_from_resumedata` rebuilds a frame for every
+                    // resumed MIFrame.  Keep that identity on this callee's own
+                    // walk context so residual execution can enter precisely this
+                    // frame on the ExecutionContext chain.  It deliberately does
+                    // not use `InlineConcreteFrameGuard`: that TLS also selects
+                    // the standard-virtualizable heap-sync target, which remains
+                    // the bridge root for a reconstructed carrier.
+                    concrete_frame: concrete_callee_frame,
+                    ..Default::default()
+                }),
+                concrete_registers_r: concrete_r,
+                current_exception_seed: (!root_sym.last_exc_box().is_none())
+                    .then_some(root_sym.last_exc_box()),
+                current_exception_seed_concrete: root_sym.last_exc_value(),
+                outer_active_boxes: outer_active_boxes,
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
                 ..Default::default()
             }),
             inline_callee_consts: Some(consts),
@@ -1335,17 +1357,15 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,
                 carrier_resume: true,
-                current_exception_seed: (!root_sym.last_exc_box().is_none())
-                    .then_some(root_sym.last_exc_box()),
-                current_exception_seed_concrete: root_sym.last_exc_value(),
+
                 class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const(),
                 ..Default::default()
             },
             session,
-            registers_r: &mut regs_r,
-            registers_i: &mut regs_i,
-            registers_f: &mut regs_f,
-            concrete_registers_r: &mut concrete_r,
+            registers_r: &regs_r,
+            registers_i: &RegisterBank::with_constants(regs_i, num_regs_i),
+            registers_f: &RegisterBank::with_constants(regs_f, num_regs_f),
+
             concrete_registers_i: &mut concrete_i,
             descr_refs: &perfn_descr_refs,
             raw_descrs: RawDescrPool::PerFn(perfn_descrs),
@@ -1363,13 +1383,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // first and only concrete execution.
             is_authoritative_executor: true,
             pending_guard_snapshot_error: None,
-            vstack_boxes: Vec::new(),
+
             vstack_depth: 0,
             vstack_cur_pypc: 0,
             vstack_valid: false,
-            vstack_last_ref: OpRef::NONE,
+
             vstack_reorder_ceiling: u32::MAX,
-            vstack_reorder_saved: None,
+
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -1380,8 +1400,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             entry_py_pc: EntryPyPc::Jit(root_pc),
             outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,
             outer_jitcode_index,
-            outer_active_boxes,
         };
+        let _frame_state_root = crate::trace::InlineFrameStateGuard::enter(&sub_wc.frame_state);
         let mut callee_parents = vec![parent_for_current];
         callee_parents.extend(pending_ctor_tail.take());
         let _inline_frame = InlineFrameGuard::enter(session, callee_w_code, false, callee_parents);
@@ -1407,17 +1427,21 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // folds to `CALL_ASSEMBLER` instead of declining.
         for (slot, &opref) in local_oprefs.iter().enumerate() {
             sub_wc
+                .frame_state
+                .borrow_mut()
                 .callee_shadow
                 .as_mut()
                 .unwrap()
                 .set_opref(slot as i64, opref);
         }
         for (slot, &v) in local_concretes.iter().enumerate() {
-            sub_wc.callee_shadow.as_mut().unwrap().set_concrete(
-                callee_pjc.metadata.portal_frame_reg,
-                slot as i64,
-                v,
-            );
+            sub_wc
+                .frame_state
+                .borrow_mut()
+                .callee_shadow
+                .as_mut()
+                .unwrap()
+                .set_concrete(callee_pjc.metadata.portal_frame_reg, slot as i64, v);
         }
         // The decoded multi-frame recipe carries this callee's semantic
         // operand stack after its locals/cells prefix.  Preserve that red
@@ -1427,17 +1451,25 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         let stack_base = local_oprefs.len();
         for (s, &opref) in resumed_stack_oprefs.iter().enumerate() {
             sub_wc
+                .frame_state
+                .borrow_mut()
                 .callee_shadow
                 .as_mut()
                 .unwrap()
                 .set_opref((stack_base + s) as i64, opref);
         }
         for (s, &value) in resumed_stack_concretes.iter().enumerate() {
-            sub_wc.callee_shadow.as_mut().unwrap().set_concrete(
-                callee_pjc.metadata.portal_frame_reg,
-                (stack_base + s) as i64,
-                value,
-            );
+            sub_wc
+                .frame_state
+                .borrow_mut()
+                .callee_shadow
+                .as_mut()
+                .unwrap()
+                .set_concrete(
+                    callee_pjc.metadata.portal_frame_reg,
+                    (stack_base + s) as i64,
+                    value,
+                );
         }
         if let Some(frame) = ActiveResumeFrame::current(session, root_sym_ptr)
             && frame.0.jitcode.code.as_ptr() == callee_code.as_ptr()
@@ -1445,7 +1477,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             && let Some((py_pc, _code_ptr, depth)) = frame.vstack_coordinate_for_jitcode_pc(entry)
             && depth == resumed_stack_oprefs.len()
         {
-            sub_wc.vstack_boxes = resumed_stack_oprefs.to_vec();
+            sub_wc.frame_state.borrow_mut().vstack_boxes = resumed_stack_oprefs.to_vec();
             sub_wc.vstack_depth = depth;
             sub_wc.vstack_cur_pypc = py_pc;
             sub_wc.vstack_valid = true;
@@ -1459,7 +1491,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // box with no runtime value, and an effectful sub-walk replays from the
         // guard (the framed-pickle stream is consumed twice).
         if !sub_wc.vstack_valid {
-            sub_wc.vstack_boxes = resumed_stack_oprefs.to_vec();
+            sub_wc.frame_state.borrow_mut().vstack_boxes = resumed_stack_oprefs.to_vec();
             sub_wc.vstack_depth = resumed_stack_oprefs.len();
             sub_wc.vstack_cur_pypc =
                 crate::py_coord::resume_py_pc_for_jitcode_word(consts.jitcode_index, entry as i32)
@@ -1467,7 +1499,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             sub_wc.vstack_valid = true;
         }
         // As above: the callee bank is a local of this frame.
-        let bank_guard = crate::trace::InlineRegisterBankGuard::enter(&raw mut *sub_wc.registers_r);
+        let bank_guard = crate::trace::InlineRegisterBankGuard::enter(sub_wc.registers_r);
         let outcome = walk(callee_code, entry, &mut sub_wc);
         drop(bank_guard);
         // `pyjitpl.py handle_guard_failure` wraps `_handle_guard_failure`

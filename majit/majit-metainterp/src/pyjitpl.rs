@@ -480,7 +480,7 @@ struct SimpleCompileViews<'a> {
 
 fn make_simple_compile_views<'a>(
     trace: &'a TreeLoop,
-    call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
     enable_opts: &'a [String],
 ) -> SimpleCompileViews<'a> {
     let data = compile::SimpleCompileData::new(trace, None, call_pure_results, enable_opts);
@@ -3014,18 +3014,13 @@ impl<M: Clone> MetaInterp<M> {
         // consts (history.py `ConstPtr.value`) those value slots can be
         // `ConstPtr(GcRef)`; they are returned on cache hits and
         // emitted into the op-graph, so a stale gcref is a use-after-move.
-        // Forward them in place. (Cache *keys* are intentionally left stale —
-        // a forwarded lookup key misses and repopulates, like
-        // `call_pure_results` below.)
+        // Forward them in place. Heapcache key ownership is a separate census
+        // from the independently rooted CALL_PURE constants below.
         trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
-        // NOTE: `trace_ctx.call_pure_results: IndexMap<Vec<Value>, Value>`
-        // (pyjitpl.py:3572-3573) also stores Ref slots. RPython's
-        // args_dict stores Const boxes and the GC traces their gcrefs
-        // through the Python object graph. Pyre stores concrete
-        // `Value::Ref(GcRef)` entries in a linear IndexMap; this active
-        // trace walker does not rewrite that cache yet. Stale entries
-        // miss after a moving collection and are repopulated by the next
-        // CALL_PURE recording.
+        // util.py args_dict / history.py ConstPtr.value: CALL_PURE's keys and
+        // results own collector-updated Const slots. Compile/optimizer handles
+        // share that same dictionary; its roots survive even after this trace
+        // is detached, without a callback borrowing TraceCtx during collection.
 
         // Non-constant Ref registers name the recorder's `RefFrontendOp` /
         // `InputArgRef`, whose attached concrete value was forwarded above.
@@ -7350,7 +7345,7 @@ impl<M: Clone> MetaInterp<M> {
         });
 
         // compile.py:221: call_pure_results = metainterp.call_pure_results
-        let call_pure_results = ctx.take_call_pure_results();
+        let call_pure_results = ctx.call_pure_results.clone();
 
         let snapshots = ctx.take_snapshots();
         let mut recorder = ctx.recorder;
@@ -9328,7 +9323,7 @@ impl<M: Clone> MetaInterp<M> {
             // ConstantPool to snapshot — this typed-constant map starts fresh.
             let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
-            let call_pure_results = ctx.take_call_pure_results();
+            let call_pure_results = ctx.call_pure_results.clone();
 
             // compile.py:358-362 records the closing JUMP on the same history
             // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
@@ -10425,7 +10420,8 @@ impl<M: Clone> MetaInterp<M> {
             .compile_tracing
             .as_mut()
             .unwrap()
-            .take_call_pure_results();
+            .call_pure_results
+            .clone();
         // `pyjitpl.py:3216-3217` / `pyjitpl.py:3241`:
         //   `token = sd.done_with_this_frame_descr_<type>` (normal) or
         //   `token = sd.exit_frame_with_exception_descr_ref` (raising),
@@ -10944,7 +10940,7 @@ impl<M: Clone> MetaInterp<M> {
         let orig_vable_ptr_simple =
             self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
 
-        let call_pure_results = ctx.take_call_pure_results();
+        let call_pure_results = ctx.call_pure_results.clone();
         let snapshots = ctx.take_snapshots();
         let recorder = ctx.recorder;
         // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
@@ -14574,7 +14570,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
-        call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
+        call_pure_results: crate::optimizeopt::util::ArgsDict,
     ) -> bool {
         self.remember_compiled_graph_write();
         self.last_compiled_artifact_token = None;

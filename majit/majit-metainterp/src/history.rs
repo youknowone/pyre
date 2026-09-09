@@ -3812,13 +3812,14 @@ impl TraceCtx {
     /// `CallPure*` (or a `Const` when all args fold) AND the
     /// `call_pure_results` cache is populated for cross-trace
     /// constant folding by the optimizer's pure pass
-    /// (`pyjitpl.py:2397 + compile.py:221 take_call_pure_results`).
+    /// (`pyjitpl.py MetaInterp.record_result_of_call_pure` and
+    /// `compile.py PreambleCompileData.optimize`).
     ///
     /// `concrete_arg_values` must be parallel to `args` and start with
     /// the funcbox's concrete value (i.e., one entry for the funcbox
     /// followed by one per real arg) — same shape as
     /// `_build_allboxes(funcbox, argboxes, descr)` in
-    /// `pyjitpl.py:1960-1993`. `concrete_result` is the value returned
+    /// `pyjitpl.py MIFrame._build_allboxes`. `concrete_result` is the value returned
     /// by executing the helper with the concrete operand values; the
     /// caller is responsible for invoking the helper (the runtime
     /// tracer already has the concrete operands available before the
@@ -4028,12 +4029,6 @@ impl TraceCtx {
         self.recorder.cut(patch_pos);
         self.recorder
             .record_op_with_descr(pure_opcode, argboxes, descr)
-    }
-
-    /// pyjitpl.py:2397 + compile.py:221: take call_pure_results for
-    /// passing to the optimizer.
-    pub fn take_call_pure_results(&mut self) -> indexmap::IndexMap<Vec<Value>, Value> {
-        std::mem::take(&mut self.call_pure_results)
     }
 
     // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──

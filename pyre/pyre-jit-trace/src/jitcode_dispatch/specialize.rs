@@ -2673,7 +2673,8 @@ fn walker_executing_frame_box<Sym: WalkSym>(
 ) -> Option<(OpRef, usize)> {
     let inline_frame = current_inline_concrete_frame();
     if inline_frame != 0 {
-        let shadow = ctx.callee_shadow.as_ref()?;
+        let state = ctx.frame_state.borrow();
+        let shadow = state.callee_shadow.as_ref()?;
         if shadow.concrete_frame != inline_frame || shadow.frame_box == OpRef::NONE {
             return None;
         }
@@ -2930,7 +2931,7 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
 fn walker_bare_super_frame_slots<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<(OpRef, OpRef, bool)> {
-    if let Some(shadow) = ctx.callee_shadow.as_ref() {
+    if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
         // `u16::MAX` is the strict fresh-frame fold switched off and a `NONE`
         // frame box is a frame register that was never seeded; in neither case
         // is the shadow the authority for this level's slots.
@@ -3446,6 +3447,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     let is_inline_frame = inline_frame != 0
         && concrete_obj as usize == inline_frame
         && ctx
+            .frame_state
+            .borrow()
             .callee_shadow
             .as_ref()
             .is_some_and(|shadow| shadow.concrete_frame == inline_frame && shadow.frame_box == obj);
@@ -12674,7 +12677,8 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         decline!("subwalk-no-callee-resume");
     }
     let (fold_frame_reg, shadow_code_ptr) = {
-        let Some(shadow) = ctx.callee_shadow.as_ref() else {
+        let state = ctx.frame_state.borrow();
+        let Some(shadow) = state.callee_shadow.as_ref() else {
             decline!("no-callee-shadow");
         };
         // `u16::MAX` is the strict fresh-frame fold switched off, and a
@@ -12789,7 +12793,8 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     };
     let mut slot_oprefs: Vec<Option<OpRef>> = Vec::with_capacity(nslots);
     {
-        let Some(shadow) = ctx.callee_shadow.as_ref() else {
+        let state = ctx.frame_state.borrow();
+        let Some(shadow) = state.callee_shadow.as_ref() else {
             decline!("shadow-vanished");
         };
         for slot in 0..nslots as i64 {
@@ -13239,7 +13244,7 @@ fn next_op_is_f_locals_for_getframe_result<Sym: WalkSym>(
     if obj_reg as usize != getframe_dst {
         return false;
     }
-    let (Some(&name_op), Some(&code_op)) = (
+    let (Some(name_op), Some(code_op)) = (
         ctx.registers_i.get(name_reg as usize),
         ctx.registers_r.get(code_reg as usize),
     ) else {
@@ -13331,7 +13336,8 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         return Ok(None);
     };
     let (vable_op, vable_ptr) = if inline_level {
-        let Some(shadow) = ctx.callee_shadow.as_ref() else {
+        let state = ctx.frame_state.borrow();
+        let Some(shadow) = state.callee_shadow.as_ref() else {
             return Ok(None);
         };
         if inline_ptr == 0 || shadow.concrete_frame != inline_ptr || shadow.frame_box == OpRef::NONE
@@ -16569,14 +16575,14 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     let saved_entry = ctx.entry_py_pc;
     let saved_marker = ctx.outer_resume_marker_jit_pc;
     let saved_oji = ctx.outer_jitcode_index;
-    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
+    let saved_active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
     ctx.entry_py_pc = EntryPyPc::Jit(op_pc);
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
-    ctx.outer_active_boxes = active;
+    ctx.frame_state.borrow_mut().outer_active_boxes = active;
     ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
@@ -16598,7 +16604,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.entry_py_pc = saved_entry;
     ctx.outer_resume_marker_jit_pc = saved_marker;
     ctx.outer_jitcode_index = saved_oji;
-    ctx.outer_active_boxes = saved_active;
+    ctx.frame_state.borrow_mut().outer_active_boxes = saved_active;
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
@@ -18641,11 +18647,15 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         let seed_answers_this_read =
             ctx.fbw_mode.current_exception_seed_from_walk_store || is_covered_bare_raise_read;
         let (prev, prev_obj) = if let Some(seed) = ctx
-            .fbw_mode
+            .frame_state
+            .borrow()
             .current_exception_seed
             .filter(|_| seed_answers_this_read)
         {
-            (seed, ctx.fbw_mode.current_exception_seed_concrete)
+            (
+                seed,
+                ctx.frame_state.borrow().current_exception_seed_concrete,
+            )
         } else {
             let Some(ec) = walker_ensure_execution_context(ctx) else {
                 return Ok(None);
@@ -18762,8 +18772,8 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     // exception into the next frame's `sys_exc_value`.
     fbw_sys_exc_journal_push(pyre_interpreter::eval::get_current_exception());
     pyre_interpreter::eval::set_current_exception(store_concrete);
-    ctx.fbw_mode.current_exception_seed = Some(store_op);
-    ctx.fbw_mode.current_exception_seed_concrete = store_concrete;
+    ctx.frame_state.borrow_mut().current_exception_seed = Some(store_op);
+    ctx.frame_state.borrow_mut().current_exception_seed_concrete = store_concrete;
     ctx.fbw_mode.current_exception_seed_from_walk_store = true;
     Ok(Some(()))
 }
@@ -19059,7 +19069,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     } {
         walker_guard_class(ctx, op_pc, range_op, zip_type as i64)?;
         walker_guard_exact_w_class(ctx, op_pc, range_op, zip_class)?;
-        ctx.vstack_last_ref = range_op;
+        ctx.frame_state.borrow_mut().vstack_last_ref = range_op;
         return Ok(Some(range_op));
     }
 
@@ -19302,7 +19312,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         new,
         majit_ir::Value::Ref(majit_ir::GcRef(real_iter as usize)),
     );
-    ctx.vstack_last_ref = new;
+    ctx.frame_state.borrow_mut().vstack_last_ref = new;
 
     Ok(Some(new))
 }
@@ -19630,7 +19640,7 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
         Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
     );
     fbw_foriter_inflight_capture(concrete_tuple, body);
-    ctx.vstack_last_ref = tuple_op;
+    ctx.frame_state.borrow_mut().vstack_last_ref = tuple_op;
     Ok(Some(tuple_op))
 }
 
@@ -19910,7 +19920,7 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
     }
     unsafe { pyre_object::iterobject::w_list_iter_set_index(iter_obj, index + 1) };
     fbw_foriter_inflight_capture(concrete_item, body);
-    ctx.vstack_last_ref = item;
+    ctx.frame_state.borrow_mut().vstack_last_ref = item;
     Ok(Some(item))
 }
 
@@ -20041,7 +20051,7 @@ fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
         fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
     }
     fbw_foriter_inflight_capture(concrete_item_ptr, body);
-    ctx.vstack_last_ref = item;
+    ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
     Ok(Some(item))
 }
@@ -20263,7 +20273,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     // Range iteration stays at the C level, so the operand-stack mirror
     // remains valid and must receive the item produced by FOR_ITER.  Its
     // virtual state is captured by subsequent body-guard snapshots.
-    ctx.vstack_last_ref = item;
+    ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
     Ok(Some(item))
 }

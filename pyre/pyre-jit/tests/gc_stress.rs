@@ -635,15 +635,12 @@ assert result == 21, result
 }
 
 /// A trace-built exception raised with a bare-class `from` cause survives a
-/// collection that fires while the fresh exception lives only in the tracer's
-/// `sym.trace_built_exc` (window A). `raise ValueError(n) from KeyError` builds
-/// the `ValueError(n)` instance at trace time and parks it in `trace_built_exc`;
-/// the `KeyError` cause normalization then allocates (a GC safepoint) before the
-/// instance is lifted back out at the raise. The `walk_active_sym_exc_roots`
-/// root walker keeps the parked instance alive across that collection — without
-/// it the caught exception's `args` are read from a swept block (wrong value or
-/// fault). Under `MAJIT_GC_STRESS` every allocation forces a full collection, so
-/// the cause normalization deterministically hits the window.
+/// collection during construction and cause normalization. The generated walk
+/// carries concrete exceptions on recorder boxes and the active exception
+/// slots; it no longer has the retired PyreSym.trace_built_exc map. Preserve
+/// this end-to-end assertion independently of that former implementation.
+/// Under `MAJIT_GC_STRESS`, cause normalization also exercises allocating
+/// safepoints before the raised instance reaches the handler.
 #[test]
 fn trace_built_exc_from_class_cause_survives_collection() {
     const PROGRAM: &str = r#"

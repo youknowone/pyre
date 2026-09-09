@@ -169,7 +169,9 @@ mod recursion_depth_policy_tests {
 /// The innermost inline level's strict-fold frame register (`u16::MAX` when
 /// inactive / no inline level).
 pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> u16 {
-    ctx.callee_shadow
+    ctx.frame_state
+        .borrow()
+        .callee_shadow
         .as_ref()
         .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
 }
@@ -507,8 +509,8 @@ pub(crate) fn fbw_built_exc_insert(op: OpRef) {
 /// `true` if it was present — i.e. the raised value was built inline by
 /// [`try_walker_trace_exception_new`].  Removed (not just read) so a
 /// second raise of the same object (whose `w_context` is now stamped)
-/// takes the residual path, matching the trait's
-/// `trace_built_exc.remove(&exc_val.opref)`.
+/// takes the residual path. This set tracks symbolic freshness only; the
+/// exception's concrete value remains attached to its recorder box.
 pub(crate) fn fbw_built_exc_take(op: OpRef) -> bool {
     FBW_BUILT_EXC.with(|s| s.borrow_mut().remove(&op))
 }

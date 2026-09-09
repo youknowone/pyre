@@ -294,7 +294,7 @@ macro_rules! latchdbg {
 /// unresolved.  A zero-effect walk may then use the legacy entry replay;
 /// an effectful walk must keep recording until a complete image can be built,
 /// because replaying it would apply the effect twice.
-/// Resolve `WalkContext::vstack_boxes` — the walker's counterpart of
+/// Resolve `WalkFrameStateData::vstack_boxes` — the walker's counterpart of
 /// `MIFrame.registers_r` snapshotted by `get_list_of_active_boxes`
 /// (`pyjitpl.py`) — into the concrete operand stack an abort image publishes.
 ///
@@ -316,8 +316,8 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
         latchdbg!("origin={origin} mirror-invalid");
         return None;
     }
-    let mut slots = Vec::with_capacity(ctx.vstack_boxes.len());
-    for &opref in ctx.vstack_boxes.iter() {
+    let mut slots = Vec::with_capacity(ctx.frame_state.borrow().vstack_boxes.len());
+    for &opref in ctx.frame_state.borrow().vstack_boxes.iter() {
         match ctx.trace_ctx.concrete_of_opref(opref) {
             Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
                 slots.push(value.as_usize() as pyre_object::PyObjectRef);
@@ -327,9 +327,9 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
                     "origin={origin} mirror-slot {}/{} unresolved opref={opref:?} \
                      concrete={other:?} pypc={} boxes={:?}",
                     slots.len(),
-                    ctx.vstack_boxes.len(),
+                    ctx.frame_state.borrow().vstack_boxes.len(),
                     ctx.vstack_cur_pypc,
-                    ctx.vstack_boxes,
+                    ctx.frame_state.borrow().vstack_boxes,
                 );
                 return None;
             }
@@ -602,7 +602,10 @@ fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
         reset_single_frame_blackhole();
         let _ = latch_abort_blackhole(ctx, resume_pc, "force-qmut");
     } else if ctx.vstack_valid && !ctx.trace_ctx.is_bridge_trace {
-        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
+        fbw_qmut_abort_stack_latch(
+            ctx.vstack_cur_pypc as usize,
+            ctx.frame_state.borrow().vstack_boxes.clone(),
+        );
     }
     // The session flag survives recovered sub-walks; always overwrite it at
     // the raise site so a later root-frame abort cannot inherit `true`.
@@ -751,7 +754,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             continue;
         }
         let ConcreteValue::Int(value) = ctx.concrete_registers_i.get(color).copied()? else {
-            if ctx.registers_i.get(color).copied()?.is_none() {
+            if ctx.registers_i.get(color)?.is_none() {
                 continue;
             }
             return None;
@@ -763,7 +766,13 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         if miframe.ref_values.get(color).copied().flatten().is_some() {
             continue;
         }
-        let value = match ctx.concrete_registers_r.get(color).copied()? {
+        let value = match ctx
+            .frame_state
+            .borrow()
+            .concrete_registers_r
+            .get(color)
+            .copied()?
+        {
             ConcreteValue::Ref(value) => value as i64,
             // ConcreteValue::Null is the walker's "unknown" sentinel, not a
             // proven Python null.  The register shadow never held this color's
@@ -772,7 +781,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             // never concretized in this frame's shadow); decline only when even
             // that cannot resolve it.
             _ => {
-                let opref = ctx.registers_r.get(color).copied()?;
+                let opref = ctx.registers_r.get(color)?;
                 if opref.is_none() {
                     continue;
                 }
@@ -789,7 +798,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         if miframe.float_values.get(color).copied().flatten().is_some() {
             continue;
         }
-        let opref = ctx.registers_f.get(color).copied()?;
+        let opref = ctx.registers_f.get(color)?;
         if opref.is_none() {
             continue;
         }
@@ -832,7 +841,12 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         // `ConcreteValue::Null` is the walker's "unknown" sentinel, not a proven
         // Python null, so it seeds nothing.
         if slot.is_none()
-            && let Some(ConcreteValue::Ref(value)) = ctx.concrete_registers_r.get(color).copied()
+            && let Some(ConcreteValue::Ref(value)) = ctx
+                .frame_state
+                .borrow()
+                .concrete_registers_r
+                .get(color)
+                .copied()
         {
             *slot = Some(value as i64);
         }
@@ -844,7 +858,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         if miframe.float_values[color].is_some() {
             continue;
         }
-        let Some(&opref) = ctx.registers_f.get(color) else {
+        let Some(opref) = ctx.registers_f.get(color) else {
             continue;
         };
         if let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) {
@@ -971,7 +985,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
             continue;
         }
         if miframe.int_values[color].is_none() {
-            let Some(opref) = ctx.registers_i.get(color).copied() else {
+            let Some(opref) = ctx.registers_i.get(color) else {
                 continue;
             };
             if opref == OpRef::NONE {
@@ -986,7 +1000,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     }
 
     for color in 0..miframe.ref_values.len() {
-        let opref = ctx.registers_r.get(color).copied();
+        let opref = ctx.registers_r.get(color);
         let forwarded = opref
             .filter(|&value| value != OpRef::NONE)
             .and_then(|value| {
@@ -999,14 +1013,16 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
                     _ => None,
                 }
             });
-        let from_shadow =
-            ctx.concrete_registers_r
-                .get(color)
-                .copied()
-                .and_then(|value| match value {
-                    ConcreteValue::Ref(value) => Some(value as i64),
-                    _ => None,
-                });
+        let from_shadow = ctx
+            .frame_state
+            .borrow()
+            .concrete_registers_r
+            .get(color)
+            .copied()
+            .and_then(|value| match value {
+                ConcreteValue::Ref(value) => Some(value as i64),
+                _ => None,
+            });
         // Every bool a comparison leaves in a Ref register is now a real Ref —
         // either the `space.newbool` singleton behind its truth guard or the
         // residual box — so `forwarded` reads it directly.  A raw-truth Int was
@@ -1026,7 +1042,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
         if miframe.float_values[color].is_some() {
             continue;
         }
-        let Some(opref) = ctx.registers_f.get(color).copied() else {
+        let Some(opref) = ctx.registers_f.get(color) else {
             continue;
         };
         if opref == OpRef::NONE {
@@ -1218,10 +1234,10 @@ thread_local! {
     /// A force inside the residual runs from `force_pyframe`, which reaches
     /// only the `TraceCtx`; `virtualizable.py write_boxes` writes the array of
     /// the virtualizable it forces, so the level's own slot source has to be
-    /// reachable there.  The pointer is valid exactly while the guard that set
-    /// it is alive, which brackets the residual.
-    static PUBLISHED_INLINE_SHADOW: std::cell::Cell<Option<(*const super::CalleeLocalsShadow, u16)>> =
-        const { std::cell::Cell::new(None) };
+    /// reachable there. Publish the shared owner, not a raw pointer into its
+    /// RefCell: writeback may collect and forward the same shadow's fields.
+    static PUBLISHED_INLINE_SHADOW: std::cell::RefCell<Option<(super::WalkFrameState, u16)>> =
+        const { std::cell::RefCell::new(None) };
 
     /// The frame a live [`LiveLastInstrGuard`] published the executing pc onto,
     /// with the resume coordinate it displaced.
@@ -1399,17 +1415,14 @@ struct ResidualFrameChainGuard {
     /// residual publishes across this scope.
     frame_root: majit_gc::shadow_stack::OwnerRootGuard,
     previous_published: *mut pyre_interpreter::PyFrame,
-    previous_shadow: Option<(*const super::CalleeLocalsShadow, u16)>,
+    previous_shadow: Option<(super::WalkFrameState, u16)>,
     /// Whether this guard performed the chain write, so `Drop` restores only
     /// what it changed.  False when the chain already named `frame`.
     entered: bool,
 }
 
 impl ResidualFrameChainGuard {
-    fn enter(
-        frame: usize,
-        shadow: Option<(*const super::CalleeLocalsShadow, u16)>,
-    ) -> Option<Self> {
+    fn enter(frame: usize, shadow: Option<(super::WalkFrameState, u16)>) -> Option<Self> {
         let frame = frame as *mut pyre_interpreter::PyFrame;
         if frame.is_null() {
             return None;
@@ -1479,7 +1492,7 @@ impl Drop for ResidualFrameChainGuard {
             // dropping that propagation would leave the escape recorded only on
             // a frame the walk owns privately.
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
-            PUBLISHED_INLINE_SHADOW.with(|slot| slot.set(self.previous_shadow));
+            PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(self.previous_shadow.take()));
             if self.entered {
                 // The value `enter` displaced, read back off the frame it was
                 // written to, so a collection during the residual forwarded it
@@ -1628,19 +1641,18 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                         // suppression is scoped to this residual.
                         let written = PUBLISHED_INLINE_SHADOW
                             .with(|slot| slot.take())
-                            .is_some_and(|(shadow, frame_reg)| {
-                                // SAFETY: the pointer is published by
-                                // `ResidualFrameChainGuard`, which brackets the
-                                // residual this force runs inside of, and
-                                // restores the previous entry on drop.
-                                let shadow = unsafe { &*shadow };
+                            .is_some_and(|(state, frame_reg)| {
                                 // The shadow describes ONE level's frame.  Only
                                 // that frame may be written from it: a nested
                                 // residual publishes its own, and writing one
                                 // level's slots onto another's array would
                                 // replace live values with unrelated ones.
-                                shadow.concrete_frame == frame as usize
-                                    && super::flush_callee_locals_region(shadow, frame, frame_reg)
+                                let matches_frame =
+                                    state.borrow().callee_shadow.as_ref().is_some_and(|shadow| {
+                                        shadow.concrete_frame == frame as usize
+                                    });
+                                matches_frame
+                                    && super::flush_callee_locals_region(&state, frame, frame_reg)
                             });
                         if !written {
                             UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.set(frame as usize));
@@ -2961,8 +2973,14 @@ pub(crate) fn probe_resid_decline_ctx<Sym: WalkSym>(
     // The declined arg's semantic register slot and its index-keyed concrete
     // shadow (`concrete_registers_r`): a `Null` shadow at a found slot with a
     // `None` box_value is the bridge-resume seed gap (neither store populated).
-    let reg_slot = ctx.registers_r.iter().position(|&r| r == arg);
-    let shadow = reg_slot.and_then(|s| ctx.concrete_registers_r.get(s));
+    let reg_slot = ctx.registers_r.iter().position(|r| r == arg);
+    let shadow = reg_slot.and_then(|s| {
+        ctx.frame_state
+            .borrow()
+            .concrete_registers_r
+            .get(s)
+            .copied()
+    });
     eprintln!(
         "[fbw-resid-decline] {why} op_pc={op_pc} py_pc={py_pc:?} py_op={opcode:?} \
          arg_index={arg_index} arg={arg_id} box_value={box_v:?} reg_slot={reg_slot:?} \
@@ -2984,7 +3002,7 @@ fn carrier_stack_box_for_ref_arg<Sym: WalkSym>(
         return None;
     }
     let consts = ctx.inline_callee_consts?;
-    let color = ctx.registers_r.iter().position(|&value| value == arg)?;
+    let color = ctx.registers_r.iter().position(|value| value == arg)?;
     let raw_code =
         unsafe { pyre_interpreter::w_code_get_ptr(consts.w_code as pyre_object::PyObjectRef) }
             as *const pyre_interpreter::CodeObject;
@@ -3001,7 +3019,9 @@ fn carrier_stack_box_for_ref_arg<Sym: WalkSym>(
         color,
     )?;
     let stack_slot = semantic.checked_sub(nlocals)?;
-    ctx.vstack_boxes
+    ctx.frame_state
+        .borrow()
+        .vstack_boxes
         .get(stack_slot)
         .copied()
         .filter(|&value| value != OpRef::NONE)
@@ -3027,11 +3047,14 @@ fn repair_carrier_call_ref_args<Sym: WalkSym>(
             *arg = frame_box;
         }
     }
-    if !ctx.vstack_valid || ctx.vstack_boxes.len() < r_args.len() {
+    if !ctx.vstack_valid || ctx.frame_state.borrow().vstack_boxes.len() < r_args.len() {
         return;
     }
-    let start = ctx.vstack_boxes.len() - r_args.len();
-    for (arg, &frame_box) in r_args.iter_mut().zip(&ctx.vstack_boxes[start..]) {
+    let start = ctx.frame_state.borrow().vstack_boxes.len() - r_args.len();
+    for (arg, &frame_box) in r_args
+        .iter_mut()
+        .zip(&ctx.frame_state.borrow().vstack_boxes[start..])
+    {
         if ctx.trace_ctx.concrete_of_opref(*arg).is_none()
             && frame_box != OpRef::NONE
             && ctx.trace_ctx.concrete_of_opref(frame_box).is_some()
@@ -4126,7 +4149,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     && !ctx.trace_ctx.is_bridge_trace
                     && escape_opcode_window_clean(*py_pc)
             })
-            .map(|_| ctx.vstack_boxes.clone());
+            .map(|_| ctx.frame_state.borrow().vstack_boxes.clone());
         let _frame_escape = ActiveFrameEscapeGuard::enter(escape_frame, escape_py_pc, escape_stack);
         // `executioncontext.py enter` for the inlined callee this residual
         // runs inside of.
@@ -4140,6 +4163,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // `sys._getframe()` onto the caller, retaining the TLS value only for
         // older non-shadow inline paths.
         let concrete_inline_frame = ctx
+            .frame_state
+            .borrow()
             .callee_shadow
             .as_ref()
             .map(|shadow| shadow.concrete_frame)
@@ -4148,13 +4173,20 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // The level's own slot source travels with the frame: a force inside
         // this residual reaches only the `TraceCtx`, and the frame it forces is
         // this callee, not the traced virtualizable.
-        let published_shadow = ctx.callee_shadow.as_ref().and_then(|shadow| {
-            let frame_reg = ctx
-                .inline_callee_consts
-                .and_then(|consts| crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index))
-                .map(|jitcode| jitcode.metadata.portal_frame_reg)?;
-            Some((shadow as *const super::CalleeLocalsShadow, frame_reg))
-        });
+        let published_shadow = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .and_then(|_| {
+                let frame_reg = ctx
+                    .inline_callee_consts
+                    .and_then(|consts| {
+                        crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
+                    })
+                    .map(|jitcode| jitcode.metadata.portal_frame_reg)?;
+                Some((ctx.frame_state.clone(), frame_reg))
+            });
         let _frame_chain = ResidualFrameChainGuard::enter(concrete_inline_frame, published_shadow);
         let live_py_pc = if ctx.fbw_mode.inline_subwalk {
             ctx.vstack_cur_pypc
@@ -4683,7 +4715,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                         // it a CALL returning None leaves a NULL hole at the
                         // following POP_TOP and an abort cannot flush past an
                         // already-executed mutation such as `seen.add(w)`.
-                        ctx.vstack_last_ref = recorded;
+                        ctx.frame_state.borrow_mut().vstack_last_ref = recorded;
                     }
                     majit_ir::Type::Float => {
                         ctx.trace_ctx.set_opref_concrete(
@@ -4734,7 +4766,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // TOS.  This runs for every `ForIterNext` residual once it
                 // returns, placing the item OpRef on the new TOS for the
                 // FOR_ITER `ResultToTos` boundary.
-                ctx.vstack_last_ref = recorded;
+                ctx.frame_state.borrow_mut().vstack_last_ref = recorded;
                 if fbw_debug_abort_enabled() {
                     let item = result_i64 as usize as pyre_object::PyObjectRef;
                     let intval = if unsafe { pyre_object::pyobject::is_int(item) } {
@@ -5050,7 +5082,7 @@ pub(crate) fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
         return;
     };
     let frame_reg = pjc.metadata.portal_frame_reg as usize;
-    let Some(&callee_frame) = ctx.registers_r.get(frame_reg) else {
+    let Some(callee_frame) = ctx.registers_r.get(frame_reg) else {
         return;
     };
     if callee_frame == OpRef::NONE {
@@ -5103,7 +5135,13 @@ pub(super) fn maybe_publish_inline_callee_last_instr_concrete<Sym: WalkSym>(
     // gh#1444 either, whose wrong answer is a depth->=2 multi-frame blackhole
     // adopt (`PYRE_FBW_MULTIFRAME_DEPTH=1` answers correctly).  So the split is
     // a recorded gap rather than either one's cause.
-    if let Some(ConcreteValue::Ref(frame_ptr)) = ctx.concrete_registers_r.get(frame_reg).copied() {
+    if let Some(ConcreteValue::Ref(frame_ptr)) = ctx
+        .frame_state
+        .borrow()
+        .concrete_registers_r
+        .get(frame_reg)
+        .copied()
+    {
         if !frame_ptr.is_null() {
             unsafe {
                 (*(frame_ptr as *mut pyre_interpreter::PyFrame)).last_instr = callee_py_pc as isize;
@@ -5130,14 +5168,15 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
     let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
         return Ok(());
     };
-    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+    let state = ctx.frame_state.borrow();
+    let Some(shadow) = state.callee_shadow.as_ref() else {
         return Ok(());
     };
     if shadow.fold_frame_reg == u16::MAX || shadow.frame_box == OpRef::NONE {
         return Ok(());
     }
     let frame_reg = pjc.metadata.portal_frame_reg as usize;
-    let Some(&callee_frame) = ctx.registers_r.get(frame_reg) else {
+    let Some(callee_frame) = ctx.registers_r.get(frame_reg) else {
         return Ok(());
     };
     if callee_frame != shadow.frame_box {
@@ -5169,6 +5208,7 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
         })
         .collect();
     slots.sort_by_key(|(slot, _, _)| *slot);
+    drop(state);
 
     for (slot, value, concrete) in slots {
         let index = ctx.trace_ctx.const_int(slot);
@@ -5192,7 +5232,7 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
         };
         walker_capture_inline_nonstandard_vable_guard(ctx, pc, guards_before, write)?;
     }
-    if let Some(shadow) = ctx.callee_shadow.as_mut()
+    if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut()
         && shadow.frame_box == callee_frame
     {
         shadow.fold_frame_reg = u16::MAX;
@@ -5240,16 +5280,16 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
         }
         'f' => {
             let len = ctx.registers_f.len();
-            let slot = ctx
+            let _ = ctx
                 .registers_f
-                .get_mut(dst)
+                .get(dst)
                 .ok_or(DispatchError::RegisterOutOfRange {
                     pc,
                     reg: dst,
                     len,
                     bank: "f",
                 })?;
-            *slot = result;
+            ctx.registers_f.set(dst, result);
         }
         // Void variants (`pyjitpl.py opimpl_residual_call_*_v`):
         // the operand layout has no `>X` dst byte and no register slot to
@@ -7617,10 +7657,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::RaiseVarargs
         && r_args.is_empty()
-        && ctx.fbw_mode.current_exception_seed.is_some()
+        && ctx.frame_state.borrow().current_exception_seed.is_some()
     {
-        let seed = ctx.fbw_mode.current_exception_seed.unwrap();
-        let concrete = ctx.fbw_mode.current_exception_seed_concrete;
+        let seed = ctx.frame_state.borrow().current_exception_seed.unwrap();
+        let concrete = ctx.frame_state.borrow().current_exception_seed_concrete;
         if !concrete.is_null() && unsafe { pyre_object::is_exception(concrete) } {
             // `RAISE_VARARGS 0` may use the normalizing nullary helper rather
             // than the raw current-exception helper.  A bridge seed is already

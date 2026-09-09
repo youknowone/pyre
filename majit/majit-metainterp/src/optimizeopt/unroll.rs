@@ -407,7 +407,7 @@ pub struct UnrollOptimizer {
     pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// compile.py:221 + optimizer.py:530: call_pure_results from tracing.
     /// Passed through to the inner Optimizer for cross-iteration CALL_PURE folding.
-    pub call_pure_results: indexmap::IndexMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results: crate::optimizeopt::util::ArgsDict,
     /// `optimizer.cpu` (model.py `AbstractCPU`) backref, carried into
     /// the inner phase-1/phase-2 `Optimizer.cpu` at spawn time so
     /// `cpu.cls_of_box(runtime_box)` reads (virtualstate.py:601/:608/:620)
@@ -559,7 +559,7 @@ impl UnrollOptimizer {
             phase1_patchguardop: None,
             next_global_opref: 0,
             callinfocollection: None,
-            call_pure_results: indexmap::IndexMap::new(),
+            call_pure_results: crate::optimizeopt::util::args_dict(),
             cpu: crate::cpu::default_cpu(),
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
@@ -1191,8 +1191,8 @@ impl UnrollOptimizer {
         // function (no `self.`-qualified read past this point on any path —
         // the imported_state path writes `phase1_emit_ops` above then reads it
         // here; the non-peeled early-return arm returns before reaching here),
-        // and the caller never reads `unroll_opt.{snapshot_*,phase1_emit_ops,
-        // call_pure_results}` after the optimize call (the InvalidLoop retry
+        // and the caller never reads `unroll_opt.{snapshot_*,phase1_emit_ops}`
+        // after the optimize call (the InvalidLoop retry
         // moves the caller's own `snapshot_map` locals, not these fields). A
         // `Vec` move copies only the (ptr,len,cap) header and leaves the inner
         // buffers — and the `*mut OpRef` const-ptr root slots collected into
@@ -1205,7 +1205,8 @@ impl UnrollOptimizer {
         opt_p2.snapshot_vable_boxes = std::mem::take(&mut self.snapshot_vable_boxes);
         opt_p2.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
         opt_p2.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
-        opt_p2.call_pure_results = std::mem::take(&mut self.call_pure_results);
+        // compile.py / optimizer.py share the attempt's args_dict itself.
+        opt_p2.call_pure_results = self.call_pure_results.clone();
         // RPython: same Optimizer instance keeps patchguardop across phases.
         // Phase 1 processes GUARD_FUTURE_CONDITION (from close_loop_args_at)
         // which sets patchguardop. optimizer.py:294 parity — no synthetic

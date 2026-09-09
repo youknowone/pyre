@@ -1496,9 +1496,9 @@ pub(crate) fn exception_string_override_has_nested_call(
 /// to abort the multi-frame inline and interpret rather than
 /// encode a NONE box.  `PYRE_FBW_MF_DIAG` dumps the missing color.
 pub(crate) fn collect_callee_active_boxes(
-    regs_i: &[OpRef],
-    regs_r: &[OpRef],
-    regs_f: &[OpRef],
+    regs_i: &(impl RegisterValues + ?Sized),
+    regs_r: &(impl RegisterValues + ?Sized),
+    regs_f: &(impl RegisterValues + ?Sized),
     callee_jitcode_index: u32,
     callee_op_pc: usize,
     carried_jitcode_pc: i32,
@@ -1521,38 +1521,54 @@ pub(crate) fn collect_callee_active_boxes(
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
     let diag = fbw_mf_diag_enabled();
-    let read = |bank: &[OpRef], idx: u32, name: &str| -> Result<OpRef, DispatchError> {
-        match bank.get(idx as usize).copied() {
-            Some(v) if v != OpRef::NONE => Ok(v),
-            other => {
-                if diag {
-                    eprintln!(
-                        "[fbw-mf-diag] decline: callee {name} reg {idx} {} \
+    let read =
+        |value: Option<OpRef>, len: usize, idx: u32, name: &str| -> Result<OpRef, DispatchError> {
+            match value {
+                Some(v) if v != OpRef::NONE => Ok(v),
+                other => {
+                    if diag {
+                        eprintln!(
+                            "[fbw-mf-diag] decline: callee {name} reg {idx} {} \
                          (callee_jitcode_index={callee_jitcode_index}, \
                          bank_len={}, live_i={:?} live_r={:?} live_f={:?})",
-                        if other.is_none() {
-                            "out-of-range"
-                        } else {
-                            "holds OpRef::NONE"
-                        },
-                        bank.len(),
-                        banks.int,
-                        banks.ref_,
-                        banks.float,
-                    );
+                            if other.is_none() {
+                                "out-of-range"
+                            } else {
+                                "holds OpRef::NONE"
+                            },
+                            len,
+                            banks.int,
+                            banks.ref_,
+                            banks.float,
+                        );
+                    }
+                    Err(DispatchError::callee_inline_unsupported(callee_op_pc))
                 }
-                Err(DispatchError::callee_inline_unsupported(callee_op_pc))
             }
-        }
-    };
+        };
     for &idx in &banks.int {
-        active.push(read(regs_i, idx, "int")?);
+        active.push(read(
+            regs_i.get_box(idx as usize),
+            regs_i.len(),
+            idx,
+            "int",
+        )?);
     }
     for &idx in &banks.ref_ {
-        active.push(read(regs_r, idx, "ref")?);
+        active.push(read(
+            regs_r.get_box(idx as usize),
+            regs_r.len(),
+            idx,
+            "ref",
+        )?);
     }
     for &idx in &banks.float {
-        active.push(read(regs_f, idx, "float")?);
+        active.push(read(
+            regs_f.get_box(idx as usize),
+            regs_f.len(),
+            idx,
+            "float",
+        )?);
     }
     Ok(active)
 }
@@ -1782,8 +1798,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // The loopless `fib` shape keeps only within-iteration temps (a prior call
     // result), no InputArg, and was foldable either way.
     if ctx.vstack_valid {
-        let kept_below = ctx.vstack_boxes.len().saturating_sub(r_args.len());
-        if ctx.vstack_boxes[..kept_below]
+        let kept_below = ctx
+            .frame_state
+            .borrow()
+            .vstack_boxes
+            .len()
+            .saturating_sub(r_args.len());
+        if ctx.frame_state.borrow().vstack_boxes[..kept_below]
             .iter()
             .any(|slot| slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot))
         {
@@ -2157,14 +2178,20 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         } else {
             raw_depth()
         };
-        ctx.vstack_boxes.truncate(resume_depth);
-        ctx.vstack_boxes.resize(resume_depth, OpRef::NONE);
+        ctx.frame_state
+            .borrow_mut()
+            .vstack_boxes
+            .truncate(resume_depth);
+        ctx.frame_state
+            .borrow_mut()
+            .vstack_boxes
+            .resize(resume_depth, OpRef::NONE);
         if resume_depth > 0 {
-            ctx.vstack_boxes[resume_depth - 1] = ca_result;
+            ctx.frame_state.borrow_mut().vstack_boxes[resume_depth - 1] = ca_result;
         }
         ctx.vstack_cur_pypc = resume_py_pc;
         ctx.vstack_depth = resume_depth;
-        ctx.vstack_last_ref = OpRef::NONE;
+        ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
         super::vstack_mirror::disarm_vstack_reorder_region(ctx);
     }
 
@@ -2595,12 +2622,16 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     // an enclosing FOR_ITER).  RPython resumes the complete MIFrame stack, so
     // retain that prefix from the authoritative vstack mirror.
     let prefix_len = if ctx.vstack_valid {
-        ctx.vstack_boxes.len().checked_sub(fresh.len())?
+        ctx.frame_state
+            .borrow()
+            .vstack_boxes
+            .len()
+            .checked_sub(fresh.len())?
     } else {
         0
     };
     let mut stack = Vec::with_capacity(prefix_len + fresh.len());
-    for &value in &ctx.vstack_boxes[..prefix_len] {
+    for &value in &ctx.frame_state.borrow().vstack_boxes[..prefix_len] {
         match concrete_from_recorded_opref(ctx, value) {
             ConcreteValue::Ref(r) if !r.is_null() => stack.push(r),
             _ => return None,
@@ -4153,7 +4184,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // leaves the caller's trace exactly as the ordinary residual call found it.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let call_site_active = if nested_helper_entry.is_some() {
-        ctx.outer_active_boxes.clone()
+        ctx.frame_state.borrow().outer_active_boxes.clone()
     } else {
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
@@ -4328,7 +4359,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let saved_entry = ctx.entry_py_pc;
     let saved_marker = ctx.outer_resume_marker_jit_pc;
     let saved_oji = ctx.outer_jitcode_index;
-    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
+    let saved_active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
@@ -4342,7 +4373,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
-    ctx.outer_active_boxes = call_site_active;
+    ctx.frame_state.borrow_mut().outer_active_boxes = call_site_active;
     ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
@@ -4387,7 +4418,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.entry_py_pc = saved_entry;
     ctx.outer_resume_marker_jit_pc = saved_marker;
     ctx.outer_jitcode_index = saved_oji;
-    ctx.outer_active_boxes = saved_active;
+    ctx.frame_state.borrow_mut().outer_active_boxes = saved_active;
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
@@ -4569,7 +4600,7 @@ fn reconstructed_call_stack_from_resume_sources<Sym: WalkSym>(
                  depth={depth} vstack_valid={} vstack_depth={} vstack_len={}",
                 ctx.vstack_valid,
                 ctx.vstack_depth,
-                ctx.vstack_boxes.len(),
+                ctx.frame_state.borrow().vstack_boxes.len(),
             );
         }
         return None;
@@ -4582,7 +4613,7 @@ fn reconstructed_call_stack_from_resume_sources<Sym: WalkSym>(
             overrides.iter().map(|&(slot, _)| slot).collect::<Vec<_>>(),
             ctx.vstack_valid,
             ctx.vstack_depth,
-            ctx.vstack_boxes.len(),
+            ctx.frame_state.borrow().vstack_boxes.len(),
         );
     }
     let mut ordered = vec![None; depth];
@@ -6388,6 +6419,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         mut callee_concrete_r,
         mut callee_concrete_i,
     ) = allocate_callee_register_banks(&body, ctx.trace_ctx);
+    let callee_regs_r = RegisterBank::with_constants(callee_regs_r, body.num_regs_r);
+    let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&callee_regs_r);
+    // MIFrame.setup_call owns the concrete halves before frame construction
+    // can allocate. The later WalkContext uses these same slots.
+    let callee_state = WalkFrameState::new(WalkFrameStateData {
+        concrete_registers_r: callee_concrete_r,
+        ..Default::default()
+    });
+    let _setup_state_guard = crate::trace::InlineFrameStateGuard::enter(&callee_state);
     // Fast-path arg seeding: positional args land in the callee's
     // param registers with their concrete shadow (mirror of
     // `dispatch_inline_call_dr_kind`).  The canonical splice regalloc does
@@ -6430,8 +6470,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if reg >= callee_regs_r.len() {
             return resolved_inline_decline(op.pc, line!());
         }
-        callee_regs_r[reg] = callee_args[i];
-        callee_concrete_r[reg] = callee_arg_concretes[i];
+        callee_regs_r.set(reg, callee_args[i]);
+        callee_state.borrow_mut().concrete_registers_r[reg] = callee_arg_concretes[i];
     }
 
     // #68: seed the callee's `frame` / `ec` reds that the codewriter
@@ -6680,7 +6720,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             return resolved_inline_decline(op.pc, line!());
         };
 
-        callee_regs_r[frame_reg as usize] = callee_frame;
+        callee_regs_r.set(frame_reg as usize, callee_frame);
         // `perform_call` creates one concrete frame per MIFrame before
         // `setup_call` installs the argument boxes (pyjitpl.py,
         // 1862-1874).  Mirror that recording-time object.  `setup_call`
@@ -6719,7 +6759,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         drop(arg_roots);
         let concrete_frame_ptr = frame.as_mut_ptr();
         concrete_callee_frame = concrete_frame_ptr;
-        callee_concrete_r[frame_reg as usize] =
+        callee_state.borrow_mut().concrete_registers_r[frame_reg as usize] =
             ConcreteValue::Ref(concrete_frame_ptr as pyre_object::PyObjectRef);
         ctx.trace_ctx.set_opref_concrete(
             callee_frame,
@@ -6741,14 +6781,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // GC-managed FrameBox::drop intentionally relinquishes only the
         // host handle; the frontend op above keeps the frame reachable.
         drop(frame);
-        callee_regs_r[ec_reg as usize] = callee_ec;
+        callee_regs_r.set(ec_reg as usize, callee_ec);
         // `perform_call` threads the same concrete ExecutionContext into
         // every MIFrame.  The symbolic second red above and its concrete
         // shadow are one value; leaving only the shadow unknown makes
         // `build_single_frame_miframe` reject an otherwise complete
         // callee image during an escape, after which the legacy caller
         // replay resumes past CALL without its result.
-        callee_concrete_r[ec_reg as usize] =
+        callee_state.borrow_mut().concrete_registers_r[ec_reg as usize] =
             ConcreteValue::Ref(concrete_ec as pyre_object::PyObjectRef);
 
         // Retain for a possible `SubLoopCalleeCallAssembler` emit.
@@ -6847,11 +6887,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         inline_outer_jc_index,
         inline_outer_resume_marker_jit_pc,
         inline_caller_py_pc,
-    ) = if ctx.outer_active_boxes.is_empty() {
+    ) = if ctx.frame_state.borrow().outer_active_boxes.is_empty() {
         let sym_ptr = ctx.fbw_mode.snapshot_sym;
         if sym_ptr.is_null() {
             (
-                ctx.outer_active_boxes.clone(),
+                ctx.frame_state.borrow().outer_active_boxes.clone(),
                 ctx.entry_py_pc,
                 ctx.outer_jitcode_index,
                 ctx.outer_resume_marker_jit_pc,
@@ -6861,7 +6901,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let sym = unsafe { &*sym_ptr };
             if sym.jitcode().is_null() {
                 (
-                    ctx.outer_active_boxes.clone(),
+                    ctx.frame_state.borrow().outer_active_boxes.clone(),
                     ctx.entry_py_pc,
                     ctx.outer_jitcode_index,
                     ctx.outer_resume_marker_jit_pc,
@@ -6928,7 +6968,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // (e.g. an inline CALL inside a carrier sub-walk whose outer
         // coordinate is the paused root).
         (
-            ctx.outer_active_boxes.clone(),
+            ctx.frame_state.borrow().outer_active_boxes.clone(),
             ctx.entry_py_pc,
             ctx.outer_jitcode_index,
             ctx.outer_resume_marker_jit_pc,
@@ -6975,12 +7015,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         None
     };
     let caller_replacements = FrameBoxReplacements::new(ctx.session);
+    caller_replacements.bind_banks(ctx.registers_r, ctx.registers_i, ctx.registers_f);
+    caller_replacements.bind_frame_state(&ctx.frame_state);
     let (callee_outcome, callee_class_of_last_exc_is_const) = {
-        let mut sub_wc = WalkContext {
-            callee_shadow: Some(super::CalleeLocalsShadow {
+        {
+            let parent_state = ctx.frame_state.borrow();
+            let mut state = callee_state.borrow_mut();
+            state.callee_shadow = Some(super::CalleeLocalsShadow {
                 code_ptr: raw_callee_code,
                 ..Default::default()
-            }),
+            });
+            state.current_exception_seed = parent_state.current_exception_seed;
+            state.current_exception_seed_concrete = parent_state.current_exception_seed_concrete;
+            state.outer_active_boxes = inline_outer_active_boxes;
+        }
+        let mut sub_wc = WalkContext {
+            frame_state: callee_state,
             // Path-1: resolve scalar static-field reads off this callee's own
             // unseeded portal frame to its compile-time constants.
             inline_callee_consts: Some(inline_consts),
@@ -7002,22 +7052,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ..ctx.fbw_mode
             },
             session: ctx.session,
-            registers_r: &mut callee_regs_r,
-            registers_i: &mut callee_regs_i,
-            registers_f: &mut callee_regs_f,
-            concrete_registers_r: &mut callee_concrete_r,
+            registers_r: &callee_regs_r,
+            registers_i: &RegisterBank::with_constants(callee_regs_i, body.num_regs_i),
+            registers_f: &RegisterBank::with_constants(callee_regs_f, body.num_regs_f),
+
             concrete_registers_i: &mut callee_concrete_i,
             descr_refs: &callee_descr_refs,
             raw_descrs: RawDescrPool::PerFn(callee_perfn_descrs),
             is_authoritative_executor: ctx.is_authoritative_executor,
             pending_guard_snapshot_error: None,
-            vstack_boxes: Vec::new(),
+
             vstack_depth: 0,
             vstack_cur_pypc: 0,
             vstack_valid: false,
-            vstack_last_ref: OpRef::NONE,
+
             vstack_reorder_ceiling: u32::MAX,
-            vstack_reorder_saved: None,
+
             vstack_handler_landing_py: None,
             live_before_jit_pc: usize::MAX,
             live_after_jit_pc: usize::MAX,
@@ -7027,7 +7077,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             entry_py_pc: inline_outer_entry_py_pc,
             outer_resume_marker_jit_pc: inline_outer_resume_marker_jit_pc,
             outer_jitcode_index: inline_outer_jc_index,
-            outer_active_boxes: inline_outer_active_boxes,
         };
         // Track this callee for the lifetime of the sub-walk so nested
         // self-calls see the correct recursion depth.
@@ -7095,12 +7144,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // unresolved).
         if callee_portal_frame_reg != u16::MAX {
             {
-                let shadow = sub_wc.callee_shadow.as_mut().unwrap();
+                let mut state = sub_wc.frame_state.borrow_mut();
+                let shadow = state.callee_shadow.as_mut().unwrap();
                 shadow.concrete_frame = concrete_callee_frame as usize;
-                shadow.frame_box = sub_wc.registers_r[callee_portal_frame_reg as usize];
+                shadow.frame_box = sub_wc
+                    .registers_r
+                    .get(callee_portal_frame_reg as usize)
+                    .expect("ref register in range");
             }
             if !try_multiframe {
-                let shadow = sub_wc.callee_shadow.as_mut().unwrap();
+                let mut state = sub_wc.frame_state.borrow_mut();
+                let shadow = state.callee_shadow.as_mut().unwrap();
                 shadow.fold_frame_reg = callee_portal_frame_reg;
                 // The fold's premise (`setarrayitem_vable_via_metainterp`) is
                 // that it writes away from an UNSEEDED portal frame — a pure
@@ -7131,7 +7185,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     .trace_ctx
                     .concrete_of_opref(callee_args[i])
                     .unwrap_or(majit_ir::Value::Void);
-                let shadow = sub_wc.callee_shadow.as_mut().unwrap();
+                let mut state = sub_wc.frame_state.borrow_mut();
+                let shadow = state.callee_shadow.as_mut().unwrap();
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(callee_portal_frame_reg, slot, concrete);
             }
@@ -7149,7 +7204,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 .enumerate()
             {
                 let slot = (callee_code.varnames.len() + i) as i64;
-                let shadow = sub_wc.callee_shadow.as_mut().unwrap();
+                let mut state = sub_wc.frame_state.borrow_mut();
+                let shadow = state.callee_shadow.as_mut().unwrap();
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(
                     callee_portal_frame_reg,
@@ -7206,7 +7262,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // `ConstPtr` into `sub_wc.registers_r`, which is not the anchored
             // `sym.registers_r`.
             let _callee_bank_guard =
-                crate::trace::InlineRegisterBankGuard::enter(&raw mut *sub_wc.registers_r);
+                crate::trace::InlineRegisterBankGuard::enter(sub_wc.registers_r);
             walk(body.code, 0, &mut sub_wc)
         };
         if let Some(jd_no) = subwalk_jd_no {
@@ -7365,13 +7421,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         let semantic_slot = nlocals + rel;
                         let register_value =
                             crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
-                                .and_then(|color| sub_wc.concrete_registers_r.get(color).copied());
+                                .and_then(|color| {
+                                    sub_wc
+                                        .frame_state
+                                        .borrow()
+                                        .concrete_registers_r
+                                        .get(color)
+                                        .copied()
+                                });
                         let value = register_value
                             .or_else(|| {
                                 (metadata.built_as_portal && abort_kind == MidBodyAbortKind::Marker)
                                     .then(|| {
                                         callee_vable_ref_at(
-                                            sub_wc.callee_shadow.as_ref(),
+                                            sub_wc.frame_state.borrow().callee_shadow.as_ref(),
                                             metadata.portal_frame_reg,
                                             semantic_slot,
                                         )
@@ -7394,6 +7457,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             continue;
                         }
                         let value = sub_wc
+                            .frame_state
+                            .borrow()
                             .callee_shadow
                             .as_ref()
                             .and_then(|shadow| shadow.concrete.get(&(slot as i64)).copied())
@@ -7460,7 +7525,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
         (result, class_of_last_exc_is_const)
     };
-    caller_replacements.apply(ctx);
     drop(caller_replacements);
     // `executioncontext.py leave`, in the original's `finally`
     // position: the sub-walk block above is an expression that always
@@ -8360,7 +8424,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     };
 
     if matches!(inlined.0, DispatchOutcome::Continue) {
-        let result = ctx.registers_r[dst];
+        let result = ctx.registers_r.get(dst).expect("ref register in range");
         let str_type = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
         let str_type_const = ctx.trace_ctx.const_int(str_type);
         ctx.trace_ctx
@@ -8499,7 +8563,7 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
     };
 
     if matches!(inlined.0, DispatchOutcome::Continue) {
-        let result = ctx.registers_r[dst];
+        let result = ctx.registers_r.get(dst).expect("ref register in range");
         let concrete_result = walker_concrete_ref_object(ctx, result);
         let live = concrete_result.and_then(walker_machine_int_value);
         // The inline unbox is guard-free only against a known-class or
@@ -10153,7 +10217,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     // back the very box the receiver guard pins, so the class the check reads
     // is that guard's class on every entry.  Any other result reaches the
     // residual, which runs the check itself.
-    if ctx.registers_r[dst] != obj_op {
+    if ctx.registers_r.get(dst).expect("ref register in range") != obj_op {
         if fbw_executed_effect_count() != executed_effects_before {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
@@ -10161,7 +10225,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
     }
-    ctx.vstack_last_ref = obj_op;
+    ctx.frame_state.borrow_mut().vstack_last_ref = obj_op;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
@@ -10325,12 +10389,12 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         return Ok(Some((DispatchOutcome::Continue, inline_resume_pc)));
     }
 
-    let item_op = ctx.registers_r[dst];
+    let item_op = ctx.registers_r.get(dst).expect("ref register in range");
     let Some(concrete_item) = walker_concrete_ref_object(ctx, item_op) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
     fbw_foriter_inflight_capture(concrete_item, body_coord);
-    ctx.vstack_last_ref = item_op;
+    ctx.frame_state.borrow_mut().vstack_last_ref = item_op;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
@@ -11422,7 +11486,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     };
 
     if matches!(inlined.0, DispatchOutcome::Continue) {
-        let result = ctx.registers_r[dst];
+        let result = ctx.registers_r.get(dst).expect("ref register in range");
         if matches!(
             concrete_from_recorded_opref(ctx, result),
             ConcreteValue::Ref(obj)
@@ -11669,7 +11733,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     };
 
     if matches!(inlined.0, DispatchOutcome::Continue) {
-        let result = ctx.registers_r[dst];
+        let result = ctx.registers_r.get(dst).expect("ref register in range");
         if matches!(
             concrete_from_recorded_opref(ctx, result),
             ConcreteValue::Ref(obj)
@@ -11880,7 +11944,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         // exact str and each accepted str subclass get their own guarded
         // version, while a later non-string result deopts to the residual that
         // raises the faithful TypeError.
-        let result = ctx.registers_r[dst];
+        let result = ctx.registers_r.get(dst).expect("ref register in range");
         let concrete_result = match concrete_from_recorded_opref(ctx, result) {
             ConcreteValue::Ref(obj) => obj,
             other => unreachable!("accepted __format__ result is not a Ref: {other:?}"),
@@ -12006,12 +12070,13 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     pc: usize,
     body: SubJitCodeBody,
     seed_from_active_resume: bool,
-    registers_r: Vec<OpRef>,
-    registers_i: Vec<OpRef>,
-    registers_f: Vec<OpRef>,
-    concrete_registers_r: Vec<ConcreteValue>,
+    registers_r: RegisterBank,
+    registers_i: RegisterBank,
+    registers_f: RegisterBank,
+
     concrete_registers_i: Vec<ConcreteValue>,
-    callee_shadow: Option<CalleeLocalsShadow>,
+    /// The active and paused adapters share the same frame-owned slots.
+    frame_state: WalkFrameState,
     inline_callee_consts: Option<InlineCalleeConsts>,
     inline_poison_pcs: Option<std::sync::Arc<[usize]>>,
     fbw_mode: FbwWalkMode<Sym>,
@@ -12023,15 +12088,15 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     entry_py_pc: EntryPyPc,
     outer_resume_marker_jit_pc: Option<usize>,
     outer_jitcode_index: u32,
-    outer_active_boxes: Vec<OpRef>,
+
     pending_guard_snapshot_error: Option<DispatchError>,
-    vstack_boxes: Vec<OpRef>,
+
     vstack_depth: usize,
     vstack_cur_pypc: u32,
     vstack_valid: bool,
-    vstack_last_ref: OpRef,
+
     vstack_reorder_ceiling: u32,
-    vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>, Vec<bool>)>,
+
     vstack_handler_landing_py: Option<u32>,
     live_before_jit_pc: usize,
     live_after_jit_pc: usize,
@@ -12043,15 +12108,15 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         trace_ctx: &mut TraceCtx,
     ) -> Result<(DispatchOutcome, usize), DispatchError> {
         let mut walk_ctx = WalkContext {
-            callee_shadow: self.callee_shadow.take(),
+            frame_state: self.frame_state.clone(),
             inline_callee_consts: self.inline_callee_consts,
             inline_poison_pcs: self.inline_poison_pcs.take(),
             fbw_mode: self.fbw_mode,
             session: self.session,
-            registers_r: &mut self.registers_r,
-            registers_i: &mut self.registers_i,
-            registers_f: &mut self.registers_f,
-            concrete_registers_r: &mut self.concrete_registers_r,
+            registers_r: &self.registers_r,
+            registers_i: &self.registers_i,
+            registers_f: &self.registers_f,
+
             concrete_registers_i: &mut self.concrete_registers_i,
             descr_refs: self.descr_refs,
             raw_descrs: self.raw_descrs,
@@ -12062,22 +12127,19 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
             entry_py_pc: self.entry_py_pc,
             outer_resume_marker_jit_pc: self.outer_resume_marker_jit_pc,
             outer_jitcode_index: self.outer_jitcode_index,
-            outer_active_boxes: std::mem::take(&mut self.outer_active_boxes),
+
             pending_guard_snapshot_error: self.pending_guard_snapshot_error.take(),
-            vstack_boxes: std::mem::take(&mut self.vstack_boxes),
+
             vstack_depth: self.vstack_depth,
             vstack_cur_pypc: self.vstack_cur_pypc,
             vstack_valid: self.vstack_valid,
-            vstack_last_ref: self.vstack_last_ref,
+
             vstack_reorder_ceiling: self.vstack_reorder_ceiling,
-            vstack_reorder_saved: self.vstack_reorder_saved.take(),
+
             vstack_handler_landing_py: self.vstack_handler_landing_py,
             live_before_jit_pc: self.live_before_jit_pc,
             live_after_jit_pc: self.live_after_jit_pc,
         };
-        // This owner survives SubWalkSuspended, unlike an invocation of walk.
-        // Synchronize the paused frame before resuming its CALL continuation.
-        self.box_replacements.apply(&mut walk_ctx);
         if self.seed_from_active_resume {
             self.seed_from_active_resume = false;
             if let Some(frame) =
@@ -12092,22 +12154,22 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         self.box_replacements.set_listening(false);
         let result = walk(self.body.code, self.pc, &mut walk_ctx);
         self.box_replacements.set_listening(true);
-        self.callee_shadow = walk_ctx.callee_shadow.take();
+
         self.inline_callee_consts = walk_ctx.inline_callee_consts;
         self.inline_poison_pcs = walk_ctx.inline_poison_pcs.take();
         self.fbw_mode = walk_ctx.fbw_mode;
         self.entry_py_pc = walk_ctx.entry_py_pc;
         self.outer_resume_marker_jit_pc = walk_ctx.outer_resume_marker_jit_pc;
         self.outer_jitcode_index = walk_ctx.outer_jitcode_index;
-        self.outer_active_boxes = std::mem::take(&mut walk_ctx.outer_active_boxes);
+
         self.pending_guard_snapshot_error = walk_ctx.pending_guard_snapshot_error.take();
-        self.vstack_boxes = std::mem::take(&mut walk_ctx.vstack_boxes);
+
         self.vstack_depth = walk_ctx.vstack_depth;
         self.vstack_cur_pypc = walk_ctx.vstack_cur_pypc;
         self.vstack_valid = walk_ctx.vstack_valid;
-        self.vstack_last_ref = walk_ctx.vstack_last_ref;
+
         self.vstack_reorder_ceiling = walk_ctx.vstack_reorder_ceiling;
-        self.vstack_reorder_saved = walk_ctx.vstack_reorder_saved.take();
+
         self.vstack_handler_landing_py = walk_ctx.vstack_handler_landing_py;
         self.live_before_jit_pc = walk_ctx.live_before_jit_pc;
         self.live_after_jit_pc = walk_ctx.live_after_jit_pc;
@@ -12148,6 +12210,7 @@ struct SubWalkDriver<'a, Sym: WalkSym> {
     frames: Vec<SubWalkFrame<'a, Sym>>,
     /// One entry per live frame, pushed and dropped with `frames`.
     bank_guards: Vec<crate::trace::InlineRegisterBankGuard>,
+    state_guards: Vec<crate::trace::InlineFrameStateGuard>,
     exchange: SubWalkExchange<'a, Sym>,
 }
 
@@ -12157,6 +12220,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
         let mut driver = Self {
             frames: Vec::new(),
             bank_guards: Vec::new(),
+            state_guards: Vec::new(),
             exchange: SubWalkExchange {
                 pending: None,
                 completed: None,
@@ -12183,27 +12247,34 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
     /// `inline_register_banks` already held every live bank at once — its only
     /// reader walks the whole list (`trace.rs walk_active_sym_register_area`).
     ///
-    /// `InlineRegisterBankGuard::drop` pops whatever entry is on top, so the
-    /// entries have to retire in reverse order; pairing them with `frames`
-    /// is what gives that.  The address published is the `Vec`'s heap buffer,
-    /// so it survives a `frames` realloc moving the `SubWalkFrame` itself, and
-    /// the walk cannot reallocate the bank because `WalkContext` borrows it as
-    /// `&mut [OpRef]`.
+    /// Each registration retains the frame's actual shared slots. A `frames`
+    /// realloc cannot move those slots, and guard retirement finds its bank
+    /// by identity, including when setup and driver registrations overlap.
     fn push_frame(&mut self, frame: SubWalkFrame<'a, Sym>) {
         self.frames.push(frame);
-        let bank: *mut [OpRef] = self
+        let bank = &self
             .frames
-            .last_mut()
+            .last()
             .expect("the frame just pushed")
-            .registers_r
-            .as_mut_slice();
+            .registers_r;
         self.bank_guards
             .push(crate::trace::InlineRegisterBankGuard::enter(bank));
+        self.state_guards
+            .push(crate::trace::InlineFrameStateGuard::enter(
+                &self
+                    .frames
+                    .last()
+                    .expect("the frame just pushed")
+                    .frame_state,
+            ));
     }
 
     /// Pop a frame, retiring its bank root first so the two stacks stay in
     /// step.
     fn pop_frame(&mut self) -> SubWalkFrame<'a, Sym> {
+        self.state_guards
+            .pop()
+            .expect("a live sub-walk frame lost its state root");
         self.bank_guards
             .pop()
             .expect("a live sub-walk frame lost its register-bank root");
@@ -12393,6 +12464,8 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         mut callee_concrete_r,
         mut callee_concrete_i,
     ) = allocate_callee_register_banks(sub_body, ctx.trace_ctx);
+    let callee_regs_r = RegisterBank::with_constants(callee_regs_r, sub_body.num_regs_r);
+    let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&callee_regs_r);
 
     if int_args.len() > sub_body.num_regs_i {
         return Err(DispatchError::InlineCallIntArityMismatch {
@@ -12419,7 +12492,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         callee_regs_i[i] = *arg;
     }
     for (i, arg) in ref_args.iter().enumerate() {
-        callee_regs_r[i] = *arg;
+        callee_regs_r.set(i, *arg);
     }
     for (i, arg) in float_args.iter().enumerate() {
         callee_regs_f[i] = *arg;
@@ -12485,7 +12558,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         exchange.next_frame_id += 1;
         id
     };
-    let frame = SubWalkFrame {
+    let mut frame = SubWalkFrame {
         box_replacements: FrameBoxReplacements::new(ctx.session),
         id: frame_id,
         caller_pc: pc,
@@ -12493,11 +12566,24 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         body: sub_body.clone(),
         seed_from_active_resume: start_pc == 0,
         registers_r: callee_regs_r,
-        registers_i: callee_regs_i,
-        registers_f: callee_regs_f,
-        concrete_registers_r: callee_concrete_r,
+        registers_i: RegisterBank::with_constants(callee_regs_i, sub_body.num_regs_i),
+        registers_f: RegisterBank::with_constants(callee_regs_f, sub_body.num_regs_f),
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: callee_concrete_r,
+            current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
+            current_exception_seed_concrete: ctx
+                .frame_state
+                .borrow()
+                .current_exception_seed_concrete,
+            outer_active_boxes: ctx.frame_state.borrow().outer_active_boxes.clone(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         concrete_registers_i: callee_concrete_i,
-        callee_shadow: None,
+
         inline_callee_consts: None,
         inline_poison_pcs: None,
         // `op_pc` belongs to the callee JitCode.  A canonical helper has no
@@ -12516,19 +12602,23 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         entry_py_pc: ctx.entry_py_pc,
         outer_resume_marker_jit_pc: ctx.outer_resume_marker_jit_pc,
         outer_jitcode_index: ctx.outer_jitcode_index,
-        outer_active_boxes: ctx.outer_active_boxes.clone(),
+
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
+
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
+
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
+
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
+    frame
+        .box_replacements
+        .bind_banks(&frame.registers_r, &frame.registers_i, &frame.registers_f);
+    frame.box_replacements.bind_frame_state(&frame.frame_state);
 
     if !driver_pointer.is_null() {
         // Nested descent: publish the heap frame and yield the parent at its
@@ -12544,8 +12634,9 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     let mut driver = SubWalkDriver::new(frame);
     let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
     let caller_replacements = FrameBoxReplacements::new(ctx.session);
+    caller_replacements.bind_banks(ctx.registers_r, ctx.registers_i, ctx.registers_f);
+    caller_replacements.bind_frame_state(&ctx.frame_state);
     let result = driver.drive(ctx.trace_ctx);
-    caller_replacements.apply(ctx);
     drop(caller_replacements);
     match result {
         Ok((outcome, class_state)) => {
@@ -13048,15 +13139,16 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                     }
                     'f' => {
                         let len = ctx.registers_f.len();
-                        let slot = ctx.registers_f.get_mut(dst).ok_or(
-                            DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "f",
-                            },
-                        )?;
-                        *slot = value;
+                        let _ =
+                            ctx.registers_f
+                                .get(dst)
+                                .ok_or(DispatchError::RegisterOutOfRange {
+                                    pc: op.pc,
+                                    reg: dst,
+                                    len,
+                                    bank: "f",
+                                })?;
+                        ctx.registers_f.set(dst, value);
                     }
                     _ => unreachable!(
                         "dispatch_inline_call_dirf_kind dst_bank must be 'i', 'r', 'f' or 'v'"

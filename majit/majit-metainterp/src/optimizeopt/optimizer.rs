@@ -96,11 +96,7 @@ pub trait Optimization {
 
     /// optimizer.py propagate_all_forward(trace, call_pure_results, flush).
     /// Only OptPure consumes this; other passes ignore it.
-    fn set_call_pure_results(
-        &mut self,
-        _results: &indexmap::IndexMap<Vec<majit_ir::Value>, majit_ir::Value>,
-    ) {
-    }
+    fn set_call_pure_results(&mut self, _results: &crate::optimizeopt::util::ArgsDict) {}
 
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
@@ -340,7 +336,7 @@ pub struct Optimizer {
     /// (via get_constant_box) → result value, carried across
     /// loop iterations so the optimizer can constant-fold repeated
     /// pure calls. RPython uses value-based equality for keys.
-    pub call_pure_results: indexmap::IndexMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results: crate::optimizeopt::util::ArgsDict,
     /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
     /// for guard sharing and descriptor fusion.
     ///
@@ -1508,7 +1504,7 @@ impl Optimizer {
             passes: Vec::new(),
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
-            call_pure_results: indexmap::IndexMap::new(),
+            call_pure_results: crate::optimizeopt::util::args_dict(),
             last_guard_op_idx: None,
             replaces_guard: indexmap::IndexMap::new(),
             pendingfields: Vec::new(),
@@ -1566,11 +1562,8 @@ impl Optimizer {
     }
 
     /// Look up a previously recorded CALL_PURE result.
-    pub fn get_call_pure_result(&self, args: &[majit_ir::Value]) -> Option<&majit_ir::Value> {
-        self.call_pure_results
-            .iter()
-            .find(|(k, _)| k.as_slice() == args)
-            .map(|(_, v)| v)
+    pub fn get_call_pure_result(&self, args: &[majit_ir::Value]) -> Option<majit_ir::Value> {
+        self.call_pure_results.get(args)
     }
 
     /// bridgeopt.py: deserialize_optimizer_knowledge
@@ -7348,7 +7341,7 @@ mod tests {
         opt.record_call_pure_result(vec![Value::Int(10), Value::Int(20)], Value::Int(42));
         assert_eq!(
             opt.get_call_pure_result(&[Value::Int(10), Value::Int(20)]),
-            Some(&Value::Int(42))
+            Some(Value::Int(42))
         );
         assert_eq!(
             opt.get_call_pure_result(&[Value::Int(10), Value::Int(99)]),

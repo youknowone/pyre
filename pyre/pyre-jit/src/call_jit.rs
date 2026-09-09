@@ -296,6 +296,38 @@ mod tests {
     }
 
     #[test]
+    fn blackhole_leave_marks_a_parent_beyond_1024_frames() {
+        std::thread::spawn(|| {
+            let mut ec = pyre_interpreter::PyExecutionContext::default();
+            // Allocate the complete chain before publishing any pointers.
+            let mut frames: Vec<PyFrame> = (0..1026).map(|_| stack_pyframe()).collect();
+            let base = frames.as_mut_ptr();
+            for index in 1..frames.len() {
+                // Keep accesses derived from the published allocation pointer;
+                // do not reborrow the Vec's entire mutable slice between links.
+                unsafe { (*base.add(index)).f_backref = base.add(index - 1) };
+            }
+            let top = unsafe { base.add(frames.len() - 1) };
+            ec.topframeref = top;
+            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
+            bh.virtualizable_ptr = base as i64;
+            super::leave_resumed_blackhole_frame(&bh, false);
+            // Clear the TLS anchor before an assertion can unwind the frame owner.
+            pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
+            assert!(frames[0].frame_finished_execution());
+            assert!(
+                frames[1..]
+                    .iter()
+                    .all(|frame| !frame.frame_finished_execution())
+            );
+            assert!(std::ptr::eq(ec.topframeref, top));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
     fn blackhole_leave_closes_the_open_scope() {
         std::thread::spawn(|| {
             let mut ec = pyre_interpreter::PyExecutionContext::default();
@@ -2507,10 +2539,10 @@ fn frame_is_on_unforced_ec_chain(
     frame_ptr: *mut PyFrame,
 ) -> bool {
     let mut cur = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
-    for _ in 0..1024 {
-        if cur.is_null() {
-            return false;
-        }
+    // ExecutionContext.enter/leave (executioncontext.py) maintain a chain
+    // ending at null, not a fixed-depth window. A recovered ancestor may be
+    // arbitrarily far below the open scope when the recursion limit is raised.
+    while !cur.is_null() {
         if std::ptr::eq(cur, frame_ptr) {
             return true;
         }
