@@ -1037,10 +1037,12 @@ fn gc_stats_public_type() -> PyObjectRef {
             "__repr__",
             crate::make_builtin_function_with_arity("__repr__", gc_stats_repr, 1),
         );
+        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_tuple_new(vec![crate::typedef::w_object()]));
         let args = [
             crate::typedef::w_type(),
             w_str_new("GcStats"),
-            pyre_object::w_tuple_new(vec![crate::typedef::w_object()]),
+            pyre_object::gc_roots::shadow_stack_get(bases_slot),
             roots.get(ns_slot),
         ];
         crate::builtins::type_descr_new(&args).expect("construct app_referents.GcStats") as usize

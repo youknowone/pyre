@@ -187,23 +187,28 @@ fn structseq_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cls = unsafe { (*inst).w_class };
     // `tuple(self)` — the positional body as a plain tuple.
     let n = unsafe { pyre_object::w_tuple_len(inst) };
-    let mut items: Vec<PyObjectRef> = Vec::with_capacity(n);
+    let mut items = pyre_object::gc_roots::RootedItems::new();
     for i in 0..n {
         items.push(
             unsafe { pyre_object::w_tuple_getitem(inst, i as i64) }
                 .unwrap_or_else(pyre_object::w_none),
         );
     }
-    let body_tuple = pyre_object::w_tuple_new(items);
+    let body_tuple = pyre_object::w_tuple_new(items.take());
     // `self.__dict__` carries the named-only extras for reconstruction.
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(body_tuple);
     let w_dict = crate::baseobjspace::getdict_native(inst);
-    let dict = if w_dict.is_null() {
+    fields.push(if w_dict.is_null() {
         pyre_object::w_dict_new()
     } else {
         w_dict
-    };
-    let inner = pyre_object::w_tuple_new(vec![body_tuple, dict]);
-    Ok(pyre_object::w_tuple_new(vec![cls, inner]))
+    });
+    let inner = pyre_object::w_tuple_new(fields.take());
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(cls);
+    result.push(inner);
+    Ok(pyre_object::w_tuple_new(result.take()))
 }
 
 /// CPython 3.14 `structseq___replace__` — copy the positional body and

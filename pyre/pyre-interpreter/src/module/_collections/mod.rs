@@ -1251,13 +1251,27 @@ impl W_Deque {
         let args = if unsafe { is_none(m) } {
             w_tuple_new(vec![])
         } else {
-            w_tuple_new(vec![w_tuple_new(vec![]), m])
+            let empty = w_tuple_new(vec![]);
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(empty);
+            fields.push(m);
+            w_tuple_new(fields.take())
         };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let args_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(args);
         let state = crate::reduce_protocol::object_getstate_default(self_obj)?;
+        let state_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(state);
         // interp_deque.py W_Deque.reduce calls `space.iter(self)`, preserving
         // subclass __iter__ overrides (including an override that raises).
         let items = crate::baseobjspace::iter(self_obj)?;
-        Ok(w_tuple_new(vec![ty, args, state, items]))
+        let mut result = pyre_object::gc_roots::RootedItems::new();
+        result.push(ty);
+        result.push(pyre_object::gc_roots::shadow_stack_get(args_slot));
+        result.push(pyre_object::gc_roots::shadow_stack_get(state_slot));
+        result.push(items);
+        Ok(w_tuple_new(result.take()))
     }
     fn __len__(&self) -> i64 {
         let self_obj = self as *const W_Deque as PyObjectRef;

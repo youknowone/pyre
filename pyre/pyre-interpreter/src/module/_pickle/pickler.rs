@@ -3116,10 +3116,10 @@ fn save_toplevel_by_name(
 fn extension_code(module_name: &str, name: &str) -> Option<i64> {
     let copyreg = import_module("copyreg").ok()?;
     let registry = crate::baseobjspace::getattr_str(copyreg, "_extension_registry").ok()?;
-    let key = pyre_object::tupleobject::w_tuple_new(vec![
-        pyre_object::w_str_new_managed(module_name),
-        pyre_object::w_str_new_managed(name),
-    ]);
+    let mut key_items = pyre_object::gc_roots::RootedItems::new();
+    key_items.push(pyre_object::w_str_new_managed(module_name));
+    key_items.push(pyre_object::w_str_new_managed(name));
+    let key = pyre_object::tupleobject::w_tuple_new(key_items.take());
     let code = unsafe { pyre_object::w_dict_lookup(registry, key) }?;
     crate::baseobjspace::int_w(code).ok()
 }

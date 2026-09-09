@@ -1915,31 +1915,44 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
     let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
     let typecode = unsafe { arr::w_array_typecode(obj) };
     let tc = typecode as char;
-    let w_typecode = pyre_object::w_str_new_managed(&tc.to_string());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let typecode_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&tc.to_string()));
     let w_dict =
         crate::baseobjspace::findattr_result(obj, "__dict__")?.unwrap_or_else(pyre_object::w_none);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_dict);
     let mformat = array_machine_format_code(typecode, unsafe { arr::w_array_itemsize(obj) });
     if protocol < 3 || mformat == UNKNOWN_FORMAT {
         let w_items = array_tolist_method(&[obj])?;
-        let ctor_args = pyre_object::w_tuple_new(vec![w_typecode, w_items]);
-        return Ok(pyre_object::w_tuple_new(vec![w_type, ctor_args, w_dict]));
+        let mut ctor = pyre_object::gc_roots::RootedItems::new();
+        ctor.push(pyre_object::gc_roots::shadow_stack_get(typecode_slot));
+        ctor.push(w_items);
+        let ctor_args = pyre_object::w_tuple_new(ctor.take());
+        let mut result = pyre_object::gc_roots::RootedItems::new();
+        result.push(w_type);
+        result.push(ctor_args);
+        result.push(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        return Ok(pyre_object::w_tuple_new(result.take()));
     }
 
     let module = crate::importing::get_sys_module("array")
         .ok_or_else(|| PyError::runtime_error("array module not initialized"))?;
     let reconstructor = crate::baseobjspace::getattr_str(module, "_array_reconstructor")?;
+    let reconstructor_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(reconstructor);
     let w_bytes = array_tobytes_method(&[obj])?;
-    let ctor_args = pyre_object::w_tuple_new(vec![
-        w_type,
-        w_typecode,
-        pyre_object::w_int_new(mformat),
-        w_bytes,
-    ]);
-    Ok(pyre_object::w_tuple_new(vec![
-        reconstructor,
-        ctor_args,
-        w_dict,
-    ]))
+    let mut ctor = pyre_object::gc_roots::RootedItems::new();
+    ctor.push(w_type);
+    ctor.push(pyre_object::gc_roots::shadow_stack_get(typecode_slot));
+    ctor.push(pyre_object::w_int_new(mformat));
+    ctor.push(w_bytes);
+    let ctor_args = pyre_object::w_tuple_new(ctor.take());
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(pyre_object::gc_roots::shadow_stack_get(reconstructor_slot));
+    result.push(ctor_args);
+    result.push(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+    Ok(pyre_object::w_tuple_new(result.take()))
 }
 
 fn decode_uint(bytes: &[u8], big_endian: bool) -> u64 {

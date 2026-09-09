@@ -26169,18 +26169,30 @@ fn bytearray_reduce_impl(
     let args = if data.is_empty() {
         w_tuple_new(vec![])
     } else if protocol.is_some_and(|p| p >= 3) {
-        w_tuple_new(vec![pyre_object::bytesobject::w_bytes_from_bytes(data)])
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::bytesobject::w_bytes_from_bytes(data));
+        w_tuple_new(fields.take())
     } else {
         // bytearrayobject.py:221-233 — legacy protocols carry a latin-1
         // unicode string plus the explicit codec name.
         let latin1: String = data.iter().map(|&b| char::from(b)).collect();
-        w_tuple_new(vec![w_str_new(&latin1), w_str_new("latin-1")])
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_str_new(&latin1));
+        fields.push(w_str_new("latin-1"));
+        w_tuple_new(fields.take())
     };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args);
     let cls = crate::typedef::r#type(obj)
         .map(|p| p.as_ptr())
         .unwrap_or_else(|| gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE));
     let state = crate::reduce_protocol::object_getstate_default(obj)?;
-    Ok(w_tuple_new(vec![cls, args, state]))
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(cls);
+    result.push(pyre_object::gc_roots::shadow_stack_get(args_slot));
+    result.push(state);
+    Ok(w_tuple_new(result.take()))
 }
 
 fn bytearray_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -28901,11 +28913,14 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         let w_set = pyre_object::w_set_iter_get_set(args[0]);
         let startlen = pyre_object::w_set_iter_get_startlen(args[0]);
         if w_set.is_null() {
-            let state = pyre_object::w_tuple_new(vec![pyre_object::w_list_new(vec![])]);
-            return Ok(pyre_object::w_tuple_new(vec![
-                crate::baseobjspace::builtin_callable("iter"),
-                state,
-            ]));
+            let empty = pyre_object::w_list_new(vec![]);
+            let mut state = pyre_object::gc_roots::RootedItems::new();
+            state.push(empty);
+            let state = pyre_object::w_tuple_new(state.take());
+            let mut result = pyre_object::gc_roots::RootedItems::new();
+            result.push(crate::baseobjspace::builtin_callable("iter"));
+            result.push(state);
+            return Ok(pyre_object::w_tuple_new(result.take()));
         }
         if startlen == usize::MAX || pyre_object::w_set_len(w_set) != startlen {
             return Err(crate::PyError::new(
@@ -28922,11 +28937,14 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             }
             i = slot + 1;
         }
-        let state = pyre_object::w_tuple_new(vec![pyre_object::w_list_new(remaining)]);
-        Ok(pyre_object::w_tuple_new(vec![
-            crate::baseobjspace::builtin_callable("iter"),
-            state,
-        ]))
+        let list = pyre_object::w_list_new(remaining);
+        let mut state = pyre_object::gc_roots::RootedItems::new();
+        state.push(list);
+        let state = pyre_object::w_tuple_new(state.take());
+        let mut result = pyre_object::gc_roots::RootedItems::new();
+        result.push(crate::baseobjspace::builtin_callable("iter"));
+        result.push(state);
+        Ok(pyre_object::w_tuple_new(result.take()))
     }
 }
 
