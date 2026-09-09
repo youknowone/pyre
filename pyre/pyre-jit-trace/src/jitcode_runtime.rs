@@ -3601,7 +3601,6 @@ mod tests {
             "cast_int_to_float/i>f",
             "cast_int_to_ptr/i>r",
             "check_neg_index/rid>i",
-            "conditional_call_ir_v/iiIRd",
             "conditional_call_value_ir_i/iiIRd>i",
             "conditional_call_value_ir_r/riIRd>r",
             "gc_load_indexed_f/riiii>f",

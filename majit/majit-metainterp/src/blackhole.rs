@@ -10067,6 +10067,13 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "residual_call_ir_v/iIRd".to_string(),
         majit_translate::insns::BC_RESIDUAL_CALL_IR_V,
     );
+    // jtransform `_rewrite_op_cond_call` now emits this key for
+    // interpreter-facing `jit.conditional_call`. `wire_bhimpl_handlers`
+    // already binds `handler_conditional_call_ir_v`.
+    insns.insert(
+        "conditional_call_ir_v/iiIRd".to_string(),
+        majit_translate::insns::BC_CONDITIONAL_CALL_IR_V,
+    );
     insns.insert(
         "residual_call_ir_i/iIRd>i".to_string(),
         majit_translate::insns::BC_RESIDUAL_CALL_IR_I,

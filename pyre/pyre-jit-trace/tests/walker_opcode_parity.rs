@@ -285,7 +285,6 @@ const PYRE_ONLY: &[&str] = &[
 /// so a new arrival costs compilation rather than correctness.
 const NEITHER: &[&str] = &[
     "check_neg_index/rid>i",
-    "conditional_call_ir_v/iiIRd",
     "gc_load_indexed_f/riiii>f",
     "gc_load_indexed_i/riiii>i",
     "getinteriorfield_gc_f/rid>f",
