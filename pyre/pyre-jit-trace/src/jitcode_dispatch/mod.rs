@@ -4732,6 +4732,18 @@ unsafe fn raw_store_float(addr: *mut u8, itemsize: usize, value: f64) {
 /// * `ConcreteValue::Null` — the handler doesn't know (e.g. residual
 ///   `Call*I`, `getfield_gc_i` cache miss).  Downstream consumers
 ///   surface `GotoIfNotValueNotConcrete` for unknown branch inputs.
+/// `pyjitpl.py` `_opimpl_isconstant` / `_opimpl_isvirtual`: `ConstInt`, no IR.
+fn write_hint_bool<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dst: usize,
+    predicate: bool,
+) -> Result<(), DispatchError> {
+    let value = i64::from(predicate);
+    let result = ctx.trace_ctx.const_int(value);
+    write_int_reg(ctx, pc, dst, result, ConcreteValue::Int(value))
+}
+
 fn write_int_reg<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -12677,26 +12689,20 @@ fn handle<Sym: WalkSym>(
         // `ConstInt(...)` and record no IR.  Operand layout `[src][dst]`.
         "int_isconstant/i>i" => {
             let src = read_int_reg(code, op, 0, ctx)?;
-            let value = i64::from(src.is_constant());
-            let result = ctx.trace_ctx.const_int(value);
             let dst = code[op.pc + 2] as usize;
-            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(value))?;
+            write_hint_bool(ctx, op.pc, dst, src.is_constant())?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_isconstant/r>i" => {
             let src = read_ref_reg(code, op, 0, ctx)?;
-            let value = i64::from(src.is_constant());
-            let result = ctx.trace_ctx.const_int(value);
             let dst = code[op.pc + 2] as usize;
-            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(value))?;
+            write_hint_bool(ctx, op.pc, dst, src.is_constant())?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_isvirtual/r>i" => {
             let src = read_ref_reg(code, op, 0, ctx)?;
-            let value = i64::from(ctx.trace_ctx.is_likely_virtual(src));
-            let result = ctx.trace_ctx.const_int(value);
             let dst = code[op.pc + 2] as usize;
-            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(value))?;
+            write_hint_bool(ctx, op.pc, dst, ctx.trace_ctx.is_likely_virtual(src))?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // RPython `pyjitpl.py opimpl_new` delegates to `execute_new`:
