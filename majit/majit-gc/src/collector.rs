@@ -6674,12 +6674,10 @@ impl MiniMarkGC {
     ///
     /// A precise map publishes the payload start. A slot that landed
     /// `N` words inside a nursery object still has to drag that object
-    /// out; snapping to the enclosing start is the walk-site counterpart
-    /// of `nursery_start_decodes`.
+    /// out. A forwarded enclosing header whose extent covers `addr` is
+    /// the only safe snap: `nursery_start_decodes` is also true of a
+    /// zeroed payload word, so it cannot be consulted first.
     fn nursery_root_object_addr(&self, addr: usize) -> usize {
-        if self.nursery_start_decodes(addr) {
-            return addr;
-        }
         self.enclosing_nursery_object_start(addr).unwrap_or(addr)
     }
 
@@ -14914,7 +14912,7 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::simple(32));
         let obj = gc.alloc_with_type(tid, 32);
         unsafe {
-            *((obj.0 + 8) as *mut u64) = 0x42;
+            *(obj.0 as *mut u64) = 0x42;
         }
 
         // Exact root first so the object is forwarded before the interior
@@ -14926,13 +14924,16 @@ cache size\t: 8192 kB\n";
             "exact root must promote the object"
         );
 
+        // Leave the word `header_of(obj+16)` reads as 0 so it decodes as
+        // type_id 0. The snap must still prefer the forwarded enclosing
+        // start rather than treating that payload word as a header.
         let mut interior = GcRef(obj.0 + 16);
         gc.drag_out_root(&mut interior);
         assert_eq!(
             exact.0, interior.0,
             "interior root must snap to the same forwarded object"
         );
-        assert_eq!(unsafe { *((exact.0 + 8) as *const u64) }, 0x42);
+        assert_eq!(unsafe { *(exact.0 as *const u64) }, 0x42);
     }
 
     /// incminimark.py:3068-3079 dead-target branch. A WEAKREF whose
