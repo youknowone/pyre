@@ -6701,10 +6701,9 @@ impl MiniMarkGC {
             }
             if unsafe { (*header_of(candidate)).is_forwarded() } {
                 let fwd = unsafe { GcHeader::forwarding_address(header_of(candidate)) };
-                let Some(size) = self.try_size_for_typeid(
-                    fwd,
-                    unsafe { (*header_of(fwd)).type_id() },
-                ) else {
+                let Some(size) =
+                    self.try_size_for_typeid(fwd, unsafe { (*header_of(fwd)).type_id() })
+                else {
                     continue;
                 };
                 if candidate + size <= obj_addr {
