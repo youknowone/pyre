@@ -828,7 +828,7 @@ fn build_module_with_write_barrier_target(
 }
 
 #[test]
-fn jitframe_barrier_reserves_arity_one_for_zero_argument_residuals() {
+fn jitframe_barrier_checks_flags_and_reserves_arity_one_for_zero_argument_residuals() {
     const WB_TARGET: i64 = 127;
     let call = make_op(
         OpCode::CallMayForceI,
@@ -854,6 +854,28 @@ fn jitframe_barrier_reserves_arity_one_for_zero_argument_residuals() {
     );
     assert_eq!(direct_write_barrier_call_count(&bytes, WB_TARGET as i32), 1);
     validate_wasm(&bytes);
+    // _reload_frame_if_necessary's frame fastpath must guard the helper;
+    // otherwise every collecting call searches the managed heap even when
+    // the frame has already been remembered (or has a zeroed off-GC header).
+    let flag = i32::from(codegen::WriteBarrierHelpers::for_current_gc(WB_TARGET, 0).if_flag);
+    let mut flag_checks = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let ops = body
+                .get_operators_reader()
+                .unwrap()
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for window in ops.windows(4) {
+                if matches!(window, [wasmparser::Operator::I32Load8U { .. }, wasmparser::Operator::I32Const { value }, wasmparser::Operator::I32And, wasmparser::Operator::If { .. }] if *value == flag)
+                {
+                    flag_checks += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(flag_checks, 1);
 }
 
 #[test]
