@@ -589,9 +589,10 @@ impl AsyncActionOps for CheckSignalAction {
             let cls_slot = pyre_object::gc_roots::pin_roots(&[w_exc]);
             let w_msg =
                 pyre_object::w_str_new("asynchronous exception triggered from another thread");
+            let msg_slot = pyre_object::gc_roots::pin_roots(&[w_msg]);
             let w_obj = crate::builtins::exc_exception_new(&[
                 pyre_object::gc_roots::shadow_stack_get(cls_slot),
-                w_msg,
+                pyre_object::gc_roots::shadow_stack_get(msg_slot),
             ])?;
             return Err(unsafe { crate::PyError::from_exc_object(w_obj) });
         }
@@ -653,8 +654,8 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         // signal seen on a worker rearms the main ticker promptly.
         majit_gc::rgil::invoke_after_thread_switch(CheckSignalAction::after_thread_switch);
 
-        // Hand the ticker cell address to the OS handler (rsignal.py:31-32)
-        // `pypysig_getaddr_occurred`).  The handler itself only arms the
+        // Hand the ticker cell address to the OS handler
+        // (`pypysig_getaddr_occurred`).  The handler itself only arms the
         // eval-breaker's async bit, which is a lock-free atomic RMW and so
         // async-signal-safe; `ExecutionContext::bytecode_trace` is what turns
         // that request into a negative ticker, under the GIL.  Writing this

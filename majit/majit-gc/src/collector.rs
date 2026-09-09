@@ -3189,12 +3189,6 @@ impl MiniMarkGC {
         }
     }
 
-    /// incminimark.py:2344-2356
-    /// `remove_young_arrays_from_old_objects_pointing_to_young`.
-    ///
-    /// An entry naming a young rawmalloced object is a contradiction: this
-    /// minor visits it as an object, and if it dies the drain would be reading
-    /// a freed header. Upstream drops those entries before the walk starts.
     /// incminimark.py `_add_to_more_objects_to_trace_if_black`.
     ///
     /// Upstream then clears `GCFLAG_VISITED` because its drain re-marks on
@@ -3207,6 +3201,11 @@ impl MiniMarkGC {
         }
     }
 
+    /// incminimark.py `remove_young_arrays_from_old_objects_pointing_to_young`.
+    ///
+    /// An entry naming a young rawmalloced object is a contradiction: this
+    /// minor visits it as an object, and if it dies the drain would be reading
+    /// a freed header. Upstream drops those entries before the walk starts.
     fn remove_young_arrays_from_old_objects_pointing_to_young(&mut self) {
         let oldgen = &self.oldgen;
         self.old_objects_pointing_to_young
@@ -6701,6 +6700,16 @@ impl MiniMarkGC {
                 break;
             }
             if unsafe { (*header_of(candidate)).is_forwarded() } {
+                let fwd = unsafe { GcHeader::forwarding_address(header_of(candidate)) };
+                let Some(size) = self.try_size_for_typeid(
+                    fwd,
+                    unsafe { (*header_of(fwd)).type_id() },
+                ) else {
+                    continue;
+                };
+                if candidate + size <= obj_addr {
+                    continue;
+                }
                 return Some(candidate);
             }
         }

@@ -4919,10 +4919,11 @@ pub fn wrap_oserror2(
     let filename = w_filename.unwrap_or_else(pyre_object::w_none);
     let filename2 = w_filename2.unwrap_or_else(pyre_object::w_none);
     let live_base = _roots.pin_roots(&[w_exc, filename, filename2]);
-    let extra = _roots.pin_roots(&[
-        pyre_object::w_int_new(errno as i64),
-        pyre_object::w_str_new_managed(&msg),
-    ]);
+    // `error.py _wrap_oserror2_impl` builds `w_errno` before `w_msg`.
+    // Evaluating both allocators in one `pin_roots` leaves the int
+    // unrooted across `w_str_new_managed`.
+    let extra = _roots.pin_roots(&[pyre_object::w_int_new(errno as i64)]);
+    let _ = _roots.pin_roots(&[pyre_object::w_str_new_managed(&msg)]);
     // The five the constructor takes, in `_wrap_oserror2_impl`'s order.  A
     // subclass reading `filename2` sees the argument it declares rather than a
     // short call.
