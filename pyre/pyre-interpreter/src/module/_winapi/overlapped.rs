@@ -378,10 +378,10 @@ pub fn read_file(
             host_winapi::read_file(handle, size)
         }
         .map_err(win32_err)?;
-        return Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::bytesobject::w_bytes_from_bytes(&result.data),
-            pyre_object::w_int_new(i64::from(result.error)),
-        ]));
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&result.data));
+        fields.push(pyre_object::w_int_new(i64::from(result.error)));
+        return Ok(pyre_object::w_tuple_new(fields.take()));
     }
     let backend = new_native(handle)?;
     let error = {
@@ -401,10 +401,10 @@ pub fn read_file(
         ERROR_IO_PENDING => backend.lock().pending = true,
         _ => return Err(super::win32_code(error)),
     }
-    Ok(pyre_object::w_tuple_new(vec![
-        w_overlapped(backend),
-        pyre_object::w_int_new(i64::from(error)),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_overlapped(backend));
+    fields.push(pyre_object::w_int_new(i64::from(error)));
+    Ok(pyre_object::w_tuple_new(fields.take()))
 }
 
 /// `_winapi.WriteFile(handle, buffer, overlapped=False)` -> `(written, error)`,
@@ -424,10 +424,10 @@ pub fn write_file(
             host_winapi::write_file(handle, data)
         }
         .map_err(win32_err)?;
-        return Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::w_int_new(i64::from(result.written)),
-            pyre_object::w_int_new(i64::from(result.error)),
-        ]));
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_int_new(i64::from(result.written)));
+        fields.push(pyre_object::w_int_new(i64::from(result.error)));
+        return Ok(pyre_object::w_tuple_new(fields.take()));
     }
     let backend = new_native(handle)?;
     let error = {
@@ -448,8 +448,8 @@ pub fn write_file(
         ERROR_IO_PENDING => backend.lock().pending = true,
         _ => return Err(super::win32_code(error)),
     }
-    Ok(pyre_object::w_tuple_new(vec![
-        w_overlapped(backend),
-        pyre_object::w_int_new(i64::from(error)),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_overlapped(backend));
+    fields.push(pyre_object::w_int_new(i64::from(error)));
+    Ok(pyre_object::w_tuple_new(fields.take()))
 }

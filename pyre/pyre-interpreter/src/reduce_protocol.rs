@@ -178,7 +178,10 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
     if unsafe { pyre_object::is_none(w_slots) } {
         return Ok(w_ret);
     }
-    Ok(pyre_object::w_tuple_new(vec![w_ret, w_slots]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_ret);
+    fields.push(w_slots);
+    Ok(pyre_object::w_tuple_new(fields.take()))
 }
 
 /// objectobject.py `_getnewargs(space, w_obj)` — returns
@@ -285,7 +288,9 @@ pub fn set_reduce(w_obj: PyObjectRef) -> PyResult {
         pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(obj_slot))
     };
     let w_list = pyre_object::listobject::w_list_new(items);
-    let w_args = pyre_object::w_tuple_new(vec![w_list]);
+    let mut args = pyre_object::gc_roots::RootedItems::new();
+    args.push(w_list);
+    let w_args = pyre_object::w_tuple_new(args.take());
     let _ = pyre_object::gc_roots::pin_root(w_args);
     let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 

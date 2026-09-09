@@ -303,21 +303,25 @@ fn unparse_address(
     )
     .map_err(|_| crate::PyError::value_error("recvfrom returned unsupported address family"))?
     {
-        host_overlapped::SocketAddress::V4 { host, port } => Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(&host),
-            pyre_object::w_int_new(port as i64),
-        ])),
+        host_overlapped::SocketAddress::V4 { host, port } => {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_str_new_managed(&host));
+            fields.push(pyre_object::w_int_new(port as i64));
+            Ok(pyre_object::w_tuple_new(fields.take()))
+        }
         host_overlapped::SocketAddress::V6 {
             host,
             port,
             flowinfo,
             scope_id,
-        } => Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new(&host),
-            pyre_object::w_int_new(port as i64),
-            pyre_object::w_int_new(flowinfo as i64),
-            pyre_object::w_int_new(scope_id as i64),
-        ])),
+        } => {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_str_new_managed(&host));
+            fields.push(pyre_object::w_int_new(port as i64));
+            fields.push(pyre_object::w_int_new(flowinfo as i64));
+            fields.push(pyre_object::w_int_new(scope_id as i64));
+            Ok(pyre_object::w_tuple_new(fields.take()))
+        }
     }
 }
 
@@ -483,7 +487,10 @@ fn overlapped_getresult(args: &[PyObjectRef]) -> crate::PyResult {
                 destination[..count].copy_from_slice(&state.buffer[..count]);
                 pyre_object::w_int_new(count as i64)
             };
-            let result = pyre_object::w_tuple_new(vec![first, address]);
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(first);
+            fields.push(address);
+            let result = pyre_object::w_tuple_new(fields.take());
             this(obj)?.w_result = result;
             pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
             Ok(result)

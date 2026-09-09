@@ -1550,10 +1550,10 @@ fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ns,
         "get_traced_memory",
         crate::make_builtin_function("get_traced_memory", |_| {
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(0),
-                pyre_object::w_int_new(0),
-            ]))
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_int_new(0));
+            fields.push(pyre_object::w_int_new(0));
+            Ok(pyre_object::w_tuple_new(fields.take()))
         }),
     );
     crate::module_ns_store(

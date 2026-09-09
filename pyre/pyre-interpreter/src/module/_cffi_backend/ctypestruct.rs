@@ -437,7 +437,10 @@ pub fn fget_fields(ct: &W_CType) -> Result<PyObjectRef, PyError> {
     }
     for (name, w_field) in fields_dict_items(ct)? {
         if let Some(i) = fields.iter().position(|&f| f == w_field) {
-            let w_pair = pyre_object::w_tuple_new(vec![pyre_object::w_str_new(&name), w_field]);
+            let mut pair = pyre_object::gc_roots::RootedItems::new();
+            pair.push(pyre_object::w_str_new_managed(&name));
+            pair.push(w_field);
+            let w_pair = pyre_object::w_tuple_new(pair.take());
             roots.set(base + i, w_pair);
         }
     }

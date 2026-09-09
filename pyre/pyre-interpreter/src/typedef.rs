@@ -7241,9 +7241,9 @@ fn init_str_type(ns: PyObjectRef) {
                 "__getnewargs__",
                 |args| {
                     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_str_from_wtf8(s.to_owned()),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_str_from_wtf8_managed(s.to_owned()));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 1,
             ),
@@ -15931,11 +15931,16 @@ pub(crate) fn slot_wrapper_check_instance(
 /// protocols 0 and 1.
 fn descr_reduce(descr: PyObjectRef) -> crate::PyResult {
     let owner = unsafe { crate::function::fget_func_objclass(descr)? };
-    let name = pyre_object::w_str_new(unsafe { crate::function::function_get_name(descr) });
-    Ok(pyre_object::w_tuple_new(vec![
-        crate::baseobjspace::builtin_callable("getattr"),
-        pyre_object::w_tuple_new(vec![owner, name]),
-    ]))
+    let mut args = pyre_object::gc_roots::RootedItems::new();
+    args.push(owner);
+    args.push(pyre_object::w_str_new(unsafe {
+        crate::function::function_get_name(descr)
+    }));
+    let args = pyre_object::w_tuple_new(args.take());
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(crate::baseobjspace::builtin_callable("getattr"));
+    result.push(args);
+    Ok(pyre_object::w_tuple_new(result.take()))
 }
 
 fn init_slot_wrapper_type(ns: PyObjectRef) {
@@ -17350,12 +17355,16 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         ));
                     }
                     let owner = unsafe { pyre_object::w_member_get_cls(member) };
-                    let name =
-                        pyre_object::w_str_new(unsafe { pyre_object::w_member_get_name(member) });
-                    Ok(pyre_object::w_tuple_new(vec![
-                        crate::baseobjspace::builtin_callable("getattr"),
-                        pyre_object::w_tuple_new(vec![owner, name]),
-                    ]))
+                    let mut args = pyre_object::gc_roots::RootedItems::new();
+                    args.push(owner);
+                    args.push(pyre_object::w_str_new(unsafe {
+                        pyre_object::w_member_get_name(member)
+                    }));
+                    let args = pyre_object::w_tuple_new(args.take());
+                    let mut result = pyre_object::gc_roots::RootedItems::new();
+                    result.push(crate::baseobjspace::builtin_callable("getattr"));
+                    result.push(args);
+                    Ok(pyre_object::w_tuple_new(result.take()))
                 },
                 1,
             ),
@@ -19779,10 +19788,10 @@ fn init_int_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "as_integer_ratio",
                 |args| {
-                    Ok(pyre_object::w_tuple_new(vec![
-                        int_as_plain_int(args),
-                        pyre_object::w_int_new(1),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(int_as_plain_int(args));
+                    fields.push(pyre_object::w_int_new(1));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 1,
             ),
@@ -20353,10 +20362,10 @@ fn init_complex_type(ns: PyObjectRef) {
                     };
                     // complexobject.py descr___getnewargs__: two base floats,
                     // preserving the sign bits of zero components.
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_float_new(re),
-                        pyre_object::w_float_new(im),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_float_new(re));
+                    fields.push(pyre_object::w_float_new(im));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 1,
             ),
@@ -20959,10 +20968,10 @@ fn float_descr_as_integer_ratio(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             pyre_object::w_long_new(b)
         }
     };
-    Ok(pyre_object::w_tuple_new(vec![
-        to_pyint(numer),
-        to_pyint(denom),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(to_pyint(numer));
+    fields.push(to_pyint(denom));
+    Ok(pyre_object::w_tuple_new(fields.take()))
 }
 
 /// RPython `rpython/rlib/rfloat.py float_as_rbigint_ratio`.
@@ -22858,9 +22867,9 @@ fn init_bytes_type(ns: PyObjectRef) {
                 "__getnewargs__",
                 |args| {
                     let data = unsafe { pyre_object::w_bytes_data(args[0]) };
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_bytes_from_bytes(data),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_bytes_from_bytes(data));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 1,
             ),
@@ -23894,11 +23903,11 @@ fn bytes_partition(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, c
             } else {
                 new_bytes_like(args[0], sep)
             };
-            Ok(pyre_object::w_tuple_new(vec![
-                new_bytes_like(args[0], &data[..i]),
-                middle,
-                new_bytes_like(args[0], &data[i + sep.len()..]),
-            ]))
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(new_bytes_like(args[0], &data[..i]));
+            fields.push(middle);
+            fields.push(new_bytes_like(args[0], &data[i + sep.len()..]));
+            Ok(pyre_object::w_tuple_new(fields.take()))
         }
         None => {
             // `cut_bytes_like` keeps a bytearray receiver out of the result
@@ -23907,9 +23916,17 @@ fn bytes_partition(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, c
             let whole = cut_bytes_like(args[0], data);
             let empty = || empty_bytes_like(args[0]);
             if forward {
-                Ok(pyre_object::w_tuple_new(vec![whole, empty(), empty()]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(whole);
+                fields.push(empty());
+                fields.push(empty());
+                Ok(pyre_object::w_tuple_new(fields.take()))
             } else {
-                Ok(pyre_object::w_tuple_new(vec![empty(), empty(), whole]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(empty());
+                fields.push(empty());
+                fields.push(whole);
+                Ok(pyre_object::w_tuple_new(fields.take()))
             }
         }
     }

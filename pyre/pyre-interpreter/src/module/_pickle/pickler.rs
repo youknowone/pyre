@@ -965,11 +965,11 @@ mod memo_proxy {
                 if obj.is_null() {
                     continue;
                 }
-                // `(index, obj)` — `w_tuple_new` pins its inputs across the malloc.
-                let tup = pyre_object::tupleobject::w_tuple_new(vec![
-                    pyre_object::w_int_new(i as i64),
-                    obj,
-                ]);
+                // `(index, obj)` — pin the boxed index before the tuple malloc.
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(i as i64));
+                fields.push(obj);
+                let tup = pyre_object::tupleobject::w_tuple_new(fields.take());
                 let _ = pyre_object::gc_roots::pin_root(tup);
                 let tup_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 // id(obj) read from the (relocated) tuple element.
@@ -1508,7 +1508,9 @@ fn save_type(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resul
     let w_type = builtin_attr("type")?;
     let _ = pyre_object::gc_roots::pin_root(w_type);
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let w_args = pyre_object::tupleobject::w_tuple_new(vec![singleton]);
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(singleton);
+    let w_args = pyre_object::tupleobject::w_tuple_new(fields.take());
     let _ = pyre_object::gc_roots::pin_root(w_args);
     let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     save_reduce(
@@ -1742,10 +1744,10 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
         let codecs = import_module("codecs")?;
         let w_encode = crate::baseobjspace::getattr_str(codecs, "encode")?;
         let w_decoded = call_meth(w_obj, "decode", &[pyre_object::w_str_new("latin1")])?;
-        let w_args = pyre_object::tupleobject::w_tuple_new(vec![
-            w_decoded,
-            pyre_object::w_str_new("latin1"),
-        ]);
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_decoded);
+        fields.push(pyre_object::w_str_new("latin1"));
+        let w_args = pyre_object::tupleobject::w_tuple_new(fields.take());
         return save_reduce(ctx, buf, &[w_encode, w_args], Some(w_obj));
     }
     let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
@@ -1974,7 +1976,9 @@ fn save_set(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
         // save_reduce(set, (list(obj),)).
         let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
         let w_list = pyre_object::listobject::w_list_new(items);
-        let w_args = pyre_object::tupleobject::w_tuple_new(vec![w_list]);
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_list);
+        let w_args = pyre_object::tupleobject::w_tuple_new(fields.take());
         let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
         return save_reduce(ctx, buf, &[w_set_type, w_args], Some(w_obj));
     }
@@ -2057,7 +2061,9 @@ fn save_frozenset(
         // save_reduce(frozenset, (list(obj),)).
         let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
         let w_list = pyre_object::listobject::w_list_new(items);
-        let w_args = pyre_object::tupleobject::w_tuple_new(vec![w_list]);
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_list);
+        let w_args = pyre_object::tupleobject::w_tuple_new(fields.take());
         let w_frozenset_type =
             crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE);
         return save_reduce(ctx, buf, &[w_frozenset_type, w_args], Some(w_obj));
@@ -2108,8 +2114,9 @@ fn save_bytearray(
         let w_args = if data.is_empty() {
             pyre_object::tupleobject::w_tuple_new(Vec::new())
         } else {
-            let w_bytes = pyre_object::w_bytes_from_bytes(data);
-            pyre_object::tupleobject::w_tuple_new(vec![w_bytes])
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_bytes_from_bytes(data));
+            pyre_object::tupleobject::w_tuple_new(fields.take())
         };
         return save_reduce(ctx, buf, &[w_bytearray_type, w_args], Some(w_obj));
     }

@@ -7192,10 +7192,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |_| match host_posix::pipe() {
                     Ok((rfd, wfd)) => {
                         use std::os::fd::IntoRawFd;
-                        Ok(pyre_object::w_tuple_new(vec![
-                            pyre_object::w_int_new(rfd.into_raw_fd() as i64),
-                            pyre_object::w_int_new(wfd.into_raw_fd() as i64),
-                        ]))
+                        let mut fields = pyre_object::gc_roots::RootedItems::new();
+                        fields.push(pyre_object::w_int_new(rfd.into_raw_fd() as i64));
+                        fields.push(pyre_object::w_int_new(wfd.into_raw_fd() as i64));
+                        Ok(pyre_object::w_tuple_new(fields.take()))
                     }
                     Err(e) => Err(io_err(e, "")),
                 },
@@ -7230,10 +7230,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     match host_posix::pipe2(flags) {
                         Ok((rfd, wfd)) => {
                             use std::os::fd::IntoRawFd;
-                            Ok(pyre_object::w_tuple_new(vec![
-                                pyre_object::w_int_new(rfd.into_raw_fd() as i64),
-                                pyre_object::w_int_new(wfd.into_raw_fd() as i64),
-                            ]))
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_int_new(rfd.into_raw_fd() as i64));
+                            fields.push(pyre_object::w_int_new(wfd.into_raw_fd() as i64));
+                            Ok(pyre_object::w_tuple_new(fields.take()))
                         }
                         Err(e) => Err(io_err(e, "")),
                     }
@@ -9885,11 +9885,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |_| {
                     let [l1, l5, l15] =
                         rustpython_host_env::time::getloadavg().map_err(|e| io_err(e, ""))?;
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_float_new(l1),
-                        pyre_object::w_float_new(l5),
-                        pyre_object::w_float_new(l15),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_float_new(l1));
+                    fields.push(pyre_object::w_float_new(l5));
+                    fields.push(pyre_object::w_float_new(l15));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
             ),

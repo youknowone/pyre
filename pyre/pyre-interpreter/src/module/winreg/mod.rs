@@ -851,7 +851,12 @@ mod imp {
         let key = as_hkey(pos[0], false)?;
         let name = wide_or_empty(opt_text(pos[1], "QueryValueEx", "2")?)?;
         match host_reg::query_value_bytes(key, &name) {
-            Ok((data, typ)) => Ok(w_tuple_new(vec![reg2py(&data, typ), w_int_new(typ as i64)])),
+            Ok((data, typ)) => {
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(reg2py(&data, typ));
+                fields.push(w_int_new(typ as i64));
+                Ok(w_tuple_new(fields.take()))
+            }
             Err(code) => Err(win_err(code)),
         }
     }
@@ -930,22 +935,24 @@ mod imp {
                 .iter()
                 .position(|&unit| unit == 0)
                 .unwrap_or(name.len());
-            return Ok(w_tuple_new(vec![
-                w_str_from_wtf8(Wtf8Buf::from_wide(&name[..end])),
-                reg2py(&data[..data_len as usize], typ),
-                w_int_new(typ as i64),
-            ]));
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_str_from_wtf8_managed(Wtf8Buf::from_wide(&name[..end])));
+            fields.push(reg2py(&data[..data_len as usize], typ));
+            fields.push(w_int_new(typ as i64));
+            return Ok(w_tuple_new(fields.take()));
         }
     }
 
     fn query_info_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let key = as_hkey(single_arg(args, "QueryInfoKey")?, false)?;
         match host_reg::query_info_key_full(key) {
-            Ok(info) => Ok(w_tuple_new(vec![
-                w_int_new(info.sub_keys as i64),
-                w_int_new(info.values as i64),
-                w_int_new(info.last_write_time as i64),
-            ])),
+            Ok(info) => {
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(w_int_new(info.sub_keys as i64));
+                fields.push(w_int_new(info.values as i64));
+                fields.push(w_int_new(info.last_write_time as i64));
+                Ok(w_tuple_new(fields.take()))
+            }
             Err(code) => Err(win_err(code)),
         }
     }

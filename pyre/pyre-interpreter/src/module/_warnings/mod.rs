@@ -398,10 +398,10 @@ fn update_registry(
     let registry_slot = pin_root_slot(registry);
     let text_slot = pin_root_slot(text);
     let category_slot = pin_root_slot(category);
-    let key = w_tuple_new(vec![
-        pyre_object::gc_roots::shadow_stack_get(text_slot),
-        pyre_object::gc_roots::shadow_stack_get(category_slot),
-    ]);
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::gc_roots::shadow_stack_get(text_slot));
+    fields.push(pyre_object::gc_roots::shadow_stack_get(category_slot));
+    let key = w_tuple_new(fields.take());
     let key_slot = pin_root_slot(key);
     already_warned(
         pyre_object::gc_roots::shadow_stack_get(registry_slot),
@@ -745,11 +745,11 @@ pub(crate) fn do_warn_explicit(
     let text_slot = pin_root_slot(text);
     let message_slot = pin_root_slot(message);
     let category_slot = pin_root_slot(category);
-    let key = w_tuple_new(vec![
-        pyre_object::gc_roots::shadow_stack_get(text_slot),
-        pyre_object::gc_roots::shadow_stack_get(category_slot),
-        w_int_new(lineno),
-    ]);
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::gc_roots::shadow_stack_get(text_slot));
+    fields.push(pyre_object::gc_roots::shadow_stack_get(category_slot));
+    fields.push(w_int_new(lineno));
+    let key = w_tuple_new(fields.take());
     let key_slot = pin_root_slot(key);
     let registry = pyre_object::gc_roots::shadow_stack_get(registry_slot);
     let has_registry = !registry.is_null() && unsafe { !is_none(registry) };

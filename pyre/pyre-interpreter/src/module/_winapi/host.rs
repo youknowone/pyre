@@ -709,16 +709,13 @@ pub fn PeekNamedPipe(
     )?;
     let peeked = host_winapi::peek_named_pipe(pipe, (size != 0).then_some(size))
         .map_err(super::win32_err)?;
-    let available = w_int_new(i64::from(peeked.available));
-    let left = w_int_new(i64::from(peeked.left_this_message));
-    Ok(match peeked.data {
-        Some(data) => w_tuple_new(vec![
-            pyre_object::bytesobject::w_bytes_from_bytes(&data),
-            available,
-            left,
-        ]),
-        None => w_tuple_new(vec![available, left]),
-    })
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    if let Some(data) = peeked.data {
+        fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&data));
+    }
+    fields.push(w_int_new(i64::from(peeked.available)));
+    fields.push(w_int_new(i64::from(peeked.left_this_message)));
+    Ok(w_tuple_new(fields.take()))
 }
 
 // ── file mappings ──
