@@ -1938,18 +1938,19 @@ impl DescrSlot {
             return;
         }
         if is_thin_fwd_box(w) {
-            // Recording only: promote to DescrWords so stamp has a home.
-            let p = unsafe { Box::from_raw(box_payload(w) as *mut ThinFwd) };
+            if stamp == 0 {
+                return;
+            }
+            // Keep the ThinFwd box; wrap it in ThinStamp (16 B) instead
+            // of promoting to a 24 B DescrWords + DescrFwd.
             unsafe {
                 *self.word.get() = 0;
             }
-            let (lo, hi) = thin_to_lo_hi(p.thin);
-            let boxed = Box::into_raw(Box::new(DescrWords { lo, hi, stamp }));
+            let boxed = Box::into_raw(Box::new(ThinStamp { inner: w, stamp }));
+            debug_assert_eq!(boxed as usize & 7, 0);
+            debug_assert_eq!(boxed as usize & !THIN_DESCR_PTR_MASK, 0);
             unsafe {
-                *self.word.get() = boxed as usize | SLOT_BOX_BIT;
-            }
-            if p.forwarded != 0 {
-                self.set_packed_forwarded(p.forwarded);
+                *self.word.get() = boxed as usize | SLOT_STAMP_BOX_BIT;
             }
             return;
         }
@@ -5226,6 +5227,26 @@ mod tests {
         op.forwarded().set(crate::forwarding::Forwarded::None);
         assert!(op.has_descr());
         assert!(op.getdescr().is_some());
+    }
+
+    #[test]
+    fn descr_forwarded_and_stamp_roundtrip_together() {
+        let descr = crate::make_loop_target_descr(2, false);
+        let op = Op::with_descr(OpCode::Label, &[], descr);
+        op.forwarded()
+            .set(crate::forwarding::Forwarded::from_const_value(
+                crate::value::Value::Int(3),
+            ));
+        op.set_value(crate::value::Value::Int(9));
+        assert!(op.has_descr());
+        assert_eq!(
+            op.forwarded().borrow().const_value(),
+            Some(crate::value::Value::Int(3))
+        );
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(9)));
+        op.set_value(crate::value::Value::Int(11));
+        assert!(op.has_descr());
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(11)));
     }
 
     #[test]
