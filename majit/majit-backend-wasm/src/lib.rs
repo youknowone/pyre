@@ -6070,9 +6070,19 @@ impl majit_backend::Backend for WasmBackend {
                 // virtualizable token is an independent edge to this JITFRAME;
                 // its lazy force may arrive after the execution root is gone.
                 install_post_finish_force_gcmap(jf);
+                // Main's `remember_and_drop_execution_frame` writes the
+                // barrier then drops.  Keep the JITFRAME rooted across
+                // `boxed()` so `jf_savedata` forwards, and apply the
+                // barrier now; the drop is after `seed_savedata_from_jf`.
+                wasm_jit_write_barrier(jf as i64);
                 let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+                // `boxed` registers the copied Ref slots and may collect.
+                // Keep the JITFRAME on the shadow stack across that call so
+                // `jf_savedata` is forwarded, then publish the updated
+                // address before dropping the frame root.
+                let jf = majit_gc::shadow_stack::peek_jf(saved).0 as *mut JitFrame;
                 data.seed_savedata_from_jf(jf);
-                remember_and_drop_execution_frame(jf, saved);
+                majit_gc::shadow_stack::pop_jf_to(saved);
                 return DeadFrame::Boxed(data);
             }
 
@@ -6145,9 +6155,18 @@ impl majit_backend::Backend for WasmBackend {
             let raw_values: Vec<i64> = (0..num_outputs)
                 .map(|i| exit_arg_word(items as usize, &fail_descr, i))
                 .collect();
-            let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
-            data.seed_savedata_from_jf(jf);
+            let savedata = GcRef(unsafe { (*jf).jf_savedata });
+            let savedata_root = if savedata.is_null() {
+                None
+            } else {
+                Some(majit_gc::shadow_stack::push(savedata))
+            };
             drop(backing);
+            let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+            data.set_savedata(savedata_root.map_or(GcRef(0), majit_gc::shadow_stack::get));
+            if let Some(root) = savedata_root {
+                majit_gc::shadow_stack::pop_to(root);
+            }
             DeadFrame::Boxed(data)
         }
     }
