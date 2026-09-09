@@ -2761,12 +2761,19 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
             if is_plain_int1(value) {
                 // ll_append (rtyper/rlist.py): length = ll_length();
                 // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
+                // The #171 append fold walks this capacity `goto_if_not`
+                // (`specialize.rs orthodox_list_append_recognize`) and lowers
+                // the `list.int_*` oopspecs; always calling
+                // `ll_list_int_resize_ge` is a residual the fold declines,
+                // so the compiled loop residual-calls every integer append.
                 let item = plain_int_w(value);
                 let length = ll_list_int_length(list);
-                ll_list_int_resize_ge(obj, length + 1);
-                let obj = current_gc_ref(obj);
-                let list = &mut *(obj as *mut W_ListObject);
-                ll_list_int_setitem_fast(list, length, item);
+                if length < ll_list_int_capacity(list) {
+                    ll_list_int_set_len(list, length + 1);
+                    ll_list_int_setitem_fast(list, length, item);
+                } else {
+                    list.int_items.push(item);
+                }
             } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
                 let obj = current_gc_ref(obj);
                 let value = current_gc_ref(value);
