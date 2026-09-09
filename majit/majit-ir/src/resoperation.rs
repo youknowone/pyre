@@ -1496,17 +1496,16 @@ fn unpack_stamp(stamp: u32) -> Option<crate::value::Value> {
     }
 }
 
-/// Inline operand capacity. `GC_STORE` is four args (`ptr`, `ofs`,
-/// `value`, `size`); `SmallVec<[; 3]>` heap-grows 64 B on every SETFIELD
-/// lowering. Four slots stay inside `Op` only if `descr` / `forwarded`
-/// drop their `RefCell` borrow flags (RPython writes those fields on
-/// the shared ResOp with no extra word).
+/// Inline operand capacity. Two `Operand`s are 16 B so `Op` is 32 B
+/// and `Rc<Op>` leaves the 64-byte class. Recorded SETFIELD / GETFIELD
+/// / INT_* are 1–2 args; rewrite `GC_STORE` (four args) heap-grows 32 B
+/// instead of keeping a fourth slot on every op.
 pub type OpArgVec = SmallVec<[Operand; 4]>;
 
-const ARG_INLINE: usize = 4;
+const ARG_INLINE: usize = 2;
 
-/// Packed `N_aryOp._args`. Four `Operand`s are 64 B; the length lives on
-/// [`Op::arg_len`] so `ArgSlot` stays 64 B and `Op` can be 112 B.
+/// Packed `N_aryOp._args`. Two `Operand`s are 16 B; the length lives on
+/// [`Op::arg_len`]. Three-or-more args heap-grow.
 #[repr(C)]
 struct ArgHeap {
     ptr: *mut Operand,
@@ -1533,8 +1532,8 @@ fn pop_arg_len() -> u8 {
     ARG_LEN_STACK.with(|s| s.borrow_mut().pop().unwrap_or(0))
 }
 
-/// `N_aryOp._args` slot. Length is [`Op`]'s `arg_len`; this is only the
-/// four-operand union. `UnsafeCell` matches RPython's unrestricted
+/// `N_aryOp._args` slot. Length is [`Op`]'s `arg_len`; this is the
+/// two-operand union. `UnsafeCell` matches RPython's unrestricted
 /// `op._args[i] = ...` on a shared ResOp.
 pub struct ArgSlot(std::cell::UnsafeCell<ArgData>);
 
@@ -2862,7 +2861,7 @@ impl Op {
     }
 
     /// `_forwarded` view. The packed word lives on [`DescrSlot`] so `Op`
-    /// stays in 48 B.
+    /// stays in 32 B.
     pub fn forwarded(&self) -> ForwardedView<'_> {
         ForwardedView { slot: &self.descr }
     }
@@ -5177,8 +5176,8 @@ mod tests {
             let op = std::mem::size_of::<Op>();
             let rc_box = op + 2 * std::mem::size_of::<usize>();
             assert!(
-                op <= 48,
-                "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 80-byte class"
+                op <= 32,
+                "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 64-byte class"
             );
             let extra = std::mem::size_of::<GuardExtra>();
             assert!(
@@ -5186,8 +5185,8 @@ mod tests {
                 "GuardExtra grew to {extra} bytes; keep Box<GuardExtra> out of the 56-byte class"
             );
             assert!(
-                std::mem::size_of::<ArgSlot>() <= 32,
-                "ArgSlot grew; four inline operands must stay in 32 B"
+                std::mem::size_of::<ArgSlot>() <= 16,
+                "ArgSlot grew; two inline operands must stay in 16 B"
             );
             assert!(
                 std::mem::size_of::<ForwardedSlot>() <= 8,
