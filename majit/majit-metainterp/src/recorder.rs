@@ -828,7 +828,7 @@ impl Trace {
                 if let Some(d) = slot.descr.clone() {
                     op.setdescr(d);
                 }
-                op.rd_resume_position.set(slot.resume.get());
+                op.set_rd_resume_position(slot.resume.get());
                 if let Some(ref types) = slot.fail_arg_types {
                     op.set_fail_arg_types(types.clone());
                 }
@@ -1111,7 +1111,7 @@ impl Trace {
             return;
         }
         if let Some(op) = self.ops.last() {
-            op.rd_resume_position.set(snapshot_id);
+            op.set_rd_resume_position(snapshot_id);
         }
     }
 
@@ -1157,7 +1157,7 @@ impl Trace {
             .filter(|op| op.opcode.is_guard())
             .nth(from_end)
         {
-            op.rd_resume_position.set(snapshot_id);
+            op.set_rd_resume_position(snapshot_id);
         }
     }
 
@@ -1553,7 +1553,7 @@ impl Trace {
                     arg.walk_const_ptr_refs(visitor);
                 }
             }
-            if let Some(fail_args) = op.getfailargs() {
+            if let Some(fail_args) = op.guard_fail_args() {
                 for arg in fail_args.iter() {
                     if !is_pooled_const_ptr(arg) {
                         arg.walk_const_ptr_refs(visitor);
@@ -1965,7 +1965,7 @@ mod tests {
         assert_eq!(ops[0].pos.get(), i2);
         assert_eq!(ops[1].opcode, OpCode::GuardTrue);
         assert_eq!(ops[1].pos.get(), g0);
-        assert_eq!(ops[1].rd_resume_position.get(), 7);
+        assert_eq!(ops[1].rd_resume_position(), 7);
         assert_eq!(ops[2].opcode, OpCode::Jump);
     }
 
@@ -2088,7 +2088,7 @@ mod tests {
             Some(&[OpRef::const_ptr(GcRef(0x2000))][..])
         );
         rec.materialize_into_ops();
-        let fail = rec.ops()[1].getfailargs().expect("guard fail_args");
+        let fail = rec.ops()[1].guard_fail_args().expect("guard fail_args");
         assert_eq!(fail[0].to_opref(), OpRef::const_ptr(GcRef(0x2000)));
     }
 
@@ -2275,7 +2275,7 @@ mod tests {
         let guard_op = &trace.ops[1]; // after IntAdd
         assert_eq!(guard_op.pos.get(), guard);
         assert!(guard_op.opcode.is_guard());
-        let fail_args = guard_op.getfailargs().unwrap();
+        let fail_args = guard_op.guard_fail_args().unwrap();
         assert_eq!(fail_args.len(), 3);
         assert_eq!(fail_args[0].to_opref(), i0);
         assert_eq!(fail_args[1].to_opref(), i1);
@@ -2307,13 +2307,13 @@ mod tests {
         assert_eq!(guards[1].opcode, OpCode::GuardFalse);
 
         // First guard's fail_args
-        let fa0 = guards[0].getfailargs().unwrap();
+        let fa0 = guards[0].guard_fail_args().unwrap();
         assert_eq!(fa0.len(), 2);
         assert_eq!(fa0[0].to_opref(), i0);
         assert_eq!(fa0[1].to_opref(), i1);
 
         // Second guard's fail_args
-        let fa1 = guards[1].getfailargs().unwrap();
+        let fa1 = guards[1].guard_fail_args().unwrap();
         assert_eq!(fa1.len(), 2);
         assert_eq!(fa1[0].to_opref(), i0);
         assert_eq!(fa1[1].to_opref(), add);
@@ -2492,7 +2492,7 @@ mod tests {
         rec.close_loop(&[i0]);
         let trace = rec.get_trace();
         let guard = &trace.ops[0];
-        let fail_args = guard.getfailargs().unwrap();
+        let fail_args = guard.guard_fail_args().unwrap();
         assert!(fail_args.is_empty());
     }
 
@@ -2657,7 +2657,7 @@ mod tests {
         // Find the guard
         let guard_op = trace.iter_guards().next().unwrap();
         assert_eq!(guard_op.pos.get(), guard);
-        let fa = guard_op.getfailargs().unwrap();
+        let fa = guard_op.guard_fail_args().unwrap();
         assert_eq!(fa.len(), 13);
 
         // Verify all fail_args match what we specified

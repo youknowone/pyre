@@ -463,7 +463,7 @@ pub fn compute_vars_longevity<T: AsRef<Op>>(
 
         // regalloc.py:1202-1208 guard failargs
         if opnum.is_guard()
-            && let Some(fail_args) = op.getfailargs()
+            && let Some(fail_args) = op.guard_fail_args()
         {
             for arg in fail_args.iter() {
                 if arg.is_none() {
@@ -2346,7 +2346,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py locs_for_fail
     pub fn locs_for_fail(&mut self, guard_op: &Op) -> Vec<Option<Loc>> {
-        let fail_args = match guard_op.getfailargs() {
+        let fail_args = match guard_op.guard_fail_args() {
             Some(fa) => fa,
             None => return Vec::new(),
         };
@@ -2468,7 +2468,7 @@ impl<'a> RegAlloc<'a> {
                 self.possibly_free_var(arg, tp);
             }
         }
-        if let Some(fail_args) = op.getfailargs() {
+        if let Some(fail_args) = op.guard_fail_args() {
             for arg in fail_args.iter() {
                 if !arg.is_constant() && !arg.is_none() {
                     let arg = arg.to_opref();
@@ -3724,7 +3724,7 @@ impl<'a> RegAlloc<'a> {
         // the correct semantics: a constant fail-arg can never alias a
         // body op result.
         if opnum != OpCode::CondCallN {
-            if let Some(fail_args) = next_op.getfailargs()
+            if let Some(fail_args) = next_op.guard_fail_args()
                 && fail_args.iter().any(|a| a.to_opref() == result)
             {
                 return false;
@@ -4057,12 +4057,14 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py `consider_guard_not_forced_2`.
     fn consider_guard_not_forced_2(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let fail_args: Vec<OpRef> = op
-            .getfailargs()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|arg| !arg.is_none())
-            .map(|arg| arg.to_opref())
-            .collect();
+            .guard_fail_args()
+            .map(|fa| {
+                fa.iter()
+                    .filter(|arg| !arg.is_none())
+                    .map(|arg| arg.to_opref())
+                    .collect()
+            })
+            .unwrap_or_default();
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,

@@ -3763,7 +3763,7 @@ mod tests {
         // overwrites guard.fail_args with the numbered liveboxes.
         seed_guard_snapshots_with(ops, |guard| {
             guard
-                .getfailargs()
+                .guard_fail_args()
                 .map(|fail_args| fail_args.iter().map(|a| a.to_opref()).collect())
                 .unwrap_or_default()
         })
@@ -7086,7 +7086,7 @@ mod tests {
         // resume.py parity: liveboxes_from_env contains TAGBOX entries
         // for the virtual's field values; the virtual itself is encoded via
         // TAGVIRTUAL into rd_virtuals (no slot in liveboxes).
-        let fa = guard_op.getfailargs().unwrap();
+        let fa = guard_op.guard_fail_args().unwrap();
         assert!(
             fa.iter().all(|a| !a.is_none()),
             "RPython liveboxes are TAGBOX-only; got {:?}",
@@ -7172,7 +7172,7 @@ mod tests {
         );
 
         // resume.py parity: liveboxes is TAGBOX-only.
-        let fa = guard_op.getfailargs().unwrap();
+        let fa = guard_op.guard_fail_args().unwrap();
         assert!(
             fa.iter().all(|a| !a.is_none()),
             "RPython liveboxes are TAGBOX-only; got {:?}",
@@ -7229,7 +7229,7 @@ mod tests {
             .expect("guard should be emitted");
 
         // No virtuals — fail_args should remain as-is with concrete values.
-        let fa = guard_op.getfailargs().unwrap();
+        let fa = guard_op.guard_fail_args().unwrap();
         assert!(
             fa.iter().all(|a| !a.is_none()),
             "no virtuals => all fail_args should be concrete"
@@ -7292,7 +7292,7 @@ mod tests {
             "guard should have rd_numb (compact resume numbering)"
         );
         // resume.py parity: liveboxes is TAGBOX-only.
-        let fa = guard_op.getfailargs().unwrap();
+        let fa = guard_op.guard_fail_args().unwrap();
         assert!(
             fa.iter().all(|a| !a.is_none()),
             "RPython liveboxes are TAGBOX-only; got {:?}",
@@ -7369,7 +7369,7 @@ mod tests {
         );
 
         // resume.py parity: liveboxes is TAGBOX-only.
-        let fa = guard_op.getfailargs().unwrap();
+        let fa = guard_op.guard_fail_args().unwrap();
         assert!(
             fa.iter().all(|a| !a.is_none()),
             "RPython liveboxes are TAGBOX-only; got {:?}",
@@ -7473,7 +7473,7 @@ mod tests {
         );
 
         // Liveboxes are TAGBOX-only — only the leaf int OpRef::int_op(40) survives.
-        let fa = guard_op.getfailargs().unwrap();
+        let fa = guard_op.guard_fail_args().unwrap();
         assert!(
             fa.iter().all(|a| !a.is_none()),
             "RPython liveboxes are TAGBOX-only; got {:?}",
@@ -7634,7 +7634,7 @@ mod tests {
             0,
             "nested virtual array item should remain virtual; got {result:?}"
         );
-        let failargs = guard_op.getfailargs().unwrap();
+        let failargs = guard_op.guard_fail_args().unwrap();
         assert!(
             failargs
                 .iter()

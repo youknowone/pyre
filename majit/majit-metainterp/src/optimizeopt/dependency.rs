@@ -647,7 +647,7 @@ impl DependencyGraph {
             return;
         }
         // dependency.py: fail_args dependencies — iterate ALL redefinitions
-        if let Some(fail_args) = op.getfailargs() {
+        if let Some(fail_args) = op.guard_fail_args() {
             let fa = fail_args.to_vec();
             for arg in &fa {
                 if arg.is_none() {

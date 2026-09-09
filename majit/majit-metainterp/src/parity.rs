@@ -62,7 +62,7 @@ fn render_op(op: &Op, constants: &IndexMap<u32, i64>, vars: &mut VarRenumbering)
         format!("v{} = {:?}({args})", vars.id_for(op.pos.get()), op.opcode)
     };
 
-    if let Some(fail_args) = op.getfailargs() {
+    if let Some(fail_args) = op.guard_fail_args() {
         let fail_args = fail_args
             .iter()
             .map(|arg| render_arg(arg.to_opref(), constants, vars))

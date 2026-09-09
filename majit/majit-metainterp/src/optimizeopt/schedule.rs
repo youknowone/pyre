@@ -501,8 +501,7 @@ impl VecScheduleState {
             }
         }
         // Also rebind any guard fail_args carried position-only.
-        if let Some(fa) = op.getfailargs() {
-            let mut rebound = fa.clone();
+        if let Some(mut rebound) = op.getfailargs() {
             let mut changed = false;
             for slot in rebound.iter_mut() {
                 let r = slot.to_opref();
@@ -858,7 +857,7 @@ pub fn prepare_fail_arguments(
     if !first_op.opcode.is_guard() {
         return;
     }
-    if let Some(fail_args) = first_op.getfailargs() {
+    if let Some(fail_args) = first_op.guard_fail_args() {
         let mut new_fail_args: smallvec::SmallVec<[Operand; 3]> =
             fail_args.iter().cloned().collect();
         for slot in new_fail_args.iter_mut() {

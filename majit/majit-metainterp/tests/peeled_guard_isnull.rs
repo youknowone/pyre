@@ -34,7 +34,7 @@ fn peeled_integer_loop_drops_the_loop_invariant_null_guard() {
     let null_arg = Operand::from_bound_inputarg(&null);
 
     let is_null = positioned(OpCode::GuardIsnull, std::slice::from_ref(&null_arg), 3);
-    is_null.rd_resume_position.set(0);
+    is_null.set_rd_resume_position(0);
     let less_than = std::rc::Rc::new(positioned(
         OpCode::IntLt,
         &[
@@ -44,7 +44,7 @@ fn peeled_integer_loop_drops_the_loop_invariant_null_guard() {
         4,
     ));
     let in_range = positioned(OpCode::GuardTrue, &[Operand::from_bound_op(&less_than)], 5);
-    in_range.rd_resume_position.set(1);
+    in_range.set_rd_resume_position(1);
     let next_acc = std::rc::Rc::new(positioned(OpCode::IntAdd, &[acc_arg, index_arg.clone()], 6));
     let next_index = std::rc::Rc::new(positioned(
         OpCode::IntAdd,

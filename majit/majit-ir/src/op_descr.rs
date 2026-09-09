@@ -246,7 +246,9 @@ impl Op {
     /// wrapped; callers no longer hold a borrow across other `Op`
     /// accesses.
     pub fn get_fail_arg_types(&self) -> Option<Vec<crate::value::Type>> {
-        self.try_guard_extra_mut()
+        // Immutable extra borrow: callers often hold `guard_fail_args()`
+        // (also an extra borrow) while reading types.
+        self.try_guard_extra()
             .and_then(|g| g.fail_arg_types.clone())
     }
 

@@ -344,7 +344,7 @@ fn lower_op(op: &Op) -> LirOp {
             kind: guard_kind(opcode),
             args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
             fail_args: op
-                .getfailargs()
+                .guard_fail_args()
                 .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
                 .unwrap_or_default(),
         },
@@ -358,7 +358,7 @@ fn lower_op(op: &Op) -> LirOp {
             dst: result_ref(op),
             args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
             fail_args: op
-                .getfailargs()
+                .guard_fail_args()
                 .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
                 .unwrap_or_default(),
         },

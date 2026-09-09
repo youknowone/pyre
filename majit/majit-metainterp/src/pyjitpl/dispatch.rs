@@ -13455,7 +13455,7 @@ mod tests {
             .rev()
             .find(|op| op.opcode == OpCode::GuardValue)
             .expect("a non-constant vable array index must promote");
-        let resume = guard.rd_resume_position.get();
+        let resume = guard.rd_resume_position();
         assert!(
             resume >= 0,
             "the promote guard must carry a resume position",
@@ -13553,7 +13553,7 @@ mod tests {
         // `UNSTAMPED_JITCODE_INDEX` until the dispatch layer re-stamps it, and
         // resume decoding sizes the frame from that coordinate.
         for (i, guard) in guards.iter().enumerate() {
-            let resume = guard.rd_resume_position.get();
+            let resume = guard.rd_resume_position();
             assert!(
                 resume >= 0,
                 "guard {i} ({:?}) was left without a resume position",
@@ -13591,7 +13591,7 @@ mod tests {
             .ops()
             .iter()
             .filter(|op| op.opcode.is_guard())
-            .map(|op| op.rd_resume_position.get())
+            .map(|op| op.rd_resume_position())
             .collect();
         assert_eq!(guards, vec![5, 7]);
         // Past the end is a no-op, not a panic or a mis-stamp.
@@ -13600,7 +13600,7 @@ mod tests {
             .ops()
             .iter()
             .filter(|op| op.opcode.is_guard())
-            .map(|op| op.rd_resume_position.get())
+            .map(|op| op.rd_resume_position())
             .collect();
         assert_eq!(guards, vec![5, 7]);
     }
@@ -14493,7 +14493,7 @@ mod tests {
         );
         assert_eq!(guards[0].opcode, OpCode::GuardException);
         assert_eq!(
-            guards[0].rd_resume_position.get(),
+            guards[0].rd_resume_position(),
             0,
             "GuardException should carry the captured snapshot id",
         );
@@ -15944,7 +15944,7 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardFalse)
             .expect("BC_GOTO_IF_NOT_INT_LT must record a GuardFalse op");
         assert_eq!(
-            guard.rd_resume_position.get(),
+            guard.rd_resume_position(),
             0,
             "guard's rd_resume_position must point at the captured snapshot",
         );
@@ -15997,7 +15997,7 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardFalse)
             .expect("guard recorded");
         assert_eq!(
-            guard.rd_resume_position.get(),
+            guard.rd_resume_position(),
             0,
             "non-state-field guard must carry its frame snapshot",
         );

@@ -1172,7 +1172,7 @@ impl UnrollOptimizer {
                 exported_state.end_args.len(),
                 p1_patchguardop
                     .as_ref()
-                    .map(|p| p.rd_resume_position.get())
+                    .map(|p| p.rd_resume_position())
                     .unwrap_or(-99),
             );
         }
@@ -1506,7 +1506,7 @@ impl UnrollOptimizer {
             for op in &p2_ops {
                 if op.opcode.is_guard() {
                     let rd_numb_len = op.resolved_rd_numb().map(|s| s.len()).unwrap_or(0);
-                    if let Some(fa) = op.getfailargs() {
+                    if let Some(fa) = op.guard_fail_args() {
                         let fa_raw: Vec<String> = fa
                             .iter()
                             .map(|a| format!("OpRef::from_raw({})", a.to_opref().raw()))
@@ -1515,7 +1515,7 @@ impl UnrollOptimizer {
                             "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=[{}]",
                             op.opcode,
                             op.pos.get(),
-                            op.rd_resume_position.get(),
+                            op.rd_resume_position(),
                             rd_numb_len,
                             fa_raw.join(", ")
                         );
@@ -1524,7 +1524,7 @@ impl UnrollOptimizer {
                             "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=<none>",
                             op.opcode,
                             op.pos.get(),
-                            op.rd_resume_position.get(),
+                            op.rd_resume_position(),
                             rd_numb_len,
                         );
                     }
@@ -1695,16 +1695,11 @@ impl UnrollOptimizer {
                         if op.opcode == OpCode::Jump {
                             continue;
                         }
-                        let arg_list = op.getarglist_copy();
-                        let arg_iter = arg_list
-                            .iter()
-                            .map(|a| a.to_opref())
-                            .chain(op.getfailargs().into_iter().flatten().map(|a| a.to_opref()));
-                        for arg in arg_iter {
+                        let mut consider_arg = |arg: OpRef| {
                             if !is_trace_runtime_ref(arg, &consts_p2)
                                 || visited_force.contains(&arg)
                             {
-                                continue;
+                                return;
                             }
                             visited_force.insert(arg);
                             let resolved = final_ctx.get_replacement_opref(arg);
@@ -1721,12 +1716,16 @@ impl UnrollOptimizer {
                                 };
                                 let source = final_ctx.force_op_from_preamble_op(&preamble_op);
                                 let _ = opt_p2.force_box(source, &mut final_ctx);
-                                continue;
+                                return;
                             }
                             if needs_force {
                                 let _ = opt_p2.force_box(arg, &mut final_ctx);
                             }
+                        };
+                        for a in op.getarglist().iter() {
+                            consider_arg(a.to_opref());
                         }
+                        op.visit_failarg_oprefs(&mut consider_arg);
                     }
                 }
                 let rebuilt = final_ctx.build_imported_short_preamble();
@@ -2824,8 +2823,8 @@ impl ExportedState {
             for arg in op.getarglist().iter() {
                 visit(arg.to_opref());
             }
-            if let Some(fail_args) = op.getfailargs() {
-                for arg in fail_args {
+            if let Some(fail_args) = op.guard_fail_args() {
+                for arg in fail_args.iter() {
                     visit(arg.to_opref());
                 }
             }
@@ -3906,7 +3905,7 @@ impl OptUnroll {
                         force_boxes,
                     )
                 });
-                let rd_resume_position = patch.rd_resume_position.get();
+                let rd_resume_position = patch.rd_resume_position();
                 for mut guard_op in emitted {
                     if crate::log_jtet_enabled() {
                         let arg_values: Vec<_> = guard_op
@@ -3938,7 +3937,7 @@ impl OptUnroll {
                     // GUARD_TRUE/GUARD_VALUE pairs; only the latter inherit
                     // resume metadata. Mirror the type filter via `is_guard()`.
                     if guard_op.opcode.is_guard() {
-                        guard_op.rd_resume_position.set(rd_resume_position);
+                        guard_op.set_rd_resume_position(rd_resume_position);
                         guard_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
                     }
                     // unroll.py:338 lets send_extra_operation raise InvalidLoop
@@ -4462,10 +4461,7 @@ impl OptUnroll {
                     // one. Decline the inlining instead, exactly as the unmapped
                     // -arg arm above does: the caller falls back to
                     // jump_to_preamble and the trace still compiles.
-                    let Some(patch_pos) = ctx
-                        .patchguardop
-                        .as_ref()
-                        .map(|p| p.rd_resume_position.get())
+                    let Some(patch_pos) = ctx.patchguardop.as_ref().map(|p| p.rd_resume_position())
                     else {
                         if crate::optimizeopt::majit_log_enabled() {
                             eprintln!(
@@ -4479,7 +4475,7 @@ impl OptUnroll {
                         );
                         return Vec::new();
                     };
-                    new_op.rd_resume_position.set(patch_pos);
+                    new_op.set_rd_resume_position(patch_pos);
                     // history.py/268/314 — Const values ride inline
                     // on the OpRef (ConstInt/ConstFloat/
                     // ConstPtr). No pool replay needed.
@@ -5588,7 +5584,7 @@ fn assemble_peeled_trace_with_jump_args(
                 max_pos = max_pos.max(arg.to_opref().raw().saturating_add(1));
             }
         }
-        if let Some(fa) = op.getfailargs() {
+        if let Some(fa) = op.guard_fail_args() {
             for arg in fa.iter() {
                 if is_trace_runtime_ref(arg.to_opref(), constants) {
                     max_pos = max_pos.max(arg.to_opref().raw().saturating_add(1));
@@ -5644,20 +5640,15 @@ fn assemble_peeled_trace_with_jump_args(
             if op.opcode == OpCode::Jump {
                 continue;
             }
-            let op_args = op.getarglist_copy();
-            let all_refs = op_args
-                .iter()
-                .map(|a| a.to_opref())
-                .chain(op.getfailargs().into_iter().flatten().map(|b| b.to_opref()));
-            for arg in all_refs {
+            let mut consider_arg = |arg: OpRef| {
                 if !is_trace_runtime_ref(arg, constants) {
-                    continue; // skip NONE and constants
+                    return; // skip NONE and constants
                 }
                 if label_set.contains(&arg)
                     || carried_source_slots.contains(&arg)
                     || seen_body_defs.contains(&arg)
                 {
-                    continue;
+                    return;
                 }
                 // Folded ConstPtr: define the reminted index in the
                 // preamble rather than carrying it on the header.
@@ -5682,7 +5673,11 @@ fn assemble_peeled_trace_with_jump_args(
                 full_label_args.push(arg);
                 appended_label_args.push(arg);
                 label_set.insert(arg);
+            };
+            for a in op.getarglist().iter() {
+                consider_arg(a.to_opref());
             }
+            op.visit_failarg_oprefs(&mut consider_arg);
             if op.result_type() != Type::Void && !op.pos.get().is_none() {
                 seen_body_defs.insert(op.pos.get());
             }
@@ -5892,13 +5887,7 @@ fn assemble_peeled_trace_with_jump_args(
                 .filter(|arg| !arg.is_none())
                 .collect();
             for later_op in p2_ops.iter().skip(op_idx + 1) {
-                for arg in later_op.getarglist().iter().map(|a| a.to_opref()).chain(
-                    later_op
-                        .getfailargs()
-                        .into_iter()
-                        .flatten()
-                        .map(|b| b.to_opref()),
-                ) {
+                let mut consider_arg = |arg: OpRef| {
                     // unroll.py `_map_args` passes Const through unchanged
                     // — inline-Const args (history.py/268/314) carry their
                     // value on the OpRef itself, so they are never label-args.
@@ -5911,7 +5900,7 @@ fn assemble_peeled_trace_with_jump_args(
                         || extra_inner_set.contains(&arg)
                         || seen_after_label_defs.contains(&arg)
                     {
-                        continue;
+                        return;
                     }
                     // optimizer.py freezes op args at emit time;
                     // walking ctx.get_box_replacement here would follow Const
@@ -5925,7 +5914,11 @@ fn assemble_peeled_trace_with_jump_args(
                         extra_inner_set.insert(arg);
                         extra_inner_sources.push(arg);
                     }
+                };
+                for a in later_op.getarglist().iter() {
+                    consider_arg(a.to_opref());
                 }
+                later_op.visit_failarg_oprefs(&mut consider_arg);
                 if later_op.result_type() != Type::Void && !later_op.pos.get().is_none() {
                     seen_after_label_defs.insert(later_op.pos.get());
                 }
@@ -6097,13 +6090,7 @@ fn assemble_peeled_trace_with_jump_args(
                 .iter()
                 .map(|a| a.to_opref())
                 .collect();
-            for arg in new_op.getarglist().iter().map(|a| a.to_opref()).chain(
-                new_op
-                    .getfailargs()
-                    .into_iter()
-                    .flatten()
-                    .map(|b| b.to_opref()),
-            ) {
+            let mut consider_arg = |arg: OpRef| {
                 // unroll.py `_map_args` passes Const through; inline-Const
                 // (history.py:227/268/314) carries its value on the OpRef and
                 // is never an inner-label-extension candidate. Short-circuit
@@ -6115,10 +6102,14 @@ fn assemble_peeled_trace_with_jump_args(
                     || label_args.contains(&arg)
                     || extra_live_args.contains(&arg)
                 {
-                    continue;
+                    return;
                 }
                 extra_live_args.push(arg);
+            };
+            for a in new_op.getarglist().iter() {
+                consider_arg(a.to_opref());
             }
+            new_op.visit_failarg_oprefs(&mut consider_arg);
             if !extra_live_args.is_empty() {
                 let existing: indexmap::IndexSet<OpRef> = result[label_idx]
                     .getarglist()
@@ -6420,7 +6411,7 @@ fn clone_guard_snapshot_remapped(
     guard: &mut Op,
     ref_map: &indexmap::IndexMap<OpRef, OpRef>,
 ) {
-    let old_pos = guard.rd_resume_position.get();
+    let old_pos = guard.rd_resume_position();
     if old_pos < 0 {
         return;
     }
@@ -6458,7 +6449,7 @@ fn clone_guard_snapshot_remapped(
     if let Some(frame_sizes) = snapshot_get(&ctx.snapshot_frame_sizes, old_pos).cloned() {
         snapshot_insert(&mut ctx.snapshot_frame_sizes, new_pos, frame_sizes);
     }
-    guard.rd_resume_position.set(new_pos);
+    guard.set_rd_resume_position(new_pos);
 }
 
 impl Default for OptUnroll {
@@ -6632,7 +6623,7 @@ mod tests {
             // snapshot so remapping can verify the TraceIterator cache
             // semantics that RPython gets from opencoder.py.
             guard
-                .getfailargs()
+                .guard_fail_args()
                 .map(|fail_args| fail_args.iter().map(|a| a.to_opref()).collect())
                 .unwrap_or_default()
         });
@@ -7169,7 +7160,7 @@ mod tests {
         assert_eq!(peeled_guard.opcode, OpCode::GuardTrue);
         let peeled_add_pos = result[0].pos.get();
         assert_eq!(
-            peeled_guard.getfailargs().unwrap()[0].to_opref(),
+            peeled_guard.guard_fail_args().unwrap()[0].to_opref(),
             peeled_add_pos,
             "peeled guard's fail_args should reference peeled add"
         );
@@ -7179,7 +7170,7 @@ mod tests {
         assert_eq!(body_guard.opcode, OpCode::GuardTrue);
         let body_add_pos = result[3].pos.get();
         assert_eq!(
-            body_guard.getfailargs().unwrap()[0].to_opref(),
+            body_guard.guard_fail_args().unwrap()[0].to_opref(),
             body_add_pos,
             "body guard's fail_args should reference body add"
         );
@@ -9204,7 +9195,7 @@ mod tests {
         );
         assert_eq!(
             combined[1]
-                .getfailargs()
+                .guard_fail_args()
                 .expect("guard fail args")
                 .iter()
                 .map(|a| a.to_opref())
@@ -9690,7 +9681,7 @@ mod tests {
         // A guard carrying the PREAMBLE trace's resume coordinate.
         let mut guard = Op::new(OpCode::GuardTrue, &[short_input_operand]);
         guard.pos.set(OpRef::void_op(13));
-        guard.rd_resume_position.set(4242);
+        guard.set_rd_resume_position(4242);
 
         let mut short_preamble = ShortPreamble::empty();
         short_preamble.inputargs = vec![short_input];

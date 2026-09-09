@@ -1544,7 +1544,7 @@ impl VectorizingOptimizer {
         // returns the bound Operand on a hit (Some) and None on a miss; the miss
         // arm keeps `orig`'s live-producer Operand. No `from_opref`, so no
         // position-only fabrication / panic on a live producer.
-        if let Some(fail_args) = copied_op.getfailargs() {
+        if let Some(fail_args) = copied_op.guard_fail_args() {
             let renamed: smallvec::SmallVec<[Operand; 3]> = fail_args
                 .iter()
                 .map(|orig| {
@@ -2361,8 +2361,7 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
     if !op.opcode.is_guard() {
         return;
     }
-    if let Some(fa) = op.getfailargs() {
-        let mut new_fa = fa.clone();
+    if let Some(mut new_fa) = op.getfailargs() {
         for (fi, arg) in new_fa.iter_mut().enumerate() {
             if arg.is_none() {
                 continue;
@@ -2688,7 +2687,7 @@ mod tests {
             .expect("mark_guard must attach a loop-version descr");
         assert!(descr.is_loop_version());
         let failargs = vloop.operations[0]
-            .getfailargs()
+            .guard_fail_args()
             .expect("mark_guard must attach label failargs");
         assert_eq!(failargs.len(), 2);
         assert_eq!(failargs[0].to_opref(), OpRef::input_arg_int(0));

@@ -4508,7 +4508,7 @@ impl<'a> AssemblerARM64<'a> {
                 fail_index,
                 op_index,
                 op.opcode,
-                op.getfailargs(),
+                op.guard_fail_args(),
                 descr_fd.fail_arg_types(),
                 faillocs
             );
@@ -5265,7 +5265,7 @@ impl<'a> AssemblerARM64<'a> {
             // op.fail_arg_types only for sharing-path guards
             // (optimizeopt/mod.rs) where op.descr=None.
             let dt = fd.fail_arg_types();
-            let expected_len = op.getfailargs().map(|fa| fa.len()).unwrap_or(0);
+            let expected_len = op.guard_fail_args().map(|fa| fa.len()).unwrap_or(0);
             if dt.len() == expected_len && !dt.is_empty() {
                 return dt.to_vec();
             }
@@ -5274,7 +5274,7 @@ impl<'a> AssemblerARM64<'a> {
             let expected_len = if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
                 op.num_args()
             } else {
-                op.getfailargs().map(|fa| fa.len()).unwrap_or(0)
+                op.guard_fail_args().map(|fa| fa.len()).unwrap_or(0)
             };
             if ts.len() == expected_len {
                 ts.to_vec()
@@ -5293,7 +5293,7 @@ impl<'a> AssemblerARM64<'a> {
                             })
                     })
                     .collect()
-            } else if let Some(fa) = op.getfailargs() {
+            } else if let Some(fa) = op.guard_fail_args() {
                 fa.iter()
                     .map(|opref| {
                         if opref.is_none() {
@@ -5347,7 +5347,7 @@ impl<'a> AssemblerARM64<'a> {
                         })
                 })
                 .collect()
-        } else if let Some(fa) = op.getfailargs() {
+        } else if let Some(fa) = op.guard_fail_args() {
             fa.iter()
                 .map(|opref| {
                     if opref.is_none() {

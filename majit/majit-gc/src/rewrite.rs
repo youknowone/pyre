@@ -1236,7 +1236,7 @@ impl GcRewriterImpl {
         if !matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardFalse) {
             return;
         }
-        let fail_args = match op.getfailargs() {
+        let fail_args = match op.guard_fail_args() {
             Some(fa) if !fa.is_empty() => fa,
             _ => return,
         };
@@ -3239,8 +3239,8 @@ impl GcRewriterImpl {
         if let Some(d) = op.getdescr() {
             call_asm.setdescr(d);
         }
-        if let Some(fa) = op.getfailargs() {
-            call_asm.setfailargs(fa);
+        if let Some(fa) = op.guard_fail_args() {
+            call_asm.setfailargs(fa.iter().cloned().collect());
             if let Some(slot) = call_asm.fail_args_mut() {
                 for a in slot.iter_mut() {
                     *a = st.resolve(a.clone());
@@ -3284,7 +3284,7 @@ impl GcRewriterImpl {
                 (0..op.num_args()).any(|k| {
                     let a = op.arg(k);
                     a.same_box(&class_ref) || a.same_box(&value_ref)
-                }) || op.getfailargs().is_some_and(|fa| {
+                }) || op.guard_fail_args().is_some_and(|fa| {
                     fa.iter()
                         .any(|a| a.same_box(&class_ref) || a.same_box(&value_ref))
                 })
@@ -3371,8 +3371,8 @@ impl GcRewriter for GcRewriterImpl {
             for arg in op.getarglist() {
                 reserve_later_box(arg.to_opref());
             }
-            if let Some(fail_args) = op.getfailargs() {
-                for arg in fail_args {
+            if let Some(fail_args) = op.guard_fail_args() {
+                for arg in fail_args.iter() {
                     reserve_later_box(arg.to_opref());
                 }
             }
@@ -5270,7 +5270,7 @@ mod tests {
         // at the position where OpRef::ref_op(2) (the IntLt result) used to appear.
         let same_pos = result[same_idx].pos.get();
         let guard_fa = result[guard_idx]
-            .getfailargs()
+            .guard_fail_args()
             .expect("guard keeps failargs");
         assert_eq!(
             guard_fa.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
@@ -5347,7 +5347,7 @@ mod tests {
             0,
             "SAME_AS_I uses ConstInt(0) per rewrite.py:421",
         );
-        let gv_fa = gv.getfailargs().expect("GuardValue inherits failargs");
+        let gv_fa = gv.guard_fail_args().expect("GuardValue inherits failargs");
         assert_eq!(
             gv_fa.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
             vec![OpRef::int_op(10), OpRef::int_op(11)]

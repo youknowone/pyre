@@ -680,7 +680,7 @@ impl TreeLoop {
                     return false;
                 }
                 // history.py:588-591: fail_args validation
-                if let Some(fa) = op.getfailargs() {
+                if let Some(fa) = op.guard_fail_args() {
                     for arg in fa.iter() {
                         if arg.is_none() {
                             continue;
@@ -961,7 +961,7 @@ impl TreeLoop {
             Some(extra)
         };
         for op in cut_ops {
-            let snapshot_id = op.rd_resume_position.get();
+            let snapshot_id = op.rd_resume_position();
             if snapshot_id < 0 {
                 continue;
             }
@@ -1405,7 +1405,7 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
-        let fa = guards[0].getfailargs().unwrap();
+        let fa = guards[0].guard_fail_args().unwrap();
         assert_eq!(fa.len(), 2);
         assert_eq!(fa[0].to_opref(), OpRef::input_arg_int(0));
         assert_eq!(fa[1].to_opref(), OpRef::input_arg_int(1));
@@ -1512,8 +1512,8 @@ mod tests {
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 2);
 
-        assert_eq!(guards[0].getfailargs().unwrap().len(), 1);
-        assert_eq!(guards[1].getfailargs().unwrap().len(), 2);
+        assert_eq!(guards[0].guard_fail_args().unwrap().len(), 1);
+        assert_eq!(guards[1].guard_fail_args().unwrap().len(), 2);
     }
 
     #[test]
@@ -1677,7 +1677,7 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let guard = trace.iter_guards().next().unwrap();
-        let fa = guard.getfailargs().unwrap();
+        let fa = guard.guard_fail_args().unwrap();
         // All referenced OpRefs are valid: 0, 1 are inputargs; 2 is the add op
         assert!(fa.iter().all(|r| r.to_opref().raw() <= 2));
         assert_eq!(fa.len(), 3);
@@ -1708,9 +1708,9 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 3);
-        assert_eq!(guards[0].getfailargs().unwrap().len(), 0);
-        assert_eq!(guards[1].getfailargs().unwrap().len(), 1);
-        assert_eq!(guards[2].getfailargs().unwrap().len(), 3);
+        assert_eq!(guards[0].guard_fail_args().unwrap().len(), 0);
+        assert_eq!(guards[1].guard_fail_args().unwrap().len(), 1);
+        assert_eq!(guards[2].guard_fail_args().unwrap().len(), 3);
     }
 
     #[test]
@@ -2189,7 +2189,7 @@ mod tests {
         // guard_true(v0) — after the cut, resuming through snapshot 0.
         let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         op1.pos.set(vop(3));
-        op1.rd_resume_position.set(0);
+        op1.set_rd_resume_position(0);
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
         op2.pos.set(vop(4));
@@ -2232,7 +2232,7 @@ mod tests {
         ops.push(op0);
         let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         op1.pos.set(vop(2));
-        op1.rd_resume_position.set(0);
+        op1.set_rd_resume_position(0);
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
         op2.pos.set(vop(3));
@@ -2274,7 +2274,7 @@ mod tests {
         ops.push(op0);
         let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         op1.pos.set(vop(3));
-        op1.rd_resume_position.set(0);
+        op1.set_rd_resume_position(0);
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
         op2.pos.set(vop(4));
@@ -2320,7 +2320,7 @@ mod tests {
         op2.pos.set(vop(3));
         let mut op3 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
         op3.pos.set(vop(4));
-        op3.rd_resume_position.set(0);
+        op3.set_rd_resume_position(0);
         let mut op4 = Op::new(OpCode::Jump, &[iarg_box(0)]);
         op4.pos.set(vop(5));
         let snapshots = vec![snapshot_with_frame_boxes(vec![
@@ -2376,7 +2376,7 @@ mod tests {
             });
             let mut op3 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
             op3.pos.set(vop(4));
-            op3.rd_resume_position.set(0);
+            op3.set_rd_resume_position(0);
             let mut op4 = Op::new(OpCode::Jump, &[iarg_box(0)]);
             op4.pos.set(vop(5));
             let snapshots = vec![snapshot_with_frame_boxes(vec![
@@ -2423,7 +2423,7 @@ mod tests {
             op0.pos.set(OpRef::ref_op(1));
             let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
             op1.pos.set(vop(2));
-            op1.rd_resume_position.set(0);
+            op1.set_rd_resume_position(0);
             let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
             op2.pos.set(vop(3));
             let snapshots = vec![snapshot_with_frame_boxes(vec![
@@ -2508,7 +2508,7 @@ mod tests {
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
 
-        let fail_args = guards[0].getfailargs().unwrap();
+        let fail_args = guards[0].guard_fail_args().unwrap();
         assert_eq!(fail_args.len(), 2);
         assert_eq!(fail_args[0].to_opref(), i0);
         assert_eq!(fail_args[1].to_opref(), i1);

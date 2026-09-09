@@ -328,18 +328,19 @@ where
         // (the encoder's monotonic op-result counter); here the equivalent
         // is the maximum raw position seen in `trace[start..end]` plus one.
         let num_inputargs = inputarg_types.len();
-        let max_pos = trace[start..end]
-            .iter()
-            .map(std::borrow::Borrow::borrow)
-            .flat_map(|op| {
-                std::iter::once(op.pos.get())
-                    .chain(op.getarglist_copy().into_iter().map(|a| a.to_opref()))
-                    .chain(op.getfailargs().into_iter().flatten().map(|a| a.to_opref()))
-            })
-            .filter(|opref| !opref.is_none() && !opref.is_constant())
-            .map(|opref| opref.raw())
-            .max()
-            .unwrap_or(0);
+        let mut max_pos = 0u32;
+        let mut consider = |opref: majit_ir::OpRef| {
+            if !opref.is_none() && !opref.is_constant() {
+                max_pos = max_pos.max(opref.raw());
+            }
+        };
+        for op in trace[start..end].iter().map(std::borrow::Borrow::borrow) {
+            consider(op.pos.get());
+            for a in op.getarglist().iter() {
+                consider(a.to_opref());
+            }
+            op.visit_failarg_oprefs(&mut consider);
+        }
         let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
         let mut _cache: Vec<Option<Operand>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
@@ -962,7 +963,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             Some(d) => majit_ir::Op::with_descr(opcode, &args, d),
             None => majit_ir::Op::new(opcode, &args),
         };
-        op.rd_resume_position.set(rd_resume_position);
+        op.set_rd_resume_position(rd_resume_position);
         // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
         // the ResOp class is intrinsically typed via the IntOp/FloatOp/
         // RefOp mixin (resoperation.py) or the AbstractResOp
@@ -3377,7 +3378,7 @@ mod tests {
         assert_eq!(r1.arg(1).to_opref(), iarg(10));
         let r2 = iter.next().unwrap();
         assert_eq!(r2.arg(0).to_opref(), iop(11));
-        let fa = r2.getfailargs().unwrap();
+        let fa = r2.guard_fail_args().unwrap();
         assert_eq!(fa[0].to_opref(), iarg(10));
         assert_eq!(fa[1].to_opref(), iop(11));
     }
@@ -3754,7 +3755,7 @@ mod tests {
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::GuardTrue);
         assert!(!op.has_descr()); // guards do NOT carry a resolved descr
-        assert_eq!(op.rd_resume_position.get(), 7); // opencoder.py:423 parity
+        assert_eq!(op.rd_resume_position(), 7); // opencoder.py setup_resume_point parity
     }
 
     /// M4 step 3: non-guard descr-bearing opcode routes through the
@@ -3787,7 +3788,7 @@ mod tests {
         assert_eq!(op.opcode, OpCode::GetfieldGcI);
         let resolved = op.getdescr().expect("descr must resolve");
         assert_eq!(resolved.index(), 99);
-        assert_eq!(op.rd_resume_position.get(), -1); // non-guard sentinel
+        assert_eq!(op.rd_resume_position(), -1); // non-guard sentinel
     }
 
     /// M4 step 3: non-guard descr-bearing opcode with `descr_index == 0`
@@ -3804,7 +3805,7 @@ mod tests {
         let op = it.next().expect("one op");
         assert_eq!(op.opcode, OpCode::GetfieldGcI);
         assert!(!op.has_descr());
-        assert_eq!(op.rd_resume_position.get(), -1);
+        assert_eq!(op.rd_resume_position(), -1);
     }
 
     // ── SnapshotIterator::get / unpack_array parity tests ──

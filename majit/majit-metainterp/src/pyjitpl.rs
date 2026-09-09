@@ -1134,17 +1134,19 @@ fn prepare_bridge_trace_from_owned(
     }
     #[cfg(feature = "jit-audits")]
     next_audit_prepare_generation();
-    let max_pos = bridge_ops
-        .iter()
-        .flat_map(|op| {
-            std::iter::once(op.pos.get())
-                .chain(op.getarglist_copy().into_iter().map(|a| a.to_opref()))
-                .chain(op.getfailargs().into_iter().flatten().map(|a| a.to_opref()))
-        })
-        .filter(|opref| !opref.is_none() && !opref.is_constant())
-        .map(|opref| opref.raw())
-        .max()
-        .unwrap_or(0);
+    let mut max_pos = 0u32;
+    let mut consider = |opref: majit_ir::OpRef| {
+        if !opref.is_none() && !opref.is_constant() {
+            max_pos = max_pos.max(opref.raw());
+        }
+    };
+    for op in bridge_ops.iter() {
+        consider(op.pos.get());
+        for a in op.getarglist().iter() {
+            consider(a.to_opref());
+        }
+        op.visit_failarg_oprefs(&mut consider);
+    }
     let cache_size = ((max_pos as usize) + 1).max(bridge_inputargs.len());
     let mut cache: Vec<Option<majit_ir::operand::Operand>> = vec![None; cache_size];
     let mut fresh = bridge_inputarg_base;
@@ -1509,7 +1511,7 @@ fn densify_root_loop_inputargs(
                 .map(&remap)
                 .collect::<smallvec::SmallVec<[_; 3]>>();
             let cloned = std::rc::Rc::new(op.copy_and_change(op.opcode, Some(&args), None));
-            if let Some(failargs) = op.getfailargs() {
+            if let Some(failargs) = op.guard_fail_args() {
                 cloned.setfailargs(failargs.iter().map(&remap).collect());
             }
             cloned
@@ -1736,8 +1738,8 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>>(inputargs: &[InputArg], ops
             for a in op.getarglist().iter() {
                 hw = hw.max(opref_high_water(a.to_opref()));
             }
-            if let Some(fa) = op.getfailargs() {
-                for a in fa {
+            if let Some(fa) = op.guard_fail_args() {
+                for a in fa.iter() {
                     hw = hw.max(opref_high_water(a.to_opref()));
                 }
             }
@@ -2778,7 +2780,7 @@ fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     for arg in op.args.borrow().iter() {
         arg.walk_const_ptr_refs(visitor);
     }
-    if let Some(fail_args) = op.getfailargs() {
+    if let Some(fail_args) = op.guard_fail_args() {
         for arg in fail_args.iter() {
             arg.walk_const_ptr_refs(visitor);
         }
@@ -8180,7 +8182,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated
-                    && let Some(fa) = op.getfailargs()
+                    && let Some(fa) = op.guard_fail_args()
                 {
                     let raw: Vec<String> = fa
                         .iter()
@@ -10781,7 +10783,7 @@ impl<M: Clone> MetaInterp<M> {
         // references). This ensures gcmap and adapt-live agree on which
         // slots are GC refs vs raw ints.
         for op in optimized_ops.iter().filter(|op| op.opcode.is_guard()) {
-            let Some(fail_args) = op.getfailargs() else {
+            let Some(fail_args) = op.guard_fail_args() else {
                 continue;
             };
             for fa in fail_args.iter() {
@@ -24727,7 +24729,7 @@ mod tests {
         });
 
         let ops = &meta.partial_trace.as_ref().unwrap().ops;
-        let fail_args = ops[0].getfailargs().expect("guard has fail_args");
+        let fail_args = ops[0].guard_fail_args().expect("guard has fail_args");
         assert_eq!(fail_args[0].to_opref().as_const_ptr(), Some(GcRef(0x8000)));
         // Non-Ref inline-Const slots untouched.
         assert_eq!(fail_args[1].to_opref(), OpRef::const_int(123));
@@ -25069,7 +25071,7 @@ mod tests {
         );
         assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(0));
         assert_eq!(
-            ops[0].getfailargs().unwrap()[0].to_opref(),
+            ops[0].guard_fail_args().unwrap()[0].to_opref(),
             OpRef::input_arg_ref(2)
         );
     }

@@ -2472,9 +2472,7 @@ impl OptHeap {
             let guard_arg = ctx.materialize_operand_at(cmp_pos);
             let guard_op = Op::new(OpCode::GuardTrue, &[guard_arg]);
             if let Some(ref patch) = ctx.patchguardop {
-                guard_op
-                    .rd_resume_position
-                    .set(patch.rd_resume_position.get());
+                guard_op.set_rd_resume_position(patch.rd_resume_position());
             }
             ctx.emit(guard_op);
             return OptimizationResult::Remove;

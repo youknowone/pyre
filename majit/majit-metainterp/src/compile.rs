@@ -650,7 +650,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 // No descr — synthetic test FINISH only.
                 op.getarglist().iter().map(finish_arg_type).collect()
             }
-        } else if let Some(fail_args) = op.getfailargs() {
+        } else if let Some(fail_args) = op.guard_fail_args() {
             // `store_final_boxes_in_guard` (resume.py:397) writes the
             // reduced liveboxes' types authoritatively. Prefer the descr's
             // fail_arg_types (single source of truth, matches RPython
@@ -789,7 +789,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
                 builder.push_frame(0, pc, -1);
                 let num_slots = op
-                    .getfailargs()
+                    .guard_fail_args()
                     .map(|fa| fa.len())
                     .unwrap_or(exit_types.len());
                 for slot_idx in 0..num_slots {
@@ -2015,18 +2015,22 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // compile.py keeps Box identities disjoint automatically; in the flat
     // OpRef model we must allocate above every runtime ref already reachable
     // from the trace so copied ops can stand in for `orig_op.set_forwarded(op)`.
-    let max_runtime_ref = ops
-        .iter()
-        .flat_map(|op| {
-            std::iter::once(op.pos.get())
-                .chain(op.getarglist_copy().into_iter().map(|b| b.to_opref()))
-                .chain(op.getfailargs().into_iter().flatten().map(|b| b.to_opref()))
-        })
-        .chain(expanded_inputargs.iter().map(|ia| ia.opref()))
-        .filter(|opref| !opref.is_none() && !opref.is_constant())
-        .map(|opref| opref.raw())
-        .max()
-        .unwrap_or(0);
+    let mut max_runtime_ref = 0u32;
+    let mut consider = |opref: majit_ir::OpRef| {
+        if !opref.is_none() && !opref.is_constant() {
+            max_runtime_ref = max_runtime_ref.max(opref.raw());
+        }
+    };
+    for op in ops.iter() {
+        consider(op.pos.get());
+        for b in op.getarglist().iter() {
+            consider(b.to_opref());
+        }
+        op.visit_failarg_oprefs(&mut consider);
+    }
+    for ia in expanded_inputargs.iter() {
+        consider(ia.opref());
+    }
     let mut next_opref = max_runtime_ref + 1;
 
     // Allocate fresh const indices above the existing max.

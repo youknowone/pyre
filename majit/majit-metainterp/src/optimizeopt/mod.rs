@@ -6310,13 +6310,13 @@ impl OptContext {
         // then simply unused and must not gate the test.
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
-        // `op.rd_resume_position.get() < 0`: see the same conjunct in
+        // `op.rd_resume_position() < 0`: see the same conjunct in
         // `Optimizer::emit_guard_operation` — a guard that owns a recorded
         // snapshot cannot inherit another's without replaying the recorded
         // bytecode range, and its committed side effects with it.
         let can_share = self.last_guard_idx.is_some()
             && !op.has_descr()
-            && op.rd_resume_position.get() < 0
+            && op.rd_resume_position() < 0
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
@@ -6353,16 +6353,15 @@ impl OptContext {
                 }
                 _ => crate::compile::make_resume_guard_copied_descr(donor_descr),
             });
-            // optimizer.py:722: guard_op.setfailargs(last_guard_op.getfailargs())
-            match self.new_operations[idx].getfailargs() {
+            // optimizer.py _copy_resume_data_from: guard_op.setfailargs(last_guard_op.getfailargs())
+            match self.new_operations[idx].guard_fail_args() {
                 Some(fa) => op.setfailargs(fa.iter().cloned().collect()),
                 None => op.clearfailargs(),
             }
             // The sharer resumes at the donor's snapshot, so it must carry the
             // donor's position too — its own recorded one is unused.  Mirrors
             // the Optimizer path's `_copy_resume_data_from`.
-            op.rd_resume_position
-                .set(self.new_operations[idx].rd_resume_position.get());
+            op.set_rd_resume_position(self.new_operations[idx].rd_resume_position());
             // bridgeopt.py parity: fail_arg_types carry the types the
             // serializer used when writing the class-knowledge bitfield in
             // rd_numb (memo.finish() uses numb_state.livebox_types). A
@@ -6390,8 +6389,10 @@ impl OptContext {
             // optimizer.py: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
             // handle tracked preamble ops, force virtuals.
-            if let Some(fa) = op.getfailargs() {
-                let fargs: Vec<OpRef> = fa.iter().map(|b| b.to_opref()).collect();
+            if let Some(fa) = op.guard_fail_args() {
+                let fargs: smallvec::SmallVec<[OpRef; 8]> =
+                    fa.iter().map(|b| b.to_opref()).collect();
+                drop(fa);
                 for farg in fargs {
                     if !farg.is_none() {
                         // regalloc.py:1206: Const objects skip forcing.
@@ -6608,7 +6609,7 @@ impl OptContext {
         // capture_resumedata (tracer guards) or patchguardop copy
         // (unroll.py:336/409). No fallback — the position is always set
         // before store_final_boxes_in_guard runs.
-        let resume_pos = op.rd_resume_position.get();
+        let resume_pos = op.rd_resume_position();
         let has_snapshot = snapshot_contains(&self.snapshot_boxes, resume_pos);
         // resume.py: `assert resume_position >= 0` —
         // RPython asserts the position is set before calling
@@ -6631,10 +6632,10 @@ impl OptContext {
             let fallback_pos = self
                 .patchguardop
                 .as_ref()
-                .map(|p| p.rd_resume_position.get())
+                .map(|p| p.rd_resume_position())
                 .filter(|&p| snapshot_contains(&self.snapshot_boxes, p));
             if let Some(fb_pos) = fallback_pos {
-                op.rd_resume_position.set(fb_pos);
+                op.set_rd_resume_position(fb_pos);
                 // resume.py _add_optimizer_sections: forward knowledge
                 // to the patchguardop snapshot so heap/class/loopinvariant
                 // sections are serialized into rd_numb. RPython's finish()
@@ -6656,7 +6657,7 @@ impl OptContext {
                  `assert resume_position >= 0` parity",
                 op.opcode,
                 op.pos.get(),
-                op.rd_resume_position.get()
+                op.rd_resume_position()
             );
         }
 
@@ -6664,16 +6665,16 @@ impl OptContext {
         // including guards with rd_virtuals. The snapshot uses original boxes
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
         // _number_virtuals then builds rd_virtuals from PtrInfo.
-        let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position.get())
+        let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position())
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position.get())
+        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position())
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position.get())
+        let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position())
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position.get())
+        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position())
             .map(Vec::as_slice)
             .unwrap_or_default();
 
@@ -6681,8 +6682,8 @@ impl OptContext {
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
-        let frame_sizes = snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position.get())
-            .map(Vec::as_slice);
+        let frame_sizes =
+            snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position()).map(Vec::as_slice);
 
         // Compare every snapshot cell's carried type with the type encoded by
         // its `OpRef` variant. `None` is an unclassified producer rather than
@@ -6739,7 +6740,7 @@ impl OptContext {
                 "[callee-rca][store-final-vable] op={:?} pos={:?} resume_pos={} vable={:?}",
                 op.opcode,
                 op.pos.get(),
-                op.rd_resume_position.get(),
+                op.rd_resume_position(),
                 vable_debug,
             );
         }
@@ -6850,7 +6851,7 @@ impl OptContext {
                  vable_items={:?} liveboxes={:?} livebox_types={:?} rd_consts={:?}",
                 op.opcode,
                 op.pos.get(),
-                op.rd_resume_position.get(),
+                op.rd_resume_position(),
                 vable_items,
                 liveboxes,
                 livebox_types,
@@ -6919,7 +6920,7 @@ impl OptContext {
                 "[callee-rca][store-final-operands] op={:?} pos={:?} resume_pos={} final_oprefs={:?}",
                 op.opcode,
                 op.pos.get(),
-                op.rd_resume_position.get(),
+                op.rd_resume_position(),
                 final_oprefs,
             );
         }
@@ -9120,10 +9121,10 @@ where
     let mut next_resume_pos = 0i32;
     for op in seeded.iter_mut().filter(|op| op.opcode.is_guard()) {
         let snapshot_boxes = snapshot_for_guard(op);
-        let resume_pos = if op.rd_resume_position.get() >= 0
-            && !snapshot_contains(&snapshots, op.rd_resume_position.get())
+        let resume_pos = if op.rd_resume_position() >= 0
+            && !snapshot_contains(&snapshots, op.rd_resume_position())
         {
-            op.rd_resume_position.get()
+            op.rd_resume_position()
         } else {
             while snapshot_contains(&snapshots, next_resume_pos) {
                 next_resume_pos += 1;
@@ -9132,7 +9133,7 @@ where
             next_resume_pos += 1;
             resume_pos
         };
-        op.rd_resume_position.set(resume_pos);
+        op.set_rd_resume_position(resume_pos);
         snapshot_insert(
             &mut snapshots,
             resume_pos,

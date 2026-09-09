@@ -262,7 +262,7 @@ impl CollectedShortPreambleBuilder {
                     }
                 }
                 let mut fail_arg_mapping = Vec::new();
-                if let Some(fail_args) = op.getfailargs() {
+                if let Some(fail_args) = op.guard_fail_args() {
                     for (fail_arg_pos, fail_arg_ref) in fail_args.iter().enumerate() {
                         if let Some(label_idx) = label_args
                             .iter()
@@ -1243,7 +1243,7 @@ impl CollectedExtendedShortPreambleBuilder {
                     }
                 }
                 let mut fail_arg_mapping = Vec::new();
-                if let Some(fail_args) = preamble_op.op.getfailargs() {
+                if let Some(fail_args) = preamble_op.op.guard_fail_args() {
                     for (fail_arg_pos, fail_arg_ref) in fail_args.iter().enumerate() {
                         if let Some(label_idx) = label_args
                             .iter()
@@ -2233,7 +2233,7 @@ fn build_short_preamble_struct_from_ops(
                 })
                 .collect();
             let fail_arg_mapping = op
-                .getfailargs()
+                .guard_fail_args()
                 .map(|fail_args| {
                     fail_args
                         .iter()
@@ -3402,11 +3402,17 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
                     .filter_map(|(pos, arg)| label_arg_idx(&arg.to_opref()).map(|idx| (pos, idx)))
                     .collect();
                 let ovf_fail_arg_mapping: Vec<(usize, usize)> = ovf_op
-                    .getfailargs()
-                    .into_iter()
-                    .flat_map(|fail_args| fail_args.into_iter().enumerate())
-                    .filter_map(|(pos, arg)| label_arg_idx(&arg.to_opref()).map(|idx| (pos, idx)))
-                    .collect();
+                    .guard_fail_args()
+                    .map(|fail_args| {
+                        fail_args
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(pos, arg)| {
+                                label_arg_idx(&arg.to_opref()).map(|idx| (pos, idx))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 if !ovf_arg_mapping.is_empty() || !ovf_fail_arg_mapping.is_empty() {
                     entries.push(ShortPreambleOp {
                         op: ovf_op.clone(),
@@ -3434,11 +3440,15 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
             .filter_map(|(pos, arg)| label_arg_idx(&arg.to_opref()).map(|idx| (pos, idx)))
             .collect();
         let fail_arg_mapping: Vec<(usize, usize)> = op
-            .getfailargs()
-            .into_iter()
-            .flat_map(|fail_args| fail_args.into_iter().enumerate())
-            .filter_map(|(pos, arg)| label_arg_idx(&arg.to_opref()).map(|idx| (pos, idx)))
-            .collect();
+            .guard_fail_args()
+            .map(|fail_args| {
+                fail_args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pos, arg)| label_arg_idx(&arg.to_opref()).map(|idx| (pos, idx)))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Only include ops that reference label args
         if (!arg_mapping.is_empty() || !fail_arg_mapping.is_empty())

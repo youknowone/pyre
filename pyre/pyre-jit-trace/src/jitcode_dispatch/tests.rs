@@ -2285,9 +2285,9 @@ fn drive_int_add_jump_if_ovf(
     let ops = tc.ops();
     let opcodes = ops.iter().map(|op| op.opcode).collect();
     let guard_num_args = ops[1].num_args();
-    let guard_has_snapshot = ops[1].rd_resume_position.get() >= 0;
+    let guard_has_snapshot = ops[1].rd_resume_position() >= 0;
     let guard_resume_pc = tc
-        .get_snapshot(ops[1].rd_resume_position.get())
+        .get_snapshot(ops[1].rd_resume_position())
         .expect("overflow guard snapshot must exist")
         .frames
         .last()
@@ -9552,7 +9552,7 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
     // (`optimizeopt/mod.rs`) finds attached resume data
     // instead of panicking on the `-1` sentinel.
     assert!(
-        guard_op.rd_resume_position.get() >= 0,
+        guard_op.rd_resume_position() >= 0,
         "GuardNoException must carry an attached snapshot (rd_resume_position >= 0) after capture_resumedata port",
     );
 }

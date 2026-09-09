@@ -293,9 +293,7 @@ impl Guard {
             Some(types) => guard_op.set_fail_arg_types(types.to_vec()),
             None => guard_op.clear_fail_arg_types(),
         }
-        guard_op
-            .rd_resume_position
-            .set(self.op.rd_resume_position.get());
+        guard_op.set_rd_resume_position(self.op.rd_resume_position());
         // guard.py: opt.emit_operation(guard)
         new_ops.push(guard_op.clone());
         Some(guard_op)
@@ -317,7 +315,7 @@ impl Guard {
     /// subtype tag).  Mirrors RPython's:
     ///   descr = myop.getdescr()
     ///   descr.copy_all_attributes_from(other.op.getdescr())
-    ///   `myop.setfailargs(otherop.getfailargs()[:])`
+    ///   `myop.setfailargs(otherop.guard_fail_args()[:])`
     /// where `descr` is the strengthened guard's *own* ResumeGuardDescr.
     pub fn inhert_attributes(&mut self, other: &Guard) {
         // guard.py:118
@@ -345,10 +343,9 @@ impl Guard {
         // myop.descr identity (`fail_index` / status / subtype tag).
         crate::compile::copy_all_attributes_from(&my_descr, &donor_descr);
         self.op
-            .rd_resume_position
-            .set(other.op.rd_resume_position.get());
-        // guard.py:123: myop.setfailargs(otherop.getfailargs()[:])
-        match other.op.getfailargs() {
+            .set_rd_resume_position(other.op.rd_resume_position());
+        // guard.py inhert_attributes: myop.setfailargs(otherop.getfailargs()[:])
+        match other.op.guard_fail_args() {
             Some(fa) => self.op.setfailargs(fa.iter().cloned().collect()),
             None => self.op.clearfailargs(),
         }
@@ -405,8 +402,8 @@ impl Guard {
         if let Some(d) = self.op.getdescr() {
             guard.setdescr(d);
         }
-        // guard.py:143: guard.setfailargs(self.op.getfailargs()[:])
-        match self.op.getfailargs() {
+        // guard.py emit_operations: guard.setfailargs(self.op.getfailargs()[:])
+        match self.op.guard_fail_args() {
             Some(fa) => guard.setfailargs(fa.iter().cloned().collect()),
             None => guard.clearfailargs(),
         }
@@ -414,9 +411,7 @@ impl Guard {
             Some(types) => guard.set_fail_arg_types(types.to_vec()),
             None => guard.clear_fail_arg_types(),
         }
-        guard
-            .rd_resume_position
-            .set(self.op.rd_resume_position.get());
+        guard.set_rd_resume_position(self.op.rd_resume_position());
         // compile.py _attrs_ on descr; Arc-clone above shares them.
         new_ops.push(guard.clone());
         // guard.py:145-147
@@ -859,7 +854,7 @@ mod tests {
         let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
         let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
         for (op, seed) in ops.iter().zip(seeded.iter()) {
-            op.rd_resume_position.set(seed.rd_resume_position.get());
+            op.set_rd_resume_position(seed.rd_resume_position());
         }
         opt.snapshot_boxes = snapshots;
         let result: Vec<Op> = opt
@@ -922,7 +917,7 @@ mod tests {
         let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
         let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
         for (op, seed) in ops.iter().zip(seeded.iter()) {
-            op.rd_resume_position.set(seed.rd_resume_position.get());
+            op.set_rd_resume_position(seed.rd_resume_position());
         }
         opt.snapshot_boxes = snapshots;
         let result: Vec<Op> = opt

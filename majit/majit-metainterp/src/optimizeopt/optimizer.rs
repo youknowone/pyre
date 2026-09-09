@@ -3938,8 +3938,8 @@ impl Optimizer {
                         );
                     }
                 }
-                if let Some(mut fail_args) = op.getfailargs() {
-                    for arg in fail_args.iter_mut() {
+                if let Some(fail_args) = op.guard_fail_args() {
+                    for arg in fail_args.iter() {
                         // Same rule as the args loop above: a bound failarg
                         // live-tracks its producer's already-remapped
                         // `op.pos`; re-remapping would double-map. Only
@@ -4043,7 +4043,7 @@ impl Optimizer {
                             "position-only exported-short-box arg remapped: {pre:?}"
                         );
                     }
-                    if let Some(fa) = entry.op.getfailargs() {
+                    if let Some(fa) = entry.op.guard_fail_args() {
                         for arg in fa.iter() {
                             // Bound failargs live-track the producer's
                             // already-remapped pos (same rule as the args
@@ -4240,7 +4240,7 @@ impl Optimizer {
         // filter below, so retarget runs only when patchguardop is gettable.
         let has_body_guard = ops
             .iter()
-            .any(|op| op.opcode.is_guard() && op.rd_resume_position.get() >= 0);
+            .any(|op| op.opcode.is_guard() && op.rd_resume_position() >= 0);
         let retarget_close_jump = ops.last().is_some_and(|op| op.opcode == OpCode::Jump)
             && inline_short_preamble
             && front_target_tokens.len() > 1
@@ -4295,8 +4295,8 @@ impl Optimizer {
         if self.patchguardop.is_none()
             && let Some(g) = ops
                 .iter()
-                .filter(|o| o.opcode.is_guard() && o.rd_resume_position.get() >= 0)
-                .max_by_key(|o| o.rd_resume_position.get())
+                .filter(|o| o.opcode.is_guard() && o.rd_resume_position() >= 0)
+                .max_by_key(|o| o.rd_resume_position())
         {
             self.patchguardop = Some((**g).clone());
         }
@@ -4893,8 +4893,8 @@ impl Optimizer {
                     debug_assert!(
                         !(current_op.opcode.is_guard()
                             && op.opcode.is_guard()
-                            && current_op.rd_resume_position.get() >= 0
-                            && op.rd_resume_position.get() < 0),
+                            && current_op.rd_resume_position() >= 0
+                            && op.rd_resume_position() < 0),
                         "Replace dropped rd_resume_position: {:?} -> {:?}",
                         current_op.opcode,
                         op.opcode,
@@ -4922,8 +4922,8 @@ impl Optimizer {
                     debug_assert!(
                         !(current_op.opcode.is_guard()
                             && op.opcode.is_guard()
-                            && current_op.rd_resume_position.get() >= 0
-                            && op.rd_resume_position.get() < 0),
+                            && current_op.rd_resume_position() >= 0
+                            && op.rd_resume_position() < 0),
                         "Restart dropped rd_resume_position: {:?} -> {:?}",
                         current_op.opcode,
                         op.opcode,
@@ -5348,7 +5348,7 @@ impl Optimizer {
         // (`assert copied_from_descr is None`).  They are never on the
         // sharing chain.  Mirrors the OptContext path in
         // `optimizeopt/mod.rs`'s `emit_guard_operation`.
-        // `op.rd_resume_position.get() < 0` is a pyre precondition with no
+        // `op.rd_resume_position() < 0` is a pyre precondition with no
         // upstream counterpart, and it is load-bearing.  Upstream shares
         // whenever `self._last_guard_op and guard_op.getdescr() is None`,
         // because a sharing guard resumes at the donor's position and the
@@ -5363,7 +5363,7 @@ impl Optimizer {
         // invented (no snapshot of its own, e.g. GUARD_NO_EXCEPTION after a
         // call — upstream's own motivating case) can safely inherit one.
         let shared = !op.has_descr()
-            && op.rd_resume_position.get() < 0
+            && op.rd_resume_position() < 0
             && self.last_guard_op_idx.is_some()
             && opcode != OpCode::GuardNotForced
             && opcode != OpCode::GuardNotForced2;
@@ -5453,7 +5453,7 @@ impl Optimizer {
             // as parameter. available_boxes filtering happens inside
             // memo.finish() using liveboxes ∩ liveboxes_from_env.
             let failarg_refs: Vec<OpRef> = op
-                .getfailargs()
+                .guard_fail_args()
                 .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
                 .unwrap_or_default();
             let knowledge_for_resume =
@@ -5471,7 +5471,8 @@ impl Optimizer {
             op = Self::store_final_boxes_in_guard(op, ctx, knowledge, pending_for_finish);
             // optimizer.py: force_box on each fail_arg for unrolling.
             if let Some(fa) = op.guard_fail_args() {
-                let fargs: Vec<OpRef> = fa.iter().map(|a| a.to_opref()).collect();
+                let fargs: smallvec::SmallVec<[OpRef; 8]> =
+                    fa.iter().map(|a| a.to_opref()).collect();
                 drop(fa);
                 for farg in fargs {
                     if !farg.is_none() {
@@ -5555,12 +5556,12 @@ impl Optimizer {
                 _ => crate::compile::make_resume_guard_copied_descr(last_descr.clone()),
             }
         });
-        // optimizer.py:722: guard_op.setfailargs(last_guard_op.getfailargs())
-        match last.getfailargs() {
+        // optimizer.py _copy_resume_data_from: guard_op.setfailargs(last_guard_op.getfailargs())
+        match last.guard_fail_args() {
             Some(fa) => op.setfailargs(fa.iter().cloned().collect()),
             None => op.clearfailargs(),
         }
-        op.rd_resume_position.set(last.rd_resume_position.get());
+        op.set_rd_resume_position(last.rd_resume_position());
         // bridgeopt.py parity: the class-knowledge bitfield baked into
         // rd_numb is indexed by the donor's per-livebox type layout.
         // `deserialize_optimizer_knowledge` reads that bitfield using the
@@ -5807,7 +5808,7 @@ impl Optimizer {
         if let Some(d) = op.getdescr() {
             newop.setdescr(d);
         }
-        match op.getfailargs() {
+        match op.guard_fail_args() {
             Some(fa) => newop.setfailargs(fa.iter().cloned().collect()),
             None => newop.clearfailargs(),
         }
@@ -5818,7 +5819,7 @@ impl Optimizer {
         // compile.py _attrs_ live on the descr; Arc-clone of
         // op.descr above shares the donor's RdPayload, so newop's
         // FailDescr::rd_* readers see the same data.
-        newop.rd_resume_position.set(op.rd_resume_position.get());
+        newop.set_rd_resume_position(op.rd_resume_position());
         newop
     }
 }
@@ -5944,7 +5945,7 @@ mod tests {
 
     /// `OpRc`-threading analogue of [`super::super::seed_empty_guard_snapshots`]
     /// for fixtures built with [`TraceBuilder`]: assigns each guard a fresh
-    /// resume position in place (`rd_resume_position` is a `Cell`, mutable
+    /// resume position in place (`set_rd_resume_position`, mutable
     /// behind the `Rc`) and inserts an empty active-frame snapshot, so the
     /// canonical producer `Rc<Op>` identity survives for the
     /// `optimize_with_constants_and_inputs_oprc` driver.
@@ -5960,10 +5961,10 @@ mod tests {
         let mut next_resume_pos = 0i32;
         for op in ops.iter().filter(|op| op.opcode.is_guard()) {
             let snapshot_boxes = snapshot_for_guard(op);
-            let resume_pos = if op.rd_resume_position.get() >= 0
-                && !crate::optimizeopt::snapshot_contains(&snapshots, op.rd_resume_position.get())
+            let resume_pos = if op.rd_resume_position() >= 0
+                && !crate::optimizeopt::snapshot_contains(&snapshots, op.rd_resume_position())
             {
-                op.rd_resume_position.get()
+                op.rd_resume_position()
             } else {
                 while crate::optimizeopt::snapshot_contains(&snapshots, next_resume_pos) {
                     next_resume_pos += 1;
@@ -5972,7 +5973,7 @@ mod tests {
                 next_resume_pos += 1;
                 resume_pos
             };
-            op.rd_resume_position.set(resume_pos);
+            op.set_rd_resume_position(resume_pos);
             crate::optimizeopt::snapshot_insert(
                 &mut snapshots,
                 resume_pos,
@@ -7291,7 +7292,9 @@ mod tests {
             guard.resolved_rd_virtuals().is_some(),
             "virtual structure should be encoded into rd_virtuals tree"
         );
-        let fail_args = guard.getfailargs().expect("guard should keep fail args");
+        let fail_args = guard
+            .guard_fail_args()
+            .expect("guard should keep fail args");
         // resume.py parity: liveboxes is TAGBOX-only.  The virtual
         // p0 is encoded into rd_virtuals; only its int field (OpRef::int_op(11))
         // survives in liveboxes.
