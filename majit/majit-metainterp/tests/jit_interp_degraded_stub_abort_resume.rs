@@ -5,6 +5,7 @@
 //! advance, so resuming at the following byte would decode an operand as a new
 //! opcode and produce a wrong result.
 
+use majit_metainterp::virt_array::VirtArray;
 use majit_metainterp::{Assembler, JitCode, JitDriver};
 
 pub type Bytecode = [u8];
@@ -33,7 +34,7 @@ fn bump_via_ptr(base: usize, idx: i64, by: i64) {
 }
 
 struct StubResumeState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
 }
 
 #[majit_macros::jit_interp(
@@ -49,7 +50,7 @@ fn dispatch_stub_resume(program: &Bytecode, threshold: u32, n: i64) -> i64 {
     let mut driver: JitDriver<StubResumeState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut state = StubResumeState {
-        regs: vec![0i64; 2],
+        regs: VirtArray::filled(0i64, 2),
     };
     state.regs[0] = n;
     {

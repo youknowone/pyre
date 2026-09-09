@@ -31,13 +31,14 @@ fn expected(limit: i64) -> i64 {
 mod fixed_array_before_virt_array {
     use super::{AtomicU32, Bytecode, OP_ACC, OP_INC, OP_JUMP_BACK, OP_RETURN, Ordering};
     use majit_metainterp::JitState as _;
+    use majit_metainterp::virt_array::VirtArray;
 
     static COMPILES: AtomicU32 = AtomicU32::new(0);
 
     struct FixedAndVirt {
         ret: i64,
         cells: Vec<i64>,
-        iregs: Vec<i64>,
+        iregs: VirtArray<i64>,
     }
 
     #[majit_macros::jit_interp(
@@ -61,7 +62,7 @@ mod fixed_array_before_virt_array {
         let mut state = FixedAndVirt {
             ret: 0,
             cells: vec![0i64, 0i64],
-            iregs: vec![0i64, limit, 0i64],
+            iregs: VirtArray::from_slice(&[0i64, limit, 0i64]),
         };
         {
             use majit_metainterp::JitState as _;
@@ -113,7 +114,7 @@ mod fixed_array_before_virt_array {
         let state = FixedAndVirt {
             ret: 0,
             cells: vec![0i64, 0i64],
-            iregs: vec![0i64, 4, 0i64],
+            iregs: VirtArray::from_slice(&[0i64, 4, 0i64]),
         };
         let program: &Bytecode = &super::count_program();
         let meta = state.build_meta(0, program);

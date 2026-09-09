@@ -27,12 +27,13 @@ fn expected(limit: i64) -> i64 {
 /// Control with two virtualizable arrays and no scalar preceding the identity.
 mod two_arrays_no_scalar {
     use super::{AtomicU32, Bytecode, OP_ACC, OP_INC, OP_JUMP_BACK, OP_RETURN, Ordering};
+    use majit_metainterp::virt_array::VirtArray;
 
     static COMPILES: AtomicU32 = AtomicU32::new(0);
 
     struct TwoArrays {
-        iregs: Vec<i64>,
-        fregs: Vec<f64>,
+        iregs: VirtArray<i64>,
+        fregs: VirtArray<f64>,
     }
 
     #[majit_macros::jit_interp(
@@ -53,8 +54,8 @@ mod two_arrays_no_scalar {
         });
         let mut pc: usize = 0;
         let mut state = TwoArrays {
-            iregs: vec![0i64, limit],
-            fregs: vec![0.0f64],
+            iregs: VirtArray::from_slice(&[0i64, limit]),
+            fregs: VirtArray::from_slice(&[0.0f64]),
         };
         {
             use majit_metainterp::JitState as _;
@@ -119,11 +120,12 @@ mod two_arrays_no_scalar {
 /// differs from a passing one in exactly one declaration.
 mod one_array_with_scalar {
     use super::{AtomicU32, Bytecode, OP_ACC, OP_INC, OP_JUMP_BACK, OP_RETURN, Ordering};
+    use majit_metainterp::virt_array::VirtArray;
 
     static COMPILES: AtomicU32 = AtomicU32::new(0);
 
     struct OneArrayScalar {
-        iregs: Vec<i64>,
+        iregs: VirtArray<i64>,
         acc: i64,
         ret: i64,
     }
@@ -147,7 +149,7 @@ mod one_array_with_scalar {
         });
         let mut pc: usize = 0;
         let mut state = OneArrayScalar {
-            iregs: vec![0i64, limit],
+            iregs: VirtArray::from_slice(&[0i64, limit]),
             acc: 0,
             ret: 0,
         };
@@ -215,12 +217,13 @@ mod one_array_with_scalar {
 /// `int` scalar instead of in element 0 of the int array.
 mod two_arrays_with_scalar {
     use super::{AtomicU32, Bytecode, OP_ACC, OP_INC, OP_JUMP_BACK, OP_RETURN, Ordering};
+    use majit_metainterp::virt_array::VirtArray;
 
     static COMPILES: AtomicU32 = AtomicU32::new(0);
 
     struct TwoArraysScalar {
-        iregs: Vec<i64>,
-        fregs: Vec<f64>,
+        iregs: VirtArray<i64>,
+        fregs: VirtArray<f64>,
         ret: i64,
     }
 
@@ -243,8 +246,8 @@ mod two_arrays_with_scalar {
         });
         let mut pc: usize = 0;
         let mut state = TwoArraysScalar {
-            iregs: vec![0i64, limit],
-            fregs: vec![0.0f64],
+            iregs: VirtArray::from_slice(&[0i64, limit]),
+            fregs: VirtArray::from_slice(&[0.0f64]),
             ret: 0,
         };
         {
@@ -316,12 +319,13 @@ mod two_arrays_with_scalar {
 /// leaves open, and separates "two arrays" from "two arrays of mixed types".
 mod two_int_arrays_with_scalar {
     use super::{AtomicU32, Bytecode, OP_ACC, OP_INC, OP_JUMP_BACK, OP_RETURN, Ordering};
+    use majit_metainterp::virt_array::VirtArray;
 
     static COMPILES: AtomicU32 = AtomicU32::new(0);
 
     struct TwoIntArraysScalar {
-        iregs: Vec<i64>,
-        aregs: Vec<i64>,
+        iregs: VirtArray<i64>,
+        aregs: VirtArray<i64>,
         ret: i64,
     }
 
@@ -344,8 +348,8 @@ mod two_int_arrays_with_scalar {
         });
         let mut pc: usize = 0;
         let mut state = TwoIntArraysScalar {
-            iregs: vec![0i64, limit],
-            aregs: vec![0i64],
+            iregs: VirtArray::from_slice(&[0i64, limit]),
+            aregs: VirtArray::from_slice(&[0i64]),
             ret: 0,
         };
         {
@@ -411,11 +415,12 @@ mod two_int_arrays_with_scalar {
 /// "flat slot 0 holds a passthrough scalar", it fails.
 mod one_array_dead_scalar {
     use super::{AtomicU32, Bytecode, OP_ACC, OP_INC, OP_JUMP_BACK, OP_RETURN, Ordering};
+    use majit_metainterp::virt_array::VirtArray;
 
     static COMPILES: AtomicU32 = AtomicU32::new(0);
 
     struct OneArrayDeadScalar {
-        iregs: Vec<i64>,
+        iregs: VirtArray<i64>,
         ret: i64,
     }
 
@@ -437,7 +442,7 @@ mod one_array_dead_scalar {
         });
         let mut pc: usize = 0;
         let mut state = OneArrayDeadScalar {
-            iregs: vec![0i64, limit, 0i64],
+            iregs: VirtArray::from_slice(&[0i64, limit, 0i64]),
             ret: 0,
         };
         {
@@ -503,13 +508,14 @@ mod one_array_dead_scalar {
 /// is the passthrough scalar at slot 0, it compiles.
 mod two_arrays_live_scalar {
     use super::{AtomicU32, Bytecode, OP_ACC, OP_INC, OP_JUMP_BACK, OP_RETURN, Ordering};
+    use majit_metainterp::virt_array::VirtArray;
 
     static COMPILES: AtomicU32 = AtomicU32::new(0);
 
     struct TwoArraysLiveScalar {
         acc: i64,
-        iregs: Vec<i64>,
-        fregs: Vec<f64>,
+        iregs: VirtArray<i64>,
+        fregs: VirtArray<f64>,
     }
 
     #[majit_macros::jit_interp(
@@ -532,8 +538,8 @@ mod two_arrays_live_scalar {
         let mut pc: usize = 0;
         let mut state = TwoArraysLiveScalar {
             acc: 0,
-            iregs: vec![0i64, limit],
-            fregs: vec![0.0f64],
+            iregs: VirtArray::from_slice(&[0i64, limit]),
+            fregs: VirtArray::from_slice(&[0.0f64]),
         };
         {
             use majit_metainterp::JitState as _;

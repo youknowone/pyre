@@ -65,7 +65,7 @@ const TLR_ALLOCATE: &str = "arm body writes a green this lowering path cannot \
                             carry back to the caller (lowering stopped at this \
                             statement; any further blockers follow): pc += 1; || \
                             arm body has a statement the lowerer cannot express: \
-                            state.regs = vec! [0; n];";
+                            state.regs = VirtArray :: filled(0, n);";
 
 /// `lower_stmt.rs`'s `lower_return_stmt` — the sibling guard to `break`/`continue`.
 const SRC_ENCLOSED_RETURN: &str =
@@ -232,7 +232,7 @@ fn an_accumulated_reason_reports_every_blocker() {
          longer matches the one the recorded string was minted with"
     );
     assert!(
-        TLR_ALLOCATE.contains("state.regs = vec! [0; n];"),
+        TLR_ALLOCATE.contains("state.regs = VirtArray :: filled(0, n);"),
         "the member behind the head must still name the reallocation — that \
          statement is the only thing this reason reports that nothing else does"
     );

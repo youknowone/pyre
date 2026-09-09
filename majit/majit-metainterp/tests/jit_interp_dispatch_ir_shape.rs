@@ -2775,6 +2775,7 @@ mod degraded_arm_is_named_at_install {
     use majit_metainterp::jitcode::insns::{
         BC_ABORT, BC_CONVERT_FLOAT_BYTES_TO_LONGLONG, BC_CONVERT_LONGLONG_BYTES_TO_FLOAT,
     };
+    use majit_metainterp::virt_array::VirtArray;
     use majit_metainterp::{Assembler, JitCode, JitDriver};
 
     const OP_ADD: u8 = 1;
@@ -2786,8 +2787,8 @@ mod degraded_arm_is_named_at_install {
     const OP_FREM_ASSIGN: u8 = 7;
 
     struct DegradedArmState {
-        regs: Vec<i64>,
-        fregs: Vec<f64>,
+        regs: VirtArray<i64>,
+        fregs: VirtArray<f64>,
     }
 
     #[majit_macros::jit_interp(
@@ -2804,8 +2805,8 @@ mod degraded_arm_is_named_at_install {
         let mut driver: JitDriver<DegradedArmState> = JitDriver::new(threshold);
         let mut pc: usize = 0;
         let mut state = DegradedArmState {
-            regs: vec![0i64; 4],
-            fregs: vec![0.0f64; 4],
+            regs: VirtArray::filled(0i64, 4),
+            fregs: VirtArray::filled(0.0f64, 4),
         };
         {
             use majit_metainterp::JitState as _;

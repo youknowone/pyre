@@ -73,6 +73,12 @@ fn compile(words: &[&str]) -> Vec<u8> {
 /// RPython tiny2_hotpath.py Stack. `_virtualizable_ = ['stackpos', 'stack[*]']`.
 struct Tiny2State {
     stackpos: i64,
+    // Observer/replay `jit_merge_point!()` — not the `; state` close.
+    // `VirtArray` registers DirectPointer and lets `compile.py` emit the
+    // GETFIELD_GC_R + GETARRAYITEM_GC_* entry reload; that compiled loop
+    // disagrees with the interpreter on fib. `Vec` keeps RustVec storage
+    // so the entry seeds boxes via `initialize_virtualizable` instead.
+    // This portal does not resume `getarrayitem_vable_*` in the blackhole.
     stack: Vec<i64>,
 }
 

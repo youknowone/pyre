@@ -3,6 +3,7 @@
 ///
 /// The program counter and bytecode are green inputs. Each tape contributes
 /// its pointer, length, and symbolic elements to the loop state.
+use majit_metainterp::virt_array::VirtArray;
 pub type Bytecode = [u8];
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -31,9 +32,9 @@ const DEFAULT_THRESHOLD: u32 = 3;
 
 struct DualState {
     pa: i64,
-    a: Vec<i64>,
+    a: VirtArray<i64>,
     pb: i64,
-    b: Vec<i64>,
+    b: VirtArray<i64>,
 }
 
 /// Uses split dispatch to exercise two virtualizable tapes and scalar tape
@@ -63,9 +64,9 @@ fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
     let mut pc: usize = 0;
     let mut state = DualState {
         pa: 0,
-        a: vec![0i64; TAPE_SIZE],
+        a: VirtArray::filled(0i64, TAPE_SIZE),
         pb: 0,
-        b: vec![0i64; TAPE_SIZE],
+        b: VirtArray::filled(0i64, TAPE_SIZE),
     };
 
     {

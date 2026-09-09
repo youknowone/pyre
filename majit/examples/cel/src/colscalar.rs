@@ -5,6 +5,7 @@
 //! the virtualizable identity makes the read-only variant fail loop closing.
 
 use crate::common::*;
+use majit_metainterp::virt_array::VirtArray;
 use std::sync::atomic::Ordering;
 
 const OP_LOAD: i64 = 0; // [LOAD, imm, dst]
@@ -16,7 +17,7 @@ const OP_COL_LOAD_SF: i64 = 5; // [COL_LOAD_SF, ea_reg, dst]  dst=*(col_base+reg
 const OP_SET_BASE: i64 = 6; // [SET_BASE, src_reg]  state.col_base = regs[src]
 
 struct VmState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
     col_base: i64,
     /// What `OP_RETURN` hands back.
     ///
@@ -50,7 +51,7 @@ fn mainloop(program: &Code, num_regs: usize, col_base: i64, threshold: u32) -> i
     let mut pc: usize = 0;
     let _stacksize: i32 = 0;
     let mut state = VmState {
-        regs: vec![0; num_regs],
+        regs: VirtArray::filled(0, num_regs),
         col_base,
         ret: 0,
     };
@@ -141,7 +142,7 @@ fn mainloop(program: &Code, num_regs: usize, col_base: i64, threshold: u32) -> i
 }
 
 fn clean_interp(program: &Code, num_regs: usize, col_base: i64) -> i64 {
-    let mut regs = vec![0i64; num_regs];
+    let mut regs = VirtArray::filled(0i64, num_regs);
     let mut base = col_base;
     let mut pc = 0usize;
     loop {

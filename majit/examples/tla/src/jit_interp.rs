@@ -13,6 +13,7 @@
 /// the greens is also what gives the merge point a green pc to report, which the
 /// `; state` close needs to name a resume position.
 use majit_metainterp::embed::Census;
+use majit_metainterp::virt_array::VirtArray;
 
 pub type Bytecode = [u8];
 
@@ -35,7 +36,7 @@ const STACK_SIZE: usize = 8;
 
 struct TlaState {
     stackpos: i64,
-    stack: Vec<i64>,
+    stack: VirtArray<i64>,
 }
 
 // ── Opcodes ──
@@ -72,7 +73,7 @@ pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
     let mut state = TlaState {
         stackpos: 1,
         stack: {
-            let mut s = vec![0i64; STACK_SIZE];
+            let mut s = VirtArray::filled(0i64, STACK_SIZE);
             s[0] = initial_value;
             s
         },

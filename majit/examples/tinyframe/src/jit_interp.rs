@@ -4,6 +4,7 @@
 /// Reds:   [regs]  (tracked via state_fields)
 use crate::interp::{ADD, JUMP_IF_ABOVE, LOAD, RETURN};
 use majit_metainterp::embed::Census;
+use majit_metainterp::virt_array::VirtArray;
 
 pub type Bytecode = [u8];
 
@@ -21,7 +22,7 @@ impl BytecodeExt for [u8] {
 }
 
 struct TinyFrameState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
     /// What `RETURN` hands back.
     ///
     /// The `; state` merge point leaves the loop through `break` before it
@@ -58,7 +59,7 @@ fn mainloop(
     let mut pc: usize = 0;
     let _stacksize: i32 = 0;
     let mut state = TinyFrameState {
-        regs: vec![0; num_regs],
+        regs: VirtArray::filled(0, num_regs),
         ret: 0,
     };
     for &(r, v) in init_regs {

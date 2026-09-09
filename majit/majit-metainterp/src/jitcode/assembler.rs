@@ -60,9 +60,9 @@ fn jitcode_may_force_effect_info() -> majit_ir::effectinfo::EffectInfo {
 /// `Int` does NOT follow the word.  It names the interpreter's integer
 /// *bank*, whose values are `i64` (`majit_ir::value::Type` doc), and the
 /// storage a descr describes is the source declaration, not the bank: a
-/// `jit_interp` `[int; virt]` array is backed by the caller's `Vec<i64>`
-/// (`majit/examples/spcount/src/main.rs`'s `StackState`) and an `int` struct
-/// field by an `i64` (`majit-metainterp/tests/jit_interp_inline_helper_typed_return.rs`'s
+/// `jit_interp` `[int; virt]` `VirtArray<i64>` stores `i64` items, and an
+/// `int` struct field is an `i64`
+/// (`majit-metainterp/tests/jit_interp_inline_helper_typed_return.rs`'s
 /// `InlineTypedNode`).
 /// Narrowing those to 4 on wasm32 strides past half of every item and
 /// truncates the value.  `Float` is `f64` on every target for the same
@@ -5678,13 +5678,21 @@ impl JitCodeBuilder {
         is_item_signed: bool,
     ) -> u16 {
         self.add_bh_descr(CanonicalBhDescr::Array {
-            base_size: std::mem::size_of::<usize>(),
+            // `Ptr(GcArray)` after `make_sure_not_resized`: length at 0,
+            // items at the payload offset. Ref items sit at the target
+            // word (`FixedObjectArray`). Int/float items sit at
+            // `VirtArray::<i64>::ITEMS_OFFSET` (element-aligned past the
+            // length word — 8 on every target, including wasm32).
+            base_size: match item_type {
+                majit_ir::value::Type::Ref => std::mem::size_of::<usize>(),
+                _ => crate::virt_array::VirtArray::<i64>::ITEMS_OFFSET,
+            },
             // A `[ref; virt]` array's runtime twin reads its item size from
             // `pyre_object::ITEMS_BLOCK_TOKEN`
             // (`pyre-jit-trace virtualizable_gen.rs`), which is
             // `size_of::<PyObjectRef>()`; a literal 8 makes the two descr
             // universes disagree on wasm32.  A `[int; virt]` array keeps 8 —
-            // it is backed by the caller's `Vec<i64>`, not by words.
+            // the interpreter integer bank is `i64` on every target.
             itemsize: scalar_size(item_type),
             len_offset: Some(0),
             type_id: 0,

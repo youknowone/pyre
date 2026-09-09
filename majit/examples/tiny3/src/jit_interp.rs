@@ -14,6 +14,7 @@
 //! The JIT traces the integer-only path. Float arithmetic falls back to the
 //! plain interpreter. This matches RPython's promote(y.__class__) strategy.
 
+use majit_metainterp::virt_array::VirtArray;
 // ── Bytecode opcodes ──
 
 const OP_PUSH_INT: u8 = 0; // followed by 8 bytes (i64 LE)
@@ -78,7 +79,7 @@ fn compile(words: &[&str]) -> Vec<u8> {
 
 struct Tiny3State {
     stackpos: i64,
-    stack: Vec<i64>,
+    stack: VirtArray<i64>,
 }
 
 pub type Bytecode = [u8];
@@ -123,7 +124,7 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
     let stacksize: i32 = 0;
     let mut state = Tiny3State {
         stackpos: num_args as i64,
-        stack: vec![0i64; program.len()],
+        stack: VirtArray::filled(0i64, program.len()),
     };
 
     // RPython warmspot.py:281-289 canonical-liveness install hook.

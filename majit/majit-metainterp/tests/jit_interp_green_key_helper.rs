@@ -18,6 +18,7 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use majit_metainterp::JitDriver;
+use majit_metainterp::virt_array::VirtArray;
 
 /// What the run's own probe answered, and how many loops it compiled.
 ///
@@ -39,7 +40,7 @@ const OP_END: u8 = 3;
 const LOOP_HEADER: usize = 0;
 
 struct GreenKeyState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
 }
 
 #[majit_macros::jit_interp(
@@ -55,7 +56,7 @@ fn dispatch_green_key(program: &Bytecode, threshold: u32) -> i64 {
     let mut driver: JitDriver<GreenKeyState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut state = GreenKeyState {
-        regs: vec![0i64; 1],
+        regs: VirtArray::filled(0i64, 1),
     };
     state.regs[0] = program[program.len() - 1] as i64;
     {

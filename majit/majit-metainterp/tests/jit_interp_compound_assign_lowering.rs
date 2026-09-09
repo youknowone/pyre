@@ -4,6 +4,7 @@
 //! The fixture varies compound assignment, computed indexing, and same-slot
 //! read-modify-write independently against a common control.
 
+use majit_metainterp::virt_array::VirtArray;
 use majit_metainterp::{Assembler, JitCode, JitDriver};
 
 pub type Bytecode = [u8];
@@ -15,7 +16,7 @@ const OP_PLAIN_COMPUTEDIDX: u8 = 4;
 const OP_COMPOUND_COMPUTEDIDX: u8 = 5;
 
 struct CompoundAssignState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
 }
 
 #[majit_macros::jit_interp(
@@ -31,7 +32,7 @@ fn dispatch_compound_assign(program: &Bytecode, threshold: u32) -> i64 {
     let mut driver: JitDriver<CompoundAssignState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut state = CompoundAssignState {
-        regs: vec![0i64; 4],
+        regs: VirtArray::filled(0i64, 4),
     };
     {
         use majit_metainterp::JitState as _;
@@ -97,13 +98,14 @@ fn install() -> JitCode {
 /// Two machines over the SAME state type still collide on `impl JitState`.
 mod float_control {
     use super::Bytecode;
+    use majit_metainterp::virt_array::VirtArray;
     use majit_metainterp::{Assembler, JitCode, JitDriver};
 
     const OP_FADD_ASSIGN: u8 = 1;
     const OP_FREM_ASSIGN: u8 = 2;
 
     struct FloatCompoundState {
-        fregs: Vec<f64>,
+        fregs: VirtArray<f64>,
     }
 
     /// Float compound assignments supported by `opcode_for_assign_binop_f`
@@ -122,7 +124,7 @@ mod float_control {
         let mut driver: JitDriver<FloatCompoundState> = JitDriver::new(threshold);
         let mut pc: usize = 0;
         let mut state = FloatCompoundState {
-            fregs: vec![0.0f64; 4],
+            fregs: VirtArray::filled(0.0f64, 4),
         };
         {
             use majit_metainterp::JitState as _;

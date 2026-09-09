@@ -4,6 +4,7 @@
 //! A block arm is lowered statement by statement, so an unsupported terminal
 //! `break` must degrade the arm instead of being discarded as inert.
 
+use majit_metainterp::virt_array::VirtArray;
 use majit_metainterp::{Assembler, JitCode, JitDriver};
 
 pub type Bytecode = [u8];
@@ -23,7 +24,7 @@ const OP_TICK: u8 = 4;
 const OP_END: u8 = 5;
 
 struct BlockBreakState {
-    regs: Vec<i64>,
+    regs: VirtArray<i64>,
 }
 
 #[majit_macros::jit_interp(
@@ -39,7 +40,7 @@ fn dispatch_block_break(program: &Bytecode, threshold: u32) -> i64 {
     let mut driver: JitDriver<BlockBreakState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
     let mut state = BlockBreakState {
-        regs: vec![0i64; 2],
+        regs: VirtArray::filled(0i64, 2),
     };
     state.regs[0] = program[program.len() - 1] as i64;
     {
