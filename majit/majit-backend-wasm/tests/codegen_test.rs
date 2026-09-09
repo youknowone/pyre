@@ -2236,11 +2236,10 @@ fn entry_prologue_nulls_the_frozen_home_region() {
     );
 }
 
-/// `genop_finish` stores `jf_gcmap = 0` when there is no `_finish_gcmap`
-/// (only `GUARD_NOT_FORCED_2` retains that map). The CA caller footer is
-/// then `_call_footer_shadowstack` — the x86 `SUB` — not a runtime
-/// `jf_force_descr` check that would take the write-barrier helper on
-/// every leftover `GUARD_NOT_FORCED` from the call itself.
+/// Without `GUARD_NOT_FORCED_2` there is no `_finish_gcmap`. The CA
+/// caller footer is `_call_footer_shadowstack` — the x86 `SUB` — not a
+/// runtime `jf_force_descr` check that would take the write-barrier
+/// helper on every leftover `GUARD_NOT_FORCED` from the call itself.
 #[test]
 fn call_assembler_without_gnf2_pops_with_shadowstack_sub() {
     fn build(with_gnf2: bool) -> Vec<u8> {

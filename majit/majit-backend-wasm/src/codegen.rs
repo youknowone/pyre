@@ -2458,19 +2458,6 @@ fn emit_ca_pop_shadowstack(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_store(mem32(0));
 }
 
-/// x86 `genop_finish` else-arm: `MOV [jf_gcmap], 0` when the assembler has
-/// no `_finish_gcmap`. That field is only retained for `GUARD_NOT_FORCED_2`;
-/// a leftover `jf_force_descr` from the `GUARD_NOT_FORCED` that follows
-/// `CALL_ASSEMBLER` is not `_finish_gcmap`.
-fn emit_publish_finish_gcmap_null(sink: &mut PeepSink<'_, '_>) {
-    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_GCMAP_OFS};
-    sink.local_get(0);
-    sink.i32_const(FIRST_ITEM_OFFSET as i32);
-    sink.i32_sub();
-    sink.i64_const(0);
-    emit_word_store(sink, JF_GCMAP_OFS as u64);
-}
-
 /// CA return footer: `_call_footer_shadowstack`.
 ///
 /// `genop_finish` publishes `_finish_gcmap` (or NULL) before the footer.
@@ -6168,16 +6155,17 @@ fn build_function(
             }
 
             OpCode::Finish => {
-                // x86 `genop_finish` else-arm: no `_finish_gcmap` →
-                // `jf_gcmap = 0` before `_call_footer`. A CA callee
-                // returns inside generated wasm, so this publish is what
-                // `execute_token` would have done for a host-entered loop.
-                // Only CA modules write it: unit-test traces have no
-                // jitframe at local 0, and a host-entered loop still
-                // publishes in `execute_token`.
-                if ca.emit_ca && !has_guard_not_forced_2 {
-                    emit_publish_finish_gcmap_null(&mut sink);
-                }
+                // x86 `genop_finish` else-arm stores `jf_gcmap = 0` when
+                // there is no `_finish_gcmap`, and calls that store
+                // redundant. `_finish_gcmap` is only retained for
+                // `GUARD_NOT_FORCED_2`. A leftover `jf_force_descr` from
+                // the `GUARD_NOT_FORCED` after `CALL_ASSEMBLER` is not
+                // that map, and the CA caller footer on this path is
+                // only `_call_footer_shadowstack` (`SUB`). The nursery
+                // bump already wrote the callee gcmap; leaving it until
+                // the pop is what the collector sees in the window
+                // before the frame is unrooted. A host-entered loop
+                // still publishes in `execute_token`.
                 emit_guard_exit(
                     &mut sink,
                     constants,
