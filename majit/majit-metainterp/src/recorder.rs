@@ -298,9 +298,9 @@ pub struct Trace {
     snapshot_offsets: Vec<usize>,
     /// Per-snapshot `py_pc` words, outermost-first. RPython's
     /// `_encode_snapshot` has no twin; resume still reads this pyre
-    /// extra after decode. Inline capacity covers the usual 1-frame
-    /// portal (regex) plus a few inlines without a heap `Vec`.
-    snapshot_py_pcs: Vec<smallvec::SmallVec<[u32; 4]>>,
+    /// extra after decode. Inline capacity covers the portal plus the
+    /// inlined matcher frames; `[; 4]` heap-grew 32 B on this path.
+    snapshot_py_pcs: Vec<smallvec::SmallVec<[u32; 8]>>,
 }
 
 impl Trace {
@@ -494,7 +494,7 @@ impl Trace {
     /// `rd_resume_position`; the byte offset lives in `snapshot_offsets`.
     pub fn encode_captured_snapshot(&mut self, snapshot: &Snapshot) -> i32 {
         let id = self.snapshot_offsets.len() as i32;
-        let py_pcs: smallvec::SmallVec<[u32; 4]> =
+        let py_pcs: smallvec::SmallVec<[u32; 8]> =
             snapshot.frames.iter().map(|f| f.py_pc).collect();
 
         // Write `_snapshot_data` only. `create_top_snapshot` also patches
@@ -565,7 +565,7 @@ impl Trace {
         all_liveness: &[u8],
     ) -> i32 {
         let id = self.snapshot_offsets.len() as i32;
-        let py_pcs: smallvec::SmallVec<[u32; 4]> = framestack.iter().map(|f| f.pc as u32).collect();
+        let py_pcs: smallvec::SmallVec<[u32; 8]> = framestack.iter().map(|f| f.pc as u32).collect();
         let vable: smallvec::SmallVec<[OcBox; 8]> = virtualizable_boxes
             .iter()
             .map(|r| self.arg_to_box(*r))
