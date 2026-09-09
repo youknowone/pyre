@@ -1755,7 +1755,7 @@ impl OptHeap {
         if Self::call_can_invalidate(op) {
             self.seen_guard_not_invalidated = false;
         }
-        OptimizationResult::Emit(op.clone())
+        OptimizationResult::PassOn
     }
 
     /// Mark call arguments as escaped.
@@ -2215,7 +2215,7 @@ impl OptHeap {
     ) -> OptimizationResult {
         let key = match Self::field_key(op) {
             Some(k) => k,
-            None => return OptimizationResult::Emit(op.clone()),
+            None => return OptimizationResult::PassOn,
         };
         let descr = op.getdescr().unwrap();
         let field_idx = Self::field_slot_index(&descr);
@@ -2433,7 +2433,7 @@ impl OptHeap {
                 let obj_box = ctx.get_box_replacement_operand(obj);
                 self.cache_field(&obj_box, &descr);
                 ctx.structinfo_setfield(op, field_idx, op.pos.get());
-                return OptimizationResult::Emit(op.clone());
+                return OptimizationResult::PassOn;
             }
         }
 
@@ -2482,7 +2482,7 @@ impl OptHeap {
             ctx.emit(guard_op);
             return OptimizationResult::Remove;
         }
-        OptimizationResult::Emit(op.clone())
+        OptimizationResult::PassOn
     }
 
     fn optimize_setfield(
@@ -2493,7 +2493,7 @@ impl OptHeap {
     ) -> OptimizationResult {
         let key = match Self::field_key(op) {
             Some(k) => k,
-            None => return OptimizationResult::Emit(op.clone()),
+            None => return OptimizationResult::PassOn,
         };
         let descr = op.getdescr().unwrap();
         let (raw_obj, _) = key;
@@ -3032,7 +3032,7 @@ impl OptHeap {
             // fires.
             make_nonnull_box(ctx, &op.arg(0));
             ctx.arrayinfo_setitem(op, const_index as usize, op.pos.get());
-            return OptimizationResult::Emit(op.clone());
+            return OptimizationResult::PassOn;
         }
 
         // heap.py:690-701: variable-index GETARRAYITEM_GC path.
@@ -3064,7 +3064,7 @@ impl OptHeap {
 
         // heap.py line 701: make_nonnull(op.getarg(0)) (optimizer.py).
         make_nonnull_box(ctx, &op.arg(0));
-        OptimizationResult::Emit(op.clone())
+        OptimizationResult::PassOn
     }
 
     fn optimize_setarrayitem(
@@ -3097,7 +3097,7 @@ impl OptHeap {
                     self.arrayitem_submap(&descr)
                         .cache_varindex_write(arrayinfo, indexbox, resbox);
                 }
-                return OptimizationResult::Emit(op.clone());
+                return OptimizationResult::PassOn;
             }
         };
 
@@ -3208,7 +3208,7 @@ impl OptHeap {
         let opcode = op.opcode;
 
         if Self::has_no_heap_cache_effect(opcode) {
-            return OptimizationResult::Emit(op.clone());
+            return OptimizationResult::PassOn;
         }
 
         // Track allocations for aliasing analysis.
@@ -3218,20 +3218,20 @@ impl OptHeap {
             if let Some(new_box) = ctx.get_box_replacement_operand_opt(op.pos.get()) {
                 self.unescaped.insert(new_box);
             }
-            return OptimizationResult::Emit(op.clone());
+            return OptimizationResult::PassOn;
         }
 
         if opcode.is_guard() {
-            // Every guard heap keeps is downstreamed as `Emit`, and
-            // `propagate_forward` then runs heap.py for it — the
-            // lazy-set flush, then the postponed op. Neither step belongs here.
-            return OptimizationResult::Emit(op.clone());
+            // Every guard heap keeps is downstreamed; `propagate_forward`
+            // then runs heap.py for it — the lazy-set flush, then the
+            // postponed op. Neither step belongs here.
+            return OptimizationResult::PassOn;
         }
 
         // Final operations (Jump, Finish): force everything.
         if opcode.is_final() {
             self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-            return OptimizationResult::Emit(op.clone());
+            return OptimizationResult::PassOn;
         }
 
         // Calls: mark arguments as escaped, force lazy sets, and invalidate.
@@ -3261,11 +3261,11 @@ impl OptHeap {
         if !opcode.has_no_side_effect() && !opcode.is_ovf() {
             self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
             self.clean_caches(ctx);
-            return OptimizationResult::Emit(op.clone());
+            return OptimizationResult::PassOn;
         }
 
         // Pure / no-side-effect / overflow ops: pass through.
-        OptimizationResult::Emit(op.clone())
+        OptimizationResult::PassOn
     }
 
     fn dispatch_propagate(
@@ -3286,9 +3286,9 @@ impl OptHeap {
             // used by compatibility paths that intentionally reload state from
             // memory instead of carrying it through loop args.
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF => {
-                OptimizationResult::Emit(op.clone())
+                OptimizationResult::PassOn
             }
-            OpCode::SetfieldRaw => OptimizationResult::Emit(op.clone()),
+            OpCode::SetfieldRaw => OptimizationResult::PassOn,
 
             // ── Field writes ──
             OpCode::SetfieldGc => self.optimize_setfield(op, op_rc, ctx),
@@ -3304,12 +3304,12 @@ impl OptHeap {
             // dynamic indices visible until we have RPython-style virtualizable
             // handling for these buffers.
             OpCode::GetarrayitemRawI | OpCode::GetarrayitemRawR | OpCode::GetarrayitemRawF => {
-                OptimizationResult::Emit(op.clone())
+                OptimizationResult::PassOn
             }
 
             // ── Array item writes ──
             OpCode::SetarrayitemGc => self.optimize_setarrayitem(op, op_rc, ctx),
-            OpCode::SetarrayitemRaw => OptimizationResult::Emit(op.clone()),
+            OpCode::SetarrayitemRaw => OptimizationResult::PassOn,
 
             // ── Interior field reads ──
             // info.py:682: "heapcache does not work for interiorfields"
@@ -3318,7 +3318,7 @@ impl OptHeap {
             // no side effect so emitting_operation returns early (heap.py).
             OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
-            | OpCode::GetinteriorfieldGcF => OptimizationResult::Emit(op.clone()),
+            | OpCode::GetinteriorfieldGcF => OptimizationResult::PassOn,
             // SETINTERIORFIELD_GC: NOT matched here — falls through to
             // handle_side_effects (the `_` arm). RPython heap.py:463-464:
             // SETINTERIORFIELD_GC is NOT in the emitting_operation exclusion
@@ -3358,7 +3358,7 @@ impl OptHeap {
                 // heap.py: force_all_lazy_sets + clean_caches.
                 self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
                 self.clean_caches(ctx);
-                OptimizationResult::Emit(op.clone())
+                OptimizationResult::PassOn
             }
 
             // ── heap.py: CALL_MAY_FORCE — postpone until GUARD_NOT_FORCED ──
@@ -3420,7 +3420,7 @@ impl OptHeap {
                     self.last_emitted_removed = false;
                     OptimizationResult::Remove
                 } else {
-                    OptimizationResult::Emit(op.clone())
+                    OptimizationResult::PassOn
                 }
             }
 
@@ -3430,7 +3430,7 @@ impl OptHeap {
                     OptimizationResult::Remove
                 } else {
                     self.seen_guard_not_invalidated = true;
-                    OptimizationResult::Emit(op.clone())
+                    OptimizationResult::PassOn
                 }
             }
 
@@ -3517,7 +3517,7 @@ impl OptHeap {
             | OpCode::GcLoadIndexedF => {
                 self.force_all_lazy_setfields(ctx.current_pass_idx, ctx);
                 self.force_all_lazy_setarrayitems(ctx.current_pass_idx, ctx);
-                OptimizationResult::Emit(op.clone())
+                OptimizationResult::PassOn
             }
 
             // ── Everything else: check for side effects ──
@@ -3598,10 +3598,19 @@ impl Optimization for OptHeap {
         }
         // heap.py:419-423 — postpone comparison / ovf ops. CALL_MAY_FORCE is
         // postponed in its own arm, which returns Remove before reaching here.
-        if let OptimizationResult::Emit(ref emit_op) = result
-            && (emit_op.opcode.is_comparison() || emit_op.opcode.is_ovf())
-        {
-            self.postponed_op = Some(emit_op.clone());
+        let postpone = match &result {
+            OptimizationResult::Emit(emit_op)
+                if emit_op.opcode.is_comparison() || emit_op.opcode.is_ovf() =>
+            {
+                Some(emit_op.clone())
+            }
+            OptimizationResult::PassOn if op.opcode.is_comparison() || op.opcode.is_ovf() => {
+                Some(op.clone())
+            }
+            _ => None,
+        };
+        if let Some(emit_op) = postpone {
+            self.postponed_op = Some(emit_op);
             // optimizer.py:84-87 — postponed ops do NOT call
             // Optimization.emit, so line 86's `last_emitted_operation = op`
             // does NOT fire. Leave `last_emitted_removed` intact so a
@@ -4715,7 +4724,7 @@ mod tests {
         op2.pos.set(pos3);
         let result2 = heap.optimize_getfield(&op2, &std::rc::Rc::new(op2.clone()), &mut ctx);
         assert!(
-            matches!(result2, OptimizationResult::Emit(_)),
+            matches!(result2, OptimizationResult::PassOn),
             "getfield after invalidation must emit, not reuse stale import"
         );
     }
@@ -5553,7 +5562,7 @@ mod tests {
         pass.setup();
 
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
-        assert!(matches!(result, OptimizationResult::Emit(_)));
+        assert!(matches!(result, OptimizationResult::PassOn));
         let arr_box = array_box.get_box_replacement(false);
         assert_eq!(
             ctx.peek_ptr_info(&arr_box)
@@ -8300,7 +8309,7 @@ mod tests {
         let guard_result =
             heap.propagate_forward(&guard, &std::rc::Rc::new(guard.clone()), &mut ctx);
         assert!(
-            matches!(guard_result, OptimizationResult::Emit(_)),
+            matches!(guard_result, OptimizationResult::PassOn),
             "GUARD_NO_EXCEPTION after a PassOn-emitted op must NOT be removed"
         );
     }

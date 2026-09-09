@@ -1755,9 +1755,40 @@ impl DescrSlot {
     }
 
     fn set_packed_forwarded(&self, packed: u64) {
-        let (descr, extra, old) = self.take_parts();
-        crate::forwarding::drop_packed_forwarded(old);
-        self.write_parts(descr, extra, packed);
+        let (lo, hi) = self.bits();
+        match hi {
+            FWD_TAG => {
+                crate::forwarding::drop_packed_forwarded(lo as u64);
+                if packed == 0 {
+                    self.set_bits(0, 0);
+                } else {
+                    self.set_bits(packed as usize, FWD_TAG);
+                }
+            }
+            EXTRA_FWD_TAG => {
+                let slot = unsafe { &mut *(lo as *mut ExtraFwd) };
+                let old = slot.forwarded;
+                slot.forwarded = packed;
+                crate::forwarding::drop_packed_forwarded(old);
+            }
+            BOTH_FWD_TAG => {
+                let slot = unsafe { &mut *(lo as *mut BothFwd) };
+                let old = slot.forwarded;
+                slot.forwarded = packed;
+                crate::forwarding::drop_packed_forwarded(old);
+            }
+            DESCR_FWD_TAG => {
+                let slot = unsafe { &mut *(lo as *mut DescrFwd) };
+                let old = slot.forwarded;
+                slot.forwarded = packed;
+                crate::forwarding::drop_packed_forwarded(old);
+            }
+            _ => {
+                let (descr, extra, old) = self.take_parts();
+                crate::forwarding::drop_packed_forwarded(old);
+                self.write_parts(descr, extra, packed);
+            }
+        }
     }
 
     pub fn borrow(&self) -> Option<DescrRef> {
