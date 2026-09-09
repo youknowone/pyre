@@ -7245,7 +7245,48 @@ fn drive_portal_metatrace(
         }
         TraceAction::Abort | TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
             let mut builder = pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder();
-            meta.run_blackhole_interp_to_cancel_tracing(&mut builder)
+            let per_frame =
+                pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
+            let ec = pyre_interpreter::call::getexecutioncontext()
+                as *mut pyre_interpreter::PyExecutionContext;
+            let saved_root =
+                majit_gc::shadow_stack::push(
+                    majit_ir::GcRef(unsafe { (*ec).topframeref } as usize),
+                );
+            let set_topframeref = |frame_ptr: i64| {
+                if frame_ptr != 0 {
+                    unsafe {
+                        (*ec).topframeref = frame_ptr as *mut PyFrame;
+                    }
+                }
+            };
+            let level_recursion = std::cell::RefCell::new(
+                per_frame
+                    .iter()
+                    .skip(1)
+                    .filter(|&&(frame_ptr, _)| frame_ptr != 0)
+                    .map(|&(frame_ptr, _)| {
+                        pyre_interpreter::call::enter_recursive_frame(frame_ptr as *const PyFrame)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let finish_level = |frame_ptr: i64| {
+                pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
+                if frame_ptr != 0 {
+                    level_recursion.borrow_mut().pop();
+                }
+            };
+            let outcome = meta.run_blackhole_interp_to_cancel_tracing(
+                &mut builder,
+                Some(per_frame.as_slice()),
+                Some(&set_topframeref as &dyn Fn(i64)),
+                Some(&finish_level as &dyn Fn(i64)),
+            );
+            unsafe {
+                (*ec).topframeref = majit_gc::shadow_stack::get(saved_root).0 as *mut PyFrame;
+            }
+            majit_gc::shadow_stack::pop_to(saved_root);
+            outcome
         }
         other => panic!("unexpected portal tracing action: {other:?}"),
     };

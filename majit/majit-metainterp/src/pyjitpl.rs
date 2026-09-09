@@ -6144,9 +6144,23 @@ impl<M: Clone> MetaInterp<M> {
     /// Finish the live interpreter-function frames before returning a portal
     /// control-flow exception. Their registers already have the JitCode ABI;
     /// no source-PC mapping or state-field register reconstruction is needed.
+    ///
+    /// `per_frame` / `on_enter_level` / `on_leave_level` are the pyre
+    /// `virtualizable_ptr` plumbing that
+    /// `blackhole.py convert_and_run_from_pyjitpl` does not need: upstream
+    /// `_copy_data_from_miframe` copies each MIFrame's own registers, and
+    /// `bhimpl_getfield_vable_*` reads the struct operand from those
+    /// registers. Our `virtualizable_ptr` is a separate field used only by
+    /// traceback recording and `executioncontext.py enter`/`leave`. Passing
+    /// `None` assigns the portal vable to every level, so a cancelled
+    /// inlined callee would mark the caller's frame finished and publish
+    /// the caller as `topframeref`.
     pub fn run_blackhole_interp_to_cancel_tracing(
         &mut self,
         builder: &mut crate::blackhole::BlackholeInterpBuilder,
+        per_frame: Option<&[(i64, usize)]>,
+        on_enter_level: Option<&dyn Fn(i64)>,
+        on_leave_level: Option<&dyn Fn(i64)>,
     ) -> crate::jitexc::JitException {
         let ctx = self.tracing.as_mut().expect("cancelling a live trace");
         assert!(
@@ -6194,9 +6208,9 @@ impl<M: Clone> MetaInterp<M> {
             &self.staticdata,
             last_exc_value,
             raising_exception,
-            None,
-            None,
-            None,
+            per_frame,
+            on_enter_level,
+            on_leave_level,
         );
         self.framestack.frames.clear();
         result.outcome
@@ -21616,7 +21630,7 @@ mod metainterp_static_data_tests {
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(41));
         let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
         assert_eq!(
-            meta.run_blackhole_interp_to_cancel_tracing(&mut builder),
+            meta.run_blackhole_interp_to_cancel_tracing(&mut builder, None, None, None),
             JitException::DoneWithThisFrameInt(142),
         );
         assert!(meta.framestack.is_empty());
@@ -21669,7 +21683,8 @@ mod metainterp_static_data_tests {
                 raising_exception,
             });
             let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
-            let outcome = meta.run_blackhole_interp_to_cancel_tracing(&mut builder);
+            let outcome =
+                meta.run_blackhole_interp_to_cancel_tracing(&mut builder, None, None, None);
             let exception = majit_ir::GcRef(0xfeed);
             assert_eq!(
                 outcome,
@@ -21680,6 +21695,76 @@ mod metainterp_static_data_tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn cancel_tracing_blackhole_publishes_each_frame_vable() {
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        use std::cell::RefCell;
+
+        let mut callee = JitCodeBuilder::new();
+        callee.record_binop_i(0, OpCode::IntAdd, 0, 1);
+        callee.record_binop_i(0, OpCode::IntAdd, 0, 1);
+        callee.int_return(0);
+        let mut portal = JitCodeBuilder::new();
+        let callee = callee.finish();
+        callee.set_index(1);
+        let callee_index = portal.add_sub_jitcode(callee);
+        portal.inline_call_ir_i(callee_index, &[(1, 0), (2, 1)], &[], Some(3));
+        portal.record_binop_i(3, OpCode::IntAdd, 3, 0);
+        portal.int_return(3);
+        let portal = portal.finish();
+        portal.set_index(0);
+        portal.set_jitdriver_sd(0);
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.force_start_tracing(
+            0,
+            (0, 0),
+            None,
+            &[Value::Int(100), Value::Int(40), Value::Int(1)],
+        );
+        meta.initialize_state_from_start(
+            Arc::new(portal),
+            &[
+                (JitArgKind::Int, OpRef::input_arg_int(0), 100),
+                (JitArgKind::Int, OpRef::input_arg_int(1), 40),
+                (JitArgKind::Int, OpRef::input_arg_int(2), 1),
+            ],
+        );
+        meta.trace_ctx().unwrap().set_trace_limit(0);
+        struct Sym;
+        impl crate::JitCodeSym for Sym {
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+        }
+        assert!(matches!(
+            meta.interpret(&mut Sym, 0),
+            crate::TraceAction::Abort
+        ));
+        assert_eq!(meta.framestack.len(), 2);
+
+        let entered = RefCell::new(Vec::new());
+        let left = RefCell::new(Vec::new());
+        let on_enter = |frame_ptr: i64| entered.borrow_mut().push(frame_ptr);
+        let on_leave = |frame_ptr: i64| left.borrow_mut().push(frame_ptr);
+        let per_frame = [(0x1000, 0), (0x2000, 0)];
+        let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
+        let _ = meta.run_blackhole_interp_to_cancel_tracing(
+            &mut builder,
+            Some(&per_frame),
+            Some(&on_enter),
+            Some(&on_leave),
+        );
+        // Innermost first: the callee must be published as its own vable.
+        // Sharing the portal frame would enter/leave 0x1000 for that level.
+        assert_eq!(entered.borrow()[0], 0x2000);
+        assert!(left.borrow().contains(&0x2000));
     }
 
     #[test]
