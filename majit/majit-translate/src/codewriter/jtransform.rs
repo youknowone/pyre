@@ -6583,6 +6583,17 @@ impl<'a> Transformer<'a> {
                     None,
                 )
             }
+            // `rlib/jit.py` `_jit_conditional_call` is an llop in upstream
+            // (`ConditionalCallEntry.specialize_call` → `jit_conditional_call`),
+            // rewritten by `rewrite_op_jit_conditional_call`. pyre harvests
+            // the interpreter-facing helper as `oopspec("jit.conditional_call")`
+            // so this arm is the `__handle_jit_call` entry that reaches it.
+            "jit.conditional_call" => {
+                self.rewrite_op_jit_conditional_call(graph, op, target, args, result_ty, graph_name)
+            }
+            "jit.conditional_call_value" => self.rewrite_op_jit_conditional_call_value(
+                graph, op, target, args, result_ty, graph_name,
+            ),
             // jtransform.py:1756-1757
             _ => {
                 // jtransform.py:1757
@@ -6647,30 +6658,18 @@ impl<'a> Transformer<'a> {
         self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name)
     }
 
-    // NOTE: rewrite_op_jit_conditional_call, _rewrite_op_cond_call, and
-    // rewrite_op_jit_record_known_result are handled by jitcode_lower
-    // (proc-macro level), not jtransform. The codewriter AST parser does
-    // not expand macro_rules!, so these macros never reach jtransform.
-    // See jitcode_lower.rs: lower_conditional_call, lower_conditional_call_elidable,
-    // lower_record_known_result.
-    //
-    // `_rewrite_op_cond_call` below is a structural mirror of
-    // `rpython/jit/codewriter/jtransform.py:1665-1683`. pyre dispatches
-    // conditional_call via the proc-macro path (see above), so this
-    // function is never reached at runtime; the Rust #[allow(dead_code)]
-    // is deliberate. Keeping the body
-    // here lets future porters cross-reference our conditional_call
-    // lowering against the upstream flow line-by-line.
+    // `#[jit_interp] conditional_call!` still lowers through jitcode_lower.
+    // Interpreter-facing `majit_rlib::jit::conditional_call*` is an oopspec
+    // and reaches this rewrite via `_handle_jit_call`, matching
+    // `jtransform.py rewrite_op_jit_conditional_call`.
 
     /// RPython: `Transformer._rewrite_op_cond_call(op, rewritten_opname)`
     /// (jtransform.py:1665-1683).
     ///
-    /// Called by upstream `rewrite_op_jit_conditional_call` and
-    /// `rewrite_op_jit_conditional_call_value`; in pyre those two
-    /// lower through `jitcode_lower::lower_conditional_call` /
-    /// `lower_conditional_call_elidable` instead. This body is kept as
-    /// structural documentation so the two code paths stay aligned.
-    #[allow(dead_code)]
+    /// `rewrite_call(op, name, op.args[:2], args=op.args[2:])`: args[0] is
+    /// the condition (or elidable value), args[1] is the callee, args[2:]
+    /// are the callee's arguments. `target` is the oopspec wrapper and is
+    /// not the residual funcptr.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -6679,7 +6678,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         graph: &mut FunctionGraph,
         op: &SpaceOperation,
-        target: &CallTarget,
+        _target: &CallTarget,
         args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
@@ -6694,17 +6693,36 @@ impl<'a> Transformer<'a> {
         if args.len() > 4 + 2 {
             panic!("Conditional call does not support more than 4 arguments");
         }
-        // jtransform.py:1673-1676: calldescr from function call (args[1:] → result)
+        assert!(
+            args.len() >= 2,
+            "jit.conditional_call needs a condition and a function"
+        );
+        // jtransform.py `_rewrite_op_cond_call`: rewrite_call(..., op.args[:2], args=op.args[2:])
         let condition_or_value_var = args[0].clone();
-        let func_args: &[crate::flowspace::model::Variable] =
-            if args.len() > 1 { &args[1..] } else { &[] };
+        let func_var = &args[1];
+        let func_args = &args[2..];
+        let func_target = fn_const_target_for_var(graph, func_var, 0).unwrap_or_else(|| {
+            panic!(
+                "conditional_call function must be a constant function item \
+                 (rtyper get_concrete_llfn); graph={graph_name}"
+            )
+        });
+        // jtransform.py `_rewrite_op_cond_call`: `direct_call` of op.args[1:] (func + args)
         let non_void_args = resolve_non_void_arg_types_from_vars(func_args);
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_ir_type = resolved_result.ir_type;
+        let callee_op = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::Call {
+                target: func_target.clone(),
+                args: func_args.to_vec(),
+                result_ty: result_ty.clone(),
+            },
+        };
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
-                op,
+                &callee_op,
                 non_void_args,
                 result_ir_type,
                 OopSpecIndex::None,
@@ -6741,7 +6759,7 @@ impl<'a> Transformer<'a> {
         let call_kind = if is_value {
             OpKind::ConditionalCallValue {
                 value: condition_or_value_var,
-                funcptr: target.clone(),
+                funcptr: func_target,
                 descriptor: descriptor.clone(),
                 args_i,
                 args_r,
@@ -6751,7 +6769,7 @@ impl<'a> Transformer<'a> {
         } else {
             OpKind::ConditionalCall {
                 condition: condition_or_value_var,
-                funcptr: target.clone(),
+                funcptr: func_target,
                 descriptor: descriptor.clone(),
                 args_i,
                 args_r,
@@ -6772,10 +6790,7 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(ops)
     }
 
-    /// RPython: `Transformer.rewrite_op_jit_conditional_call(op)`
-    /// (jtransform.py:1685-1686). Dispatch wrapper kept for structural
-    /// parity; pyre's `rewrite_operation` match does not reach it.
-    #[allow(dead_code)]
+    /// RPython: `Transformer.rewrite_op_jit_conditional_call(op)`.
     fn rewrite_op_jit_conditional_call(
         &mut self,
         graph: &mut FunctionGraph,
@@ -6788,10 +6803,7 @@ impl<'a> Transformer<'a> {
         self._rewrite_op_cond_call(graph, op, target, args, result_ty, graph_name, false)
     }
 
-    /// RPython: `Transformer.rewrite_op_jit_conditional_call_value(op)`
-    /// (jtransform.py:1687-1688). Dispatch wrapper kept for structural
-    /// parity; pyre's `rewrite_operation` match does not reach it.
-    #[allow(dead_code)]
+    /// RPython: `Transformer.rewrite_op_jit_conditional_call_value(op)`.
     fn rewrite_op_jit_conditional_call_value(
         &mut self,
         graph: &mut FunctionGraph,

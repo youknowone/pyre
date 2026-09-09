@@ -409,6 +409,33 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "majit_rlib.jit.isvirtual",
         majit_metainterp_bool_flag,
     );
+    // `rlib/jit.py conditional_call` returns None. One analyzer covers
+    // every residual arity (`conditional_call0`..`conditional_call4`).
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call0",
+        jit_conditional_call,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call1",
+        jit_conditional_call,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call2",
+        jit_conditional_call,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call3",
+        jit_conditional_call,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call4",
+        jit_conditional_call,
+    );
     // `rlib/jit.py` — the `hint` ExtRegistryEntry's
     // `compute_result_annotation`, the one place upstream MINTS
     // `access_directly` onto an annotation. Upstream spells the kwargs on a
@@ -1943,6 +1970,16 @@ fn majit_metainterp_bool_flag(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Bool(super::model::SomeBool::new()))
+}
+
+/// `rlib/jit.py ConditionalCallEntry.compute_result_annotation` for
+/// `_jit_conditional_call`: the call is void.
+fn jit_conditional_call(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(super::model::s_none())
 }
 
 /// Analyzer for Rust primitive type `From` / `TryFrom` impls

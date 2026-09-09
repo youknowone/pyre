@@ -2241,6 +2241,55 @@ pub fn ll_list_int_set_len(l: &mut W_ListObject, n: usize) {
     l.int_items.set_len(n);
 }
 
+/// `rlist.py _ll_list_resize_hint_really` for Integer storage.
+///
+/// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
+fn ll_list_int_resize_hint_really_iff(
+    obj: PyObjectRef,
+    newsize: usize,
+    _overallocate: bool,
+) -> bool {
+    unsafe {
+        let cap = ll_list_int_capacity(&*(obj as *const W_ListObject));
+        majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&newsize)
+    }
+}
+
+#[majit_macros::look_inside_iff(ll_list_int_resize_hint_really_iff)]
+pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: usize, overallocate: bool) {
+    let list = &mut *(obj as *mut W_ListObject);
+    if overallocate {
+        list.int_items.grow(newsize);
+    } else if newsize > list.int_items.heap_capacity() {
+        list.int_items.grow(newsize);
+    }
+}
+
+/// `rlist.py _ll_list_resize_ge` for Integer storage.
+///
+/// `cond = len(l.items) < newsize`; a constant pair inlines the realloc,
+/// otherwise `jit.conditional_call` keeps the fast path bridge-free.
+pub unsafe fn ll_list_int_resize_ge(obj: PyObjectRef, newsize: usize) {
+    let list = &*(obj as *const W_ListObject);
+    let allocated = ll_list_int_capacity(list);
+    let cond = allocated < newsize;
+    if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
+        if cond {
+            ll_list_int_resize_hint_really(obj, newsize, true);
+        }
+    } else {
+        majit_rlib::jit::conditional_call3(
+            cond,
+            ll_list_int_resize_hint_really,
+            obj,
+            newsize,
+            true,
+        );
+    }
+    let list = &mut *(obj as *mut W_ListObject);
+    ll_list_int_set_len(list, newsize);
+}
+
 // Float-strategy storage leaves, mirroring the Integer leaves above but
 // addressing `float_items.{len,block}` and holding unboxed `f64` scalars.
 // The codewriter recognises the `#[oopspec("list.float_*")]` tag and emits
@@ -2712,17 +2761,12 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
             if is_plain_int1(value) {
                 // ll_append (rtyper/rlist.py): length = ll_length();
                 // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
-                // The resize-ge fast case (rlist.py:285) inlines only while
-                // there is spare capacity; bump the length and store in
-                // place. Otherwise fall back to the resizing push.
                 let item = plain_int_w(value);
                 let length = ll_list_int_length(list);
-                if length < ll_list_int_capacity(list) {
-                    ll_list_int_set_len(list, length + 1);
-                    ll_list_int_setitem_fast(list, length, item);
-                } else {
-                    list.int_items.push(item);
-                }
+                ll_list_int_resize_ge(obj, length + 1);
+                let obj = current_gc_ref(obj);
+                let list = &mut *(obj as *mut W_ListObject);
+                ll_list_int_setitem_fast(list, length, item);
             } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
                 let obj = current_gc_ref(obj);
                 let value = current_gc_ref(value);
@@ -5369,6 +5413,23 @@ mod tests {
             // The write is observable through the public accessor.
             let item = w_list_getitem(list, 1).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(item), 99);
+        }
+    }
+
+    #[test]
+    fn integer_resize_ge_grows_then_stores() {
+        // Residual `_ll_list_resize_ge` + `ll_setitem_fast` (rlist.py ll_append).
+        let list = w_list_new(vec![w_int_new(1)]);
+        unsafe {
+            w_list_append(list, w_int_new(2));
+            w_list_append(list, w_int_new(3));
+            w_list_append(list, w_int_new(4));
+            w_list_append(list, w_int_new(5));
+            assert_eq!(w_list_len(list), 5);
+            let l = &*(list as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Integer);
+            assert!(ll_list_int_capacity(l) >= 5);
+            assert_eq!(ll_list_int_getitem_fast(l, 4), 5);
         }
     }
 

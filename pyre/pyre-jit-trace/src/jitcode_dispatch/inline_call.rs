@@ -2047,7 +2047,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // `ca_result` with the executed concrete on success, and seeds the
     // standing exception state on a raise.
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
-    let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
+    let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types(), None);
     let exec = {
         let _selfrec_ca_fold_guard = SelfRecCaFoldGuard::enter();
         try_execute_residual_call_via_executor(

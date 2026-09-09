@@ -2167,6 +2167,26 @@ impl HostEnv {
             "isvirtual",
             HostObject::new_builtin_callable("majit_rlib.jit.isvirtual"),
         );
+        majit_rlib_jit.module_set(
+            "conditional_call0",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call0"),
+        );
+        majit_rlib_jit.module_set(
+            "conditional_call1",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call1"),
+        );
+        majit_rlib_jit.module_set(
+            "conditional_call2",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call2"),
+        );
+        majit_rlib_jit.module_set(
+            "conditional_call3",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call3"),
+        );
+        majit_rlib_jit.module_set(
+            "conditional_call4",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call4"),
+        );
 
         // Container constructors emitted as `[Type, "new"]` 2-segment
         // FunctionPath callsites by pyre-source helpers.  Same shape

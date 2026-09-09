@@ -5409,15 +5409,14 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
 /// `read_float_var_list`) tag each entry with its bank, so the parallel
 /// array is correct without needing a runtime type query.
 ///
-/// The RPython `prepend_box` parameter is unused at every
-/// `residual_call*` call site (only `conditional_call*` uses it, not
-/// yet ported), so it's omitted from the walker signature. Add it back
-/// when porting `opimpl_conditional_call*`.
+/// `pyjitpl.py _build_allboxes(..., prepend_box=)`. Residual calls pass
+/// `None`; `opimpl_conditional_call*` prepends the condition/value box.
 fn build_allboxes(
     funcbox: OpRef,
     argboxes: &[OpRef],
     argbox_types: &[Type],
     arg_types: &[Type],
+    prepend_box: Option<OpRef>,
 ) -> Vec<OpRef> {
     debug_assert_eq!(
         argboxes.len(),
@@ -5425,8 +5424,12 @@ fn build_allboxes(
         "argboxes and argbox_types must align",
     );
     // RPython line 1961: `allboxes = [None] * (len(argboxes)+1 + …)`.
-    let total = arg_types.len() + 1;
+    let extra = usize::from(prepend_box.is_some());
+    let total = arg_types.len() + 1 + extra;
     let mut allboxes: Vec<OpRef> = Vec::with_capacity(total);
+    if let Some(pre) = prepend_box {
+        allboxes.push(pre);
+    }
     // RPython line 1966: `allboxes[i] = funcbox`.
     allboxes.push(funcbox);
     // RPython line 1968: `src_i = src_r = src_f = 0`.
@@ -12228,6 +12231,8 @@ fn handle<Sym: WalkSym>(
         // family per `resoperation.py Type::Void => CallN`.
         "residual_call_r_v/iRd" => dispatch_residual_call_iRd_kind(code, op, ctx, 'v'),
         "residual_call_ir_v/iIRd" => dispatch_residual_call_iIRd_kind(code, op, ctx, 'v'),
+        // `pyjitpl.py opimpl_conditional_call_ir_v`: condition + func + I/R.
+        "conditional_call_ir_v/iiIRd" => dispatch_conditional_call_ir_v(code, op, ctx),
         "residual_call_irf_v/iIRFd" => dispatch_residual_call_iIRFd_kind(code, op, ctx, 'v'),
         // The `int_*` / `float_*` / `ptr_*` record families are routed
         // through `dispatch_regular_record` (see `arith.rs`) before this

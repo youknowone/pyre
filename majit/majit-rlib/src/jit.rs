@@ -41,6 +41,62 @@ pub fn isvirtual<T: ?Sized>(_value: &T) -> bool {
     false
 }
 
+/// `rlib/jit.py conditional_call` residual body (`if condition: function(*args)`).
+///
+/// Translated graphs rewrite a `oopspec("jit.conditional_call")` call to
+/// `conditional_call_ir_v` (`jtransform.py rewrite_op_jit_conditional_call`).
+/// Upstream is one `*args` function with `_always_inline_ = 'try'`; Rust
+/// spells one arity per residual word-count (`jtransform.py` rejects more
+/// than 4 function arguments).
+#[majit_macros::oopspec("jit.conditional_call")]
+pub fn conditional_call0(condition: bool, function: unsafe fn()) {
+    if condition {
+        unsafe { function() }
+    }
+}
+
+/// [`conditional_call0`] with one function argument.
+#[majit_macros::oopspec("jit.conditional_call")]
+pub fn conditional_call1<A>(condition: bool, function: unsafe fn(A), a: A) {
+    if condition {
+        unsafe { function(a) }
+    }
+}
+
+/// [`conditional_call0`] with two function arguments.
+#[majit_macros::oopspec("jit.conditional_call")]
+pub fn conditional_call2<A, B>(condition: bool, function: unsafe fn(A, B), a: A, b: B) {
+    if condition {
+        unsafe { function(a, b) }
+    }
+}
+
+/// [`conditional_call0`] with three function arguments.
+///
+/// `rlist.py _ll_list_resize_ge` uses this shape:
+/// `conditional_call(cond, _ll_list_resize_hint_really, l, newsize, True)`.
+#[majit_macros::oopspec("jit.conditional_call")]
+pub fn conditional_call3<A, B, C>(condition: bool, function: unsafe fn(A, B, C), a: A, b: B, c: C) {
+    if condition {
+        unsafe { function(a, b, c) }
+    }
+}
+
+/// [`conditional_call0`] with four function arguments.
+#[majit_macros::oopspec("jit.conditional_call")]
+pub fn conditional_call4<A, B, C, D>(
+    condition: bool,
+    function: unsafe fn(A, B, C, D),
+    a: A,
+    b: B,
+    c: C,
+    d: D,
+) {
+    if condition {
+        unsafe { function(a, b, c, d) }
+    }
+}
+
 /// `rlib/jit.py loop_unrolling_heuristic`.
 ///
 /// `isvirtual(lst)` is often lying for a resizable list (it reports the
@@ -65,5 +121,19 @@ mod tests {
         // Residual `isconstant` is false, so a non-empty list does not unroll.
         let lst = &[1, 2];
         assert!(!loop_unrolling_heuristic(lst, 2, 2));
+    }
+
+    #[test]
+    fn conditional_call_runs_when_true() {
+        // Residual `rlib/jit.py conditional_call`: `if condition: function(*args)`.
+        fn mark(flag: &mut bool) {
+            *flag = true;
+        }
+        let mut flag = false;
+        conditional_call1(true, mark, &mut flag);
+        assert!(flag);
+        let mut flag = true;
+        conditional_call1(false, mark, &mut flag);
+        assert!(flag);
     }
 }
