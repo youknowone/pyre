@@ -1104,7 +1104,7 @@ fn translate_trace_iter_box_map(
 /// just to rewrite `pos` is a second `cls()`. Rewrite args and
 /// positions in place when `strong_count == 1`.
 fn prepare_bridge_trace_from_owned(
-    mut bridge_ops: Vec<majit_ir::OpRc>,
+    bridge_ops: Vec<majit_ir::OpRc>,
     bridge_inputargs: &[InputArg],
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
@@ -1115,23 +1115,13 @@ fn prepare_bridge_trace_from_owned(
     runtime_boxes: Vec<OpRef>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace {
-    if !bridge_ops
-        .iter()
-        .all(|op| std::rc::Rc::strong_count(op) == 1)
-    {
-        return prepare_bridge_trace_for_optimizer(
-            &bridge_ops,
-            bridge_inputargs,
-            snapshot_boxes,
-            snapshot_frame_sizes,
-            snapshot_vable_boxes,
-            snapshot_vref_boxes,
-            snapshot_frame_pcs,
-            pending_bridge_rd,
-            runtime_boxes,
-            bridge_inputarg_base,
-        );
-    }
+    // `Operand::Op` already shares the producer `Rc`. Later uses hold a
+    // second strong ref, so `strong_count == 1` on every op is false on
+    // any real bridge and used to fall through to a second `cls()`.
+    // `pos` / `setarg` / guard extra are interior-mutable: rewrite the
+    // live objects and every operand already pointing at them sees the
+    // new `pos`. That is the one materialization `TraceIterator.next`
+    // would have done.
     #[cfg(feature = "jit-audits")]
     next_audit_prepare_generation();
     let mut max_pos = 0u32;
@@ -1173,39 +1163,33 @@ fn prepare_bridge_trace_from_owned(
         cache[p] = Some(majit_ir::operand::Operand::from_bound_inputarg(&ia));
     }
     for i in 0..bridge_ops.len() {
-        let orig;
-        let is_void;
-        {
-            let op = std::rc::Rc::get_mut(&mut bridge_ops[i]).expect("strong_count checked above");
-            for ai in 0..op.num_args() {
-                let arg = op.arg(ai);
-                if !arg.is_constant() {
-                    op.setarg(ai, untag_prepared_cache(arg.to_opref(), &cache));
-                }
+        let op = &bridge_ops[i];
+        for ai in 0..op.num_args() {
+            let arg = op.arg(ai);
+            if let Some(rewritten) = remap_prepared_arg(&arg, &cache, bridge_inputarg_base) {
+                op.setarg(ai, rewritten);
             }
-            if let Some(fa) = op.fail_args_mut() {
-                for arg in fa.iter_mut() {
-                    if !arg.is_constant() {
-                        *arg = untag_prepared_cache(arg.to_opref(), &cache);
-                    }
-                }
+        }
+        op.map_failargs_in_place(|arg| {
+            if let Some(rewritten) = remap_prepared_arg(arg, &cache, bridge_inputarg_base) {
+                *arg = rewritten;
             }
-            orig = op.pos.get();
-            is_void = orig.is_none() || op.opcode.result_type() == Type::Void;
-            if !is_void {
-                op.pos.set(OpRef::op_typed(fresh, op.opcode.result_type()));
-                fresh += 1;
-            } else if !orig.is_none() {
-                op.pos.set(OpRef::void_op(fresh));
-                fresh += 1;
-            }
+        });
+        let orig = op.pos.get();
+        let is_void = orig.is_none() || op.opcode.result_type() == Type::Void;
+        if !is_void {
+            op.pos.set(OpRef::op_typed(fresh, op.opcode.result_type()));
+            fresh += 1;
+        } else if !orig.is_none() {
+            op.pos.set(OpRef::void_op(fresh));
+            fresh += 1;
         }
         if !is_void {
             let slot = orig.raw() as usize;
             if slot >= cache.len() {
                 cache.resize(slot + 1, None);
             }
-            cache[slot] = Some(majit_ir::operand::Operand::from_bound_op(&bridge_ops[i]));
+            cache[slot] = Some(majit_ir::operand::Operand::from_bound_op(op));
         }
     }
     finish_prepared_bridge(
@@ -1220,6 +1204,41 @@ fn prepare_bridge_trace_from_owned(
         pending_bridge_rd,
         runtime_boxes,
     )
+}
+
+/// Remap one operand into the prepared namespace. `None` means keep `arg`.
+/// A bound same-bridge producer already has its `pos` rewritten; looking
+/// that live `pos` up in a cache keyed by the *old* position misses
+/// (`IntOp(396)` vs `cache_len=175`).
+fn remap_prepared_arg(
+    arg: &majit_ir::operand::Operand,
+    cache: &[Option<majit_ir::operand::Operand>],
+    bridge_inputarg_base: u32,
+) -> Option<majit_ir::operand::Operand> {
+    if arg.is_constant() || arg.is_none() {
+        return None;
+    }
+    if let Some(prod) = arg.bound_op() {
+        let p = prod.pos.get();
+        if p.is_none() || p.is_constant() || p.raw() >= bridge_inputarg_base {
+            return None;
+        }
+        return cache.get(p.raw() as usize).and_then(|slot| slot.clone());
+    }
+    let opref = arg.to_opref();
+    if opref.is_none() || opref.is_constant() {
+        return None;
+    }
+    match cache
+        .get(opref.raw() as usize)
+        .and_then(|slot| slot.clone())
+    {
+        Some(found) => {
+            assert_prepared_cache_bank("remap_prepared_arg", opref, found.to_opref().ty());
+            Some(found)
+        }
+        None => None,
+    }
 }
 
 fn untag_prepared_cache(

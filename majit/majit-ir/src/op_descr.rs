@@ -197,6 +197,18 @@ impl Op {
     /// the fail_args slot.  Takes `&self` (interior mutability) so the
     /// optimizer can stamp fail_args onto a shared `Op` reached through
     /// `Rc<Op>`.
+    /// Rewrite each live fail-arg in place. Avoids a `SmallVec` clone
+    /// when the caller only remaps boxes already stored on the guard.
+    pub fn map_failargs_in_place(&self, mut f: impl FnMut(&mut crate::operand::Operand)) {
+        if let Some(mut g) = self.try_guard_extra_mut()
+            && let Some(fa) = g.fail_args.as_mut()
+        {
+            for arg in fa.iter_mut() {
+                f(arg);
+            }
+        }
+    }
+
     pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::operand::Operand; 3]>) {
         // `GuardResOp._fail_args` holds the producer operands themselves
         // (resoperation.py:483), exactly like `Op.args`: a bound fail-arg
