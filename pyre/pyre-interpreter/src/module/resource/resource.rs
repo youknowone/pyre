@@ -2,7 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-
 /// `lib_pypy/resource.py:15-37 class struct_rusage(
 /// metaclass=structseqtype)` — process-wide cached subclass-of-tuple
 /// type.
@@ -11,26 +10,26 @@ static STRUCT_RUSAGE_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new
 fn struct_rusage_type() -> pyre_object::PyObjectRef {
     *STRUCT_RUSAGE_TYPE.get_or_init(|| {
         crate::_structseq::make_struct_seq(
-                "resource.struct_rusage",
-                &[
-                    "ru_utime",
-                    "ru_stime",
-                    "ru_maxrss",
-                    "ru_ixrss",
-                    "ru_idrss",
-                    "ru_isrss",
-                    "ru_minflt",
-                    "ru_majflt",
-                    "ru_nswap",
-                    "ru_inblock",
-                    "ru_oublock",
-                    "ru_msgsnd",
-                    "ru_msgrcv",
-                    "ru_nsignals",
-                    "ru_nvcsw",
-                    "ru_nivcsw",
-                ],
-            ) as usize
+            "resource.struct_rusage",
+            &[
+                "ru_utime",
+                "ru_stime",
+                "ru_maxrss",
+                "ru_ixrss",
+                "ru_idrss",
+                "ru_isrss",
+                "ru_minflt",
+                "ru_majflt",
+                "ru_nswap",
+                "ru_inblock",
+                "ru_oublock",
+                "ru_msgsnd",
+                "ru_msgrcv",
+                "ru_nsignals",
+                "ru_nvcsw",
+                "ru_nivcsw",
+            ],
+        ) as usize
     }) as pyre_object::PyObjectRef
 }
 
@@ -142,17 +141,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     match rustpython_host_env::resource::getrlimit(res) {
                         Ok(rl) => {
-                            Ok(pyre_object::w_tuple_new(vec![
-                                pyre_object::w_int_new(rl.rlim_cur as i64),
-                                pyre_object::w_int_new(rl.rlim_max as i64),
-                            ]))
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_int_new(rl.rlim_cur as i64));
+                            fields.push(pyre_object::w_int_new(rl.rlim_max as i64));
+                            Ok(pyre_object::w_tuple_new(fields.take()))
                         }
-                        Err(e) => {
-                            Err(crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("getrlimit: {e}"),
-                            ))
-                        }
+                        Err(e) => Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getrlimit: {e}"),
+                        )),
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]

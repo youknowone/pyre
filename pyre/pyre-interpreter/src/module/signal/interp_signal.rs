@@ -784,10 +784,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         )));
                     }
                 }
-                #[cfg(all(
-                    unix,
-                    any(not(feature = "host_env"), feature = "sandbox")
-                ))]
+                #[cfg(all(unix, any(not(feature = "host_env"), feature = "sandbox")))]
                 unsafe {
                     let mut st: libc::stat = std::mem::zeroed();
                     let bad_fd = libc::fstat(fd, &mut st) != 0;
@@ -1134,10 +1131,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             errno_exception("signal.ItimerError", e.raw_os_error().unwrap_or(0))
                         })?;
                     let (delay, interval) = rustpython_host_env::signal::itimerval_to_tuple(&old);
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_float_new(delay),
-                        pyre_object::w_float_new(interval),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_float_new(delay));
+                    fields.push(pyre_object::w_float_new(interval));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 }
                 #[cfg(not(feature = "host_env"))]
                 {
@@ -1176,10 +1173,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         })?;
                         let (delay, interval) =
                             rustpython_host_env::signal::itimerval_to_tuple(&it);
-                        Ok(pyre_object::w_tuple_new(vec![
-                            pyre_object::w_float_new(delay),
-                            pyre_object::w_float_new(interval),
-                        ]))
+                        let mut fields = pyre_object::gc_roots::RootedItems::new();
+                        fields.push(pyre_object::w_float_new(delay));
+                        fields.push(pyre_object::w_float_new(interval));
+                        Ok(pyre_object::w_tuple_new(fields.take()))
                     }
                     #[cfg(not(feature = "host_env"))]
                     {

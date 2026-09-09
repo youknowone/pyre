@@ -417,7 +417,14 @@ pub mod deque_iter {
             let consumed = W_Deque::from_obj(self.deque)
                 .map(|deque| deque.len - self.counter)
                 .unwrap_or(0);
-            w_tuple_new(vec![ty, w_tuple_new(vec![self.deque, w_int_new(consumed)])])
+            let mut state = pyre_object::gc_roots::RootedItems::new();
+            state.push(self.deque);
+            state.push(w_int_new(consumed));
+            let state = w_tuple_new(state.take());
+            let mut result = pyre_object::gc_roots::RootedItems::new();
+            result.push(ty);
+            result.push(state);
+            w_tuple_new(result.take())
         }
     }
 
@@ -537,7 +544,14 @@ pub mod deque_rev_iter {
             let consumed = W_Deque::from_obj(self.deque)
                 .map(|deque| deque.len - self.counter)
                 .unwrap_or(0);
-            w_tuple_new(vec![ty, w_tuple_new(vec![self.deque, w_int_new(consumed)])])
+            let mut state = pyre_object::gc_roots::RootedItems::new();
+            state.push(self.deque);
+            state.push(w_int_new(consumed));
+            let state = w_tuple_new(state.take());
+            let mut result = pyre_object::gc_roots::RootedItems::new();
+            result.push(ty);
+            result.push(state);
+            w_tuple_new(result.take())
         }
     }
 

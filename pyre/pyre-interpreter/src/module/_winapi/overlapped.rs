@@ -175,10 +175,10 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
     if state.completed && state.transfer == Transfer::Read {
         state.buffer.truncate(transferred as usize);
     }
-    Ok(pyre_object::w_tuple_new(vec![
-        pyre_object::w_int_new(i64::from(transferred)),
-        pyre_object::w_int_new(i64::from(error)),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_int_new(i64::from(transferred)));
+    fields.push(pyre_object::w_int_new(i64::from(error)));
+    Ok(pyre_object::w_tuple_new(fields.take()))
 }
 
 /// `Overlapped.getbuffer()` -> what a completed read produced, or `None` when

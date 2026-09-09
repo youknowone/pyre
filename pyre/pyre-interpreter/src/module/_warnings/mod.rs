@@ -104,13 +104,13 @@ fn get_once_registry() -> Result<PyObjectRef, PyError> {
 }
 
 fn create_filter(category: PyObjectRef, action: &str, module: Option<&str>) -> PyObjectRef {
-    w_tuple_new(vec![
-        w_str_new(action),
-        w_none(),
-        category,
-        module.map(w_str_new).unwrap_or_else(w_none),
-        w_int_new(0),
-    ])
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_str_new(action));
+    fields.push(w_none());
+    fields.push(category);
+    fields.push(module.map(w_str_new).unwrap_or_else(w_none));
+    fields.push(w_int_new(0));
+    w_tuple_new(fields.take())
 }
 
 fn warning_class(name: &str) -> PyObjectRef {

@@ -245,7 +245,10 @@ mod process {
             },
         )?;
         let (read, write) = host_winapi::create_pipe(size).map_err(win32_err)?;
-        Ok(w_tuple_new(vec![w_handle(read), w_handle(write)]))
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_handle(read));
+        fields.push(w_handle(write));
+        Ok(w_tuple_new(fields.take()))
     }
 
     /// `_winapi.DuplicateHandle(source_process, source, target_process,
@@ -530,12 +533,12 @@ mod process {
             handles,
         )
         .map_err(win32_err)?;
-        Ok(w_tuple_new(vec![
-            w_handle(info.process),
-            w_handle(info.thread),
-            w_int_new(info.process_id as i64),
-            w_int_new(info.thread_id as i64),
-        ]))
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_handle(info.process));
+        fields.push(w_handle(info.thread));
+        fields.push(w_int_new(info.process_id as i64));
+        fields.push(w_int_new(info.thread_id as i64));
+        Ok(w_tuple_new(fields.take()))
     }
 }
 

@@ -388,10 +388,10 @@ fn raw_encode(args: &[PyObjectRef]) -> crate::PyResult {
     let errors = crate::baseobjspace::text_w(roots.get(base + 2))?.to_owned();
     let final_input = crate::baseobjspace::is_true(roots.get(base + 3))?;
     let (output, consumed) = encode_impl(&name, roots.get(base + 1), &errors, final_input)?;
-    Ok(w_tuple_new(vec![
-        pyre_object::bytesobject::w_bytes_from_bytes(&output),
-        w_int_new(consumed as i64),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&output));
+    fields.push(w_int_new(consumed as i64));
+    Ok(w_tuple_new(fields.take()))
 }
 
 fn codec_call_control(
@@ -437,10 +437,10 @@ fn raw_encode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
         Some(&state),
         Some(w_state),
     )?;
-    Ok(w_tuple_new(vec![
-        pyre_object::bytesobject::w_bytes_from_bytes(&output),
-        w_int_new(consumed as i64),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&output));
+    fields.push(w_int_new(consumed as i64));
+    Ok(w_tuple_new(fields.take()))
 }
 
 fn raw_decode(args: &[PyObjectRef]) -> crate::PyResult {
@@ -451,10 +451,10 @@ fn raw_decode(args: &[PyObjectRef]) -> crate::PyResult {
     let input = codec_input_bytes(roots.get(base + 1))?;
     let final_input = crate::baseobjspace::is_true(roots.get(base + 3))?;
     let (output, consumed) = decode_impl(&name, &input, &errors, final_input)?;
-    Ok(w_tuple_new(vec![
-        pyre_object::unicodeobject::w_str_from_wtf8_managed(output),
-        w_int_new(consumed as i64),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::unicodeobject::w_str_from_wtf8_managed(output));
+    fields.push(w_int_new(consumed as i64));
+    Ok(w_tuple_new(fields.take()))
 }
 
 fn raw_decode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
@@ -472,10 +472,10 @@ fn raw_decode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
         Some(&state),
         Some(w_state),
     )?;
-    Ok(w_tuple_new(vec![
-        pyre_object::unicodeobject::w_str_from_wtf8_managed(output),
-        w_int_new(consumed as i64),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::unicodeobject::w_str_from_wtf8_managed(output));
+    fields.push(w_int_new(consumed as i64));
+    Ok(w_tuple_new(fields.take()))
 }
 
 fn raw_initial_state(args: &[PyObjectRef]) -> crate::PyResult {

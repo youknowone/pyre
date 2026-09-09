@@ -191,8 +191,32 @@ fn codec_error_arg(args: &[PyObjectRef]) -> Result<CodecException, crate::PyErro
         .and_then(check_exception)
 }
 
+/// Pins each result field as it is produced. An array literal would mint
+/// every field first, so a later allocation could sweep an earlier
+/// collectable string or bytes object.
+struct RootedTuple {
+    items: gc_roots::RootedItems,
+}
+
+fn rooted_tuple() -> RootedTuple {
+    RootedTuple {
+        items: gc_roots::RootedItems::new(),
+    }
+}
+
+impl RootedTuple {
+    fn arg(mut self, item: PyObjectRef) -> Self {
+        self.items.push(item);
+        self
+    }
+
+    fn finish(self) -> PyObjectRef {
+        w_tuple_new(self.items.take())
+    }
+}
+
 fn codec_result(replacement: PyObjectRef, position: PyObjectRef) -> PyObjectRef {
-    w_tuple_new(vec![replacement, position])
+    rooted_tuple().arg(replacement).arg(position).finish()
 }
 
 fn strict_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -965,10 +989,10 @@ fn encode_with_name(
         encode_method,
         &[w_str_new(encoding), w_str_new(&errors)],
     )?;
-    Ok(w_tuple_new(vec![
-        encoded,
-        w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(encoded)
+        .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
+        .finish())
 }
 
 fn decode_with_name(
@@ -993,7 +1017,10 @@ fn decode_with_name(
         decode_method,
         &[w_str_new(encoding), w_str_new(&errors)],
     )?;
-    Ok(w_tuple_new(vec![decoded, w_int_new(consumed as i64)]))
+    Ok(rooted_tuple()
+        .arg(decoded)
+        .arg(w_int_new(consumed as i64))
+        .finish())
 }
 
 /// `bufferstr_w`: the read-only bytes of a decoder input.
@@ -1047,11 +1074,11 @@ fn utf16_32_ex_decode_impl(
         &errors,
         crate::baseobjspace::is_true(w_final)?,
     )?;
-    Ok(w_tuple_new(vec![
-        w_str_from_wtf8_managed(decoded),
-        w_int_new(consumed as i64),
-        w_int_new(bo as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_str_from_wtf8_managed(decoded))
+        .arg(w_int_new(consumed as i64))
+        .arg(w_int_new(bo as i64))
+        .finish())
 }
 
 /// PyPy `make_decoder_wrapper` for the two-value UTF-16/32 decoder entry
@@ -1076,10 +1103,10 @@ fn utf16_32_decode_impl(
         &errors,
         crate::baseobjspace::is_true(w_final)?,
     )?;
-    Ok(w_tuple_new(vec![
-        w_str_from_wtf8_managed(decoded),
-        w_int_new(consumed as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_str_from_wtf8_managed(decoded))
+        .arg(w_int_new(consumed as i64))
+        .finish())
 }
 
 /// PyPy `interp_codecs.utf_8_decode`, including its incremental consumed
@@ -1101,10 +1128,10 @@ fn utf8_decode_impl(
         crate::baseobjspace::is_true(w_final)?,
         errors == "surrogatepass",
     )?;
-    Ok(w_tuple_new(vec![
-        w_str_from_wtf8_managed(decoded),
-        w_int_new(consumed as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_str_from_wtf8_managed(decoded))
+        .arg(w_int_new(consumed as i64))
+        .finish())
 }
 
 /// `charmapencode_lookup` — map one code point through the encoding table and
@@ -1284,10 +1311,10 @@ fn charmap_encode_impl(
     // Pinned because minting the bytes below can collect and move it.
     let _ = pyre_object::gc_roots::pin_root(w_int_new(char_count as i64));
     let w_encoded = w_bytes_from_bytes(&out);
-    Ok(w_tuple_new(vec![
-        w_encoded,
-        pyre_object::gc_roots::shadow_stack_get(sp + 2),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_encoded)
+        .arg(pyre_object::gc_roots::shadow_stack_get(sp + 2))
+        .finish())
 }
 
 /// `charmapdecode_lookup` — read one byte's entry out of a decoding table.
@@ -1439,10 +1466,10 @@ fn charmap_decode_impl(
             }
         }
     }
-    Ok(w_tuple_new(vec![
-        w_str_from_wtf8_managed(out),
-        w_int_new(orig_len as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_str_from_wtf8_managed(out))
+        .arg(w_int_new(orig_len as i64))
+        .finish())
 }
 
 fn utf7_is_base64(b: u8) -> bool {
@@ -1571,10 +1598,10 @@ fn utf7_encode_impl(
     if in_shift {
         out.push(b'-');
     }
-    Ok(w_tuple_new(vec![
-        w_bytes_from_bytes(&out),
-        w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_bytes_from_bytes(&out))
+        .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
+        .finish())
 }
 
 /// Route a utf-7 decode error through the requested handler, shaped like
@@ -1782,10 +1809,10 @@ fn utf7_decode_impl(
         consumed = startinpos;
         out.truncate(shift_out_start);
     }
-    Ok(w_tuple_new(vec![
-        w_str_from_wtf8_managed(out),
-        w_int_new(consumed as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_str_from_wtf8_managed(out))
+        .arg(w_int_new(consumed as i64))
+        .finish())
 }
 
 fn push_ascii_hex_escape(out: &mut Vec<u8>, prefix: u8, cp: u32, digits: usize) {
@@ -1818,10 +1845,10 @@ fn unicode_escape_encode_impl(
             c => push_ascii_hex_escape(&mut out, b'U', c, 8),
         }
     }
-    Ok(w_tuple_new(vec![
-        w_bytes_from_bytes(&out),
-        w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_bytes_from_bytes(&out))
+        .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
+        .finish())
 }
 
 fn unicode_escape_error(
@@ -2137,10 +2164,10 @@ fn unicode_escape_decode_impl(
     if let Some(message) = first_escape_warning {
         crate::warn::warn_deprecation(&message)?;
     }
-    Ok(w_tuple_new(vec![
-        w_str_from_wtf8_managed(out),
-        w_int_new(pos as i64 + pos_delta),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_str_from_wtf8_managed(out))
+        .arg(w_int_new(pos as i64 + pos_delta))
+        .finish())
 }
 
 /// `unicode_escape_decode`'s raw counterpart: only `\uXXXX` and
@@ -2155,10 +2182,10 @@ fn raw_unicode_escape_decode_impl(
     let errors_s = codec_errors_arg("raw_unicode_escape_decode", 2, errors)?;
     let (out, consumed) =
         crate::type_methods::decode_raw_unicode_escape_stateful(&data, &errors_s, final_)?;
-    Ok(w_tuple_new(vec![
-        w_str_from_wtf8_managed(out),
-        w_int_new(consumed as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_str_from_wtf8_managed(out))
+        .arg(w_int_new(consumed as i64))
+        .finish())
 }
 
 /// `interp_codecs.py escape_decode` / `_PyString_DecodeEscape` — the
@@ -2272,10 +2299,10 @@ fn escape_decode_impl(
     if let Some(message) = first_escape_warning {
         crate::warn::warn_deprecation(&message)?;
     }
-    Ok(w_tuple_new(vec![
-        w_bytes_from_bytes(&out),
-        w_int_new(data.len() as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_bytes_from_bytes(&out))
+        .arg(w_int_new(data.len() as i64))
+        .finish())
 }
 
 /// `interp_codecs.py escape_encode` / `string_escape_encode(data,
@@ -2301,10 +2328,10 @@ fn escape_encode_impl(
             value => out.extend_from_slice(format!("\\x{value:02x}").as_bytes()),
         }
     }
-    Ok(w_tuple_new(vec![
-        w_bytes_from_bytes(&out),
-        w_int_new(data.len() as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_bytes_from_bytes(&out))
+        .arg(w_int_new(data.len() as i64))
+        .finish())
 }
 
 fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2369,10 +2396,10 @@ fn code_page_encode_impl(
     }
     let errors = code_page_errors(name, position + 1, w_errors)?;
     let bytes = crate::unicodehelper_win32::encode_code_page(code_page, w_str, &errors)?;
-    Ok(w_tuple_new(vec![
-        pyre_object::bytesobject::w_bytes_from_bytes(&bytes),
-        w_int_new(unsafe { w_str_len(w_str) } as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
+        .arg(w_int_new(unsafe { w_str_len(w_str) } as i64))
+        .finish())
 }
 
 /// `_codecs.code_page_decode` - `(str, bytes consumed)`.
@@ -2393,10 +2420,10 @@ fn code_page_decode_impl(
     // `final` is the caller promising that no continuation is coming, so the
     // whole buffer reads as consumed: nothing is being held back for one.
     let consumed = if is_final { data.len() } else { consumed };
-    Ok(w_tuple_new(vec![
-        w_str_from_wtf8_managed(text),
-        w_int_new(consumed as i64),
-    ]))
+    Ok(rooted_tuple()
+        .arg(w_str_from_wtf8_managed(text))
+        .arg(w_int_new(consumed as i64))
+        .finish())
 }
 
 /// Strip the keyword marker these positional-only entry points cannot take.
@@ -2483,10 +2510,10 @@ crate::py_module! {
                 decode_input_bytes(data)?
             };
             let _errors = codec_errors_arg("readbuffer_encode", 2, errors)?;
-            Ok(w_tuple_new(vec![
-                pyre_object::bytesobject::w_bytes_from_bytes(&bytes),
-                w_int_new(bytes.len() as i64),
-            ]))
+            Ok(rooted_tuple()
+                .arg(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
+                .arg(w_int_new(bytes.len() as i64))
+                .finish())
         }
         fn ascii_encode(
             obj: PyObjectRef,

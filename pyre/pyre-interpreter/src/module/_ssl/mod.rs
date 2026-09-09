@@ -2423,11 +2423,11 @@ mod ssl_socket_methods {
             };
             let version =
                 unsafe { pyre_native::ssl::connection_version(self.backend) }.unwrap_or("unknown");
-            w_list_new(vec![w_tuple_new(vec![
-                w_str_new(&name),
-                w_str_new(version),
-                w_int_new(bits as i64),
-            ])])
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_str_new_managed(&name));
+            fields.push(w_str_new_managed(version));
+            fields.push(w_int_new(bits as i64));
+            w_list_new(vec![w_tuple_new(fields.take())])
         }
 
         fn cipher(&self) -> PyObjectRef {
@@ -2442,11 +2442,11 @@ mod ssl_socket_methods {
             else {
                 return w_none();
             };
-            w_tuple_new(vec![
-                w_str_new(&name),
-                w_str_new(version),
-                w_int_new(bits as i64),
-            ])
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_str_new_managed(&name));
+            fields.push(w_str_new_managed(version));
+            fields.push(w_int_new(bits as i64));
+            w_tuple_new(fields.take())
         }
 
         fn getpeercert(
@@ -2817,12 +2817,12 @@ fn rand_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn oid_tuple(entry: pyre_native::ssl::OidInfo) -> PyObjectRef {
-    w_tuple_new(vec![
-        w_int_new(i64::from(entry.nid)),
-        w_str_new(entry.short_name),
-        w_str_new(entry.long_name),
-        entry.oid.map(w_str_new).unwrap_or_else(w_none),
-    ])
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_int_new(i64::from(entry.nid)));
+    fields.push(w_str_new_managed(entry.short_name));
+    fields.push(w_str_new_managed(entry.long_name));
+    fields.push(entry.oid.map(w_str_new_managed).unwrap_or_else(w_none));
+    w_tuple_new(fields.take())
 }
 
 fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2868,12 +2868,12 @@ fn nid2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn get_default_verify_paths(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (cert_file, cert_dir) = pyre_native::ssl::default_verify_paths();
-    Ok(w_tuple_new(vec![
-        w_str_new("SSL_CERT_FILE"),
-        w_str_new(&cert_file),
-        w_str_new("SSL_CERT_DIR"),
-        w_str_new(&cert_dir),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_str_new("SSL_CERT_FILE"));
+    fields.push(w_str_new_managed(&cert_file));
+    fields.push(w_str_new("SSL_CERT_DIR"));
+    fields.push(w_str_new_managed(&cert_dir));
+    Ok(w_tuple_new(fields.take()))
 }
 
 /// The Windows system-certificate-store readers behind `ssl.enum_certificates`

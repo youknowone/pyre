@@ -93,10 +93,10 @@ pub fn phase(args: &[PyObjectRef]) -> PyResult {
 /// `wrapped_polar` — `(r, phi)` tuple.
 pub fn polar(args: &[PyObjectRef]) -> PyResult {
     let (r, phi) = pmc::polar(unpack(args[0])?).map_err(map_err)?;
-    Ok(w_tuple_new(vec![
-        floatobject::w_float_new(r),
-        floatobject::w_float_new(phi),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(floatobject::w_float_new(r));
+    fields.push(floatobject::w_float_new(phi));
+    Ok(w_tuple_new(fields.take()))
 }
 
 /// `wrapped_rect` — arguments go through `space.float_w`, so a complex

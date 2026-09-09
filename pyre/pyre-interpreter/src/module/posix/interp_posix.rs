@@ -1096,7 +1096,7 @@ fn wide_result(units: &[u16], as_bytes: bool) -> PyObjectRef {
     if as_bytes {
         pyre_object::w_bytes_from_bytes(&crate::gateway::fsencode_wtf8_total(&text))
     } else {
-        pyre_object::w_str_from_wtf8(text)
+        pyre_object::w_str_from_wtf8_managed(text)
     }
 }
 
@@ -1359,11 +1359,11 @@ mod win_nt {
         if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
             return Err(io_err(&std::io::Error::last_os_error(), ""));
         }
-        Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::w_int_new(info.dwVolumeSerialNumber as i64),
-            pyre_object::w_int_new(info.nFileIndexHigh as i64),
-            pyre_object::w_int_new(info.nFileIndexLow as i64),
-        ]))
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_int_new(info.dwVolumeSerialNumber as i64));
+        fields.push(pyre_object::w_int_new(info.nFileIndexHigh as i64));
+        fields.push(pyre_object::w_int_new(info.nFileIndexLow as i64));
+        Ok(pyre_object::w_tuple_new(fields.take()))
     }
 
     /// shutil.disk_usage helper — (total, free) bytes. host_env::getdiskusage
@@ -1378,10 +1378,12 @@ mod win_nt {
             host_nt::getdiskusage(&path)
         };
         match usage {
-            Ok((total, free)) => Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(total as i64),
-                pyre_object::w_int_new(free as i64),
-            ])),
+            Ok((total, free)) => {
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(total as i64));
+                fields.push(pyre_object::w_int_new(free as i64));
+                Ok(pyre_object::w_tuple_new(fields.take()))
+            }
             Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
     }
@@ -4169,10 +4171,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // this one stays in the text domain rather than the byte one.
                 let path = crate::gateway::fsdecode_filename_wtf8(&path);
                 let (root, tail) = split_root(&path);
-                Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_str_from_wtf8(root.to_wtf8_buf()),
-                    pyre_object::w_str_from_wtf8(tail.to_wtf8_buf()),
-                ]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_str_from_wtf8_managed(root.to_wtf8_buf()));
+                fields.push(pyre_object::w_str_from_wtf8_managed(tail.to_wtf8_buf()));
+                Ok(pyre_object::w_tuple_new(fields.take()))
             },
             "($module, /, path)",
             "Removes everything after the root on Win32.",
@@ -4195,11 +4197,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     nonstrict_wide_path(bound[0].expect("p is required"), "_path_splitroot_ex")?;
                 let units = &wide[..wide.len() - 1];
                 let (drvsize, rootsize) = skiproot(units, HOST_SEPS);
-                Ok(pyre_object::w_tuple_new(vec![
-                    wide_result(&units[..drvsize], as_bytes),
-                    wide_result(&units[drvsize..drvsize + rootsize], as_bytes),
-                    wide_result(&units[drvsize + rootsize..], as_bytes),
-                ]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(wide_result(&units[..drvsize], as_bytes));
+                fields.push(wide_result(&units[drvsize..drvsize + rootsize], as_bytes));
+                fields.push(wide_result(&units[drvsize + rootsize..], as_bytes));
+                Ok(pyre_object::w_tuple_new(fields.take()))
             },
             "($module, /, p)",
             "Split a pathname into drive, root and tail.\n\nThe tail contains \
@@ -7982,18 +7984,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
                             drop(fork_serial);
-                            Ok(pyre_object::w_tuple_new(vec![
-                                pyre_object::w_int_new(0),
-                                pyre_object::w_int_new(master_fd as i64),
-                            ]))
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_int_new(0));
+                            fields.push(pyre_object::w_int_new(master_fd as i64));
+                            Ok(pyre_object::w_tuple_new(fields.take()))
                         }
                         Ok(pid) => {
                             run_fork_callbacks("parent");
                             drop(fork_serial);
-                            Ok(pyre_object::w_tuple_new(vec![
-                                pyre_object::w_int_new(pid as i64),
-                                pyre_object::w_int_new(master_fd as i64),
-                            ]))
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_int_new(pid as i64));
+                            fields.push(pyre_object::w_int_new(master_fd as i64));
+                            Ok(pyre_object::w_tuple_new(fields.take()))
                         }
                         Err(error) => {
                             run_fork_callbacks("parent");
@@ -8253,10 +8255,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
                         }
                     };
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(res as i64),
-                        pyre_object::w_int_new(status as i64),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_int_new(res as i64));
+                    fields.push(pyre_object::w_int_new(status as i64));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 2,
             ),
@@ -8283,10 +8285,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
                         }
                     };
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(res as i64),
-                        pyre_object::w_int_new(status as i64),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_int_new(res as i64));
+                    fields.push(pyre_object::w_int_new(status as i64));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
             ),
@@ -11141,10 +11143,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |_| {
                     use std::os::fd::IntoRawFd;
                     let (master, slave) = host_posix::openpty().map_err(|e| io_err(e, ""))?;
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(master.into_raw_fd() as i64),
-                        pyre_object::w_int_new(slave.into_raw_fd() as i64),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_int_new(master.into_raw_fd() as i64));
+                    fields.push(pyre_object::w_int_new(slave.into_raw_fd() as i64));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
             ),
@@ -11159,11 +11161,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "getresuid",
                 |_| {
                     let (r, e, s) = host_posix::getresuid().map_err(|e| io_err(e, ""))?;
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(r as i64),
-                        pyre_object::w_int_new(e as i64),
-                        pyre_object::w_int_new(s as i64),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_int_new(r as i64));
+                    fields.push(pyre_object::w_int_new(e as i64));
+                    fields.push(pyre_object::w_int_new(s as i64));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
             ),
@@ -11178,11 +11180,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "getresgid",
                 |_| {
                     let (r, e, s) = host_posix::getresgid().map_err(|e| io_err(e, ""))?;
-                    Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(r as i64),
-                        pyre_object::w_int_new(e as i64),
-                        pyre_object::w_int_new(s as i64),
-                    ]))
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_int_new(r as i64));
+                    fields.push(pyre_object::w_int_new(e as i64));
+                    fields.push(pyre_object::w_int_new(s as i64));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
             ),
@@ -12257,10 +12259,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::make_builtin_function_with_arity(
                 "pipe",
                 |_| match host_nt::pipe() {
-                    Ok((read_fd, write_fd)) => Ok(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(read_fd as i64),
-                        pyre_object::w_int_new(write_fd as i64),
-                    ])),
+                    Ok((read_fd, write_fd)) => {
+                        let mut fields = pyre_object::gc_roots::RootedItems::new();
+                        fields.push(pyre_object::w_int_new(read_fd as i64));
+                        fields.push(pyre_object::w_int_new(write_fd as i64));
+                        Ok(pyre_object::w_tuple_new(fields.take()))
+                    }
                     Err(e) => Err(errno_err(crt_errno_of(&e), "")),
                 },
                 0,
@@ -12461,10 +12465,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         // -- an exit code above `INT_MAX`, which
                         // `ExitProcess` takes, is a positive number here and
                         // not a negative `int`.
-                        Ok((pid, status)) => Ok(pyre_object::w_tuple_new(vec![
-                            pyre_object::w_int_new(pid as i64),
-                            pyre_object::w_int_new((status as u32 as i64) << 8),
-                        ])),
+                        Ok((pid, status)) => {
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_int_new(pid as i64));
+                            fields.push(pyre_object::w_int_new((status as u32 as i64) << 8));
+                            Ok(pyre_object::w_tuple_new(fields.take()))
+                        }
                         Err(e) => Err(errno_err(crt_errno_of(&e), "")),
                     }
                 },

@@ -1540,10 +1540,10 @@ fn array_buffer_info_method(args: &[PyObjectRef]) -> PyResult {
     } else {
         pyre_object::longobject::w_long_new(BigInt::from(addr))
     };
-    Ok(pyre_object::w_tuple_new(vec![
-        w_addr,
-        pyre_object::w_int_new(len),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_addr);
+    fields.push(pyre_object::w_int_new(len));
+    Ok(pyre_object::w_tuple_new(fields.take()))
 }
 
 fn array_byteswap_method(args: &[PyObjectRef]) -> PyResult {
