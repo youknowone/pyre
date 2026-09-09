@@ -46,19 +46,41 @@ const ENOENT: i32 = 2;
 #[cfg(target_arch = "wasm32")]
 const EIO: i32 = 5;
 
-const S_IFDIR: Mode = 0o040000;
-const S_IFREG: Mode = 0o100000;
-const S_IFMT: Mode = 0o170000;
-const S_IWUSR: Mode = 0o000200;
-const S_IRUSR: Mode = 0o000400;
-const S_IRGRP: Mode = 0o000040;
-const S_IROTH: Mode = 0o000004;
-const S_IXUSR: Mode = 0o000100;
-const S_IXGRP: Mode = 0o000010;
-const S_IXOTH: Mode = 0o000001;
-const S_IRWXO: Mode = 0o000007;
-const S_IRWXU: Mode = 0o000700;
-const S_IRWXG: Mode = 0o000070;
+bitflags::bitflags! {
+    /// POSIX `st_mode` bits, hard-coded so Windows/wasm hosts still have them.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct ModeBits: Mode {
+        const IXOTH = 0o000001;
+        const IWOTH = 0o000002;
+        const IROTH = 0o000004;
+        const IRWXO = 0o000007;
+        const IXGRP = 0o000010;
+        const IRGRP = 0o000040;
+        const IRWXG = 0o000070;
+        const IXUSR = 0o000100;
+        const IWUSR = 0o000200;
+        const IRUSR = 0o000400;
+        const IRWXU = 0o000700;
+        const IFDIR = 0o040000;
+        const IFREG = 0o100000;
+        const IFMT = 0o170000;
+    }
+}
+
+const S_IFDIR: Mode = ModeBits::IFDIR.bits();
+const S_IFREG: Mode = ModeBits::IFREG.bits();
+const S_IFMT: Mode = ModeBits::IFMT.bits();
+const S_IWUSR: Mode = ModeBits::IWUSR.bits();
+const S_IRUSR: Mode = ModeBits::IRUSR.bits();
+const S_IRGRP: Mode = ModeBits::IRGRP.bits();
+const S_IROTH: Mode = ModeBits::IROTH.bits();
+const S_IXUSR: Mode = ModeBits::IXUSR.bits();
+const S_IXGRP: Mode = ModeBits::IXGRP.bits();
+const S_IXOTH: Mode = ModeBits::IXOTH.bits();
+const S_IRWXO: Mode = ModeBits::IRWXO.bits();
+const S_IRWXU: Mode = ModeBits::IRWXU.bits();
+const S_IRWXG: Mode = ModeBits::IRWXG.bits();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatResult {

@@ -24,6 +24,7 @@ test-support = []
 
 [dependencies]
 parking_lot = { workspace = true }
+bitflags = { workspace = true }
 indexmap = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }

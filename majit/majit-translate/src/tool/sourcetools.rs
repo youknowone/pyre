@@ -61,10 +61,20 @@ pub fn valid_identifier(stuff: impl std::fmt::Display) -> String {
     stuff
 }
 
+bitflags::bitflags! {
+    /// RPython `sourcetools.py` `CO_*` compile flags.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct CoFlags: u32 {
+        const VARARGS = 0x0004;
+        const VARKEYWORDS = 0x0008;
+    }
+}
+
 /// RPython `CO_VARARGS` (`sourcetools.py`).
-pub const CO_VARARGS: u32 = 0x0004;
+pub const CO_VARARGS: u32 = CoFlags::VARARGS.bits();
 /// RPython `CO_VARKEYWORDS` (`sourcetools.py`).
-pub const CO_VARKEYWORDS: u32 = 0x0008;
+pub const CO_VARKEYWORDS: u32 = CoFlags::VARKEYWORDS.bits();
 
 /// RPython `has_varargs(func)` for callers that already have
 /// `co_flags` (`sourcetools.py:250-252`).

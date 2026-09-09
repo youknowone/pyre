@@ -14,6 +14,18 @@ use pyre_object::PyObjectRef;
 #[cfg(feature = "sandbox")]
 use crate::host_seam::sys as libc;
 
+#[cfg(windows)]
+bitflags::bitflags! {
+    /// `WIN32_FIND_DATA.dwFileAttributes` bits this module decodes.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct FileAttributes: u32 {
+        const READONLY = 0x1;
+        const DIRECTORY = 0x10;
+        const REPARSE_POINT = 0x400;
+    }
+}
+
 /// PyPy `ApplevelForkCallbacks`, cached on the object space.
 ///
 /// The callback collections are RPython lists, so use insertion-ordered Vecs;
@@ -4820,9 +4832,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // attributes.  `_Py_attribute_data_to_stat` then replaces only the
             // format bits for a symlink, so a link to a directory keeps the
             // execute bits its own attributes carry.
-            const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
-            const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-            let permissions = if attrs & FILE_ATTRIBUTE_READONLY != 0 {
+            let permissions = if attrs & FileAttributes::READONLY.bits() != 0 {
                 0o444
             } else {
                 0o666
@@ -4834,7 +4844,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             } else {
                 0o100000
             };
-            let executable = if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            let executable = if attrs & FileAttributes::DIRECTORY.bits() != 0 {
                 0o111
             } else {
                 0
@@ -5325,9 +5335,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// name for the identity.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     fn stat_fields_from_find_data(data: &WinFindData) -> StatFields {
-        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
-        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
         const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
         // A `FILETIME` counts 100ns ticks from 1601-01-01.
         const SECS_BETWEEN_EPOCHS: i64 = 11_644_473_600;
@@ -5341,17 +5348,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
 
         let attrs = data.file_attributes;
-        let reparse_tag = if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        let reparse_tag = if attrs & FileAttributes::REPARSE_POINT.bits() != 0 {
             data.reserved0
         } else {
             0
         };
-        let mut mode = if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        let mut mode = if attrs & FileAttributes::DIRECTORY.bits() != 0 {
             S_IFDIR | 0o111
         } else {
             S_IFREG
         };
-        mode |= if attrs & FILE_ATTRIBUTE_READONLY != 0 {
+        mode |= if attrs & FileAttributes::READONLY.bits() != 0 {
             0o444
         } else {
             0o666

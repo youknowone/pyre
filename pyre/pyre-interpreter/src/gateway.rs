@@ -699,12 +699,23 @@ impl pyre_object::lltype::GcType for BuiltinCode {
     const SIZE: usize = BUILTIN_CODE_OBJECT_SIZE;
 }
 
+bitflags::bitflags! {
+    /// eval.py fast-path markers packed into `BuiltinCode` arity.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct BuiltinCodeFlags: u16 {
+        const FLATPYCALL = 0x100;
+        const PASSTHROUGHARGS1 = 0x200;
+        const HOPELESS = 0x400;
+    }
+}
+
 /// eval.py:16 — `FLATPYCALL = 0x100`.
-pub const FLATPYCALL: u16 = 0x100;
+pub const FLATPYCALL: u16 = BuiltinCodeFlags::FLATPYCALL.bits();
 /// eval.py — `PASSTHROUGHARGS1 = 0x200`.
-pub const PASSTHROUGHARGS1: u16 = 0x200;
+pub const PASSTHROUGHARGS1: u16 = BuiltinCodeFlags::PASSTHROUGHARGS1.bits();
 /// eval.py — `HOPELESS = 0x400`. Default for code that cannot fast-path.
-pub const HOPELESS: u16 = 0x400;
+pub const HOPELESS: u16 = BuiltinCodeFlags::HOPELESS.bits();
 
 /// Allocate a new `BuiltinCode` with no docstring.
 /// `fast_natural_arity` defaults to HOPELESS (no fast path).

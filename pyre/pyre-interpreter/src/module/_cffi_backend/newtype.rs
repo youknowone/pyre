@@ -410,20 +410,35 @@ pub fn array_length_arg(w_length: PyObjectRef) -> Result<i64, PyError> {
 
 // ── structs and unions ──────────────────────────────────────────────────
 
+bitflags::bitflags! {
+    /// `newtype.py SF_*` struct-layout flags.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct StructFlags: i64 {
+        const MSVC_BITFIELDS = 0x01;
+        const GCC_ARM_BITFIELDS = 0x02;
+        const GCC_BIG_ENDIAN = 0x04;
+        const PACKED = 0x08;
+        const GCC_X86_BITFIELDS = 0x10;
+        const GCC_LITTLE_ENDIAN = 0x40;
+        const STD_FIELD_POS = 0x80;
+    }
+}
+
 /// `newtype.py SF_MSVC_BITFIELDS`.
-pub const SF_MSVC_BITFIELDS: i64 = 0x01;
+pub const SF_MSVC_BITFIELDS: i64 = StructFlags::MSVC_BITFIELDS.bits();
 /// `newtype.py SF_GCC_ARM_BITFIELDS`.
-pub const SF_GCC_ARM_BITFIELDS: i64 = 0x02;
+pub const SF_GCC_ARM_BITFIELDS: i64 = StructFlags::GCC_ARM_BITFIELDS.bits();
 /// `newtype.py SF_GCC_X86_BITFIELDS`.
-pub const SF_GCC_X86_BITFIELDS: i64 = 0x10;
+pub const SF_GCC_X86_BITFIELDS: i64 = StructFlags::GCC_X86_BITFIELDS.bits();
 /// `newtype.py SF_GCC_BIG_ENDIAN`.
-pub const SF_GCC_BIG_ENDIAN: i64 = 0x04;
+pub const SF_GCC_BIG_ENDIAN: i64 = StructFlags::GCC_BIG_ENDIAN.bits();
 /// `newtype.py SF_GCC_LITTLE_ENDIAN`.
-pub const SF_GCC_LITTLE_ENDIAN: i64 = 0x40;
+pub const SF_GCC_LITTLE_ENDIAN: i64 = StructFlags::GCC_LITTLE_ENDIAN.bits();
 /// `newtype.py SF_PACKED`.
-pub const SF_PACKED: i64 = 0x08;
+pub const SF_PACKED: i64 = StructFlags::PACKED.bits();
 /// `newtype.py SF_STD_FIELD_POS`.
-pub const SF_STD_FIELD_POS: i64 = 0x80;
+pub const SF_STD_FIELD_POS: i64 = StructFlags::STD_FIELD_POS.bits();
 
 /// `newtype.py SF_DEFAULT_PACKING`.
 const SF_DEFAULT_PACKING: i64 = if cfg!(windows) { 8 } else { 0x4000_0000 };
