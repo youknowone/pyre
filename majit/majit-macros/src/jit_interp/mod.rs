@@ -52,6 +52,7 @@ use syn::{
 /// `__MAJIT_HELPER_POLICIES`). Alternatively, use `helpers` or `calls`
 /// to explicitly list the functions that need JIT integration.
 pub struct JitInterpConfig {
+    pub trace_cfg: Option<syn::Meta>,
     /// The interpreter state type (e.g., `InterpState`).
     pub state_type: Ident,
     /// The environment type (e.g., `Program`).
@@ -749,6 +750,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
 
 impl Parse for JitInterpConfig {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut trace_cfg = None;
         let mut state_type = None;
         let mut env_type = None;
         let mut io_shims = None;
@@ -794,6 +796,11 @@ impl Parse for JitInterpConfig {
                 }
                 "helpers" => {
                     calls.extend(parse_helpers_list(input)?);
+                }
+                "trace_cfg" => {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    trace_cfg = Some(content.parse()?);
                 }
                 "auto_calls" => {
                     auto_calls = Some(input.parse::<LitBool>()?.value);
@@ -905,6 +912,7 @@ impl Parse for JitInterpConfig {
         )?;
 
         Ok(JitInterpConfig {
+            trace_cfg,
             state_type,
             env_type,
             io_shims: io_shims.unwrap_or_default(),
@@ -1786,14 +1794,25 @@ pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStrea
     let state_impl = codegen_state::generate_jit_state(&config, &func);
     let merge_wrapper = generate_merge_wrapper(&config, &func);
     let green_key_fn = generate_green_key_fn(&config, &func);
-    let transformed_fn = transform_function(&config, &func);
+    let transformed_fn = transform_function(&config, &func, true);
 
-    quote! {
+    let generated = quote! {
         #state_impl
         #trace_fn
         #merge_wrapper
         #green_key_fn
         #transformed_fn
+    };
+    if let Some(condition) = &config.trace_cfg {
+        let concrete = transform_function(&config, &func, false);
+        let generated = crate::gate_generated_items(generated, condition);
+        quote! {
+            #generated
+            #[cfg(not(#condition))]
+            #concrete
+        }
+    } else {
+        generated
     }
 }
 
@@ -2119,7 +2138,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
 }
 
 /// Transform the original function: replace jit_merge_point!() and can_enter_jit!() markers.
-fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> TokenStream {
     use syn::visit_mut::VisitMut;
 
     let vis = &func.vis;
@@ -2621,16 +2640,20 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         .into_iter()
         .map(|(name, _, _)| syn::parse_quote!(#name))
         .collect();
-    let body = rewrite_body(
-        &block,
-        &merge_fn_name,
-        &portal_green_args,
-        &config.greens,
-        config.greens_declared,
-        &config.green_type_tags,
-        config.recursive_entry.as_ref(),
-        finish_return.as_ref(),
-    );
+    let body = if trace {
+        rewrite_body(
+            &block,
+            &merge_fn_name,
+            &portal_green_args,
+            &config.greens,
+            config.greens_declared,
+            &config.green_type_tags,
+            config.recursive_entry.as_ref(),
+            finish_return.as_ref(),
+        )
+    } else {
+        quote!(#block)
+    };
 
     quote! {
         #(#attrs)*

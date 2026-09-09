@@ -3860,7 +3860,30 @@ impl CallControl {
              use find_all_graphs_for_tests() if no portal is available"
         );
         self.materialize_deferred_indirect_families();
-        self.find_all_graphs_bfs(policy);
+        self.find_all_graphs_bfs(policy, &[]);
+    }
+
+    /// Rust macro consumers already own their portal and request separate
+    /// helper JitCodes. Reuse call.py's regular-call closure without inventing
+    /// a JitDriver for a helper. This entry-root adapter has no RPython API
+    /// counterpart; graph transformation and call policy remain unchanged.
+    pub fn find_helper_graphs(&mut self, policy: &mut dyn JitPolicy, roots: &[CallPath]) {
+        assert!(
+            self.jitdrivers_sd.is_empty(),
+            "helper analysis has no portal"
+        );
+        assert!(!roots.is_empty(), "helper analysis requires explicit roots");
+        for root in roots {
+            assert!(
+                self.function_graphs.contains_key(root),
+                "missing helper graph: {root:?}"
+            );
+        }
+        self.materialize_deferred_indirect_families();
+        self.find_all_graphs_bfs(policy, roots);
+        for root in roots {
+            self.get_jitcode(root);
+        }
     }
 
     /// Test-only: include all registered function graphs as candidates.
@@ -3876,7 +3899,7 @@ impl CallControl {
             return;
         }
         let mut policy = crate::policy::DefaultJitPolicy::new();
-        self.find_all_graphs_bfs(&mut policy);
+        self.find_all_graphs_bfs(&mut policy, &[]);
     }
 
     /// Attach the final `c_graphs` list to vtable calls the MIR frontend has
@@ -3931,7 +3954,7 @@ impl CallControl {
         }
     }
 
-    fn find_all_graphs_bfs(&mut self, policy: &mut dyn JitPolicy) {
+    fn find_all_graphs_bfs(&mut self, policy: &mut dyn JitPolicy, helper_roots: &[CallPath]) {
         // RPython call.py:49-92: BFS from portal targets.
         // For each graph, scan all Call ops. If guess_call_kind would
         // return 'regular' (i.e. graphs_from returns a graph AND it's
@@ -3945,6 +3968,7 @@ impl CallControl {
             .iter()
             .map(|jd| jd.portal_graph.clone())
             .collect();
+        todo.extend_from_slice(helper_roots);
         for path in &todo {
             self.candidate_graphs.insert(path.clone());
         }

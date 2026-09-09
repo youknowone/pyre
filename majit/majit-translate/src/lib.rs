@@ -582,6 +582,7 @@ pub fn analyze_multiple_pipeline_with_modules(
     analyze_pipeline_from_module_paths(
         module_paths,
         None,
+        &[],
         config,
         layout_provider,
         vinfo_factory,
@@ -613,6 +614,7 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
     analyze_pipeline_from_module_paths(
         module_paths,
         Some(llbc_paths),
+        &[],
         config,
         layout_provider,
         vinfo_factory,
@@ -965,6 +967,35 @@ fn unique_trait_impl_roots(
         .collect()
 }
 
+/// Generate only explicit helper roots for a macro-owned portal. Unlike the
+/// full portal API this does not manufacture JIT-driver metadata. This is a
+/// Rust consumer adapter; it uses the same codewriter graph transformation.
+pub fn analyze_helper_pipeline_with_modules(
+    module_paths: &[&str],
+    helper_roots: &[CallPath],
+    config: &AnalyzeConfig,
+) -> pipeline::ProgramPipelineResult {
+    assert!(
+        !helper_roots.is_empty(),
+        "helper analysis requires explicit roots"
+    );
+    assert!(
+        config.pipeline.jit_drivers.is_empty(),
+        "helper analysis has no portal"
+    );
+    analyze_pipeline_from_module_paths(
+        module_paths,
+        None,
+        helper_roots,
+        config,
+        None,
+        &|_, _| None,
+        &[],
+        &[],
+        HostStaticAddrs::default(),
+    )
+}
+
 #[expect(
     clippy::arc_with_non_send_sync,
     reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
@@ -976,6 +1007,7 @@ fn unique_trait_impl_roots(
 fn analyze_pipeline_from_module_paths(
     module_paths: &[&str],
     explicit_llbc_paths: Option<&[&str]>,
+    helper_roots: &[CallPath],
     config: &AnalyzeConfig,
     layout_provider: Option<&dyn layout::LayoutProvider>,
     vinfo_factory: &VirtualizableInfoFactory<'_>,
@@ -2145,11 +2177,13 @@ fn analyze_pipeline_from_module_paths(
     // RPython: setup_jitdriver(jitdriver_sd) — register every explicit
     // portal and its green/red layout. Portal binding and graph discovery
     // are independent of any interpreter dispatch representation.
-    register_configured_jitdrivers(
-        &mut call_control,
-        &config.pipeline.jit_drivers,
-        &config.pipeline.transform.jitdriver_receiver_roots,
-    );
+    if helper_roots.is_empty() {
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.pipeline.jit_drivers,
+            &config.pipeline.transform.jitdriver_receiver_roots,
+        );
+    }
     // warmspot.py WarmRunnerDesc.make_virtualizable_infos —
     // assigns each registered driver's virtualizable metadata only after the
     // complete driver set exists.
@@ -2291,7 +2325,11 @@ fn analyze_pipeline_from_module_paths(
         call_control.mark_canmallocgc(parse::CallPath::from_segments(["majit_gc", gc_entry]));
     }
     let mut policy = policy::DefaultJitPolicy::new();
-    call_control.find_all_graphs(&mut policy);
+    if helper_roots.is_empty() {
+        call_control.find_all_graphs(&mut policy);
+    } else {
+        call_control.find_helper_graphs(&mut policy, helper_roots);
+    }
     prof.mark("  find_all_graphs");
     prof.note(|| {
         // Two different populations are each legitimately "the universe" the
