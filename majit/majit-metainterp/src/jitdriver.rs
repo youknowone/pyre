@@ -5939,7 +5939,7 @@ impl<S: JitState> JitDriver<S> {
         // from the live state. Grain's two reds are those identities and
         // the resume stream can still name a walk-local address; rewrite
         // the concrete shadows before the walk residual-calls through them.
-        state.rebind_bridge_reds(&mut frames);
+        state.rebind_bridge_reds_from_fail(&mut frames, raw_values);
 
         self.bridge_entered_at_guard_resume = true;
         let mut entered = false;

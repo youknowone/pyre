@@ -532,6 +532,14 @@ pub trait JitState: Sized {
     /// to replace.
     fn rebind_bridge_reds(&self, _frames: &mut [GuardResumeFrame]) {}
 
+    /// Same as [`Self::rebind_bridge_reds`], with the compiled guard's
+    /// failarg dump so a red that is a livebox but not a portal-register
+    /// occupant can still name an `InputArg`.
+    fn rebind_bridge_reds_from_fail(&self, frames: &mut [GuardResumeFrame], fail_values: &[i64]) {
+        let _ = fail_values;
+        self.rebind_bridge_reds(frames);
+    }
+
     /// resume.py rebuild_from_resumedata: decode rd_numb to
     /// reconstruct the complete frame state for bridge tracing.
     ///
