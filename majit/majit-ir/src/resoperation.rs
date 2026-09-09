@@ -1277,7 +1277,10 @@ pub struct VectorizationInfo {
 #[derive(Clone, Debug)]
 pub(crate) struct GuardExtra {
     pub(crate) fail_args: Option<Vec<Operand>>,
-    pub(crate) fail_arg_types: Option<Vec<Type>>,
+    /// Packed so `Box<GuardExtra>` leaves the 64-byte class. `Option<Vec<Type>>`
+    /// is 24 B and kept every guard clone in that class; the type cache is a
+    /// handful of `Type` tags (backend convenience, not a GuardResOp field).
+    pub(crate) fail_arg_types: Option<Box<[Type]>>,
     /// resoperation.py `GuardResOp.rd_resume_position` — `-1` unset.
     pub(crate) rd_resume_position: i32,
 }
@@ -4053,6 +4056,11 @@ mod tests {
             assert!(
                 op <= 144,
                 "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 176-byte class"
+            );
+            let extra = std::mem::size_of::<GuardExtra>();
+            assert!(
+                extra <= 48,
+                "GuardExtra grew to {extra} bytes; keep Box<GuardExtra> out of the 64-byte class"
             );
         }
     }

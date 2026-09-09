@@ -167,9 +167,9 @@ impl Op {
 
     /// Owned snapshot of `GuardResOp.getfailargs` (`self._fail_args[:]`).
     /// The live list is [`Op::guard_fail_args`]; use that on hot reads.
-    /// A `SmallVec<[; 3]>` clone heap-grows when resume failargs exceed
-    /// three live boxes, which is the common deopt shape.
-    pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::operand::Operand; 3]>> {
+    /// A `SmallVec<[; 4]>` clone stays inline for the common four-or-fewer
+    /// failarg list (same capacity as `OpArgVec` / `setfailargs`).
+    pub fn getfailargs(&self) -> Option<crate::resoperation::OpArgVec> {
         self.guard_fail_args()
             .map(|fa| fa.iter().cloned().collect())
     }
@@ -209,13 +209,17 @@ impl Op {
         }
     }
 
-    pub fn setfailargs(&self, fail_args: smallvec::SmallVec<[crate::operand::Operand; 3]>) {
+    pub fn setfailargs(&self, fail_args: crate::resoperation::OpArgVec) {
         // `GuardResOp._fail_args` holds the producer operands themselves
-        // (resoperation.py:483), exactly like `Op.args`: a bound fail-arg
-        // is its `Operand::Op`/`Operand::InputArg` producer, a constant is
-        // `Operand::Const`. An unbound position-only fail-arg is a contract
-        // violation (every writer binds its producer) — `Operand::from_opref`
-        // panics for it at the call site.
+        // (resoperation.py `setfailargs`), exactly like `Op.args`: a bound
+        // fail-arg is its `Operand::Op`/`Operand::InputArg` producer, a
+        // constant is `Operand::Const`. An unbound position-only fail-arg
+        // is a contract violation (every writer binds its producer) —
+        // `Operand::from_opref` panics for it at the call site.
+        //
+        // Four inline slots match `OpArgVec`: a 4-failarg list stays on
+        // the stack here and becomes one `Vec` heap, not a `[; 3]` spill
+        // plus a second collect.
         self.ensure_guard_extra().fail_args = Some(fail_args.into_iter().collect());
     }
 
@@ -261,7 +265,7 @@ impl Op {
         // Immutable extra borrow: callers often hold `guard_fail_args()`
         // (also an extra borrow) while reading types.
         self.try_guard_extra()
-            .and_then(|g| g.fail_arg_types.clone())
+            .and_then(|g| g.fail_arg_types.as_ref().map(|t| t.to_vec()))
     }
 
     /// Owned-clone variant — RPython would write `fail_arg_types[:]`.
@@ -273,7 +277,7 @@ impl Op {
     /// (interior mutability through `RefCell`) so shared `Op` instances
     /// can be re-stamped without `&mut`.
     pub fn set_fail_arg_types(&self, types: Vec<crate::value::Type>) {
-        self.ensure_guard_extra().fail_arg_types = Some(types);
+        self.ensure_guard_extra().fail_arg_types = Some(types.into_boxed_slice());
     }
 
     /// Clear the per-failarg type vector.

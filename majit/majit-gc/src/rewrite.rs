@@ -868,11 +868,12 @@ impl RewriteState {
                 out = Rc::new((*out).clone());
                 replaced = true;
             }
-            if let Some(fa) = out.guard_fail_args() {
-                let rewritten: Vec<Operand> = fa.iter().map(|a| self.resolve(a.clone())).collect();
-                drop(fa);
-                out.setfailargs(rewritten.into());
-            }
+            // copy_and_change already copied `_fail_args`. Remap that list
+            // in place instead of `setfailargs([get_box_replacement(a)])`,
+            // which would allocate a second 4-operand Vec.
+            out.map_failargs_in_place(|a| {
+                *a = self.resolve(a.clone());
+            });
         }
         let rt = out.result_type();
         let pos = if replaced {
@@ -1002,6 +1003,7 @@ impl RewriteState {
         self.forwarding.get(&r.to_opref()).cloned().unwrap_or(r)
     }
 
+    #[allow(dead_code)]
     fn rewrite_op(&self, op: &Op) -> Op {
         let mut rewritten = op.clone();
         // optimizer.py force_box loop parity:
@@ -3415,10 +3417,10 @@ impl GcRewriter for GcRewriterImpl {
                 OpCode::Label => {
                     st.emitting_an_operation_that_can_collect();
                     st.known_lengths.clear();
-                    // rewrite.py emit_label resets the per-block load CSE.
+                    // rewrite.py emit_label resets the per-block load CSE,
+                    // then the main loop falls through to emit_op.
                     st.gcrefs_recently_loaded.clear();
-                    let rewritten = st.rewrite_op(op);
-                    st.emit_rewritten_from(op, rewritten);
+                    st.emit_maybe_forwarded(&op_rc);
                 }
 
                 // ── Allocation ──
@@ -3511,10 +3513,9 @@ impl GcRewriter for GcRewriterImpl {
                 // ── Operations that can trigger GC ──
                 _ if op.opcode.can_malloc() => {
                     // rewrite.py — emitting_an_operation_that_can_collect
-                    // already flushes pending zeros (rewrite.py:707).
+                    // already flushes pending zeros, then emit_op.
                     st.emitting_an_operation_that_can_collect();
-                    let rewritten = st.rewrite_op(op);
-                    st.emit_rewritten_from(op, rewritten);
+                    st.emit_maybe_forwarded(&op_rc);
                 }
 
                 // ── GUARD_ALWAYS_FAILS lowering (rewrite.py:419-426) ──
@@ -3530,8 +3531,7 @@ impl GcRewriter for GcRewriterImpl {
                     let same_pos = st.emit_result(same, OpRef::NONE);
                     let newop =
                         op.copy_and_change(OpCode::GuardValue, Some(&[same_pos, one]), None);
-                    let rewritten = st.rewrite_op(&newop);
-                    st.emit(rewritten);
+                    st.emit_op(&Rc::new(newop));
                 }
 
                 // ── Guards: emit_pending_zeros was already called at the
@@ -3540,51 +3540,44 @@ impl GcRewriter for GcRewriterImpl {
                 // not clear wb_applied — only emitting_an_operation_that_
                 // can_collect does that (rewrite.py:699-711).
                 _ if op.opcode.is_guard() => {
-                    let rewritten = st.rewrite_op(op);
-                    // GUARD_EXCEPTION carries a Ref result (the caught
-                    // exception value, pyjitpl.py:3385-3392 `last_exc_box =
-                    // op`). Emit through `emit_rewritten_from` so a non-Void
-                    // guard result keeps its original position and registers
-                    // a forwarding entry — otherwise `emit` would renumber it
-                    // and downstream uses (e.g. a SETFIELD_GC of the caught
-                    // exception) would dangle. Void-result guards are
-                    // unaffected (emit_rewritten_from defers to `emit`).
-                    st.emit_rewritten_from(op, rewritten);
+                    // rewrite.py falls through to emit_op after
+                    // emit_pending_zeros. emit_op copy_and_changes guards
+                    // (failargs) and emit_maybe_forwarded records a
+                    // non-void result (GUARD_EXCEPTION) under the original
+                    // position.
+                    st.emit_maybe_forwarded(&op_rc);
                 }
 
                 // ── Everything else: pass through unchanged. ──
                 OpCode::CondCallGcWb => {
-                    let rewritten = st.rewrite_op(op);
-                    let obj = rewritten.arg(0);
-                    st.emit(rewritten);
+                    let obj = st.resolve(op.arg(0));
+                    st.emit_maybe_forwarded(&op_rc);
                     st.remember_wb(&obj);
                 }
                 OpCode::CondCallGcWbArray => {
-                    // rewrite.py:970: WB_ARRAY does not mark the base as
-                    // barrier-applied; future setarrayitems still need
-                    // their own barrier (no remember_wb call).
-                    let rewritten = st.rewrite_op(op);
-                    st.emit(rewritten);
+                    // rewrite.py `handle_write_barrier_setarrayitem`: WB_ARRAY
+                    // does not mark the base as barrier-applied; future
+                    // setarrayitems still need their own barrier (no
+                    // remember_wb call). Then emit_op.
+                    st.emit_maybe_forwarded(&op_rc);
                 }
                 // ── Final ops (Jump, Finish) flush pending zeros before emit. ──
                 _ if op.opcode.is_final() => {
                     st.emit_pending_zeros();
-                    let rewritten = st.rewrite_op(op);
-                    st.emit_rewritten_from(op, rewritten);
+                    st.emit_maybe_forwarded(&op_rc);
                 }
 
                 // rewrite.py:383-387 — record INT_ADD/INT_SUB whose
                 // constant operand is later folded into a GC_STORE_INDEXED
                 // / GC_LOAD_INDEXED offset via `_try_use_older_box`.
                 OpCode::IntAdd | OpCode::IntAddOvf => {
-                    let rewritten = st.rewrite_op(op);
-                    st.record_int_add_or_sub(&rewritten, false);
-                    st.emit_rewritten_from(op, rewritten);
+                    // rewrite.py records on the original op, then emit_op.
+                    st.record_int_add_or_sub(op, false);
+                    st.emit_maybe_forwarded(&op_rc);
                 }
                 OpCode::IntSub | OpCode::IntSubOvf => {
-                    let rewritten = st.rewrite_op(op);
-                    st.record_int_add_or_sub(&rewritten, true);
-                    st.emit_rewritten_from(op, rewritten);
+                    st.record_int_add_or_sub(op, true);
+                    st.emit_maybe_forwarded(&op_rc);
                 }
 
                 // ── Everything else: follow forwarding if `transform_to_gc_load`

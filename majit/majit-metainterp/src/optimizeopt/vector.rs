@@ -1545,7 +1545,7 @@ impl VectorizingOptimizer {
         // arm keeps `orig`'s live-producer Operand. No `from_opref`, so no
         // position-only fabrication / panic on a live producer.
         if let Some(fail_args) = copied_op.guard_fail_args() {
-            let renamed: smallvec::SmallVec<[Operand; 3]> = fail_args
+            let renamed: smallvec::SmallVec<[Operand; 4]> = fail_args
                 .iter()
                 .map(|orig| {
                     renamer

@@ -858,7 +858,7 @@ pub fn prepare_fail_arguments(
         return;
     }
     if let Some(fail_args) = first_op.guard_fail_args() {
-        let mut new_fail_args: smallvec::SmallVec<[Operand; 3]> =
+        let mut new_fail_args: smallvec::SmallVec<[Operand; 4]> =
             fail_args.iter().cloned().collect();
         for slot in new_fail_args.iter_mut() {
             let arg = slot.to_opref();
