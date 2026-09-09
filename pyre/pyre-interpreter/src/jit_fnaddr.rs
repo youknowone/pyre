@@ -5513,7 +5513,10 @@ mod tests {
             bindings["pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w"],
             expected,
         );
-        assert_eq!(bindings["pyre_object::w_dict_getitem_str_hashed_w"], expected);
+        assert_eq!(
+            bindings["pyre_object::w_dict_getitem_str_hashed_w"],
+            expected
+        );
     }
 
     #[test]

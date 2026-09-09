@@ -2302,6 +2302,14 @@ fn field_slot_disagreement(
     if !crate::jit_strict_mode() {
         return None;
     }
+    // An uninterned SizeDescr (`index == u32::MAX`) has field rows whose
+    // parent identities are not the assembler-pool keys `slot_holds_field`
+    // compares. The check cannot name a real disagreement, so it must not
+    // abort a walk that recorded an ADT tag write (StepResult::__discriminant
+    // vs StepResult::Return::__discriminant at the same offset).
+    if descr.index() == u32::MAX {
+        return None;
+    }
     let fields = descr.as_size_descr()?.all_fielddescrs();
     let Some(slot) = fields.get(field_idx as usize) else {
         return Some(format!(
