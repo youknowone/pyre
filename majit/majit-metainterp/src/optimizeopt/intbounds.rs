@@ -77,10 +77,13 @@ pub fn print_rewrite_rule_statistics() {
 /// (`Forwarded::Info(OpInfo::IntBound(_))`) accessed via
 /// `ctx.getintbound`/`ctx.setintbound`/`ctx.with_intbound_mut`.
 pub struct OptIntBounds {
-    /// intbounds.py: last_emitted_operation — opcode (for overflow guard handling).
+    /// intbounds.py `last_emitted_operation` — opcode (overflow guards).
     last_emitted_opcode: Option<OpCode>,
-    /// intbounds.py: last_emitted_operation — args (for overflow guard handling).
-    last_emitted_args: Vec<OpRef>,
+    /// `lastop.getarg(0)` / `getarg(1)`. INT_*_OVF is binary; keep the
+    /// two args inline so `record_emitted` does not mint a Vec per op.
+    last_emitted_arg0: OpRef,
+    last_emitted_arg1: OpRef,
+    last_emitted_n_args: u8,
     /// intbounds.py: last_emitted_operation — OpRef result.
     last_emitted_ref: OpRef,
 }
@@ -89,7 +92,9 @@ impl OptIntBounds {
     pub fn new() -> Self {
         OptIntBounds {
             last_emitted_opcode: None,
-            last_emitted_args: Vec::new(),
+            last_emitted_arg0: OpRef::NONE,
+            last_emitted_arg1: OpRef::NONE,
+            last_emitted_n_args: 0,
             last_emitted_ref: OpRef::NONE,
         }
     }
@@ -766,9 +771,9 @@ impl OptIntBounds {
         }
         // intbounds.py:222-228: synthesize the non-overflowing inverse
         let result = self.last_emitted_ref;
-        if self.last_emitted_args.len() >= 2 && !result.is_none() {
-            let arg0 = self.last_emitted_args[0];
-            let arg1 = self.last_emitted_args[1];
+        if self.last_emitted_n_args >= 2 && !result.is_none() {
+            let arg0 = self.last_emitted_arg0;
+            let arg1 = self.last_emitted_arg1;
             match opcode {
                 OpCode::IntAddOvf => {
                     ctx.register_pure_from_args2(OpCode::IntSub, arg0, result, arg1);
@@ -1517,7 +1522,10 @@ impl OptIntBounds {
     /// Mirrors RPython's self.last_emitted_operation = op in Optimization.emit().
     fn record_emitted(&mut self, op: &Op) {
         self.last_emitted_opcode = Some(op.opcode);
-        self.last_emitted_args = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let args = op.getarglist();
+        self.last_emitted_arg0 = args.first().map(|a| a.to_opref()).unwrap_or(OpRef::NONE);
+        self.last_emitted_arg1 = args.get(1).map(|a| a.to_opref()).unwrap_or(OpRef::NONE);
+        self.last_emitted_n_args = args.len().min(2) as u8;
         self.last_emitted_ref = op.pos.get();
     }
 }
@@ -1600,7 +1608,9 @@ impl Optimization for OptIntBounds {
 
     fn setup(&mut self) {
         self.last_emitted_opcode = None;
-        self.last_emitted_args.clear();
+        self.last_emitted_arg0 = OpRef::NONE;
+        self.last_emitted_arg1 = OpRef::NONE;
+        self.last_emitted_n_args = 0;
         self.last_emitted_ref = OpRef::NONE;
     }
 
