@@ -656,17 +656,23 @@ fn branch_guard_snapshot_rechecks_the_condition_before_either_arm() {
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut tc = TraceCtx::for_test_types(&[Type::Int]);
     let condbox = OpRef::input_arg_int(0);
-    let mut regs_i = [condbox];
     let mut wc = WalkContext {
-        callee_shadow: None,
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: Vec::new(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
         inline_callee_consts: None,
         inline_poison_pcs: None,
         fbw_mode: mode,
         session: &session,
-        registers_r: &mut [],
-        registers_i: &mut regs_i,
-        registers_f: &mut [],
-        concrete_registers_r: &mut [],
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new([condbox]),
+        registers_f: &RegisterBank::default(),
         concrete_registers_i: &mut [],
         descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
@@ -677,15 +683,11 @@ fn branch_guard_snapshot_rechecks_the_condition_before_either_arm() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: unsafe { (*installed).index as u32 },
-        outer_active_boxes: Vec::new(),
         pending_guard_snapshot_error: None,
-        vstack_boxes: Vec::new(),
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-        vstack_last_ref: OpRef::NONE,
         vstack_reorder_ceiling: u32::MAX,
-        vstack_reorder_saved: None,
         vstack_handler_landing_py: None,
         live_before_jit_pc: 0,
         live_after_jit_pc: usize::MAX,
