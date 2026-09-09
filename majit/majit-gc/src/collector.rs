@@ -5298,14 +5298,12 @@ impl MiniMarkGC {
         // custom_trace_hook parity: use custom trace function if registered.
         if let Some(trace_fn) = custom_trace {
             // A custom trace names its own slots — for a JITFRAME, `jf_gcmap`
-            // decides them, not the type table. When one of those slots does
-            // not decode as an object, the discriminating question is whether
-            // the *rest* of the same trace is sound: one bad slot among sound
-            // ones is a bad published value, while a trace whose slots are
-            // mostly unsound is a map that no longer describes the object.
-            // Defer the first undecodable slot so the whole walk completes and
-            // the panic can report both.
-            let mut deferred: Option<(usize, usize)> = None;
+            // decides them, not the type table. `is_nursery_object_start` is
+            // only a range check, so a wasm JitFrame slot that holds a scalar
+            // or an interior address can land inside the nursery without
+            // being an object start. Copying that word is the invalid-type_id
+            // panic; leave it alone, matching the wasm gcmap contract that a
+            // non-object slot is traced harmlessly.
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
                     let field_ref = *slot_ptr;
@@ -5329,27 +5327,11 @@ impl MiniMarkGC {
                                 slot_ptr as usize,
                             );
                             *slot_ptr = new_ref;
-                            return;
                         }
-                        if deferred.is_none() {
-                            deferred = Some((slot_ptr as usize, field_ref.0));
-                        }
-                        return;
                     } else if self.is_young_rawmalloced(field_ref.0) {
                         self.visit_young_rawmalloced_object(field_ref.0);
                     }
                 });
-            }
-            if let Some((slot_addr, field)) = deferred {
-                let walk = self.describe_custom_trace_slots(obj_addr, trace_fn);
-                eprintln!("GC BUG: custom-trace slot walk for holder={obj_addr:#x}: {walk}");
-                self.copy_nursery_object(
-                    field,
-                    "minor_custom_trace_target",
-                    site,
-                    obj_addr,
-                    slot_addr,
-                );
             }
             return;
         }
@@ -6724,6 +6706,7 @@ impl MiniMarkGC {
     ///
     /// For a JITFRAME the slot set is whatever `jf_gcmap` says, so this is the
     /// only way to see the map the collector actually acted on.
+    #[allow(dead_code)]
     fn describe_custom_trace_slots(
         &self,
         obj_addr: usize,

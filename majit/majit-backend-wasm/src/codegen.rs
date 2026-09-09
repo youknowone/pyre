@@ -2412,11 +2412,11 @@ impl HomeLiveness {
         Self { def_pos, last_use }
     }
 
-    /// Value `raw` is defined before op `at` and read after it — i.e. its
-    /// local holds a value a collection at op `at` could invalidate.
+    /// Value `raw` is defined before op `at` and still read at or after it.
+    /// RPython `RegisterManager.is_still_alive` is `last_usage >= position`.
     fn live_across(&self, raw: u32, at: usize) -> bool {
         let raw = raw as usize;
-        raw < self.def_pos.len() && self.def_pos[raw] < at as i32 && self.last_use[raw] > at as i32
+        raw < self.def_pos.len() && self.def_pos[raw] < at as i32 && self.last_use[raw] >= at as i32
     }
 
     fn live_across_any(&self, raw: u32, positions: &[usize]) -> bool {
@@ -4458,14 +4458,13 @@ impl FrameGcMaps {
         let mut indices: Vec<_> = homes
             .iter()
             .filter_map(|(raw, home)| {
-                // `live_across` is `last_use > at`. RPython
-                // `RegisterManager.is_still_alive` is `last_usage >=
-                // position`, and `consider_call` force-stores every Ref
-                // argument even when this call is its last SSA use
-                // (callbuilder.py). The callee still holds the raw
-                // argument, so a collecting Call* must keep it in the
-                // gcmap. CALL_ASSEMBLER is the same rule, not a special
-                // case.
+                // `live_across` is `last_use >= at`, matching RPython
+                // `RegisterManager.is_still_alive`. `consider_call` still
+                // force-stores every Ref argument (callbuilder.py); keep
+                // the same rule here so a collecting Call* whose last
+                // SSA use is this op stays in the gcmap even if a later
+                // edit narrows `live_across`. CALL_ASSEMBLER is the same
+                // rule, not a special case.
                 let call_arg = op.getarglist().iter().any(|arg| {
                     let arg = arg.to_opref();
                     !arg.is_constant() && arg.raw() == raw
@@ -4484,7 +4483,8 @@ impl FrameGcMaps {
     fn force_indices(&self, homes: &RefHomes, op: &Op) -> Vec<usize> {
         let args = exit_fail_args(op);
         let mask = live_fail_arg_mask(op.getdescr().as_ref(), args.len());
-        args.into_iter()
+        let mut indices: Vec<_> = args
+            .into_iter()
             .zip(mask)
             .enumerate()
             .filter_map(|(i, (arg, live))| {
@@ -4495,7 +4495,17 @@ impl FrameGcMaps {
                 (live && arg.ty() == Some(Type::Ref) && homes.home(arg).is_some())
                     .then(|| force_arg_location(self.frame, homes, arg, i))
             })
-            .collect()
+            .collect();
+        // LABEL captures stay live until the source loop resumes
+        // (`FrameGeometry`: the whole home region remains covered by
+        // jf_gcmap).  GUARD_NOT_FORCED_2 installs this map until FINISH;
+        // dropping the captures lets a minor collection free them while
+        // the old-gen JitFrame stays remembered, and the next
+        // `live_indices` remarks the leftover.
+        for home in self.frame.ordinary_home_slots()..self.frame.home_slots {
+            indices.push(self.home_index(home as u32));
+        }
+        indices
     }
 
     fn emit_push_gcmap(&self, sink: &mut PeepSink<'_, '_>, indices: &[usize]) {
@@ -13465,6 +13475,31 @@ mod tests {
         assert!(
             maps.finish_gcmap.borrow().is_empty(),
             "a later trace must not inherit this finish map"
+        );
+    }
+
+    #[test]
+    fn force_indices_keeps_label_capture_homes() {
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let homes = RefHomes {
+            by_id: vec![0, 1, 2, 3, 4],
+            len: 5,
+        };
+        let maps = FrameGcMaps::new(true, FrameGeometry::compact(8, 5, 2));
+        let guard = Op::new(OpCode::GuardNotForced2, &[]);
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_ref(1))]);
+        let indices = maps.force_indices(&homes, &guard);
+        assert!(
+            indices.contains(&maps.home_index(1)),
+            "force failarg home stays in the map"
+        );
+        assert!(
+            indices.contains(&maps.home_index(3)) && indices.contains(&maps.home_index(4)),
+            "LABEL capture homes stay covered through GUARD_NOT_FORCED_2 / FINISH"
+        );
+        assert!(
+            !indices.contains(&maps.home_index(0)),
+            "ordinary homes that are not force failargs stay off the force map"
         );
     }
 

@@ -580,11 +580,22 @@ pub(crate) fn publish_residual_call_exception(exc_obj: i64) {
     // the blackhole) end up reading the value's `ExcKind` tag through a match
     // with no wildcard arm; see `exit_frame_exception_ref`.
     let obj = exc_obj as PyObjectRef;
+    // Leftover `NewWithVtable` allocates the exception in the nursery.  A
+    // later collection that does not rewrite this native copy leaves a
+    // forwarding stub: the first payload word is the new address
+    // (`GcHeader::set_forwarding_address`), so classifying the leftover
+    // reads that address as `ob_type` and rejects a live ValueError.
+    let obj = if obj.is_null() {
+        obj
+    } else {
+        pyre_object::gc_hook::try_gc_current_object_address(obj as *mut u8) as PyObjectRef
+    };
     if !obj.is_null()
         && unsafe { pyre_object::interp_exceptions::w_exception_kind_checked(obj) }.is_none()
     {
         reject_non_exception_channel_value(obj, "publish_residual_call_exception", String::new);
     }
+    let exc_obj = obj as i64;
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj));
     store_jit_exception(exc_obj);
 }
