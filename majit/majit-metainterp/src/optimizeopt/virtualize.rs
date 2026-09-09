@@ -2489,7 +2489,7 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         slot_owner: &str,
         field_owner: &str,
         field_name: &str,
-        _parent_keys: Option<(u64, u64)>,
+        parent_keys: Option<(u64, u64)>,
     ) -> bool {
         if field_name != "__discriminant" {
             return false;
@@ -2501,12 +2501,18 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         if base != majit_ir::descr::strip_generic_args(field_owner).as_ref() {
             return false;
         }
-        // The tag is the only row the enum base carries. A fully-qualified
-        // `Enum::Variant` / `Enum` pair at `__discriminant` is that
-        // superclass edge; unresolved SizeDescrs (`index == u32::MAX`)
-        // have cache keys that do not match `from_canonical_spelling`,
-        // so the key check cannot be required here.
-        true
+        // Unlike the two explicitly-declared Result/Option shells above, an
+        // arbitrary textual `Enum::Variant -> Enum` shape is not itself proof
+        // of inheritance: two crates can publish the same stripped spelling.
+        // Require both parent cache keys to be the identities derived from the
+        // producer-canonical names. This admits the distinct variant/base
+        // StructIds of the real superclass edge and rejects an alias whose
+        // spelling happens to collide with either identity.
+        parent_keys.is_some_and(|(slot_key, field_key)| {
+            majit_ir::descr::StructId::from_canonical_spelling(slot_owner).as_u64() == slot_key
+                && majit_ir::descr::StructId::from_canonical_spelling(field_owner).as_u64()
+                    == field_key
+        })
     }
 
     let owners_agree = |slot_owner: &str, field_owner: &str, parent_keys: Option<(u64, u64)>| {
