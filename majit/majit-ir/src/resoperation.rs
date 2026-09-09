@@ -1377,6 +1377,55 @@ const VALUE_FLOAT: u8 = 2;
 const VALUE_REF: u8 = 3;
 const VALUE_VOID: u8 = 4;
 
+/// Inline operand capacity. `GC_STORE` is four args (`ptr`, `ofs`,
+/// `value`, `size`); `SmallVec<[; 3]>` heap-grows 64 B on every SETFIELD
+/// lowering. Four slots stay inside `Op` only if `descr` / `forwarded`
+/// drop their `RefCell` borrow flags (RPython writes those fields on
+/// the shared ResOp with no extra word).
+pub type OpArgVec = SmallVec<[Operand; 4]>;
+
+/// `ResOpWithDescr._descr` slot. `UnsafeCell` matches RPython's
+/// unrestricted `op.setdescr(...)` on a shared ResOp; a `RefCell` flag
+/// would push `OpArgVec` back into the 192-byte `Rc<Op>` class.
+#[derive(Debug)]
+pub struct DescrSlot(std::cell::UnsafeCell<Option<DescrRef>>);
+
+impl DescrSlot {
+    pub fn new(v: Option<DescrRef>) -> Self {
+        DescrSlot(std::cell::UnsafeCell::new(v))
+    }
+
+    #[inline]
+    pub fn borrow(&self) -> &Option<DescrRef> {
+        unsafe { &*self.0.get() }
+    }
+
+    #[inline]
+    pub fn borrow_mut(&self) -> &mut Option<DescrRef> {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// `_forwarded` slot. Same `UnsafeCell` trade as [`DescrSlot`].
+#[derive(Debug)]
+pub struct ForwardedSlot(std::cell::UnsafeCell<crate::forwarding::Forwarded>);
+
+impl ForwardedSlot {
+    pub fn new(v: crate::forwarding::Forwarded) -> Self {
+        ForwardedSlot(std::cell::UnsafeCell::new(v))
+    }
+
+    #[inline]
+    pub fn borrow(&self) -> &crate::forwarding::Forwarded {
+        unsafe { &*self.0.get() }
+    }
+
+    #[inline]
+    pub fn borrow_mut(&self) -> &mut crate::forwarding::Forwarded {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
 /// `resoperation.py` subclass payload: `GuardResOp` / `VectorOp` /
 /// `VectorGuardOp`. Stored behind `Op.extra` so `PlainResOp` stays slim.
 #[derive(Clone, Debug)]
@@ -1419,13 +1468,11 @@ pub struct Op {
     /// [`Operand`] directly. Every source binds its producer, so an unbound
     /// position-only operand is never stored — that would be a #9 contract
     /// violation.
-    pub args: std::cell::RefCell<SmallVec<[Operand; 3]>>,
-    /// `resoperation.py ResOpWithDescr._descr` parity.  `RefCell`
-    /// so the optimizer can stamp a descr onto a shared `Op` reached
-    /// through `Rc<Op>`: RPython's
-    /// `op.setdescr(...)` writes through the same slot every observer
-    /// sees.
-    pub descr: std::cell::RefCell<Option<DescrRef>>,
+    pub args: std::cell::RefCell<OpArgVec>,
+    /// `resoperation.py ResOpWithDescr._descr` parity. Shared-`Op`
+    /// writes go through [`DescrSlot`] the way RPython assigns
+    /// `op._descr` on the same ResOp every observer sees.
+    pub descr: DescrSlot,
     /// `resoperation.py` subclass extras: `GuardResOp._fail_args`,
     /// `fail_arg_types`, `rd_resume_position`, and `VectorOp` /
     /// `VectorGuardOp` vector shape. `PlainResOp` / `ResOpWithDescr`
@@ -1436,7 +1483,7 @@ pub struct Op {
     /// slot — the canonical forwarding host for a bound ResOp box.
     /// `Forwarded::None` until a writer sets it; `set_forwarded_*`
     /// on a bound box routes here, and `get_forwarded` reads it back.
-    pub forwarded: std::cell::RefCell<crate::forwarding::Forwarded>,
+    pub forwarded: ForwardedSlot,
 }
 
 impl Clone for Op {
@@ -1454,9 +1501,9 @@ impl Clone for Op {
             pos: OpPos::new(self.pos.get()),
             value_bits: std::cell::Cell::new(0),
             args: std::cell::RefCell::new(self.args.borrow().clone()),
-            descr: std::cell::RefCell::new(self.descr.borrow().clone()),
+            descr: DescrSlot::new(self.descr.borrow().clone()),
             extra: std::cell::RefCell::new(self.extra.borrow().clone()),
-            forwarded: std::cell::RefCell::new(Forwarded::None),
+            forwarded: ForwardedSlot::new(Forwarded::None),
         }
     }
 }
@@ -1582,9 +1629,9 @@ impl Op {
             pos: OpPos::new(OpRef::NONE),
             value_bits: std::cell::Cell::new(0),
             args: std::cell::RefCell::new(args.iter().cloned().collect()),
-            descr: std::cell::RefCell::new(None),
+            descr: DescrSlot::new(None),
             extra: std::cell::RefCell::new(None),
-            forwarded: std::cell::RefCell::new(Forwarded::None),
+            forwarded: ForwardedSlot::new(Forwarded::None),
         }
     }
 
@@ -1596,9 +1643,9 @@ impl Op {
             pos: OpPos::new(OpRef::NONE),
             value_bits: std::cell::Cell::new(0),
             args: std::cell::RefCell::new(args.iter().cloned().collect()),
-            descr: std::cell::RefCell::new(Some(descr)),
+            descr: DescrSlot::new(Some(descr)),
             extra: std::cell::RefCell::new(None),
-            forwarded: std::cell::RefCell::new(Forwarded::None),
+            forwarded: ForwardedSlot::new(Forwarded::None),
         }
     }
 
@@ -1693,7 +1740,7 @@ impl Op {
         args: Option<&[Operand]>,
         descr: Option<Option<DescrRef>>,
     ) -> Op {
-        let new_args: SmallVec<[Operand; 3]> = match args {
+        let new_args: OpArgVec = match args {
             Some(a) => a.iter().cloned().collect(),
             None => self.args.borrow().clone(),
         };
@@ -1708,9 +1755,9 @@ impl Op {
             pos: OpPos::new(self.pos.get()),
             value_bits: std::cell::Cell::new(0),
             args: std::cell::RefCell::new(new_args),
-            descr: std::cell::RefCell::new(new_descr),
+            descr: DescrSlot::new(new_descr),
             extra: std::cell::RefCell::new(self.extra.borrow().clone()),
-            forwarded: std::cell::RefCell::new(Forwarded::None),
+            forwarded: ForwardedSlot::new(Forwarded::None),
         };
         // resoperation.py GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
@@ -3982,7 +4029,7 @@ mod tests {
                 type_: Type::Void,
                 value_kind: std::cell::Cell::new(VALUE_UNSET),
                 value_bits: std::cell::Cell::new(0),
-                forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
+                forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
             };
             __op.type_ = __op.opcode.result_type();
             __op
@@ -5066,21 +5113,21 @@ mod tests {
             op! {
                 opcode: OpCode::IntAdd,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(3)),
             extra: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(4)),
             extra: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
             extra: std::cell::RefCell::new(None),
             },
@@ -5098,7 +5145,7 @@ mod tests {
         let op = op! {
             opcode: OpCode::IntAdd,
             args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-            descr: std::cell::RefCell::new(None),
+            descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::int_op(6)),
             extra: std::cell::RefCell::new(None),
         };
@@ -5111,7 +5158,7 @@ mod tests {
         let op = op! {
             opcode: OpCode::SetfieldGc,
             args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-            descr: std::cell::RefCell::new(None),
+            descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::NONE),
             extra: std::cell::RefCell::new(None),
         };
@@ -5124,7 +5171,7 @@ mod tests {
         let op = op! {
             opcode: OpCode::GuardTrue,
             args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-            descr: std::cell::RefCell::new(None),
+            descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::NONE),
             // FAIL_ARGS applied below
             extra: std::cell::RefCell::new(None),
@@ -5145,7 +5192,7 @@ mod tests {
         let op = op! {
             opcode: OpCode::GuardTrue,
             args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-            descr: std::cell::RefCell::new(None),
+            descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::NONE),
             extra: std::cell::RefCell::new(None),
         };
@@ -5158,7 +5205,7 @@ mod tests {
         let ops = vec![op! {
             opcode: OpCode::IntAdd,
             args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-            descr: std::cell::RefCell::new(None),
+            descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::int_op(1)),
             extra: std::cell::RefCell::new(None),
         }];
@@ -5175,7 +5222,7 @@ mod tests {
             op! {
                 opcode: OpCode::IntAdd,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(1)),
                 extra: std::cell::RefCell::new(None),
             },
@@ -5183,7 +5230,7 @@ mod tests {
                 let op = op! {
                     opcode: OpCode::GuardTrue,
                     args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-                    descr: std::cell::RefCell::new(None),
+                    descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
                     extra: std::cell::RefCell::new(None),
                 };
@@ -5199,7 +5246,7 @@ mod tests {
             op! {
                 opcode: OpCode::Finish,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
                 extra: std::cell::RefCell::new(None),
             },
@@ -5216,7 +5263,7 @@ mod tests {
             let op = op! {
                 opcode: OpCode::GuardTrue,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
                 extra: std::cell::RefCell::new(None),
             };
@@ -5253,28 +5300,28 @@ mod tests {
             op! {
                 opcode: OpCode::Label,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
             extra: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(3)),
             extra: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(4)),
             extra: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
             extra: std::cell::RefCell::new(None),
             },
@@ -5303,14 +5350,14 @@ mod tests {
             op! {
                 opcode: OpCode::IntSub,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(1)),
             extra: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntGt,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_001)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(2)),
             extra: std::cell::RefCell::new(None),
             },
@@ -5318,7 +5365,7 @@ mod tests {
                 let op = op! {
                     opcode: OpCode::GuardTrue,
                     args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                    descr: std::cell::RefCell::new(None),
+                    descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
                     extra: std::cell::RefCell::new(None),
                 };
@@ -5334,7 +5381,7 @@ mod tests {
             op! {
                 opcode: OpCode::Finish,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
                 extra: std::cell::RefCell::new(None),
             },
@@ -5360,7 +5407,7 @@ mod tests {
         let ops = vec![op! {
             opcode: OpCode::DebugMergePoint,
             args: std::cell::RefCell::new(smallvec::smallvec![]),
-            descr: std::cell::RefCell::new(Some(descr)),
+            descr: DescrSlot::new(Some(descr)),
             pos: OpPos::new(OpRef::NONE),
             extra: std::cell::RefCell::new(None),
         }];
@@ -5388,21 +5435,21 @@ mod tests {
             op! {
                 opcode: OpCode::Label,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
             extra: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(2)),
             extra: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::IntLt,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 2), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(3)),
             extra: std::cell::RefCell::new(None),
             },
@@ -5410,7 +5457,7 @@ mod tests {
                 let op = op! {
                     opcode: OpCode::GuardTrue,
                     args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
-                    descr: std::cell::RefCell::new(None),
+                    descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
                     extra: std::cell::RefCell::new(None),
                 };
@@ -5426,14 +5473,14 @@ mod tests {
             op! {
                 opcode: OpCode::IntSub,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_001)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(4)),
             extra: std::cell::RefCell::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                descr: std::cell::RefCell::new(None),
+                descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
             extra: std::cell::RefCell::new(None),
             },
@@ -5463,7 +5510,7 @@ mod tests {
                 let op = op! {
                     opcode: OpCode::GuardTrue,
                     args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-                    descr: std::cell::RefCell::new(None),
+                    descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
                     extra: std::cell::RefCell::new(None),
                 };
@@ -5480,7 +5527,7 @@ mod tests {
                 let op = op! {
                     opcode: OpCode::GuardFalse,
                     args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                    descr: std::cell::RefCell::new(None),
+                    descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
                     extra: std::cell::RefCell::new(None),
                 };

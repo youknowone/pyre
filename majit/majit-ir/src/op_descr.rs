@@ -284,7 +284,7 @@ impl Op {
     /// Returns an owned `SmallVec` (clones of the `Rc`-cheap operands)
     /// rather than borrowing the slot, dropping the `RefCell` borrow at
     /// the call boundary so a caller may freely `setarg` afterwards.
-    pub fn getarglist(&self) -> smallvec::SmallVec<[crate::operand::Operand; 3]> {
+    pub fn getarglist(&self) -> crate::resoperation::OpArgVec {
         self.args.borrow().iter().cloned().collect()
     }
 
@@ -306,7 +306,7 @@ impl Op {
     /// `resoperation.py AbstractResOp.getarglist_copy` parity —
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
     /// an owned `SmallVec` of the stored operands.
-    pub fn getarglist_copy(&self) -> smallvec::SmallVec<[crate::operand::Operand; 3]> {
+    pub fn getarglist_copy(&self) -> crate::resoperation::OpArgVec {
         self.args.borrow().iter().cloned().collect()
     }
 
@@ -320,8 +320,8 @@ impl Op {
     ///  sb.used_boxes)` extends the LABEL arg list when finishing the
     /// peel pass.  pyre's matching call lives in `unroll.rs` and
     /// rebuilds the SmallVec rather than pushing onto `args`.
-    pub fn initarglist(&self, args: smallvec::SmallVec<[crate::operand::Operand; 3]>) {
-        *self.args.borrow_mut() = args;
+    pub fn initarglist(&self, args: impl IntoIterator<Item = crate::operand::Operand>) {
+        *self.args.borrow_mut() = args.into_iter().collect();
     }
 
     /// `resoperation.py AbstractResOp.setarg` parity — position-wise

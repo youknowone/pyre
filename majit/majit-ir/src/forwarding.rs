@@ -12,7 +12,7 @@
 //! Hosted in `majit-ir` so the slot can carry `Rc<Op>` / `Rc<InputArg>`
 //! without a `majit-metainterp -> majit-ir` circular dep.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 #[cfg(feature = "test-support")]
@@ -152,8 +152,13 @@ impl std::fmt::Debug for Forwarded {
 /// `InputArg` to these impls — the canonical forwarding logic lives on the
 /// bound `Op` / `InputArg`.
 pub trait ForwardingHost {
-    /// The canonical `_forwarded` slot (`resoperation.py`).
-    fn forwarded_cell(&self) -> &RefCell<Forwarded>;
+    /// `resoperation.py get_forwarded` — clone the slot.
+    fn get_forwarded(&self) -> Forwarded;
+
+    /// `resoperation.py self._forwarded = forwarded_to` — the slot write
+    /// shared by every typed setter. Prefer the typed `set_forwarded_*`,
+    /// which carry the self-cycle assert.
+    fn store_forwarded(&self, value: Forwarded);
 
     /// Pointer-identity probes backing the `resoperation.py
     /// assert forwarded_to is not self` self-cycle guard. A different
@@ -164,18 +169,6 @@ pub trait ForwardingHost {
     }
     fn is_same_inputarg(&self, _ia: &crate::value::InputArgRc) -> bool {
         false
-    }
-
-    /// `resoperation.py get_forwarded` — clone the slot.
-    fn get_forwarded(&self) -> Forwarded {
-        self.forwarded_cell().borrow().clone()
-    }
-
-    /// `resoperation.py self._forwarded = forwarded_to` — the slot write
-    /// shared by every typed setter. Prefer the typed `set_forwarded_*`,
-    /// which carry the self-cycle assert.
-    fn store_forwarded(&self, value: Forwarded) {
-        *self.forwarded_cell().borrow_mut() = value;
     }
 
     /// `optimizer.py op.set_forwarded(newop)` — Op target.
@@ -269,8 +262,11 @@ pub trait ForwardingHost {
 }
 
 impl ForwardingHost for Op {
-    fn forwarded_cell(&self) -> &RefCell<Forwarded> {
-        &self.forwarded
+    fn get_forwarded(&self) -> Forwarded {
+        self.forwarded.borrow().clone()
+    }
+    fn store_forwarded(&self, value: Forwarded) {
+        *self.forwarded.borrow_mut() = value;
     }
     fn is_same_op(&self, op: &crate::resoperation::OpRc) -> bool {
         std::ptr::eq(self, Rc::as_ptr(op))
@@ -278,8 +274,11 @@ impl ForwardingHost for Op {
 }
 
 impl ForwardingHost for InputArg {
-    fn forwarded_cell(&self) -> &RefCell<Forwarded> {
-        &self.forwarded
+    fn get_forwarded(&self) -> Forwarded {
+        self.forwarded.borrow().clone()
+    }
+    fn store_forwarded(&self, value: Forwarded) {
+        *self.forwarded.borrow_mut() = value;
     }
     fn is_same_inputarg(&self, ia: &crate::value::InputArgRc) -> bool {
         std::ptr::eq(self, Rc::as_ptr(ia))

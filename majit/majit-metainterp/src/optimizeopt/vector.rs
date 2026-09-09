@@ -1878,7 +1878,7 @@ impl VectorizingOptimizer {
             };
             guard_op.setdescr(descr);
         }
-        guard_op.setfailargs(loop_.label.getarglist());
+        guard_op.setfailargs(loop_.label.getarglist().into_iter().collect());
     }
 
     /// Attempt to vectorize the buffered loop body (Optimization trait path).

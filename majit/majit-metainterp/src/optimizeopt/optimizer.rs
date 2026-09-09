@@ -4851,7 +4851,7 @@ impl Optimizer {
         // optimizer.py:570-589 parity: collect pass indices that need
         // postprocess callbacks. After emission, invoke them in reverse
         // order — matching RPython's OptimizationResult.callback() chain.
-        let mut postprocess_passes: Vec<usize> = Vec::new();
+        let mut postprocess_passes: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
 
         // Track whether any pass replaced the op. Only the untouched
         // pass-through reaches final emission structurally identical to the

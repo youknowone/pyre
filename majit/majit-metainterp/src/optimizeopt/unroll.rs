@@ -237,11 +237,11 @@ fn root_forwarded_gcref(
 /// post-GC GcRef. Matches PyPy `_forwarded` Python object reference
 /// semantics — the cell stays, only its content updates.
 fn refresh_forwarded_ptrinfo_constant(
-    forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
+    forwarded: &majit_ir::forwarding::Forwarded,
     updated: majit_ir::GcRef,
 ) {
     use crate::optimizeopt::info::{OpInfo, PtrInfo};
-    let rc = match &*forwarded.borrow() {
+    let rc = match forwarded {
         majit_ir::forwarding::Forwarded::Info(OpInfo::Ptr(rc))
             if matches!(&*rc.borrow(), PtrInfo::Constant(_)) =>
         {
@@ -258,10 +258,10 @@ fn refresh_forwarded_ptrinfo_constant(
 /// post-GC GcRef. Matches PyPy `_forwarded` Python object reference
 /// semantics — the chain terminal stays a Const, only its GcRef updates.
 fn refresh_forwarded_const_ref(
-    forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
+    forwarded: &majit_ir::forwarding::Forwarded,
     updated: majit_ir::GcRef,
 ) {
-    let cell = match &*forwarded.borrow() {
+    let cell = match forwarded {
         majit_ir::forwarding::Forwarded::Const(cell)
             if matches!(cell.get(), majit_ir::Value::Ref(_)) =>
         {
@@ -2718,11 +2718,10 @@ impl ExportedState {
         }
 
         fn visit_forwarded(
-            forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
+            forwarded: &mut majit_ir::forwarding::Forwarded,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
-            let mut forwarded = forwarded.borrow_mut();
-            match &mut *forwarded {
+            match forwarded {
                 majit_ir::forwarding::Forwarded::Info(info) => visit_op_info(info, visitor),
                 majit_ir::forwarding::Forwarded::Const(cell) => {
                     if let majit_ir::Value::Ref(mut gcref) = cell.get() {
@@ -2792,11 +2791,11 @@ impl ExportedState {
             visit_op(patchguardop, visitor);
         }
         for ia in &self.partial_trace_inputargs {
-            visit_forwarded(&ia.forwarded, visitor);
+            visit_forwarded(&mut ia.forwarded.borrow_mut(), visitor);
         }
         for op in &self.partial_trace_operations {
             visit_op(op, visitor);
-            visit_forwarded(&op.forwarded, visitor);
+            visit_forwarded(&mut op.forwarded.borrow_mut(), visitor);
         }
     }
 
@@ -3078,22 +3077,22 @@ impl ExportedState {
                 }
                 ExportedGcRefField::PartialTraceInputArgInfoPtrInfoConstant(i) => {
                     if let Some(ia) = self.partial_trace_inputargs.get(*i) {
-                        refresh_forwarded_ptrinfo_constant(&ia.forwarded, updated);
+                        refresh_forwarded_ptrinfo_constant(&ia.forwarded.borrow(), updated);
                     }
                 }
                 ExportedGcRefField::PartialTraceInputArgConstRef(i) => {
                     if let Some(ia) = self.partial_trace_inputargs.get(*i) {
-                        refresh_forwarded_const_ref(&ia.forwarded, updated);
+                        refresh_forwarded_const_ref(&ia.forwarded.borrow(), updated);
                     }
                 }
                 ExportedGcRefField::PartialTraceOpInfoPtrInfoConstant(i) => {
                     if let Some(op) = self.partial_trace_operations.get(*i) {
-                        refresh_forwarded_ptrinfo_constant(&op.forwarded, updated);
+                        refresh_forwarded_ptrinfo_constant(&op.forwarded.borrow(), updated);
                     }
                 }
                 ExportedGcRefField::PartialTraceOpConstRef(i) => {
                     if let Some(op) = self.partial_trace_operations.get(*i) {
-                        refresh_forwarded_const_ref(&op.forwarded, updated);
+                        refresh_forwarded_const_ref(&op.forwarded.borrow(), updated);
                     }
                 }
             }
