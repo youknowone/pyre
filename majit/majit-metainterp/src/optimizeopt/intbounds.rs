@@ -1089,7 +1089,9 @@ impl OptIntBounds {
             self.make_constant_int_ref(box_.to_opref(), b.get_constant_int(), ctx);
         }
         if let Some(producing_op) = self.find_producing_op(box_, ctx) {
-            let producing_op = (*producing_op).clone();
+            // intbounds.py `dispatch_bounds_ops(self, box1)` uses the
+            // live ResOperation. Do not `Op::clone` — that mints a
+            // 16 B ThinStamp just to re-read opcode/args.
             self.propagate_bounds_backward_op(&producing_op, ctx);
         }
     }

@@ -2127,13 +2127,19 @@ impl DescrSlot {
             return;
         }
         if is_stamp_box(w) {
-            let p = unsafe { Box::from_raw(tagged_ptr(w) as *mut ThinStamp) };
+            // Keep the ThinStamp box; rewrite only its inner word.
+            // Unwrapping and `set_stamp_word` minted a second 16 B box
+            // on every descr-bearing `set_forwarded`.
+            let p = tagged_ptr(w) as *mut ThinStamp;
+            let inner = unsafe { (*p).inner };
             unsafe {
-                *self.word.get() = p.inner;
+                *self.word.get() = inner;
             }
             self.set_packed_forwarded(packed);
-            if p.stamp != 0 {
-                self.set_stamp_word(p.stamp);
+            let new_inner = self.word();
+            unsafe {
+                (*p).inner = new_inner;
+                *self.word.get() = w;
             }
             return;
         }
