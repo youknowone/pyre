@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static NEXT_SMALL_INT_ID: AtomicU32 = AtomicU32::new(1);
 
 #[inline]
-fn fresh_small_int(value: i64) -> Option<u64> {
+pub(crate) fn fresh_small_int(value: i64) -> Option<u64> {
     let value = i32::try_from(value).ok()?;
     let id = NEXT_SMALL_INT_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -53,7 +53,7 @@ fn fresh_small_int(value: i64) -> Option<u64> {
 }
 
 #[inline]
-fn small_int_value(encoded: u64) -> i64 {
+pub(crate) fn small_int_value(encoded: u64) -> i64 {
     (encoded as u32 as i32) as i64
 }
 
@@ -368,6 +368,12 @@ impl Operand {
                     // RPython. Reuse its identity; constructing a new cell
                     // here made every replacement lookup allocate.
                     return Operand::Const(c);
+                }
+                Forwarded::SmallConst(enc) => {
+                    if not_const {
+                        return cur;
+                    }
+                    return Operand::SmallInt(enc);
                 }
             }
         }

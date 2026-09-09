@@ -62,6 +62,10 @@ pub enum Forwarded {
     /// the explicit GC walker to forward `ConstPtr` in place.
     Const(Rc<Cell<Value>>),
 
+    /// `Operand::SmallInt` twin — a freshly-minted `ConstInt` whose value
+    /// fits in i32. Same identity-token encoding, no process allocator.
+    SmallConst(u64),
+
     /// `optimizeopt/info.py AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
     Info(OpInfo),
@@ -89,6 +93,30 @@ pub enum Forwarded {
     // store and stays.
 }
 
+impl Forwarded {
+    /// Mint the `_forwarded` Const object `optimizer.py make_constant` stores.
+    pub fn from_const_value(value: Value) -> Self {
+        if let Value::Int(v) = value
+            && let Some(enc) = crate::operand::fresh_small_int(v)
+        {
+            return Forwarded::SmallConst(enc);
+        }
+        Forwarded::Const(Rc::new(Cell::new(value)))
+    }
+
+    pub fn is_const(&self) -> bool {
+        matches!(self, Forwarded::Const(_) | Forwarded::SmallConst(_))
+    }
+
+    pub fn const_value(&self) -> Option<Value> {
+        match self {
+            Forwarded::Const(c) => Some(c.get()),
+            Forwarded::SmallConst(enc) => Some(Value::Int(crate::operand::small_int_value(*enc))),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Debug for Forwarded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Compact by design: `Info(OpInfo)` carries the abstract-value graph
@@ -101,6 +129,9 @@ impl std::fmt::Debug for Forwarded {
             Forwarded::Op(_) => f.write_str("Op(..)"),
             Forwarded::InputArg(_) => f.write_str("InputArg(..)"),
             Forwarded::Const(c) => write!(f, "Const({:?})", c.get()),
+            Forwarded::SmallConst(enc) => {
+                write!(f, "SmallConst({})", crate::operand::small_int_value(*enc))
+            }
             Forwarded::Info(_) => f.write_str("Info(..)"),
         }
     }
@@ -171,8 +202,9 @@ pub trait ForwardingHost {
     fn set_forwarded_const(&self, value: Const) {
         // `optimizer.py make_constant` stores the Const object itself in the
         // box's `_forwarded` slot. Mint that object once at the write, not on
-        // every `get_box_replacement` read.
-        self.store_forwarded(Forwarded::Const(Rc::new(Cell::new(value.to_value()))));
+        // every `get_box_replacement` read. Small ConstInts use the same
+        // inline identity encoding as `Operand::SmallInt`.
+        self.store_forwarded(Forwarded::from_const_value(value.to_value()));
     }
 
     /// `resoperation.py set_forwarded(forwarded_to)` — Info target.

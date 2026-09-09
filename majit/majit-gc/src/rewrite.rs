@@ -17,6 +17,7 @@ use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
 use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
 use majit_ir::{Const, ConstMap, GcRef, Value};
+use std::rc::Rc;
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
@@ -807,14 +808,7 @@ impl RewriteState {
             pos
         };
         op.pos.set(pos);
-        let rc = std::rc::Rc::new(op);
-        self.out.push(rc.clone());
-        if pos.is_none() {
-            Operand::none()
-        } else {
-            self.out_by_pos.insert(pos, rc.clone());
-            Operand::from_bound_op(&rc)
-        }
+        self.push_emitted(Rc::new(op), pos)
     }
 
     /// Emit a result-producing op, preserving the provided position when the
@@ -833,12 +827,69 @@ impl RewriteState {
             preferred_pos
         };
         op.pos.set(pos);
-        let rc = std::rc::Rc::new(op);
+        self.push_emitted(Rc::new(op), pos)
+    }
+
+    fn push_emitted(&mut self, rc: OpRc, pos: OpRef) -> Operand {
         self.out.push(rc.clone());
-        if !pos.is_none() {
+        if pos.is_none() || rc.result_type() == Type::Void {
+            Operand::none()
+        } else {
             self.out_by_pos.insert(pos, rc.clone());
+            Operand::from_bound_op(&rc)
         }
-        Operand::from_bound_op(&rc)
+    }
+
+    /// rewrite.py `emit_op` — append `op` itself unless an arg (or a
+    /// guard failarg) was replaced, in which case `copy_and_change`.
+    fn emit_op(&mut self, op: &OpRc) -> Operand {
+        let keep = op.opcode == OpCode::JitDebug;
+        let mut replaced = false;
+        let mut out = Rc::clone(op);
+        for i in 0..out.num_args() {
+            let orig = out.arg(i);
+            let mut arg = self.resolve(orig.clone());
+            if !keep
+                && let Some(Value::Ref(gcref)) = arg.const_value()
+                && !gcref.is_null()
+            {
+                arg = self.remove_constptr(gcref);
+            }
+            if arg != orig {
+                if !replaced {
+                    out = Rc::new((*out).clone());
+                    replaced = true;
+                }
+                out.setarg(i, arg);
+            }
+        }
+        if out.opcode.is_guard() {
+            if !replaced {
+                out = Rc::new((*out).clone());
+                replaced = true;
+            }
+            if let Some(fa) = out.guard_fail_args() {
+                let rewritten: Vec<Operand> = fa.iter().map(|a| self.resolve(a.clone())).collect();
+                drop(fa);
+                out.setfailargs(rewritten.into());
+            }
+        }
+        let rt = out.result_type();
+        let pos = if replaced {
+            if rt == Type::Void {
+                OpRef::NONE
+            } else if op.pos.get().is_none() {
+                let p = OpRef::op_typed(self.next_pos, rt);
+                self.next_pos += 1;
+                p
+            } else {
+                op.pos.get()
+            }
+        } else {
+            op.pos.get()
+        };
+        out.pos.set(pos);
+        self.push_emitted(out, pos)
     }
 
     /// rewrite.py emitting_an_operation_that_can_collect
@@ -999,7 +1050,7 @@ impl RewriteState {
     /// previously stashed via `set_forwarded` (if any) or the rewritten
     /// original.  Preserves the original's position mapping so downstream
     /// uses of the original's `OpRef` resolve to the lowered op's result.
-    fn emit_maybe_forwarded(&mut self, original: &Op) -> Operand {
+    fn emit_maybe_forwarded(&mut self, original: &OpRc) -> Operand {
         if let Some(lowered) = self.forwarded_ops.swap_remove(&self.current_i) {
             let result = if original.result_type() == Type::Void {
                 self.emit(lowered)
@@ -1011,8 +1062,11 @@ impl RewriteState {
             }
             result
         } else {
-            let rewritten = self.rewrite_op(original);
-            self.emit_rewritten_from(original, rewritten)
+            let result = self.emit_op(original);
+            if original.result_type() != Type::Void {
+                self.record_result_mapping(original.pos.get(), result.clone());
+            }
+            result
         }
     }
 
@@ -2630,7 +2684,10 @@ impl GcRewriterImpl {
                 // short-circuits (return True).
                 st.emit_pending_zeros();
                 self.emit_gc_load_or_indexed(op, ptr, cint_zero, itemsize, 1, ofs, sign, st);
-                st.emit_maybe_forwarded(op);
+                if let Some(lowered) = st.forwarded_ops.swap_remove(&st.current_i) {
+                    let result = st.emit_result(lowered, op.pos.get());
+                    st.record_result_mapping(op.pos.get(), result);
+                }
                 return true;
             }
             self.emit_gc_load_or_indexed(op, ptr, cint_zero, itemsize, 1, ofs, sign, st);
@@ -3326,7 +3383,8 @@ impl GcRewriter for GcRewriterImpl {
             // rewrite.py — if `remove_tested_failarg` rewrote this
             // op on a previous iteration, use the stashed replacement.
             let owned = st.changed_ops.swap_remove(&i);
-            let op: &Op = owned.as_ref().unwrap_or(orig_op.as_ref());
+            let op_rc: OpRc = owned.map(Rc::new).unwrap_or_else(|| Rc::clone(orig_op));
+            let op: &Op = &op_rc;
             st.current_i = i;
 
             // rewrite.py — is_guard OR could_merge_with_next_guard
@@ -3405,21 +3463,21 @@ impl GcRewriter for GcRewriterImpl {
                     // pending zero-init entry before WB emission.
                     self.consider_setfield_gc(op, &mut st);
                     self.handle_write_barrier_setfield(op, &mut st);
-                    st.emit_maybe_forwarded(op);
+                    st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
                 OpCode::SetinteriorfieldGc if self.wb_descr.is_some() => {
                     // rewrite.py:946 `handle_write_barrier_setinteriorfield
                     // = handle_write_barrier_setarrayitem`.
                     self.handle_write_barrier_setarrayitem(op, &mut st);
-                    st.emit_maybe_forwarded(op);
+                    st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
                 OpCode::SetarrayitemGc if self.wb_descr.is_some() => {
                     // rewrite.py:401-404
                     self.consider_setarrayitem_gc(op, &mut st);
                     self.handle_write_barrier_setarrayitem(op, &mut st);
-                    st.emit_maybe_forwarded(op);
+                    st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
                 // rewrite.py:405-412 — the `else` arm of that gate: the
@@ -3432,12 +3490,12 @@ impl GcRewriter for GcRewriterImpl {
                 // falls to the catch-all unchanged.
                 OpCode::SetfieldGc => {
                     self.consider_setfield_gc(op, &mut st);
-                    st.emit_maybe_forwarded(op);
+                    st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
                 OpCode::SetarrayitemGc => {
                     self.consider_setarrayitem_gc(op, &mut st);
-                    st.emit_maybe_forwarded(op);
+                    st.emit_maybe_forwarded(&op_rc);
                     continue;
                 }
 
@@ -3535,7 +3593,7 @@ impl GcRewriter for GcRewriterImpl {
                 // ARRAYLEN_GC, RAW_LOAD, RAW_STORE, GC_LOAD_INDEXED,
                 // GC_STORE_INDEXED …); otherwise pass through unchanged.
                 _ => {
-                    st.emit_maybe_forwarded(op);
+                    st.emit_maybe_forwarded(&op_rc);
                 }
             }
         }

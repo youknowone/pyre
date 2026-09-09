@@ -7733,7 +7733,10 @@ impl OptContext {
             // or `Info(_)` per the chain walker (forwarding.rs); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh operand whose own slot is None.
-            Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
+            Forwarded::Const(_)
+            | Forwarded::SmallConst(_)
+            | Forwarded::Op(_)
+            | Forwarded::InputArg(_) => {
                 unreachable!(
                     "getrawptrinfo: chain terminal must not carry Forwarded::Const \
                  (forwarding.rs get_box_replacement walker invariant)",
@@ -7821,7 +7824,10 @@ impl OptContext {
             // or `Info(_)` per the chain walker (forwarding.rs); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh operand whose own slot is None.
-            Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
+            Forwarded::Const(_)
+            | Forwarded::SmallConst(_)
+            | Forwarded::Op(_)
+            | Forwarded::InputArg(_) => {
                 unreachable!(
                     "getptrinfo: chain terminal must not carry Forwarded::Const \
                  (forwarding.rs get_box_replacement walker invariant)",
@@ -8314,7 +8320,10 @@ impl OptContext {
                     // its target (`forwarding.rs Forwarded::Op`); while it held
                     // a `Weak`, a dropped target ended the walk one hop early
                     // and this arm fired.
-                    Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
+                    Forwarded::Const(_)
+                    | Forwarded::SmallConst(_)
+                    | Forwarded::Op(_)
+                    | Forwarded::InputArg(_) => {
                         unreachable!("chain walker terminal")
                     }
                     Forwarded::None => {}
@@ -9334,7 +9343,7 @@ mod boxref_forwarding_tests {
         // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
         match &b0.get_forwarded() {
-            BoxForwarded::Const(c) => assert_eq!(c.get(), majit_ir::Value::Int(42)),
+            other if other.const_value() == Some(majit_ir::Value::Int(42)) => {}
             other => panic!("expected b0 to forward to Const, got {:?}", other),
         }
     }
@@ -9423,6 +9432,10 @@ mod boxref_forwarding_tests {
                 std::rc::Rc::ptr_eq(a, b),
                 "get_box_replacement must return the Const object stored in _forwarded"
             ),
+            (Operand::SmallInt(a), Operand::SmallInt(b)) => assert_eq!(
+                a, b,
+                "get_box_replacement must return the SmallConst identity stored in _forwarded"
+            ),
             other => panic!("expected two Const terminals, got {other:?}"),
         }
         // Negative case: operand with no constant forwarding.
@@ -9465,9 +9478,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         ctx.make_constant_arg(&b0, Value::Int(42));
         match &b0.get_forwarded() {
-            BoxForwarded::Const(c) => {
-                assert_eq!(c.get(), majit_ir::Value::Int(42));
-            }
+            other if other.const_value() == Some(majit_ir::Value::Int(42)) => {}
             other => panic!("expected Forwarded::Const(Int 42), got {:?}", other),
         }
     }
@@ -9501,9 +9512,7 @@ mod boxref_forwarding_tests {
         let b_const = ctx.materialize_operand_at(const_opref);
         ctx.make_equal_to(&b0, &b_const);
         match &b0.get_forwarded() {
-            BoxForwarded::Const(c) => {
-                assert_eq!(c.get(), majit_ir::Value::Int(42));
-            }
+            other if other.const_value() == Some(majit_ir::Value::Int(42)) => {}
             other => panic!("expected Forwarded::Const(Int 42), got {:?}", other),
         }
     }

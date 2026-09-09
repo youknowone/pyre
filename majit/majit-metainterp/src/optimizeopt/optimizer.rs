@@ -638,9 +638,8 @@ pub(crate) fn merge_backend_constants_from_ctx(
             return;
         }
         let idx = pos.raw();
-        let value = match op.forwarded.borrow().clone() {
-            majit_ir::forwarding::Forwarded::Const(c) => c.get(),
-            _ => return,
+        let Some(value) = op.forwarded.borrow().const_value() else {
+            return;
         };
         // A ref constant is never resolved from this backend pool: a referenced
         // (live) ref operand is an inline ConstPtr that `remove_constptr`
@@ -740,7 +739,7 @@ impl Optimizer {
         let Some(forwarded) = ctx.read_forwarded(op.pos.get()) else {
             return false;
         };
-        if !matches!(forwarded, majit_ir::forwarding::Forwarded::Const(_)) {
+        if !forwarded.is_const() {
             return false;
         }
         op.num_args() == 0 || op.getarglist().iter().all(|arg| arg.is_none())
@@ -3880,10 +3879,7 @@ impl Optimizer {
                 if remap.contains_key(&old_idx) || old_idx < num_inputs as u32 {
                     return;
                 }
-                if !matches!(
-                    op.forwarded.borrow().clone(),
-                    majit_ir::forwarding::Forwarded::Const(_)
-                ) {
+                if !op.forwarded.borrow().is_const() {
                     return;
                 }
                 remap.insert(old_idx, next_const_pos);
