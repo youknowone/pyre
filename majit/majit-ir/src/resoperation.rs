@@ -1274,13 +1274,15 @@ pub struct VectorizationInfo {
 /// `resoperation.py GuardResOp` extras — `_fail_args`, the pyre
 /// `fail_arg_types` cache, and `rd_resume_position`. Allocated only
 /// when the op is a guard (`GuardResOp` owns the field upstream).
-#[derive(Clone, Debug)]
 pub(crate) struct GuardExtra {
-    pub(crate) fail_args: Option<Vec<Operand>>,
-    /// Packed so `Box<GuardExtra>` leaves the 64-byte class. `Option<Vec<Type>>`
-    /// is 24 B and kept every guard clone in that class; the type cache is a
-    /// handful of `Type` tags (backend convenience, not a GuardResOp field).
-    pub(crate) fail_arg_types: Option<Box<[Type]>>,
+    /// Thin storage for `_fail_args`. `Option<Vec<Operand>>` is 24 B and
+    /// `Box<[Operand]>` is a 16 B fat pointer; either one keeps
+    /// `BothPayload` (descr + extra) in the 56-byte class.
+    fail_ptr: *mut Operand,
+    fail_len: u32,
+    /// `-1` = unset. Four tags cover the usual failarg arity.
+    n_types: i8,
+    types: [Type; 4],
     /// resoperation.py `GuardResOp.rd_resume_position` — `-1` unset.
     pub(crate) rd_resume_position: i32,
 }
@@ -1288,10 +1290,107 @@ pub(crate) struct GuardExtra {
 impl GuardExtra {
     fn new() -> Self {
         GuardExtra {
-            fail_args: None,
-            fail_arg_types: None,
+            fail_ptr: std::ptr::null_mut(),
+            fail_len: 0,
+            n_types: -1,
+            types: [Type::Void; 4],
             rd_resume_position: -1,
         }
+    }
+
+    pub(crate) fn fail_args(&self) -> Option<&[Operand]> {
+        if self.fail_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(self.fail_ptr, self.fail_len as usize) })
+        }
+    }
+
+    pub(crate) fn fail_args_mut(&mut self) -> Option<&mut [Operand]> {
+        if self.fail_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts_mut(self.fail_ptr, self.fail_len as usize) })
+        }
+    }
+
+    pub(crate) fn set_fail_args(&mut self, args: impl IntoIterator<Item = Operand>) {
+        self.clear_fail_args();
+        let vec: Vec<Operand> = args.into_iter().collect();
+        if vec.is_empty() {
+            self.fail_ptr = std::ptr::NonNull::<Operand>::dangling().as_ptr();
+            self.fail_len = 0;
+            return;
+        }
+        let mut boxed = vec.into_boxed_slice();
+        self.fail_len = boxed.len() as u32;
+        self.fail_ptr = boxed.as_mut_ptr();
+        std::mem::forget(boxed);
+    }
+
+    pub(crate) fn clear_fail_args(&mut self) {
+        if !self.fail_ptr.is_null() {
+            unsafe {
+                let _ = Vec::from_raw_parts(
+                    self.fail_ptr,
+                    self.fail_len as usize,
+                    self.fail_len as usize,
+                );
+            }
+            self.fail_ptr = std::ptr::null_mut();
+            self.fail_len = 0;
+        }
+    }
+
+    pub(crate) fn fail_arg_types(&self) -> Option<&[Type]> {
+        if self.n_types < 0 {
+            None
+        } else {
+            Some(&self.types[..self.n_types as usize])
+        }
+    }
+
+    pub(crate) fn set_fail_arg_types(&mut self, types: &[Type]) {
+        if types.len() > self.types.len() {
+            self.n_types = -1;
+            return;
+        }
+        self.types[..types.len()].copy_from_slice(types);
+        self.n_types = types.len() as i8;
+    }
+
+    pub(crate) fn clear_fail_arg_types(&mut self) {
+        self.n_types = -1;
+    }
+}
+
+impl Clone for GuardExtra {
+    fn clone(&self) -> Self {
+        let mut out = GuardExtra::new();
+        if let Some(fa) = self.fail_args() {
+            out.set_fail_args(fa.iter().cloned());
+        }
+        if let Some(ts) = self.fail_arg_types() {
+            out.set_fail_arg_types(ts);
+        }
+        out.rd_resume_position = self.rd_resume_position;
+        out
+    }
+}
+
+impl Drop for GuardExtra {
+    fn drop(&mut self) {
+        self.clear_fail_args();
+    }
+}
+
+impl std::fmt::Debug for GuardExtra {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardExtra")
+            .field("fail_args", &self.fail_args())
+            .field("fail_arg_types", &self.fail_arg_types())
+            .field("rd_resume_position", &self.rd_resume_position)
+            .finish()
     }
 }
 
@@ -2164,7 +2263,7 @@ impl Op {
     pub fn guard_fail_args(&self) -> Option<&[Operand]> {
         match self.descr.extra_ref() {
             Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => {
-                g.fail_args.as_deref()
+                g.fail_args()
             }
             _ => None,
         }
@@ -4351,8 +4450,8 @@ mod tests {
             );
             let extra = std::mem::size_of::<GuardExtra>();
             assert!(
-                extra <= 48,
-                "GuardExtra grew to {extra} bytes; keep Box<GuardExtra> out of the 64-byte class"
+                extra <= 32,
+                "GuardExtra grew to {extra} bytes; keep Box<GuardExtra> out of the 56-byte class"
             );
             assert!(
                 std::mem::size_of::<ArgSlot>() <= 72,

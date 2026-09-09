@@ -856,29 +856,23 @@ impl RewriteState {
                 arg = self.remove_constptr(gcref);
             }
             if arg != orig {
-                if !replaced {
-                    out = Rc::new((*out).clone());
-                    replaced = true;
-                }
+                // The op IS the box (resoperation.py). setarg writes the
+                // replacement on this ResOperation; a second cls() would
+                // only mint an identical identity for get_box_replacement
+                // to find via _forwarded.
                 out.setarg(i, arg);
+                replaced = true;
             }
         }
         if out.opcode.is_guard() {
-            // rewrite.py emit_op copy_and_changes every guard so setfailargs
-            // can install replacements. When every failarg is already its
-            // replacement the new ResOperation is identical — skip that
-            // second cls() and keep the recorded op.
             let failargs_changed = out
                 .guard_fail_args()
                 .is_some_and(|fa| fa.iter().any(|a| self.resolve(a.clone()) != *a));
             if failargs_changed {
-                if !replaced {
-                    out = Rc::new((*out).clone());
-                    replaced = true;
-                }
                 out.map_failargs_in_place(|a| {
                     *a = self.resolve(a.clone());
                 });
+                replaced = true;
             }
         }
         let rt = out.result_type();

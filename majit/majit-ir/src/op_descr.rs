@@ -201,7 +201,7 @@ impl Op {
     /// when the caller only remaps boxes already stored on the guard.
     pub fn map_failargs_in_place(&self, mut f: impl FnMut(&mut crate::operand::Operand)) {
         if let Some(mut g) = self.try_guard_extra_mut()
-            && let Some(fa) = g.fail_args.as_mut()
+            && let Some(fa) = g.fail_args_mut()
         {
             for arg in fa.iter_mut() {
                 f(arg);
@@ -220,7 +220,7 @@ impl Op {
         // Four inline slots match `OpArgVec`: a 4-failarg list stays on
         // the stack here and becomes one `Vec` heap, not a `[; 3]` spill
         // plus a second collect.
-        self.ensure_guard_extra().fail_args = Some(fail_args.into_iter().collect());
+        self.ensure_guard_extra().set_fail_args(fail_args);
     }
 
     /// In-place mutable view of the fail_args slot.  Lets callers iterate
@@ -229,12 +229,10 @@ impl Op {
     /// slot is empty.  Uses `RefCell::get_mut` so it requires `&mut Op`;
     /// shared-`Op` callers should clone via `getfailargs_copy`, mutate
     /// the copy, and call `setfailargs`.
-    pub fn fail_args_mut(&mut self) -> Option<&mut Vec<crate::operand::Operand>> {
+    pub fn fail_args_mut(&mut self) -> Option<&mut [crate::operand::Operand]> {
         match self.descr.extra_mut()? {
             crate::resoperation::OpKindExtra::Guard(g)
-            | crate::resoperation::OpKindExtra::VectorGuard { guard: g, .. } => {
-                g.fail_args.as_mut()
-            }
+            | crate::resoperation::OpKindExtra::VectorGuard { guard: g, .. } => g.fail_args_mut(),
             crate::resoperation::OpKindExtra::Vector(_) => None,
         }
     }
@@ -245,7 +243,7 @@ impl Op {
     /// clarity.
     pub fn clearfailargs(&self) {
         if let Some(mut g) = self.try_guard_extra_mut() {
-            g.fail_args = None;
+            g.clear_fail_args();
         }
     }
 
@@ -265,7 +263,7 @@ impl Op {
         // Immutable extra borrow: callers often hold `guard_fail_args()`
         // (also an extra borrow) while reading types.
         self.try_guard_extra()
-            .and_then(|g| g.fail_arg_types.as_ref().map(|t| t.to_vec()))
+            .and_then(|g| g.fail_arg_types().map(|t| t.to_vec()))
     }
 
     /// Owned-clone variant — RPython would write `fail_arg_types[:]`.
@@ -277,13 +275,13 @@ impl Op {
     /// (interior mutability through `RefCell`) so shared `Op` instances
     /// can be re-stamped without `&mut`.
     pub fn set_fail_arg_types(&self, types: Vec<crate::value::Type>) {
-        self.ensure_guard_extra().fail_arg_types = Some(types.into_boxed_slice());
+        self.ensure_guard_extra().set_fail_arg_types(&types);
     }
 
     /// Clear the per-failarg type vector.
     pub fn clear_fail_arg_types(&self) {
         if let Some(mut g) = self.try_guard_extra_mut() {
-            g.fail_arg_types = None;
+            g.clear_fail_arg_types();
         }
     }
 
