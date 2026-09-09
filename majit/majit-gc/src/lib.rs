@@ -1121,6 +1121,10 @@ pub trait GcAllocator: Send {
         self.write_barrier(obj);
     }
 
+    /// `gcreftracer.py` `llop.gc_writebarrier(tr)`: a newly written table
+    /// enters this collector's remembered set for one minor.
+    fn remember_gc_table(&mut self, _table: &std::sync::Arc<crate::GcTable>) {}
+
     /// Whether the GC supports optimized conditional write barriers.
     ///
     /// When true, the JIT emits COND_CALL_GC_WB (inline flag test +
@@ -1477,6 +1481,10 @@ pub struct GcHandle;
 unsafe impl Send for GcHandle {}
 
 impl GcAllocator for GcHandle {
+    fn remember_gc_table(&mut self, table: &std::sync::Arc<crate::GcTable>) {
+        gc_sync::gc_op(|gc| gc.remember_gc_table(table));
+    }
+
     fn alloc_nursery(&mut self, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_nursery(size))
     }

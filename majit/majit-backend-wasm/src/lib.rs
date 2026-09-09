@@ -2762,7 +2762,7 @@ impl WasmBackend {
 
     fn register_gc_table(token: &JitCellToken, table: Arc<majit_gc::GcTable>) {
         if let Some(clt) = token.compiled_loop_token() {
-            let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = table.clone();
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
     }

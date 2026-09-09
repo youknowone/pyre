@@ -10,6 +10,7 @@ use majit_ir::GcRef;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 /// Monotonic source for the durations the collector reports to its hooks.
 ///
 /// `wasm32-unknown-unknown` has no clock: `Instant::now` panics with "time not
@@ -951,6 +952,12 @@ pub struct MiniMarkGC {
     /// temporary mistake; the next minor collection removes it again, in
     /// [`Self::remove_young_arrays_from_old_objects_pointing_to_young`].
     old_objects_pointing_to_young: Vec<usize>,
+    /// `gcreftracer.py` `llop.gc_writebarrier(tr)` analogue. A `GCREFTRACER`
+    /// is an ordinary old object upstream, so writing its slots puts *that*
+    /// MiniMark's `old_objects_pointing_to_young` on the hook for one minor.
+    /// pyre's tables are Rust-owned, so the same remembered-set entry lives
+    /// here instead of a process-global list.
+    pending_gc_tables: Vec<Weak<crate::GcTable>>,
     /// incminimark.py:355 `prebuilt_root_objects = AddressStack()`.
     /// Immortal objects enter exactly once, when their first pointer write
     /// clears NO_HEAP_PTRS in the write barrier.
@@ -1293,6 +1300,7 @@ impl MiniMarkGC {
             jitframe_type_id: None,
             roots: RootSet::new(),
             old_objects_pointing_to_young: Vec::new(),
+            pending_gc_tables: Vec::new(),
             prebuilt_root_objects: Vec::new(),
             root_snapshot_capacity: std::cell::Cell::new(0),
             totalroots_rpy: 0,
@@ -3453,6 +3461,10 @@ impl MiniMarkGC {
         if !self.probably_young_objects_with_finalizers.is_empty() {
             self.deal_with_young_objects_with_finalizers();
         }
+
+        // GCREFTRACER write-barrier analogue: tables remembered on *this*
+        // MiniMark, consumed once like `old_objects_pointing_to_young`.
+        self.collect_pending_gc_tables_to_nursery();
 
         // incminimark.py:1843-1862: while True loop —
         // collect_cardrefs_to_nursery, then collect_oldrefs_to_nursery.
@@ -8150,6 +8162,20 @@ impl MiniMarkGC {
     /// append the object to the remembered set (`old_objects_pointing_to_young`)
     /// and clear GCFLAG_TRACK_YOUNG_PTRS. Callers have already verified the flag
     /// (the inline COND_CALL_GC_WB test, or `do_write_barrier`).
+    /// `gcreftracer.py` `llop.gc_writebarrier(tr)`.
+    pub fn remember_gc_table(&mut self, table: &Arc<crate::GcTable>) {
+        self.pending_gc_tables.push(Arc::downgrade(table));
+    }
+
+    /// Drain this MiniMark's table remembered set. Same consume as
+    /// `collect_oldrefs_to_nursery` on `old_objects_pointing_to_young`.
+    fn collect_pending_gc_tables_to_nursery(&mut self) {
+        let pending = std::mem::take(&mut self.pending_gc_tables);
+        for table in pending.into_iter().filter_map(|w| w.upgrade()) {
+            table.trace(&mut |r| self.drag_out_root(r));
+        }
+    }
+
     fn remember_young_pointer(&mut self, obj: GcRef) {
         // incminimark.py does not special-case STATE_SWEEPING in its barrier.
         // After the seam, every retained entry names a VISITED survivor. A new
@@ -8828,6 +8854,10 @@ impl Default for MiniMarkGC {
 }
 
 impl GcAllocator for MiniMarkGC {
+    fn remember_gc_table(&mut self, table: &Arc<crate::GcTable>) {
+        MiniMarkGC::remember_gc_table(self, table);
+    }
+
     fn writebarrier_before_move(&mut self, obj: GcRef) {
         MiniMarkGC::writebarrier_before_move(self, obj.0);
     }

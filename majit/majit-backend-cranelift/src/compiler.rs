@@ -16120,9 +16120,12 @@ impl CraneliftBackend {
         table: Arc<majit_gc::GcTable>,
     ) {
         if let Some(clt) = token.compiled_loop_token() {
-            let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = table.clone();
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
+        // `gcreftracer.py` `llop.gc_writebarrier(tr)`: the table enters
+        // this MiniMark's remembered set for one minor.
+        let _ = with_cranelift_gc(|gc| gc.remember_gc_table(&table));
     }
 }
 
@@ -20332,16 +20335,15 @@ mod tests {
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xB12D_6001);
     }
 
-    /// gcreftracer.py gcrefs_trace: re-emission must read the forwarded
-    /// reference constant, just as the already compiled owner does.
+    /// gcreftracer.py gcrefs_trace: a later `assemble_bridge` must read the
+    /// forwarded reference constant, just as the already compiled owner does.
     ///
-    /// Parallel MiniMarks share `PENDING_MINOR_TABLES` and the published
-    /// nursery window, so a sibling collection can leave this table's
-    /// slot unmoved. Run serially:
-    /// `cargo test -p majit-backend-cranelift merged_owner_preserves -- --ignored --test-threads=1`
+    /// Still ignored: after a nursery collect the owner's slot forwards, but
+    /// `compile_bridge` then leaves `slot(0) == 0`. That is not the old
+    /// process-global pending-list steal (tables now live on the MiniMark).
     #[test]
-    #[ignore = "needs an exclusive MiniMark; sibling collections steal the pending-table list"]
-    fn merged_owner_preserves_reference_constant_after_collection() {
+    #[ignore = "compile_bridge zeroes the forwarded owner slot; not pending-list steal"]
+    fn owner_preserves_reference_constant_after_collection() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,

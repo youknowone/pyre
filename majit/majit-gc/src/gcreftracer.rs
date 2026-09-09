@@ -116,17 +116,6 @@ static LIVE_GC_TABLES: RwLock<Vec<Weak<GcTable>>> = RwLock::new(Vec::new());
 #[cfg(test)]
 static GC_TABLE_WALK_LOCK: RwLock<()> = RwLock::new(());
 
-/// Tables built since the last minor collection. `GCREFTRACER` is an
-/// ordinary old object upstream: writing its slots at construction puts it
-/// on that MiniMark's `old_objects_pointing_to_young` for exactly one
-/// minor, which promotes every referent it holds; later minors skip it
-/// because the slots are never written again. A major marks through every
-/// live tracer. This list is that remembered set, but process-global —
-/// it belongs on the collector. [`walk_all_gc_tables_inner`] drains it on
-/// a minor walk and walks the whole registry on a major one.
-static PENDING_MINOR_TABLES: parking_lot::Mutex<Vec<Weak<GcTable>>> =
-    parking_lot::Mutex::new(Vec::new());
-
 impl GcTable {
     /// Build a per-loop table from the rewrite's gcref output list and
     /// register it for GC forwarding.
@@ -183,7 +172,6 @@ impl GcTable {
     fn register(table: GcTable) -> Arc<GcTable> {
         let table = Arc::new(table);
         register_table(&table);
-        PENDING_MINOR_TABLES.lock().push(Arc::downgrade(&table));
         table
     }
 
@@ -265,23 +253,11 @@ fn walk_all_gc_tables(visitor: &mut dyn FnMut(&mut GcRef)) {
 /// already holds the write side observes the registry without re-entering
 /// the lock.
 fn walk_all_gc_tables_inner(visitor: &mut dyn FnMut(&mut GcRef)) {
-    // A minor collection reaches only the tables the remembered set names
-    // (see `PENDING_MINOR_TABLES`); every other live table already holds
-    // promoted referents, which a minor collection does not move.
+    // A minor reaches only the tables that MiniMark remembered
+    // (`pending_gc_tables`, the `old_objects_pointing_to_young` analogue).
+    // That drain lives on the collecting MiniMark, not here.
     if crate::shadow_stack::extra_root_walk_kind() == crate::shadow_stack::ExtraRootWalkKind::Minor
     {
-        // Remembered-set drain, same as MiniMark's
-        // `old_objects_pointing_to_young`: this minor consumes the tables
-        // that recorded a young store since the last one. A later write
-        // re-registers. `take` is that consume — there is no test/prod
-        // split. Parallel MiniMarks sharing this process-global list is a
-        // harness isolation defect (the list belongs on the collector);
-        // cloning it would leave the set undrained and let two visitors
-        // `trace` the same unsynchronized slots.
-        let pending = std::mem::take(&mut *PENDING_MINOR_TABLES.lock());
-        for table in pending.iter().filter_map(Weak::upgrade) {
-            table.trace(visitor);
-        }
         return;
     }
     // Snapshot the live tables under a read guard, then release the lock
@@ -409,5 +385,36 @@ mod tests {
         }
         // The Arc dropped; the registry's Weak no longer upgrades.
         assert_eq!(count_sentinels(), 0, "freed table must not be walked");
+    }
+
+    #[test]
+    fn pending_gc_tables_stay_on_the_remembering_minimark() {
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let root = owner.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E700 };
+        let table = GcTable::from_gcrefs(&[root]);
+        owner.remember_gc_table(&table);
+
+        let mut sibling = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        sibling.do_collect_nursery();
+        assert_eq!(
+            table.slot(0),
+            root,
+            "a sibling MiniMark must not drain this collector's table"
+        );
+
+        owner.do_collect_nursery();
+        let moved = table.slot(0);
+        assert_ne!(moved, root, "the owning MiniMark forwards the slot");
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E700);
     }
 }
