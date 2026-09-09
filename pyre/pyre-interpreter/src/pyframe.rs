@@ -1885,13 +1885,13 @@ impl Drop for FrameLocalsRoot {
 /// `addr_of_mut!(locals_cells_stack_w)` is an interior address. Residual so a
 /// compiled gcmap cannot mark it as a GCREF (`rewrite_op_getsubstruct`).
 #[majit_macros::dont_look_inside]
-unsafe fn register_frame_locals_slot(frame_ptr: *mut PyFrame) -> bool {
+pub unsafe fn register_frame_locals_slot(frame_ptr: *mut PyFrame) -> bool {
     let slot = unsafe { std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8 };
     unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }
 }
 
 #[majit_macros::dont_look_inside]
-fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
+pub fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
     let slot = unsafe { std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8 };
     pyre_object::gc_hook::try_gc_remove_root(slot);
 }
