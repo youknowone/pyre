@@ -129,7 +129,9 @@ fn leaf3_prov_enabled() -> bool {
 /// debug builds rather than silently producing an out-of-RPython-shape
 /// numbering state.
 pub struct LiveboxMap {
-    entries: Vec<(majit_ir::operand::Operand, i16)>,
+    /// Insertion-order live set. Eight pairs stay inline so the common
+    /// four-or-fewer liveboxes never heap-grow (24 B/pair, Vec 1→2→4 = 96 B).
+    entries: SmallVec<[(majit_ir::operand::Operand, i16); 8]>,
     /// Identity index over `entries`, built once the map outgrows
     /// [`Self::LINEAR_MAX`] and maintained from then on.
     ///
@@ -151,7 +153,7 @@ impl LiveboxMap {
 
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: SmallVec::new(),
             index: None,
         }
     }
@@ -4442,8 +4444,8 @@ impl ResumeDataLoopMemo {
 
         // resume.py:414-426: iterate liveboxes_from_env, discover virtual
         // fields. RPython walks the dict in insertion order; pyre's
-        // `LiveboxMap` is built on `IndexMap` so the
-        // `.iter()` sequence already matches that order, which the
+        // `LiveboxMap` keeps that order in `entries` so the
+        // `.iter()` sequence already matches, which the
         // virtual worklist drain below relies on for byte-identical
         // visitor_walk_recursive sequencing. Sorting by tag would
         // observably re-order virtuals across builds.
