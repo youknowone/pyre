@@ -4599,11 +4599,12 @@ where
                 // which carries the field's byte width; a sub-word integer field
                 // (`Char`/`Bool`/`INT` narrower than a word) must be read at that
                 // width, not as a full word — otherwise adjacent bytes leak into
-                // the value. Ref fields are always word-sized pointers.
+                // the value. Ref fields are always word-sized pointers
+                // (`llmodel.py bh_getfield_gc_r` / `read_ref_at_mem`).
                 let loaded = if struct_ptr == 0 {
                     0
                 } else if is_ref {
-                    unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
+                    unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) as i64 }
                 } else {
                     let addr = (struct_ptr as usize).wrapping_add(offset);
                     unsafe {
@@ -4709,15 +4710,36 @@ where
                     // an entry seeded without a live concrete and skips
                     // the check.  A null struct fabricated `loaded` rather
                     // than reading, so it has nothing to compare either.
+                    //
+                    // RPython runs `executor.execute(cpu, metainterp,
+                    // opnum, fielddescr, box)` for this compare
+                    // (`_opimpl_getfield_gc_any_pureornot`). That is
+                    // `bh_getfield_gc_{i,r}`, a word-sized ref load —
+                    // not a raw i64 read that on a 32-bit target
+                    // swallows the next field.
                     let expected = match ctx.box_value(cached) {
                         Some(Value::Int(n)) => Some(n),
                         Some(Value::Ref(r)) => Some(r.0 as i64),
                         _ => None,
                     };
+                    let executed = if is_ref {
+                        ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Ref)
+                            .and_then(|v| match v {
+                                Value::Ref(r) => Some(r.0 as i64),
+                                _ => None,
+                            })
+                    } else {
+                        ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Int)
+                            .and_then(|v| match v {
+                                Value::Int(n) => Some(n),
+                                _ => None,
+                            })
+                    };
+                    let compare = executed.unwrap_or(loaded);
                     assert!(
-                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
+                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != compare),
                         "_opimpl_getfield_gc_any_pureornot sanity check ({}): \
-                             loaded {loaded} != cached {expected:?} \
+                             loaded {compare} != cached {expected:?} \
                              (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
                         if is_ref { "ref" } else { "int" },
                     );
