@@ -2429,14 +2429,18 @@ impl TraceCtx {
             let args: Vec<String> = op
                 .args_slice()
                 .iter()
-                .map(|a| match a {
-                    Operand::Op(o) => format!("{:?}", o.pos.get()),
-                    Operand::InputArg(ia) => format!("IA{}", ia.index),
-                    Operand::SmallInt(_) => format!("C{:?}", a.const_value().unwrap()),
-                    Operand::SmallWide(_) => format!("C{:?}", a.const_value().unwrap()),
-                    Operand::NullRef => "CRef(NULL)".to_string(),
-                    Operand::Const(c) => format!("C{:?}", c.get()),
-                    Operand::None => "_".to_string(),
+                .map(|a| {
+                    if a.is_none() {
+                        "_".to_string()
+                    } else if let Some(o) = a.bound_op() {
+                        format!("{:?}", o.pos.get())
+                    } else if let Some(ia) = a.bound_inputarg() {
+                        format!("IA{}", ia.index)
+                    } else if a.is_null_ref() {
+                        "CRef(NULL)".to_string()
+                    } else {
+                        format!("C{:?}", a.const_value().unwrap())
+                    }
                 })
                 .collect();
             eprintln!(

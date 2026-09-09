@@ -9569,17 +9569,10 @@ mod boxref_forwarding_tests {
         let first = b1.get_box_replacement(false);
         let second = b1.get_box_replacement(false);
         assert!(first.is_constant());
-        match (&first, &second) {
-            (Operand::Const(a), Operand::Const(b)) => assert!(
-                std::rc::Rc::ptr_eq(a, b),
-                "get_box_replacement must return the Const object stored in _forwarded"
-            ),
-            (Operand::SmallInt(a), Operand::SmallInt(b)) => assert_eq!(
-                a, b,
-                "get_box_replacement must return the SmallConst identity stored in _forwarded"
-            ),
-            other => panic!("expected two Const terminals, got {other:?}"),
-        }
+        assert_eq!(
+            first, second,
+            "get_box_replacement must return the identity stored in _forwarded"
+        );
         // Negative case: operand with no constant forwarding.
         let (nb, _ia_nb) = bound_inputarg_operand(Type::Int, 0);
         assert!(!nb.get_box_replacement(false).is_constant());

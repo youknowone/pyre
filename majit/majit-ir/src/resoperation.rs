@@ -1908,7 +1908,7 @@ pub struct Op {
     /// Packed `history.py *FrontendOp` concrete stamp (`_resint` /
     /// `_resfloat` / `_resref`). `0` = unset; see `VALUE_*`.
     value_kind: std::cell::Cell<u8>,
-    /// `N_aryOp._args` length. Lives here so [`ArgSlot`] is 64 B.
+    /// `N_aryOp._args` length. Lives here so [`ArgSlot`] is 32 B.
     pub(crate) arg_len: std::cell::Cell<u8>,
     /// Index of this op in the trace (set by the trace builder). Packed
     /// so the position can be patched via `&Op` once the op is shared
@@ -4495,8 +4495,8 @@ mod tests {
             let op = std::mem::size_of::<Op>();
             let rc_box = op + 2 * std::mem::size_of::<usize>();
             assert!(
-                op <= 112,
-                "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 144-byte class"
+                op <= 80,
+                "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 128-byte class"
             );
             let extra = std::mem::size_of::<GuardExtra>();
             assert!(
@@ -4504,8 +4504,8 @@ mod tests {
                 "GuardExtra grew to {extra} bytes; keep Box<GuardExtra> out of the 56-byte class"
             );
             assert!(
-                std::mem::size_of::<ArgSlot>() <= 64,
-                "ArgSlot grew; four inline operands must stay in 64 B"
+                std::mem::size_of::<ArgSlot>() <= 32,
+                "ArgSlot grew; four inline operands must stay in 32 B"
             );
             assert!(
                 std::mem::size_of::<ForwardedSlot>() <= 8,

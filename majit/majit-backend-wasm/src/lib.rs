@@ -4812,16 +4812,16 @@ impl majit_backend::Backend for WasmBackend {
                 .rev()
                 .find(|op| op.opcode == majit_ir::OpCode::Jump)
                 .is_some_and(|jump| {
-                    jump.getarglist().iter().any(|arg| match arg {
-                        majit_ir::operand::Operand::Op(producer) => {
+                    jump.getarglist().iter().any(|arg| {
+                        if let Some(producer) = arg.bound_op() {
                             advances_loop_state(producer.opcode)
-                        }
-                        majit_ir::operand::Operand::InputArg(ia) => {
+                        } else if let Some(ia) = arg.bound_inputarg() {
                             input_pos.get(&ia.index).is_some_and(|&k| {
                                 source_fail_arg_advanced.get(k).copied().unwrap_or(false)
                             })
+                        } else {
+                            false
                         }
-                        _ => false,
                     })
                 });
             // The JUMP hands input `k` back at position `k` only when it
@@ -4858,11 +4858,9 @@ impl majit_backend::Backend for WasmBackend {
                     let sources: Vec<Option<usize>> = jump
                         .getarglist()
                         .iter()
-                        .map(|arg| match arg {
-                            majit_ir::operand::Operand::InputArg(ia) => {
-                                input_pos.get(&ia.index).copied()
-                            }
-                            _ => None,
+                        .map(|arg| {
+                            arg.bound_inputarg()
+                                .and_then(|ia| input_pos.get(&ia.index).copied())
                         })
                         .collect();
                     sources.iter().any(|source| {
