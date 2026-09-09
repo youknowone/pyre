@@ -4501,6 +4501,32 @@ thread_local! {
         std::cell::RefCell::new(indexmap::IndexMap::new());
 }
 
+/// RAII guard that restores `GC_TABLE_BASE` / `GC_TABLE_VAR_INDEX` on Drop
+/// so nested compiles (bridge compilation re-entry) keep their own table
+/// base and rematerialize map. Same reason as `OprefVarMapGuard`.
+struct GcTableCompileGuard {
+    saved_base: usize,
+    saved_index: indexmap::IndexMap<u32, u32>,
+}
+
+impl GcTableCompileGuard {
+    fn enter(new_base: usize) -> Self {
+        let saved_base = GC_TABLE_BASE.with(|cell| cell.replace(new_base));
+        let saved_index = GC_TABLE_VAR_INDEX.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        Self {
+            saved_base,
+            saved_index,
+        }
+    }
+}
+
+impl Drop for GcTableCompileGuard {
+    fn drop(&mut self) {
+        GC_TABLE_BASE.with(|cell| cell.set(self.saved_base));
+        GC_TABLE_VAR_INDEX.with(|cell| *cell.borrow_mut() = std::mem::take(&mut self.saved_index));
+    }
+}
+
 fn record_gc_table_var(var_idx: u32, table_index: u32) {
     GC_TABLE_VAR_INDEX.with(|cell| {
         cell.borrow_mut().insert(var_idx, table_index);
@@ -9642,8 +9668,7 @@ impl CraneliftBackend {
         // Empty list ⇒ no table, base stays 0.
         let gc_table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
         let gc_table_base = gc_table.as_ref().map_or(0usize, |t| t.base_addr());
-        GC_TABLE_BASE.with(|cell| cell.set(gc_table_base));
-        GC_TABLE_VAR_INDEX.with(|cell| cell.borrow_mut().clear());
+        let _gc_table_guard = GcTableCompileGuard::enter(gc_table_base);
         // RPython parity: regalloc asserts that every Box used as an
         // argument or in fail_args is bound to a register or stack
         // location before code emission begins. The pyre/Cranelift
