@@ -1673,6 +1673,15 @@ pub enum RegAllocOp {
     },
     /// regalloc_perform_discard(op_index, arglocs)
     PerformDiscard { op_index: usize, arglocs: Vec<Loc> },
+    /// `GC_STORE` `[value, base, ofs, imm(size)]` without a 64 B `Vec`.
+    /// Three locs plus `size` stay inside the 72 B `RegAllocOp` envelope.
+    PerformDiscardGcStore {
+        op_index: usize,
+        value: Loc,
+        base: Loc,
+        ofs: Loc,
+        size: i64,
+    },
     /// Register move: src → dst (from spill/reload/register-register moves)
     Move { src: Loc, dst: Loc },
     /// Skip (dead operation, no-op)
@@ -2345,6 +2354,25 @@ impl<'a> RegAlloc<'a> {
     ) {
         self.flush_moves(output);
         output.push(RegAllocOp::PerformDiscard { op_index, arglocs });
+    }
+
+    fn perform_discard_gc_store(
+        &mut self,
+        op_index: usize,
+        value: Loc,
+        base: Loc,
+        ofs: Loc,
+        size: i64,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.flush_moves(output);
+        output.push(RegAllocOp::PerformDiscardGcStore {
+            op_index,
+            value,
+            base,
+            ofs,
+            size,
+        });
     }
 
     /// x86/regalloc.py locs_for_fail
@@ -4815,11 +4843,7 @@ impl<'a> RegAlloc<'a> {
         let value_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, false);
         let size = size.map(|arg| self.const_value(arg)).unwrap_or(8);
         let ofs_loc = self.gc_offset_loc(self.const_value(offset));
-        self.perform_discard(
-            i,
-            vec![value_loc, base_loc, ofs_loc, Loc::immed(size)],
-            output,
-        );
+        self.perform_discard_gc_store(i, value_loc, base_loc, ofs_loc, size, output);
     }
 
     /// aarch64/regalloc.py prepare_op_gc_store_indexed parity.
@@ -4928,11 +4952,7 @@ impl<'a> RegAlloc<'a> {
             Loc::Reg(LARGE_IMM_SCRATCH)
         };
         // aarch64/regalloc.py:531: return [value_loc, base_loc, ofs_loc, imm(size)]
-        self.perform_discard(
-            i,
-            vec![value_loc, base_loc, ofs_loc, Loc::immed(size)],
-            output,
-        );
+        self.perform_discard_gc_store(i, value_loc, base_loc, ofs_loc, size, output);
     }
 
     /// aarch64/regalloc.py prepare_op_gc_store_indexed parity.
@@ -6498,6 +6518,16 @@ mod tests {
             !has_move_from(&output, &Loc::Reg(unrelated)),
             "fixed nursery allocation must not spill an unrelated live register"
         );
+    }
+
+    #[test]
+    fn loc_and_regallocop_sizes() {
+        assert!(
+            std::mem::size_of::<RegAllocOp>() <= 72,
+            "RegAllocOp grew to {} B; PerformDiscardGcStore must stay in the 72 B envelope",
+            std::mem::size_of::<RegAllocOp>()
+        );
+        assert!(std::mem::size_of::<Loc>() <= 16);
     }
 
     #[test]

@@ -2284,28 +2284,22 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index += 1;
                 }
                 RegAllocOp::PerformDiscard { op_index, arglocs } => {
+                    self.emit_discard(*op_index, arglocs, fail_index, ops);
                     let op = &ops[*op_index];
-                    if crate::majit_log_enabled() {
-                        let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
-                        eprintln!(
-                            "[dynasm] discard[{}]: {:?} args=[{}]",
-                            op_index,
-                            op.opcode,
-                            al.join(", ")
-                        );
+                    if op.opcode.is_guard() || op.opcode == OpCode::Finish {
+                        fail_index += 1;
                     }
-                    // A result-less op still emits code — the stores that
-                    // advance a loop's mutable state are all discards — so it
-                    // opens its own span too.
-                    if crate::majit_dump_enabled() {
-                        eprintln!(
-                            "[dynasm] @{:#06x} op[{}] {:?}",
-                            self.mc.offset().0,
-                            op_index,
-                            op.opcode
-                        );
-                    }
-                    self.regalloc_perform(op, *op_index, arglocs, None, fail_index, ops);
+                }
+                RegAllocOp::PerformDiscardGcStore {
+                    op_index,
+                    value,
+                    base,
+                    ofs,
+                    size,
+                } => {
+                    let locs = [*value, *base, *ofs, Loc::immed(*size)];
+                    self.emit_discard(*op_index, &locs, fail_index, ops);
+                    let op = &ops[*op_index];
                     if op.opcode.is_guard() || op.opcode == OpCode::Finish {
                         fail_index += 1;
                     }
@@ -2336,6 +2330,28 @@ impl<'a> AssemblerARM64<'a> {
         self.frame_depth = self.frame_depth.max(self.jump_target_frame_depth);
 
         Ok(())
+    }
+
+    fn emit_discard(&mut self, op_index: usize, arglocs: &[Loc], fail_index: u32, ops: &[OpRc]) {
+        let op = &ops[op_index];
+        if crate::majit_log_enabled() {
+            let al: Vec<String> = arglocs.iter().map(|l| format!("{l:?}")).collect();
+            eprintln!(
+                "[dynasm] discard[{}]: {:?} args=[{}]",
+                op_index,
+                op.opcode,
+                al.join(", ")
+            );
+        }
+        if crate::majit_dump_enabled() {
+            eprintln!(
+                "[dynasm] @{:#06x} op[{}] {:?}",
+                self.mc.offset().0,
+                op_index,
+                op.opcode
+            );
+        }
+        self.regalloc_perform(op, op_index, arglocs, None, fail_index, ops);
     }
 
     /// assembler.py:326 regalloc_perform — emit code for a non-guard op.
