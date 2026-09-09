@@ -1717,6 +1717,19 @@ const SLOT_STAMP_INLINE_TAG: usize = 0x7FFE << 48;
 const THIN_DESCR_BIT: usize = 1 << 62;
 const THIN_DESCR_ID_SHIFT: usize = 48;
 const THIN_DESCR_PTR_MASK: usize = (1 << 48) - 1;
+/// Small `_resint` stamps ride in bits 56-61 of a thin descr word so
+/// `marked`/`empty` GETFIELD (0/1) does not mint a 16 B `ThinStamp`.
+/// `pack_stamp(Int(i))` for `i` in `0..=15` fits.
+const THIN_STAMP_SHIFT: usize = 56;
+const THIN_STAMP_MASK: usize = 0x3f;
+/// Wider stamps intern `(vtable_id, stamp)` and set bit 61 plus a 13-bit
+/// id in bits 48-60. Bit 61 on a thin descr (no `SLOT_BOX_BIT`) cannot
+/// collide with `ThinFwd` (which also sets bit 63).
+const THIN_STAMPED_BIT: usize = 1 << 61;
+const THIN_STAMPED_ID_SHIFT: usize = 48;
+const THIN_STAMPED_ID_MASK: usize = 0x1fff;
+
+static THIN_STAMPED: std::sync::Mutex<Vec<(u8, u32)>> = std::sync::Mutex::new(Vec::new());
 
 static DESCR_VTABLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
@@ -1738,7 +1751,7 @@ fn descr_vtable_at(id: u8) -> usize {
 }
 
 fn is_thin_descr(w: usize) -> bool {
-    w & SLOT_BOX_BIT == 0 && w & THIN_DESCR_BIT != 0 && w & 7 == 0
+    w & SLOT_BOX_BIT == 0 && w & THIN_DESCR_BIT != 0 && w & 7 == 0 && !is_stamp_inline(w)
 }
 
 fn is_thin_fwd_box(w: usize) -> bool {
@@ -1746,15 +1759,51 @@ fn is_thin_fwd_box(w: usize) -> bool {
 }
 
 fn is_extra_inline(w: usize) -> bool {
-    w & SLOT_BOX_BIT == 0 && w & SLOT_EXTRA_BIT != 0 && w & 7 == 0
+    w & SLOT_BOX_BIT == 0 && w & SLOT_EXTRA_BIT != 0 && w & THIN_DESCR_BIT == 0 && w & 7 == 0
 }
 
 fn is_both_inline(w: usize) -> bool {
-    w & SLOT_BOX_BIT == 0 && w & SLOT_BOTH_BIT != 0 && w & 7 == 0
+    w & SLOT_BOX_BIT == 0 && w & SLOT_BOTH_BIT != 0 && w & THIN_DESCR_BIT == 0 && w & 7 == 0
 }
 
 fn is_stamp_box(w: usize) -> bool {
-    w & SLOT_BOX_BIT == 0 && w & SLOT_STAMP_BOX_BIT != 0 && w & 7 == 0
+    w & SLOT_BOX_BIT == 0 && w & SLOT_STAMP_BOX_BIT != 0 && w & THIN_DESCR_BIT == 0 && w & 7 == 0
+}
+
+fn thin_stamp(w: usize) -> u32 {
+    if w & THIN_STAMPED_BIT != 0 {
+        let id = (w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK;
+        let v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
+        return v.get(id).map(|(_, s)| *s).unwrap_or(0);
+    }
+    ((w >> THIN_STAMP_SHIFT) & THIN_STAMP_MASK) as u32
+}
+
+fn thin_with_stamp(thin: usize, stamp: u32) -> Option<usize> {
+    let data = thin & THIN_DESCR_PTR_MASK;
+    let vtable_id = thin_vtable_id(thin);
+    if stamp == 0 {
+        return Some(data | ((vtable_id as usize) << THIN_DESCR_ID_SHIFT) | THIN_DESCR_BIT);
+    }
+    if stamp < 64 && stamp & (1 << 5) == 0 {
+        // Bit 5 would set THIN_STAMPED_BIT (61); those values intern.
+        return Some(
+            data | ((vtable_id as usize) << THIN_DESCR_ID_SHIFT)
+                | ((stamp as usize) << THIN_STAMP_SHIFT)
+                | THIN_DESCR_BIT,
+        );
+    }
+    let mut v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
+    let id = if let Some(i) = v.iter().position(|&e| e == (vtable_id, stamp)) {
+        i
+    } else {
+        if v.len() >= THIN_STAMPED_ID_MASK + 1 {
+            return None;
+        }
+        v.push((vtable_id, stamp));
+        v.len() - 1
+    };
+    Some(data | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT)
 }
 
 fn is_stamp_inline(w: usize) -> bool {
@@ -1787,14 +1836,19 @@ fn take_word(w: usize) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32)
     } else if is_thin_fwd_box(w) {
         let p = unsafe { Box::from_raw(box_payload(w) as *mut ThinFwd) };
         let (lo, hi) = thin_to_lo_hi(p.thin);
-        (Some(descr_arc_from_bits(lo, hi)), None, p.forwarded, 0)
+        (
+            Some(descr_arc_from_bits(lo, hi)),
+            None,
+            p.forwarded,
+            thin_stamp(p.thin),
+        )
     } else if w & SLOT_BOX_BIT != 0 {
         let p = unsafe { Box::from_raw(box_payload(w) as *mut DescrWords) };
         let (d, e, f) = unsafe { decode_descr_extra(p.lo, p.hi) };
         (d, e, f, p.stamp)
     } else if is_thin_descr(w) {
         let (lo, hi) = thin_to_lo_hi(w);
-        (Some(descr_arc_from_bits(lo, hi)), None, 0, 0)
+        (Some(descr_arc_from_bits(lo, hi)), None, 0, thin_stamp(w))
     } else {
         let (d, e, f) = unsafe { decode_descr_extra(w, FWD_TAG) };
         (d, e, f, 0)
@@ -1861,10 +1915,19 @@ fn encode_thin_descr(d: DescrRef) -> Result<usize, DescrRef> {
     }
 }
 
+fn thin_vtable_id(w: usize) -> u8 {
+    if w & THIN_STAMPED_BIT != 0 {
+        let id = (w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK;
+        let v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
+        v.get(id).map(|(vt, _)| *vt).unwrap_or(0)
+    } else {
+        ((w >> THIN_DESCR_ID_SHIFT) & 0xff) as u8
+    }
+}
+
 fn thin_to_lo_hi(w: usize) -> (usize, usize) {
     let data = w & THIN_DESCR_PTR_MASK;
-    let id = ((w >> THIN_DESCR_ID_SHIFT) & 0xff) as u8;
-    (data, descr_vtable_at(id))
+    (data, descr_vtable_at(thin_vtable_id(w)))
 }
 
 /// `ResOpWithDescr._descr` slot. One tagged word: empty, inline
@@ -1910,10 +1973,13 @@ impl DescrSlot {
             let p = tagged_ptr(w) as *const ThinStamp;
             unsafe { (*p).stamp }
         } else if is_thin_fwd_box(w) {
-            0
+            let p = box_payload(w) as *const ThinFwd;
+            thin_stamp(unsafe { (*p).thin })
         } else if w & SLOT_BOX_BIT != 0 {
             let p = box_payload(w) as *const DescrWords;
             unsafe { (*p).stamp }
+        } else if is_thin_descr(w) {
+            thin_stamp(w)
         } else {
             0
         }
@@ -1936,6 +2002,13 @@ impl DescrSlot {
             return;
         }
         if is_thin_fwd_box(w) {
+            let p = box_payload(w) as *mut ThinFwd;
+            if let Some(thin) = thin_with_stamp(unsafe { (*p).thin }, stamp) {
+                unsafe {
+                    (*p).thin = thin;
+                }
+                return;
+            }
             if stamp == 0 {
                 return;
             }
@@ -1970,6 +2043,14 @@ impl DescrSlot {
         if w == 0 || is_stamp_inline(w) {
             unsafe {
                 *self.word.get() = SLOT_STAMP_INLINE_TAG | stamp as usize;
+            }
+            return;
+        }
+        if is_thin_descr(w)
+            && let Some(thin) = thin_with_stamp(w, stamp)
+        {
+            unsafe {
+                *self.word.get() = thin;
             }
             return;
         }
@@ -5262,6 +5343,24 @@ mod tests {
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(42)));
         op.set_value(crate::value::Value::Int(-7));
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(-7)));
+    }
+
+    #[test]
+    fn small_stamp_on_a_descr_op_stays_in_the_thin_word() {
+        let descr = crate::make_loop_target_descr(3, false);
+        let op = Op::with_descr(OpCode::GetfieldGcI, &[], descr);
+        op.set_value(crate::value::Value::Int(0));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(0)));
+        assert!(op.has_descr());
+        op.set_value(crate::value::Value::Int(1));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(1)));
+        assert!(op.has_descr());
+        op.set_value(crate::value::Value::Int(15));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(15)));
+        assert!(op.has_descr());
+        op.set_value(crate::value::Value::Int(16));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(16)));
+        assert!(op.has_descr());
     }
 
     #[test]
