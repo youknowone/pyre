@@ -1682,6 +1682,15 @@ pub enum RegAllocOp {
         ofs: Loc,
         size: i64,
     },
+    /// `GC_LOAD` `[base, ofs, res, imm(nsize)]` without a 64 B `Vec`.
+    /// Three locs plus `nsize` stay inside the 72 B `RegAllocOp` envelope.
+    PerformGcLoad {
+        op_index: usize,
+        base: Loc,
+        ofs: Loc,
+        res: Loc,
+        nsize: i64,
+    },
     /// Register move: src → dst (from spill/reload/register-register moves)
     Move { src: Loc, dst: Loc },
     /// Skip (dead operation, no-op)
@@ -1950,7 +1959,7 @@ impl<'a> RegAlloc<'a> {
     /// Mirror per-arch via #[cfg].
     fn _compute_hint_locations_from_descr(&mut self, descr: &dyn majit_ir::descr::LoopTargetDescr) {
         use majit_ir::descr::TargetArgLoc;
-        let Some((_, jump_args)) = self.final_jump_args.clone() else {
+        let Some((_, jump_args)) = self.final_jump_args.as_ref() else {
             return;
         };
         let target_arglocs = descr.target_arglocs();
@@ -2372,6 +2381,25 @@ impl<'a> RegAlloc<'a> {
             base,
             ofs,
             size,
+        });
+    }
+
+    fn perform_gc_load(
+        &mut self,
+        op_index: usize,
+        base: Loc,
+        ofs: Loc,
+        res: Loc,
+        nsize: i64,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.flush_moves(output);
+        output.push(RegAllocOp::PerformGcLoad {
+            op_index,
+            base,
+            ofs,
+            res,
+            nsize,
         });
     }
 
@@ -4529,12 +4557,7 @@ impl<'a> RegAlloc<'a> {
         let nsize = self.gc_load_nsize(op, size);
         let tp = op.opcode.result_type();
         let res_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
-        self.perform(
-            i,
-            vec![base_loc, ofs_loc, res_loc, Loc::immed(nsize)],
-            Some(res_loc),
-            output,
-        );
+        self.perform_gc_load(i, base_loc, ofs_loc, res_loc, nsize, output);
     }
 
     /// aarch64/regalloc.py _prepare_op_gc_load_indexed parity, j2plan path.
@@ -4665,12 +4688,7 @@ impl<'a> RegAlloc<'a> {
         let tp = op.opcode.result_type();
         let res_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
         // aarch64/regalloc.py:546: return [base_loc, ofs_loc, res_loc, imm(nsize)]
-        self.perform(
-            i,
-            vec![base_loc, ofs_loc, res_loc, Loc::immed(nsize)],
-            Some(res_loc),
-            output,
-        );
+        self.perform_gc_load(i, base_loc, ofs_loc, res_loc, nsize, output);
     }
 
     /// aarch64/regalloc.py _prepare_op_gc_load_indexed parity.
@@ -6524,7 +6542,7 @@ mod tests {
     fn loc_and_regallocop_sizes() {
         assert!(
             std::mem::size_of::<RegAllocOp>() <= 72,
-            "RegAllocOp grew to {} B; PerformDiscardGcStore must stay in the 72 B envelope",
+            "RegAllocOp grew to {} B; PerformDiscardGcStore/PerformGcLoad must stay in the 72 B envelope",
             std::mem::size_of::<RegAllocOp>()
         );
         assert!(std::mem::size_of::<Loc>() <= 16);

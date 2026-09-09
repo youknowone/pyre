@@ -2304,6 +2304,17 @@ impl<'a> AssemblerARM64<'a> {
                         fail_index += 1;
                     }
                 }
+                RegAllocOp::PerformGcLoad {
+                    op_index,
+                    base,
+                    ofs,
+                    res,
+                    nsize,
+                } => {
+                    let op = &ops[*op_index];
+                    let locs = [*base, *ofs, *res, Loc::immed(*nsize)];
+                    self.regalloc_perform(op, *op_index, &locs, Some(res), fail_index, ops);
+                }
             }
         }
 
