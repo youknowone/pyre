@@ -10135,15 +10135,24 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `f64::is_finite(x)` is `(x - x) == 0.0` — emit the
-                // arithmetic directly instead of an unresolved call.
-                if args.len() == 1 && self.is_f64_is_finite(&reg) {
+                // ll_math.py ll_math_isfinite / ll_math_isinf (jitted arm):
+                // `(x - x) == 0.0` / `(x + VERY_LARGE_FLOAT) == x`.
+                // Like isnan above, these opaque Rust primitives become
+                // ordinary graph operations, not unresolved host calls.
+                let is_infinite = self.is_f64_is_infinite(&reg);
+                if args.len() == 1 && (self.is_f64_is_finite(&reg) || is_infinite) {
                     let zero = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(zero.clone()),
-                        kind: OpKind::ConstFloat(0),
+                        // Upstream starts at 1.0 and multiplies by 64 until
+                        // multiplying by 100 overflows: exactly 2**1020.
+                        kind: OpKind::ConstFloat(if is_infinite {
+                            (2.0_f64.powi(1020)).to_bits()
+                        } else {
+                            0
+                        }),
                     });
                     let diff = self
                         .graph
@@ -10151,9 +10160,13 @@ impl<'a> Lowering<'a> {
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(diff.clone()),
                         kind: OpKind::BinOp {
-                            op: "sub".to_string(),
+                            op: if is_infinite { "add" } else { "sub" }.to_string(),
                             lhs: args[0].clone(),
-                            rhs: args[0].clone(),
+                            rhs: if is_infinite {
+                                zero.clone()
+                            } else {
+                                args[0].clone()
+                            },
                             result_ty: ValueType::Float,
                         },
                     });
@@ -10165,7 +10178,11 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::BinOp {
                             op: "eq".to_string(),
                             lhs: diff.clone(),
-                            rhs: zero.clone(),
+                            rhs: if is_infinite {
+                                args[0].clone()
+                            } else {
+                                zero.clone()
+                            },
                             result_ty: ValueType::Int,
                         },
                     });
@@ -14191,6 +14208,16 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_finite")
+    }
+
+    /// Rust's opaque infinity predicate maps to ll_math.py ll_math_isinf.
+    fn is_f64_is_infinite(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_infinite")
     }
 
     /// `f64::from_bits(bits)` — `core` has no graph body (Opaque), so map the
