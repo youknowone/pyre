@@ -403,8 +403,10 @@ pub struct InputArg {
     /// `resoperation.py AbstractInputArg._forwarded` parity slot —
     /// the canonical forwarding host for a bound InputArg box.
     /// `Forwarded::None` until a writer sets it; `set_forwarded_*`
-    /// on a bound box routes here.
-    pub forwarded: std::cell::RefCell<crate::forwarding::Forwarded>,
+    /// on a bound box routes here. `ForwardedSlot` (same as `Op`)
+    /// drops the `RefCell` borrow flags so `Rc<InputArg>` leaves the
+    /// 64-byte class.
+    pub forwarded: crate::resoperation::ForwardedSlot,
     /// `resoperation.py/727/739 InputArgInt/Float/Ref` carry the
     /// concrete runtime value on the frontend-arg object itself (the
     /// `_resint`/`_resfloat`/`_resref` mixin slot, `history.py:803-807`).
@@ -433,7 +435,7 @@ impl InputArg {
         InputArg {
             tp: self.tp,
             index: self.index,
-            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
+            forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }
@@ -455,7 +457,7 @@ impl InputArg {
         InputArg {
             tp: Type::Int,
             index,
-            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
+            forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }
@@ -464,7 +466,7 @@ impl InputArg {
         InputArg {
             tp: Type::Ref,
             index,
-            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
+            forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }
@@ -473,7 +475,7 @@ impl InputArg {
         InputArg {
             tp: Type::Float,
             index,
-            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
+            forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }
@@ -489,7 +491,7 @@ impl InputArg {
         InputArg {
             tp,
             index,
-            forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
+            forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
         }
     }
@@ -1564,6 +1566,17 @@ mod tests {
         // therefore starts with its own remembered young-edge state.
         let replacement = SharedConstPool::new(Vec::new());
         assert!(replacement.take_minor_scan_pending());
+    }
+
+    #[test]
+    fn inputarg_rc_leaves_the_64_byte_class() {
+        // Rc header is two usizes (16). Payload must stay at 48 or below
+        // so Rc<InputArg> is not a 64-byte allocation.
+        assert!(
+            std::mem::size_of::<InputArg>() < 48,
+            "InputArg is {} bytes; RcBox would stay in the 64-byte class",
+            std::mem::size_of::<InputArg>()
+        );
     }
 
     #[test]
