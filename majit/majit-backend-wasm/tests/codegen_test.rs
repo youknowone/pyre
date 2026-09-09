@@ -2120,6 +2120,113 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     );
 }
 
+/// `genop_finish` stores `jf_gcmap = 0` when there is no `_finish_gcmap`
+/// (only `GUARD_NOT_FORCED_2` retains that map). The CA caller footer is
+/// then `_call_footer_shadowstack` — the x86 `SUB` — not a runtime
+/// `jf_force_descr` check that would take the write-barrier helper on
+/// every leftover `GUARD_NOT_FORCED` from the call itself.
+#[test]
+fn call_assembler_without_gnf2_pops_with_shadowstack_sub() {
+    fn build(with_gnf2: bool) -> Vec<u8> {
+        let token = 0x5a5a_u64;
+        let ca_pop_fn_ptr = 0x77_i64;
+        let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+        let call = make_op(
+            OpCode::CallAssemblerI,
+            &[OpRef::input_arg_int(0)],
+            OpRef::int_op(1),
+        );
+        call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
+            arg_types: vec![Type::Int],
+            result_type: Type::Int,
+            target_token: token,
+        }));
+        let mut ops = vec![call];
+        if with_gnf2 {
+            ops.push(make_guard(
+                OpCode::GuardNotForced2,
+                &[],
+                &[OpRef::int_op(1)],
+            ));
+        }
+        ops.push(Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]));
+        let inputs = codegen::ModuleBuildInputs {
+            inputargs,
+            ops,
+            inlined_bridges: Vec::new(),
+            constants: indexmap::IndexMap::new(),
+            vtable_offset: Some(0),
+            classptr_to_typeid: HashMap::new(),
+            guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+            alloc: codegen::AllocHelpers::default(),
+            wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+            nursery: None,
+            invalidated_flag_addr: 0,
+            gc_table_base: 0,
+            fail_index_base: 0,
+            bridge_cells_base: 0,
+            bridge_entry_arity: None,
+            bridge_param_dispatch: false,
+            trace_entry_census: None,
+            inline_trip: None,
+            external_jump_slot: 0,
+            external_jump_wide_slot: 0,
+            external_jump_key: 0,
+            frame: codegen::FrameGeometry::fixed(),
+            ca: codegen::CaParams {
+                emit_ca: true,
+                targets: HashMap::from([(
+                    token,
+                    codegen::CaTarget {
+                        dispatch_entry: 1024,
+                    },
+                )]),
+                deopt_helper_slot: 1,
+                ca_alloc_fn_ptr: 2,
+                ca_pop_fn_ptr,
+                ca_reload_fn_ptr: 4,
+                ca_reload_caller_fn_ptr: 5,
+                inline: Some(codegen::CaInlineParams {
+                    nursery_free_addr: 0x1000,
+                    nursery_top_addr: 0x1008,
+                    jf_top_addr: 0x2000,
+                    jf_limit_addr: 0x2008,
+                    jitframe_tid: 7,
+                    large_threshold: 4096,
+                }),
+                ..codegen::CaParams::default()
+            },
+        };
+        codegen::build_wasm_module(&inputs)
+            .expect("inline CA pop should compile")
+            .0
+    }
+
+    fn mentions_pop_helper(bytes: &[u8]) -> bool {
+        let mut saw = false;
+        count_operators(bytes, |op| {
+            if matches!(op, wasmparser::Operator::I32Const { value } if *value == 0x77) {
+                saw = true;
+            }
+        });
+        saw
+    }
+
+    let without = build(false);
+    validate_wasm(&without);
+    assert!(
+        !mentions_pop_helper(&without),
+        "no GUARD_NOT_FORCED_2: pop is SUB, not wasm_jit_ca_pop_frame"
+    );
+
+    let with = build(true);
+    validate_wasm(&with);
+    assert!(
+        mentions_pop_helper(&with),
+        "GUARD_NOT_FORCED_2 keeps the write-barrier pop helper"
+    );
+}
+
 /// A region's value ids are its own trace's, so they collide with the owner's.
 /// The merged stream has one local namespace, so an unrebased collision makes
 /// the region's entry moves land in locals the owner still holds live across

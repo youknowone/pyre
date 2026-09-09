@@ -1894,8 +1894,9 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
 /// this callee's frame.
 pub extern "C" fn wasm_jit_ca_pop_frame(_items_base: i64) -> i64 {
     // `genop_finish` publishes `assembler._finish_gcmap` before the call
-    // footer drops the execution root.  A CA callee returns inside generated
-    // wasm, so its footer is this helper rather than `execute_token`.
+    // footer drops the execution root.  Traces without GUARD_NOT_FORCED_2
+    // now do that publish at FINISH and pop with `_call_footer_shadowstack`;
+    // this helper remains the GUARD_NOT_FORCED_2 footer.
     // `_reload_frame_if_necessary`: the deopt helper can collect after the
     // generated caller last refreshed its callee local. The shadow-stack root
     // is forwarded by that collection; the argument may still name old space.
