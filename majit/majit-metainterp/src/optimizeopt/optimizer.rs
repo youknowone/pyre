@@ -4880,7 +4880,10 @@ impl Optimizer {
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
                     }
-                    self.emit_operation(op.clone(), ctx, false)?;
+                    // heap.py optimize_SETFIELD_GC ends in emit(op) of the
+                    // same ResOperation. Reuse that Rc instead of cls().
+                    let existing = (op.opcode == op_rc.opcode).then(|| std::rc::Rc::clone(op_rc));
+                    self.emit_operation_inner(op.clone(), ctx, false, existing)?;
                     // optimizer.py:585-589: invoke postprocess callbacks
                     // in reverse order after emission.
                     for &pp_idx in postprocess_passes.iter().rev() {
@@ -4983,9 +4986,18 @@ impl Optimizer {
         }
 
         // If no pass handled it, emit as-is. An unreplaced pass-through is the
-        // recorder input op verbatim (args re-resolved), so emit may reuse that
-        // input op as the producer instead of cloning.
-        self.emit_operation((*current_op).clone(), ctx, !replaced)?;
+        // recorder input op verbatim (args re-resolved), so emit may append
+        // that same Rc — no second ResOperation().
+        if !replaced {
+            self.emit_operation_inner(
+                (*current_op).clone(),
+                ctx,
+                true,
+                Some(std::rc::Rc::clone(op_rc)),
+            )?;
+        } else {
+            self.emit_operation((*current_op).clone(), ctx, false)?;
+        }
         // Postprocess in reverse order after emission.
         for &pp_idx in postprocess_passes.iter().rev() {
             self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
@@ -5007,9 +5019,19 @@ impl Optimizer {
     /// virtual args that weren't caught by pass-level handlers.
     fn emit_operation(
         &mut self,
+        op: Op,
+        ctx: &mut OptContext,
+        reuse: bool,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        self.emit_operation_inner(op, ctx, reuse, None)
+    }
+
+    fn emit_operation_inner(
+        &mut self,
         mut op: Op,
         ctx: &mut OptContext,
         reuse: bool,
+        existing: Option<majit_ir::OpRc>,
     ) -> Result<(), crate::optimize::InvalidLoop> {
         // RPython optimizer.py: _emit_operation is on the Optimizer (last
         // "pass" in the chain). Any force_box called here should emit directly,
@@ -5184,7 +5206,16 @@ impl Optimizer {
         // `debug_assert_box_type_invariant`).
         let op_opcode = op.opcode;
         let op_result_type = op.result_type();
-        let emitted = if reuse {
+        let emitted = if let Some(rc) = existing {
+            if rc.opcode == op.opcode {
+                OptContext::stamp_emitted_op(&op, &rc);
+                ctx.emit_rc(rc)
+            } else {
+                // `_maybe_replace_guard_value` / similar rewrites change
+                // the opcode; the recorded Rc cannot follow.
+                ctx.emit(op)
+            }
+        } else if reuse {
             ctx.emit_reusing(op)
         } else {
             ctx.emit(op)

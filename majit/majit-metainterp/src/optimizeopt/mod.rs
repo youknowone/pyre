@@ -3023,6 +3023,62 @@ impl OptContext {
         self.emit_impl(op, false)
     }
 
+    /// Append an already-allocated `OpRc` without a second `ResOperation()`.
+    /// Used when the optimizer pass-through is the recorder/iterator op
+    /// itself (`optimizer.py _newoperations.append(op)`).
+    pub(crate) fn emit_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
+        if op.pos.get().is_none() || op.pos.get().is_constant() {
+            op.pos.set(self.reserve_pos_typed(op.result_type()));
+        } else {
+            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
+        }
+        let pos_ref = op.pos.get();
+        if op.opcode.is_guard() {
+            if !self.in_final_emission {
+                let mut owned = (*op).clone();
+                self.emit_guard_operation(&mut owned);
+                Self::stamp_emitted_op(&owned, &op);
+            }
+        } else {
+            let dominated_by_side_effect = !((op.opcode.has_no_side_effect()
+                || op.opcode.is_ovf()
+                || op.opcode.is_jit_debug())
+                && !Self::is_call_pure_pure_canraise(&op));
+            if dominated_by_side_effect {
+                self.last_guard_idx = None;
+                self.guard_chain_broken = true;
+            }
+        }
+        Self::debug_assert_box_type_invariant(&op);
+        self.emitted_operations
+            .insert(majit_ir::operand::Operand::from_bound_op(&op));
+        self.push_new_operation(op);
+        pos_ref
+    }
+
+    pub(crate) fn stamp_emitted_op(src: &Op, dst: &Op) {
+        for i in 0..src.num_args() {
+            dst.setarg(i, src.arg(i));
+        }
+        match src.getdescr() {
+            Some(d) => dst.setdescr(d),
+            None => dst.cleardescr(),
+        }
+        if src.opcode.is_guard() {
+            if let Some(fa) = src.guard_fail_args() {
+                dst.setfailargs(fa.iter().cloned().collect());
+            } else {
+                dst.clearfailargs();
+            }
+            match src.get_fail_arg_types() {
+                Some(ts) => dst.set_fail_arg_types(ts),
+                None => dst.clear_fail_arg_types(),
+            }
+            dst.set_rd_resume_position(src.rd_resume_position());
+        }
+        dst.pos.set(src.pos.get());
+    }
+
     /// `emit` variant that REUSES the recorder input op (the `live_synthetics`
     /// entry at this position) as the emitted producer instead of cloning into
     /// a fresh `Rc<Op>`. The input op is the object later ops' operands already
@@ -3162,11 +3218,12 @@ impl OptContext {
         // value (resoperation.py:233 the op IS the box). This is the structural
         // collapse the clone path's catch-up only approximates by copying
         // `_forwarded` onto a fresh clone and redirecting input -> clone.
-        // Guards are excluded (the guard path mutates `op` in emit_guard_operation
-        // before reaching here). The opcode/num_args match guards against reusing
-        // a non-matching stand-in; on any mismatch we fall through to the clone
-        // path below, which is always correct.
-        if reuse && !op.opcode.is_guard() {
+        // Guards used to be excluded because emit_guard_operation mutates
+        // the owned `op` (failargs / descr / rd_resume_position) before
+        // we get here. Stamp that same state onto the live recorder op
+        // instead of `Rc::new` — the opcode/num_args match still rejects
+        // a stand-in that is no longer the same guard.
+        if reuse {
             // At most one live entry per position (emit invariant), so the
             // O(1) index resolves the reuse candidate; the opcode/num_args
             // predicate then guards against reusing a non-matching stand-in
@@ -3189,6 +3246,18 @@ impl OptContext {
                 match op.getdescr() {
                     Some(d) => reused.setdescr(d),
                     None => reused.cleardescr(),
+                }
+                if op.opcode.is_guard() {
+                    if let Some(fa) = op.guard_fail_args() {
+                        reused.setfailargs(fa.iter().cloned().collect());
+                    } else {
+                        reused.clearfailargs();
+                    }
+                    match op.get_fail_arg_types() {
+                        Some(ts) => reused.set_fail_arg_types(ts),
+                        None => reused.clear_fail_arg_types(),
+                    }
+                    reused.set_rd_resume_position(op.rd_resume_position());
                 }
                 // optimizer.py `self._emittedoperations[op] = None`. The
                 // clone path below records this too; `get_producing_op` only

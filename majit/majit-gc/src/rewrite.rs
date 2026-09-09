@@ -864,16 +864,22 @@ impl RewriteState {
             }
         }
         if out.opcode.is_guard() {
-            if !replaced {
-                out = Rc::new((*out).clone());
-                replaced = true;
+            // rewrite.py emit_op copy_and_changes every guard so setfailargs
+            // can install replacements. When every failarg is already its
+            // replacement the new ResOperation is identical — skip that
+            // second cls() and keep the recorded op.
+            let failargs_changed = out
+                .guard_fail_args()
+                .is_some_and(|fa| fa.iter().any(|a| self.resolve(a.clone()) != *a));
+            if failargs_changed {
+                if !replaced {
+                    out = Rc::new((*out).clone());
+                    replaced = true;
+                }
+                out.map_failargs_in_place(|a| {
+                    *a = self.resolve(a.clone());
+                });
             }
-            // copy_and_change already copied `_fail_args`. Remap that list
-            // in place instead of `setfailargs([get_box_replacement(a)])`,
-            // which would allocate a second 4-operand Vec.
-            out.map_failargs_in_place(|a| {
-                *a = self.resolve(a.clone());
-            });
         }
         let rt = out.result_type();
         let pos = if replaced {
@@ -4662,6 +4668,31 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::GuardTrue);
         assert_eq!(result[2].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_guard_reuses_recorded_rc_when_failargs_are_already_resolved() {
+        let rw = make_rewriter();
+        let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(2))]);
+        guard.store_final_boxes(vec![ro(OpRef::int_op(0))]);
+        let boxed: Vec<OpRc> = vec![
+            Rc::new(Op::new(
+                OpCode::IntAdd,
+                &[ro(OpRef::int_op(0)), ro(OpRef::int_op(1))],
+            )),
+            Rc::new(guard),
+            Rc::new(Op::new(OpCode::Jump, &[])),
+        ];
+        let recorded = Rc::clone(&boxed[1]);
+        let result = GcRewriter::rewrite_for_gc(&rw, &boxed);
+        let out = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard survives rewrite");
+        assert!(
+            Rc::ptr_eq(out, &recorded),
+            "emit_op must not mint a second ResOperation when failargs are unchanged"
+        );
     }
 
     // ── Test 6: Multiple allocations are batched ──
