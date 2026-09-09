@@ -1853,26 +1853,47 @@ impl Drop for FrameBox {
 /// root the eval path holds in `call.rs`: during setup the freshly-installed
 /// locals/cells live only in that array, so an intervening collection would
 /// drop or mis-forward them unless the slot is rooted.
+///
+/// The guard stores the frame, not the field address. `jtransform.py`
+/// `rewrite_op_getsubstruct` refuses a GC interior in the Ref bank — the
+/// gcmap would treat `frame+offset` as its own object. Computing the slot
+/// only inside residual helpers keeps that address out of compiled slots.
 pub struct FrameLocalsRoot {
-    slot: *mut *mut u8,
+    frame: *mut PyFrame,
     registered: bool,
 }
 
 impl FrameLocalsRoot {
+    #[majit_macros::dont_look_inside]
     pub fn new(frame_ptr: *mut PyFrame) -> Self {
-        let slot =
-            unsafe { std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8 };
-        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
-        Self { slot, registered }
+        let registered = unsafe { register_frame_locals_slot(frame_ptr) };
+        Self {
+            frame: frame_ptr,
+            registered,
+        }
     }
 }
 
 impl Drop for FrameLocalsRoot {
     fn drop(&mut self) {
         if self.registered {
-            pyre_object::gc_hook::try_gc_remove_root(self.slot);
+            unregister_frame_locals_slot(self.frame);
         }
     }
+}
+
+/// `addr_of_mut!(locals_cells_stack_w)` is an interior address. Residual so a
+/// compiled gcmap cannot mark it as a GCREF (`rewrite_op_getsubstruct`).
+#[majit_macros::dont_look_inside]
+unsafe fn register_frame_locals_slot(frame_ptr: *mut PyFrame) -> bool {
+    let slot = unsafe { std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8 };
+    unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }
+}
+
+#[majit_macros::dont_look_inside]
+fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
+    let slot = unsafe { std::ptr::addr_of_mut!((*frame_ptr).locals_cells_stack_w) as *mut *mut u8 };
+    pyre_object::gc_hook::try_gc_remove_root(slot);
 }
 
 #[inline]

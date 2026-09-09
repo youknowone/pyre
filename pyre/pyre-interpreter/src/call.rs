@@ -36,16 +36,16 @@ pub(crate) fn frame_into_generator_for_function(
 }
 
 struct FrameLocalsRoot {
-    slot: *mut *mut u8,
+    frame: *mut PyFrame,
     registered: bool,
 }
 
 impl FrameLocalsRoot {
+    #[majit_macros::dont_look_inside]
     fn new(frame: &PyFrame) -> Self {
         let frame = frame as *const PyFrame as *mut PyFrame;
-        let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) } as *mut *mut u8;
-        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
-        Self { slot, registered }
+        let registered = unsafe { register_frame_locals_slot(frame) };
+        Self { frame, registered }
     }
 
     fn new_mut(frame: &mut PyFrame) -> Self {
@@ -56,9 +56,21 @@ impl FrameLocalsRoot {
 impl Drop for FrameLocalsRoot {
     fn drop(&mut self) {
         if self.registered {
-            pyre_object::gc_hook::try_gc_remove_root(self.slot);
+            unregister_frame_locals_slot(self.frame);
         }
     }
+}
+
+#[majit_macros::dont_look_inside]
+unsafe fn register_frame_locals_slot(frame: *mut PyFrame) -> bool {
+    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) } as *mut *mut u8;
+    unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }
+}
+
+#[majit_macros::dont_look_inside]
+fn unregister_frame_locals_slot(frame: *mut PyFrame) {
+    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) } as *mut *mut u8;
+    pyre_object::gc_hook::try_gc_remove_root(slot);
 }
 
 thread_local! {
