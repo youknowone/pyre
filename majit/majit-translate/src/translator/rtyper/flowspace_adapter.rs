@@ -407,12 +407,12 @@ fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
 /// `pairtype(Repr, VoidRepr).convert_from_to` (rmodel.py)
 /// converts into Void as `inputconst(lltype.Void, None)`.
 ///
-/// The front end relies on that: `front::mir` mints a Void operand with
-/// no defining operation when a field read lands on a fieldless enum,
-/// and says so — "No defining operation, matching the bare
-/// `Constant(None, lltype.Void)` the argument lists skip". Materialising
-/// that constant here is the other half of the same decision, so a Void
-/// operand resolves instead of tripping the undefined-operand invariant.
+/// PRE-EXISTING-ADAPTATION: tolerate legacy graphs with undefined Void
+/// operands. MIR's erased-call results and fieldless-enum projections now
+/// emit actual ConstNone definitions: this fallback must not replace those
+/// producers, because it runs after framestate and loses their provenance.
+/// Remove it once the other input-graph producers and their fixtures enforce
+/// the upstream defined-operand invariant, not by treating Unknown as Void.
 ///
 /// Only Void is treated this way. A missing operand of any other kind
 /// still fails loud: it names a value some op was supposed to define.
@@ -2959,10 +2959,10 @@ pub fn translate_op(
                         // matched variant's, breaking enum base/variant class
                         // identity (RPython keys identity on the live class
                         // object, never a name, so this cannot arise upstream).
-                        // Interning still keys on the bare tail: a constructed
-                        // value and a discriminant-narrowed value both reach
-                        // the SAME base classdef (the narrowing reads back the
-                        // classdef name the ctor minted), so they agree.
+                        // Keep the qualified owner when interning too. A
+                        // withdrawn or absent bare-leaf alias must not split
+                        // the constructor from the class used by field reads
+                        // and the common-base join (Bookkeeper.getuniqueclassdef).
                         let owner_tail = owner_path.last();
                         let owner_qual = owner_path.join("::");
                         let is_enum_variant =
@@ -2971,7 +2971,7 @@ pub fn translate_op(
                                     || owner_tail.is_some_and(|tail| reg.is_enum_base(tail))
                             });
                         if is_enum_variant {
-                            bk.intern_enum_variant_host(owner_tail.unwrap(), name)
+                            bk.intern_enum_variant_host(&owner_qual, name)
                         } else {
                             // A closure env ctor.  Normal struct ctors keep the
                             // dotted qualname (`_init_classdef`'s
@@ -3348,6 +3348,10 @@ pub struct FlowspaceAdapterOutput {
     /// does not have to reconstruct the kind from the reduced legacy
     /// `ValueType` view.
     pub constant_concretetypes: HashMap<Variable, LowLevelType>,
+    /// Actual constant representatives, retained for the Constant arm of
+    /// simplify.py::remove_identical_vars_SSA's phi renaming. Type equality
+    /// alone is not evidence that two incoming constants are equal.
+    pub constant_hlvalues: HashMap<Variable, Hlvalue>,
     /// `BlockId → flowspace::BlockRef` mapping. Includes the canonical
     /// `returnblock` and `exceptblock` (mapped to the
     /// `FunctionGraph::with_return_var`-allocated final blocks) so any
@@ -3697,6 +3701,7 @@ fn link_arg_to_hlvalue(
 )]
 fn link_extravar_to_hlvalue(
     arg: &LinkArg,
+    name: &str,
     value_map: &mut HashMap<Variable, Hlvalue>,
     value_to_var: &mut LegacyToTyped,
 ) -> Result<Hlvalue, TyperError> {
@@ -3705,7 +3710,13 @@ fn link_extravar_to_hlvalue(
             if let Some(existing) = value_map.get(legacy_var).cloned() {
                 return Ok(existing);
             }
-            let var = seed_variable(legacy_var);
+            let mut var = seed_variable(legacy_var);
+            // flowcontext.py BlockRecorder.guessexception gives these
+            // link-scoped definitions their last_exception/last_exc_value
+            // names. SSA_to_SSI excludes those prefixes from ordinary
+            // cross-block uses; anonymous variables would be threaded back
+            // before the raising operation that actually defines them.
+            var.rename(name);
             value_to_var
                 .entry(legacy_var.clone())
                 .or_insert_with(|| var.clone());
@@ -4546,12 +4557,26 @@ fn function_graph_to_flowspace_inner(
             let last_exception = legacy_link
                 .last_exception
                 .as_ref()
-                .map(|arg| link_extravar_to_hlvalue(arg, &mut link_value_map, &mut value_to_var))
+                .map(|arg| {
+                    link_extravar_to_hlvalue(
+                        arg,
+                        "last_exception",
+                        &mut link_value_map,
+                        &mut value_to_var,
+                    )
+                })
                 .transpose()?;
             let last_exc_value = legacy_link
                 .last_exc_value
                 .as_ref()
-                .map(|arg| link_extravar_to_hlvalue(arg, &mut link_value_map, &mut value_to_var))
+                .map(|arg| {
+                    link_extravar_to_hlvalue(
+                        arg,
+                        "last_exc_value",
+                        &mut link_value_map,
+                        &mut value_to_var,
+                    )
+                })
                 .transpose()?;
             let target = block_map.get(&legacy_link.target).cloned().ok_or_else(|| {
                 TyperError::message(format!(
@@ -4663,6 +4688,7 @@ fn function_graph_to_flowspace_inner(
         value_to_var,
         value_to_var_candidates,
         constant_concretetypes,
+        constant_hlvalues,
         #[cfg(test)]
         block_map,
     })
@@ -7282,6 +7308,27 @@ mod tests {
             exc_link.last_exc_value.as_ref(),
             "exception value arg must reuse link.last_exc_value Variable"
         );
+        drop(exc_link);
+        drop(startblock);
+        drop(flowspace_graph);
+
+        // SSA_to_SSI deliberately ignores the startblock when collecting
+        // cross-block uses. Put the raising operation in a successor so this
+        // test actually reaches its exception-extravar handling.
+        let entry_args = vec![
+            Hlvalue::Variable(Variable::new()),
+            Hlvalue::Variable(Variable::new()),
+        ];
+        let entry = flowspace_model::Block::shared(entry_args.clone());
+        let old_start = output.graph.borrow().startblock.clone();
+        let mut link = FlowspaceLink::new(entry_args, Some(old_start), None);
+        link.prevblock = Some(Rc::downgrade(&entry));
+        entry.borrow_mut().closeblock(vec![link.into_ref()]);
+        output.graph.borrow_mut().startblock = entry;
+        let graph = output.graph.borrow();
+        flowspace_model::checkgraph(&graph);
+        crate::translator::backendopt::ssa::ssa_to_ssi(&graph, None);
+        flowspace_model::checkgraph(&graph);
     }
 
     #[test]

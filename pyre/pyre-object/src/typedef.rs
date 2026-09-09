@@ -18,6 +18,193 @@
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
+/// Host values accepted by TypeDef.rawdict. Keep Python host strings/None
+/// distinct from W_Root values: StdObjSpace.wrap allocates the former but
+/// calls spacebind on the latter. In particular a wrapped string is NOT the
+/// host string TypeDef.__init__ accepts as its doc candidate.
+#[derive(Clone)]
+pub enum TypeDefValue {
+    Text(String),
+    None,
+    Root(&'static std::cell::UnsafeCell<PyObjectRef>),
+}
+
+impl TypeDefValue {
+    /// Own a prebuilt declaration reference, including while its rawdict is
+    /// still being assembled. Slots are process-lifetime like the TypeDefs;
+    /// their addresses are stable even when the ordered host dict grows.
+    /// # Safety
+    /// `value` must be a live W_Root object, rooted across this call.
+    pub unsafe fn root(value: PyObjectRef) -> Self {
+        assert!(!value.is_null(), "use TypeDefValue::None for host None");
+        let slot = Box::leak(Box::new(std::cell::UnsafeCell::new(value)));
+        TYPEDEF_VALUE_ROOTS.lock().push(slot.get() as usize);
+        crate::gc_roots::mark_prebuilt_roots_dirty();
+        Self::Root(slot)
+    }
+}
+
+/// `pypy/interpreter/typedef.py TypeDef`, shared with `typeobject.py Layout`.
+///
+/// This is the existing runtime metadata, not a second type-definition
+/// registry. Derived layouts retain this object's identity. It lives in the
+/// object crate because Layout cannot depend on the interpreter crate;
+/// pyre-interpreter's typedef module re-exports this same type.
+///
+/// The current bootstrap supplies the layout-relevant subset of TypeDef's
+/// fields. Full `TypeDef.__init__` (bases/rawdict/gateway metadata) and
+/// TypeCache.build must converge on this owner, not allocate a parallel key.
+pub struct TypeDef {
+    /// Present for declaration-driven definitions; the legacy layout-only
+    /// producers have not supplied declaration names yet.
+    pub name: Option<String>,
+    pub bases: Vec<*const TypeDef>,
+    /// Host declarations, not the Function-valued namespace produced by
+    /// TypeCache.build. IndexMap preserves Python dict insertion order.
+    pub rawdict: indexmap::IndexMap<String, TypeDefValue>,
+    pub doc: Option<String>,
+    pub weakrefable: bool,
+    /// Existing allocation-vtable representation of the interpreter class;
+    /// replace with the canonical class metadata when rpy_cls is connected.
+    pub instance_type: *const PyType,
+    acceptable_as_base_class: std::sync::atomic::AtomicBool,
+    pub hasdict: bool,
+    /// TypeDef.__init__: initialization-time declaration, not a flag inferred
+    /// from the generated W_TypeObject's name or namespace.
+    pub method_descriptor: bool,
+}
+
+impl TypeDef {
+    /// Construct the metadata subset currently supplied by type bootstrap.
+    /// This is not yet the full initialization-time TypeDef.__init__ API.
+    pub fn new(
+        instance_type: *const PyType,
+        acceptable_as_base_class: bool,
+        hasdict: bool,
+    ) -> Self {
+        Self {
+            name: None,
+            bases: Vec::new(),
+            rawdict: indexmap::IndexMap::new(),
+            doc: None,
+            weakrefable: false,
+            instance_type,
+            acceptable_as_base_class: std::sync::atomic::AtomicBool::new(acceptable_as_base_class),
+            hasdict,
+            method_descriptor: false,
+        }
+    }
+
+    #[inline]
+    pub fn acceptable_as_base_class(&self) -> bool {
+        self.acceptable_as_base_class
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn set_acceptable_as_base_class(&self, value: bool) {
+        self.acceptable_as_base_class
+            .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// TypeDef._freeze_: track individual prebuilt definitions as PBCs.
+    pub fn _freeze_(&self) -> bool {
+        true
+    }
+
+    /// TypeDef.__init__'s declaration-derived metadata. The host dictionary
+    /// must contain unbound gateways/properties, not materialized Functions.
+    ///
+    /// # Safety
+    /// Every Root value must be a live W_Root and every base a live prebuilt
+    /// TypeDef. Definitions and their native root registrations are immortal.
+    #[majit_macros::not_rpython]
+    pub unsafe fn from_rawdict(
+        name: &str,
+        bases: Vec<*const TypeDef>,
+        rawdict: indexmap::IndexMap<String, TypeDefValue>,
+        instance_type: *const PyType,
+    ) -> *const Self {
+        let mut definition = Self::new(
+            instance_type,
+            rawdict.contains_key("__new__"),
+            rawdict.contains_key("__dict__"),
+        );
+        definition.name = Some(name.to_string());
+        assert!(
+            !rawdict.contains_key("__del__"),
+            "TypeDef requires an RPython finalizer"
+        );
+        definition.weakrefable = rawdict.contains_key("__weakref__");
+        definition.doc = match rawdict.get("__doc__") {
+            Some(TypeDefValue::Text(doc)) => Some(doc.clone()),
+            _ => None,
+        };
+        for &base in &bases {
+            // SAFETY: the constructor contract requires live prebuilt bases.
+            unsafe {
+                definition.hasdict |= (*base).hasdict;
+                definition.weakrefable |= (*base).weakrefable;
+            }
+        }
+        definition.bases = bases;
+        unsafe { definition.add_entries(rawdict) };
+        crate::lltype::malloc_raw(definition)
+    }
+
+    /// TypeDef.add_entries: name descriptors before updating the rawdict.
+    /// # Safety
+    /// Root entries must contain valid W_Root objects; mutate declarations
+    /// only during host initialization, before publishing them to a cache.
+    pub unsafe fn add_entries(&mut self, entries: indexmap::IndexMap<String, TypeDefValue>) {
+        for (key, entry) in &entries {
+            let TypeDefValue::Root(slot) = entry else {
+                continue;
+            };
+            let value = unsafe { *slot.get() };
+            if unsafe { crate::gateway::is_interp2app(value) } {
+                let gateway = unsafe { &mut *(value as *mut crate::gateway::interp2app) };
+                gateway.name = Box::leak(key.clone().into_boxed_str());
+                gateway._is_type_method = true;
+            } else if unsafe { is_getset_property(value) } {
+                let w_name = crate::w_str_new(key);
+                let value = unsafe { *slot.get() };
+                unsafe { w_getset_set_name(value, w_name) };
+            }
+        }
+        self.rawdict.extend(entries);
+    }
+}
+
+// RPython's host GC owns these prebuilt declaration dictionaries. Native
+// bootstrap needs a root census, not a semantic TypeDef lookup side table.
+static TYPEDEF_VALUE_ROOTS: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
+
+/// Trace the host declaration values, including templates no namespace owns.
+/// The visitor must not allocate or construct another TypeDef.
+pub fn walk_typedef_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    for &address in TYPEDEF_VALUE_ROOTS.lock().iter() {
+        unsafe {
+            forward(&mut *(address as *mut PyObjectRef));
+        }
+    }
+}
+
+/// Existing process-lifetime allocation for module-level `W_X.typedef`
+/// metadata. Keep the allocation identity while its bootstrap owner migrates
+/// to TypeDef.__init__ / TypeCache.build.
+pub fn leak_typedef(
+    instance_type: *const PyType,
+    acceptable_as_base_class: bool,
+    hasdict: bool,
+) -> *const TypeDef {
+    crate::lltype::malloc_raw(TypeDef::new(
+        instance_type,
+        acceptable_as_base_class,
+        hasdict,
+    ))
+}
+
 /// `pypy/interpreter/typedef.py class GetSetProperty(W_Root)`.
 ///
 /// All `PyObjectRef`-shaped slots default to `PY_NULL` to mark
@@ -516,6 +703,128 @@ pub unsafe fn w_member_get_direct_kind(obj: PyObjectRef) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declaration_metadata_distinguishes_host_text_and_wrapped_values() {
+        use super::*;
+        use indexmap::IndexMap;
+
+        unsafe {
+            let base = TypeDef::from_rawdict(
+                "base",
+                vec![],
+                IndexMap::from([
+                    ("__dict__".into(), TypeDefValue::None),
+                    ("__weakref__".into(), TypeDefValue::None),
+                    (
+                        "__doc__".into(),
+                        TypeDefValue::Text("host documentation".into()),
+                    ),
+                ]),
+                &INSTANCE_TYPE,
+            );
+            assert_eq!((*base).doc.as_deref(), Some("host documentation"));
+            assert!(!(*base).acceptable_as_base_class());
+            let child = TypeDef::from_rawdict(
+                "child",
+                vec![base],
+                IndexMap::from([
+                    ("__new__".into(), TypeDefValue::None),
+                    (
+                        "__doc__".into(),
+                        TypeDefValue::root(crate::w_str_new("wrapped")),
+                    ),
+                ]),
+                &INSTANCE_TYPE,
+            );
+            assert_eq!((*child).name.as_deref(), Some("child"));
+            assert_eq!((*child).bases, vec![base]);
+            assert!((*child).hasdict && (*child).weakrefable);
+            assert!((*child).acceptable_as_base_class());
+            assert_eq!((*child).doc, None);
+            assert_eq!(
+                (*child)
+                    .rawdict
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["__new__", "__doc__"]
+            );
+            // add_entries updates declarations; it does not recompute the
+            // metadata derived during TypeDef.__init__.
+            let child = &mut *(child as *mut TypeDef);
+            child.add_entries(IndexMap::from([(
+                "__doc__".into(),
+                TypeDefValue::Text("later".into()),
+            )]));
+            assert_eq!(child.doc, None);
+        }
+    }
+
+    #[test]
+    fn method_descriptor_is_projected_from_the_selected_layout_owner() {
+        use super::*;
+        use crate::typeobject::*;
+
+        let mut definition = TypeDef::new(&INSTANCE_TYPE, false, false);
+        assert!(!definition.method_descriptor);
+        definition.method_descriptor = true;
+        let definition = crate::lltype::malloc_raw(definition);
+        let layout = leak_layout(Layout {
+            typedef: definition,
+            nslots: 0,
+            newslotnames: vec![],
+            base_layout: std::ptr::null(),
+            dict_data_slot: DICT_DATA_SLOT_UNRESOLVED,
+        });
+        let plain = leak_layout(Layout {
+            typedef: leak_typedef(&INSTANCE_TYPE, true, false),
+            nslots: 0,
+            newslotnames: vec![],
+            base_layout: std::ptr::null(),
+            dict_data_slot: DICT_DATA_SLOT_UNRESOLVED,
+        });
+        unsafe {
+            // Neither spelling nor the initial flag selects the behavior.
+            let w_type = w_type_new("not_a_descriptor_name", PY_NULL, std::ptr::null_mut());
+            assert!(!w_type_get_flag_method_descriptor(w_type));
+            w_type_set_layout(w_type, layout);
+            assert!(w_type_get_flag_method_descriptor(w_type));
+            w_type_set_layout(w_type, plain);
+            assert!(!w_type_get_flag_method_descriptor(w_type));
+        }
+    }
+
+    #[test]
+    fn typedef_identity_is_preserved_by_layout_and_freeze() {
+        use super::{TypeDef, leak_typedef};
+        use crate::typeobject::{DICT_DATA_SLOT_UNRESOLVED, Layout, leak_layout};
+
+        let definition: *const TypeDef = leak_typedef(&crate::pyobject::INSTANCE_TYPE, true, true);
+        let root = leak_layout(Layout {
+            typedef: definition,
+            nslots: 0,
+            newslotnames: vec![],
+            base_layout: std::ptr::null(),
+            dict_data_slot: DICT_DATA_SLOT_UNRESOLVED,
+        });
+        let child = leak_layout(Layout {
+            typedef: definition,
+            nslots: 1,
+            newslotnames: vec!["x".into()],
+            base_layout: root,
+            dict_data_slot: DICT_DATA_SLOT_UNRESOLVED,
+        });
+        unsafe {
+            assert!(std::ptr::eq((*root).typedef, (*child).typedef));
+            assert!((*definition)._freeze_());
+            (*definition).set_acceptable_as_base_class(false);
+            assert!(!(*(*root).typedef).acceptable_as_base_class());
+            assert!(!(*(*child).typedef).acceptable_as_base_class());
+            assert!((*(*child).typedef).hasdict);
+            assert!((*child).issublayout(root));
+        }
+    }
+
     use super::*;
 
     #[test]

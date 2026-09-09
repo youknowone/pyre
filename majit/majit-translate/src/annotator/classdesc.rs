@@ -446,7 +446,12 @@ impl InstanceSource {
     /// RPython `InstanceSource.all_instance_attributes(self)`
     /// (classdesc.py:453-464).
     pub fn all_instance_attributes(&self) -> Result<Vec<String>, AnnotatorError> {
-        let mut result = self.obj.instance_dict_keys();
+        let mut result = self.obj.instance_dict_keys().map_err(|error| {
+            AnnotatorError::new(format!(
+                "InstanceSource.all_instance_attributes({:?}): host __dict__ enumeration failed: {error:?}",
+                self.obj.qualname()
+            ))
+        })?;
         let Some(tp) = self.obj.instance_class() else {
             return Ok(result);
         };
@@ -3244,16 +3249,12 @@ mod tests {
             ConstValue::Tuple(vec![ConstValue::byte_str("slot_a")]),
         );
         let obj = HostObject::new_instance(cls, vec![]);
-        obj.instance_set("dyn", ConstValue::Int(1));
+        obj.instance_set("dyn", ConstValue::Int(1)).unwrap();
         let src = InstanceSource::new(&bk, obj);
-        // `all_instance_attributes` starts from `instance_dict_keys()`, which
-        // reads a `HashMap`, so the order is not stable across runs — sort
-        // before comparing. What the three membership checks could not see is
-        // an *extra* attribute: the instance dict, this class's `__slots__`
-        // and the base's `__slots__` contribute exactly one entry each.
-        let mut attrs = src.all_instance_attributes().unwrap();
-        attrs.sort();
-        assert_eq!(attrs, ["base_slot", "dyn", "slot_a"]);
+        // InstanceSource.all_instance_attributes preserves dictionary order,
+        // then extends it with slots in MRO order.
+        let attrs = src.all_instance_attributes().unwrap();
+        assert_eq!(attrs, ["dyn", "slot_a", "base_slot"]);
     }
 
     #[test]
@@ -3262,7 +3263,7 @@ mod tests {
         let cls = HostObject::new_class("pkg.X", vec![]);
         cls.class_set("klass", ConstValue::Int(9));
         let obj = HostObject::new_instance(cls.clone(), vec![]);
-        obj.instance_set("x", ConstValue::Int(4));
+        obj.instance_set("x", ConstValue::Int(4)).unwrap();
         let src = AttrSource::Instance(InstanceSource::new(&bk, obj));
 
         let s_x = src.s_get_value(None, "x").unwrap();

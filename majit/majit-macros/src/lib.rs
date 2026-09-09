@@ -2129,13 +2129,26 @@ pub fn always_inline_try(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// body.
 #[proc_macro_attribute]
 pub fn not_rpython(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    host_function_marker(item, "_not_rpython_", "not_rpython")
+}
+
+/// `objectmodel.py specialize.memo`: attach the source callable's
+/// `_annspecialcase_ = 'specialize:memo'` attribute without changing its ABI.
+/// The translator must supply a native host evaluator and finite prebuilt
+/// arguments; this marker does not residualize or execute the function.
+#[proc_macro_attribute]
+pub fn specialize_memo(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    host_function_marker(item, "_annspecialcase_memo_", "specialize_memo")
+}
+
+fn host_function_marker(item: TokenStream, prefix: &str, attribute: &str) -> TokenStream {
     let item_ts = proc_macro2::TokenStream::from(item);
     if let Ok(func) = syn::parse2::<ItemFn>(item_ts.clone()) {
         let attrs = &func.attrs;
         let vis = &func.vis;
         let sig = &func.sig;
         let block = &func.block;
-        let marker = format_ident!("_not_rpython_{}", sig.ident);
+        let marker = format_ident!("{}{}", prefix, sig.ident);
         return quote! {
             #(#attrs)*
             #vis #sig {
@@ -2153,7 +2166,7 @@ pub fn not_rpython(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let defaultness = &method.defaultness;
         let sig = &method.sig;
         let block = &method.block;
-        let marker = format_ident!("_not_rpython_{}", sig.ident);
+        let marker = format_ident!("{}{}", prefix, sig.ident);
         return quote! {
             #(#attrs)*
             #vis #defaultness #sig {
@@ -2167,7 +2180,7 @@ pub fn not_rpython(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
     syn::Error::new_spanned(
         item_ts,
-        "#[not_rpython] supports free functions and impl methods",
+        format!("#[{attribute}] supports free functions and impl methods"),
     )
     .to_compile_error()
     .into()

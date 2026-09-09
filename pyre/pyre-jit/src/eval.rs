@@ -4746,6 +4746,27 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_object::rbuilder::set_stringpiece_gc_type_id(stringpiece_tid);
     let _ = pyre_jit_trace::descr::stringpiece_size_descr();
 
+    // gateway.py interp2app is an internal prebuilt W_Root, not an
+    // app-level builtin type. Trace its Code reference like the hidden
+    // WeakrefLifeline above. This is the tail of fixed layouts, BEFORE
+    // register_unresolved_struct_tids: that dynamic cache registers only
+    // previously unresolved descriptors, so its count differs on GC rebuild.
+    let gateway_descr =
+        <pyre_object::gateway::interp2app as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let gateway_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        gateway_descr.object_size,
+        gateway_descr.ptr_offsets.to_vec(),
+    ));
+    if gateway_descr.gc_type_id.is_unassigned() {
+        gateway_descr.gc_type_id.set(gateway_tid);
+    } else {
+        debug_assert_eq!(gateway_descr.gc_type_id.get(), gateway_tid);
+    }
+    pyre_object::gc_hook::register_pyre_class_offsets(
+        gateway_descr.pytype_ptr as usize,
+        gateway_descr.ptr_offsets,
+    );
+
     // `gc.py GcLLDescr_framework.init_size_descr` asks the
     // gctypelayout layoutbuilder for a collector type id after the translated
     // GC layouts are known, and only walks Size/Array objects already in
@@ -17141,6 +17162,24 @@ mod tests {
             rebuilt.subclass_range(classptr)
         });
         assert_matches_gc();
+    }
+
+    #[test]
+    fn prebuilt_gateway_traces_its_code_reference() {
+        let _ = driver_pair();
+        let code =
+            pyre_interpreter::gateway::builtin_code_new(
+                "root_probe",
+                |_| Ok(pyre_object::w_none()),
+            );
+        let gateway = pyre_interpreter::gateway::interp2app(code);
+        let mut found = false;
+        unsafe {
+            pyre_interpreter::eval::walk_raw_immortal_roots(gateway, &mut |slot| {
+                found |= slot.0 == code as usize;
+            });
+        }
+        assert!(found, "raw interp2app must expose its inline Code to GC");
     }
 
     #[test]

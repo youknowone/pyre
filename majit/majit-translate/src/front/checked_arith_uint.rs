@@ -23,22 +23,21 @@
 //! ## The rewrite (`rewire_one_checked_arith_uint_site`)
 //!
 //! Block A's last op is the residual `opt = checked_*(x, y)` call.  The
-//! rewrite drops that call and, **in place**, emits the native sequence plus a
-//! virtualized `Option` reusing `opt` as the ctor result:
+//! rewrite drops that call and emits the native sequence followed by a
+//! Some/None construction diamond forwarding to the original continuation:
 //!   - `checked_mul`: `lo = mul(x, y)`, `hi = uint_mul_high(x, y)`,
 //!     `disc = eq(hi, 0)`, value = `lo`.
 //!   - `checked_add`: `sum = add(x, y)`, `ovf = uint_lt(sum, x)`,
 //!     `disc = eq(ovf, 0)`, value = `sum`.
 //!   - `checked_sub`: `diff = sub(x, y)`, `ovf = uint_lt(x, y)`,
 //!     `disc = eq(ovf, 0)`, value = `diff`.
-//!   - `opt = Some/None` aggregate with `__discriminant = disc` (dynamic,
-//!     `1` = `Some` when no overflow, `0` = `None` on overflow) and
-//!     `__pos_0 = value`.
+//!   - branch on `disc`; Some carries `value`, None carries no payload.
 //!
 //! Unlike [`crate::front::checked_arith`] / [`crate::front::option_try`] this
-//! is **order-independent**: it produces a valid virtualized `Option` value
-//! that the downstream `?` / match / let-else consumes unchanged — no diamond
-//! matching, no exit rewiring.
+//! does not match a particular consumer diamond: it produces valid variant
+//! instances that downstream `?` / match / let-else consume unchanged.
+//! Ordinary annotation joins them to the enum base; no payload is stored on
+//! that base (rpython/annotator/classdesc.py::ClassDef._generalize_attr).
 //!
 //! It is **fail-safe**: any structural mismatch returns `Err`, the caller
 //! leaves the residual call untouched, and the census Skip / legacy-walker
@@ -58,7 +57,7 @@ use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType}
 #[derive(Clone)]
 pub(crate) struct CheckedArithUintSite {
     /// The `checked_*` call result (the `Option<T>` value) — locates block A
-    /// and is reused as the virtualized `Option` ctor result.
+    /// and is replaced on its outgoing edge by each arm's concrete instance.
     pub opt: Variable,
     /// The `Option` enum root `name_path` — the `__discriminant` field owner
     /// and the ctor owner.
@@ -165,6 +164,8 @@ fn rewire_one_checked_arith_uint_site(
             ));
         }
     };
+
+    crate::front::bool_then::validate_dynamic_option_exit(graph, graph.blocks[a].id)?;
 
     // --- All structural validation passed; mutate the graph. ---
 
@@ -373,35 +374,40 @@ mod tests {
         // Overflow tests: `mul` (low word) + `uint_mul_high` (high word) + `eq`.
         assert_eq!(tail_binops(&g, a), vec!["mul", "uint_mul_high", "eq"]);
 
-        // `opt` is now produced by the transparent Option ctor.
-        let ctor = g.blocks[a]
-            .operations
-            .iter()
-            .find(|op| op.result.as_ref() == Some(&opt))
-            .expect("opt must be produced");
-        assert!(
-            matches!(
-                &ctor.kind,
-                OpKind::Call {
-                    target: CallTarget::SyntheticTransparentCtor { .. },
-                    ..
-                }
-            ),
-            "opt must be the synthetic transparent Option ctor result"
-        );
-        // The aggregate writes the dynamic `__discriminant` and the `__pos_0`
-        // payload keyed to the Some owner.
-        let disc_write = g.blocks[a].operations.iter().any(|op| {
-            matches!(&op.kind, OpKind::FieldWrite { base, field, .. }
-                if *base == opt && field.name == "__discriminant")
-        });
-        let pos0_write = g.blocks[a].operations.iter().any(|op| {
-            matches!(&op.kind, OpKind::FieldWrite { base, field, .. }
-                if *base == opt && field.name == "__pos_0"
-                    && field.owner_root.as_deref() == Some("core::option::Option::Some"))
-        });
-        assert!(disc_write, "the __discriminant tag write must be present");
-        assert!(pos0_write, "the __pos_0 payload write must be present");
+        assert_eq!(g.blocks[a].exits.len(), 2);
+        let mut variants = Vec::new();
+        for exit in &g.blocks[a].exits {
+            let arm = g.block(exit.target);
+            let variant = arm
+                .operations
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { name, .. },
+                        ..
+                    } => Some(name.as_str()),
+                    _ => None,
+                })
+                .expect("arm constructor");
+            variants.push(variant);
+            let payloads: Vec<_> = arm
+                .operations
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::FieldWrite { field, .. } if field.name == "__pos_0" => Some(field),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(payloads.len(), usize::from(variant == "Some"));
+            if let Some(field) = payloads.first() {
+                assert_eq!(
+                    field.owner_root.as_deref(),
+                    Some("core::option::Option::Some")
+                );
+            }
+        }
+        variants.sort();
+        assert_eq!(variants, vec!["None", "Some"]);
     }
 
     #[test]

@@ -215,7 +215,7 @@ enum HostObjectKind {
         args: Vec<ConstValue>,
         /// The ordered container is required because a `HashMap`'s iteration
         /// order varies per process and these keys produce a work order.
-        instance_dict: Mutex<IndexMap<String, ConstValue>>,
+        instance_dict: HostInstanceDict,
     },
     /// `Constant.value` 에 담긴 임의의 host object — flowspace 가 구조
     /// 를 모르지만 보존해야 하는 값(예: 포팅되지 않은 `ConstantData`
@@ -290,6 +290,27 @@ enum HostObjectKind {
 /// propagates host-side failures (upstream `TypeError`, unhandled
 /// descriptor case, …) which callers rewrap into `AnnotatorError`.
 pub type HostCallableFn = Arc<dyn Fn(&[ConstValue]) -> Result<ConstValue, String> + Send + Sync>;
+
+/// Native-source boundary for a live host instance's `__dict__`.
+/// RPython's `InstanceSource.all_instance_attributes` enumerates the actual
+/// object and `InstanceSource.s_get_value` reads it through `getattr`.
+/// A native provider must retain its object's lifetime and return projected
+/// field names in order. Missing native support is Unsupported, not Missing.
+/// Object-valued fields must preserve the importer's canonical identity.
+///
+/// This is a read-only view, not a second attribute store. The HostObject
+/// carrier invokes it without holding an attribute lock, permitting recursive
+/// imports. Production providers still need validated LLBC field projection
+/// and translation-owned identity/rooting; this interface does not supply them.
+pub trait NativeInstanceDict: Send + Sync {
+    fn get(&self, name: &str) -> Result<ConstValue, HostGetAttrError>;
+    fn keys(&self) -> Result<Vec<String>, HostGetAttrError>;
+}
+
+enum HostInstanceDict {
+    Owned(Mutex<IndexMap<String, ConstValue>>),
+    Native(Arc<dyn NativeInstanceDict>),
+}
 
 impl PartialEq for HostObject {
     fn eq(&self, other: &Self) -> bool {
@@ -502,26 +523,40 @@ impl HostObject {
     }
 
     /// Instance → per-instance `__dict__` lookup. Mirrors
-    /// `getattr(instance, name)` respecting `inst.__dict__` before
-    /// MRO. Returns `None` when the instance doesn't carry the
-    /// attribute (or `self` isn't an instance).
-    pub fn instance_get(&self, name: &str) -> Option<ConstValue> {
+    /// the dictionary step of `getattr`; descriptor precedence belongs to
+    /// `host_getattr`. An unsupported native read must not fall through to a
+    /// class attribute or become a default prebuilt field in the rtyper.
+    pub fn instance_get(&self, name: &str) -> Result<ConstValue, HostGetAttrError> {
         match &self.inner.kind {
-            HostObjectKind::Instance { instance_dict, .. } => {
-                instance_dict.lock().get(name).cloned()
-            }
-            _ => None,
+            HostObjectKind::Instance {
+                instance_dict: HostInstanceDict::Owned(dict),
+                ..
+            } => dict
+                .lock()
+                .get(name)
+                .cloned()
+                .ok_or(HostGetAttrError::Missing),
+            HostObjectKind::Instance {
+                instance_dict: HostInstanceDict::Native(dict),
+                ..
+            } => dict.get(name),
+            _ => Err(HostGetAttrError::Missing),
         }
     }
 
     /// Instance `__dict__.keys()` snapshot. Non-instance returns an
     /// empty Vec, mirroring `getattr(obj, '__dict__', {}).keys()`.
-    pub fn instance_dict_keys(&self) -> Vec<String> {
+    pub fn instance_dict_keys(&self) -> Result<Vec<String>, HostGetAttrError> {
         match &self.inner.kind {
-            HostObjectKind::Instance { instance_dict, .. } => {
-                instance_dict.lock().keys().cloned().collect()
-            }
-            _ => Vec::new(),
+            HostObjectKind::Instance {
+                instance_dict: HostInstanceDict::Owned(dict),
+                ..
+            } => Ok(dict.lock().keys().cloned().collect()),
+            HostObjectKind::Instance {
+                instance_dict: HostInstanceDict::Native(dict),
+                ..
+            } => dict.keys(),
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -529,9 +564,21 @@ impl HostObject {
     /// `__dict__`. Used by prebuilt-instance fixtures in tests and
     /// by the `@setattr_to_class_annotation` style decorators
     /// that populate known attributes upfront.
-    pub fn instance_set(&self, name: impl Into<String>, value: ConstValue) {
-        if let HostObjectKind::Instance { instance_dict, .. } = &self.inner.kind {
-            instance_dict.lock().insert(name.into(), value);
+    pub fn instance_set(
+        &self,
+        name: impl Into<String>,
+        value: ConstValue,
+    ) -> Result<(), HostGetAttrError> {
+        if let HostObjectKind::Instance {
+            instance_dict: HostInstanceDict::Owned(dict),
+            ..
+        } = &self.inner.kind
+        {
+            dict.lock().insert(name.into(), value);
+            Ok(())
+        } else {
+            // A native view cannot accept a detached shadow write.
+            Err(HostGetAttrError::Unsupported)
         }
     }
 
@@ -746,6 +793,28 @@ impl HostObject {
     }
 
     pub fn new_instance(class_obj: HostObject, args: Vec<ConstValue>) -> Self {
+        Self::new_instance_with_dict(
+            class_obj,
+            args,
+            HostInstanceDict::Owned(Mutex::new(IndexMap::new())),
+        )
+    }
+
+    /// The caller supplies the canonical projected class and interns this
+    /// carrier for its native object. A same-spelled new class is not equivalent.
+    pub fn new_native_instance(class_obj: HostObject, dict: Arc<dyn NativeInstanceDict>) -> Self {
+        assert!(
+            class_obj.is_class(),
+            "native instance requires a projected class"
+        );
+        Self::new_instance_with_dict(class_obj, Vec::new(), HostInstanceDict::Native(dict))
+    }
+
+    fn new_instance_with_dict(
+        class_obj: HostObject,
+        args: Vec<ConstValue>,
+        instance_dict: HostInstanceDict,
+    ) -> Self {
         let qualname = format!("{}-instance", class_obj.qualname());
         HostObject {
             inner: Arc::new(HostObjectInner {
@@ -755,7 +824,7 @@ impl HostObject {
                 kind: HostObjectKind::Instance {
                     class_obj,
                     args,
-                    instance_dict: Mutex::new(IndexMap::new()),
+                    instance_dict,
                 },
             }),
         }
@@ -1483,8 +1552,10 @@ pub(crate) fn host_getattr(pyobj: &HostObject, name: &str) -> Result<ConstValue,
         {
             return host_descriptor_get(value.clone(), name, Some(pyobj), cls, origin_class);
         }
-        if let Some(value) = pyobj.instance_get(name) {
-            return Ok(value);
+        match pyobj.instance_get(name) {
+            Ok(value) => return Ok(value),
+            Err(HostGetAttrError::Missing) => {}
+            Err(error) => return Err(error),
         }
         if let Some((value, origin_class)) = class_hit {
             return host_descriptor_get(value, name, Some(pyobj), cls, &origin_class);
@@ -6244,10 +6315,133 @@ mod tests {
     fn instance_dict_keys_preserve_insertion_order() {
         let cls = HostObject::new_class("pkg.Foo", vec![]);
         let instance = HostObject::new_instance(cls, vec![]);
-        instance.instance_set("second", ConstValue::Int(2));
-        instance.instance_set("first", ConstValue::Int(1));
+        instance.instance_set("second", ConstValue::Int(2)).unwrap();
+        instance.instance_set("first", ConstValue::Int(1)).unwrap();
 
-        assert_eq!(instance.instance_dict_keys(), vec!["second", "first"]);
+        assert_eq!(
+            instance.instance_dict_keys().unwrap(),
+            vec!["second", "first"]
+        );
+    }
+
+    struct NativeInstanceFixture {
+        value: std::sync::atomic::AtomicI64,
+        child: HostObject,
+    }
+
+    impl NativeInstanceDict for NativeInstanceFixture {
+        fn get(&self, name: &str) -> Result<ConstValue, HostGetAttrError> {
+            match name {
+                "child" => Ok(ConstValue::HostObject(self.child.clone())),
+                "value" => Ok(ConstValue::Int(
+                    self.value.load(std::sync::atomic::Ordering::Acquire),
+                )),
+                "nested" => host_getattr(&self.child, "value"),
+                "blocked" => Err(HostGetAttrError::Unsupported),
+                _ => Err(HostGetAttrError::Missing),
+            }
+        }
+
+        fn keys(&self) -> Result<Vec<String>, HostGetAttrError> {
+            Ok(["child", "value", "nested", "blocked"]
+                .map(str::to_string)
+                .to_vec())
+        }
+    }
+
+    #[test]
+    fn native_instance_dict_is_live_read_only_and_preserves_identity() {
+        use crate::annotator::{bookkeeper::Bookkeeper, classdesc::InstanceSource};
+        let cls = HostObject::new_class("pkg.Native", vec![]);
+        let child = HostObject::new_instance(cls.clone(), vec![]);
+        child.instance_set("value", ConstValue::Int(11)).unwrap();
+        let native = Arc::new(NativeInstanceFixture {
+            value: std::sync::atomic::AtomicI64::new(7),
+            child: child.clone(),
+        });
+        let instance = HostObject::new_native_instance(cls.clone(), native.clone());
+        assert_eq!(instance.instance_class(), Some(&cls));
+        assert_eq!(
+            host_getattr(&instance, "child"),
+            Ok(ConstValue::HostObject(child))
+        );
+        assert_eq!(host_getattr(&instance, "nested"), Ok(ConstValue::Int(11)));
+        assert_eq!(host_getattr(&instance, "value"), Ok(ConstValue::Int(7)));
+        native.value.store(8, std::sync::atomic::Ordering::Release);
+        assert_eq!(host_getattr(&instance, "value"), Ok(ConstValue::Int(8)));
+        assert_eq!(
+            instance.instance_set("value", ConstValue::Int(99)),
+            Err(HostGetAttrError::Unsupported)
+        );
+        assert_eq!(host_getattr(&instance, "value"), Ok(ConstValue::Int(8)));
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let source = InstanceSource::new(&bk, instance.clone());
+        assert_eq!(
+            source.all_instance_attributes().unwrap(),
+            ["child", "value", "nested", "blocked"]
+        );
+        assert!(source.s_get_value(None, "blocked").is_err());
+        drop(native);
+        assert_eq!(host_getattr(&instance, "value"), Ok(ConstValue::Int(8)));
+    }
+
+    #[test]
+    fn native_instance_lookup_preserves_descriptor_order_and_access_errors() {
+        let cls = HostObject::new_class("pkg.Native", vec![]);
+        cls.class_set("blocked", ConstValue::Int(99));
+        cls.class_set("inherited", ConstValue::Int(42));
+        let fget = HostObject::new_native_callable(
+            "pkg.Native.value",
+            Arc::new(|_| Ok(ConstValue::Int(21))),
+        );
+        cls.class_set(
+            "value",
+            ConstValue::HostObject(HostObject::new_property(
+                "pkg.Native.value",
+                Some(fget),
+                None,
+                None,
+            )),
+        );
+        let instance = HostObject::new_native_instance(
+            cls.clone(),
+            Arc::new(NativeInstanceFixture {
+                value: std::sync::atomic::AtomicI64::new(7),
+                child: HostObject::new_instance(cls, vec![]),
+            }),
+        );
+        assert_eq!(host_getattr(&instance, "value"), Ok(ConstValue::Int(21)));
+        assert_eq!(
+            host_getattr(&instance, "inherited"),
+            Ok(ConstValue::Int(42))
+        );
+        assert_eq!(
+            host_getattr(&instance, "absent"),
+            Err(HostGetAttrError::Missing)
+        );
+        assert_eq!(
+            host_getattr(&instance, "blocked"),
+            Err(HostGetAttrError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn native_instance_enumeration_failure_is_not_an_empty_dict() {
+        use crate::annotator::{bookkeeper::Bookkeeper, classdesc::InstanceSource};
+        struct Unreadable;
+        impl NativeInstanceDict for Unreadable {
+            fn get(&self, _: &str) -> Result<ConstValue, HostGetAttrError> {
+                Err(HostGetAttrError::Unsupported)
+            }
+            fn keys(&self) -> Result<Vec<String>, HostGetAttrError> {
+                Err(HostGetAttrError::Unsupported)
+            }
+        }
+        let cls = HostObject::new_class("pkg.Unreadable", vec![]);
+        let instance = HostObject::new_native_instance(cls, Arc::new(Unreadable));
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let source = InstanceSource::new(&bk, instance);
+        assert!(source.all_instance_attributes().is_err());
     }
 
     #[test]
@@ -6424,7 +6618,7 @@ mod tests {
         let prop = HostObject::new_property("pkg.Box.value", Some(fget), None, None);
         cls.class_set("value", ConstValue::HostObject(prop));
         let inst = HostObject::new_instance(cls.clone(), vec![]);
-        inst.instance_set("value", ConstValue::Int(99));
+        inst.instance_set("value", ConstValue::Int(99)).unwrap();
         let out = host_getattr(&inst, "value").expect("descriptor wins");
         // Data descriptor `fget` beats the instance dict.
         assert_eq!(out, ConstValue::Int(7));
@@ -6441,7 +6635,7 @@ mod tests {
             HostObject::new_native_callable("pkg.Box.method", Arc::new(|_| Ok(ConstValue::Int(1))));
         cls.class_set("method", ConstValue::HostObject(method));
         let inst = HostObject::new_instance(cls.clone(), vec![]);
-        inst.instance_set("method", ConstValue::Int(42));
+        inst.instance_set("method", ConstValue::Int(42)).unwrap();
         let out = host_getattr(&inst, "method").expect("instance dict wins");
         assert_eq!(out, ConstValue::Int(42));
     }

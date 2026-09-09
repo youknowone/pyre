@@ -1140,26 +1140,17 @@ pub fn builtin_hasattr(
     let mut r = SomeBool::new();
     if s_obj.is_immutable_constant() {
         // upstream: `r.const = hasattr(s_obj.const, s_attr.const)`.
-        // Emulate Python's attribute resolution via [`host_hasattr`]:
-        // modules → module_get; classes → MRO walk (class_get per base);
-        // instances → instance dict first, then class MRO; everything
-        // else → class_get fallback.
+        // Use the same host descriptor lookup as FrozenDesc, not a separate
+        // dict-presence probe which can disagree with getattr.
         if let Some(ConstValue::HostObject(host)) = s_obj.const_() {
-            let found = host_hasattr(host, attr_name);
+            let found = host_hasattr(host, attr_name)?;
             r.base.const_box = Some(super::super::flowspace::model::Constant::new(
                 ConstValue::Bool(found),
             ));
         }
     } else if let SomeValue::PBC(pbc) = s_obj {
         // upstream: `isinstance(s_obj, SomePBC) and s_obj.getKind() is FrozenDesc`.
-        let all_frozen = !pbc.descriptions.is_empty()
-            && pbc.descriptions.values().all(|d| {
-                matches!(
-                    d.kind(),
-                    super::model::DescKind::Frozen | super::model::DescKind::MethodOfFrozen
-                )
-            });
-        if all_frozen {
+        if pbc.get_kind()? == super::model::DescKind::Frozen {
             // upstream (builtin.py:142-147):
             //
             //     answers = {}
@@ -1169,20 +1160,17 @@ pub fn builtin_hasattr(
             //         answers[answer] = True
             //     if len(answers) == 1:
             //         r.const, = answers
-            let mut answers: std::collections::HashSet<bool> = Default::default();
+            let mut answers = indexmap::IndexMap::new();
             for desc in pbc.descriptions.values() {
-                if let DescEntry::Frozen(fd) = desc {
-                    let result = fd.borrow().s_read_attribute(attr_name);
-                    // upstream returns `s_ImpossibleValue` for missing
-                    // attrs; the Rust port surfaces errors as
-                    // `AnnotatorError`, which we treat as "not found"
-                    // for the `hasattr` containment question.
-                    let found = matches!(result, Ok(ref v) if !matches!(v, SomeValue::Impossible));
-                    answers.insert(found);
-                }
+                // s_read_attribute itself turns only AttributeError into
+                // s_ImpossibleValue. Other failures propagate in builtin.py;
+                // an unsupported native field is not a missing attribute.
+                let result = desc.s_read_attribute(attr_name)?;
+                let found = !matches!(result, SomeValue::Impossible);
+                answers.insert(found, true);
             }
             if answers.len() == 1 {
-                let only = *answers.iter().next().unwrap();
+                let only = *answers.keys().next().unwrap();
                 r.base.const_box = Some(super::super::flowspace::model::Constant::new(
                     ConstValue::Bool(only),
                 ));
@@ -2481,51 +2469,22 @@ pub fn pdb_set_trace(
 /// Emulates Python's `hasattr(host, name)` for a constant [`HostObject`]
 /// receiver.
 ///
-/// Upstream `builtin_hasattr` calls Python's built-in `hasattr(...)`
-/// which walks the object's MRO and falls back to the module / instance
-/// namespace. The Rust port reproduces the three kinds it cares about:
-///
-/// * **Module** — look up in the module dict.
-/// * **Class** — walk the MRO and check each class dict.
-/// * **Instance** — check the instance dict first, then the MRO of its
-///   `__class__`.
-///
-/// Everything else (functions, builtin callables, …) falls back to a
-/// flat `class_get` / `instance_get` / `module_get` probe because those
-/// carriers do not expose a class hierarchy through HostObject.
-fn host_hasattr(host: &crate::flowspace::model::HostObject, name: &str) -> bool {
-    // Module lookup.
-    if host.module_get(name).is_some() {
-        return true;
+/// Native carrier boundary for builtin.py builtin_hasattr's host lookup.
+/// Missing is AttributeError; Unsupported is a porting failure, not a Python
+/// exception to fold away. In particular it must not manufacture Bool(false).
+fn host_hasattr(
+    host: &crate::flowspace::model::HostObject,
+    name: &str,
+) -> Result<bool, AnnotatorError> {
+    use crate::flowspace::model::{HostGetAttrError, host_getattr};
+    match host_getattr(host, name) {
+        Ok(_) => Ok(true),
+        Err(HostGetAttrError::Missing) => Ok(false),
+        Err(HostGetAttrError::Unsupported) => Err(AnnotatorError::new(format!(
+            "builtin_hasattr({:?}, {name:?}): host getattr is unsupported",
+            host.qualname(),
+        ))),
     }
-    // Instance lookup — check the per-instance dict first, then the
-    // class MRO for inherited attributes / descriptors.
-    if host.instance_get(name).is_some() {
-        return true;
-    }
-    if let Some(class_obj) = host.instance_class()
-        && let Some(mro) = class_obj.mro()
-    {
-        for cls in mro {
-            if cls.class_get(name).is_some() {
-                return true;
-            }
-        }
-        return false;
-    }
-    // Class lookup — walk the MRO so inherited members resolve.
-    if host.is_class()
-        && let Some(mro) = host.mro()
-    {
-        for cls in mro {
-            if cls.class_get(name).is_some() {
-                return true;
-            }
-        }
-        return false;
-    }
-    // Fallback for carriers without a usable class hierarchy.
-    host.class_get(name).is_some()
 }
 
 /// Upstream `union(*s_values)` (model.py).
@@ -3172,6 +3131,76 @@ mod tests {
                 }
             }
             other => panic!("expected SomeUnicodeString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_hasattr_constant_observes_data_descriptor_before_instance_dict() {
+        use crate::flowspace::model::HostObject;
+        use std::sync::Arc;
+
+        let bk = bk();
+        let class = HostObject::new_class("owner.FrozenAttributes", vec![]);
+        class.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "owner.FrozenAttributes._freeze_",
+                Arc::new(|_| Ok(ConstValue::Bool(true))),
+            )),
+        );
+        class.class_set(
+            "value",
+            ConstValue::HostObject(HostObject::new_property("value", None, None, None)),
+        );
+        let instance = HostObject::new_instance(class, vec![]);
+        instance.instance_set("value", ConstValue::Int(7)).unwrap();
+        let s_obj = bk
+            .immutablevalue(&ConstValue::HostObject(instance))
+            .unwrap();
+        assert!(s_obj.is_immutable_constant());
+        let s_attr = bk.immutablevalue(&ConstValue::byte_str("value")).unwrap();
+        let out = builtin_hasattr(&bk, &[Some(s_obj), Some(s_attr)], &no_kwds()).unwrap();
+        assert!(matches!(out.const_(), Some(ConstValue::Bool(false))));
+    }
+
+    #[test]
+    fn builtin_hasattr_frozen_family_distinguishes_missing_from_unsupported() {
+        use crate::annotator::description::FrozenDesc;
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::model::{HostGetAttrError, HostObject};
+        use std::cell::RefCell;
+
+        // Two descriptions keep the PBC nonconstant and exercise upstream's
+        // FrozenDesc-family branch, not its singleton host-hasattr branch.
+        for modes in [[0, 0], [1, 1], [0, 1], [0, 2]] {
+            let bk = bk();
+            let descriptions = modes.into_iter().enumerate().map(|(i, mode)| {
+                let desc = FrozenDesc::new_with_read_attribute(
+                    bk.clone(),
+                    HostObject::new_module(format!("native_{i}")),
+                    Box::new(move |_| match mode {
+                        0 => Err(HostGetAttrError::Missing),
+                        1 => Ok(ConstValue::Int(42)),
+                        _ => Err(HostGetAttrError::Unsupported),
+                    }),
+                )
+                .unwrap();
+                DescEntry::Frozen(Rc::new(RefCell::new(desc)))
+            });
+            let s_obj = SomeValue::PBC(SomePBC::new(descriptions, false));
+            assert!(!s_obj.is_constant());
+            let s_attr = bk.immutablevalue(&ConstValue::byte_str("field")).unwrap();
+            let result = builtin_hasattr(&bk, &[Some(s_obj), Some(s_attr)], &no_kwds());
+            if modes.contains(&2) {
+                assert!(result.unwrap_err().to_string().contains("unsupported"));
+            } else {
+                let out = result.unwrap();
+                match modes {
+                    [0, 0] => assert!(matches!(out.const_(), Some(ConstValue::Bool(false)))),
+                    [1, 1] => assert!(matches!(out.const_(), Some(ConstValue::Bool(true)))),
+                    _ => assert!(!out.is_constant()),
+                }
+            }
         }
     }
 

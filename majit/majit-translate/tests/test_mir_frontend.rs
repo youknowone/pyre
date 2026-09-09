@@ -1546,7 +1546,7 @@ fn a_borrowed_primitive_banks_by_its_container() {
     assert_eq!(
         payloads("slice_get_tag_dispatch"),
         vec![(
-            "core::option::Option::Some".to_string(),
+            "core::option::Option<u8>::Some".to_string(),
             ValueType::Unsigned
         )],
         "the `?` payload of an `Option<&u8>` is the byte, not a pointer to it",

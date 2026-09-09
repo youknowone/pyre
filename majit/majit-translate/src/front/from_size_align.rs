@@ -47,7 +47,9 @@
 //! census Skip (no regression).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::emit_option_variant_dynamic;
+use crate::front::bool_then::{
+    close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
+};
 use crate::front::checked_arith_uint::{push_binop, push_const_int};
 use crate::model::{
     BlockId, CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
@@ -143,7 +145,7 @@ fn rewire_one_from_size_align_site(
         .position(|b| b.operations.iter().any(|op| op.result.as_ref() == Some(ok)))
         .ok_or_else(|| format!("{name}: .ok() result var has no producer block"))?;
     let ok_idx = graph.blocks[q].operations.len() - 1;
-    let fsa_res = match &graph.blocks[q].operations[ok_idx] {
+    let ok_arg = match &graph.blocks[q].operations[ok_idx] {
         SpaceOperation {
             result: Some(r),
             kind:
@@ -173,15 +175,30 @@ fn rewire_one_from_size_align_site(
 
     // Block P: the `from_size_align` residual producing `fsa_res` as its last
     // op — a 2-arg `[..]::Layout::from_size_align` FunctionPath call.
-    let p = graph
+    let (p, fsa_res, fsa_in_q) = graph
         .blocks
         .iter()
-        .position(|b| {
-            b.operations
+        .enumerate()
+        .find_map(|(index, block)| {
+            let [exit] = block.exits.as_slice() else {
+                return None;
+            };
+            if exit.target != graph.blocks[q].id {
+                return None;
+            }
+            let produced = block.operations.last()?.result.as_ref()?;
+            exit.args
                 .iter()
-                .any(|op| op.result.as_ref() == Some(&fsa_res))
+                .zip(&graph.blocks[q].inputargs)
+                .find_map(|(arg, input)| {
+                    let LinkArg::Value(source) = arg else {
+                        return None;
+                    };
+                    (source == produced && (input == &ok_arg || source == &ok_arg))
+                        .then(|| (index, source.clone(), input.clone()))
+                })
         })
-        .ok_or_else(|| format!("{name}: from_size_align result var has no producer block"))?;
+        .ok_or_else(|| format!("{name}: from_size_align result is not threaded into .ok()"))?;
     let fsa_idx = graph.blocks[p].operations.len() - 1;
     let (size, align_arg) = match &graph.blocks[p].operations[fsa_idx] {
         SpaceOperation {
@@ -228,6 +245,17 @@ fn rewire_one_from_size_align_site(
 
     // --- All structural validation passed; mutate the graph. ---
 
+    crate::front::bool_then::validate_dynamic_option_exit(graph, graph.blocks[p].id)?;
+    // The rewritten .ok() forwards Q's own input, not the now-removed P
+    // result. RPython Link.args -> Block.inputargs is the value boundary.
+    // Extra Q operations reading a legacy cross-block alias need their own
+    // normalization before this fold can remove that alias's definition.
+    if ok_arg != fsa_in_q && ok_idx != 0 {
+        return Err(format!(
+            "{name}: .ok() has an unnormalized cross-block operand"
+        ));
+    }
+
     let p_id = graph.blocks[p].id;
     // Drop the residual `from_size_align` call (P's last op) so `fsa_res` is
     // produced solely by the virtualized `Option` ctor appended below.
@@ -247,27 +275,53 @@ fn rewire_one_from_size_align_site(
     let zero = push_const_int(graph, p_id, 0);
     let disc = push_binop(graph, p_id, "eq", too_big, zero, ValueType::Int);
 
-    // Nested `Layout { size, align }` transparent-ctor aggregate; its
-    // `Ref` is the `Some` payload.
+    // Forward the old continuation's live values through both arms. Layout
+    // is constructed only after the bound check succeeds, just as the native
+    // from_size_align source does; the None arm has no payload allocation.
+    let saved_exit = graph.block(p_id).exits[0].clone();
+    let mut carried = Vec::new();
+    for arg in &saved_exit.args {
+        if let LinkArg::Value(value) = arg
+            && value != &fsa_res
+            && !carried.contains(value)
+        {
+            carried.push(value.clone());
+        }
+    }
+    let mut some_sources = carried.clone();
+    for value in [&size, &align_arg] {
+        if !some_sources.contains(value) {
+            some_sources.push(value.clone());
+        }
+    }
+    let (some_block, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
+    let (none_block, none_inputs) = graph.create_block_with_arg_vars(carried.len());
     let layout = graph.alloc_value_var();
     build_layout_aggregate(
         graph,
-        p_id,
+        some_block,
         &site.layout_owner,
         layout.clone(),
-        size,
-        align_arg,
+        map_source(&some_sources, &some_inputs, &size).expect("size threaded"),
+        map_source(&some_sources, &some_inputs, &align_arg).expect("align threaded"),
     );
-
-    // Reuse `fsa_res` as the virtualized `Option` ctor result.
-    emit_option_variant_dynamic(
+    let some = emit_option_variant(
         graph,
-        p_id,
-        fsa_res.clone(),
+        some_block,
         &site.option_owner,
-        disc,
+        1,
         Some((&site.some_owner, layout, site.payload_ty.clone())),
     );
+    let none = emit_option_variant(graph, none_block, &site.option_owner, 0, None);
+    for (arm, value, sources, inputs) in [
+        (some_block, some, &some_sources, &some_inputs),
+        (none_block, none, &carried, &none_inputs),
+    ] {
+        let args = reproduce_exit_args(&saved_exit, &fsa_res, &value, sources, inputs, &name)
+            .expect("all continuation values threaded");
+        close_goto_mixed(graph, arm, saved_exit.target, args);
+    }
+    graph.set_branch(p_id, disc, some_block, some_sources, none_block, carried);
 
     // Block Q: drop the `.ok()` call and alias its result to the block-P
     // `Option` threaded across the P→Q edge (`fsa_res` is a Q inputarg).
@@ -277,7 +331,7 @@ fn rewire_one_from_size_align_site(
             if let LinkArg::Value(v) = arg
                 && v == ok
             {
-                *v = fsa_res.clone();
+                *v = fsa_in_q.clone();
             }
         }
     }
@@ -600,17 +654,14 @@ mod tests {
                 true,
             )
             .unwrap();
-        // Block Q consumes `fsa` via `.ok()`.  The single-predecessor
-        // framestate threading reuses the same `Variable` identity across the
-        // P→Q edge, so `.ok()`'s arg is `fsa` itself (its producer op lives in
-        // P) — the shape the rewrite walks back through.
-        let (q, _q_args) = g.create_block_with_arg_vars(1);
+        // Q consumes its own inputarg, reached by the P result's link arg.
+        let (q, q_args) = g.create_block_with_arg_vars(1);
         let ok = g
             .push_op_var(
                 q,
                 OpKind::Call {
                     target: ok_target(),
-                    args: vec![fsa.clone()],
+                    args: vec![q_args[0].clone()],
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -626,8 +677,24 @@ mod tests {
     #[test]
     fn from_size_align_ok_lowers_to_bound_check_and_nested_option() {
         let (mut g, ok) = build_site();
+        let q = g
+            .blocks
+            .iter()
+            .find(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| op.result.as_ref() == Some(&ok))
+            })
+            .expect("ok block")
+            .id;
+        let q_input = g.block(q).inputargs[0].clone();
         let rewritten = rewire_from_size_align_sites(&mut g, &[site_for(&ok)]);
         assert_eq!(rewritten, 1, "the from_size_align().ok() site must rewrite");
+        assert!(
+            matches!(&g.block(q).exits[0].args[0], LinkArg::Value(value) if value == &q_input),
+            ".ok() must forward the Q input, not the deleted P result"
+        );
 
         // No residual FunctionPath / Method call survives.
         let has_residual = g.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -657,8 +724,8 @@ mod tests {
         assert!(binops.contains(&"uint_lt".to_string()));
         assert!(binops.contains(&"eq".to_string()));
 
-        // A nested `Layout` transparent ctor and an `Option` transparent ctor
-        // both exist.
+        // A nested Layout and the two concrete Option variants exist;
+        // the enum base must never be allocated and given a payload.
         let ctor_owners: Vec<String> = g
             .blocks
             .iter()
@@ -675,10 +742,17 @@ mod tests {
             ctor_owners.contains(&"Layout".to_string()),
             "Layout ctor present"
         );
-        assert!(
-            ctor_owners.contains(&"Option".to_string()),
-            "Option ctor present"
-        );
+        assert!(ctor_owners.contains(&"Some".to_string()));
+        assert!(ctor_owners.contains(&"None".to_string()));
+        assert!(!ctor_owners.contains(&"Option".to_string()));
+        assert!(!g.block(g.startblock).operations.iter().any(|op| matches!(&op.kind,
+            OpKind::Call { target: CallTarget::SyntheticTransparentCtor { name, .. }, .. } if name == "Layout")),
+            "Layout allocation belongs after the successful bound check");
+        let none_arm = g.blocks.iter().find(|block| block.operations.iter().any(|op| matches!(&op.kind,
+            OpKind::Call { target: CallTarget::SyntheticTransparentCtor { name, .. }, .. } if name == "None")))
+            .expect("None arm");
+        assert!(!none_arm.operations.iter().any(|op| matches!(&op.kind,
+            OpKind::Call { target: CallTarget::SyntheticTransparentCtor { name, .. }, .. } if name == "Layout")));
 
         // The Layout aggregate writes `__pos_0` and `__pos_1`.
         let layout_fields: Vec<String> = g

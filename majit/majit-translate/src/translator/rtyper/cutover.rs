@@ -21,19 +21,14 @@
 //!
 //! ## Scope
 //!
-//! - Build a `FlowspaceAdapterOutput` via the adapter.
-//! - Construct a fresh `RPythonAnnotator`; bypass `build_types`
-//!   (pyre's surface DSL has no `HostObject` to feed it) by populating
-//!   `annotator.annotated` and `annotator.all_blocks` directly with
-//!   the adapter's blocks. The annotation shells are
-//!   already attached to each `Variable.annotation`, which is what
-//!   `RPythonTyper.bindingrepr` reads.
-//! - Construct an `RPythonTyper` and call `specialize(true)` —
-//!   `dont_simplify_again=true` because pyre's legacy graph is already
-//!   in simplified SSA shape; running the simplify pass would attempt
-//!   to call into bookkeeper machinery that requires
-//!   `RPythonAnnotator.translator.entry_point_graph`, which we have
-//!   not seeded.
+//! - Build a `FlowspaceAdapterOutput`, then run the ordinary
+//!   `TranslationContext.buildflowgraph` simplification stage. Native MIR
+//!   simplification is not a substitute for simplifying the lifted graph.
+//! - Queue source-typed inputs with `addpendingblock` on the CallRegistry's
+//!   shared annotator; `complete_pending_blocks` infers the reachable bodies.
+//! - In the production two-phase path, finish annotation before specializing
+//!   with the shared rtyper. Per-subject recovery and the fused compatibility
+//!   path remain migration scaffolding, not the terminal #346 pipeline.
 //! - Walk the `value_to_var` map and project each `Variable.concretetype`
 //!   to `ConcreteType` (Signed/Float/GcRef/Void/Unknown).
 //!
@@ -257,6 +252,9 @@ pub(crate) enum DualGateOutcome {
         /// `FunctionGraph::concretetype_of(&v)` then reads the legacy
         /// Variable's `concretetype` cell directly.
         real_value_to_var: LegacyToTyped,
+        /// Constant representatives, including eliminated phi carriers.
+        /// Publish only after the legacy comparison, alongside Variable types.
+        real_constants: HashMap<Variable, LowLevelType>,
     },
     /// Real path failed on a known-unported feature — the gate
     /// cannot validate this graph yet but the failure is *not* a
@@ -365,7 +363,10 @@ pub(crate) fn dual_gate_check_with_registry(
             "dual-gate divergence: {divergence}"
         )));
     }
-    Ok(DualGateOutcome::Match { real_value_to_var })
+    Ok(DualGateOutcome::Match {
+        real_value_to_var,
+        real_constants,
+    })
 }
 
 /// Repair shared callee state poisoned by a failed subject scope.
@@ -2049,7 +2050,13 @@ pub(crate) fn populate_call_registry_from_call_graphs(
                 .lookup(canonical_key)
                 .expect("canonical entry registered")
         } else {
-            let entry = registry.get_or_register(key.clone(), signature.clone());
+            let entry = registry.lookup(&key).unwrap_or_else(|| {
+                registry.get_or_register_with_func(
+                    key.clone(),
+                    signature.clone(),
+                    source_graph_func(graph),
+                )
+            });
             by_canonical_path.insert(canonical_strip, key.clone());
             entry
         };
@@ -2209,6 +2216,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // the callee's return `ValueType`; [`residual_return_shell`]
         // decodes it.  A token it declines falls through to the normal
         // lift.
+        // specialize.memo evaluates the host callable, never its original
+        // flow graph. MemoTable.finish installs the decision graph later.
+        if entry.function_desc.borrow().is_memo() {
+            continue;
+        }
         let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
             || graph.hints.iter().any(|h| h == "elidable");
         if residualize {
@@ -2237,7 +2249,12 @@ pub(crate) fn populate_call_registry_from_call_graphs(
                 continue;
             }
         }
-        match lift_callee_to_pygraph(graph, (*signature).clone(), registry) {
+        let func = entry
+            .host_object
+            .user_function()
+            .expect("registered source callable")
+            .clone();
+        match lift_callee_to_pygraph_with_func(graph, (*signature).clone(), registry, func) {
             Ok(pygraph) => entry.prefill_default_cache(pygraph),
             Err(e) => {
                 let message = format!("{e}");
@@ -2334,6 +2351,20 @@ pub(crate) fn lift_callee_to_pygraph(
     signature: Signature,
     nested_registry: &CallRegistry,
 ) -> Result<Rc<PyGraph>, TyperError> {
+    lift_callee_to_pygraph_with_func(
+        callee_graph,
+        signature,
+        nested_registry,
+        source_graph_func(callee_graph),
+    )
+}
+
+fn lift_callee_to_pygraph_with_func(
+    callee_graph: &LegacyGraph,
+    signature: Signature,
+    nested_registry: &CallRegistry,
+    func: GraphFunc,
+) -> Result<Rc<PyGraph>, TyperError> {
     // The adapter also returns `value_to_var` and `constant_concretetypes`
     // side maps, but they are not consumed here.
     // RPython parity: `Variable.concretetype` and `Constant.concretetype`
@@ -2351,31 +2382,17 @@ pub(crate) fn lift_callee_to_pygraph(
             callee_graph,
             nested_registry,
         )?;
-    // Pyre's synthetic `GraphFunc` mirrors `description.py:193-203
-    // FunctionDesc.__init__` test fixtures — empty Dict globals,
-    // name from the legacy graph.  No HostCode body — the cache
-    // pre-fill ensures `cachedgraph` never asks for one.
-    let mut func = GraphFunc::new(
-        callee_graph.name.clone(),
-        Constant::new(ConstValue::Dict(HashMap::new())),
-    );
-    func._always_inline_ = if callee_graph
-        .hints
-        .iter()
-        .any(|hint| hint == "always_inline")
-    {
-        AlwaysInline::True
-    } else if callee_graph
-        .hints
-        .iter()
-        .any(|hint| hint == "always_inline_try")
-    {
-        AlwaysInline::Try
-    } else {
-        AlwaysInline::Absent
-    };
-    func._dont_inline_ = callee_graph.func.dont_inline;
+    // The graph and FunctionDesc share the same source callable identity.
+    // Synthesizing a second GraphFunc here drops native host evaluators and
+    // splits function attributes from the object Bookkeeper.getdesc knows.
     graph.borrow_mut().func = Some(func.clone());
+    // TranslationContext.buildflowgraph (translator.py) simplifies a freshly
+    // flowed body before publishing it to FunctionDesc.cachedgraph. The native
+    // source adapter replaces build_flow, not this stage. In particular its
+    // method-call reconstruction leaves unused raw fnptr projections behind;
+    // the ordinary dead-op pass removes those while retaining shared reads,
+    // effects and raising_op. Do not suppress those reads by trait/name tests.
+    crate::translator::simplify::simplify_graph(&graph.borrow(), None);
     let pygraph = Rc::new(PyGraph {
         graph,
         func,
@@ -2389,6 +2406,29 @@ pub(crate) fn lift_callee_to_pygraph(
         access_directly: Cell::new(callee_graph.access_directly),
     });
     Ok(pygraph)
+}
+
+/// Source attributes are installed before Bookkeeper.newfuncdesc chooses
+/// its policy, not merely on the separately lifted flow graph afterwards.
+fn source_graph_func(graph: &LegacyGraph) -> GraphFunc {
+    let mut func = GraphFunc::new(
+        graph.name.clone(),
+        Constant::new(ConstValue::Dict(HashMap::new())),
+    );
+    func._always_inline_ = if graph.hints.iter().any(|h| h == "always_inline") {
+        AlwaysInline::True
+    } else if graph.hints.iter().any(|h| h == "always_inline_try") {
+        AlwaysInline::Try
+    } else {
+        AlwaysInline::Absent
+    };
+    func._dont_inline_ = graph.func.dont_inline;
+    func.annspecialcase = graph
+        .hints
+        .iter()
+        .find(|h| h.starts_with("specialize:"))
+        .cloned();
+    func
 }
 
 /// Synthesize a minimal flowed `PyGraph` for a
@@ -3063,7 +3103,7 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
 ) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
-    let (_graph, value_to_var, _value_to_var_candidates, constant_concretetypes) =
+    let (_graph, value_to_var, _value_to_var_candidates, constant_concretetypes, _) =
         drive_subject(legacy, call_registry, true)?;
     Ok((value_to_var, constant_concretetypes))
 }
@@ -3092,6 +3132,7 @@ fn drive_subject(
         LegacyToTyped,
         LegacyToTypedCandidates,
         HashMap<Variable, LowLevelType>,
+        HashMap<Variable, Hlvalue>,
     ),
     TyperError,
 > {
@@ -3113,12 +3154,18 @@ fn drive_subject(
         graph,
         mut value_to_var,
         value_to_var_candidates,
-        constant_concretetypes,
+        mut constant_concretetypes,
+        mut constant_hlvalues,
         ..
     } = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
         legacy,
         call_registry,
     )?;
+
+    // Same buildflowgraph stage as the cached-callee path above. Do not wait
+    // until annotator.simplify: unused native projection preimages can block
+    // annotation before that later cleanup is reachable.
+    crate::translator::simplify::simplify_graph(&graph.borrow(), None);
 
     // ── Step 2 — annotator surface ────────────────────────────────
     //
@@ -3358,13 +3405,19 @@ fn drive_subject(
 
     if do_rtype {
         select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)?;
-        reconcile_projection_aliases(legacy, &mut value_to_var);
+        reconcile_projection_aliases(
+            legacy,
+            &mut value_to_var,
+            &mut constant_hlvalues,
+            &mut constant_concretetypes,
+        );
     }
     Ok((
         graph,
         value_to_var,
         value_to_var_candidates,
         constant_concretetypes,
+        constant_hlvalues,
     ))
 }
 
@@ -3652,7 +3705,13 @@ fn run_two_phase_prepass_inner(
             drive_subject(legacy, call_registry, /* do_rtype = */ false)
         }));
         match attempt {
-            Ok(Ok((graph, value_to_var, value_to_var_candidates, constant_concretetypes))) => {
+            Ok(Ok((
+                graph,
+                value_to_var,
+                value_to_var_candidates,
+                constant_concretetypes,
+                constant_hlvalues,
+            ))) => {
                 let key = path.canonical_key();
                 call_registry.two_phase().subjects.insert(
                     key,
@@ -3662,6 +3721,7 @@ fn run_two_phase_prepass_inner(
                         value_to_var,
                         value_to_var_candidates,
                         constant_concretetypes,
+                        constant_hlvalues,
                     },
                 );
             }
@@ -4083,7 +4143,8 @@ fn run_phase_b_rtype_isolated(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-fn reconcile_elided_hint_results(legacy: &LegacyGraph, value_to_var: &mut LegacyToTyped) {
+fn reconcile_elided_hint_results(legacy: &LegacyGraph, value_to_var: &mut LegacyToTyped) -> bool {
+    let mut changed = false;
     for block in &legacy.blocks {
         for op in &block.operations {
             let crate::model::OpKind::Hint { value, .. } = &op.kind else {
@@ -4101,9 +4162,14 @@ fn reconcile_elided_hint_results(legacy: &LegacyGraph, value_to_var: &mut Legacy
             let Some(operand_twin) = value_to_var.get(value).cloned() else {
                 continue;
             };
+            if operand_twin.concretetype().is_none() {
+                continue;
+            }
             value_to_var.insert(result.clone(), operand_twin);
+            changed = true;
         }
     }
+    changed
 }
 
 /// Reconnect a block inputarg to the typed representative shared by all of
@@ -4128,7 +4194,13 @@ fn reconcile_elided_hint_results(legacy: &LegacyGraph, value_to_var: &mut Legacy
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-fn reconcile_elided_phi_inputargs(legacy: &LegacyGraph, value_to_var: &mut LegacyToTyped) {
+fn reconcile_elided_phi_inputargs(
+    legacy: &LegacyGraph,
+    value_to_var: &mut LegacyToTyped,
+    constant_values: &mut HashMap<Variable, Hlvalue>,
+    constant_types: &mut HashMap<Variable, LowLevelType>,
+) -> bool {
+    let mut changed = false;
     loop {
         let mut aliases = Vec::new();
         for target in &legacy.blocks {
@@ -4139,38 +4211,57 @@ fn reconcile_elided_phi_inputargs(legacy: &LegacyGraph, value_to_var: &mut Legac
                 continue;
             }
             for (column, input) in target.inputargs.iter().enumerate() {
-                if value_to_var
-                    .get(input)
-                    .is_some_and(|typed| typed.concretetype().is_some())
+                if constant_values.contains_key(input)
+                    || value_to_var
+                        .get(input)
+                        .is_some_and(|typed| typed.concretetype().is_some())
                 {
                     continue;
                 }
                 let mut saw_incoming = false;
-                let mut shared: Option<Variable> = None;
+                let mut shared: Option<Hlvalue> = None;
+                let mut shared_constant_type = None;
                 let mut valid = true;
                 for source in &legacy.blocks {
                     for link in source.exits.iter().filter(|link| link.target == target.id) {
                         saw_incoming = true;
-                        let Some(crate::model::LinkArg::Value(source_var)) = link.args.get(column)
-                        else {
-                            valid = false;
-                            break;
+                        let source = match link.args.get(column) {
+                            Some(crate::model::LinkArg::Value(source_var)) => {
+                                if let Some(Hlvalue::Constant(c)) = constant_values.get(source_var)
+                                {
+                                    constant_types
+                                        .get(source_var)
+                                        .cloned()
+                                        .map(|ty| (Hlvalue::Constant(c.clone()), Some(ty)))
+                                } else {
+                                    value_to_var
+                                        .get(source_var)
+                                        .filter(|typed| typed.concretetype().is_some())
+                                        .map(|typed| (Hlvalue::Variable(typed.clone()), None))
+                                }
+                            }
+                            Some(crate::model::LinkArg::Const(c)) => c
+                                .concretetype
+                                .clone()
+                                .map(|ty| (Hlvalue::Constant(c.clone()), Some(ty))),
+                            _ => None,
                         };
-                        let Some(source_typed) = value_to_var
-                            .get(source_var)
-                            .filter(|typed| typed.concretetype().is_some())
-                        else {
+                        let Some((source, constant_type)) = source else {
                             valid = false;
                             break;
                         };
                         if shared
                             .as_ref()
-                            .is_some_and(|representative| representative != source_typed)
+                            .is_some_and(|representative| representative != &source)
+                            || (shared.is_some() && shared_constant_type != constant_type)
                         {
                             valid = false;
                             break;
                         }
-                        shared.get_or_insert_with(|| source_typed.clone());
+                        if shared.is_none() {
+                            shared = Some(source);
+                            shared_constant_type = constant_type;
+                        }
                     }
                     if !valid {
                         break;
@@ -4180,17 +4271,30 @@ fn reconcile_elided_phi_inputargs(legacy: &LegacyGraph, value_to_var: &mut Legac
                     && saw_incoming
                     && let Some(shared) = shared
                 {
-                    aliases.push((input.clone(), shared));
+                    aliases.push((input.clone(), shared, shared_constant_type));
                 }
             }
         }
         if aliases.is_empty() {
             break;
         }
-        for (input, shared) in aliases {
-            value_to_var.insert(input, shared);
+        changed = true;
+        for (input, shared, constant_type) in aliases {
+            match shared {
+                Hlvalue::Variable(shared) => {
+                    value_to_var.insert(input, shared);
+                }
+                Hlvalue::Constant(c) => {
+                    // simplify.py::remove_identical_vars_SSA uses the actual
+                    // Constant representative, not an equal register bank.
+                    // Retain it without changing the legacy baseline's cells.
+                    constant_types.insert(input.clone(), constant_type.expect("typed constant"));
+                    constant_values.insert(input, Hlvalue::Constant(c));
+                }
+            }
         }
     }
+    changed
 }
 
 /// Backfill the low-level type of a call-result Variable the real path
@@ -4290,14 +4394,27 @@ fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTy
 
 /// Apply projection repairs in dependency order.
 ///
-/// Declared call results and `same_as` hints are phi sources in real portal
-/// graphs, so their representatives must be recovered before the transitive
-/// phi-union pass.  Keeping the order here prevents the direct and cached
-/// dual-gate paths from drifting apart.
-fn reconcile_projection_aliases(legacy: &LegacyGraph, value_to_var: &mut LegacyToTyped) {
+/// `same_as` results can feed phis and phi inputs can feed `same_as`.
+/// Close both identity relations together, as the renaming performed by
+/// simplify.py::remove_identical_vars_SSA and rtyping does in the canonical
+/// graph. Each successful step publishes a positively typed representative;
+/// already-typed mappings remain authoritative, so this terminates without
+/// a retry limit or type guesses. Both direct and cached publication use it.
+fn reconcile_projection_aliases(
+    legacy: &LegacyGraph,
+    value_to_var: &mut LegacyToTyped,
+    constants: &mut HashMap<Variable, Hlvalue>,
+    constant_types: &mut HashMap<Variable, LowLevelType>,
+) {
     backfill_untyped_call_results(legacy, value_to_var);
-    reconcile_elided_hint_results(legacy, value_to_var);
-    reconcile_elided_phi_inputargs(legacy, value_to_var);
+    loop {
+        let hint_changed = reconcile_elided_hint_results(legacy, value_to_var);
+        let phi_changed =
+            reconcile_elided_phi_inputargs(legacy, value_to_var, constants, constant_types);
+        if !hint_changed && !phi_changed {
+            break;
+        }
+    }
 }
 
 /// Two-phase publish: derive the [`DualGateOutcome`] for `legacy` from the
@@ -4327,18 +4444,25 @@ pub(crate) fn dual_gate_outcome_from_cache(
                 subj.value_to_var.clone(),
                 subj.value_to_var_candidates.clone(),
                 subj.constant_concretetypes.clone(),
+                subj.constant_hlvalues.clone(),
             )),
             Some(_) => Err("two-phase: subject rtype-skipped in prepass"),
             None => Err("two-phase: graph was never a prepass subject"),
         }
     };
-    let (mut value_to_var, value_to_var_candidates, constants) = match cached {
-        Ok(cached) => cached,
-        Err(reason) => return Ok(DualGateOutcome::Skip(reason.to_string())),
-    };
+    let (mut value_to_var, value_to_var_candidates, mut constants, mut constant_values) =
+        match cached {
+            Ok(cached) => cached,
+            Err(reason) => return Ok(DualGateOutcome::Skip(reason.to_string())),
+        };
     select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)
         .map_err(|e| e.to_string())?;
-    reconcile_projection_aliases(legacy, &mut value_to_var);
+    reconcile_projection_aliases(
+        legacy,
+        &mut value_to_var,
+        &mut constant_values,
+        &mut constants,
+    );
 
     // Validate the cached lltypes project to concrete kinds (the Step-4 check
     // deferred from `drive_subject`, which did not rtype in Phase A).
@@ -4382,6 +4506,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
     }
     Ok(DualGateOutcome::Match {
         real_value_to_var: value_to_var,
+        real_constants: constants,
     })
 }
 
@@ -4391,6 +4516,220 @@ mod tests {
     use crate::flowspace::model::BlockKey;
     use crate::model::{Block, BlockId, LinkArg, ValueType};
     use crate::translator::rtyper::legacy_annotator::setbinding;
+
+    #[test]
+    fn registry_population_keeps_memo_source_policy_without_lifting_host_body() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("memo_source");
+        graph.source_identity = Some("owner::memo_source".into());
+        graph.hints.push("specialize:memo".into());
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(
+            crate::parse::CallPath {
+                segments: vec!["owner".into(), "memo_source".into()],
+            },
+            graph,
+        );
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &registry).unwrap();
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments(["owner", "memo_source"]))
+            .unwrap();
+        assert!(entry.function_desc.borrow().is_memo());
+        assert!(entry.function_desc.borrow().cache.borrow().is_empty());
+        // Re-populating keeps the canonical callable instead of making a
+        // second GraphFunc and silently erasing its specialization policy.
+        let id = entry.host_object.user_function().unwrap().id;
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &registry).unwrap();
+        assert_eq!(
+            registry
+                .lookup(&FunctionPathKey::from_segments(["owner", "memo_source"]))
+                .unwrap()
+                .host_object
+                .user_function()
+                .unwrap()
+                .id,
+            id
+        );
+        let err = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut Vec::new(), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no host_call hook registered"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn populated_memo_uses_the_registered_native_callable() {
+        use crate::annotator::description::SpecializeResult;
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::HostCall;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("native_memo");
+        graph.source_identity = Some("owner::native_memo".into());
+        graph.hints.push("specialize:memo".into());
+        let mut func = source_graph_func(&graph);
+        fn native_body() -> i64 {
+            42
+        }
+        func.host_call = Some(HostCall(std::sync::Arc::new(|args| {
+            assert!(args.is_empty());
+            Ok(ConstValue::Int(native_body()))
+        })));
+        let key = FunctionPathKey::from_segments(["owner", "native_memo"]);
+        let entry = registry.get_or_register_with_func(
+            key,
+            Signature::new(vec![], None, None),
+            func.clone(),
+        );
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(
+            crate::parse::CallPath {
+                segments: vec!["owner".into(), "native_memo".into()],
+            },
+            graph,
+        );
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &registry).unwrap();
+        assert_eq!(entry.host_object.user_function().unwrap().id, func.id);
+        let result = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut Vec::new(), None)
+            .unwrap();
+        let SpecializeResult::Annotation(value) = result else {
+            panic!("memo annotation expected")
+        };
+        assert!(value.is_constant());
+        assert!(matches!(
+            *value,
+            crate::annotator::model::SomeValue::Integer(_)
+        ));
+    }
+
+    #[test]
+    fn registered_memo_preserves_frozen_input_and_prebuilt_instance_result() {
+        // specialize.py:memo feeds real host objects to the evaluator;
+        // rclass.py:InstanceRepr.convert_const owns the resulting instance.
+        use crate::annotator::description::SpecializeResult;
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::{
+            HostCall, HostGetAttrError, HostObject, NativeInstanceDict, host_getattr,
+        };
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::sync::Arc;
+
+        struct NativeValue(i64);
+        impl NativeInstanceDict for NativeValue {
+            fn get(&self, name: &str) -> Result<ConstValue, HostGetAttrError> {
+                if name == "value" {
+                    Ok(ConstValue::Int(self.0))
+                } else {
+                    Err(HostGetAttrError::Missing)
+                }
+            }
+            fn keys(&self) -> Result<Vec<String>, HostGetAttrError> {
+                Ok(vec!["value".into()])
+            }
+        }
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let frozen_class = HostObject::new_class("owner.FrozenKey", vec![]);
+        frozen_class.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "owner.FrozenKey._freeze_",
+                Arc::new(|_| Ok(ConstValue::Bool(true))),
+            )),
+        );
+        let key = HostObject::new_native_instance(frozen_class, Arc::new(NativeValue(7)));
+        let result = HostObject::new_native_instance(
+            HostObject::new_class("owner.PreBuiltResult", vec![]),
+            Arc::new(NativeValue(42)),
+        );
+        let expected_key = key.clone();
+        let native_result = result.clone();
+        let mut graph = LegacyGraph::new("prebuilt_memo");
+        graph.hints.push("specialize:memo".into());
+        let mut func = source_graph_func(&graph);
+        func.host_call = Some(HostCall(Arc::new(move |args| {
+            assert_eq!(args, &[ConstValue::HostObject(expected_key.clone())]);
+            assert_eq!(host_getattr(&expected_key, "value"), Ok(ConstValue::Int(7)));
+            Ok(ConstValue::HostObject(native_result.clone()))
+        })));
+        let entry = registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["owner", "prebuilt_memo"]),
+            Signature::new(vec!["key".into()], None, None),
+            func,
+        );
+        let s_key = ann
+            .bookkeeper
+            .immutablevalue(&ConstValue::HostObject(key))
+            .unwrap();
+        assert!(matches!(s_key, SomeValue::PBC(_)));
+        let SpecializeResult::Annotation(s_result) = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut vec![Some(s_key)], None)
+            .unwrap()
+        else {
+            panic!("memo must first return its result annotation")
+        };
+        assert!(matches!(*s_result, SomeValue::Instance(_)));
+
+        // Read the instance source through ClassDef's ordinary attribute path.
+        // No manually seeded field annotation or readonly override: the native
+        // object's enumerated source supplies both the cell and mutability.
+        let cd = ann
+            .bookkeeper
+            .getuniqueclassdef(result.instance_class().unwrap())
+            .unwrap();
+        let field_annotation =
+            crate::annotator::classdesc::ClassDef::find_attribute(&cd, "value").unwrap();
+        assert!(matches!(field_annotation, SomeValue::Integer(_)));
+        assert!(!cd.borrow().attrs["value"].readonly);
+
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().unwrap();
+        let repr = rtyper.getrepr(&s_result).unwrap();
+        rtyper.call_all_setups().unwrap();
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+        let value = ConstValue::HostObject(result);
+        let first = repr.convert_const(&value).unwrap();
+        let second = repr.convert_const(&value).unwrap();
+        let (ConstValue::LLPtr(first_ptr), ConstValue::LLPtr(second_ptr)) =
+            (&first.value, &second.value)
+        else {
+            panic!("prebuilt conversion must produce typed low-level pointers")
+        };
+        assert!(first_ptr.nonzero());
+        assert_eq!(first.concretetype.as_ref(), Some(repr.lowleveltype()));
+        assert_eq!(
+            first_ptr._hashable_identity(),
+            second_ptr._hashable_identity()
+        );
+        let instance_repr = crate::translator::rtyper::rclass::getinstancerepr(
+            &rtyper,
+            Some(&cd),
+            crate::translator::rtyper::rclass::Flavor::Gc,
+        )
+        .unwrap();
+        let fields = instance_repr.fields();
+        let (field, _) = fields.get("value").unwrap();
+        let crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::Struct(object) =
+            first_ptr._obj().unwrap()
+        else {
+            panic!("typed prebuilt instance")
+        };
+        assert!(matches!(
+            object._getattr(field).unwrap(),
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Signed(42)
+        ));
+    }
 
     fn link_to_returnblock(args: Vec<LinkArg>, returnblock_id: BlockId) -> crate::model::Link {
         crate::model::Link::new_mixed(args, returnblock_id, None)
@@ -4518,9 +4857,61 @@ mod tests {
             (tail.clone(), Variable::new()),
         ]);
 
-        reconcile_elided_phi_inputargs(&graph, &mut value_to_var);
+        reconcile_elided_phi_inputargs(
+            &graph,
+            &mut value_to_var,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         assert_eq!(value_to_var.get(&middle), Some(&typed_source));
         assert_eq!(value_to_var.get(&tail), Some(&typed_source));
+    }
+
+    #[test]
+    fn projection_aliases_close_interleaved_phi_and_hint_chains() {
+        let mut graph = LegacyGraph::new("phi_hint_chain");
+        let source = graph.alloc_value_var();
+        graph.block_mut(graph.startblock).inputargs = vec![source.clone()];
+        let typed_source = Variable::new();
+        typed_source.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        ));
+        let mut variables = HashMap::from([(source.clone(), typed_source.clone())]);
+        let mut predecessor = graph.startblock;
+        let mut incoming = source;
+        let mut aliases = Vec::new();
+        for _ in 0..3 {
+            let (block, inputs) = graph.create_block_with_arg_vars(1);
+            graph.set_goto(predecessor, block, vec![incoming]);
+            let input = inputs[0].clone();
+            let result = graph.alloc_value_var();
+            graph
+                .block_mut(block)
+                .operations
+                .push(crate::model::SpaceOperation {
+                    result: Some(result.clone()),
+                    kind: crate::model::OpKind::Hint {
+                        value: input.clone(),
+                        kind: crate::hints::HintKind::Promote,
+                    },
+                });
+            for alias in [input, result.clone()] {
+                variables.insert(alias.clone(), Variable::new());
+                aliases.push(alias);
+            }
+            predecessor = block;
+            incoming = result;
+        }
+        reconcile_projection_aliases(
+            &graph,
+            &mut variables,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        for alias in aliases {
+            assert_eq!(variables.get(&alias), Some(&typed_source));
+            assert!(alias.concretetype().is_none(), "do not seed the baseline");
+        }
     }
 
     #[test]
@@ -4550,12 +4941,62 @@ mod tests {
             (target.clone(), untyped_target.clone()),
         ]);
 
-        reconcile_elided_phi_inputargs(&graph, &mut value_to_var);
+        reconcile_elided_phi_inputargs(
+            &graph,
+            &mut value_to_var,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
         assert_eq!(
             value_to_var.get(&target),
             Some(&untyped_target),
             "same kind is insufficient: upstream unions exact phi representatives"
         );
+    }
+
+    #[test]
+    fn constant_phi_aliases_require_equal_values_and_publish_after_acceptance() {
+        for (right, expected_alias) in [(1, true), (2, false)] {
+            let mut graph = LegacyGraph::new("constant_phi");
+            let literal = graph.alloc_value_var();
+            let (join, inputs) = graph.create_block_with_arg_vars(1);
+            let input = inputs[0].clone();
+            let (tail, tail_inputs) = graph.create_block_with_arg_vars(1);
+            let make_constant =
+                |value| Constant::with_concretetype(ConstValue::Int(value), LowLevelType::Unsigned);
+            let first = make_constant(1);
+            graph.block_mut(graph.startblock).exits = vec![
+                crate::model::Link::new_mixed(vec![LinkArg::Value(literal.clone())], join, None),
+                crate::model::Link::new_mixed(
+                    vec![LinkArg::Const(make_constant(right))],
+                    join,
+                    None,
+                ),
+            ];
+            graph.block_mut(join).exits = vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(input.clone())],
+                tail,
+                None,
+            )];
+            let mut values = HashMap::from([(literal.clone(), Hlvalue::Constant(first))]);
+            let mut types = HashMap::from([(literal, LowLevelType::Unsigned)]);
+            let mut variables = HashMap::from([
+                (input.clone(), Variable::new()),
+                (tail_inputs[0].clone(), Variable::new()),
+            ]);
+            reconcile_elided_phi_inputargs(&graph, &mut variables, &mut values, &mut types);
+            assert_eq!(types.contains_key(&input), expected_alias);
+            assert_eq!(types.contains_key(&tail_inputs[0]), expected_alias);
+            // Alias reconstruction must not contaminate the independent baseline.
+            assert!(input.concretetype().is_none());
+            assert!(tail_inputs[0].concretetype().is_none());
+            if expected_alias {
+                assert_eq!(types.get(&input), Some(&LowLevelType::Unsigned));
+                crate::codewriter::type_state::apply_from_flowspace_constants(&types);
+                assert_eq!(input.concretetype(), Some(LowLevelType::Unsigned));
+                assert_eq!(tail_inputs[0].concretetype(), Some(LowLevelType::Unsigned));
+            }
+        }
     }
 
     fn backfill_call_result_fixture(
@@ -6087,8 +6528,9 @@ mod tests {
         let registry = crate::translator::rtyper::call_registry::CallRegistry::new(Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
         ));
-        let (flow_graph, _, _, _) = drive_subject(&graph, &registry, /* do_rtype = */ false)
-            .expect("repeat subject must annotate and transform");
+        let (flow_graph, _, _, _, _) =
+            drive_subject(&graph, &registry, /* do_rtype = */ false)
+                .expect("repeat subject must annotate and transform");
         let transformed_ops: Vec<String> = flow_graph
             .borrow()
             .iterblocks()
@@ -6193,6 +6635,83 @@ mod tests {
                 .map(|block| BlockKey::of(block).as_usize())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn lifted_dyn_dispatch_simplifies_only_the_consumed_slot_projection() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+
+        // TranslationContext.buildflowgraph runs simplify_graph before the
+        // annotator sees a body. A native dyn-call's consumed fnptr projection
+        // must not survive as getattr(raw_vtable, "method_run"): the adapter
+        // has reconstructed getattr(receiver, "run") + simple_call instead.
+        // A separately returned slot remains live and must still be checked.
+        for return_slot in [false, true] {
+            let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
+            let mut source = LegacyGraph::new("dyn_dispatch_preimage");
+            let vars = mint_vars(&mut source, 4);
+            setbinding(&vars[0], ValueType::Ref(None));
+            setbinding(&vars[1], ValueType::Ref(None));
+            let start = source.startblock;
+            source.block_mut(start).inputargs = vars[..2].to_vec();
+            source.block_mut(start).operations = vec![
+                crate::model::SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: crate::model::OpKind::FieldRead {
+                        base: vars[1].clone(),
+                        field: crate::model::FieldDescriptor::new(
+                            "method_run",
+                            Some("{vtable}".into()),
+                        ),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                },
+                crate::model::SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: crate::model::OpKind::IndirectCall {
+                        funcptr: vars[2].clone(),
+                        args: vec![vars[0].clone()],
+                        graphs: None,
+                        family_key: Some(("Handler".into(), "run".into())),
+                        result_ty: ValueType::Int,
+                    },
+                },
+            ];
+            source.set_return(start, Some(vars[if return_slot { 2 } else { 3 }].clone()));
+            let lifted = lift_callee_to_pygraph(
+                &source,
+                Signature::new(vec!["receiver".into(), "vtable".into()], None, None),
+                &registry,
+            )
+            .expect("dyn dispatch must lift");
+            let graph = lifted.graph.borrow();
+            crate::flowspace::model::checkgraph(&graph);
+            let attr_names: Vec<String> = graph
+                .iterblocks()
+                .into_iter()
+                .flat_map(|block| block.borrow().operations.clone())
+                .filter(|op| op.opname == "getattr")
+                .filter_map(|op| match &op.args[1] {
+                    Hlvalue::Constant(c) => c.value.as_text().map(str::to_owned),
+                    _ => None,
+                })
+                .collect();
+            assert!(attr_names.iter().any(|name| name == "run"));
+            assert_eq!(
+                attr_names.iter().any(|name| name == "method_run"),
+                return_slot,
+                "only a separately consumed native slot is live"
+            );
+            assert_eq!(graph.startblock.borrow().inputargs.len(), 2);
+            assert!(
+                matches!(
+                    source.block(start).operations[0].kind,
+                    crate::model::OpKind::FieldRead { .. }
+                ),
+                "the native/legacy dispatch projection must remain intact"
+            );
+        }
     }
 
     #[test]

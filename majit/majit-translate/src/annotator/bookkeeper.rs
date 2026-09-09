@@ -1466,7 +1466,6 @@ impl Bookkeeper {
             ))
         })?;
         // upstream bookkeeper.py `signature = cpython_code_signature(pyfunc.__code__)`.
-        let name = gf.name.clone();
         let signature = match gf.code.as_ref() {
             Some(code) => cpython_code_signature(code),
             // No HostCode attached — upstream hits the
@@ -1477,6 +1476,22 @@ impl Bookkeeper {
             // still traverse.
             None => Signature::new(vec!["entry".to_string()], None, None),
         };
+        self.newfuncdesc_with_signature(pyfunc, signature)
+    }
+
+    /// The native-source adapter supplies the signature read from its own
+    /// code object (the LLBC declaration), instead of fabricating HostCode
+    /// bytecode. All callable attributes, policy selection and MemoDesc
+    /// construction still follow Bookkeeper.newfuncdesc's single path.
+    pub(crate) fn newfuncdesc_with_signature(
+        self: &Rc<Self>,
+        pyfunc: &HostObject,
+        signature: Signature,
+    ) -> Result<DescEntry, AnnotatorError> {
+        let gf = pyfunc.user_function().ok_or_else(|| {
+            AnnotatorError::new("native function descriptor requires a user function")
+        })?;
+        let name = gf.name.clone();
         let defaults = if gf.defaults.is_empty() {
             None
         } else {
@@ -6038,7 +6053,7 @@ mod tests {
         let bk = ann.bookkeeper.clone();
         let cls = HostObject::new_class("pkg.Holder", vec![]);
         let inst = HostObject::new_instance(cls.clone(), vec![]);
-        inst.instance_set("x", ConstValue::Int(42));
+        inst.instance_set("x", ConstValue::Int(42)).unwrap();
         let s = bk
             .immutablevalue(&ConstValue::HostObject(inst.clone()))
             .expect("user-class instance must route to SomeInstance");

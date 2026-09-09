@@ -4494,9 +4494,8 @@ pub(crate) fn build_ll_dict_entries_arraycopy_helper_graph(
 /// ll_dict_reindex(d, _ll_len_of_d_indexes(d))
 /// ```
 ///
-/// rordereddict.py:814-815 — `llop.gc_writebarrier` is a performance hint for
-/// the in-place compaction branch and has no local llop surface; the graph still
-/// performs the same field writes and trailing pointer clears.
+/// `ll_dict_remove_deleted_items` barriers the reused entries array once,
+/// before the copy loop, instead of relying on card-by-card write barriers.
 pub(crate) fn build_ll_dict_remove_deleted_items_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -4655,6 +4654,15 @@ pub(crate) fn build_ll_dict_remove_deleted_items_helper_graph(
         .into_ref(),
     ]);
 
+    // rordereddict.py::ll_dict_remove_deleted_items, the non-shrinking arm:
+    // llop.gc_writebarrier(lltype.Void, newitems), where newitems is d.entries.
+    let barrier_result = new_var("v", LowLevelType::Void);
+    push(
+        &block_inplace,
+        "gc_writebarrier",
+        vec![var(&ip_old)],
+        &barrier_result,
+    );
     block_inplace.closeblock(vec![
         Link::new(
             vec![var(&ip_d), var(&ip_old), var(&ip_old), bool_const(false)],
@@ -10230,6 +10238,34 @@ mod tests {
             1,
             "tail reindex call"
         );
+        let start = inner.startblock.borrow();
+        for link in &start.exits {
+            let link = link.borrow();
+            let target = link.target.as_ref().unwrap().borrow();
+            let barriers: Vec<_> = target
+                .operations
+                .iter()
+                .filter(|op| op.opname == "gc_writebarrier")
+                .collect();
+            if target
+                .operations
+                .iter()
+                .any(|op| op.opname == "malloc_varsize")
+            {
+                assert!(
+                    barriers.is_empty(),
+                    "fresh entries need no pre-copy barrier"
+                );
+            } else {
+                assert_eq!(
+                    barriers.len(),
+                    1,
+                    "in-place compaction barriers the old array once"
+                );
+                assert_eq!(barriers[0].args, vec![target.inputargs[1].clone()]);
+                assert_eq!(target.operations.len(), 1, "barrier precedes the copy loop");
+            }
+        }
     }
 
     /// `_ll_dict_resize_to` restores the shrink-via-compaction branch:

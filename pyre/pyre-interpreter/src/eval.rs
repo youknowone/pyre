@@ -1556,6 +1556,22 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // owner before walking module/type caches below.
     crate::pycode::walk_prebuilt_code_roots(visitor);
     unsafe {
+        {
+            let mut forward_declaration = |slot: &mut PyObjectRef| {
+                visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                walk_raw_function_roots(*slot, visitor);
+                walk_raw_getset_roots(*slot, visitor);
+                walk_raw_wrapped_function_roots(*slot, visitor);
+                // A declaration can be an immortal interp2app whose Code
+                // is reachable only through its inline field. The collector
+                // does not enter raw prebuilt allocations by itself.
+                walk_raw_immortal_roots(*slot, visitor);
+            };
+            // Native Cache.content and TypeDef.rawdict have the same strong
+            // GC reachability as their host dictionaries in PyPy.
+            crate::baseobjspace::walk_object_space_cache_roots(&mut forward_declaration);
+            pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
+        }
         let mut forward = |slot: &mut PyObjectRef| {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             walk_raw_function_roots(*slot, visitor);

@@ -2073,6 +2073,7 @@ dependencies = [
 name = "majit-rlib"
 version = "0.0.2"
 dependencies = [
+ "indexmap",
  "majit-gc",
  "majit-ir",
  "majit-macros",

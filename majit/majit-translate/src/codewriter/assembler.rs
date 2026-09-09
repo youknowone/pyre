@@ -5253,12 +5253,11 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstRefAddr(_) => "ref_copy".into(),
-        // `ConstNone` (Void `None`) is const-inlined by
-        // `legacy_const_define_hlvalue`, and `decompose_slice_args` DROPS
-        // the getslice `stop` operand for a `[start:]` slice
-        // (in `rtyper.rs`) — so it never reaches the assembler in a lifted
-        // graph.  It only appears here if a graph that planted it dropped
-        // to the legacy walker (the gate failed); the distinctive
+        // `ConstNone` (Void `None`) is const-inlined by the flowspace
+        // adapter. jtransform also erases its legacy definition after
+        // rtyping, including graphs that used the legacy walker. RPython
+        // represents it only as Constant(None, Void), not an instruction.
+        // A surviving definition is a missed transformation; the distinctive
         // handler-less `const_none` opname trips
         // `default_bh_builder_unwired_set_matches_task_85_snapshot` loudly
         // rather than mis-materialising a Void into a register.

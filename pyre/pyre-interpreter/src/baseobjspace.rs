@@ -221,50 +221,224 @@ pub struct DescrMismatch;
 #[derive(Debug, Clone)]
 pub struct CannotHaveLock;
 
-/// Minimal compatibility placeholder for PyPy-style cache objects.
-#[derive(Debug, Default)]
-pub struct SpaceCache {
-    space: PyObjectRef,
-    _entries: RefCell<HashMap<usize, PyObjectRef>>,
+/// `baseobjspace.py SpaceCache`: a Cache plus its owning object space.
+///
+/// Keys/results remain typed so a TypeDef key need not masquerade as a Python
+/// object pointer. Object-valued results must clone identity, not the object.
+/// The space is retained by its actual handle/reference type; this base does
+/// not manufacture a Python object pointer for a native ObjSpace.
+#[derive(Debug)]
+pub struct SpaceCache<K = PyObjectRef, V = PyObjectRef, S = PyObjectRef> {
+    pub space: S,
+    base: majit_rlib::cache::Cache<K, V>,
 }
 
-impl SpaceCache {
-    pub fn new(space: PyObjectRef) -> Self {
+impl<K, V, S: Default> Default for SpaceCache<K, V, S> {
+    fn default() -> Self {
+        Self::new(S::default())
+    }
+}
+
+/// The concrete subclass methods called by SpaceCache._build/_ready.
+/// The owner embeds a SpaceCache and reads that base's `space` when building.
+pub trait SpaceCacheBuild<K, V> {
+    type Error;
+
+    fn build(&self, key: &K) -> Result<V, majit_rlib::cache::CacheError<Self::Error>>;
+
+    fn ready(&self, _result: &V) -> Result<(), majit_rlib::cache::CacheError<Self::Error>> {
+        Ok(())
+    }
+}
+
+// Rust's explicit subclass receiver for SpaceCache._build -> self.build and
+// SpaceCache._ready -> self.ready. No borrow of cache storage spans callbacks.
+struct SpaceCacheHooks<'a, B>(&'a B);
+
+impl<K, V, B: SpaceCacheBuild<K, V>> majit_rlib::cache::CacheBuilder<K, V>
+    for SpaceCacheHooks<'_, B>
+{
+    type Error = B::Error;
+
+    fn _build(&self, key: &K) -> Result<V, majit_rlib::cache::CacheError<Self::Error>> {
+        self.0.build(key)
+    }
+
+    fn _ready(&self, result: &V) -> Result<(), majit_rlib::cache::CacheError<Self::Error>> {
+        self.0.ready(result)
+    }
+}
+
+impl<K, V, S> SpaceCache<K, V, S> {
+    pub fn new(space: S) -> Self {
         Self {
             space,
-            _entries: RefCell::new(HashMap::new()),
+            base: majit_rlib::cache::Cache::default(),
         }
     }
 
-    #[inline]
-    pub fn getorbuild(&self, _key: PyObjectRef) -> PyObjectRef {
-        std::ptr::null_mut()
+    pub fn visit_values_mut(&self, visit: impl FnMut(&mut V)) {
+        self.base.visit_values_mut(visit);
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash, V: Clone, S> SpaceCache<K, V, S> {
+    pub fn getorbuild<B: SpaceCacheBuild<K, V>>(
+        &self,
+        key: K,
+        owner: &B,
+    ) -> Result<V, majit_rlib::cache::CacheError<B::Error>> {
+        self.base.getorbuild(key, &SpaceCacheHooks(owner))
     }
 
-    #[inline]
-    pub fn ready(&self, _result: PyObjectRef) {}
+    pub fn _freeze_(&self) -> bool {
+        self.base._freeze_()
+    }
 }
 
-/// Compatibility cache variant with `callable(self)` construction path.
-#[derive(Debug, Default)]
-pub struct InternalSpaceCache {
-    base: SpaceCache,
+/// An initialization-time callable with stable identity as a cache key.
+/// `baseobjspace.py InternalSpaceCache._build` calls this object with space.
+/// A function address alone is not a substitute for Python callable identity.
+pub trait SpaceCallable<S>: Clone + Eq + std::hash::Hash {
+    type Value: Clone;
+    type Error;
+
+    fn call(&self, space: &S) -> Result<Self::Value, majit_rlib::cache::CacheError<Self::Error>>;
 }
 
-impl InternalSpaceCache {
-    pub fn new(space: PyObjectRef) -> Self {
+/// `baseobjspace.py InternalSpaceCache`: Cache directly, not a SpaceCache.
+/// Each object space owns its cache; no TLS or process-wide result table.
+pub struct InternalSpaceCache<F: SpaceCallable<S>, S> {
+    pub space: S,
+    base: majit_rlib::cache::Cache<F, F::Value>,
+}
+
+impl<F: SpaceCallable<S>, S> InternalSpaceCache<F, S> {
+    pub fn new(space: S) -> Self {
         Self {
-            base: SpaceCache::new(space),
+            space,
+            base: majit_rlib::cache::Cache::default(),
         }
     }
 
-    #[inline]
-    pub fn getorbuild<F>(&self, f: F) -> PyObjectRef
-    where
-        F: FnOnce(PyObjectRef) -> PyObjectRef,
-    {
-        let _ = self.base.space;
-        f(std::ptr::null_mut())
+    pub fn getorbuild(
+        &self,
+        callable: F,
+    ) -> Result<F::Value, majit_rlib::cache::CacheError<F::Error>> {
+        self.base.getorbuild(callable, self)
+    }
+
+    pub fn _freeze_(&self) -> bool {
+        self.base._freeze_()
+    }
+
+    pub fn visit_values_mut(&self, visit: impl FnMut(&mut F::Value)) {
+        self.base.visit_values_mut(visit);
+    }
+}
+
+impl<F: SpaceCallable<S>, S> majit_rlib::cache::CacheBuilder<F, F::Value>
+    for InternalSpaceCache<F, S>
+{
+    type Error = F::Error;
+
+    fn _build(&self, callable: &F) -> Result<F::Value, majit_rlib::cache::CacheError<Self::Error>> {
+        callable.call(&self.space)
+    }
+}
+
+#[cfg(test)]
+mod space_cache_tests {
+    use super::{InternalSpaceCache, SpaceCache, SpaceCacheBuild, SpaceCallable};
+    use majit_rlib::cache::CacheError;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Owner {
+        base: SpaceCache<usize, Arc<(usize, usize)>, usize>,
+        builds: AtomicUsize,
+        readies: AtomicUsize,
+    }
+
+    impl Owner {
+        fn new(space: usize) -> Self {
+            Self {
+                base: SpaceCache::new(space),
+                builds: AtomicUsize::new(0),
+                readies: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SpaceCacheBuild<usize, Arc<(usize, usize)>> for Owner {
+        type Error = ();
+
+        fn build(&self, key: &usize) -> Result<Arc<(usize, usize)>, CacheError<()>> {
+            self.builds.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new((self.base.space, *key)))
+        }
+
+        fn ready(&self, result: &Arc<(usize, usize)>) -> Result<(), CacheError<()>> {
+            self.readies.fetch_add(1, Ordering::Relaxed);
+            assert!(Arc::ptr_eq(result, &self.base.getorbuild(result.1, self)?));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn space_cache_delegates_and_keeps_per_space_identity() {
+        let a = Owner::new(11);
+        let b = Owner::new(22);
+        let first = a.base.getorbuild(1, &a).unwrap();
+        assert_eq!(*first, (11, 1));
+        assert!(Arc::ptr_eq(&first, &a.base.getorbuild(1, &a).unwrap()));
+        let other = b.base.getorbuild(1, &b).unwrap();
+        assert_eq!(*other, (22, 1));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(a.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(a.readies.load(Ordering::Relaxed), 1);
+        assert!(a.base._freeze_());
+        assert_eq!(*a.base.getorbuild(2, &a).unwrap(), (11, 2));
+    }
+
+    #[test]
+    fn space_cache_concurrent_callers_share_result() {
+        let owner = Owner::new(11);
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| owner.base.getorbuild(1, &owner).unwrap()))
+                .collect();
+            let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            assert!(results.iter().all(|v| Arc::ptr_eq(v, &results[0])));
+        });
+        assert_eq!(owner.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(owner.readies.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct Callable(usize);
+
+    impl SpaceCallable<usize> for Callable {
+        type Value = Arc<(usize, usize)>;
+        type Error = ();
+
+        fn call(&self, space: &usize) -> Result<Self::Value, CacheError<()>> {
+            Ok(Arc::new((*space, self.0)))
+        }
+    }
+
+    #[test]
+    fn internal_space_cache_keys_the_callable_and_passes_its_space() {
+        let a = InternalSpaceCache::<Callable, _>::new(11);
+        let b = InternalSpaceCache::<Callable, _>::new(22);
+        let first = a.getorbuild(Callable(1)).unwrap();
+        assert_eq!(*first, (11, 1));
+        assert!(Arc::ptr_eq(&first, &a.getorbuild(Callable(1)).unwrap()));
+        assert_eq!(*a.getorbuild(Callable(2)).unwrap(), (11, 2));
+        let other = b.getorbuild(Callable(1)).unwrap();
+        assert_eq!(*other, (22, 1));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert!(a._freeze_());
     }
 }
 
@@ -287,27 +461,112 @@ impl AppExecCache {
     }
 }
 
-/// Very small compatibility object for PyPy's `ObjSpace` interface.
-/// The full object-space API is implemented as free functions in this module.
-#[derive(Debug, Default)]
+/// Native class-object identities admitted by ObjSpace.fromcache. These keys
+/// represent constructor objects, not function addresses or result type IDs.
+/// Extend alongside each real SpaceCache subclass, not a parallel registry.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpaceCacheClass {
+    GatewayCache,
+    TypeCache,
+}
+
+#[derive(Clone)]
+pub enum SpaceCacheInstance {
+    GatewayCache(std::sync::Arc<crate::gateway::GatewayCache>),
+    TypeCache(std::sync::Arc<crate::objspace::std::typeobject::TypeCache>),
+}
+
+impl SpaceCallable<std::sync::Weak<ObjSpace>> for SpaceCacheClass {
+    type Value = SpaceCacheInstance;
+    type Error = std::convert::Infallible;
+
+    fn call(
+        &self,
+        space: &std::sync::Weak<ObjSpace>,
+    ) -> Result<Self::Value, majit_rlib::cache::CacheError<Self::Error>> {
+        // InternalSpaceCache.__init__ owns its space strongly upstream.
+        // Only the native self-reference is Weak (Arc::new_cyclic cannot
+        // upgrade during construction); fromcache's &self proves it live.
+        // Returned subclass caches retain a strong space just as PyPy does.
+        let space = space.upgrade().expect("live InternalSpaceCache owner");
+        Ok(match self {
+            Self::TypeCache => SpaceCacheInstance::TypeCache(std::sync::Arc::new(
+                crate::objspace::std::typeobject::TypeCache::new(space.clone()),
+            )),
+            Self::GatewayCache => SpaceCacheInstance::GatewayCache(std::sync::Arc::new(
+                crate::gateway::GatewayCache::new(space.clone()),
+            )),
+        })
+    }
+}
+
+/// baseobjspace.py ObjSpace.__init__: own InternalSpaceCache, whose callable
+/// keys construct per-space caches. The prebuilt strong ownership cycle is
+/// intentional: a returned cache keeps its space alive. Runtime operations
+/// remain free functions while they are migrated onto this owner.
 pub struct ObjSpace {
-    #[allow(dead_code)]
-    fromcache: Option<PyObjectRef>,
+    fromcache: InternalSpaceCache<SpaceCacheClass, std::sync::Weak<ObjSpace>>,
 }
 
 impl ObjSpace {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new() -> std::sync::Arc<Self> {
+        let space = std::sync::Arc::new_cyclic(|space| Self {
+            fromcache: InternalSpaceCache::new(space.clone()),
+        });
+        OBJECT_SPACE_ROOTS
+            .lock()
+            .push(std::sync::Arc::downgrade(&space));
+        space
     }
 
-    pub fn fromcache<T, F>(&self, mut build: F, cache: &SpaceCache) -> T
-    where
-        T: Default,
-        F: FnMut(&SpaceCache) -> T,
-    {
-        let _ = cache.getorbuild(std::ptr::null_mut());
-        build(cache)
+    pub fn fromcache(&self, cls: SpaceCacheClass) -> SpaceCacheInstance {
+        self.fromcache
+            .getorbuild(cls)
+            .unwrap_or_else(|_| panic!("recursive object-space cache construction"))
     }
+
+    pub fn walk_cache_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
+        self.fromcache.visit_values_mut(|cache| match cache {
+            SpaceCacheInstance::GatewayCache(cache) => cache.walk_roots(forward),
+            SpaceCacheInstance::TypeCache(cache) => cache.walk_roots(forward),
+        });
+    }
+
+    /// # Safety
+    /// `definition` is an immutable live prebuilt TypeDef declaration.
+    pub unsafe fn gettypeobject(
+        &self,
+        definition: *const pyre_object::typedef::TypeDef,
+    ) -> Result<PyObjectRef, majit_rlib::cache::CacheError<crate::PyError>> {
+        let SpaceCacheInstance::TypeCache(cache) = self.fromcache(SpaceCacheClass::TypeCache)
+        else {
+            unreachable!()
+        };
+        unsafe { cache.getorbuild(definition) }
+    }
+}
+
+static OBJECT_SPACE: std::sync::OnceLock<std::sync::Arc<ObjSpace>> = std::sync::OnceLock::new();
+
+// Native counterpart of the GC transform's prebuilt roots. Not a semantic
+// object-space lookup table: every live space must expose its actual caches.
+static OBJECT_SPACE_ROOTS: parking_lot::Mutex<Vec<std::sync::Weak<ObjSpace>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// The existing single interpreter's object-space owner, shared by threads.
+pub fn object_space() -> &'static std::sync::Arc<ObjSpace> {
+    OBJECT_SPACE.get_or_init(ObjSpace::new)
+}
+
+pub fn walk_object_space_cache_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    OBJECT_SPACE_ROOTS.lock().retain(|owner| {
+        if let Some(space) = owner.upgrade() {
+            space.walk_cache_roots(forward);
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// `rpython/rlib/rthread.py Lock` — the interp-level lock object

@@ -63,6 +63,25 @@ pub fn apply_from_flowspace_variables(
     }
 }
 
+/// Publish the Constant half of the accepted rtyper projection. Upstream
+/// reads Constant.concretetype directly; the transitional MIR emitter also
+/// has Variables for constant definitions and eliminated phi aliases.
+/// Call only after the unchanged dual-gate comparison has accepted them.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Variable keys use immutable identity, like RPython graph variables"
+)]
+pub(crate) fn apply_from_flowspace_constants(
+    constants: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    >,
+) {
+    for (legacy, lltype) in constants {
+        legacy.set_concretetype(Some(lltype.clone()));
+    }
+}
+
 /// `ValueType` → `ConcreteType` projection used by both
 /// `resolve_types` (legacy graph walk) and `authoritative_result_types`
 /// (post-jtransform op-result projection).

@@ -52,6 +52,14 @@ pub(crate) type Flags = HashMap<String, ConstValue>;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, LazyLock};
 
+thread_local! {
+    // rclass.py:InstanceRepr._initialize_data_flattenrec is a class-owned
+    // FlattenRecursion; upstream tool/flattenrec.py derives from thread._local.
+    // Share one queue across reprs on the translation thread, not per instance.
+    static INITIALIZE_DATA_FLATTENREC: crate::tool::flattenrec::FlattenRecursion<TyperError> =
+        crate::tool::flattenrec::FlattenRecursion::new();
+}
+
 use crate::annotator::classdesc::ClassDef;
 use crate::annotator::description::{ClassDefKey, DescEntry};
 use crate::annotator::model::{DescKind, SomePBC, SomeValue};
@@ -2452,7 +2460,22 @@ impl InstanceRepr {
         let rbase = self.rbase.borrow().clone().ok_or_else(|| {
             TyperError::message("InstanceRepr.getfieldrepr: rbase missing — call setup() first")
         })?;
-        rbase.getfieldrepr(attr)
+        rbase.getfieldrepr(attr).map_err(|err| {
+            // Keep the failing owner's annotation beside its built fields:
+            // this distinguishes an absent attribute from premature repr
+            // setup without changing rclass.py::InstanceRepr.getfieldrepr's
+            // lookup or allowing a missing field.
+            let classdef = self.classdef.as_ref().unwrap().borrow();
+            let attribute = classdef.attrs.get(attr).map(|value| {
+                (value.readonly, value.s_value.clone())
+            });
+            let mut fields: Vec<_> = self.fields.borrow().keys().cloned().collect();
+            fields.sort();
+            TyperError::message(format!(
+                "{err}; InstanceRepr {:?}: attribute {attr:?} (readonly, value)={attribute:?}, built fields={fields:?}",
+                classdef.name
+            ))
+        })
     }
 
     /// RPython `InstanceRepr.hook_access_field(self, vinst, cname,
@@ -2975,13 +2998,8 @@ impl InstanceRepr {
     ///   `Ellipsis` sentinel meaning "use defaults"). The Ellipsis
     ///   path skips the live `instance_get` probe and falls through
     ///   straight to `read_attribute` → `_defl`.
-    /// - Upstream's `try: getattr(value, name) except AttributeError:`
-    ///   is split into an explicit `host.instance_get(name)` lookup
-    ///   on the per-instance `__dict__` followed by the same
-    ///   `read_attribute(name, None)` → `_defl` cascade upstream uses
-    ///   inside the except branch — see the body block at
-    ///   `for (name, ...) in &fields_snapshot` below for the full
-    ///   try/except mirror.
+    /// - Upstream's `getattr(value, name)` uses the host descriptor protocol;
+    ///   only a missing attribute takes the class-declaration/default branch.
     pub fn initialize_prebuilt_data(
         &self,
         _value: Option<&HostObject>,
@@ -3019,12 +3037,9 @@ impl InstanceRepr {
             //               llattrvalue = r.convert_const(attrvalue)
             //       setattr(result, mangled_name, llattrvalue)
             //
-            // Pyre splits the upstream try/except on `getattr` into an
-            // explicit `instance_get` (live `__dict__`) → fall through
-            // to `read_attribute` (class-level dict) → fall through to
-            // `_defl` cascade. The Ellipsis-sentinel path
+            // The Ellipsis-sentinel path
             // (`get_reusable_prebuilt_instance` with `_value = None`)
-            // skips the `instance_get` lookup entirely and goes
+            // skips the host lookup entirely and goes
             // straight to `read_attribute` / `_defl`.
             #[expect(
                 clippy::type_complexity,
@@ -3047,10 +3062,19 @@ impl InstanceRepr {
                         // is modeled as `LowLevelValue::Void`.
                         lltype::LowLevelValue::Void
                     } else {
-                        // upstream try/except: `getattr(value, name)` ⇒
-                        // pyre's `host.instance_get(name)`. AttributeError
-                        // ⇒ `read_attribute(name, None)` ⇒ `_defl`.
-                        let probe = _value.and_then(|host| host.instance_get(name));
+                        // rclass.py:InstanceRepr.initialize_prebuilt_data
+                        // reads getattr, not __dict__: native prebuilt views
+                        // and data descriptors must be observed before defaults.
+                        use crate::flowspace::model::{HostGetAttrError, host_getattr};
+                        let probe = match _value.map(|host| host_getattr(host, name)) {
+                            Some(Ok(value)) => Some(value),
+                            None | Some(Err(HostGetAttrError::Missing)) => None,
+                            Some(Err(HostGetAttrError::Unsupported)) => {
+                                return Err(TyperError::message(format!(
+                                    "InstanceRepr.initialize_prebuilt_data: unsupported getattr({name:?})"
+                                )));
+                            }
+                        };
                         if let Some(attrvalue) = probe {
                             let const_for_field =
                                 (r.as_ref() as &dyn Repr).convert_const(&attrvalue)?;
@@ -3150,12 +3174,9 @@ impl InstanceRepr {
     /// (rclass.py); upstream uses `identity_dict()` which is
     /// pointer-keyed dict semantics — pyre keys on
     /// [`HostObject`]'s Arc identity (Hash + Eq via `Arc::ptr_eq`).
-    /// `initialize_prebuilt_instance` is a thin wrapper around
-    /// `initialize_prebuilt_data` (the recursion shield via
-    /// `_initialize_data_flattenrec` is folded into pyre's recursive
-    /// call structure since the `flattenrec` mechanism is upstream-only
-    /// and operates as a no-op for non-recursive
-    /// `initialize_prebuilt_data` graphs).
+    /// `initialize_prebuilt_instance` queues nested initialization through
+    /// the shared FlattenRecursion, as upstream does for circular prebuilt
+    /// graphs and their hash initialization order.
     pub fn convert_const_exact(
         self: &Arc<Self>,
         host_obj: &HostObject,
@@ -3193,12 +3214,32 @@ impl InstanceRepr {
         self.iprebuiltinstances
             .borrow_mut()
             .insert(host_obj.clone(), initial.clone());
-        let mut local = initial;
-        self.initialize_prebuilt_data(Some(host_obj), self.classdef.as_ref(), &mut local, &[])?;
+        let local = initial;
+        self.initialize_prebuilt_instance(host_obj, self.classdef.as_ref(), &local)?;
         Ok(Constant::with_concretetype(
             ConstValue::LLPtr(Box::new(local)),
             self.lowleveltype.clone(),
         ))
+    }
+
+    /// RPython `InstanceRepr.initialize_prebuilt_instance`: defer nested
+    /// initialization until the outer object's fields (including hash state)
+    /// have been populated. Pointer clones share the allocated field storage.
+    pub fn initialize_prebuilt_instance(
+        self: &Arc<Self>,
+        value: &HostObject,
+        classdef: Option<&Rc<RefCell<ClassDef>>>,
+        result: &_ptr,
+    ) -> Result<(), TyperError> {
+        let repr = self.clone();
+        let value = value.clone();
+        let classdef = classdef.cloned();
+        let mut result = result.clone();
+        INITIALIZE_DATA_FLATTENREC.with(|flat| {
+            flat.call(Box::new(move || {
+                repr.initialize_prebuilt_data(Some(&value), classdef.as_ref(), &mut result, &[])
+            }))
+        })
     }
 
     /// RPython `InstanceRepr.get_reusable_prebuilt_instance(self)`
@@ -5997,6 +6038,90 @@ mod tests {
         );
         // The cache holds exactly one entry for this prebuilt.
         assert_eq!(inst.iprebuiltinstances.borrow().len(), 1);
+    }
+
+    #[test]
+    fn prebuilt_data_defers_nested_initialization_and_reads_descriptors() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::HostObject;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().unwrap();
+        let host_class = HostObject::new_class("PrebuiltDescriptor", vec![]);
+        let cd = ann.bookkeeper.getuniqueclassdef(&host_class).unwrap();
+        ClassDef::generalize_attr(
+            &cd,
+            "value",
+            Some(SomeValue::Integer(SomeInteger::new(false, false))),
+        )
+        .unwrap();
+        cd.borrow_mut()
+            .attrs
+            .get_mut("value")
+            .unwrap()
+            .modified(None)
+            .unwrap();
+        let repr = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).unwrap();
+        Repr::setup(repr.as_ref()).unwrap();
+        rtyper.call_all_setups().unwrap();
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+
+        // Supply the live host descriptor after the field layout is known.
+        // rclass.py:InstanceRepr.initialize_prebuilt_data must observe
+        // getattr(value, name), even with a shadowing __dict__ entry.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let getter_reads = reads.clone();
+        let getter = HostObject::new_native_callable(
+            "PrebuiltDescriptor.value",
+            Arc::new(move |_| {
+                getter_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(ConstValue::Int(42))
+            }),
+        );
+        host_class.class_set(
+            "value",
+            ConstValue::HostObject(HostObject::new_property(
+                "PrebuiltDescriptor.value",
+                Some(getter),
+                None,
+                None,
+            )),
+        );
+        let value = HostObject::new_instance(host_class, vec![]);
+        value.instance_set("value", ConstValue::Int(7)).unwrap();
+        let saved = Rc::new(RefCell::new(None));
+        let saved_inner = saved.clone();
+        let repr_inner = repr.clone();
+        let reads_inner = reads.clone();
+        INITIALIZE_DATA_FLATTENREC
+            .with(|flat| {
+                flat.call(Box::new(move || {
+                    *saved_inner.borrow_mut() = Some(repr_inner.convert_const_exact(&value)?);
+                    assert_eq!(
+                        reads_inner.load(std::sync::atomic::Ordering::Relaxed),
+                        0,
+                        "nested prebuilt initialization must wait for the outer object"
+                    );
+                    Ok(())
+                }))
+            })
+            .unwrap();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let constant = saved.borrow_mut().take().unwrap();
+        let ConstValue::LLPtr(ptr) = constant.value else {
+            panic!("typed instance")
+        };
+        let lltype::_ptr_obj::Struct(object) = ptr._obj().unwrap() else {
+            panic!("struct")
+        };
+        let fields = repr.fields();
+        let (field, _) = fields.get("value").expect("nonconstant instance field");
+        assert!(matches!(
+            object._getattr(field).unwrap(),
+            lltype::LowLevelValue::Signed(42)
+        ));
     }
 
     #[test]

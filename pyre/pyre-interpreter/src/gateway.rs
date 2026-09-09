@@ -354,8 +354,81 @@ pub struct FastFuncNotSupported;
 #[derive(Debug, Clone)]
 pub struct BuiltinActivation;
 
-#[derive(Debug, Clone)]
-pub struct GatewayCache;
+pub struct GatewayCache {
+    base: crate::baseobjspace::SpaceCache<
+        usize,
+        usize,
+        std::sync::Arc<crate::baseobjspace::ObjSpace>,
+    >,
+}
+
+impl GatewayCache {
+    pub fn new(space: std::sync::Arc<crate::baseobjspace::ObjSpace>) -> Self {
+        Self {
+            base: crate::baseobjspace::SpaceCache::new(space),
+        }
+    }
+
+    pub fn getorbuild(&self, gateway: PyObjectRef) -> PyObjectRef {
+        assert!(unsafe { pyre_object::gateway::is_interp2app(gateway) });
+        // The constructor allocates an immortal gateway. Its address is
+        // object identity, never a Rust function-address identity surrogate.
+        self.base
+            .getorbuild(gateway as usize, self)
+            .expect("recursive gateway construction") as PyObjectRef
+    }
+
+    pub fn walk_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
+        self.base.visit_values_mut(|value| {
+            let mut w_value = *value as PyObjectRef;
+            forward(&mut w_value);
+            *value = w_value as usize;
+        });
+    }
+
+    /// `gateway.py GatewayCache.build`: materialize the Function from a
+    /// prebuilt gateway, rather than treating the gateway itself as Code.
+    /// The current declaration constructor admits no host default arguments;
+    /// `_getdefaults` for host default arguments remains to be wired.
+    #[majit_macros::not_rpython]
+    pub fn build(&self, gateway: PyObjectRef) -> PyObjectRef {
+        assert!(unsafe { pyre_object::gateway::is_interp2app(gateway) });
+        let gateway = unsafe { &*(gateway as *const interp2app) };
+        let code = gateway._code;
+        assert!(unsafe { is_builtin_code(code) });
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(crate::function_new_with_fixed_code(
+            code as *const (),
+            gateway.name.to_string(),
+            pyre_object::PY_NULL,
+        ));
+        if let Some(text_sig) = gateway._explicit_text_sig {
+            let w_text_sig = pyre_object::w_str_new(text_sig);
+            let function = pyre_object::gc_roots::shadow_stack_get(slot);
+            unsafe { crate::function::fset_func_text_signature(function, w_text_sig) };
+        }
+        let function = pyre_object::gc_roots::shadow_stack_get(slot);
+        if gateway.as_classmethod {
+            pyre_object::function::w_classmethod_new(function)
+        } else {
+            function
+        }
+    }
+}
+
+impl crate::baseobjspace::SpaceCacheBuild<usize, usize> for GatewayCache {
+    type Error = std::convert::Infallible;
+
+    fn build(&self, key: &usize) -> Result<usize, majit_rlib::cache::CacheError<Self::Error>> {
+        Ok(GatewayCache::build(self, *key as PyObjectRef) as usize)
+    }
+
+    fn ready(&self, _result: &usize) -> Result<(), majit_rlib::cache::CacheError<Self::Error>> {
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BuiltinCodePassThroughArguments0 {
@@ -400,13 +473,12 @@ pub struct ApplevelClass {
     pub source: Option<PyObjectRef>,
 }
 
-#[derive(Debug, Clone)]
 pub struct ApplevelCache {
     pub base: GatewayCache,
 }
 
 #[allow(non_camel_case_types)]
-pub type interp2app = BuiltinCode;
+pub use pyre_object::gateway::interp2app;
 
 #[allow(non_camel_case_types)]
 pub type interp2app_temp = interp2app;
@@ -435,8 +507,102 @@ pub fn int_unwrapping_space_method<T>(_typ: T) -> &'static str {
 }
 
 pub fn interp2app(func: PyObjectRef) -> PyObjectRef {
-    let _ = func;
-    make_builtin_function("interp2app", |_| Ok(std::ptr::null_mut()))
+    // gateway.py interp2app.__new__: retain the real Code object. Rust
+    // callers supply the BuiltinCode produced by the typed constructor;
+    // they must not pass an app-level Function in its place.
+    assert!(
+        unsafe { is_builtin_code(func) },
+        "interp2app requires a BuiltinCode"
+    );
+    let name = unsafe { (*(func as *const BuiltinCode)).name };
+    unsafe { interp2app::new(func, name) }
+}
+
+/// gateway.py interp2app.spacebind/get_function/getcache. Wrapping binds a
+/// declaration to its object space; it does not allocate a new Code object.
+pub fn interp2app_spacebind(
+    gateway: PyObjectRef,
+    space: &crate::baseobjspace::ObjSpace,
+) -> PyObjectRef {
+    let crate::baseobjspace::SpaceCacheInstance::GatewayCache(cache) =
+        space.fromcache(crate::baseobjspace::SpaceCacheClass::GatewayCache)
+    else {
+        unreachable!()
+    };
+    cache.getorbuild(gateway)
+}
+
+#[cfg(test)]
+mod gateway_cache_tests {
+    use super::*;
+
+    fn answer(_args: &[PyObjectRef]) -> crate::PyResult {
+        Ok(pyre_object::w_int_new(42))
+    }
+
+    #[test]
+    fn declaration_binds_the_real_code_once_per_space() {
+        crate::typedef::init_typeobjects();
+        let a = crate::baseobjspace::ObjSpace::new();
+        let b = crate::baseobjspace::ObjSpace::new();
+        let code = builtin_code_new_with_arity("answer", answer, 0);
+        let gateway = interp2app(code);
+        unsafe {
+            (*(gateway as *mut interp2app))._explicit_text_sig = Some("()");
+            assert_eq!((*(gateway as *const interp2app))._code, code);
+        }
+        let first = interp2app_spacebind(gateway, &a);
+        assert_eq!(first, interp2app_spacebind(gateway, &a));
+        let other = interp2app_spacebind(gateway, &b);
+        assert_ne!(first, other);
+        unsafe {
+            assert_eq!(crate::function::getcode(first), code);
+            let result = ((*(code as *const BuiltinCode)).func)(&[]).unwrap();
+            assert_eq!(pyre_object::w_int_get_value(result), 42);
+        }
+        // Native Cache.content, not a duplicate table, supplies the GC root.
+        let mut seen = false;
+        a.walk_cache_roots(&mut |slot| {
+            if *slot == first {
+                seen = true;
+                *slot = other;
+            }
+        });
+        assert!(seen);
+        assert_eq!(interp2app_spacebind(gateway, &a), other);
+    }
+
+    #[test]
+    fn classmethod_gateway_caches_the_wrapper() {
+        crate::typedef::init_typeobjects();
+        let space = crate::baseobjspace::ObjSpace::new();
+        let gateway = interp2app(builtin_code_new("answer", answer));
+        unsafe { (*(gateway as *mut interp2app)).as_classmethod = true };
+        let wrapped = interp2app_spacebind(gateway, &space);
+        assert!(unsafe { pyre_object::function::is_classmethod(wrapped) });
+        assert_eq!(wrapped, interp2app_spacebind(gateway, &space));
+    }
+
+    #[test]
+    fn escaped_cache_keeps_space_and_its_roots_alive() {
+        use crate::baseobjspace::{ObjSpace, SpaceCacheClass, SpaceCacheInstance};
+        let space = ObjSpace::new();
+        let weak = std::sync::Arc::downgrade(&space);
+        let SpaceCacheInstance::GatewayCache(cache) =
+            space.fromcache(SpaceCacheClass::GatewayCache)
+        else {
+            unreachable!()
+        };
+        drop(space);
+        assert!(weak.upgrade().is_some());
+        let gateway = interp2app(builtin_code_new("answer", answer));
+        let function = cache.getorbuild(gateway);
+        let mut found = false;
+        crate::baseobjspace::walk_object_space_cache_roots(&mut |slot| {
+            found |= *slot == function;
+        });
+        assert!(found, "non-global space caches are GC roots too");
+    }
 }
 
 pub fn interp2app_temp(func: PyObjectRef) -> PyObjectRef {

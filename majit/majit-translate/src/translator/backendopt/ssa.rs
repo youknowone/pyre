@@ -631,8 +631,10 @@ pub fn ssa_to_ssi(
                 .cloned()
                 .unwrap_or_else(|| {
                     panic!(
-                        "SSA_to_SSI failed: no way to give a value to {} in block",
-                        v.name()
+                        "SSA_to_SSI failed: no way to give a value to {} in graph {:?}, block {:?}",
+                        v.name(),
+                        graph.name,
+                        block.borrow().inputargs,
                     )
                 });
             let w = v.copy();

@@ -6351,28 +6351,20 @@ pub unsafe fn create_all_slots(
         // typeobject.py: copy_flags_from_bases — inherit hasdict/weakrefable/hasuserdel
         copy_flags_from_bases(w_type, w_bases);
 
-        // typeobject.py:1146: base_layout = w_bestbase.layout
-        let base_layout = if w_bestbase.is_null() {
-            std::ptr::null()
-        } else {
-            pyre_object::w_type_get_layout_ptr(w_bestbase)
-        };
-        let base_nslots = if base_layout.is_null() {
-            0
-        } else {
-            (*base_layout).nslots
-        };
+        // typeobject.py create_all_slots reads the best base's existing
+        // Layout unconditionally. check_and_find_best_base has rejected a
+        // missing/incomplete base; a ready base without a Layout is a broken
+        // bootstrap invariant, not permission to invent a fresh TypeDef.
+        let base_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
+        assert!(!base_layout.is_null(), "ready base must own a Layout");
+        let base_nslots = (*base_layout).nslots;
         // CPython 3.14 `type_new_slots`: a variable-sized base may add a
         // managed instance dict, but may not add weakrefs or any explicit
         // `__slots__` entry.  Derive this from the same layout metadata which
         // exposes `tp_itemsize`, so newly ported variable builtins cannot be
         // omitted from type creation semantics.
-        let base_has_variable_items = if base_layout.is_null() {
-            false
-        } else {
-            crate::typedef::cpython_type_layout(w_bestbase)
-                .is_some_and(|(_, itemsize)| itemsize != 0)
-        };
+        let base_has_variable_items = crate::typedef::cpython_type_layout(w_bestbase)
+            .is_some_and(|(_, itemsize)| itemsize != 0);
 
         // typeobject.py create_all_slots
         let mut newslotnames = Vec::new();
@@ -6529,22 +6521,14 @@ pub unsafe fn create_all_slots(
             pyre_object::w_type_set_hasuserdel(w_type, true);
         }
 
-        // typeobject.py:1199-1204: layout computation
+        // typeobject.py create_all_slots: even a new Layout retains the
+        // best base's TypeDef; Python subclasses do not declare TypeDefs.
         let nslots = base_nslots + newslotnames.len() as u32;
-        let typedef = if base_layout.is_null() {
-            pyre_object::typeobject::leak_interpreter_typedef(
-                &pyre_object::pyobject::INSTANCE_TYPE,
-                true,
-                false,
-            )
-        } else {
-            (*base_layout).typedef
-        };
-        let layout = if nslots == base_nslots && !base_layout.is_null() {
+        let layout = if nslots == base_nslots {
             base_layout
         } else {
             leak_layout(Layout {
-                typedef,
+                typedef: (*base_layout).typedef,
                 nslots,
                 newslotnames,
                 base_layout,
@@ -6601,7 +6585,7 @@ unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
 }
 
 /// typeobject.py find_best_base.
-unsafe fn find_best_base(
+pub(crate) unsafe fn find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {

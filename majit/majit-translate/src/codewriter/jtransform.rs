@@ -1963,6 +1963,22 @@ impl<'a> Transformer<'a> {
         }
 
         match &op.kind {
+            // rmodel.py::pairtype(Repr, VoidRepr).convert_from_to produces
+            // Constant(None, Void), which has no defining operation upstream.
+            // The frontend's ConstNone definition exists only to keep that
+            // value defined through SSA/annotation. Erase it now, before
+            // flatten.py::GraphFlattener drops Void operands/results; never
+            // invent a runtime const_none instruction for a value with no bank.
+            OpKind::ConstNone => {
+                if let Some(result) = &op.result {
+                    assert_eq!(
+                        FunctionGraph::concretetype_of(result),
+                        crate::model::ConcreteType::Void,
+                        "ConstNone must retain its Void type before CodeWriter"
+                    );
+                }
+                RewriteResult::Replace(Vec::new())
+            }
             // ── rewrite_op_hint ──
             //
             // The structured `OpKind::Hint` (emitted by `front::mir` for
@@ -10411,6 +10427,32 @@ mod tests {
         assert_eq!(block.exits.len(), 1);
         assert_eq!(block.exits[0].target, transformed.graph.returnblock);
         assert_eq!(block.exits[0].args, vec![LinkArg::Value(input_var)]);
+    }
+
+    #[test]
+    fn transform_graph_erases_unit_constant_definition() {
+        let mut graph = FunctionGraph::new("unit_constant");
+        let unit = graph
+            .push_op_var(graph.startblock, OpKind::ConstNone, true)
+            .unwrap();
+        unit.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+        ));
+        graph.set_return(graph.startblock, Some(unit.clone()));
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        assert!(
+            !transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::ConstNone)),
+            "Constant(None, Void) must not become a const_none runtime instruction"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&unit),
+            crate::model::ConcreteType::Void
+        );
     }
 
     #[test]

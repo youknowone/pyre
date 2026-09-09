@@ -71,6 +71,15 @@ impl<E> FlattenRecursion<E> {
         }
         // upstream: `self.later = lst = []`.
         *self.later.borrow_mut() = Some(VecDeque::new());
+        // flattenrec.py:FlattenRecursion.__call__ resets `later` in finally.
+        // Rust unwinding must discard pending work as well as Result::Err.
+        struct ResetLater<'a, E>(&'a FlattenRecursion<E>);
+        impl<E> Drop for ResetLater<'_, E> {
+            fn drop(&mut self) {
+                *self.0.later.borrow_mut() = None;
+            }
+        }
+        let _reset_later = ResetLater(self);
         // upstream: `try: func(); for func, args, kwds in lst: func(...)`.
         // Python's for-loop over `lst` re-reads `len(lst)` each step, so
         // appends *during* the drain (via nested `call()`) are visited
@@ -92,8 +101,6 @@ impl<E> FlattenRecursion<E> {
             }
             Ok(())
         })();
-        // upstream: `finally: self.later = None`.
-        *self.later.borrow_mut() = None;
         result
     }
 }
@@ -269,5 +276,27 @@ mod tests {
             .unwrap();
         }
         assert_eq!(counter.get(), 3);
+    }
+
+    #[test]
+    fn unwind_discards_deferred_work_and_resets_outer_state() {
+        let flat: Rc<FlattenRecursion<TestError>> = Rc::new(FlattenRecursion::new());
+        let nested = flat.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flat.call(Box::new(move || {
+                nested.call(Box::new(|| panic!("discarded pending work")))?;
+                panic!("outer initialization failed")
+            }))
+        }));
+        assert!(outcome.is_err());
+        assert!(flat.later.borrow().is_none());
+        let called = Rc::new(Cell::new(false));
+        let called_inner = called.clone();
+        flat.call(Box::new(move || {
+            called_inner.set(true);
+            Ok(())
+        }))
+        .unwrap();
+        assert!(called.get());
     }
 }

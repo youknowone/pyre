@@ -335,6 +335,7 @@ impl CodeWriter {
         match outcome {
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Match {
                 real_value_to_var,
+                real_constants,
             }) => {
                 // The accept arm, recorded so this gate's rows sum to a
                 // denominator.  "N graphs Skipped" is not a finding on its
@@ -371,6 +372,7 @@ impl CodeWriter {
                 // Bridging here keeps the partition consistent with the kind
                 // the assembler later reads.
                 crate::codewriter::type_state::apply_from_flowspace_variables(&real_value_to_var);
+                crate::codewriter::type_state::apply_from_flowspace_constants(&real_constants);
                 Some(real_value_to_var)
             }
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason)) => {

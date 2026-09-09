@@ -89,48 +89,9 @@ pub const PATMA_SEQUENCE: i64 = TpFlags::PY_TPFLAGS_SEQUENCE.as_int();
 /// `typeobject.py PATMA_MAPPING`.
 pub const PATMA_MAPPING: i64 = TpFlags::PY_TPFLAGS_MAPPING.as_int();
 
-/// `pypy/interpreter/typedef.py TypeDef` metadata used by
-/// `objspace/std/typeobject.py Layout`.
-///
-/// Layout identity and TypeDef identity are different axes in PyPy: derived
-/// layouts retain the interpreter class's TypeDef, while multiple types may
-/// share one Layout.  Keeping these TypeDef fields on Layout forces a layout
-/// clone when bootstrap adjusts `acceptable_as_base_class`, breaking that
-/// identity relationship.
-pub struct InterpreterTypeDef {
-    /// Pyre's allocation-vtable analogue of the RPython interpreter class.
-    pub instance_type: *const PyType,
-    acceptable_as_base_class: std::sync::atomic::AtomicBool,
-    pub hasdict: bool,
-}
-
-impl InterpreterTypeDef {
-    #[inline]
-    pub fn acceptable_as_base_class(&self) -> bool {
-        self.acceptable_as_base_class
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub fn set_acceptable_as_base_class(&self, value: bool) {
-        self.acceptable_as_base_class
-            .store(value, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Allocate process-lifetime TypeDef metadata, matching PyPy's module-level
-/// `W_X.typedef` objects.
-pub fn leak_interpreter_typedef(
-    instance_type: *const PyType,
-    acceptable_as_base_class: bool,
-    hasdict: bool,
-) -> *const InterpreterTypeDef {
-    crate::lltype::malloc_raw(InterpreterTypeDef {
-        instance_type,
-        acceptable_as_base_class: std::sync::atomic::AtomicBool::new(acceptable_as_base_class),
-        hasdict,
-    })
-}
+use crate::typedef::TypeDef;
+#[cfg(test)]
+use crate::typedef::leak_typedef;
 
 /// typeobject.py Layout object.
 ///
@@ -139,7 +100,7 @@ pub fn leak_interpreter_typedef(
 /// Identity comparison via pointer equality.
 pub struct Layout {
     /// `Layout.__init__` — the TypeDef that this layout is for.
-    pub typedef: *const InterpreterTypeDef,
+    pub typedef: *const TypeDef,
     /// `Layout.__init__` — total number of extra slots.
     pub nslots: u32,
     /// `Layout.__init__` — sorted slot names introduced by this class.
@@ -380,9 +341,9 @@ pub struct W_TypeObject {
     /// from `typedef.method_descriptor` at `__init__`
     /// (typeobject.py:256; typedef.py:22/61) — `True` only for the
     /// `function` typedef (typedef.py:807).  Gates the LOAD_METHOD
-    /// unbound `[w_descr, w_obj]` fast path (callmethod.py:66).  pyre
-    /// has no TypeDef struct, so the creation site of each builtin
-    /// W_TypeObject sets it directly.
+    /// unbound `[w_descr, w_obj]` fast path (callmethod.py:66). Pyre's
+    /// TypeDef owns the declaration; installing the Layout copies it as in
+    /// W_TypeObject.__init__, including for a reused/overridden TypeDef.
     pub flag_method_descriptor: bool,
     /// `Py_TPFLAGS_DISALLOW_INSTANTIATION` (`1 << 7`) — set on types
     /// whose `tp_new` is NULL (generator / coroutine / frame / ...).
@@ -719,18 +680,27 @@ pub fn w_type_new_builtin(
     dict_ptr: *mut u8,
     _layout_pytype: *const PyType,
 ) -> PyObjectRef {
-    let qualname_value = name.rsplit('.').next().unwrap_or(name).to_string();
-    let name = crate::lltype::malloc_raw(name.to_string());
-    let qualname = crate::lltype::malloc_raw(qualname_value);
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(bases);
     let _ = crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
+    let w_type = w_type_alloc_builtin();
+    unsafe {
+        w_type_init_builtin(
+            w_type,
+            name,
+            crate::gc_roots::shadow_stack_get(save_point),
+            crate::gc_roots::shadow_stack_get(save_point + 1) as *mut u8,
+        );
+    }
+    w_type
+}
 
-    let bases = crate::gc_roots::shadow_stack_get(save_point);
-    let dict_ptr = crate::gc_roots::shadow_stack_get(save_point + 1) as *mut u8;
-
+/// TypeCache.build's `instantiate(W_TypeObject)`, before descriptor wrapping.
+/// The existing immortal builtin allocation policy is retained. Null reference
+/// slots make this shell safe for the root walker while descriptors are built;
+/// do not expose it to Python operations before w_type_init_builtin.
+pub fn w_type_alloc_builtin() -> PyObjectRef {
     let w_type = crate::lltype::malloc_typed(W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
@@ -738,13 +708,13 @@ pub fn w_type_new_builtin(
         },
         cpy_ref: std::ptr::null_mut(),
         mro_w: std::ptr::null_mut(),
-        name,
+        name: std::ptr::null_mut(),
         w_name: PY_NULL,
-        qualname,
+        qualname: std::ptr::null_mut(),
         w_qualname: PY_NULL,
         text_signature: std::ptr::null_mut(),
-        bases,
-        dict: dict_ptr,
+        bases: PY_NULL,
+        dict: std::ptr::null_mut(),
         flag_heaptype: false,
         flag_cpython_heaptype: false,
         flag_cpython_static_builtin: true,
@@ -768,9 +738,7 @@ pub fn w_type_new_builtin(
         // typeobject.py:185-186: conservative `False` default.
         uses_object_getattribute: std::sync::atomic::AtomicBool::new(false),
         uses_object_setattr: std::sync::atomic::AtomicBool::new(false),
-        // typeobject.py — `typedef.method_descriptor` (typedef.py:22
-        // default `False`); the `function` creation site flips it
-        // (typedef.py:807).
+        // W_TypeObject.__init__ reads the declaration when Layout is installed.
         flag_method_descriptor: false,
         // `Py_TPFLAGS_DISALLOW_INSTANTIATION` off by default; the
         // generator / coroutine / frame typedefs flip it via
@@ -789,6 +757,32 @@ pub fn w_type_new_builtin(
     // collection could otherwise reclaim a young namespace value.
     register_builtin_type_roots(w_type as usize);
     w_type
+}
+
+/// W_TypeObject.__init__'s name/bases/dict installation on an allocated shell.
+/// Layout/MRO setup remains in the interpreter's builtin construction path.
+///
+/// # Safety
+/// w_type must be a fresh w_type_alloc_builtin result, initialized exactly
+/// once and not yet published to Python. bases/dict_ptr must be live objects
+/// (or null for the existing root/low-level construction cases).
+pub unsafe fn w_type_init_builtin(
+    w_type: PyObjectRef,
+    name: &str,
+    bases: PyObjectRef,
+    dict_ptr: *mut u8,
+) {
+    let w_self = &mut *(w_type as *mut W_TypeObject);
+    assert!(w_self.name.is_null(), "builtin type initialized twice");
+    w_self.name = crate::lltype::malloc_raw(name.to_string());
+    w_self.qualname =
+        crate::lltype::malloc_raw(name.rsplit('.').next().unwrap_or(name).to_string());
+    w_self.bases = bases;
+    w_self.dict = dict_ptr;
+    // A collection during descriptor wrapping can clear the dirty bit set
+    // when the shell was registered. These newly installed children must be
+    // visited by the next minor collection as well.
+    crate::gc_roots::mark_prebuilt_roots_dirty();
 }
 
 /// `dictmultiobject.py` `UNKNOWN` — cache miss; recompute via
@@ -1012,7 +1006,11 @@ pub unsafe fn w_type_set_abstract(w_type: PyObjectRef, abstract_: bool) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_layout(obj: PyObjectRef, layout: *const Layout) {
-    (*(obj as *mut W_TypeObject)).layout = layout;
+    let w_self = &mut *(obj as *mut W_TypeObject);
+    w_self.layout = layout;
+    // typeobject.py W_TypeObject.__init__: read the selected layout's
+    // typedef, not the declaration that an overridetypedef replaced.
+    w_self.flag_method_descriptor = !layout.is_null() && (*(*layout).typedef).method_descriptor;
 }
 
 /// Get the Layout pointer from a type object.
@@ -1079,7 +1077,7 @@ pub unsafe fn w_type_get_base_layout(obj: PyObjectRef) -> *const Layout {
     }
 }
 
-/// typeobject.py `flag_method_descriptor` getter/setter
+/// typeobject.py `flag_method_descriptor` getter
 /// (callmethod.py:66 `space.type(w_descr).flag_method_descriptor`).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -1087,13 +1085,6 @@ pub unsafe fn w_type_get_base_layout(obj: PyObjectRef) -> *const Layout {
 pub unsafe fn w_type_get_flag_method_descriptor(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject)).flag_method_descriptor
 }
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_type_set_flag_method_descriptor(obj: PyObjectRef, v: bool) {
-    (*(obj as *mut W_TypeObject)).flag_method_descriptor = v;
-}
-
 /// typeobject.py `hasdict` getter/setter.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -2253,8 +2244,30 @@ mod tests {
     }
 
     #[test]
+    fn builtin_shell_is_initialized_without_replacing_its_identity() {
+        let shell = w_type_alloc_builtin();
+        unsafe {
+            let before = &*(shell as *const W_TypeObject);
+            assert!(before.name.is_null());
+            assert!(before.qualname.is_null());
+            assert!(before.dict.is_null());
+            assert!(before.bases.is_null());
+            assert!(before.layout.is_null());
+            assert!(before.mro_w.is_null());
+            assert!(snapshot_builtin_type_roots().contains(&(shell as usize)));
+            let _roots = crate::gc_roots::push_roots();
+            let ns = crate::gc_roots::pin_root(crate::w_dict_new());
+            w_type_init_builtin(shell, "module.Example", PY_NULL, ns as *mut u8);
+            assert_eq!(w_type_get_name(shell), "module.Example");
+            assert_eq!(&*(*(shell as *const W_TypeObject)).qualname, "Example");
+            assert_eq!(w_type_get_dict_ptr(shell), ns as *mut u8);
+            assert!(!w_type_is_heaptype(shell));
+        }
+    }
+
+    #[test]
     fn test_layout_issublayout() {
-        let typedef = leak_interpreter_typedef(&INSTANCE_TYPE, true, false);
+        let typedef = leak_typedef(&INSTANCE_TYPE, true, false);
         let root = leak_layout(Layout {
             typedef,
             nslots: 0,
@@ -2279,7 +2292,7 @@ mod tests {
     #[test]
     fn test_layout_expand_equality() {
         let root = leak_layout(Layout {
-            typedef: leak_interpreter_typedef(&INSTANCE_TYPE, true, false),
+            typedef: leak_typedef(&INSTANCE_TYPE, true, false),
             nslots: 1,
             newslotnames: vec!["x".to_string()],
             base_layout: std::ptr::null(),
@@ -2293,7 +2306,7 @@ mod tests {
 
     #[test]
     fn acceptable_as_base_class_mutates_typedef_without_replacing_layout() {
-        let typedef = leak_interpreter_typedef(&INSTANCE_TYPE, true, false);
+        let typedef = leak_typedef(&INSTANCE_TYPE, true, false);
         let layout = leak_layout(Layout {
             typedef,
             nslots: 0,
@@ -2339,7 +2352,7 @@ mod tests {
         ) -> PyObjectRef {
             let w_type = w_type_new("C", PY_NULL, std::ptr::null_mut());
             let layout = leak_layout(Layout {
-                typedef: leak_interpreter_typedef(typedef, true, typedef_hasdict),
+                typedef: leak_typedef(typedef, true, typedef_hasdict),
                 nslots: 0,
                 newslotnames: vec![],
                 base_layout: std::ptr::null(),
@@ -2391,7 +2404,7 @@ mod tests {
     fn type_flags_project_managed_weakref_through_the_best_base_owner() {
         const MANAGED_WEAKREF: i64 = TpFlags::PY_TPFLAGS_MANAGED_WEAKREF.as_int();
         let layout = leak_layout(Layout {
-            typedef: leak_interpreter_typedef(&INSTANCE_TYPE, true, false),
+            typedef: leak_typedef(&INSTANCE_TYPE, true, false),
             nslots: 0,
             newslotnames: vec![],
             base_layout: std::ptr::null(),
