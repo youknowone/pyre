@@ -357,39 +357,39 @@ mod frame_replacement_tests {
     }
 
     #[test]
-    fn replace_box_rewrites_bound_paused_banks_immediately() {
-        let old = OpRef::input_arg_ref(0);
-        let standard = OpRef::input_arg_ref(1);
+    fn paused_replacement_retains_and_updates_all_typed_banks() {
+        let old = [
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_float(0),
+        ];
+        let new = [
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_float(1),
+        ];
         let session = std::cell::RefCell::new(WalkSession::default());
         let parent = FrameBoxReplacements::new(&session);
-        let regs = RegisterBank::new([old]);
-        let ints = RegisterBank::default();
-        let floats = RegisterBank::default();
-        parent.bind_banks(&regs, &ints, &floats);
-        replace_box_in_paused_frames(&mut session.borrow_mut(), old, standard);
-        assert_eq!(regs.to_vec(), vec![standard]);
-    }
-
-    #[test]
-    fn paused_float_bank_keeps_ownership_across_active_writes() {
-        let old = OpRef::input_arg_float(0);
-        let new = OpRef::input_arg_float(1);
-        let session = std::cell::RefCell::new(WalkSession::default());
-        let parent = FrameBoxReplacements::new(&session);
-        let bank = RegisterBank::new([old]);
-        parent.bind_banks(&RegisterBank::default(), &RegisterBank::default(), &bank);
+        let banks = old.map(|value| RegisterBank::new([value, value]));
+        parent.bind_banks(&banks[0], &banks[1], &banks[2]);
         parent.set_listening(false);
-        bank.set(0, new);
+        for (bank, value) in banks.iter().zip(new) {
+            bank.set(0, value);
+        }
         parent.set_listening(true);
-        replace_box_in_paused_frames(&mut session.borrow_mut(), new, old);
-        assert_eq!(bank.get(0), Some(old));
-        drop(bank);
+        for i in 0..3 {
+            replace_box_in_paused_frames(&mut session.borrow_mut(), old[i], new[i]);
+            assert_eq!(banks[i].to_vec(), [new[i], new[i]]);
+        }
+        drop(banks);
         // Registration owns the storage, not a pointer into the dropped owner.
-        replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
-        assert_eq!(
-            parent.0.banks_f.borrow().as_ref().unwrap().get(0),
-            Some(new)
-        );
+        for (bank, (old, new)) in [&parent.0.banks_r, &parent.0.banks_i, &parent.0.banks_f]
+            .into_iter()
+            .zip(old.into_iter().zip(new))
+        {
+            replace_box_in_paused_frames(&mut session.borrow_mut(), new, old);
+            assert_eq!(bank.borrow().as_ref().unwrap().to_vec(), [old, old]);
+        }
     }
 }
 

@@ -84,14 +84,6 @@ impl RegisterValues for RegisterBank {
 }
 
 impl RegisterBank {
-    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
-            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        }
-    }
-
     pub fn new(values: impl IntoIterator<Item = OpRef>) -> Self {
         let slots: Vec<_> = values.into_iter().map(Cell::new).collect();
         let num_regs = slots.len();
@@ -163,17 +155,6 @@ impl RegisterBank {
         self.0.iter().flat_map(|slots| slots.iter().map(Cell::get))
     }
 
-    /// Trace the frame's actual slots, as RPython's GC traces MIFrame's list.
-    /// The root walker only calls this synchronously on the owner or while
-    /// all foreign mutators are quiesced. It never clones/drops the Rc owner.
-    pub(crate) fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-        for slot in self.0.iter().flat_map(|slots| slots.iter()) {
-            let mut value = slot.get();
-            value.walk_const_ptr_refs_mut(visitor);
-            slot.set(value);
-        }
-    }
-
     pub fn replace_active_box(&self, old: OpRef, new: OpRef) {
         // pyjitpl.py MIFrame.replace_active_box_in_frame stops at num_regs,
         // not num_regs_and_consts: replacement must not rewrite constants.
@@ -190,67 +171,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn active_replacement_preserves_the_constant_suffix() {
-        let old = OpRef::const_ptr(majit_ir::GcRef(0x1000));
-        let new = OpRef::input_arg_ref(0);
-        let bank = RegisterBank::with_constants([old, old], 1);
-        bank.clone().replace_active_box(old, new);
-        assert_eq!(bank.to_vec(), [new, old]);
-        let constants_only = RegisterBank::with_constants([old], 0);
-        constants_only.replace_active_box(old, new);
-        assert_eq!(constants_only.to_vec(), [old]);
-    }
-
-    #[test]
-    fn empty_bank_has_no_shared_allocation() {
-        let bank = RegisterBank::new([]);
-        assert!(bank.is_empty());
-        assert!(bank.0.is_none());
-        assert_eq!(bank.get(0), None);
-    }
-
-    #[test]
-    fn paused_and_active_access_share_the_frame_owned_slots() {
-        let old = OpRef::input_arg_float(0);
-        let new = OpRef::input_arg_float(1);
-        let owner = RegisterBank::new([old]);
-        let paused = owner.clone();
-        owner.set(0, new);
-        paused.replace_active_box(new, old);
-        assert_eq!(owner.get(0), Some(old));
-        drop(owner);
-        paused.replace_active_box(old, new);
-        assert_eq!(paused.get(0), Some(new));
-    }
-
-    #[test]
-    fn int_replacement_updates_each_live_alias_immediately() {
-        let old = OpRef::input_arg_int(0);
-        let new = OpRef::input_arg_int(1);
-        let frame = RegisterBank::new([old, old]);
-        let paused = frame.clone();
-        frame.set(1, new);
-        paused.replace_active_box(old, new);
-        assert_eq!(frame.to_vec(), vec![new, new]);
-        drop(frame);
-        paused.replace_active_box(new, old);
-        assert_eq!(paused.to_vec(), vec![old, old]);
-    }
-
-    #[test]
-    fn gc_root_forwards_shared_ref_slots_and_retains_their_owner() {
-        use majit_ir::GcRef;
-        let old = OpRef::const_ptr(GcRef(0x1000));
-        let frame = RegisterBank::new([old, OpRef::input_arg_ref(0)]);
-        let root = frame.clone();
-        assert!(frame.ptr_eq(&root));
-        assert!(!frame.ptr_eq(&RegisterBank::new([old])));
-        root.walk_const_ptr_refs(&mut |ptr| ptr.0 += 0x1000);
-        assert_eq!(frame.get(0), Some(OpRef::const_ptr(GcRef(0x2000))));
-        frame.set(0, old);
-        drop(frame);
-        root.walk_const_ptr_refs(&mut |ptr| ptr.0 += 0x1000);
-        assert_eq!(root.get(0), Some(OpRef::const_ptr(GcRef(0x2000))));
-        assert_eq!(root.get(1), Some(OpRef::input_arg_ref(0)));
+    fn shared_replacement_updates_live_aliases_but_preserves_constants() {
+        // MIFrame.setup leaves absent register lists unallocated.
+        let empty = RegisterBank::new([]);
+        assert!(empty.0.is_none());
+        // pyjitpl.py MIFrame.replace_active_box_in_frame: all three banks
+        // replace every live alias, stopping before the constant suffix.
+        for (old, new) in [
+            (
+                OpRef::const_ptr(majit_ir::GcRef(0x1000)),
+                OpRef::input_arg_ref(0),
+            ),
+            (OpRef::const_int(7), OpRef::input_arg_int(0)),
+            (OpRef::const_float(2.5), OpRef::input_arg_float(0)),
+        ] {
+            let owner = RegisterBank::with_constants([old, old, old], 2);
+            let paused = owner.clone();
+            owner.set(1, new);
+            paused.replace_active_box(old, new);
+            assert_eq!(owner.to_vec(), [new, new, old]);
+            drop(owner);
+            paused.replace_active_box(new, old);
+            assert_eq!(paused.to_vec(), [old, old, old]);
+            let constants_only = RegisterBank::with_constants([old], 0);
+            constants_only.replace_active_box(old, new);
+            assert_eq!(constants_only.to_vec(), [old]);
+        }
     }
 }

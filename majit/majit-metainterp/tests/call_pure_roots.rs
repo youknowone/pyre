@@ -78,12 +78,6 @@ fn cache_constants_survive_movement_handoff_and_retire_with_the_last_owner() {
     assert_eq!(root_count(), initial_roots + 3);
     drop(optimizer);
     assert_eq!(root_count(), initial_roots);
-    assert_eq!(
-        args_dict().get(&[Value::Int(7)]),
-        None,
-        "new attempt starts empty"
-    );
-
     majit_gc::set_active_gc_id_or_identityhash(None);
     shadow_stack::unregister_mutator();
     gc_sync::unregister_thread();

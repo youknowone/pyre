@@ -6887,7 +6887,7 @@ mod tests {
         let inner = Box::new(PyreSym::new_uninit(OpRef::NONE));
         outer.registers_r.replace(vec![ptr(0x1000)]);
         inner.registers_r.replace(vec![ptr(0x2000)]);
-        let outer_bank = RegisterBank::new([ptr(0x3000)]);
+        let outer_bank = RegisterBank::new([ptr(0x3000), OpRef::input_arg_ref(0)]);
         let inner_bank = RegisterBank::new([ptr(0x4000)]);
         // Do not expose sentinel addresses to another test's real collector.
         let _stw = majit_gc::gc_sync::quiesce_mutators();
@@ -6912,6 +6912,7 @@ mod tests {
         assert_eq!(seen, [0x1000, 0x3000, 0x2000, 0x4000]);
         assert_eq!(outer.registers_r.to_vec(), [ptr(0x1080)]);
         assert_eq!(outer_bank.get(0), Some(ptr(0x3080)));
+        assert_eq!(outer_bank.get(1), Some(OpRef::input_arg_ref(0)));
         assert_eq!(inner.registers_r.to_vec(), [ptr(0x2080)]);
         assert_eq!(inner_bank.get(0), Some(ptr(0x4080)));
 

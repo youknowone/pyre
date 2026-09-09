@@ -180,25 +180,25 @@ mod tests {
     }
 
     #[test]
-    fn args_dict_shares_identity_and_uses_typed_constant_equality() {
+    fn args_dict_isolates_fresh_caches_and_uses_typed_constant_equality() {
         use majit_ir::Value;
         let dict = super::args_dict();
-        let compiler = dict.clone();
         dict.insert(vec![Value::Float(0.0)], Value::Int(1));
         dict.insert(vec![Value::Float(-0.0)], Value::Int(2));
         dict.insert(vec![Value::Int(0)], Value::Int(3));
         let nan = f64::from_bits(0x7ff8000000000001);
         dict.insert(vec![Value::Float(nan)], Value::Int(4));
-        assert_eq!(compiler.get(&[Value::Float(0.0)]), Some(Value::Int(1)));
-        assert_eq!(compiler.get(&[Value::Float(-0.0)]), Some(Value::Int(2)));
-        assert_eq!(compiler.get(&[Value::Int(0)]), Some(Value::Int(3)));
-        assert_eq!(compiler.get(&[Value::Float(nan)]), Some(Value::Int(4)));
+        assert_eq!(dict.get(&[Value::Float(0.0)]), Some(Value::Int(1)));
+        assert_eq!(dict.get(&[Value::Float(-0.0)]), Some(Value::Int(2)));
+        assert_eq!(dict.get(&[Value::Int(0)]), Some(Value::Int(3)));
+        let fresh = super::args_dict();
+        assert_eq!(fresh.get(&[Value::Int(0)]), None);
+        fresh.insert(vec![Value::Int(0)], Value::Int(5));
+        assert_eq!(dict.get(&[Value::Int(0)]), Some(Value::Int(3)));
+        assert_eq!(dict.get(&[Value::Float(nan)]), Some(Value::Int(4)));
         assert_eq!(
-            compiler.get(&[Value::Float(f64::from_bits(nan.to_bits() + 1))]),
+            dict.get(&[Value::Float(f64::from_bits(nan.to_bits() + 1))]),
             None
         );
-        compiler.insert(vec![], Value::Int(5));
-        assert_eq!(dict.get(&[]), Some(Value::Int(5)));
-        assert_eq!(super::args_dict().get(&[]), None);
     }
 }
