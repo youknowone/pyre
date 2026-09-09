@@ -4143,14 +4143,8 @@ impl ResumeDataLoopMemo {
                 numb_state.append_short(NULLREF);
                 continue;
             }
-            // An InputArg is never a Const (`isinstance(box, Const)`).
-            // Walking it into a forwarded ConstPtr makes TAGCONST and
-            // drops a stack-resident red from the liveboxes.
-            let opref = if raw_opref.is_input_arg() {
-                env.get_box_replacement_not_const(raw_opref)
-            } else {
-                env.get_box_replacement(raw_opref)
-            };
+            // resume.py: box = box.get_box_replacement()
+            let opref = env.get_box_replacement(raw_opref);
             if opref.is_none() {
                 numb_state.append_short(NULLREF);
                 continue;

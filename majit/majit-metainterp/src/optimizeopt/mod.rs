@@ -1148,12 +1148,6 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         if opref.is_constant() {
             return true;
         }
-        // An InputArg is never a Const, even when the optimizer knows
-        // its pointer. Walking that knowledge to TAGCONST drops a
-        // stack-resident red from resume liveboxes.
-        if opref.is_input_arg() {
-            return false;
-        }
         // One chain walk answers both tests below; `get_box_replacement`
         // materializes the terminal as an `Operand`, so walking twice built
         // it twice for every live box in every guard.
