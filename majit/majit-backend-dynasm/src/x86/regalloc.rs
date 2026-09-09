@@ -376,7 +376,7 @@ impl<'a> RegAlloc<'a> {
         // and it can only coincide with eax when arg1 IS arg2 (the
         // swap above already pinned arg2 to eax).
         assert!(
-            !matches!(l1, Loc::Immed(_)),
+            !matches!(l1, Loc::Immed(_) | Loc::ImmedFloat(_)),
             "consider_uint_mul_high_j2: l1 must be a register/frame, got immediate {l1:?}"
         );
         assert!(

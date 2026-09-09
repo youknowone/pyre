@@ -117,13 +117,17 @@ fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
             is_float: e.is_float,
         },
         Loc::Frame(f) => TargetArgLoc::Frame {
-            position: f.position,
+            position: f.get_position(),
             ebp_offset: f.ebp_loc.value,
             is_float: f.ebp_loc.is_float,
         },
         Loc::Immed(i) => TargetArgLoc::Immed {
             value: i.value,
-            is_float: i.is_float,
+            is_float: false,
+        },
+        Loc::ImmedFloat(i) => TargetArgLoc::Immed {
+            value: i.value,
+            is_float: true,
         },
         Loc::Addr(a) => TargetArgLoc::Addr {
             base: a.base,
@@ -152,7 +156,11 @@ fn loc_from_target_argloc(loc: &TargetArgLoc) -> Loc {
             is_float,
         } => Loc::Frame(crate::regloc::FrameLoc::new(position, ebp_offset, is_float)),
         TargetArgLoc::Immed { value, is_float } => {
-            Loc::Immed(crate::regloc::ImmedLoc { value, is_float })
+            if is_float {
+                Loc::immed_float(value)
+            } else {
+                Loc::immed(value)
+            }
         }
         TargetArgLoc::Addr {
             base,
@@ -202,8 +210,8 @@ fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
         Loc::Reg(reg) => Some(
             reg_position_in_jitframe(*reg).expect("deadframe slot: register is not managed") as u16,
         ),
-        Loc::Frame(frame) => Some((frame.position + JITFRAME_FIXED_SIZE) as u16),
-        Loc::Immed(_) | Loc::Ebp(_) | Loc::Addr(_) => None,
+        Loc::Frame(frame) => Some((frame.get_position() + JITFRAME_FIXED_SIZE) as u16),
+        Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::Ebp(_) | Loc::Addr(_) => None,
     }
 }
 
@@ -1018,7 +1026,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp(scratch, f.ebp_loc.value);
                 scratch
             }
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 self.emit_mov_imm64(scratch as u32, i.value);
                 scratch
             }
@@ -1034,7 +1042,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Range mirrors `check_imm_box` (`0 <= v < DEFAULT_IMM_SIZE` = 4096).
     fn addsub_imm12(loc: &Loc) -> Option<i64> {
         match loc {
-            Loc::Immed(i) if (0..4096).contains(&i.value) => Some(i.value),
+            Loc::Immed(i) | Loc::ImmedFloat(i) if (0..4096).contains(&i.value) => Some(i.value),
             _ => None,
         }
     }
@@ -1114,7 +1122,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp(16, f.ebp_loc.value);
                 16
             }
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 self.emit_mov_imm64(16, i.value);
                 16
             }
@@ -1123,7 +1131,7 @@ impl<'a> AssemblerARM64<'a> {
         // `opassembler.py`'s `emit_int_comp_op` takes `CMP_ri` when the
         // right-hand side is an immediate; `codebuilder.py`'s `CMP_ri` holds
         // a 12-bit unsigned field, so anything wider still needs a register.
-        if let Loc::Immed(i) = loc1
+        if let Loc::Immed(i) | Loc::ImmedFloat(i) = loc1
             && let Ok(imm) = u32::try_from(i.value)
             && imm <= MAX_CMP_IMM12
         {
@@ -1140,7 +1148,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp(17, f.ebp_loc.value);
                 17
             }
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 self.emit_mov_imm64(17, i.value);
                 17
             }
@@ -1157,7 +1165,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp(16, f.ebp_loc.value);
                 16
             }
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 self.emit_mov_imm64(16, i.value);
                 16
             }
@@ -1260,7 +1268,7 @@ impl<'a> AssemblerARM64<'a> {
             Loc::Reg(r) if r.value == 0 && !r.is_xmm => {
                 // already in rax/x0
             }
-            Loc::Immed(imm) => {
+            Loc::Immed(imm) | Loc::ImmedFloat(imm) => {
                 self.emit_mov_imm64(0, imm.value);
             }
             _ => self.regalloc_mov(&loc, &rax),
@@ -1299,7 +1307,7 @@ impl<'a> AssemblerARM64<'a> {
             let mut max_abs_slot = JITFRAME_FIXED_SIZE;
             for (ia, loc) in inputargs.iter().zip(input_locs.iter()) {
                 if let Loc::Frame(floc) = loc {
-                    let abs_slot = JITFRAME_FIXED_SIZE + floc.position;
+                    let abs_slot = JITFRAME_FIXED_SIZE + floc.get_position();
                     self.opref_to_slot.insert(ia.opref(), abs_slot);
                     if abs_slot + 1 > max_abs_slot {
                         max_abs_slot = abs_slot + 1;
@@ -1785,7 +1793,7 @@ impl<'a> AssemblerARM64<'a> {
                     }
                 }
                 Some(Loc::Frame(f)) => {
-                    gcmap_set_bit(gcmap, f.position + JITFRAME_FIXED_SIZE);
+                    gcmap_set_bit(gcmap, f.get_position() + JITFRAME_FIXED_SIZE);
                 }
                 None => {}
                 Some(other) => panic!(
@@ -2156,7 +2164,7 @@ impl<'a> AssemblerARM64<'a> {
         for (&opref, lifetime) in ra.longevity.lifetimes_iter() {
             if let Some(floc) = lifetime.current_frame_loc {
                 self.opref_to_slot
-                    .insert(opref, JITFRAME_FIXED_SIZE + floc.position);
+                    .insert(opref, JITFRAME_FIXED_SIZE + floc.get_position());
             }
         }
         // frame_slot_depth is already absolute (see calculation above).
@@ -2479,8 +2487,8 @@ impl<'a> AssemblerARM64<'a> {
                 // arithmetic ops, where no condition follows the operands.
                 let mut opcode = op.opcode;
                 if arglocs.len() >= 2 {
-                    let (cmp0, cmp1) = if matches!(arglocs[0], Loc::Immed(_))
-                        && !matches!(arglocs[1], Loc::Immed(_))
+                    let (cmp0, cmp1) = if matches!(arglocs[0], Loc::Immed(_) | Loc::ImmedFloat(_))
+                        && !matches!(arglocs[1], Loc::Immed(_) | Loc::ImmedFloat(_))
                         && let Some(reflexed) = opcode.bool_reflex()
                     {
                         opcode = reflexed;
@@ -2698,7 +2706,8 @@ impl<'a> AssemblerARM64<'a> {
             // gc_table root walker forwards the slot in place, so each load
             // observes the relocated object.
             OpCode::LoadFromGcTable => {
-                let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc)
+                let (Some(Loc::Immed(idx) | Loc::ImmedFloat(idx)), Some(Loc::Reg(dst))) =
+                    (arglocs.first(), result_loc)
                 else {
                     panic!(
                         "LoadFromGcTable expects [Immed(index)] and a register result, \
@@ -2946,7 +2955,7 @@ impl<'a> AssemblerARM64<'a> {
                         },
                     };
                     let nsize = match arglocs.get(3) {
-                        Some(Loc::Immed(i)) => i.value,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                         _ => op
                             .with_array_descr(|ad| {
                                 let s = ad.item_size() as i64;
@@ -2958,7 +2967,7 @@ impl<'a> AssemblerARM64<'a> {
                         Some(Loc::Reg(base)) => {
                             self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
                         }
-                        Some(Loc::Immed(base_i)) => {
+                        Some(Loc::Immed(base_i) | Loc::ImmedFloat(base_i)) => {
                             self.emit_mov_imm64(16, base_i.value);
                             let base = RegLoc {
                                 value: 16,
@@ -2994,7 +3003,7 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 let val_reg = match value_loc {
                     Loc::Reg(r) => *r,
-                    Loc::Immed(i) => {
+                    Loc::Immed(i) | Loc::ImmedFloat(i) => {
                         self.emit_mov_imm64(16, i.value);
                         crate::regloc::RegLoc::new(16, false)
                     }
@@ -3010,13 +3019,13 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 // aarch64/opassembler.py:367: scale = get_scale(size_loc.value)
                 let size = match size_loc {
-                    Loc::Immed(i) => i.value.unsigned_abs() as usize,
+                    Loc::Immed(i) | Loc::ImmedFloat(i) => i.value.unsigned_abs() as usize,
                     other => panic!(
                         "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
                     ),
                 };
                 if crate::majit_log_enabled()
-                    && let Loc::Immed(i) = ofs_loc
+                    && let Loc::Immed(i) | Loc::ImmedFloat(i) = ofs_loc
                 {
                     let input0_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE);
                     let input1_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE + 1);
@@ -3038,7 +3047,7 @@ impl<'a> AssemblerARM64<'a> {
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
                 {
                     let nsize = match arglocs.get(3) {
-                        Some(Loc::Immed(i)) => i.value,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                         _ => op
                             .with_array_descr(|ad| {
                                 let s = ad.item_size() as i64;
@@ -3052,7 +3061,7 @@ impl<'a> AssemblerARM64<'a> {
                     // offset immediate so the emitter handles the full
                     // range via the check_imm_arg / materialize fallback.
                     let ofs = match arglocs.get(4) {
-                        Some(Loc::Immed(i)) => i.value,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                         _ => 0,
                     };
                     self.emit_op_gcload_indexed_regalloc(base, index, res, ofs, nsize);
@@ -3065,14 +3074,14 @@ impl<'a> AssemblerARM64<'a> {
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
                 {
                     let size = match arglocs.get(3) {
-                        Some(Loc::Immed(i)) => i.value.unsigned_abs() as usize,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value.unsigned_abs() as usize,
                         _ => 8,
                     };
                     // aarch64/opassembler.py:385-392 keeps `ofs_loc.value`
                     // at the Signed word width; large displacements folded
                     // in via `_try_use_older_box` must not be truncated.
                     let ofs = match arglocs.get(4) {
-                        Some(Loc::Immed(i)) => i.value,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                         _ => 0,
                     };
                     // aarch64/opassembler.py:385-392: combine ofs into ip0 = index + ofs.
@@ -3097,7 +3106,7 @@ impl<'a> AssemblerARM64<'a> {
                     };
                     let val_reg = match value_loc {
                         Loc::Reg(r) => *r,
-                        Loc::Immed(i) => {
+                        Loc::Immed(i) | Loc::ImmedFloat(i) => {
                             self.emit_mov_imm64(17, i.value);
                             crate::regloc::RegLoc::new(17, false)
                         }
@@ -3540,7 +3549,7 @@ impl<'a> AssemblerARM64<'a> {
                 let base_size = base_size as i64;
                 let type_id = type_id as i64;
                 let itemsize = match arglocs.get(1) {
-                    Some(Loc::Immed(i)) => i.value,
+                    Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                     _ => 8,
                 };
                 // aarch64/assembler.py `malloc_cond_varsize`: x0 is the
@@ -3573,7 +3582,9 @@ impl<'a> AssemblerARM64<'a> {
                             debug_assert_ne!(len_r.value, 1);
                             dynasm!(self.mc ; .arch aarch64 ; mov x1, X(len_r.value));
                         }
-                        Some(Loc::Immed(len_i)) => self.emit_mov_imm64(1, len_i.value),
+                        Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
+                            self.emit_mov_imm64(1, len_i.value)
+                        }
                         Some(Loc::Frame(len_f)) => self.emit_ldr_fp(1, len_f.ebp_loc.value),
                         Some(Loc::Ebp(len_e)) => self.emit_ldr_fp(1, len_e.value),
                         other => {
@@ -3650,7 +3661,7 @@ impl<'a> AssemblerARM64<'a> {
                     Some(Loc::Reg(len_r)) => {
                         dynasm!(self.mc ; .arch aarch64 ; mov x2, X(len_r.value));
                     }
-                    Some(Loc::Immed(len_i)) => {
+                    Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
                         self.emit_mov_imm64(2, len_i.value);
                     }
                     Some(Loc::Frame(len_f)) => {
@@ -4008,14 +4019,11 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(self.mc ; .arch aarch64 ; ldr x16, [X(obj.value), ofs]);
                 self.regalloc_mov(class_loc, &Loc::Reg(crate::regloc::RegLoc::new(17, false)));
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
-            } else if let Loc::Immed(i) = class_loc {
+            } else if let Loc::Immed(i) | Loc::ImmedFloat(i) = class_loc {
                 let expected_typeid = self
                     .lookup_typeid_from_classptr(i.value as usize)
                     .expect("GuardClass: missing typeid for classptr");
-                self._cmp_guard_gc_type(
-                    &Loc::Reg(*obj),
-                    &Loc::Immed(crate::regloc::ImmedLoc::new(expected_typeid as i64)),
-                );
+                self._cmp_guard_gc_type(&Loc::Reg(*obj), &Loc::immed(expected_typeid as i64));
             }
         }
     }
@@ -4062,7 +4070,7 @@ impl<'a> AssemblerARM64<'a> {
                     ; cmp x16, x17
                 );
             }
-            Loc::Immed(expected) => {
+            Loc::Immed(expected) | Loc::ImmedFloat(expected) => {
                 self.emit_mov_imm64(17, expected.value);
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
             }
@@ -4096,7 +4104,9 @@ impl<'a> AssemblerARM64<'a> {
     /// aarch64/opassembler.py `emit_op_guard_subclass`.
     fn emit_guard_subclass(&mut self, obj_loc: &Loc, class_loc: &Loc) {
         let info = self.require_guard_gc_type_info("GUARD_SUBCLASS");
-        let (Loc::Reg(obj), Loc::Immed(classptr)) = (obj_loc, class_loc) else {
+        let (Loc::Reg(obj), Loc::Immed(classptr) | Loc::ImmedFloat(classptr)) =
+            (obj_loc, class_loc)
+        else {
             panic!(
                 "GUARD_SUBCLASS expects [Reg object, Immed classptr] \
                  like aarch64/opassembler.py:667"
@@ -4151,7 +4161,7 @@ impl<'a> AssemblerARM64<'a> {
                     ; cmp x16, x17
                 );
             }
-            Loc::Immed(expected) => {
+            Loc::Immed(expected) | Loc::ImmedFloat(expected) => {
                 self.emit_mov_imm64(17, expected.value);
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
             }
@@ -4527,7 +4537,7 @@ impl<'a> AssemblerARM64<'a> {
             .iter()
             .map(|fl| match fl {
                 None => 0xFFFF,
-                Some(Loc::Immed(i)) => {
+                Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => {
                     let slot = self.frame_depth;
                     self.frame_depth += 1;
                     const_stores.push((slot, i.value));
@@ -5705,7 +5715,7 @@ impl<'a> AssemblerARM64<'a> {
 
     fn argloc_imm(arglocs: &[Loc], index: usize) -> i64 {
         match arglocs.get(index) {
-            Some(Loc::Immed(i)) => i.value,
+            Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
             _ => 0,
         }
     }
@@ -5755,7 +5765,8 @@ impl<'a> AssemblerARM64<'a> {
             let is_float = match arg {
                 Loc::Frame(f) => f.ebp_loc.is_float,
                 Loc::Reg(r) => r.is_xmm,
-                Loc::Immed(im) => im.is_float,
+                Loc::Immed(_) => false,
+                Loc::ImmedFloat(_) => true,
                 _ => false,
             };
             let abi_idx = if is_float {
@@ -5793,7 +5804,10 @@ impl<'a> AssemblerARM64<'a> {
                     non_float_dst.push(Loc::Reg(crate::regloc::RegLoc::new(abi_idx, false)));
                 }
                 Loc::Immed(im) => {
-                    immed_args.push((abi_idx, im.value, im.is_float));
+                    immed_args.push((abi_idx, im.value, false));
+                }
+                Loc::ImmedFloat(im) => {
+                    immed_args.push((abi_idx, im.value, true));
                 }
                 // See the x86 twin: Reg/Frame/Immed is the whole range the
                 // regalloc produces, and silently skipping anything else
@@ -5825,7 +5839,7 @@ impl<'a> AssemblerARM64<'a> {
                         self.emit_ldr_fp(16, f.ebp_loc.value);
                         dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, offset]);
                     }
-                    Loc::Immed(im) => {
+                    Loc::Immed(im) | Loc::ImmedFloat(im) => {
                         self.emit_mov_imm64(16, im.value);
                         dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, offset]);
                     }
@@ -5857,7 +5871,7 @@ impl<'a> AssemblerARM64<'a> {
             // Unlike x86, which always ends in `call rax`, this arm is the
             // only place a `blr` is emitted — an unhandled fnloc spelling
             // would emit no call at all and fall through with a stale x0.
-            let Some(Loc::Immed(i)) = fnloc else {
+            let Some(Loc::Immed(i) | Loc::ImmedFloat(i)) = fnloc else {
                 panic!("unsupported AArch64 call target {fnloc:?}");
             };
             let val = i.value;
@@ -6425,7 +6439,7 @@ impl<'a> AssemblerARM64<'a> {
                 // `- GcHeader::SIZE` bias the register form applies with
                 // `sub x30, x30, ...`: the base addresses the payload while the
                 // card bytes sit before the header.
-                Some(Loc::Immed(loc_index)) => {
+                Some(Loc::Immed(loc_index) | Loc::ImmedFloat(loc_index)) => {
                     let byte_index = loc_index.value >> wb.jit_wb_card_page_shift;
                     let byte_ofs = !(byte_index >> 3) - majit_gc::header::GcHeader::SIZE as i64;
                     let byte_val = (1_i64 << (byte_index & 7)) as u32;
@@ -6873,7 +6887,7 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(this.mc ; .arch aarch64 ; mov x17, X(src));
             }
             Loc::Frame(frame) => this.emit_ldr_fp(17, frame.ebp_loc.value),
-            Loc::Immed(imm) => this.emit_mov_imm64(17, imm.value),
+            Loc::Immed(imm) | Loc::ImmedFloat(imm) => this.emit_mov_imm64(17, imm.value),
             other => panic!(
                 "genop_restore_exception: unhandled operand {other:?} — x17 still \
             holds the previously loaded operand, which the store below writes"
@@ -7086,7 +7100,7 @@ impl<'a> AssemblerARM64<'a> {
             Loc::Reg(r) if !r.is_xmm => {
                 dynasm!(self.mc ; .arch aarch64 ; mov x16, X(r.value));
             }
-            Loc::Immed(imm) => {
+            Loc::Immed(imm) | Loc::ImmedFloat(imm) => {
                 self.emit_mov_imm64(16, imm.value);
             }
             Loc::Frame(f) if !f.ebp_loc.is_float => {
@@ -7258,7 +7272,7 @@ impl<'a> AssemblerARM64<'a> {
         else {
             panic!("ZERO_ARRAY expects five regalloc locations, got {arglocs:?}");
         };
-        if matches!(size_loc, Loc::Immed(i) if i.value == 0) {
+        if matches!(size_loc, Loc::Immed(i) | Loc::ImmedFloat(i) if i.value == 0) {
             return;
         }
         let (base_size, item_size) = op
@@ -7272,10 +7286,10 @@ impl<'a> AssemblerARM64<'a> {
         // op: a non-constant scale is an invariant break the emitter cannot
         // encode, and failing loud declines the trace instead of silently
         // scaling by one.
-        let Loc::Immed(scale_start) = scale_start_loc else {
+        let (Loc::Immed(scale_start) | Loc::ImmedFloat(scale_start)) = scale_start_loc else {
             panic!("ZERO_ARRAY scale_start must be an immediate, got {scale_start_loc:?}");
         };
-        let Loc::Immed(scale_size) = scale_size_loc else {
+        let (Loc::Immed(scale_size) | Loc::ImmedFloat(scale_size)) = scale_size_loc else {
             panic!("ZERO_ARRAY scale_size must be an immediate, got {scale_size_loc:?}");
         };
         let (scale_start, scale_size) = (scale_start.value, scale_size.value);
@@ -7283,7 +7297,7 @@ impl<'a> AssemblerARM64<'a> {
         // aarch64/opassembler.py:755-839: first compute the byte destination
         // in ip0/x16.  ip0/ip1 are never managed by regalloc.
         self.regalloc_mov(base_loc, &Loc::Reg(crate::aarch64::registers::X16));
-        if let Loc::Immed(start) = start_loc {
+        if let Loc::Immed(start) | Loc::ImmedFloat(start) = start_loc {
             let byte_offset = base_size + start.value * scale_start;
             if byte_offset != 0 {
                 if (0..4096).contains(&byte_offset) {
@@ -7322,14 +7336,14 @@ impl<'a> AssemblerARM64<'a> {
         } else {
             8
         };
-        let constant_start = matches!(start_loc, Loc::Immed(_));
+        let constant_start = matches!(start_loc, Loc::Immed(_) | Loc::ImmedFloat(_));
         let limit = if natural_size < 8 && constant_start {
             8
         } else {
             natural_size
         };
         let constant_bytes = match size_loc {
-            Loc::Immed(size) => Some(size.value * scale_size),
+            Loc::Immed(size) | Loc::ImmedFloat(size) => Some(size.value * scale_size),
             _ => None,
         };
 
@@ -7338,7 +7352,7 @@ impl<'a> AssemblerARM64<'a> {
             // For a constant byte start, group naturally aligned runs into
             // eight-byte stores exactly as upstream does.
             let start_byte = match start_loc {
-                Loc::Immed(start) => start.value * scale_start,
+                Loc::Immed(start) | Loc::ImmedFloat(start) => start.value * scale_start,
                 _ => -1,
             };
             let mut next_group = -1;
@@ -7912,7 +7926,7 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                     self.emit_ldr_fp(d.value, ofs);
                 }
             }
-            (Loc::Immed(i), Loc::Reg(d)) => {
+            (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(d)) => {
                 if d.is_xmm {
                     self.emit_mov_imm64(16, i.value); // x16 = scratch
                     dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(16));
@@ -7920,7 +7934,7 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                     self.emit_mov_imm64(d.value as u32, i.value);
                 }
             }
-            (Loc::Immed(i), ebp_loc_pat!(e)) => {
+            (Loc::Immed(i) | Loc::ImmedFloat(i), ebp_loc_pat!(e)) => {
                 let ofs = e.value;
                 self.emit_mov_imm64(16, i.value);
                 self.emit_str_fp(16, ofs);

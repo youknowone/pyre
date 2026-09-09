@@ -627,7 +627,7 @@ impl FrameManager {
 
     /// regalloc.py:164
     pub fn bind(&mut self, v: OpRef, loc: FrameLoc, tp: Type, longevity: &mut LifetimeManager) {
-        let pos = loc.position;
+        let pos = loc.get_position();
         let size = Self::frame_size(tp);
         if pos + size > self.current_frame_depth {
             self._increase_frame_depth(pos + size - self.current_frame_depth);
@@ -657,7 +657,7 @@ impl FrameManager {
         let lifetime = longevity.get_mut(v).unwrap();
         debug_assert!(lifetime.current_frame_loc.is_some());
         lifetime.current_frame_loc = None;
-        let pos = loc.position;
+        let pos = loc.get_position();
         let size = Self::frame_size(tp);
         debug_assert!(self.boxes_in_frame[pos] == Some(v));
         for index in pos..pos + size {
@@ -668,7 +668,7 @@ impl FrameManager {
     /// regalloc.py:201
     pub fn add_frame_pos_hint(&self, v: OpRef, loc: FrameLoc, longevity: &mut LifetimeManager) {
         if let Some(lifetime) = longevity.get_mut(v) {
-            lifetime.hint_frame_pos = loc.position as i32;
+            lifetime.hint_frame_pos = loc.get_position() as i32;
         }
     }
 
@@ -699,7 +699,7 @@ impl FrameManager {
 
     /// x86/regalloc.py get_loc_index(loc)
     pub fn get_loc_index(loc: &FrameLoc) -> usize {
-        loc.position
+        loc.get_position()
     }
 }
 
@@ -1291,9 +1291,9 @@ impl RegisterManager {
             // the constants snapshot.
             let val = const_bits_or_panic(v, constants, "loc");
             if tp == Type::Float || self.is_float_constant(v) {
-                return Loc::Immed(ImmedLoc::new_float(val));
+                return Loc::immed_float(val);
             }
-            return Loc::Immed(ImmedLoc::new(val));
+            return Loc::immed(val);
         }
         if let Some(reg) = self.reg_bindings_get(v, longevity) {
             return Loc::Reg(reg);
@@ -1313,9 +1313,9 @@ impl RegisterManager {
             .or_else(|| constants.get(&v.raw()).copied())
         {
             if tp == Type::Float || self.is_float_constant(v) {
-                return Loc::Immed(ImmedLoc::new_float(val));
+                return Loc::immed_float(val);
             }
-            return Loc::Immed(ImmedLoc::new(val));
+            return Loc::immed(val);
         }
         if must_exist {
             panic!("RegisterManager.loc: box {:?} not found", v);
@@ -1625,9 +1625,9 @@ impl RegisterManager {
         // raw bits via the constants snapshot.
         let val = const_bits_or_panic(v, constants, "convert_to_imm");
         if self.is_float_constant(v) {
-            Loc::Immed(ImmedLoc::new_float(val))
+            Loc::immed_float(val)
         } else {
-            Loc::Immed(ImmedLoc::new(val))
+            Loc::immed(val)
         }
     }
 
@@ -2329,7 +2329,7 @@ impl<'a> RegAlloc<'a> {
             debug_assert_eq!(FrameManager::get_loc_index(&loc), index);
             let size = FrameManager::frame_size(self.tp(v));
             if self.opref_type(v) == Some(Type::Ref) && self.rm.is_still_alive(v, &self.longevity) {
-                gcmap_set_bit(gcmap, loc.position + JITFRAME_FIXED_SIZE);
+                gcmap_set_bit(gcmap, loc.get_position() + JITFRAME_FIXED_SIZE);
             }
             index += size;
         }
@@ -4477,10 +4477,10 @@ impl<'a> RegAlloc<'a> {
 
     fn gc_offset_loc(&mut self, ofs: i64) -> Loc {
         if check_imm_arg(ofs) {
-            Loc::Immed(ImmedLoc::new(ofs))
+            Loc::immed(ofs)
         } else {
             self.pending_moves
-                .push((Loc::Immed(ImmedLoc::new(ofs)), Loc::Reg(LARGE_IMM_SCRATCH)));
+                .push((Loc::immed(ofs), Loc::Reg(LARGE_IMM_SCRATCH)));
             Loc::Reg(LARGE_IMM_SCRATCH)
         }
     }
@@ -4503,7 +4503,7 @@ impl<'a> RegAlloc<'a> {
         let res_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
         self.perform(
             i,
-            vec![base_loc, ofs_loc, res_loc, Loc::Immed(ImmedLoc::new(nsize))],
+            vec![base_loc, ofs_loc, res_loc, Loc::immed(nsize)],
             Some(res_loc),
             output,
         );
@@ -4541,8 +4541,8 @@ impl<'a> RegAlloc<'a> {
                 res_loc,
                 base_loc,
                 index_loc,
-                Loc::Immed(ImmedLoc::new(nsize)),
-                Loc::Immed(ImmedLoc::new(ofs)),
+                Loc::immed(nsize),
+                Loc::immed(ofs),
             ],
             Some(res_loc),
             output,
@@ -4578,17 +4578,17 @@ impl<'a> RegAlloc<'a> {
         let offset_value = self.const_value(offset);
         let nsize = self.const_value(size);
         // x86/regalloc.py:1187 `size_loc = imm(abs(nsize))`
-        let size_loc = Loc::Immed(ImmedLoc::new(nsize.unsigned_abs() as i64));
+        let size_loc = Loc::immed(nsize.unsigned_abs() as i64);
         // x86/regalloc.py:1188-1191 sign_loc = imm1 if nsize < 0 else imm0
-        let sign_loc = Loc::Immed(ImmedLoc::new(if nsize < 0 { 1 } else { 0 }));
+        let sign_loc = Loc::immed(if nsize < 0 { 1 } else { 0 });
         // x86/regalloc.py:1192-1193
         self.perform(
             i,
             vec![
                 base_loc,
                 ofs_loc,
-                Loc::Immed(ImmedLoc::new(scale_value)),
-                Loc::Immed(ImmedLoc::new(offset_value)),
+                Loc::immed(scale_value),
+                Loc::immed(offset_value),
                 size_loc,
                 sign_loc,
             ],
@@ -4606,10 +4606,10 @@ impl<'a> RegAlloc<'a> {
         // aarch64/regalloc.py: ofs = op.getarg(1).getint(); check_imm_arg
         let ofs = self.const_value(op.arg(1).to_opref());
         let ofs_loc = if check_imm_arg(ofs) {
-            Loc::Immed(ImmedLoc::new(ofs))
+            Loc::immed(ofs)
         } else {
             self.pending_moves
-                .push((Loc::Immed(ImmedLoc::new(ofs)), Loc::Reg(LARGE_IMM_SCRATCH)));
+                .push((Loc::immed(ofs), Loc::Reg(LARGE_IMM_SCRATCH)));
             Loc::Reg(LARGE_IMM_SCRATCH)
         };
         // aarch64/regalloc.py:536: nsize = op.getarg(2).getint()
@@ -4639,7 +4639,7 @@ impl<'a> RegAlloc<'a> {
         // aarch64/regalloc.py:546: return [base_loc, ofs_loc, res_loc, imm(nsize)]
         self.perform(
             i,
-            vec![base_loc, ofs_loc, res_loc, Loc::Immed(ImmedLoc::new(nsize))],
+            vec![base_loc, ofs_loc, res_loc, Loc::immed(nsize)],
             Some(res_loc),
             output,
         );
@@ -4686,8 +4686,8 @@ impl<'a> RegAlloc<'a> {
                 res_loc,
                 base_loc,
                 index_loc,
-                Loc::Immed(ImmedLoc::new(nsize)),
-                Loc::Immed(ImmedLoc::new(ofs)),
+                Loc::immed(nsize),
+                Loc::immed(ofs),
             ],
             Some(res_loc),
             output,
@@ -4724,17 +4724,17 @@ impl<'a> RegAlloc<'a> {
         // x86/regalloc.py:1186 `nsize = size_box.value  # negative for "signed"`
         let nsize = self.const_value(op.arg(4).to_opref());
         // x86/regalloc.py:1187 `size_loc = imm(abs(nsize))`
-        let size_loc = Loc::Immed(ImmedLoc::new(nsize.unsigned_abs() as i64));
+        let size_loc = Loc::immed(nsize.unsigned_abs() as i64);
         // x86/regalloc.py:1188-1191 sign_loc = imm1 if nsize < 0 else imm0
-        let sign_loc = Loc::Immed(ImmedLoc::new(if nsize < 0 { 1 } else { 0 }));
+        let sign_loc = Loc::immed(if nsize < 0 { 1 } else { 0 });
         // x86/regalloc.py:1192-1193
         self.perform(
             i,
             vec![
                 base_loc,
                 ofs_loc,
-                Loc::Immed(ImmedLoc::new(scale)),
-                Loc::Immed(ImmedLoc::new(offset)),
+                Loc::immed(scale),
+                Loc::immed(offset),
                 size_loc,
                 sign_loc,
             ],
@@ -4817,12 +4817,7 @@ impl<'a> RegAlloc<'a> {
         let ofs_loc = self.gc_offset_loc(self.const_value(offset));
         self.perform_discard(
             i,
-            vec![
-                value_loc,
-                base_loc,
-                ofs_loc,
-                Loc::Immed(ImmedLoc::new(size)),
-            ],
+            vec![value_loc, base_loc, ofs_loc, Loc::immed(size)],
             output,
         );
     }
@@ -4858,8 +4853,8 @@ impl<'a> RegAlloc<'a> {
                 value_loc,
                 base_loc,
                 index_loc,
-                Loc::Immed(ImmedLoc::new(size)),
-                Loc::Immed(ImmedLoc::new(ofs)),
+                Loc::immed(size),
+                Loc::immed(ofs),
             ],
             output,
         );
@@ -4897,9 +4892,9 @@ impl<'a> RegAlloc<'a> {
                 base_loc,
                 ofs_loc,
                 value_loc,
-                Loc::Immed(ImmedLoc::new(factor)),
-                Loc::Immed(ImmedLoc::new(offset)),
-                Loc::Immed(ImmedLoc::new(size)),
+                Loc::immed(factor),
+                Loc::immed(offset),
+                Loc::immed(size),
             ],
             output,
         );
@@ -4925,22 +4920,17 @@ impl<'a> RegAlloc<'a> {
         };
         // aarch64/regalloc.py: check_imm_arg(ofs)
         let ofs_loc = if check_imm_arg(ofs) {
-            Loc::Immed(ImmedLoc::new(ofs))
+            Loc::immed(ofs)
         } else {
             // aarch64/regalloc.py:529-530: ofs_loc = r.ip1; self.assembler.load(ofs_loc, imm(ofs))
             self.pending_moves
-                .push((Loc::Immed(ImmedLoc::new(ofs)), Loc::Reg(LARGE_IMM_SCRATCH)));
+                .push((Loc::immed(ofs), Loc::Reg(LARGE_IMM_SCRATCH)));
             Loc::Reg(LARGE_IMM_SCRATCH)
         };
         // aarch64/regalloc.py:531: return [value_loc, base_loc, ofs_loc, imm(size)]
         self.perform_discard(
             i,
-            vec![
-                value_loc,
-                base_loc,
-                ofs_loc,
-                Loc::Immed(ImmedLoc::new(size)),
-            ],
+            vec![value_loc, base_loc, ofs_loc, Loc::immed(size)],
             output,
         );
     }
@@ -4985,8 +4975,8 @@ impl<'a> RegAlloc<'a> {
                 value_loc,
                 base_loc,
                 index_loc,
-                Loc::Immed(ImmedLoc::new(size)),
-                Loc::Immed(ImmedLoc::new(ofs)),
+                Loc::immed(size),
+                Loc::immed(ofs),
             ],
             output,
         );
@@ -5039,9 +5029,9 @@ impl<'a> RegAlloc<'a> {
                 base_loc,
                 ofs_loc,
                 value_loc,
-                Loc::Immed(ImmedLoc::new(factor)),
-                Loc::Immed(ImmedLoc::new(offset)),
-                Loc::Immed(ImmedLoc::new(size)),
+                Loc::immed(factor),
+                Loc::immed(offset),
+                Loc::immed(size),
             ],
             output,
         );
@@ -5073,13 +5063,9 @@ impl<'a> RegAlloc<'a> {
 
         // aarch64/regalloc.py — capture arglocs before before_call.
         let mut arglocs = Vec::with_capacity(op.num_args() + 3);
-        arglocs.push(Loc::Immed(ImmedLoc::new(0))); // placeholder for result_loc
-        arglocs.push(Loc::Immed(ImmedLoc::new(calldescr.result_size() as i64)));
-        arglocs.push(Loc::Immed(ImmedLoc::new(if calldescr.is_result_signed() {
-            1
-        } else {
-            0
-        })));
+        arglocs.push(Loc::immed(0)); // placeholder for result_loc
+        arglocs.push(Loc::immed(calldescr.result_size() as i64));
+        arglocs.push(Loc::immed(if calldescr.is_result_signed() { 1 } else { 0 }));
         let mut force_store_refs = Vec::new();
         for (arg_index, arg) in op.getarglist().iter().enumerate() {
             let arg = arg.to_opref();
@@ -5157,7 +5143,7 @@ impl<'a> RegAlloc<'a> {
         } else {
             None
         };
-        arglocs[0] = result_loc.unwrap_or(Loc::Immed(ImmedLoc::new(0)));
+        arglocs[0] = result_loc.unwrap_or(Loc::immed(0));
 
         if let Some(gcmap) = gcmap {
             self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, output);
@@ -5183,13 +5169,9 @@ impl<'a> RegAlloc<'a> {
         assert_eq!(calldescr.arg_types().len(), args.len() - first_arg_index);
 
         let mut arglocs = Vec::with_capacity(args.len() + 3);
-        arglocs.push(Loc::Immed(ImmedLoc::new(0)));
-        arglocs.push(Loc::Immed(ImmedLoc::new(calldescr.result_size() as i64)));
-        arglocs.push(Loc::Immed(ImmedLoc::new(if calldescr.is_result_signed() {
-            1
-        } else {
-            0
-        })));
+        arglocs.push(Loc::immed(0));
+        arglocs.push(Loc::immed(calldescr.result_size() as i64));
+        arglocs.push(Loc::immed(if calldescr.is_result_signed() { 1 } else { 0 }));
         let mut force_store_refs = Vec::new();
         for (arg_index, &arg) in args.iter().enumerate() {
             let tp = if arg_index >= first_arg_index {
@@ -5258,7 +5240,7 @@ impl<'a> RegAlloc<'a> {
         } else {
             None
         };
-        arglocs[0] = result_loc.unwrap_or(Loc::Immed(ImmedLoc::new(0)));
+        arglocs[0] = result_loc.unwrap_or(Loc::immed(0));
 
         if let Some(gcmap) = gcmap {
             self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, output);
@@ -5582,7 +5564,7 @@ impl<'a> RegAlloc<'a> {
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         // aarch64/regalloc.py:968: sizeloc = size_box.getint()
         let size_val = self.const_value(op.arg(0).to_opref());
-        let arglocs = vec![Loc::Immed(ImmedLoc::new(size_val))];
+        let arglocs = vec![Loc::immed(size_val)];
         self.perform_with_gcmap(i, arglocs, Some(Loc::Reg(result_reg)), output);
     }
 
@@ -5634,7 +5616,7 @@ impl<'a> RegAlloc<'a> {
         let size_val = args.first().map(|&arg| self.const_value(arg)).unwrap_or(0);
         self.perform_with_gcmap(
             i,
-            vec![Loc::Immed(ImmedLoc::new(size_val))],
+            vec![Loc::immed(size_val)],
             Some(Loc::Reg(result_reg)),
             output,
         );
@@ -5794,11 +5776,7 @@ impl<'a> RegAlloc<'a> {
         let kind = self.const_value(op.arg(0).to_opref());
         self.perform_with_gcmap(
             i,
-            vec![
-                lengthloc,
-                Loc::Immed(ImmedLoc::new(itemsize)),
-                Loc::Immed(ImmedLoc::new(kind)),
-            ],
+            vec![lengthloc, Loc::immed(itemsize), Loc::immed(kind)],
             Some(Loc::Reg(result_reg)),
             output,
         );
@@ -5837,16 +5815,12 @@ impl<'a> RegAlloc<'a> {
         let lengthloc = args
             .get(2)
             .map(|&arg| self.loc(arg, Type::Int))
-            .unwrap_or_else(|| Loc::Immed(ImmedLoc::new(0)));
+            .unwrap_or_else(|| Loc::immed(0));
         let itemsize = args.get(1).map(|&arg| self.const_value(arg)).unwrap_or(0);
         let kind = args.first().map(|&arg| self.const_value(arg)).unwrap_or(0);
         self.perform_with_gcmap(
             i,
-            vec![
-                lengthloc,
-                Loc::Immed(ImmedLoc::new(itemsize)),
-                Loc::Immed(ImmedLoc::new(kind)),
-            ],
+            vec![lengthloc, Loc::immed(itemsize), Loc::immed(kind)],
             Some(Loc::Reg(result_reg)),
             output,
         );
@@ -6298,7 +6272,9 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
     match (a, b) {
         (Loc::Reg(ra), Loc::Reg(rb)) => ra == rb,
         (Loc::Frame(fa), Loc::Frame(fb)) => fa.position == fb.position,
-        (Loc::Immed(ia), Loc::Immed(ib)) => ia.value == ib.value,
+        (Loc::Immed(ia) | Loc::ImmedFloat(ia), Loc::Immed(ib) | Loc::ImmedFloat(ib)) => {
+            ia.value == ib.value
+        }
         _ => false,
     }
 }
@@ -6991,7 +6967,9 @@ mod tests {
                     "GuardNotForced2 must spill every failarg into the jitframe, got {faillocs:?}"
                 );
                 assert!(
-                    !arglocs.iter().any(|l| matches!(l, Loc::Immed(_))),
+                    !arglocs
+                        .iter()
+                        .any(|l| matches!(l, Loc::Immed(_) | Loc::ImmedFloat(_))),
                     "GuardNotForced2 must not carry a frame-depth immediate argloc, got {arglocs:?}"
                 );
             }

@@ -75,7 +75,7 @@ impl<'a> AssemblerARM64<'a> {
         let abs_size = size.unsigned_abs() as usize;
         let signed = size < 0;
         match ofs_loc {
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 let o = i.value as i32;
                 self.emit_load_sized(base, o, None, dst, abs_size, signed);
             }
@@ -216,7 +216,7 @@ impl<'a> AssemblerARM64<'a> {
         size: usize,
     ) {
         match ofs_loc {
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 let o = i.value as i32;
                 if (-256..0).contains(&o) {
                     self.emit_stur_sized(base, o, val, size);
