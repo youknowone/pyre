@@ -2526,21 +2526,25 @@ impl TraceCtx {
         greens: &(Vec<i64>, Vec<i64>, Vec<i64>),
     ) -> Option<GreenKey> {
         let (ints, refs, floats) = greens;
-        let spec = if let Some(key) = self.green_key_values.as_ref() {
-            debug_assert_eq!(
-                key.types.first().copied(),
-                Some(GreenType::Int),
-                "structured green key must start with the prepended target pc",
-            );
-            key.types.get(1..)?.to_vec()
-        } else {
-            self.driver_descriptor
-                .as_ref()
-                .map(|d| d.green_args_spec())?
-        };
+        let spec: smallvec::SmallVec<[GreenType; 4]> =
+            if let Some(key) = self.green_key_values.as_ref() {
+                debug_assert_eq!(
+                    key.types.first().copied(),
+                    Some(GreenType::Int),
+                    "structured green key must start with the prepended target pc",
+                );
+                smallvec::SmallVec::from_slice(key.types.get(1..)?)
+            } else {
+                smallvec::SmallVec::from_iter(
+                    self.driver_descriptor
+                        .as_ref()
+                        .map(|d| d.green_args_spec())?
+                        .into_iter(),
+                )
+            };
 
-        let mut values = Vec::with_capacity(spec.len() + 1);
-        let mut types = Vec::with_capacity(spec.len() + 1);
+        let mut values = smallvec::SmallVec::<[i64; 4]>::new();
+        let mut types = smallvec::SmallVec::<[GreenType; 4]>::new();
         values.push(pc);
         types.push(GreenType::Int);
         let mut int_i = 0;
@@ -2566,7 +2570,7 @@ impl TraceCtx {
             };
             values.push(value);
         }
-        types.extend(spec);
+        types.extend(spec.iter().copied());
         Some(GreenKey::with_types(values, types))
     }
 

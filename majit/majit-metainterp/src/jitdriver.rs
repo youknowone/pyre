@@ -11608,8 +11608,8 @@ mod tests {
             vec![("r_int", Type::Int)],
         );
         let key = sd.unwrap_greenkey(&[42, 0xdeadbeef]);
-        assert_eq!(key.values, vec![42, 0xdeadbeef]);
-        assert_eq!(key.types, vec![GreenType::Int, GreenType::Ref]);
+        assert_eq!(&key.values[..], &[42, 0xdeadbeef]);
+        assert_eq!(&key.types[..], &[GreenType::Int, GreenType::Ref]);
     }
 
     /// `warmstate.py:535-553` — upstream's `unrolling_iterable` loop

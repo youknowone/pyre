@@ -2,6 +2,7 @@
 ///
 /// Translated from rpython/jit/metainterp/history.py.
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 /// The type of a value in the JIT IR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1182,11 +1183,14 @@ pub fn green_uhash_step(x: u64, tp: GreenType, value: i64) -> u64 {
 #[derive(Clone, Debug, Default)]
 pub struct GreenKey {
     /// Values of all green variables, in declaration order.
-    pub values: Vec<i64>,
+    /// Four i64s stay inline: shortcircuit's `pc, program, root` plus the
+    /// prepended target pc is exactly 32 B, which `Vec::with_capacity(4)`
+    /// minted on every `merge_point_green_key`.
+    pub values: SmallVec<[i64; 4]>,
     /// warmstate.py — per-entry TYPE. Drives hash_whatever/equal_whatever.
     /// `GreenType` (not IR `Type`) so `Ptr to rstr.STR/UNICODE` stays distinct
     /// from generic Ref and is dispatched through ll_streq / ll_strhash.
-    pub types: Vec<GreenType>,
+    pub types: SmallVec<[GreenType; 4]>,
 }
 
 impl PartialEq for GreenKey {
@@ -1232,25 +1236,32 @@ impl std::hash::Hash for GreenKey {
 
 impl GreenKey {
     /// Create an all-Int green key (most common case: PC-based keys).
-    pub fn new(values: Vec<i64>) -> Self {
-        let types = vec![GreenType::Int; values.len()];
+    pub fn new(values: impl Into<SmallVec<[i64; 4]>>) -> Self {
+        let values = values.into();
+        let mut types = SmallVec::new();
+        types.resize(values.len(), GreenType::Int);
         GreenKey { values, types }
     }
 
     /// warmstate.py:564-565 — typed green key. Accepts either IR-level
     /// [`Type`] (via `From<Type>`) or the richer [`GreenType`].
-    pub fn with_types<T: Into<GreenType> + Copy>(values: Vec<i64>, types: Vec<T>) -> Self {
+    pub fn with_types<T: Into<GreenType> + Copy>(
+        values: impl Into<SmallVec<[i64; 4]>>,
+        types: impl IntoIterator<Item = T>,
+    ) -> Self {
+        let values = values.into();
+        let types: SmallVec<[GreenType; 4]> = types.into_iter().map(Into::into).collect();
         debug_assert_eq!(values.len(), types.len());
-        let types = types.into_iter().map(Into::into).collect();
         GreenKey { values, types }
     }
 
     /// Single Int green key.
     pub fn single(value: i64) -> Self {
-        GreenKey {
-            values: vec![value],
-            types: vec![GreenType::Int],
-        }
+        let mut values = SmallVec::new();
+        values.push(value);
+        let mut types = SmallVec::new();
+        types.push(GreenType::Int);
+        GreenKey { values, types }
     }
 
     /// warmstate.py JitCell.get_uhash(*greenargs)
