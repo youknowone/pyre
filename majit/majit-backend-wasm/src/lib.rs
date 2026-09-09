@@ -4088,6 +4088,9 @@ impl majit_backend::Backend for WasmBackend {
                 label_ref_slots,
             ),
         };
+        // Leaked before codegen so the key-0 prologue can publish it after
+        // nulling homes, instead of the CA bump filling the whole item area.
+        let home_gcmap_ptr = Box::leak(build_home_gcmap(frame)).as_ptr() as *const usize as usize;
         // `x86/assembler.py::assemble_loop` installs the generated frame
         // depth on the token's `CompiledLoopToken.frame_info`.  CALL_ASSEMBLER
         // redirect later propagates the replacement depth through that exact
@@ -4171,6 +4174,7 @@ impl majit_backend::Backend for WasmBackend {
                 || codegen::CaParams {
                     ca_reload_fn_ptr: body_reload_fn_ptr(),
                     jf_top_addr: jf_top_addr(),
+                    entry_gcmap_ptr: home_gcmap_ptr as i64,
                     ..codegen::CaParams::default()
                 },
                 |targets| codegen::CaParams {
@@ -4184,6 +4188,7 @@ impl majit_backend::Backend for WasmBackend {
                         as i64,
                     inline: ca_inline_params(ca_max_frame_bytes(targets)),
                     jf_top_addr: jf_top_addr(),
+                    entry_gcmap_ptr: home_gcmap_ptr as i64,
                 },
             ),
         };
@@ -4300,7 +4305,6 @@ impl majit_backend::Backend for WasmBackend {
         // GUARD_NOT_FORCED_2 frame can be reached through a virtualizable token
         // after the host deadframe wrapper has returned, so this map cannot be
         // scoped to one `execute_token` call.
-        let home_gcmap_ptr = Box::leak(build_home_gcmap(frame)).as_ptr() as *const usize as usize;
 
         let compiled = CompiledWasmLoop {
             token_number: token.number,
@@ -5098,6 +5102,7 @@ impl majit_backend::Backend for WasmBackend {
                 // per-op callee frame in this trace.
                 inline: ca_inline_params(ca_max_frame_bytes(targets)),
                 jf_top_addr: jf_top_addr(),
+                ..codegen::CaParams::default()
             }
         } else {
             codegen::CaParams {

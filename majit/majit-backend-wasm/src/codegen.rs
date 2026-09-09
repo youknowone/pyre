@@ -2545,9 +2545,8 @@ fn emit_ca_malloc_cond_varsize_frame(
     alloc_size_local: u32,
 ) {
     use majit_backend::jitframe::{
-        FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS,
-        JF_FRAME_OFS, JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE,
-        SIZEOFSIGNED,
+        JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS, JF_FRAME_OFS,
+        JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE, SIZEOFSIGNED,
     };
     let word = SIZEOFSIGNED as i32;
     let ss_word = std::mem::size_of::<usize>() as i32;
@@ -2653,24 +2652,14 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.i32_shr_u();
     sink.i64_extend_i32_u();
     emit_word_store(sink, JF_FRAME_OFS as u64);
+    // Leave `jf_gcmap` null. The callee key-0 prologue nulls homes and
+    // then publishes the map — the same moment PyPy's assembler writes
+    // `_finish_gcmap` / the live gcmap, once those slots are valid or
+    // null. Filling `ca_frame_bytes` here on every recursive bump is
+    // what made `recursion_past_unroll_bound_from_loop` 4.9x dynasm.
     sink.local_get(alloc_scratch_local);
-    sink.local_get(ca_target_local);
-    sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
+    sink.i64_const(0);
     emit_word_store(sink, JF_GCMAP_OFS as u64);
-    // `build_callee_gcmap` is installed now, before the callee prologue
-    // writes homes. Host MiniMarkGC reset does not zero
-    // (`malloc_zero_filled = False`; the wasm32 fill is guest-only), so
-    // `jitframe_trace` would walk leftover item pointers. PyPy never
-    // does this fill: its assembler writes `jf_gcmap` at safepoints
-    // once those slots are live.
-    sink.local_get(alloc_scratch_local);
-    sink.i32_const(FIRST_ITEM_OFFSET as i32);
-    sink.i32_add();
-    sink.i32_const(0);
-    sink.local_get(ca_target_local);
-    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-    sink.i32_wrap_i64();
-    sink.memory_fill(0);
     // assembler.py `_call_header_shadowstack`: [is_minor=1, jf_ptr], then
     // advance top by 2*WORD.
     sink.i32_const(inline.jf_top_addr as i32);
@@ -3576,6 +3565,9 @@ pub struct CaParams {
     /// Active-GC state for the direct CA-only inline allocation/frame path.
     /// `None` retains the helpers (including under gc_stress).
     pub inline: Option<CaInlineParams>,
+    /// Per-loop `jf_gcmap` installed at key-0 entry after homes are nulled.
+    /// Zero leaves the map the allocator (or `execute_token`) already stored.
+    pub entry_gcmap_ptr: i64,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -5649,6 +5641,20 @@ fn build_function(
             sink.local_get(0);
             sink.local_get(local_idx);
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+        }
+    }
+    if ca.entry_gcmap_ptr != 0 {
+        // Homes are now null or the entry Refs. Publish the map the
+        // allocator left unset so a later collection can walk them.
+        sink.local_get(0);
+        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+        sink.i64_const(ca.entry_gcmap_ptr);
+        if majit_backend::jitframe::SIZEOFSIGNED == 4 {
+            sink.i32_wrap_i64();
+            sink.i32_store(memarg(majit_backend::jitframe::JF_GCMAP_OFS as u64, 2));
+        } else {
+            sink.i64_store(memarg(majit_backend::jitframe::JF_GCMAP_OFS as u64, 3));
         }
     }
     // Past the entry loader, so the count is one per entry on the same path

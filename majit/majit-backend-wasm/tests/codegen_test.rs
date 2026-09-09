@@ -131,14 +131,9 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
         .unwrap_or_else(|err| panic!("invalid {name}= in wasm JIT stats: {err}\n{stderr}"))
 }
 
-/// CALL_ASSEMBLER must not refill a frame the allocator already zeroed.
-/// Two fills are expected:
-///
-/// - Entry prologues clear the current frame's GC Ref homes. #1683
-///   coalesces those stores into `memory.fill` on local 0.
-/// - The inline bump installs `build_callee_gcmap` before the callee
-///   writes homes, so it `memory.fill`s the `jf_frame` items. rewrite.py
-///   `gen_malloc_frame` only nulls the five GCREF header fields.
+/// CALL_ASSEMBLER must not refill a frame. The inline bump leaves
+/// `jf_gcmap` unset; the callee prologue nulls homes and then publishes
+/// the map. The only expected `memory.fill` is the entry home clear.
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
     let lines: Vec<_> = stderr.lines().map(str::trim).collect();
@@ -152,24 +147,9 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3] == "i32.add"
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
-        // Guest traces are wasm32: JitFrame is seven pointer fields plus
-        // the Signed length word, so FIRST_ITEM_OFFSET is 32. The length
-        // load is `WasmCaRuntimeTarget.callee_frame_bytes`.
-        let frame_bytes_load = format!(
-            "i64.load32_u offset={}",
-            majit_backend_wasm::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS
-        );
-        let is_ca_item_zero = index >= 7
-            && lines[index - 7].starts_with("local.get ")
-            && lines[index - 6] == "i32.const 32"
-            && lines[index - 5] == "i32.add"
-            && lines[index - 4] == "i32.const 0"
-            && lines[index - 3].starts_with("local.get ")
-            && lines[index - 2] == frame_bytes_load
-            && lines[index - 1] == "i32.wrap_i64";
         assert!(
-            is_entry_home_clear || is_ca_item_zero,
-            "recursive CA refilled a nursery frame instead of relying on its zeroed payload:\n{stderr}"
+            is_entry_home_clear,
+            "recursive CA filled a nursery frame on the bump path:\n{stderr}"
         );
     }
 }
@@ -2107,26 +2087,10 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         .0;
     validate_wasm(&bytes);
     let mut saw_nursery_free = false;
-    let mut saw_first_item = false;
-    let mut saw_frame_bytes_load = false;
     let mut saw_item_fill = false;
     count_operators(&bytes, |op| {
         if matches!(op, wasmparser::Operator::I32Const { value } if *value == nursery_free as i32) {
             saw_nursery_free = true;
-        }
-        if matches!(
-            op,
-            wasmparser::Operator::I32Const { value }
-                if *value == majit_backend::jitframe::FIRST_ITEM_OFFSET as i32
-        ) {
-            saw_first_item = true;
-        }
-        if matches!(
-            op,
-            wasmparser::Operator::I64Load32U { memarg }
-                if memarg.offset == majit_backend_wasm::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS
-        ) {
-            saw_frame_bytes_load = true;
         }
         if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
             saw_item_fill = true;
@@ -2137,8 +2101,8 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         "malloc_cond_varsize_frame must load nursery_free"
     );
     assert!(
-        saw_first_item && saw_frame_bytes_load && saw_item_fill,
-        "malloc_cond_varsize_frame must memory.fill jf_frame items from FIRST_ITEM_OFFSET for frame_bytes"
+        !saw_item_fill,
+        "inline CA bump must not memory.fill the item area; the callee publishes jf_gcmap after nulling homes"
     );
 }
 
