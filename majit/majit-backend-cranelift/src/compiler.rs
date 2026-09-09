@@ -1754,6 +1754,13 @@ unsafe fn alloc_nursery_collecting_typed_rooted_via_active_runtime(
     .unwrap_or(GcRef(0))
 }
 
+/// Rooted companion used when more than one native Rust slot holds a GC child.
+/// MiniMark registers those slots only on the nursery-full slow path.
+///
+/// # Safety
+/// `roots` must address `root_count` contiguous mutable [`GcRef`] slots
+/// which remain valid until this call returns.
+/// `needs_write_barrier` must remain a valid mutable `bool` slot.
 unsafe fn alloc_nursery_collecting_typed_roots_via_active_runtime(
     type_id: u32,
     size: usize,
