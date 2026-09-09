@@ -8575,6 +8575,25 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     sink.i64_store(mem64(FRAME_SLOT_BASE + arg_index as u64 * SLOT_SIZE));
                 }
+                // Homes are still recycled nursery bytes. Null them before
+                // installing `build_callee_gcmap`, which marks every home.
+                // No call sits between the input stores and this map, so a
+                // Ref argument cannot be collected while the map is still
+                // null. x86 writes the map at the first safepoint instead.
+                if frame.home_slots > 0 {
+                    sink.local_get(ca_cfp_local);
+                    sink.i32_const(frame.home_slot_base as i32);
+                    sink.i32_add();
+                    sink.i32_const(0);
+                    sink.i32_const((frame.home_slots as u64 * SLOT_SIZE) as i32);
+                    sink.memory_fill(0);
+                }
+                sink.local_get(ca_cfp_local);
+                sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+                sink.i32_sub();
+                sink.local_get(ca_target_local);
+                sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
+                emit_word_store(&mut sink, majit_backend::jitframe::JF_GCMAP_OFS as u64);
                 // Run the callee loop on F'; discard the returned frame_ptr.
                 sink.local_get(ca_cfp_local);
                 // The immutable target snapshot was loaded before allocating
