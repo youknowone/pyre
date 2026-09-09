@@ -176,9 +176,9 @@ struct CachedField {
     /// `ctx.get_ptr_info(opref)` / `ctx.get_const_info(opref)`.
     cached_structs: Vec<Operand>,
     /// `AbstractCachedEntry._lazy_set`: at most one pending `SetfieldGc` per descr.
-    /// Stores only the pending `Op` (`_lazy_set = op`); the struct base
-    /// is `op.getarg(0)`, resolved on demand by the consumers.
-    lazy_set: Option<Op>,
+    /// Stores the pending ResOperation object (`_lazy_set = op`); the struct
+    /// base is `op.getarg(0)`, resolved on demand by the consumers.
+    lazy_set: Option<majit_ir::OpRc>,
 }
 
 impl CachedField {
@@ -472,9 +472,9 @@ struct ArrayCachedItem {
     /// slot holds a cached value. Replaces RPython's `cached_infos`.
     cached_structs: Vec<Operand>,
     /// heap.py:40 _lazy_set — at most one pending SetarrayitemGc.
-    /// Stores only the pending `Op` (`_lazy_set = op`); the array base
-    /// is `op.getarg(0)`, resolved on demand by the consumers.
-    lazy_set: Option<Op>,
+    /// Stores the pending ResOperation object (`_lazy_set = op`); the array
+    /// base is `op.getarg(0)`, resolved on demand by the consumers.
+    lazy_set: Option<majit_ir::OpRc>,
 }
 
 impl ArrayCachedItem {
@@ -1293,14 +1293,15 @@ impl OptHeap {
     /// carries it to `Optimizer::emit_operation`, whose force_box loop
     /// (optimizer.py:641-665) is the single force point that appends
     /// the materialization directly ahead of the store.
-    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext) {
+    fn emit_lazy_setfield(op: &majit_ir::OpRc, ctx: &mut OptContext) {
         // Resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
             op.setarg(i, ctx.resolve_operand_operand(&op.arg(i)));
         }
-        // heap.py: emit_extra(op, emit=False) → next_optimization
-        ctx.emit_extra(ctx.current_pass_idx, op.clone());
+        // heap.py: emit_extra(op, emit=False) → next_optimization.
+        // `_lazy_set` already holds this ResOperation; do not cls() again.
+        ctx.emit_extra_rc(ctx.current_pass_idx, std::rc::Rc::clone(op));
     }
 
     /// heap.py: force_lazy_set → emit_extra(op, emit=False)
@@ -1424,7 +1425,7 @@ impl OptHeap {
                 match ctx.get_constant_int_box(&pending_op.arg(1).get_box_replacement(false)) {
                     Some(index) => self.arrayitem_cache(&descr, index).lazy_set = Some(pending_op),
                     None => {
-                        ctx.emit(pending_op);
+                        ctx.emit((*pending_op).clone());
                     }
                 }
             } else {
@@ -1440,7 +1441,11 @@ impl OptHeap {
     /// data (emitting_operation stores them in ctx.pending_for_guard →
     /// optimizer.rs encodes as op.rd_pendingfields).
     /// Non-virtual lazy sets are emitted (forced) immediately.
-    fn force_lazy_sets_for_guard(&mut self, self_pass_idx: usize, ctx: &mut OptContext) -> Vec<Op> {
+    fn force_lazy_sets_for_guard(
+        &mut self,
+        self_pass_idx: usize,
+        ctx: &mut OptContext,
+    ) -> Vec<majit_ir::OpRc> {
         let mut pendingfields = Vec::new();
 
         // heap.py:610-621: iterate cached fields
@@ -1454,7 +1459,7 @@ impl OptHeap {
         // cached field instead of a `DescrRef` clone per cached field. Filtering
         // ahead of the sort is equivalent: the sort is stable and filtering
         // preserves relative order.
-        let mut field_entries: Vec<(u32, DescrRef, Op)> = self
+        let mut field_entries: Vec<(u32, DescrRef, majit_ir::OpRc)> = self
             .cached_fields
             .iter()
             .filter_map(|(field_idx, descr, cf)| {
@@ -1464,7 +1469,7 @@ impl OptHeap {
             })
             .collect();
         sort_descr_entries_untranslated(&mut field_entries);
-        for (field_idx, descr, mut op) in field_entries {
+        for (field_idx, descr, op) in field_entries {
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
             let is_virtual = ctx.is_virtual(&op.arg(1).get_box_replacement(false));
             if is_virtual {
@@ -1490,11 +1495,11 @@ impl OptHeap {
             // AFTER it's been emitted by emit_extra. Clone it so the
             // structinfo write goes through `structinfo_setfield` (which
             // also handles the constant arg0 → const_infos route).
-            let put_back_op = op.clone();
+            let put_back_op = std::rc::Rc::clone(&op);
             // emit_extra(op, emit=False): route through passes after heap.
             // RPython: self.next_optimization — always starts AFTER heap,
             // regardless of which pass emitted the guard that triggered this.
-            ctx.emit_extra(self_pass_idx, op);
+            ctx.emit_extra_rc(self_pass_idx, op);
             // heap.py: put_field_back_to_info — restore cache + PtrInfo.
             // Struct base = op.getarg(0) (args already resolved above).
             let struct_ref = put_back_op.arg(0).to_opref();
@@ -1506,7 +1511,7 @@ impl OptHeap {
         // heap.py:622-636: iterate cached array items
         //   for descr, submap in self.cached_arrayitems.iteritems():
         //       for index, cf in submap.const_indexes.iteritems():
-        let array_entries: Vec<(usize, i64, Op)> = self
+        let array_entries: Vec<(usize, i64, majit_ir::OpRc)> = self
             .cached_arrayitems
             .iter_mut()
             .flat_map(|(descr_idx, _, submap)| {
@@ -1518,7 +1523,7 @@ impl OptHeap {
                     })
             })
             .collect();
-        for (descr_idx, index, mut op) in array_entries {
+        for (descr_idx, index, op) in array_entries {
             // heap.py:631-633: assert container not virtual; check value virtual
             let is_virtual = ctx.is_virtual(&op.arg(2).get_box_replacement(false));
             if is_virtual {
@@ -1542,9 +1547,9 @@ impl OptHeap {
             let final_value = op.arg(2);
             let array_ref = op.arg(0);
             let descr = op.getdescr();
-            let put_back_op = op.clone();
+            let put_back_op = std::rc::Rc::clone(&op);
             // emit_extra(op, emit=False): route through passes after heap.
-            ctx.emit_extra(self_pass_idx, op);
+            ctx.emit_extra_rc(self_pass_idx, op);
             self.cache_arrayitem(&array_ref, descr_idx, index, descr.as_ref());
             // info.py: ArrayPtrInfo.setitem — keep PtrInfo in sync.
             ctx.arrayinfo_setitem(&put_back_op, index as usize, final_value.to_opref());
@@ -1923,7 +1928,7 @@ impl OptHeap {
             .map(|(field_idx, descr, cf)| (*field_idx, descr.clone(), cf))
             .collect();
         sort_descr_entries_untranslated(&mut field_entries);
-        let pending_fields: Vec<(u32, DescrRef, OpRef, Op)> = field_entries
+        let pending_fields: Vec<(u32, DescrRef, OpRef, majit_ir::OpRc)> = field_entries
             .into_iter()
             .filter_map(|(field_idx, descr, cf)| match cf.lazy_set.as_ref() {
                 Some(lazy_op) => {
@@ -1938,7 +1943,7 @@ impl OptHeap {
             })
             .collect();
 
-        for (field_idx, descr, obj, mut pending_op) in pending_fields {
+        for (field_idx, descr, obj, pending_op) in pending_fields {
             // heap.py invalidate(descr) — purity self-gate
             // inside the method.
             if let Some(cf) = self.get_cached_field_mut(&descr) {
@@ -1950,8 +1955,8 @@ impl OptHeap {
             }
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(1);
-            let put_back_op = pending_op.clone();
-            ctx.emit_extra(heap_pass_idx, pending_op);
+            let put_back_op = std::rc::Rc::clone(&pending_op);
+            ctx.emit_extra_rc(heap_pass_idx, pending_op);
             let obj_box = ctx.get_box_replacement_operand(obj);
             self.cache_field(&obj_box, &descr);
             ctx.structinfo_setfield(&put_back_op, field_idx, final_value.to_opref());
@@ -1976,7 +1981,7 @@ impl OptHeap {
                 }
             }
         }
-        for (descr_idx, index, _obj, mut pending_op) in pending_arrays {
+        for (descr_idx, index, _obj, pending_op) in pending_arrays {
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..pending_op.num_args() {
                 pending_op.setarg(i, ctx.resolve_operand_operand(&pending_op.arg(i)));
@@ -1986,8 +1991,8 @@ impl OptHeap {
             let final_value = pending_op.arg(2);
             let array_ref = pending_op.arg(0);
             let descr = pending_op.getdescr();
-            let put_back_op = pending_op.clone();
-            ctx.emit_extra(heap_pass_idx, pending_op);
+            let put_back_op = std::rc::Rc::clone(&pending_op);
+            ctx.emit_extra_rc(heap_pass_idx, pending_op);
             self.cache_arrayitem(&array_ref, descr_idx, index, descr.as_ref());
             ctx.arrayinfo_setitem(&put_back_op, index as usize, final_value.to_opref());
         }
@@ -2354,7 +2359,7 @@ impl OptHeap {
                         ctx.emit_extra(ctx.current_pass_idx, p);
                     }
                 }
-                Self::emit_lazy_setfield(&mut lazy_op, ctx);
+                Self::emit_lazy_setfield(&lazy_op, ctx);
                 // can_cache=True: put_field_back_to_info
                 let final_value = lazy_op.arg(1);
                 let lazy_descr = lazy_op.getdescr().unwrap().clone();
@@ -2480,7 +2485,12 @@ impl OptHeap {
         OptimizationResult::Emit(op.clone())
     }
 
-    fn optimize_setfield(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_setfield(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let key = match Self::field_key(op) {
             Some(k) => k,
             None => return OptimizationResult::Emit(op.clone()),
@@ -2495,7 +2505,7 @@ impl OptHeap {
         // escape tracking outside the do_setfield contract.
         self.escape_from_write(ctx, obj, op.arg(1).to_opref());
         // heap.py do_setfield line-by-line.
-        self.do_setfield_field(op, &descr, obj, ctx)
+        self.do_setfield_field(op, op_rc, &descr, obj, ctx)
     }
 
     /// heap.py `AbstractCachedEntry.do_setfield(optheap, op)`
@@ -2533,6 +2543,7 @@ impl OptHeap {
     fn do_setfield_field(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         descr: &DescrRef,
         obj: OpRef,
         ctx: &mut OptContext,
@@ -2592,7 +2603,7 @@ impl OptHeap {
         }
         // heap.py:89-91 common case: self._lazy_set = op
         let cf = self.field_cache(descr);
-        cf.lazy_set = Some(op.clone());
+        cf.lazy_set = Some(std::rc::Rc::clone(op_rc));
         OptimizationResult::Remove
     }
 
@@ -2636,7 +2647,7 @@ impl OptHeap {
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&mut lazy_op, ctx);
+                Self::emit_lazy_setfield(&lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2668,6 +2679,7 @@ impl OptHeap {
     fn do_setfield_array(
         &mut self,
         op: &Op,
+        op_rc: &majit_ir::OpRc,
         descr: &DescrRef,
         array: OpRef,
         descr_idx: usize,
@@ -2727,7 +2739,7 @@ impl OptHeap {
         }
         // heap.py:89-91 common case: self._lazy_set = op
         let cai = self.arrayitem_cache(descr, const_index);
-        cai.lazy_set = Some(op.clone());
+        cai.lazy_set = Some(std::rc::Rc::clone(op_rc));
         OptimizationResult::Remove
     }
 
@@ -2786,7 +2798,7 @@ impl OptHeap {
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&mut lazy_op, ctx);
+                Self::emit_lazy_setfield(&lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2916,7 +2928,7 @@ impl OptHeap {
                             ctx.emit_extra(ctx.current_pass_idx, p);
                         }
                     }
-                    Self::emit_lazy_setfield(&mut lazy_op, ctx);
+                    Self::emit_lazy_setfield(&lazy_op, ctx);
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
@@ -3055,7 +3067,12 @@ impl OptHeap {
         OptimizationResult::Emit(op.clone())
     }
 
-    fn optimize_setarrayitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_setarrayitem(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // heapcache.py _escape_from_write parity:
         let array_obj = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         let stored_value = op.arg(2).to_opref();
@@ -3088,7 +3105,7 @@ impl OptHeap {
         let descr = op.getdescr().unwrap();
         // heap.py ArrayCachedItem.do_setfield (shared body via
         // AbstractCachedEntry).
-        let result = self.do_setfield_array(op, &descr, array, descr_idx, const_index, ctx);
+        let result = self.do_setfield_array(op, op_rc, &descr, array, descr_idx, const_index, ctx);
         // heap.py `submap.clear_varindex()` AFTER do_setfield (called
         // at the optimize_SETARRAYITEM_GC site — outside do_setfield).
         if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
@@ -3274,7 +3291,7 @@ impl OptHeap {
             OpCode::SetfieldRaw => OptimizationResult::Emit(op.clone()),
 
             // ── Field writes ──
-            OpCode::SetfieldGc => self.optimize_setfield(op, ctx),
+            OpCode::SetfieldGc => self.optimize_setfield(op, op_rc, ctx),
 
             // ── Array item reads ──
             OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => {
@@ -3291,7 +3308,7 @@ impl OptHeap {
             }
 
             // ── Array item writes ──
-            OpCode::SetarrayitemGc => self.optimize_setarrayitem(op, ctx),
+            OpCode::SetarrayitemGc => self.optimize_setarrayitem(op, op_rc, ctx),
             OpCode::SetarrayitemRaw => OptimizationResult::Emit(op.clone()),
 
             // ── Interior field reads ──
@@ -3665,7 +3682,10 @@ impl Optimization for OptHeap {
         if op.opcode.is_guard() {
             let pending_virtual = self.force_lazy_sets_for_guard(self_pass_idx, ctx);
             // heap.py:433: self.optimizer.pendingfields = pendingfields
-            ctx.pending_for_guard = pending_virtual;
+            ctx.pending_for_guard = pending_virtual
+                .into_iter()
+                .map(|op| (*op).clone())
+                .collect();
             ctx.current_pass_idx = saved_pass_idx;
             return;
         }

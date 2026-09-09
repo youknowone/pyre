@@ -3219,6 +3219,13 @@ impl OptContext {
     pub fn emit_extra(&mut self, after_pass_idx: usize, op: Op) -> OpRef {
         // emit_extra enters the chain at the pass AFTER the caller; the first
         // re-processing pass is `after_pass_idx + 1`.
+        self.emit_extra_at(after_pass_idx + 1, std::rc::Rc::new(op))
+    }
+
+    /// `emit_extra` when the caller already holds the ResOperation object
+    /// (`heap.py _lazy_set = op` then `emit_extra(op)`). Queue that `OpRc`
+    /// instead of a second `cls()`.
+    pub fn emit_extra_rc(&mut self, after_pass_idx: usize, op: majit_ir::OpRc) -> OpRef {
         self.emit_extra_at(after_pass_idx + 1, op)
     }
 
@@ -3226,7 +3233,7 @@ impl OptContext {
     /// `start_pass`. `emit_extra` enters downstream of the caller; head
     /// re-dispatch (`send_extra_operation`, optimizer.py with
     /// `opt=first_optimization`) enters at pass 0.
-    fn emit_extra_at(&mut self, start_pass: usize, mut op: Op) -> OpRef {
+    fn emit_extra_at(&mut self, start_pass: usize, op: majit_ir::OpRc) -> OpRef {
         if op.pos.get().is_none() {
             // Typed allocation, same rationale as `emit`.
             op.pos.set(self.reserve_pos_typed(op.result_type()));
@@ -3239,12 +3246,11 @@ impl OptContext {
         // through `propagate_one` into `new_operations`, `op_at` resolves
         // its type without the side-table detour.
         Self::debug_assert_box_type_invariant(&op);
-        let op_rc = std::rc::Rc::new(op);
         // Register the queued op as the producer for its position so a fold
         // through `make_equal_to(from_bound_op(op_rc), ..)` reaches a host
         // `find_producer_op` resolves to.
-        self.register_extra_producer(&op_rc);
-        self.extra_operations_after.push_back((start_pass, op_rc));
+        self.register_extra_producer(&op);
+        self.extra_operations_after.push_back((start_pass, op));
         pos_ref
     }
 
@@ -3257,7 +3263,7 @@ impl OptContext {
         if self.in_final_emission {
             self.emit(op)
         } else {
-            self.emit_extra_at(0, op)
+            self.emit_extra_at(0, std::rc::Rc::new(op))
         }
     }
 

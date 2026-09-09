@@ -6392,8 +6392,11 @@ mod tests {
         let mut ctx = OptContext::new(2);
         let lhs = rooted_resop_operand(Type::Int, 0);
         let rhs = rooted_resop_operand(Type::Int, 1);
-        ctx.emit_extra_at(0, Op::new(OpCode::IntAdd, &[lhs.clone(), rhs.clone()]));
-        ctx.emit_extra_at(0, Op::new(OpCode::IntSub, &[lhs, rhs]));
+        ctx.emit_extra_at(
+            0,
+            std::rc::Rc::new(Op::new(OpCode::IntAdd, &[lhs.clone(), rhs.clone()])),
+        );
+        ctx.emit_extra_at(0, std::rc::Rc::new(Op::new(OpCode::IntSub, &[lhs, rhs])));
 
         let result = opt.drain_extra_operations_from(0, &mut ctx);
 
