@@ -5754,35 +5754,10 @@ impl Optimizer {
         // directly at serialization time in resume.rs via env.has_known_class(),
         // matching RPython's per-livebox getptrinfo(box).get_known_class(cpu).
 
-        // Pyre-only trailing resume section. PyPy's bridge retraces from
-        // the loop COMPARE and re-proves the bound; pyre's resume starts
-        // after that compare, so the bound the loop already has on each
-        // integer failarg has to travel with the guard.
-        let mut int_bounds = Vec::new();
-        for &arg in failargs {
-            if arg.is_none() || arg.is_constant() {
-                continue;
-            }
-            let Some(arg_box) = ctx.get_box_replacement_operand_opt(arg) else {
-                continue;
-            };
-            if !matches!(ctx.opref_type(arg_box.to_opref()), Some(Type::Int)) {
-                continue;
-            }
-            let Some(bound) = ctx.peek_intbound_box(&arg_box) else {
-                continue;
-            };
-            if bound.is_unbounded() {
-                continue;
-            }
-            int_bounds.push((arg_box.to_opref(), bound.lower, bound.upper));
-        }
-
         crate::resume::OptimizerKnowledgeForResume {
             heap_fields,
             heap_arrayitems,
             loopinvariant_results,
-            int_bounds,
         }
     }
 

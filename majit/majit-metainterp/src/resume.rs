@@ -4906,12 +4906,6 @@ pub struct OptimizerKnowledgeForResume {
     pub heap_arrayitems: Vec<(majit_ir::OpRef, i64, i32, majit_ir::OpRef)>,
     /// (const_func_ptr, result_opref) loop-invariant call results.
     pub loopinvariant_results: Vec<(i64, majit_ir::OpRef)>,
-    /// Integer failarg bounds the loop already proved. PyPy's bridge
-    /// retraces from the loop COMPARE and re-establishes them via
-    /// `IntLt`; pyre's resume starts after that compare, so the bound
-    /// has to ride with the guard. Optional trailing section: readers
-    /// treat EOF as empty.
-    pub int_bounds: Vec<(majit_ir::OpRef, i64, i64)>,
 }
 
 impl OptimizerKnowledgeForResume {
@@ -4919,7 +4913,6 @@ impl OptimizerKnowledgeForResume {
         self.heap_fields.is_empty()
             && self.heap_arrayitems.is_empty()
             && self.loopinvariant_results.is_empty()
-            && self.int_bounds.is_empty()
     }
 }
 

@@ -211,25 +211,6 @@ pub fn serialize_optimizer_knowledge(
         let result_tag = tag_box(result, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(result_tag as i32);
     }
-
-    // Trailing int-bound section. Pyre's bridge does not retrace the
-    // loop COMPARE the way PyPy does; the bound the loop already
-    // proved on each integer failarg rides here. Empty when nothing
-    // was proved. Older rd_numb without this section is still read:
-    // deserialize treats EOF as no bounds.
-    let filtered_bounds: Vec<(OpRef, i64, i64)> = knowledge
-        .int_bounds
-        .iter()
-        .copied()
-        .filter(|&(op, _, _)| env.is_const(op) || available_boxes.contains(&op))
-        .collect();
-    numb_state.append_int(filtered_bounds.len() as i64);
-    for (op, lower, upper) in &filtered_bounds {
-        let op_tag = tag_box(*op, &numb_state.liveboxes, memo, env, new_liveboxes)?;
-        numb_state.writer.append_short(op_tag as i32);
-        numb_state.append_int(*lower);
-        numb_state.append_int(*upper);
-    }
     Ok(())
 }
 
@@ -381,22 +362,6 @@ pub fn deserialize_optimizer_knowledge(
     // bridgeopt.py:184-185: optimizer.optrewrite.deserialize_optrewrite(...)
     if !result_loopinvariant.is_empty() {
         optimizer.import_loopinvariant_knowledge(&result_loopinvariant);
-    }
-
-    // Optional trailing section: older rd_numb stops after loopinvariant.
-    if reader.has_more() {
-        let length = reader.next_item();
-        for _ in 0..length {
-            let tagged = reader.next_item() as i16;
-            let box1 = decode_box(tagged, rd_consts, liveboxes);
-            let lower = reader.next_item() as i64;
-            let upper = reader.next_item() as i64;
-            let opref = decoded_box_to_opref(&box1, ctx);
-            if let Some(arg_box) = ctx.get_box_replacement_operand_opt(opref) {
-                let imported = majit_ir::intbound::IntBound::new(lower, upper, 0, u64::MAX);
-                let _ = ctx.with_intbound_mut(&arg_box, |bm| bm.intersect(&imported));
-            }
-        }
     }
 }
 
