@@ -2588,6 +2588,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 )),
             );
         }
+        let result_as_ref_rewritten = crate::front::result_as_ref::rewire_result_as_ref_sites(
+            &mut lo.graph,
+            &lo.result_as_ref_sites,
+        );
         if let Some(site) = lo
             .result_map_err_sites
             .iter()
@@ -2919,6 +2923,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         } else {
             crate::front::option_expect::rewire_expect_call_sites(&mut lo.graph, &lo.expect_sites)
         };
+        let result_expect_rewritten = crate::front::option_unwrap::rewire_result_expect_sites(
+            &mut lo.graph,
+            &lo.result_expect_sites,
+        );
         // The `Option::map_or` closure-select rewrite (`front::option_map_or`)
         // splits the residual `map_or` call block into a `__discriminant`
         // diamond whose `Some` arm calls the closure, same post-lowering shape
@@ -3013,6 +3021,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
             || expect_rewritten > 0
+            || result_expect_rewritten > 0
+            || result_as_ref_rewritten > 0
             || map_or_rewritten > 0
             || closure_select_rewritten > 0
         {
@@ -3626,6 +3636,8 @@ struct Lowering<'a> {
     /// Ok/Err closure-select before the exception-link pass consumes the
     /// newly built result shells.
     result_map_err_sites: Vec<crate::front::result_map_err::ResultMapErrSite>,
+    result_as_ref_sites: Vec<crate::front::result_as_ref::ResultAsRefSite>,
+    result_expect_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.  The paired [`ValueType`] is the
@@ -3987,6 +3999,8 @@ impl<'a> Lowering<'a> {
             result_exc_call_results: Vec::new(),
             option_ok_or_else_try_sites: Vec::new(),
             result_map_err_sites: Vec::new(),
+            result_as_ref_sites: Vec::new(),
+            result_expect_sites: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
             checked_arith_ok_or_else_sites: Vec::new(),
@@ -11905,6 +11919,41 @@ impl<'a> Lowering<'a> {
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.local_var[dest_local] = Some(result_var.clone());
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && callee_name_path.as_deref().is_some_and(|path| {
+                matches!(
+                    path.split("::").collect::<Vec<_>>().as_slice(),
+                    [
+                        "core" | "std",
+                        "result",
+                        "<Impl>" | "Result",
+                        "as_ref" | "expect"
+                    ]
+                )
+            })
+        {
+            if name == "as_ref" && args.len() == 1 {
+                if let Some(site) = self.recognize_result_as_ref_site(
+                    first_arg_ty.as_ref(),
+                    &call.dest.ty,
+                    &result_var,
+                ) {
+                    self.result_as_ref_sites.push(site);
+                }
+            } else if name == "expect"
+                && args.len() == 2
+                && first_arg_ty
+                    .as_ref()
+                    .is_some_and(|ty| crate::front::result_exc::tyref_is_result(ty, self.llbc))
+                && let Some(site) = self.recognize_unwrap_site(first_arg_ty.as_ref(), &result_var)
+            {
+                self.result_expect_sites.push(site);
+            }
+        }
         // `Option::ok_or_else(opt, closure)?` is one combined value-or-raise
         // boundary in the translated graph.  Record it separately from an
         // ordinary scoped `Result` call: `ok_or_else` is a foreign core
@@ -15737,6 +15786,80 @@ impl<'a> Lowering<'a> {
             mapped_err_class_root: enum_payload_instance_class_root(&dest_err, self.llbc),
             args_tuple_suffix: payload_tuple_suffix(&recv_err, self.llbc),
             closure_env_is_trivially_dropless,
+        })
+    }
+
+    /// core::result::Result::as_ref, restricted to payloads already modelled
+    /// as immutable RPython scalars/strings. Other payloads need a separate
+    /// address/lifetime representation; register-bank equality alone is not
+    /// sufficient evidence that their borrows can be copied as values.
+    fn recognize_result_as_ref_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::result_as_ref::ResultAsRefSite> {
+        let recv_ty = self.tyref_peel_ref_to_pointee(recv_ty?)?;
+        if !crate::front::result_exc::tyref_is_result(&recv_ty, self.llbc)
+            || !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc)
+        {
+            return None;
+        }
+        let source_types = [
+            self.tyref_adt_type_arg(&recv_ty, 0)?,
+            self.tyref_adt_type_arg(&recv_ty, 1)?,
+        ];
+        let mut payload_types = [ValueType::Unknown, ValueType::Unknown];
+        for (index, source) in source_types.iter().enumerate() {
+            let destination = self.tyref_adt_type_arg(dest_ty, index)?;
+            let node = strip_ty_indirections(tyref_node(&destination, self.llbc)?, self.llbc)?;
+            let reference = node.get("Ref")?.as_array()?;
+            if reference.get(2)?.as_str()? != "Shared" {
+                return None;
+            }
+            let pointee = self.tyref_peel_ref_to_pointee(&destination)?;
+            if tyref_to_ast_string(source, self.llbc) != tyref_to_ast_string(&pointee, self.llbc) {
+                return None;
+            }
+            let ty = tyref_to_value_type(source, self.llbc);
+            if !matches!(
+                ty,
+                ValueType::Int
+                    | ValueType::Unsigned
+                    | ValueType::Bool
+                    | ValueType::Float
+                    | ValueType::Str
+            ) || ty != tyref_enum_payload_value_type(&destination, self.llbc)
+            {
+                return None;
+            }
+            payload_types[index] = ty;
+        }
+        let source_decl = self.llbc.type_by_id(self.tyref_adt_def_id(&recv_ty)?)?;
+        let dest_decl = self.llbc.type_by_id(self.tyref_adt_def_id(dest_ty)?)?;
+        let receiver_owner = format!(
+            "{}{}",
+            source_decl.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(&recv_ty, self.llbc)
+        );
+        let result_owner = format!(
+            "{}{}",
+            dest_decl.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        Some(crate::front::result_as_ref::ResultAsRefSite {
+            result_var: result_var.clone(),
+            receiver_variants: [
+                Self::tagged_pair_payload_owner(source_decl, &receiver_owner, 0)?,
+                Self::tagged_pair_payload_owner(source_decl, &receiver_owner, 1)?,
+            ],
+            result_variants: [
+                Self::tagged_pair_payload_owner(dest_decl, &result_owner, 0)?,
+                Self::tagged_pair_payload_owner(dest_decl, &result_owner, 1)?,
+            ],
+            receiver_owner,
+            result_owner,
+            payload_types,
         })
     }
 
