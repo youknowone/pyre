@@ -909,6 +909,16 @@ pub fn is_abi_unsound_argument_residual(addr: usize) -> bool {
         .contains(&(addr as i64))
 }
 
+/// Runtime word of `lltype.cast_ptr_to_int`: the residual carries a GCREF.
+fn residual_cast_ptr_to_int(ptr: *const u8) -> i64 {
+    ptr as i64
+}
+
+/// Runtime word of `lltype.cast_int_to_ptr`: the residual returns a GCREF.
+fn residual_cast_int_to_ptr(value: i64) -> *const u8 {
+    value as *const u8
+}
+
 /// [`jit_trace_fnaddrs`] and the [`is_abi_unsound_argument_residual`] set,
 /// which the publication sites fill in one pass.
 fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
@@ -2372,6 +2382,30 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::pycode::w_code_getname_w",
         crate::pycode::w_code_getname_w,
+    );
+    // `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr` emit the
+    // `cast_ptr_to_int` / `cast_int_to_ptr` opcodes when the typer sees
+    // them. A residual call still names the RPython helper path; without
+    // these rows interpret panics on the symbolic hash.
+    p1(
+        &mut entries,
+        "rpython::rtyper::lltypesystem::lltype::cast_ptr_to_int",
+        residual_cast_ptr_to_int,
+    );
+    p1(
+        &mut entries,
+        "rpython::rtyper::lltypesystem::lltype::cast_int_to_ptr",
+        residual_cast_int_to_ptr,
+    );
+    p1(
+        &mut entries,
+        "rtyper::lltypesystem::lltype::cast_ptr_to_int",
+        residual_cast_ptr_to_int,
+    );
+    p1(
+        &mut entries,
+        "rtyper::lltypesystem::lltype::cast_int_to_ptr",
+        residual_cast_int_to_ptr,
     );
     // `compare` residualizes its `compare_slot` tail: the slot body reads two
     // `&[u8]` through `core::slice::cmp`, which has no LLBC, so the source lift
