@@ -7154,7 +7154,7 @@ impl OptContext {
             // holes on the latter backends, shifting the known-class
             // bitfield into the heap-knowledge stream.
             fd.set_rd_locs(logical_rd_locs);
-            fd.set_rd_numb(Some(rd_numb));
+            fd.set_rd_numb_arc(Some(rd_numb));
             fd.set_rd_consts_arc(Some(rd_consts));
             fd.set_rd_virtuals(descr_rd_virtuals);
             fd.set_rd_pendingfields(descr_pending);

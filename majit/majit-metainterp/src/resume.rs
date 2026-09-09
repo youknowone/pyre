@@ -264,6 +264,9 @@ impl NumberingState {
     pub fn create_numbering(&self) -> Vec<u8> {
         self.writer.create_numbering()
     }
+    pub fn create_numbering_arc(&self) -> Arc<[u8]> {
+        self.writer.create_numbering_arc()
+    }
 }
 
 /// RPython snapshot: the state captured at a guard point.
@@ -4425,7 +4428,7 @@ impl ResumeDataLoopMemo {
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
     ) -> Result<
         (
-            Vec<u8>,
+            Arc<[u8]>,
             Arc<majit_ir::SharedConstPool>,
             Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
             Vec<majit_ir::OpRef>,
@@ -4635,7 +4638,7 @@ impl ResumeDataLoopMemo {
         )?;
 
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
-        let rd_numb = numb_state.create_numbering();
+        let rd_numb = numb_state.create_numbering_arc();
         let rd_consts = self.consts.clone();
 
         // Resolve each livebox through the forwarding chain so the backend

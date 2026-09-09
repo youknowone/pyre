@@ -9,6 +9,11 @@
 
 /// resumecode.py: append_numbering(lst, item)
 pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
+    let (bytes, n) = encode_varint_bytes(value);
+    buf.extend_from_slice(&bytes[..n]);
+}
+
+fn encode_varint_bytes(value: i32) -> ([u8; 3], usize) {
     let mut item = (value as i64) * 2;
     if item < 0 {
         item = -1 - item;
@@ -17,15 +22,19 @@ pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
     let item = item as u32;
 
     if item < (1 << 7) {
-        buf.push(item as u8);
+        ([item as u8, 0, 0], 1)
     } else if item < (1 << 14) {
-        buf.push((item | 0x80) as u8);
-        buf.push((item >> 7) as u8);
+        ([(item | 0x80) as u8, (item >> 7) as u8, 0], 2)
     } else {
         assert!(item < (1 << 16), "resumecode item too large: {item}");
-        buf.push((item | 0x80) as u8);
-        buf.push(((item >> 7) | 0x80) as u8);
-        buf.push((item >> 14) as u8);
+        (
+            [
+                (item | 0x80) as u8,
+                ((item >> 7) | 0x80) as u8,
+                (item >> 14) as u8,
+            ],
+            3,
+        )
     }
 }
 
@@ -144,6 +153,18 @@ impl Writer {
             encode_varint(&mut buf, item);
         }
         buf
+    }
+
+    /// Encode onto the stack when the numbering fits, then one `Arc` copy.
+    /// Avoids the 64 B `Vec` that `create_numbering` used to hand to
+    /// `set_rd_numb` for a second 64 B `Arc`.
+    pub fn create_numbering_arc(&self) -> std::sync::Arc<[u8]> {
+        let mut buf = smallvec::SmallVec::<[u8; 128]>::new();
+        for &item in &self.current {
+            let (bytes, n) = encode_varint_bytes(item);
+            buf.extend_from_slice(&bytes[..n]);
+        }
+        std::sync::Arc::from(buf.as_slice())
     }
 
     /// resumecode.py: patch_current_size
