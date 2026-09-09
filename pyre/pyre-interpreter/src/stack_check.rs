@@ -763,7 +763,7 @@ pub fn stack_check() -> Result<(), PyError> {
     // CPython 3.14 checks `py_recursion_remaining`, i.e. Python interpreter
     // depth, independently of native stack protection.  pyre's matching
     // counter is bumped around every user-function call.
-    recursion_depth_check(crate::call::py_recursion_depth())?;
+    check_recursion_depth()?;
     let current = current_sp();
     let end = PYRE_STACKTOOBIG.stack_end.load(Ordering::Relaxed);
     let length = PYRE_STACKTOOBIG.stack_length.load(Ordering::Relaxed);
@@ -785,6 +785,17 @@ pub extern "C" fn stack_check_jit_abi() -> i64 {
         Ok(()) => 0,
         Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
     }
+}
+
+/// Run only [`stack_check`]'s logical Python-activation-depth half.
+///
+/// A compiled fragment already carries the backend's native-stack probe at
+/// its entry. Its guard exit still has to reproduce `PyFrame.execute_frame`'s
+/// check against `sys.getrecursionlimit()`, without paying for that native
+/// probe a second time when it enters the portal runner.
+#[inline]
+pub fn check_recursion_depth() -> Result<(), PyError> {
+    recursion_depth_check(crate::call::py_recursion_depth())
 }
 
 /// The logical half of [`stack_check`]: `execute_frame`'s entry test against

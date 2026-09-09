@@ -1288,6 +1288,7 @@ impl<'a> Transformer<'a> {
     /// directly.
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
+        join_blocks(&mut rewritten);
 
         // PRE-EXISTING-ADAPTATION: jtransform.py transform_graph starts with
         // constant_fold_ll_issubclass(graph, cpu), folding constant calls to
@@ -7857,6 +7858,112 @@ fn optimize_goto_if_not(graph: &mut FunctionGraph, block_idx: usize) -> bool {
     false
 }
 
+/// `simplify.py join_blocks(graph)`: a link that is the single exit of a
+/// block without an exitswitch and the single entry of its target is
+/// deleted, the target's operations (inputargs renamed to the link's
+/// arguments) appended to the block, and the target's exitswitch and exits
+/// taken over.
+///
+/// Upstream runs it on every flow graph before annotation, so the graphs
+/// jtransform sees have no such links.  Pyre's MIR front lowers every call
+/// as its own block terminator, which leaves the result of a call in one
+/// block and the `bool` exitswitch that tests it in the next -- across the
+/// link, `optimize_goto_if_not` cannot fuse the test: every `is_null()`
+/// (`ptr_iszero`) opening `py_type_check` /
+/// `is_exact_builtin_instance` stayed a standalone op plus a
+/// `goto_if_not`, and a descended `int + int` recorded six of them as
+/// `ptr_eq` + `guard_false` pairs.  Joining here, ahead of the per-block
+/// rewrite, is what lets the fusion see them.
+///
+/// A link carrying a constant argument is left alone: the model's
+/// operations read variables only, so renaming an inputarg to a constant
+/// has no operand to write it into.  The joined-away block is emptied in
+/// place (no operations, no exits) rather than removed, so every block
+/// index -- `returnblock`, `exceptblock`, the per-block rewrite loop --
+/// keeps its meaning.
+fn join_blocks(graph: &mut FunctionGraph) {
+    use crate::model::LinkArg;
+    let mut entry_count = vec![0usize; graph.blocks.len()];
+    for block in &graph.blocks {
+        for link in &block.exits {
+            entry_count[link.target.0] += 1;
+        }
+    }
+    // `mkentrymap` seeds a synthetic entry link into `graph.startblock`.
+    // Counting it keeps a start block whose only in-edge is a backedge from
+    // reading as single-entry; `joinable` would otherwise absorb the graph's
+    // entry into its own predecessor and empty it.
+    entry_count[graph.startblock.0] += 1;
+    let mut seen = vec![false; graph.blocks.len()];
+    seen[graph.startblock.0] = true;
+    let mut stack: Vec<(usize, usize)> = (0..graph.blocks[graph.startblock.0].exits.len())
+        .map(|exit_idx| (graph.startblock.0, exit_idx))
+        .collect();
+    while let Some((prev, exit_idx)) = stack.pop() {
+        let Some(link) = graph.blocks[prev].exits.get(exit_idx) else {
+            continue;
+        };
+        let target = link.target.0;
+        let joinable = graph.blocks[prev].exitswitch.is_none()
+            && entry_count[target] == 1
+            && !graph.blocks[target].exits.is_empty()
+            && target != prev
+            && link.args.iter().all(|arg| matches!(arg, LinkArg::Value(_)));
+        if joinable {
+            debug_assert_eq!(graph.blocks[prev].exits.len(), 1);
+            let renaming: std::collections::HashMap<
+                crate::flowspace::model::Variable,
+                crate::flowspace::model::Variable,
+            > =
+                graph.blocks[target]
+                    .inputargs
+                    .iter()
+                    .cloned()
+                    .zip(graph.blocks[prev].exits[exit_idx].args.iter().filter_map(
+                        |arg| match arg {
+                            LinkArg::Value(var) => Some(var.clone()),
+                            LinkArg::Const(_) => None,
+                        },
+                    ))
+                    .collect();
+            let target_block = &graph.blocks[target];
+            let moved_ops: Vec<SpaceOperation> = target_block
+                .operations
+                .iter()
+                .map(|op| remap_op(op, &renaming))
+                .collect();
+            let (exitswitch, mut exits) = crate::model::remap_control_flow_metadata_var(
+                &target_block.exitswitch,
+                &target_block.exits,
+                |var| remap_value(var, &renaming),
+                |b| b,
+            );
+            for exit in &mut exits {
+                exit.prevblock = Some(crate::model::BlockId(prev));
+            }
+            {
+                let target_block = &mut graph.blocks[target];
+                target_block.inputargs.clear();
+                target_block.operations.clear();
+                target_block.exitswitch = None;
+                target_block.exits.clear();
+            }
+            let prev_block = &mut graph.blocks[prev];
+            prev_block.operations.extend(moved_ops);
+            prev_block.exitswitch = exitswitch;
+            prev_block.exits = exits;
+            // Re-examine the block with its new exits, as upstream re-pushes
+            // `link.prevblock.exits`.
+            stack.extend((0..graph.blocks[prev].exits.len()).map(|idx| (prev, idx)));
+            continue;
+        }
+        if !seen[target] {
+            seen[target] = true;
+            stack.extend((0..graph.blocks[target].exits.len()).map(|idx| (target, idx)));
+        }
+    }
+}
+
 /// `jtransform.py:206-209` supported-opname gate for
 /// [`optimize_goto_if_not`].  Returns the RPython opname and the op's
 /// operand Variables (`tuple(op.args)`) when the op is one of the
@@ -10313,6 +10420,87 @@ mod tests {
             "escaping v must be replaced with the link's bool constant, got {:?}",
             true_arm.args[0],
         );
+    }
+
+    /// A null test whose `ptr_iszero` sits in the block after a call
+    /// terminator: `join_blocks` folds the single-entry successor into its
+    /// predecessor, renaming the inputarg to the link variable, so
+    /// `optimize_goto_if_not` then fuses the test into the exitswitch.
+    #[test]
+    fn join_blocks_lets_goto_if_not_fuse_a_null_test_across_a_link() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("join_then_fuse");
+        let start = graph.startblock;
+        let a = graph.alloc_value_var();
+        let x = graph
+            .push_op_var(
+                start,
+                OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand: a.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        // `x` crosses a plain link into a block whose only work is the test.
+        let tester = graph.create_block();
+        let x_in = graph.alloc_value_var();
+        graph.push_inputarg_var(tester, x_in.clone());
+        let t = graph
+            .push_op_var(
+                tester,
+                OpKind::UnaryOp {
+                    op: "ptr_iszero".to_string(),
+                    operand: x_in.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        t.set_concretetype(Some(LowLevelType::Bool));
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        graph.set_control_flow_metadata(
+            tester,
+            Some(ExitSwitch::Value(t.clone())),
+            vec![
+                Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true))),
+            ],
+        );
+        graph.set_control_flow_metadata(
+            start,
+            None,
+            vec![Link::new_mixed(
+                vec![LinkArg::Value(x.clone())],
+                tester,
+                None,
+            )],
+        );
+
+        super::join_blocks(&mut graph);
+        let joined = &graph.blocks[start.0];
+        assert_eq!(
+            joined.exits.len(),
+            2,
+            "the tester's exits move to the start block"
+        );
+        assert!(
+            graph.blocks[tester.0].operations.is_empty() && graph.blocks[tester.0].exits.is_empty(),
+            "the joined-away block is emptied in place"
+        );
+        assert!(
+            joined.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. } if op == "ptr_iszero" && *operand == x
+            )),
+            "the moved test reads the link variable, not the dead inputarg"
+        );
+
+        assert!(super::optimize_goto_if_not(&mut graph, start.0));
     }
 
     /// the GotoIfNotOp lowering Stage 1: a non-supported result op (`int_add`) is NOT
