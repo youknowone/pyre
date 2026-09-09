@@ -70,6 +70,22 @@ discovery; this API does **not** claim to remove the measured per-call entry
 cost, binding cost, GC overhead, or actual host-function invocation cost. A
 dedicated low-overhead scalar ABI is separate work.
 
+The `majit` example `eager_vs_jit` probes that boundary using the same compiled
+token through `CompiledIr::execute` and `Backend::execute_token_raw`:
+
+```sh
+cargo run --release -p majit --no-default-features --features dynasm --example eager_vs_jit
+```
+
+Despite its historical name, it does not run a tracing frontend or compare AOT
+against JIT code generation. It reports one cold compilation, the first checked
+call, and seven-sample steady-state wall-clock minima for checked and raw entry.
+Inputs vary and integer overflow results are checked outside the timed loops.
+The panels run sequentially, so drift and timer noise prevent treating their
+difference as an exact cost decomposition. Both retain ordinary JITFRAME entry.
+Use `EAGER_BENCH_ITERS` to reduce iterations for a smoke run; use external power
+and the existing thread-CPU benchmark board for performance conclusions.
+
 For a CEL frontend, short-circuiting, errors, dynamic types and host side effects
 must survive lowering. Compiling an example input and treating the observed path
 as the whole program is not a valid implementation of this API's frontend.

@@ -295,7 +295,7 @@ use majit_backend::deadframe::FrameHeapOwner;
 use majit_backend::jitframe::{
     BASEITEMOFS, HostHeapGc, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
     JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, check_jitframe_descr, jitframe_is_gc_object,
-    jitframe_write_barrier, malloc_entry_jitframe_no_collect, malloc_jitframe_no_collect,
+    jitframe_write_barrier, malloc_entry_jitframe, malloc_jitframe_no_collect,
 };
 /// Byte offset of `jf_frame_length` from JitFrame start
 /// (`jitframe.py:84` — `jf_frame`'s length word sits at the array base).
@@ -8220,14 +8220,37 @@ fn run_compiled_code_inner(
     // llmodel.py:298 `frame = self.gc_ll_descr.malloc_jitframe(frame_info)`:
     // the descr decides whether the frame is a nursery object under JITFRAME
     // — traced through `jf_gcmap`, held by the shadow stack through a root
-    // slot the collector updates when it copies — or a host block. Input
-    // slots are read once at entry (before any GC point) and their values
-    // live in SSA/ref_root_slots afterward.
-    let (use_gc_alloc, jf) = with_gc_ll_descr(|gc| {
-        (
-            jitframe_is_gc_object(gc),
-            malloc_entry_jitframe_no_collect(gc, payload_bytes),
-        )
+    // slot the collector updates when it copies — or a host block.
+    // `execute_token` receives typed `Value`s, so it can root refs across
+    // that collecting malloc the way dynasm `alloc_entry_jitframe` does.
+    // Flattened `i64` re-entry cannot name which words are refs, so it keeps
+    // the non-collecting allocator.
+    type EntryArgRoots = Vec<majit_gc::shadow_stack::OwnerRootGuard>;
+    let (use_gc_alloc, jf, arg_roots) = with_gc_ll_descr(|gc| {
+        let gc_object = jitframe_is_gc_object(gc);
+        match inputs {
+            FrameInputs::Values(values) => {
+                let roots: EntryArgRoots = if gc_object {
+                    values
+                        .iter()
+                        .filter_map(|arg| match arg {
+                            Value::Ref(value) => {
+                                Some(majit_gc::shadow_stack::OwnerRootGuard::new(*value))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (gc_object, malloc_entry_jitframe(gc, payload_bytes), roots)
+            }
+            FrameInputs::Ints(_) | FrameInputs::OwnedInts(_) => (
+                gc_object,
+                malloc_jitframe_no_collect(gc, payload_bytes),
+                Vec::new(),
+            ),
+        }
     });
     let jf_gcref = GcRef(jf as usize);
     unsafe {
@@ -8241,8 +8264,31 @@ fn run_compiled_code_inner(
 
     let jf_ptr = jf_gcref.0 as *mut i64;
 
-    // llmodel.py:306-315: set arguments in frame
-    unsafe { inputs.write_into(jf_ptr.add(header_words)) };
+    // llmodel.py:306-315: set arguments in frame. Collecting malloc may have
+    // moved the rooted refs; write the forwarded copies, then drop the
+    // owner-root slots so they are not extra GC roots during the run
+    // (dynasm `alloc_entry_jitframe` / `drop(arg_roots)`).
+    unsafe {
+        if let FrameInputs::Values(values) = inputs {
+            let mut ref_index = 0;
+            for (i, arg) in values.iter().enumerate() {
+                let raw = match arg {
+                    Value::Int(v) => *v,
+                    Value::Float(v) => v.to_bits() as i64,
+                    Value::Ref(r) => {
+                        let current = arg_roots.get(ref_index).map_or(*r, |root| root.get());
+                        ref_index += 1;
+                        current.0 as i64
+                    }
+                    Value::Void => 0,
+                };
+                *jf_ptr.add(header_words + i) = raw;
+            }
+        } else {
+            inputs.write_into(jf_ptr.add(header_words));
+        }
+    }
+    drop(arg_roots);
     // The one repeatable part of a compiled entry's call. Everything past this
     // point runs the trace and cannot be made to happen twice, but allocating
     // the frame and writing the arguments into it produces a frame NOTHING has
