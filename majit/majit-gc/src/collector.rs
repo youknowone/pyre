@@ -6699,6 +6699,14 @@ impl MiniMarkGC {
             }
             if unsafe { (*header_of(candidate)).is_forwarded() } {
                 let fwd = unsafe { GcHeader::forwarding_address(header_of(candidate)) };
+                // A payload word can equal FORWARDED_MARKER. The word after
+                // it is then not a live object start; refuse an unaligned
+                // or non-heap forwarding address before reading its header.
+                if !fwd.is_multiple_of(GcHeader::ALIGN)
+                    || !(self.oldgen.contains(fwd) || self.is_in_nursery(fwd))
+                {
+                    continue;
+                }
                 let Some(size) =
                     self.try_size_for_typeid(fwd, unsafe { (*header_of(fwd)).type_id() })
                 else {
@@ -14934,6 +14942,22 @@ cache size\t: 8192 kB\n";
             "interior root must snap to the same forwarded object"
         );
         assert_eq!(unsafe { *(exact.0 as *const u64) }, 0x42);
+    }
+
+    #[test]
+    fn test_enclosing_snap_ignores_forwarded_marker_payload_words() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(48));
+        let obj = gc.alloc_with_type(tid, 48);
+        unsafe {
+            *(obj.0 as *mut u64) = crate::header::FORWARDED_MARKER;
+            *((obj.0 + 8) as *mut usize) = 0xffff_ffff_ffff_ffce;
+        }
+        let mut exact = obj;
+        gc.drag_out_root(&mut exact);
+        let mut interior = GcRef(obj.0 + 24);
+        gc.drag_out_root(&mut interior);
+        assert_eq!(exact.0, interior.0);
     }
 
     /// incminimark.py:3068-3079 dead-target branch. A WEAKREF whose
