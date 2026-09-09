@@ -1679,10 +1679,25 @@ struct DescrWords {
     stamp: u32,
 }
 
-/// High bit marks a [`DescrWords`] box. Heap pointers are 48-bit;
-/// `pack_forwarded` SmallConst ids would need bit 28 of the id to
-/// collide (256M mints).
+/// Descr + `_forwarded` without extra/stamp. Thin descr is 8 B and
+/// the packed forwarded word is 8 B, so the pair is 16 B — not a
+/// 24 B `DescrFwd` plus a 24 B `DescrWords`.
+struct ThinFwd {
+    thin: usize,
+    forwarded: u64,
+}
+
+/// High bit marks a [`DescrWords`] or [`ThinFwd`] box. Heap pointers
+/// are 48-bit; `pack_forwarded` SmallConst ids would need bit 28 of
+/// the id to collide (256M mints).
 const SLOT_BOX_BIT: usize = 1 << 63;
+/// Boxed [`ThinFwd`]. Distinct from [`THIN_DESCR_BIT`] (62) and the
+/// box bit (63). Heap pointers do not set bit 61.
+const SLOT_THIN_FWD_BIT: usize = 1 << 61;
+/// Extra-only `Box<OpKindExtra>` pointer, no `DescrWords` wrapper.
+const SLOT_EXTRA_BIT: usize = 1 << 60;
+/// `Box<BothPayload>` pointer, no `DescrWords` wrapper.
+const SLOT_BOTH_BIT: usize = 1 << 59;
 /// Descr-only (no extra / stamp / forwarded) is a thin word: data
 /// pointer in bits 0-47, interned vtable id in 48-55, this flag at 62.
 /// Distinct from `pack_forwarded` SmallConst (low 3 bits = 3).
@@ -1711,6 +1726,26 @@ fn descr_vtable_at(id: u8) -> usize {
 
 fn is_thin_descr(w: usize) -> bool {
     w & SLOT_BOX_BIT == 0 && w & THIN_DESCR_BIT != 0 && w & 7 == 0
+}
+
+fn is_thin_fwd_box(w: usize) -> bool {
+    w & SLOT_BOX_BIT != 0 && w & SLOT_THIN_FWD_BIT != 0
+}
+
+fn is_extra_inline(w: usize) -> bool {
+    w & SLOT_BOX_BIT == 0 && w & SLOT_EXTRA_BIT != 0 && w & 7 == 0
+}
+
+fn is_both_inline(w: usize) -> bool {
+    w & SLOT_BOX_BIT == 0 && w & SLOT_BOTH_BIT != 0 && w & 7 == 0
+}
+
+fn tagged_ptr(w: usize) -> usize {
+    w & THIN_DESCR_PTR_MASK
+}
+
+fn box_payload(w: usize) -> usize {
+    w & !SLOT_BOX_BIT & !SLOT_THIN_FWD_BIT
 }
 
 fn encode_thin_descr(d: DescrRef) -> Result<usize, DescrRef> {
@@ -1767,11 +1802,18 @@ impl DescrSlot {
         let w = self.word();
         if w == 0 {
             (0, 0)
+        } else if is_thin_fwd_box(w) {
+            let p = box_payload(w) as *const ThinFwd;
+            thin_to_lo_hi(unsafe { (*p).thin })
         } else if w & SLOT_BOX_BIT != 0 {
-            let p = (w & !SLOT_BOX_BIT) as *const DescrWords;
+            let p = box_payload(w) as *const DescrWords;
             unsafe { ((*p).lo, (*p).hi) }
         } else if is_thin_descr(w) {
             thin_to_lo_hi(w)
+        } else if is_extra_inline(w) {
+            (tagged_ptr(w), EXTRA_TAG)
+        } else if is_both_inline(w) {
+            (tagged_ptr(w), BOTH_TAG)
         } else {
             (w, FWD_TAG)
         }
@@ -1779,8 +1821,10 @@ impl DescrSlot {
 
     fn stamp_word(&self) -> u32 {
         let w = self.word();
-        if w & SLOT_BOX_BIT != 0 {
-            let p = (w & !SLOT_BOX_BIT) as *const DescrWords;
+        if is_thin_fwd_box(w) {
+            0
+        } else if w & SLOT_BOX_BIT != 0 {
+            let p = box_payload(w) as *const DescrWords;
             unsafe { (*p).stamp }
         } else {
             0
@@ -1789,19 +1833,39 @@ impl DescrSlot {
 
     fn set_stamp_word(&self, stamp: u32) {
         let w = self.word();
+        if is_thin_fwd_box(w) {
+            // Recording only: promote to DescrWords so stamp has a home.
+            let p = unsafe { Box::from_raw(box_payload(w) as *mut ThinFwd) };
+            unsafe {
+                *self.word.get() = 0;
+            }
+            let (lo, hi) = thin_to_lo_hi(p.thin);
+            let boxed = Box::into_raw(Box::new(DescrWords { lo, hi, stamp }));
+            unsafe {
+                *self.word.get() = boxed as usize | SLOT_BOX_BIT;
+            }
+            if p.forwarded != 0 {
+                self.set_packed_forwarded(p.forwarded);
+            }
+            return;
+        }
         if w & SLOT_BOX_BIT != 0 {
-            let p = (w & !SLOT_BOX_BIT) as *mut DescrWords;
+            let p = box_payload(w) as *mut DescrWords;
             unsafe {
                 (*p).stamp = stamp;
             }
             return;
         }
-        // Empty, thin descr, or inline forwarded: box so the stamp has a home.
-        // Compile-path first mint never stamps, so this is recording only.
+        // Empty, thin descr, extra/both, or inline forwarded: box so the
+        // stamp has a home. Compile-path first mint never stamps.
         let (lo, hi) = if w == 0 {
             (0, 0)
         } else if is_thin_descr(w) {
             thin_to_lo_hi(w)
+        } else if is_extra_inline(w) {
+            (tagged_ptr(w), EXTRA_TAG)
+        } else if is_both_inline(w) {
+            (tagged_ptr(w), BOTH_TAG)
         } else {
             (w, FWD_TAG)
         };
@@ -1811,6 +1875,20 @@ impl DescrSlot {
         let boxed = Box::into_raw(Box::new(DescrWords { lo, hi, stamp }));
         unsafe {
             *self.word.get() = boxed as usize | SLOT_BOX_BIT;
+        }
+    }
+
+    fn write_thin_fwd(&self, thin: usize, forwarded: u64) {
+        debug_assert_eq!(self.word(), 0);
+        if forwarded == 0 {
+            unsafe {
+                *self.word.get() = thin;
+            }
+            return;
+        }
+        let boxed = Box::into_raw(Box::new(ThinFwd { thin, forwarded }));
+        unsafe {
+            *self.word.get() = boxed as usize | SLOT_BOX_BIT | SLOT_THIN_FWD_BIT;
         }
     }
 
@@ -1861,24 +1939,37 @@ impl DescrSlot {
                 }
             },
             (None, Some(e), false) => {
-                let ptr = Box::into_raw(e);
-                self.set_bits(ptr as usize, EXTRA_TAG);
+                let ptr = Box::into_raw(e) as usize;
+                debug_assert_eq!(self.word(), 0);
+                debug_assert_eq!(ptr & !THIN_DESCR_PTR_MASK, 0);
+                debug_assert_eq!(ptr & 7, 0);
+                unsafe {
+                    *self.word.get() = ptr | SLOT_EXTRA_BIT;
+                }
             }
             (Some(d), Some(e), false) => {
                 let ptr = Box::into_raw(Box::new(BothPayload {
                     descr: Some(d),
                     extra: *e,
-                }));
-                self.set_bits(ptr as usize, BOTH_TAG);
+                })) as usize;
+                debug_assert_eq!(self.word(), 0);
+                debug_assert_eq!(ptr & !THIN_DESCR_PTR_MASK, 0);
+                debug_assert_eq!(ptr & 7, 0);
+                unsafe {
+                    *self.word.get() = ptr | SLOT_BOTH_BIT;
+                }
             }
             (None, None, true) => self.set_bits(forwarded as usize, FWD_TAG),
-            (Some(d), None, true) => {
-                let ptr = Box::into_raw(Box::new(DescrFwd {
-                    descr: d,
-                    forwarded,
-                }));
-                self.set_bits(ptr as usize, DESCR_FWD_TAG);
-            }
+            (Some(d), None, true) => match encode_thin_descr(d) {
+                Ok(thin) => self.write_thin_fwd(thin, forwarded),
+                Err(d) => {
+                    let ptr = Box::into_raw(Box::new(DescrFwd {
+                        descr: d,
+                        forwarded,
+                    }));
+                    self.set_bits(ptr as usize, DESCR_FWD_TAG);
+                }
+            },
             (None, Some(e), true) => {
                 let ptr = Box::into_raw(Box::new(ExtraFwd {
                     extra: *e,
@@ -1909,8 +2000,18 @@ impl DescrSlot {
         }
         if w == 0 {
             (None, None, 0, 0)
+        } else if is_extra_inline(w) {
+            let extra = unsafe { Box::from_raw(tagged_ptr(w) as *mut OpKindExtra) };
+            (None, Some(extra), 0, 0)
+        } else if is_both_inline(w) {
+            let both = unsafe { Box::from_raw(tagged_ptr(w) as *mut BothPayload) };
+            (both.descr, Some(Box::new(both.extra)), 0, 0)
+        } else if is_thin_fwd_box(w) {
+            let p = unsafe { Box::from_raw(box_payload(w) as *mut ThinFwd) };
+            let (lo, hi) = thin_to_lo_hi(p.thin);
+            (Some(descr_arc_from_bits(lo, hi)), None, p.forwarded, 0)
         } else if w & SLOT_BOX_BIT != 0 {
-            let p = unsafe { Box::from_raw((w & !SLOT_BOX_BIT) as *mut DescrWords) };
+            let p = unsafe { Box::from_raw(box_payload(w) as *mut DescrWords) };
             let (d, e, f) = unsafe { decode_descr_extra(p.lo, p.hi) };
             (d, e, f, p.stamp)
         } else if is_thin_descr(w) {
@@ -1923,6 +2024,11 @@ impl DescrSlot {
     }
 
     fn packed_forwarded(&self) -> u64 {
+        let w = self.word();
+        if is_thin_fwd_box(w) {
+            let p = box_payload(w) as *const ThinFwd;
+            return unsafe { (*p).forwarded };
+        }
         let (lo, hi) = self.bits();
         match hi {
             FWD_TAG => lo as u64,
@@ -1935,10 +2041,26 @@ impl DescrSlot {
 
     fn set_packed_forwarded(&self, packed: u64) {
         let w = self.word();
+        if is_thin_fwd_box(w) {
+            let p = box_payload(w) as *mut ThinFwd;
+            unsafe {
+                let old = (*p).forwarded;
+                if packed == 0 {
+                    let thin = (*p).thin;
+                    drop(Box::from_raw(p));
+                    crate::forwarding::drop_packed_forwarded(old);
+                    *self.word.get() = thin;
+                } else {
+                    (*p).forwarded = packed;
+                    crate::forwarding::drop_packed_forwarded(old);
+                }
+            }
+            return;
+        }
         if w & SLOT_BOX_BIT != 0 {
             // Mutate the existing DescrWords. Do not take/rebox: that
             // minted a second 24 B on every descr-bearing set_forwarded.
-            let p = (w & !SLOT_BOX_BIT) as *mut DescrWords;
+            let p = box_payload(w) as *mut DescrWords;
             unsafe {
                 match (*p).hi {
                     FWD_TAG => {
@@ -2004,12 +2126,26 @@ impl DescrSlot {
             return;
         }
         if is_thin_descr(w) {
-            let (lo, hi) = thin_to_lo_hi(w);
             unsafe {
                 *self.word.get() = 0;
             }
-            let descr = descr_arc_from_bits(lo, hi);
-            self.write_parts(Some(descr), None, packed);
+            self.write_thin_fwd(w, packed);
+            return;
+        }
+        if is_extra_inline(w) {
+            let extra = unsafe { Box::from_raw(tagged_ptr(w) as *mut OpKindExtra) };
+            unsafe {
+                *self.word.get() = 0;
+            }
+            self.write_parts(None, Some(extra), packed);
+            return;
+        }
+        if is_both_inline(w) {
+            let both = unsafe { Box::from_raw(tagged_ptr(w) as *mut BothPayload) };
+            unsafe {
+                *self.word.get() = 0;
+            }
+            self.write_parts(both.descr, Some(Box::new(both.extra)), packed);
             return;
         }
         if w != 0 {
@@ -4963,7 +5099,31 @@ mod tests {
                 std::mem::size_of::<DescrSlot>() <= 8,
                 "DescrSlot grew; forwarded-only must stay an 8 B word"
             );
+            assert!(
+                std::mem::size_of::<ThinFwd>() <= 16,
+                "ThinFwd grew to {} B; descr+forwarded must stay out of the 24-byte class",
+                std::mem::size_of::<ThinFwd>()
+            );
         }
+    }
+
+    #[test]
+    fn descr_plus_forwarded_roundtrips_without_dropping_descr() {
+        let descr = crate::make_loop_target_descr(1, false);
+        let op = Op::with_descr(OpCode::Label, &[], descr.clone());
+        assert!(op.has_descr());
+        op.forwarded()
+            .set(crate::forwarding::Forwarded::from_const_value(
+                crate::value::Value::Int(7),
+            ));
+        assert!(op.has_descr());
+        assert_eq!(
+            op.forwarded().borrow().const_value(),
+            Some(crate::value::Value::Int(7))
+        );
+        op.forwarded().set(crate::forwarding::Forwarded::None);
+        assert!(op.has_descr());
+        assert!(op.getdescr().is_some());
     }
 
     #[test]
