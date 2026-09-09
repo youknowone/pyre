@@ -1475,30 +1475,28 @@ impl ExecutionContext {
         self.sys_exc_value = caller_exc;
     }
 
+    #[majit_macros::dont_look_inside]
     pub fn settrace(&mut self, w_func: PyObjectRef) {
-        let w_func = if w_func.is_null() || w_func == pyre_object::w_none() {
-            pyre_object::PY_NULL
-        } else {
-            w_func
-        };
-        // `executioncontext.py _immutable_fields_ = ['w_tracefunc?']`:
-        // notify watchers before the store, as
-        // `function_notify_quasi_immut` does for `code?`.
+        if w_func.is_null() || w_func == pyre_object::w_none() {
+            if self.w_tracefunc_watchers.0.is_installed() {
+                self.w_tracefunc_watchers.0.invalidate();
+            }
+            self.w_tracefunc = pyre_object::PY_NULL;
+            return;
+        }
+        // executioncontext.py settrace: force, then the `w_tracefunc?`
+        // store, then raise the JIT trace_limit.
+        self.force_all_frames(false);
         if self.w_tracefunc_watchers.0.is_installed() {
             self.w_tracefunc_watchers.0.invalidate();
         }
         self.w_tracefunc = w_func;
-        if !w_func.is_null() {
-            self.force_all_frames(false);
-            // executioncontext.py settrace — increase the JIT's
-            // trace_limit when a tracefunc is installed; tracing
-            // generates a ton of extra ops per bytecode.
-            crate::call::set_jit_param("trace_limit", 10000);
-        }
+        crate::call::set_jit_param("trace_limit", 10000);
     }
 
     pub fn gettrace(&self) -> PyObjectRef {
-        self.w_tracefunc
+        // executioncontext.py gettrace: `return jit.promote(self.w_tracefunc)`.
+        majit_metainterp::jit::promote(self.w_tracefunc)
     }
 
     /// `quasiimmut.py get_current_qmut_instance` for `w_tracefunc?`.
