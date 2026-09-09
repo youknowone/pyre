@@ -4513,6 +4513,17 @@ mod tests {
         }
 
         #[test]
+        fn reraise_of_a_null_exception_aborts_the_frame() {
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.exception_last_value = 0;
+            let err = super::handler_reraise(&mut bh, &[], 0)
+                .expect_err("a null exception must leave the frame");
+            assert!(matches!(err, super::DispatchError::LeaveFrame));
+            assert!(bh.aborted);
+        }
+
+        #[test]
         fn obsolete_vtable_method_opcode_bails_instead_of_panicking() {
             let mut builder = super::build_inline_call_only_bh_builder();
             let mut bh = builder.acquire_interp();
@@ -9212,7 +9223,7 @@ fn check_residual_call_exception_after(
 /// NULL is never an ordinary `r` result that the following opcode may consume.
 #[inline]
 fn check_blackhole_allocation_after(
-    bh: &BlackholeInterpreter,
+    bh: &mut BlackholeInterpreter,
     result: i64,
     next_pos: usize,
 ) -> Result<(), DispatchError> {
@@ -9224,15 +9235,21 @@ fn check_blackhole_allocation_after(
     // the backend copy now; otherwise an unrelated later compiled call sees a
     // stale MemoryError.
     bh.cpu().clear_stored_exception();
-    Err(blackhole_allocation_error(next_pos))
+    let err = blackhole_allocation_error(next_pos);
+    // No MemoryError provider: `LeaveFrame` alone is a successful return
+    // in `resume_mainloop`. Mark the frame aborted so the caller bails.
+    if matches!(err, DispatchError::LeaveFrame) {
+        bh.aborted = true;
+    }
+    Err(err)
 }
 
 #[inline]
 fn blackhole_allocation_error(next_pos: usize) -> DispatchError {
     let exc = majit_backend::memory_error_singleton_ref();
     // Grain never installs MiniMark or a MemoryError singleton. A typed
-    // `bh_new` then returns NULL; leave to the portal merge point rather
-    // than panic. Hosts that registered a provider still raise it.
+    // `bh_new` then returns NULL; abort the frame rather than panic.
+    // Hosts that registered a provider still raise it.
     if exc == 0 {
         return DispatchError::LeaveFrame;
     }
@@ -11367,8 +11384,9 @@ fn handler_raise(
     // RPython blackhole.py `bhimpl_raise(self, excvalue)`
     // `e = cast_opaque_ptr(...); assert e; reraise(e)`.
     // Grain never installs MiniMark, so a helper `NEW` of the exception
-    // is NULL. Leave to the portal merge point rather than panic.
+    // is NULL. Abort the frame rather than panic or publish a void return.
     if exc == 0 {
+        bh.aborted = true;
         return Err(DispatchError::LeaveFrame);
     }
     Err(DispatchError::RaiseException {
@@ -11383,8 +11401,10 @@ fn handler_reraise(
 ) -> Result<usize, DispatchError> {
     // `reraise/` decodes no operands, so `p` is already the end of the
     // instruction.
-    // Grain: no MiniMark means no exception object. Leave rather than panic.
+    // Grain: no MiniMark means no exception object. Abort rather than
+    // panic or publish a void return.
     if bh.exception_last_value == 0 {
+        bh.aborted = true;
         return Err(DispatchError::LeaveFrame);
     }
     Err(DispatchError::RaiseException {
@@ -12265,21 +12285,25 @@ fn handler_newlist(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
+    let structdescr = structdescr.clone();
+    let lengthdescr = lengthdescr.clone();
+    let itemsdescr = itemsdescr.clone();
+    let arraydescr = arraydescr.clone();
     // blackhole.py:1163: result = cpu.bh_new(structdescr)
-    let result = bh.cpu().bh_new(structdescr);
+    let result = bh.cpu().bh_new(&structdescr);
     check_blackhole_allocation_after(bh, result, p + 1)?;
     // blackhole.py:1164: cpu.bh_setfield_gc_i(result, length, lengthdescr)
-    bh.cpu().bh_setfield_gc_i(result, length, lengthdescr);
+    bh.cpu().bh_setfield_gc_i(result, length, &lengthdescr);
     // blackhole.py:1165-1169: bh_new_array_clear when is_array_of_structs or is_array_of_pointers
     let items = if arraydescr.is_array_of_structs() || arraydescr.is_array_of_pointers() {
-        bh.cpu().bh_new_array_clear(length, arraydescr)
+        bh.cpu().bh_new_array_clear(length, &arraydescr)
     } else {
-        bh.cpu().bh_new_array(length, arraydescr)
+        bh.cpu().bh_new_array(length, &arraydescr)
     };
     check_blackhole_allocation_after(bh, items, p + 1)?;
     // blackhole.py:1170: cpu.bh_setfield_gc_r(result, items, itemsdescr)
     bh.cpu()
-        .bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
+        .bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), &itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
@@ -12294,14 +12318,18 @@ fn handler_newlist_clear(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let result = bh.cpu().bh_new(structdescr);
+    let structdescr = structdescr.clone();
+    let lengthdescr = lengthdescr.clone();
+    let itemsdescr = itemsdescr.clone();
+    let arraydescr = arraydescr.clone();
+    let result = bh.cpu().bh_new(&structdescr);
     check_blackhole_allocation_after(bh, result, p + 1)?;
-    bh.cpu().bh_setfield_gc_i(result, length, lengthdescr);
+    bh.cpu().bh_setfield_gc_i(result, length, &lengthdescr);
     // blackhole.py:1178: items = cpu.bh_new_array_clear(length, arraydescr)
-    let items = bh.cpu().bh_new_array_clear(length, arraydescr);
+    let items = bh.cpu().bh_new_array_clear(length, &arraydescr);
     check_blackhole_allocation_after(bh, items, p + 1)?;
     bh.cpu()
-        .bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
+        .bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), &itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
@@ -12316,19 +12344,23 @@ fn handler_newlist_hint(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let result = bh.cpu().bh_new(structdescr);
+    let structdescr = structdescr.clone();
+    let lengthdescr = lengthdescr.clone();
+    let itemsdescr = itemsdescr.clone();
+    let arraydescr = arraydescr.clone();
+    let result = bh.cpu().bh_new(&structdescr);
     check_blackhole_allocation_after(bh, result, p + 1)?;
     // blackhole.py:1186: cpu.bh_setfield_gc_i(result, 0, lengthdescr)
-    bh.cpu().bh_setfield_gc_i(result, 0, lengthdescr);
+    bh.cpu().bh_setfield_gc_i(result, 0, &lengthdescr);
     // blackhole.py:1187-1191: bh_new_array_clear when is_array_of_structs or is_array_of_pointers
     let items = if arraydescr.is_array_of_structs() || arraydescr.is_array_of_pointers() {
-        bh.cpu().bh_new_array_clear(lengthhint, arraydescr)
+        bh.cpu().bh_new_array_clear(lengthhint, &arraydescr)
     } else {
-        bh.cpu().bh_new_array(lengthhint, arraydescr)
+        bh.cpu().bh_new_array(lengthhint, &arraydescr)
     };
     check_blackhole_allocation_after(bh, items, p + 1)?;
     bh.cpu()
-        .bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
+        .bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), &itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
