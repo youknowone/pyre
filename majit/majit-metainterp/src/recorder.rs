@@ -405,7 +405,7 @@ impl Trace {
         }
     }
 
-    fn decode_jitcode_index(idx: i64) -> u32 {
+    pub(crate) fn decode_jitcode_index(idx: i64) -> u32 {
         if idx == -2 {
             UNSTAMPED_JITCODE_INDEX
         } else {
@@ -441,7 +441,7 @@ impl Trace {
         OpRef::op_typed(unique, slot.opcode.result_type())
     }
 
-    fn untag_snapshot(&self, tagged: i64, box_to_unique: &[u32]) -> SnapshotTagged {
+    pub(crate) fn untag_snapshot(&self, tagged: i64, box_to_unique: &[u32]) -> SnapshotTagged {
         use crate::opencoder::{TAG_MASK, TAG_SHIFT, TAGBOX, TAGCONSTOTHER, TAGCONSTPTR, TAGINT};
         let tag = (tagged & TAG_MASK as i64) as u8;
         let v = tagged >> TAG_SHIFT;
@@ -602,9 +602,7 @@ impl Trace {
         id
     }
 
-    /// Rebuild `Vec<Snapshot>` from `_snapshot_data` in capture order.
-    pub fn decode_captured_snapshots(&self) -> Option<Vec<Snapshot>> {
-        let trb = self.trb.as_ref()?;
+    pub(crate) fn box_to_unique_map(&self) -> Vec<u32> {
         let mut box_to_unique = Vec::new();
         for (unique, &mapped) in self.unique_to_box.iter().enumerate() {
             if mapped == u32::MAX {
@@ -615,6 +613,52 @@ impl Trace {
             }
             box_to_unique[mapped as usize] = unique as u32;
         }
+        box_to_unique
+    }
+
+    /// Walk each captured snapshot's tagged arrays without building
+    /// `Vec<Snapshot>`. `opencoder.py` keeps `_snapshot_data` as the
+    /// source of truth.
+    pub(crate) fn for_each_captured_snapshot_arrays(
+        &self,
+        mut f: impl FnMut(
+            smallvec::SmallVec<[i64; 8]>,
+            smallvec::SmallVec<[i64; 8]>,
+            smallvec::SmallVec<[(i64, i64, smallvec::SmallVec<[i64; 8]>); 4]>,
+            &[u32],
+        ),
+    ) -> bool {
+        let Some(trb) = self.trb.as_ref() else {
+            return false;
+        };
+        for (i, &offset) in self.snapshot_offsets.iter().enumerate() {
+            let it = trb.get_snapshot_iter(offset);
+            let vable_t: smallvec::SmallVec<[i64; 8]> = it.iter_vable_array().collect();
+            let vref_t: smallvec::SmallVec<[i64; 8]> = it.iter_vref_array().collect();
+            let frames_t: smallvec::SmallVec<[(i64, i64, smallvec::SmallVec<[i64; 8]>); 4]> = it
+                .framestack
+                .iter()
+                .copied()
+                .map(|snap_idx| {
+                    let (jc, pc) = it.unpack_jitcode_pc(snap_idx);
+                    let boxes: smallvec::SmallVec<[i64; 8]> = it.iter_array(snap_idx).collect();
+                    (jc, pc, boxes)
+                })
+                .collect();
+            let py_pcs = self
+                .snapshot_py_pcs
+                .get(i)
+                .map(smallvec::SmallVec::as_slice)
+                .unwrap_or(&[]);
+            f(vable_t, vref_t, frames_t, py_pcs);
+        }
+        true
+    }
+
+    /// Rebuild `Vec<Snapshot>` from `_snapshot_data` in capture order.
+    pub fn decode_captured_snapshots(&self) -> Option<Vec<Snapshot>> {
+        let trb = self.trb.as_ref()?;
+        let box_to_unique = self.box_to_unique_map();
         let mut out = Vec::with_capacity(self.snapshot_offsets.len());
         for (i, &offset) in self.snapshot_offsets.iter().enumerate() {
             let (vable_t, vref_t, frames_t) = {
@@ -1509,8 +1553,8 @@ impl Trace {
                     arg.walk_const_ptr_refs(visitor);
                 }
             }
-            if let Some(fail_args) = op.fail_args.borrow().as_ref() {
-                for arg in fail_args {
+            if let Some(fail_args) = op.getfailargs() {
+                for arg in fail_args.iter() {
                     if !is_pooled_const_ptr(arg) {
                         arg.walk_const_ptr_refs(visitor);
                     }

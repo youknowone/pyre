@@ -20,7 +20,7 @@ use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::j2plan::{GuardKind, IntBinKind, IntUnaryKind, LirOp, LoadKind, StoreKind};
 use crate::regloc::*;
-use majit_ir::{InputArg, Op, OpCode, OpRef, OpTypeIndex, Type, descr_identity};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, descr_identity};
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -418,12 +418,15 @@ impl LifetimeManager {
 // ── compute_vars_longevity ─────────────────────────────────────────
 
 /// regalloc.py compute_vars_longevity — backward liveness analysis.
-pub fn compute_vars_longevity(inputargs: &[InputArg], operations: &[Op]) -> LifetimeManager {
+pub fn compute_vars_longevity<T: AsRef<Op>>(
+    inputargs: &[InputArg],
+    operations: &[T],
+) -> LifetimeManager {
     let mut longevity = LifetimeManager::new();
 
     // regalloc.py:1179 iterate operations in REVERSE
     for i in (0..operations.len()).rev() {
-        let op = &operations[i];
+        let op = operations[i].as_ref();
         let opnum = op.opcode;
         let opref = op.pos.get();
         let i = i as i32;
@@ -1479,14 +1482,14 @@ impl RegisterManager {
     /// regalloc.py — RPython reads `v.type` directly during the
     /// reg-binding walk; pyre routes the lookup through `OpTypeIndex`
     /// since `OpRef(u32)` has no intrinsic type.
-    pub fn before_call(
+    pub fn before_call<T: AsRef<Op>>(
         &mut self,
         force_store: &[OpRef],
         save_all_regs: u8,
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
         pending_moves: &mut Vec<(Loc, Loc)>,
-        type_index: &OpTypeIndex<'_>,
+        type_index: &OpTypeIndex<'_, T>,
     ) {
         self.spill_or_move_registers_before_call(
             &self.save_around_call_regs.clone(),
@@ -1500,7 +1503,7 @@ impl RegisterManager {
     }
 
     /// regalloc.py:714
-    pub fn spill_or_move_registers_before_call(
+    pub fn spill_or_move_registers_before_call<T: AsRef<Op>>(
         &mut self,
         save_sublist: &[RegLoc],
         force_store: &[OpRef],
@@ -1508,7 +1511,7 @@ impl RegisterManager {
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
         pending_moves: &mut Vec<(Loc, Loc)>,
-        type_index: &OpTypeIndex<'_>,
+        type_index: &OpTypeIndex<'_, T>,
     ) {
         let mut new_free_regs: Vec<RegLoc> = Vec::new();
         let mut move_or_spill: Vec<OpRef> = Vec::new();
@@ -1696,7 +1699,7 @@ pub struct RegAlloc<'a> {
     inputargs: &'a [InputArg],
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
-    pub(crate) operations: &'a [Op],
+    pub(crate) operations: &'a [OpRc],
     /// `arg.index` raw -> idx in inputargs. Mirrors
     /// `OpTypeIndex::inputarg_pos`.
     inputarg_pos: majit_ir::PosIndex,
@@ -1732,7 +1735,7 @@ impl<'a> RegAlloc<'a> {
     pub fn new(
         constants: indexmap::IndexMap<u32, i64>,
         inputargs: &'a [InputArg],
-        operations: &'a [Op],
+        operations: &'a [OpRc],
     ) -> Self {
         // We create with empty longevity/managers; they get initialized in _prepare.
         let longevity = LifetimeManager::new();
@@ -2399,7 +2402,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py walk_operations — main dispatch loop.
     pub fn walk_operations(&mut self) -> Vec<RegAllocOp> {
-        let operations: &'a [Op] = self.operations;
+        let operations: &'a [OpRc] = self.operations;
         let inputargs: &'a [InputArg] = self.inputargs;
         // Take the lowering plan so dispatch can borrow each LirOp without cloning it.
         let j2_ops = std::mem::take(&mut self.j2_ops);
@@ -3455,7 +3458,7 @@ impl<'a> RegAlloc<'a> {
         if !lhs_in_reg && !rhs_in_reg && !lhs.is_constant() && !rhs.is_constant() {
             arglocs[0] = self.make_sure_var_in_reg(lhs, Type::Int, &[], None, false);
         }
-        let ops_ref: &[Op] = self.operations;
+        let ops_ref: &[OpRc] = self.operations;
         let result_loc = self.force_allocate_reg_or_cc(dst, ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
@@ -3683,11 +3686,11 @@ impl<'a> RegAlloc<'a> {
     /// - `CondCallN` via `guard_success_cc` (see
     ///   `genop_discard_cond_call`, mirrors `x86/assembler.py:2526
     ///   cond_call`).
-    fn next_op_can_accept_cc(&self, ops: &[Op], i: usize, result: OpRef) -> bool {
+    fn next_op_can_accept_cc<T: AsRef<Op>>(&self, ops: &[T], i: usize, result: OpRef) -> bool {
         if i + 1 >= ops.len() {
             return false;
         }
-        let next_op = &ops[i + 1];
+        let next_op = ops[i + 1].as_ref();
         let opnum = next_op.opcode;
         if !matches!(
             opnum,
@@ -3749,7 +3752,12 @@ impl<'a> RegAlloc<'a> {
     /// and `aarch64/assembler.rs flush_cc` publish `guard_success_cc` and
     /// emit nothing when `result_loc` is the frame register, so neither
     /// clobbers rbp / x29.
-    pub(crate) fn force_allocate_reg_or_cc(&mut self, result: OpRef, ops: &[Op], i: usize) -> Loc {
+    pub(crate) fn force_allocate_reg_or_cc<T: AsRef<Op>>(
+        &mut self,
+        result: OpRef,
+        ops: &[T],
+        i: usize,
+    ) -> Loc {
         if self.next_op_can_accept_cc(ops, i, result) {
             self.rm.force_allocate_frame_reg(result);
             return Loc::Reg(arch_regalloc::frame_reg());
@@ -3769,7 +3777,7 @@ impl<'a> RegAlloc<'a> {
             arglocs[0] = self.make_sure_var_in_reg(vx, Type::Int, &[], None, false);
         }
         // x86/regalloc.py force_allocate_reg_or_cc.
-        let ops_ref: &[Op] = self.operations;
+        let ops_ref: &[OpRc] = self.operations;
         let result_loc = self.force_allocate_reg_or_cc(op.pos.get(), ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
@@ -4281,7 +4289,7 @@ impl<'a> RegAlloc<'a> {
         }
         // x86/regalloc.py:682 — a float comparison whose only consumer is the
         // next guard leaves its answer in the flags, like the integer one.
-        let ops_ref: &[Op] = self.operations;
+        let ops_ref: &[OpRc] = self.operations;
         let result_loc = self.force_allocate_reg_or_cc(op.pos.get(), ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
@@ -4300,7 +4308,7 @@ impl<'a> RegAlloc<'a> {
         if !lhs_in_reg && !rhs_in_reg && !lhs.is_constant() {
             arglocs[0] = self.make_sure_var_in_reg(lhs, Type::Float, &[], None, false);
         }
-        let ops_ref: &[Op] = self.operations;
+        let ops_ref: &[OpRc] = self.operations;
         let result_loc = self.force_allocate_reg_or_cc(dst, ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
@@ -6265,9 +6273,13 @@ mod tests {
     use super::*;
 
     use majit_ir::operand::Operand;
-    use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+    use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type};
 
     use majit_ir::forwarding::bound_operand_from_opref as rb;
+
+    fn rcs(ops: Vec<Op>) -> Vec<OpRc> {
+        ops.into_iter().map(OpRc::new).collect()
+    }
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
@@ -6443,6 +6455,7 @@ mod tests {
         finish.set_fail_arg_types(vec![Type::Ref, Type::Ref]);
         let ops = vec![malloc, finish];
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let unrelated = all_core_regs()
@@ -6508,6 +6521,7 @@ mod tests {
         let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
         let ops = vec![add, is_true, guard, finish];
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(constants, &inputargs, &ops);
         ra.prepare_loop();
         let ra_ops = ra.walk_operations();
@@ -6566,6 +6580,7 @@ mod tests {
         ops.push(guard);
         ops.push(finish);
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         ra.walk_operations();
@@ -6597,6 +6612,7 @@ mod tests {
         let store = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i0)]);
         let ops = vec![store];
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         ra.j2_ops[0] = crate::j2plan::LirOp::Finish { args: vec![i0] };
@@ -6644,6 +6660,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
@@ -6702,6 +6719,7 @@ mod tests {
         finish.pos.set(OpRef::void_op(2));
         let ops = vec![malloc, finish];
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let ra_ops = ra.walk_operations();
@@ -6741,6 +6759,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
@@ -6777,6 +6796,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Ref);
@@ -6820,6 +6840,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Ref);
@@ -6858,6 +6879,7 @@ mod tests {
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
@@ -6898,6 +6920,7 @@ mod tests {
         let inputargs = vec![];
         let ops = vec![force, make_guard(OpCode::GuardNotForced2, 1, &[], &[token])];
 
+        let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let output = ra.walk_operations();

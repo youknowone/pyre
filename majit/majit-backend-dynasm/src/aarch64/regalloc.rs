@@ -285,7 +285,7 @@ impl<'a> RegAlloc<'a> {
         );
         let arg_loc = self.make_sure_var_in_reg(arg, Type::Int, &[], None, false);
         self.possibly_free_var(arg, Type::Int);
-        let ops_ref: &[majit_ir::Op] = self.operations;
+        let ops_ref: &[majit_ir::OpRc] = self.operations;
         let res = self.force_allocate_reg_or_cc(dst, ops_ref, i);
         self.perform(i, vec![arg_loc], Some(res), output);
     }

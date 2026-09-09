@@ -60,9 +60,10 @@ impl RegisterHints {
         &self,
         longevity: &mut LifetimeManager,
         _inputargs: &[majit_ir::InputArg],
-        operations: &[Op],
+        operations: &[impl AsRef<Op>],
     ) {
         for (i, op) in operations.iter().enumerate() {
+            let op = op.as_ref();
             let position = i as i32;
             // reghint.py:34-35 skip dead no-side-effect ops.
             if op.opcode.has_no_side_effect() && !longevity.contains(op.pos.get()) {

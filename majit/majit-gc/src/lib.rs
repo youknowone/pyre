@@ -9,7 +9,7 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 /// 4. Stack maps for compiled code
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
-use majit_ir::{Const, ConstMap, GcRef, Op};
+use majit_ir::{Const, ConstMap, GcRef, OpRc};
 pub use trace::{
     ClassTypeLayout, CustomDataLayout, TypeEntry, TypeEntryTail, TypeInfo, TypeInfoLayout,
     VarSizeTypeInfoLayout,
@@ -1836,7 +1836,11 @@ impl GcAllocator for GcHandle {
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
 pub trait GcRewriter: Send {
     /// Rewrite a list of operations, inserting GC-aware code.
-    fn rewrite_for_gc(&self, ops: &[Op]) -> Vec<Op>;
+    ///
+    /// Input and output stay `OpRc` so the rewriter can hand the same
+    /// objects `rewrite.py GcRewriterAssembler.rewrite` appends to
+    /// `self.newops` — no `Op` clone at the backend boundary.
+    fn rewrite_for_gc(&self, ops: &[OpRc]) -> Vec<OpRc>;
     /// Rewrite with access to the constant pool.
     /// Returns (rewritten ops, merged constants, gc_table gcrefs). Each
     /// `Const` box carries its own type via `Const::get_type`, so a separate
@@ -1852,9 +1856,9 @@ pub trait GcRewriter: Send {
     /// downstream readers that resolve `ConstInt.raw()` against this table.
     fn rewrite_for_gc_with_constants(
         &self,
-        ops: &[Op],
+        ops: &[OpRc],
         constants: &ConstMap<Const>,
-    ) -> (Vec<Op>, ConstMap<Const>, Vec<GcRef>) {
+    ) -> (Vec<OpRc>, ConstMap<Const>, Vec<GcRef>) {
         (self.rewrite_for_gc(ops), constants.clone(), Vec::new())
     }
 }

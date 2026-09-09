@@ -15,7 +15,7 @@ use crate::regloc::{
     EAX, EBP, EBX, ECX, EDI, EDX, ESI, R8, R9, R10, R12, R13, R14, R15, RegLoc, XMM0, XMM1, XMM2,
     XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14,
 };
-use majit_ir::{Op, OpRef, Type};
+use majit_ir::{OpRc, OpRef, Type};
 
 /// x86/regalloc.py X86_64_RegisterManager.all_regs — the GPR allocation
 /// pool.  Order chosen to prefer caller-save first (popped from end).
@@ -347,7 +347,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let argloc = self.loc(arg, Type::Int);
-        let ops_ref: &[Op] = self.operations;
+        let ops_ref: &[OpRc] = self.operations;
         let resloc = self.force_allocate_reg_or_cc(dst, ops_ref, i);
         self.perform(i, vec![argloc], Some(resloc), output);
     }

@@ -51,24 +51,24 @@ impl Op {
     /// returns an owned clone of the per-op vector metadata installed
     /// by the vectorizer.
     pub fn get_vecinfo(&self) -> Option<crate::resoperation::VectorizationInfo> {
-        self.vecinfo.borrow().as_deref().cloned()
+        self.vecinfo_slot()
     }
 
     /// Overwrite the per-op vector metadata slot.  Takes `&self` —
     /// interior mutability through `RefCell` matches RPython's
     /// `op._vector_info = …` write on a shared object.
     pub fn set_vecinfo(&self, vecinfo: crate::resoperation::VectorizationInfo) {
-        *self.vecinfo.borrow_mut() = Some(Box::new(vecinfo));
+        self.set_vecinfo_slot(vecinfo);
     }
 
     /// Clear the per-op vector metadata slot.
     pub fn clear_vecinfo(&self) {
-        *self.vecinfo.borrow_mut() = None;
+        self.clear_vecinfo_slot();
     }
 
     /// True iff the per-op vector metadata slot is populated.
     pub fn has_vecinfo(&self) -> bool {
-        self.vecinfo.borrow().is_some()
+        self.vecinfo_slot().is_some()
     }
 
     /// Project the descr (if any) through a closure operating on a
@@ -165,16 +165,12 @@ impl Op {
             .rd_pendingfields_arc()
     }
 
-    /// `resoperation.py/489 AbstractResOp/GuardResOp.getfailargs`
-    /// parity. Returns an owned `SmallVec` clone of the fail_args slot —
-    /// None for non-guard ops.  Clone is cheap because `Operand` is an `Rc`
-    /// bump and fail_args almost always fits inline (≤3 entries).  Owned
-    /// return avoids the `Ref<[T]>` ergonomics tax for callers that chain
-    /// through `.into_iter().flatten()` or `.iter()` patterns.
+    /// Owned snapshot of `GuardResOp.getfailargs` (`self._fail_args[:]`).
+    /// The live list is [`Op::guard_fail_args`]; use that on hot reads.
+    /// A `SmallVec<[; 3]>` clone heap-grows when resume failargs exceed
+    /// three live boxes, which is the common deopt shape.
     pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::operand::Operand; 3]>> {
-        self.fail_args
-            .borrow()
-            .as_ref()
+        self.guard_fail_args()
             .map(|fa| fa.iter().cloned().collect())
     }
 
@@ -186,7 +182,7 @@ impl Op {
     /// fail-args bug surfaces at the call site rather than returning
     /// a silently-empty vector.
     pub fn getfailargs_copy(&self) -> Vec<crate::operand::Operand> {
-        let borrow = self.fail_args.borrow();
+        let borrow = self.guard_fail_args();
         let fa = borrow.as_ref().unwrap_or_else(|| {
             panic!(
                 "getfailargs_copy on op with fail_args=None — RPython \
@@ -208,7 +204,7 @@ impl Op {
         // `Operand::Const`. An unbound position-only fail-arg is a contract
         // violation (every writer binds its producer) — `Operand::from_opref`
         // panics for it at the call site.
-        *self.fail_args.borrow_mut() = Some(fail_args.into_iter().collect());
+        self.ensure_guard_extra().fail_args = Some(fail_args.into_iter().collect());
     }
 
     /// In-place mutable view of the fail_args slot.  Lets callers iterate
@@ -218,7 +214,13 @@ impl Op {
     /// shared-`Op` callers should clone via `getfailargs_copy`, mutate
     /// the copy, and call `setfailargs`.
     pub fn fail_args_mut(&mut self) -> Option<&mut Vec<crate::operand::Operand>> {
-        self.fail_args.get_mut().as_mut()
+        match self.extra.get_mut().as_mut()?.as_mut() {
+            crate::resoperation::OpKindExtra::Guard(g)
+            | crate::resoperation::OpKindExtra::VectorGuard { guard: g, .. } => {
+                g.fail_args.as_mut()
+            }
+            crate::resoperation::OpKindExtra::Vector(_) => None,
+        }
     }
 
     /// Clear the fail_args slot.  PyPy has no separate `clearfailargs`
@@ -226,12 +228,14 @@ impl Op {
     /// pyre's signature distinguishes the two paths (set vs clear) for
     /// clarity.
     pub fn clearfailargs(&self) {
-        *self.fail_args.borrow_mut() = None;
+        if let Some(mut g) = self.try_guard_extra_mut() {
+            g.fail_args = None;
+        }
     }
 
     /// True iff the fail_args slot is populated.
     pub fn has_failargs(&self) -> bool {
-        self.fail_args.borrow().is_some()
+        self.guard_fail_args().is_some()
     }
 
     /// Per-failarg type vector accessor.  Pyre's `fail_arg_types` slot
@@ -242,29 +246,32 @@ impl Op {
     /// wrapped; callers no longer hold a borrow across other `Op`
     /// accesses.
     pub fn get_fail_arg_types(&self) -> Option<Vec<crate::value::Type>> {
-        self.fail_arg_types.borrow().clone()
+        self.try_guard_extra_mut()
+            .and_then(|g| g.fail_arg_types.clone())
     }
 
     /// Owned-clone variant — RPython would write `fail_arg_types[:]`.
     pub fn get_fail_arg_types_copy(&self) -> Vec<crate::value::Type> {
-        self.fail_arg_types.borrow().clone().unwrap_or_default()
+        self.get_fail_arg_types().unwrap_or_default()
     }
 
     /// Overwrite the per-failarg type vector.  Takes `&self`
     /// (interior mutability through `RefCell`) so shared `Op` instances
     /// can be re-stamped without `&mut`.
     pub fn set_fail_arg_types(&self, types: Vec<crate::value::Type>) {
-        *self.fail_arg_types.borrow_mut() = Some(types);
+        self.ensure_guard_extra().fail_arg_types = Some(types);
     }
 
     /// Clear the per-failarg type vector.
     pub fn clear_fail_arg_types(&self) {
-        *self.fail_arg_types.borrow_mut() = None;
+        if let Some(mut g) = self.try_guard_extra_mut() {
+            g.fail_arg_types = None;
+        }
     }
 
     /// True iff the per-failarg type vector slot is populated.
     pub fn has_fail_arg_types(&self) -> bool {
-        self.fail_arg_types.borrow().is_some()
+        self.get_fail_arg_types().is_some()
     }
 
     /// `resoperation.py AbstractResOp.getarglist` parity — the stored
