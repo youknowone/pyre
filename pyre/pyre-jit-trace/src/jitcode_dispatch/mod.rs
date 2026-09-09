@@ -4732,18 +4732,6 @@ unsafe fn raw_store_float(addr: *mut u8, itemsize: usize, value: f64) {
 /// * `ConcreteValue::Null` — the handler doesn't know (e.g. residual
 ///   `Call*I`, `getfield_gc_i` cache miss).  Downstream consumers
 ///   surface `GotoIfNotValueNotConcrete` for unknown branch inputs.
-/// `pyjitpl.py` `_opimpl_isconstant` / `_opimpl_isvirtual`: `ConstInt`, no IR.
-fn write_hint_bool<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    pc: usize,
-    dst: usize,
-    predicate: bool,
-) -> Result<(), DispatchError> {
-    let value = i64::from(predicate);
-    let result = ctx.trace_ctx.const_int(value);
-    write_int_reg(ctx, pc, dst, result, ConcreteValue::Int(value))
-}
-
 fn write_int_reg<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
