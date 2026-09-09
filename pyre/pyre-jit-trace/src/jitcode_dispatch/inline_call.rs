@@ -11205,7 +11205,7 @@ fn walk_generator_resume<Sym: WalkSym>(
     };
     write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
     fbw_foriter_inflight_capture(concrete_item, body_coord);
-    ctx.vstack_last_ref = item;
+    ctx.frame_state.borrow_mut().vstack_last_ref = item;
     let _ = code_root;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
@@ -12537,7 +12537,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         if reg >= callee_regs_r.len() {
             continue;
         }
-        callee_regs_r[reg] = opref;
+        callee_regs_r.set(reg, opref);
         callee_concrete_r[reg] = concrete;
         if let ConcreteValue::Ref(value) = concrete
             && !value.is_null()
