@@ -522,10 +522,7 @@ fn handle_fail_dispatch(
     // the wrapped descr.  No global lookup — the cell's strong refcount
     // is held by `clt.asmmemmgr_gcreftracers` for the lifetime of the
     // executing JIT code.
-    let descr_arc = {
-        let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_raw) };
-        cell.descr.clone()
-    };
+    let descr_arc = { unsafe { majit_ir::recover_fail_descr_cell(descr_raw) } };
     let descr_fd = match descr_arc.as_fail_descr() {
         Some(fd) => fd,
         None => return 0,
@@ -950,7 +947,7 @@ mod tests {
 
         let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
         let cell = majit_ir::FailDescrCell::wrap(descr.clone());
-        let descr_ptr = Arc::as_ptr(&cell) as *const () as usize;
+        let descr_ptr = majit_ir::FailDescrCell::thin_ptr(&cell);
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[100, 200, 0, 0]) };
         let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 42);
@@ -970,7 +967,7 @@ mod tests {
         // the blackhole result (or 0) regardless of bridge presence.
         let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int]);
         let cell = majit_ir::FailDescrCell::wrap(descr.clone());
-        let descr_ptr = Arc::as_ptr(&cell) as *const () as usize;
+        let descr_ptr = majit_ir::FailDescrCell::thin_ptr(&cell);
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
         let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 99);

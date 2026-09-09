@@ -1860,17 +1860,16 @@ impl DynasmBackend {
     pub fn register_fail_descrs(
         &self,
         token: &majit_backend::JitCellToken,
-        cells: &[Arc<majit_ir::FailDescrCell>],
+        cells: &Arc<Vec<Box<majit_ir::FailDescrCell>>>,
     ) {
         // `assembler.py:820-823` parity: each call appends one tracer.
         // `clt.asmmemmgr_gcreftracers` is the sole lifetime root for the
         // baked descrs (`model.py:294` / `llmodel.py:252-268
         // free_loop_and_bridges`).  The cells' addresses are baked into
-        // machine code, so the tracer must keep them alive — recovery
-        // (`recover_fail_descr_cell`) does `Arc::increment_strong_count`
-        // against these live cells and would UB-fault otherwise.
+        // machine code, so the tracer must keep the same `Box`es alive —
+        // clone the `Arc`, not the cells.
         if let Some(clt) = token.compiled_loop_token() {
-            let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(cells.to_vec());
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = cells.clone();
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
     }
@@ -2387,8 +2386,7 @@ impl DynasmBackend {
             ptr, 0,
             "find_descr_by_ptr: jf_descr was not written; refusing to recover a null FailDescrCell"
         );
-        let cell = unsafe { majit_ir::recover_fail_descr_cell(ptr) };
-        cell.descr.clone()
+        unsafe { majit_ir::recover_fail_descr_cell(ptr) }
     }
 
     /// `rpython/jit/backend/x86/assembler.py:599` parity: store
@@ -2582,7 +2580,7 @@ impl Backend for DynasmBackend {
         // guard op (unified descr), so the write lands on the
         // same `ResumeGuardDescr` Arc upstream targets.
         if let Some(clt) = token.compiled_loop_token() {
-            for descr in &compiled.fail_descrs {
+            for descr in compiled.fail_descrs.iter() {
                 if !descr.is_resume_guard() {
                     continue;
                 }
@@ -2907,7 +2905,7 @@ impl Backend for DynasmBackend {
         // sibling `compile_loop` site for the parity rationale on the
         // `is_resume_guard()` predicate (`compile.py:185`).
         if let Some(clt) = original_token.compiled_loop_token() {
-            for descr in &compiled.fail_descrs {
+            for descr in compiled.fail_descrs.iter() {
                 if !descr.is_resume_guard() {
                     continue;
                 }
@@ -3044,7 +3042,7 @@ impl Backend for DynasmBackend {
 
         // Debug: verify bridge patches are visible
         if crate::majit_log_enabled() {
-            for descr in &compiled.fail_descrs {
+            for descr in compiled.fail_descrs.iter() {
                 if let Some(fd) = descr.as_fail_descr() {
                     let bridge_addr =
                         self.lookup_bridge_addr(token, fd.trace_id(), fd.fail_index_per_trace());
@@ -3345,8 +3343,7 @@ impl Backend for DynasmBackend {
         // recovery is a direct `Arc::from_raw` with a refcount bump.
         // Safety: the cell is kept alive by `clt.asmmemmgr_gcreftracers`
         // for the life of the executing JIT code (`model.py`).
-        let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_addr) };
-        cell.descr.clone()
+        unsafe { majit_ir::recover_fail_descr_cell(descr_addr) }
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {

@@ -133,10 +133,10 @@ pub type DescrRef = Arc<dyn Descr>;
 /// Rust's `Arc<dyn Descr>` is a fat pointer (data + vtable).  Codegen can
 /// only bake the data half, so reconstructing the fat Arc at recovery
 /// time needs a side-channel for the vtable.  `FailDescrCell` is a
-/// concrete-typed wrapper: `Arc<FailDescrCell>` is thin, so
-/// `Arc::as_ptr(&cell) as *const () as usize` bakes a complete identity
-/// and `Arc::from_raw(addr as *const FailDescrCell)` recovers it
-/// without a registry.
+/// concrete-typed wrapper: `Box<FailDescrCell>` is a 16 B payload (the
+/// inner `DescrRef`) so `thin_ptr` bakes a complete identity and
+/// [`recover_fail_descr_cell`] reads the descr back without a registry.
+/// An `Arc` header on the cell would put every guard in the 32-byte class.
 ///
 /// The cell is the unit kept alive by
 /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py`);
@@ -146,8 +146,13 @@ pub struct FailDescrCell {
 }
 
 impl FailDescrCell {
-    pub fn wrap(descr: DescrRef) -> Arc<Self> {
-        Arc::new(Self { descr })
+    pub fn wrap(descr: DescrRef) -> Box<Self> {
+        Box::new(Self { descr })
+    }
+
+    /// Address baked into `jf_descr` / `jf_force_descr`.
+    pub fn thin_ptr(cell: &Self) -> usize {
+        cell as *const Self as usize
     }
 }
 
@@ -172,17 +177,14 @@ impl std::fmt::Debug for FailDescrCell {
 /// `history.py AbstractDescr.show(cpu, descr_gcref)` parity.
 ///
 /// # Safety
-/// `addr` MUST be the address of a live `Arc<FailDescrCell>` whose
-/// strong refcount is held by `CompiledLoopToken.asmmemmgr_gcreftracers`
+/// `addr` MUST be [`FailDescrCell::thin_ptr`] of a live cell whose
+/// `Box` is held by `CompiledLoopToken.asmmemmgr_gcreftracers`
 /// (or an equivalent keep-alive collection) while the baked JIT code
 /// references this address.  Calling with any other address — including
 /// the address of a different concrete type — is undefined behavior.
-pub unsafe fn recover_fail_descr_cell(addr: usize) -> Arc<FailDescrCell> {
-    let ptr = addr as *const FailDescrCell;
-    unsafe {
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
-    }
+pub unsafe fn recover_fail_descr_cell(addr: usize) -> DescrRef {
+    let cell = unsafe { &*(addr as *const FailDescrCell) };
+    cell.descr.clone()
 }
 
 /// descr.py: GcCache dict keys.
@@ -8096,6 +8098,16 @@ mod tests {
         // even a few times would repeat the array descr's own name.
         assert_eq!(from_array.matches("SimpleArrayDescr").count(), 1);
         assert_eq!(from_interior.matches("SimpleInteriorFieldDescr").count(), 1);
+    }
+
+    #[test]
+    fn wrap_bakes_a_thin_ptr_that_recovers_the_same_descr() {
+        let descr: DescrRef = Arc::new(SimpleFailDescr::new(1, 2, vec![Type::Int]));
+        let cell = FailDescrCell::wrap(descr.clone());
+        assert!(std::mem::size_of_val(&*cell) <= 16);
+        let ptr = FailDescrCell::thin_ptr(&cell);
+        let recovered = unsafe { recover_fail_descr_cell(ptr) };
+        assert!(Arc::ptr_eq(&descr, &recovered));
     }
 
     /// `class_word_field()` is the layout's own answer, and "this layout has

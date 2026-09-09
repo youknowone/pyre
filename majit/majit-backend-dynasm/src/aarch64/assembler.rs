@@ -473,7 +473,7 @@ pub struct AssemblerARM64<'a> {
     /// reallocs the in-flight JITFRAME large enough before the `br`.
     jump_target_frame_depth: usize,
     /// Fail descriptors built during assembly.
-    fail_descrs: Vec<std::sync::Arc<majit_ir::FailDescrCell>>,
+    fail_descrs: Vec<Box<majit_ir::FailDescrCell>>,
     /// trace_id for this compilation.
     trace_id: u64,
     /// header_pc (green_key) for this compilation.
@@ -593,7 +593,7 @@ pub struct AssemblerARM64<'a> {
     /// fat-pointer mismatch a bare `Arc<dyn Descr>` ptr would cause.
     /// The same cell is consumed by `append_guard_token_with_faillocs`
     /// so jf_force_descr and jf_descr resolve to the same identity.
-    pending_force_cell: Option<std::sync::Arc<majit_ir::FailDescrCell>>,
+    pending_force_cell: Option<Box<majit_ir::FailDescrCell>>,
     /// `compile.py:665-674` + `pyjitpl.py:2283`: construction-time
     /// snapshot of the six descr pointers attached to the owning cpu
     /// instance.  Retained for constructor signature stability across
@@ -634,11 +634,11 @@ struct GuardToken {
     /// Dynamic label that the guard's Jcc jumps to — bound in
     /// write_pending_failure_recoveries to the recovery stub.
     fail_label: DynamicLabel,
-    /// The fail descriptor cell for this guard.  `Arc::as_ptr(&fail_descr)`
-    /// is the thin pointer baked into `jf_descr`; the same cell instance is
-    /// stored on `Asm::fail_descrs` so registration on the owning CLT keeps
-    /// it alive while the recovery stub references its address.
-    fail_descr: std::sync::Arc<majit_ir::FailDescrCell>,
+    /// Descr for stub bookkeeping (`set_adr_jump_offset`).
+    fail_descr: majit_ir::DescrRef,
+    /// [`FailDescrCell::thin_ptr`] baked into `jf_descr`. The `Box` lives
+    /// on `Asm::fail_descrs` so the address stays valid.
+    fail_cell_ptr: usize,
     /// Constants to store in frame during recovery.
     /// Each entry: (frame_slot_index, constant_value).
     const_stores: Vec<(usize, i64)>,
@@ -663,7 +663,7 @@ struct GuardToken {
 /// walk needs survive it as this.
 struct RecoveryStub {
     /// `tok.faildescr`.
-    fail_descr: std::sync::Arc<majit_ir::FailDescrCell>,
+    fail_descr: majit_ir::DescrRef,
     /// `tok.pos_recovery_stub`.
     pos_recovery_stub: usize,
     /// `tok.offset`, present only for `GUARD_NOT_INVALIDATED`.
@@ -681,7 +681,7 @@ pub struct CompiledCode {
     /// contract (compile.py record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at conversion
     /// from the in-progress `AssemblerARM64.fail_descrs` Vec.
-    pub fail_descrs: Box<[std::sync::Arc<majit_ir::FailDescrCell>]>,
+    pub fail_descrs: std::sync::Arc<Vec<Box<majit_ir::FailDescrCell>>>,
     /// Input argument types.
     pub input_types: Vec<Type>,
     /// `compile.py` parity: `Arc` clone of the owning cpu's
@@ -1905,7 +1905,7 @@ impl<'a> AssemblerARM64<'a> {
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
-            fail_descrs: self.fail_descrs.into_boxed_slice(),
+            fail_descrs: std::sync::Arc::new(self.fail_descrs),
             input_types: self.input_types,
             cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
@@ -2057,7 +2057,7 @@ impl<'a> AssemblerARM64<'a> {
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
-            fail_descrs: self.fail_descrs.into_boxed_slice(),
+            fail_descrs: std::sync::Arc::new(self.fail_descrs),
             input_types: self.input_types,
             cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
@@ -4591,9 +4591,11 @@ impl<'a> AssemblerARM64<'a> {
             .pending_force_cell
             .take()
             .unwrap_or_else(|| majit_ir::FailDescrCell::wrap(descr.clone()));
+        let fail_cell_ptr = majit_ir::FailDescrCell::thin_ptr(&cell);
         self.pending_guard_tokens.push(GuardToken {
             fail_label,
-            fail_descr: cell.clone(),
+            fail_descr: descr.clone(),
+            fail_cell_ptr,
             const_stores,
             gcmap,
             pos_jump_offset: None,
@@ -4636,7 +4638,7 @@ impl<'a> AssemblerARM64<'a> {
             self.emit_mov_imm64(16, value);
             dynasm!(self.mc ; .arch aarch64 ; str X(16), [x29, ofs as u32]);
         }
-        let descr_ptr = Arc::as_ptr(&token.fail_descr) as *const () as i64;
+        let descr_ptr = token.fail_cell_ptr as i64;
         self.emit_mov_imm64(16, descr_ptr);
         dynasm!(self.mc ; .arch aarch64
             ; str X(16), [x29, JF_FORCE_DESCR_OFS as u32]
@@ -4738,7 +4740,7 @@ impl<'a> AssemblerARM64<'a> {
             );
         }
 
-        let descr_ptr = Arc::as_ptr(&guard_token.fail_descr) as *const () as i64;
+        let descr_ptr = guard_token.fail_cell_ptr as i64;
         self.emit_mov_imm64(0, descr_ptr);
         dynasm!(self.mc ; .arch aarch64
             ; str x0, [x29, JF_DESCR_OFS as u32]
@@ -5455,7 +5457,7 @@ impl<'a> AssemblerARM64<'a> {
         // hand the cell off to `append_guard_token_with_faillocs` so the
         // inline guard-exit path bakes the same identity into jf_descr.
         let cell = majit_ir::FailDescrCell::wrap(descr.clone());
-        let descr_ptr = Arc::as_ptr(&cell) as *const () as i64;
+        let descr_ptr = majit_ir::FailDescrCell::thin_ptr(&cell) as i64;
         self.pending_force_descr = Some(descr);
         self.pending_force_cell = Some(cell);
 

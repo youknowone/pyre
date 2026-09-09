@@ -2928,9 +2928,10 @@ impl<M: Clone> MetaInterp<M> {
                 // (`model.py CompiledLoopToken`).  Walk those tracers so a
                 // bridge guard's pool is a root for the token's lifetime,
                 // the same way the root loop's descrs are reached above.
-                // Dynasm registers `Vec<Arc<FailDescrCell>>`, cranelift and
-                // wasm `Vec<DescrRef>`; the other tracer kinds (GcTables)
-                // are rooted through the gcreftracer registry.
+                // Dynasm registers `Vec<Box<FailDescrCell>>` (shared via
+                // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
+                // the other tracer kinds (GcTables) are rooted through
+                // the gcreftracer registry.
                 let tokens = entry.live_token().into_iter().chain(
                     entry
                         .previous_tokens
@@ -2947,7 +2948,7 @@ impl<M: Clone> MetaInterp<M> {
                             visit_pool(pool.as_ref(), generation, is_minor, &mut visitor);
                         };
                         if let Some(cells) =
-                            tracer.downcast_ref::<Vec<Arc<majit_ir::FailDescrCell>>>()
+                            tracer.downcast_ref::<Vec<Box<majit_ir::FailDescrCell>>>()
                         {
                             for cell in cells {
                                 visit_descr(&*cell.descr);
