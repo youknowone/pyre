@@ -223,10 +223,7 @@ fn root_forwarded_gcref(
             // (ConstInt), never a traced ref — no rooting needed.
             _ => {}
         }
-    } else if let majit_ir::forwarding::Forwarded::Const(cell) = forwarded
-        && let majit_ir::Value::Ref(gcref) = cell.get()
-        && !gcref.is_null()
-    {
+    } else if let Some(gcref) = forwarded.const_ref() {
         let ss_idx = majit_gc::shadow_stack::push(gcref);
         rooted_refs.push((dummy_key, const_ref_field, ss_idx));
     }
@@ -261,17 +258,7 @@ fn refresh_forwarded_const_ref(
     forwarded: &majit_ir::forwarding::Forwarded,
     updated: majit_ir::GcRef,
 ) {
-    let cell = match forwarded {
-        majit_ir::forwarding::Forwarded::Const(cell)
-            if matches!(cell.get(), majit_ir::Value::Ref(_)) =>
-        {
-            Some(std::rc::Rc::clone(cell))
-        }
-        _ => None,
-    };
-    if let Some(cell) = cell {
-        cell.set(majit_ir::Value::Ref(updated));
-    }
+    forwarded.refresh_const_ref(updated);
 }
 
 /// `pyjitpl.py compile_trace`'s `live_arg_boxes[num_green_args:]` -
@@ -2723,13 +2710,7 @@ impl ExportedState {
         ) {
             match forwarded {
                 majit_ir::forwarding::Forwarded::Info(info) => visit_op_info(info, visitor),
-                majit_ir::forwarding::Forwarded::Const(cell) => {
-                    if let majit_ir::Value::Ref(mut gcref) = cell.get() {
-                        visitor(&mut gcref);
-                        cell.set(majit_ir::Value::Ref(gcref));
-                    }
-                }
-                _ => {}
+                other => other.walk_const_ptr_refs(visitor),
             }
         }
 

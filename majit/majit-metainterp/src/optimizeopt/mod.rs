@@ -2904,11 +2904,18 @@ impl OptContext {
         ]
         .iter()
         .filter_map(|key| self.resop_refs.get(key))
-        .any(|op| matches!(*op.forwarded.borrow(), Forwarded::Const(_)));
-        let inputarg_const = self
-            .inputarg_refs
-            .get(&raw)
-            .is_some_and(|ia| matches!(*ia.forwarded.borrow(), Forwarded::Const(_)));
+        .any(|op| {
+            matches!(
+                *op.forwarded.borrow(),
+                Forwarded::Const(_) | Forwarded::SmallWide(_)
+            )
+        });
+        let inputarg_const = self.inputarg_refs.get(&raw).is_some_and(|ia| {
+            matches!(
+                *ia.forwarded.borrow(),
+                Forwarded::Const(_) | Forwarded::SmallWide(_)
+            )
+        });
         resop_const || inputarg_const
     }
 
@@ -4088,21 +4095,22 @@ impl OptContext {
                 majit_ir::forwarding::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
                     Some(OpInfo::FloatConstInfo(*f))
                 }
-                majit_ir::forwarding::Forwarded::Const(c) => {
+                majit_ir::forwarding::Forwarded::Const(_)
+                | majit_ir::forwarding::Forwarded::SmallWide(_) => {
                     // optimizer.py `getinfo` parity for the Const
                     // terminal — Refs surface as `ConstPtrInfo`, Floats as
                     // `FloatConstInfo`, Ints as `IntBound::from_constant`.
-                    match c.get() {
-                        majit_ir::Value::Ref(gcref) => Some(OpInfo::ptr(
+                    match fwd.const_value() {
+                        Some(majit_ir::Value::Ref(gcref)) => Some(OpInfo::ptr(
                             crate::optimizeopt::info::PtrInfo::Constant(gcref),
                         )),
-                        majit_ir::Value::Float(f) => Some(OpInfo::FloatConstInfo(
+                        Some(majit_ir::Value::Float(f)) => Some(OpInfo::FloatConstInfo(
                             crate::optimizeopt::info::FloatConstInfo::new(f),
                         )),
-                        majit_ir::Value::Int(i) => Some(OpInfo::int_bound(
+                        Some(majit_ir::Value::Int(i)) => Some(OpInfo::int_bound(
                             crate::optimizeopt::intutils::IntBound::from_constant(i),
                         )),
-                        majit_ir::Value::Void => None,
+                        Some(majit_ir::Value::Void) | None => None,
                     }
                 }
                 _ => None,
@@ -7742,6 +7750,7 @@ impl OptContext {
             // walker into a fresh operand whose own slot is None.
             Forwarded::Const(_)
             | Forwarded::SmallConst(_)
+            | Forwarded::SmallWide(_)
             | Forwarded::Op(_)
             | Forwarded::InputArg(_) => {
                 unreachable!(
@@ -7833,6 +7842,7 @@ impl OptContext {
             // walker into a fresh operand whose own slot is None.
             Forwarded::Const(_)
             | Forwarded::SmallConst(_)
+            | Forwarded::SmallWide(_)
             | Forwarded::Op(_)
             | Forwarded::InputArg(_) => {
                 unreachable!(
@@ -8329,6 +8339,7 @@ impl OptContext {
                     // and this arm fired.
                     Forwarded::Const(_)
                     | Forwarded::SmallConst(_)
+                    | Forwarded::SmallWide(_)
                     | Forwarded::Op(_)
                     | Forwarded::InputArg(_) => {
                         unreachable!("chain walker terminal")
@@ -9382,28 +9393,21 @@ mod boxref_forwarding_tests {
         let (b, _ia) = bound_inputarg_operand(Type::Ref, 0);
         ctx.seed_boxes_canonical(std::slice::from_ref(&b));
         ctx.make_constant_arg(&b, Value::Ref(GcRef(0xdead_beef)));
-        match &b.get_forwarded() {
-            BoxForwarded::Const(c) => {
-                assert_eq!(c.get(), majit_ir::Value::Ref(GcRef(0xdead_beef)));
-            }
-            other => panic!(
-                "expected Forwarded::Const(Ref) post make_constant, got {:?}",
-                other
-            ),
-        }
+        assert_eq!(
+            b.get_forwarded().const_value(),
+            Some(majit_ir::Value::Ref(GcRef(0xdead_beef))),
+            "expected const-ref terminal post make_constant, got {:?}",
+            b.get_forwarded()
+        );
         // Use the operand form because `make_nonnull` writes to the box's
         // forwarded slot.
         ctx.make_nonnull(&b);
-        match &b.get_forwarded() {
-            BoxForwarded::Const(c) => {
-                assert_eq!(
-                    c.get(),
-                    majit_ir::Value::Ref(GcRef(0xdead_beef)),
-                    "make_nonnull must not overwrite the Const slot"
-                );
-            }
-            other => panic!("make_nonnull clobbered Const slot — got {:?}", other),
-        }
+        assert_eq!(
+            b.get_forwarded().const_value(),
+            Some(majit_ir::Value::Ref(GcRef(0xdead_beef))),
+            "make_nonnull must not overwrite the Const slot — got {:?}",
+            b.get_forwarded()
+        );
     }
 
     /// `resoperation.py get_box_replacement` + `history.py:188

@@ -66,6 +66,10 @@ pub enum Forwarded {
     /// fits in i32. Same identity-token encoding, no process allocator.
     SmallConst(u64),
 
+    /// `Operand::SmallWide` twin — `ConstFloat` / `ConstPtr` / out-of-i32
+    /// `ConstInt`. Same unique-token slab index, no `Rc<Cell<Value>>`.
+    SmallWide(u64),
+
     /// `optimizeopt/info.py AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
     Info(OpInfo),
@@ -101,18 +105,68 @@ impl Forwarded {
         {
             return Forwarded::SmallConst(enc);
         }
-        Forwarded::Const(Rc::new(Cell::new(value)))
+        Forwarded::SmallWide(crate::operand::fresh_wide(value))
     }
 
     pub fn is_const(&self) -> bool {
-        matches!(self, Forwarded::Const(_) | Forwarded::SmallConst(_))
+        matches!(
+            self,
+            Forwarded::Const(_) | Forwarded::SmallConst(_) | Forwarded::SmallWide(_)
+        )
     }
 
     pub fn const_value(&self) -> Option<Value> {
         match self {
             Forwarded::Const(c) => Some(c.get()),
             Forwarded::SmallConst(enc) => Some(Value::Int(crate::operand::small_int_value(*enc))),
+            Forwarded::SmallWide(id) => Some(crate::operand::wide_value(*id)),
             _ => None,
+        }
+    }
+
+    /// Non-null `ConstPtr` payload, if this slot is a const-ref terminal.
+    pub fn const_ref(&self) -> Option<crate::value::GcRef> {
+        match self.const_value() {
+            Some(Value::Ref(gcref)) if !gcref.is_null() => Some(gcref),
+            _ => None,
+        }
+    }
+
+    /// Forward an inline `ConstPtr` in place (`walk_const_ptr_refs`).
+    pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut crate::value::GcRef)) {
+        match self {
+            Forwarded::Const(cell) => {
+                let mut v = cell.get();
+                if let Value::Ref(gcref) = &mut v {
+                    visitor(gcref);
+                    cell.set(v);
+                }
+            }
+            Forwarded::SmallWide(id) => {
+                let cell = crate::operand::wide_slot(*id as u32);
+                let mut v = cell.get();
+                if let Value::Ref(gcref) = &mut v {
+                    visitor(gcref);
+                    cell.set(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Overwrite a const-ref terminal's `GcRef` after a collection.
+    pub fn refresh_const_ref(&self, updated: crate::value::GcRef) {
+        match self {
+            Forwarded::Const(cell) if matches!(cell.get(), Value::Ref(_)) => {
+                cell.set(Value::Ref(updated));
+            }
+            Forwarded::SmallWide(id) => {
+                let cell = crate::operand::wide_slot(*id as u32);
+                if matches!(cell.get(), Value::Ref(_)) {
+                    cell.set(Value::Ref(updated));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -131,6 +185,9 @@ impl std::fmt::Debug for Forwarded {
             Forwarded::Const(c) => write!(f, "Const({:?})", c.get()),
             Forwarded::SmallConst(enc) => {
                 write!(f, "SmallConst({})", crate::operand::small_int_value(*enc))
+            }
+            Forwarded::SmallWide(id) => {
+                write!(f, "SmallWide({:?})", crate::operand::wide_value(*id))
             }
             Forwarded::Info(_) => f.write_str("Info(..)"),
         }

@@ -95,7 +95,7 @@ fn init_wide_chunk(chunk_i: usize) -> *mut Cell<Value> {
     }
 }
 
-fn wide_slot(id: u32) -> &'static Cell<Value> {
+pub(crate) fn wide_slot(id: u32) -> &'static Cell<Value> {
     let idx = id as usize;
     let chunk_i = idx / WIDE_CHUNK;
     assert!(
@@ -112,7 +112,7 @@ fn wide_slot(id: u32) -> &'static Cell<Value> {
     unsafe { &*p.add(off) }
 }
 
-fn fresh_wide(value: Value) -> u64 {
+pub(crate) fn fresh_wide(value: Value) -> u64 {
     let id = NEXT_WIDE_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .unwrap_or_else(|_| panic!("wide Const identity space exhausted"));
@@ -120,7 +120,7 @@ fn fresh_wide(value: Value) -> u64 {
     u64::from(id)
 }
 
-fn wide_value(id: u64) -> Value {
+pub(crate) fn wide_value(id: u64) -> Value {
     wide_slot(id as u32).get()
 }
 
@@ -467,6 +467,12 @@ impl Operand {
                         return cur;
                     }
                     return Operand::SmallInt(enc);
+                }
+                Forwarded::SmallWide(id) => {
+                    if not_const {
+                        return cur;
+                    }
+                    return Operand::SmallWide(id);
                 }
             }
         }
@@ -1100,6 +1106,18 @@ mod tests {
 
         #[cfg(target_pointer_width = "64")]
         assert_eq!(std::mem::size_of::<Operand>(), 16);
+    }
+
+    #[test]
+    fn set_forwarded_const_wide_keeps_token_identity() {
+        let host = Operand::from_bound_op(&op_at(0, Type::Ref));
+        host.set_forwarded_const(Const::Ref(GcRef(0x1000)));
+        let first = host.get_box_replacement(false);
+        let second = host.get_box_replacement(false);
+        assert!(matches!(first, Operand::SmallWide(_)));
+        assert_eq!(first, second);
+        assert_eq!(first.const_value(), Some(Value::Ref(GcRef(0x1000))));
+        assert!(host.get_forwarded().is_const());
     }
 
     /// `opencoder.py Trace._cached_const_ptr` reserves ref-pool index zero for
