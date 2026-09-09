@@ -3819,6 +3819,7 @@ fn install_post_finish_force_gcmap(jf: *mut majit_backend::jitframe::JitFrame) {
 /// Drop the host execution root the way `wasm_jit_ca_pop_frame` drops a
 /// callee: remember the (old-gen) frame so a virtualizable token that still
 /// points at it can find young homes after the shadow-stack root is gone.
+#[cfg(any(target_arch = "wasm32", test))]
 fn remember_and_drop_execution_frame(jf: *mut majit_backend::jitframe::JitFrame, saved: usize) {
     wasm_jit_write_barrier(jf as i64);
     majit_gc::shadow_stack::pop_jf_to(saved);
