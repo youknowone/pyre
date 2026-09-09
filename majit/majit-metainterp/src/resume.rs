@@ -527,6 +527,9 @@ impl BoxEnv for SimpleBoxEnv {
         if opref.is_constant() {
             return true;
         }
+        if opref.is_input_arg() {
+            return false;
+        }
         self.constants.contains_key(&opref.raw())
     }
     fn get_const(&self, opref: majit_ir::OpRef) -> (i64, majit_ir::Type) {
@@ -4140,7 +4143,14 @@ impl ResumeDataLoopMemo {
                 numb_state.append_short(NULLREF);
                 continue;
             }
-            let opref = env.get_box_replacement(raw_opref);
+            // An InputArg is never a Const (`isinstance(box, Const)`).
+            // Walking it into a forwarded ConstPtr makes TAGCONST and
+            // drops a stack-resident red from the liveboxes.
+            let opref = if raw_opref.is_input_arg() {
+                env.get_box_replacement_not_const(raw_opref)
+            } else {
+                env.get_box_replacement(raw_opref)
+            };
             if opref.is_none() {
                 numb_state.append_short(NULLREF);
                 continue;

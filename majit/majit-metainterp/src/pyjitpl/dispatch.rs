@@ -1233,7 +1233,10 @@ fn refuse_walk_local_ref_args(
     // The first `i` is a stack depth. A walk local in that slot is a
     // pointer-sized word. Do not match plain `ri`: that class also
     // carries `track_operation` position bits (`line << 16`).
-    let pointer_index = matches!(arg_classes, "rii" | "rif")
+    // Only during a bridge walk: `rii`/`rif` is also `shift(n, c, mark)`
+    // and other helpers whose first int is a payload, not a stack depth.
+    let pointer_index = crate::is_bridge_walking()
+        && matches!(arg_classes, "rii" | "rif")
         && raw_i.first().is_some_and(|&index| {
             let as_usize = index as u64 as usize;
             as_usize > 0x1_0000

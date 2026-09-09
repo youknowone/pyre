@@ -13,17 +13,20 @@ use std::sync::{Arc, OnceLock};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 
+thread_local! {
+    static NULL_MEM_ACCESS: Cell<bool> = const { Cell::new(false) };
+}
+
 /// `llmodel.py protect_speculative_field` rejected a null gcptr.
 /// The walker aborts the trace instead of panicking the host.
-static NULL_MEM_ACCESS: AtomicBool = AtomicBool::new(false);
-
+/// Per-thread: two overlapping walks must not consume each other's latch.
 pub fn note_null_mem_access() {
-    NULL_MEM_ACCESS.store(true, Ordering::Relaxed);
+    NULL_MEM_ACCESS.with(|cell| cell.set(true));
 }
 
 #[must_use]
 pub fn take_null_mem_access() -> bool {
-    NULL_MEM_ACCESS.swap(false, Ordering::Relaxed)
+    NULL_MEM_ACCESS.with(|cell| cell.replace(false))
 }
 
 /// `rpython/jit/backend/model.py CPUTotalTracker` — per-CPU totals

@@ -359,6 +359,20 @@ impl RegAllocatorState {
         if (v_has_red && w_has_noncopy) || (w_has_red && v_has_noncopy) {
             return;
         }
+        if (v_has_red || w_has_red) && std::env::var_os("MAJIT_REGALLOC_DEBUG").is_some() {
+            let other = if v_has_red {
+                w.name_prefix()
+            } else {
+                v.name_prefix()
+            };
+            if other != "self" && other != "frame" && other != "v" {
+                eprintln!(
+                    "[regalloc] coalesce red with {other} (v={} w={})",
+                    v.name_prefix(),
+                    w.name_prefix(),
+                );
+            }
+        }
         if self
             .depgraph
             .neighbours
@@ -397,6 +411,13 @@ impl RegAllocatorState {
         kind: RegKind,
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
+        // Identity reds are Ref (frame / vm). Int and float reds are
+        // loop-carried values with ordinary lifetimes; reserving those
+        // too can push a register-heavy portal past the assembler's
+        // 256-register cap.
+        if kind != RegKind::Ref {
+            return;
+        }
         let reds = portal_merge_point_reds(graph, kind);
         if reds.is_empty() {
             return;
@@ -937,11 +958,27 @@ fn log_portal_ref_colors(graph: &FunctionGraph, coloring: &VarMap<usize>) {
         }
     }
     kind_hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut name_hits: Vec<(String, usize)> = Vec::new();
+    for (var, color) in coloring {
+        if !red_colors.iter().any(|red| *red == Some(*color)) {
+            continue;
+        }
+        let prefix = var.name_prefix();
+        if let Some((_, n)) = name_hits.iter_mut().find(|(k, _)| *k == prefix) {
+            *n += 1;
+        } else {
+            name_hits.push((prefix, 1));
+        }
+    }
+    name_hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if name_hits.len() > 16 {
+        name_hits.truncate(16);
+    }
     eprintln!(
         "[regalloc] portal {} ref reds={} colors={red_colors:?} \
          occupancy={red_occupancy:?} calls={call_hits} scope_calls={scope_calls} \
          scope_fields={scope_fields} protected_sharing_red={shared} colored={} \
-         red_kinds={kind_hits:?} samples={samples:?}",
+         red_kinds={kind_hits:?} samples={samples:?} red_names={name_hits:?}",
         graph.name,
         reds.len(),
         coloring.len(),
