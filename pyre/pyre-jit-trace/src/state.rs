@@ -1821,66 +1821,101 @@ fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
 pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
         let idx = jitcode_index as usize;
-        let jc = match sd.jitcodes.get(idx) {
-            Some(jc) => jc,
-            // `record_guard_with_snapshot` (`history.rs`) mints the
-            // interpreter-side vable promotes' resume frame with no
-            // coordinate of its own, marked
-            // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps
-            // it with the real position
-            // (`walker_capture_inline_nonstandard_vable_guard`). Arriving
-            // here still carrying the mark means that re-stamp was missed and
-            // the guard was compiled against a resume coordinate that names
-            // no frame. The frame holds no boxes, so `0` is the arithmetically
-            // right answer and the decode would survive it — but the guard it
-            // belongs to cannot resume, so say so instead of continuing.
-            None if jitcode_index == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 => {
-                panic!(
-                    "frame_value_count_at: guard resume frame is still \
-                     unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
-                     pc={pc}) — the `record_guard_with_snapshot` placeholder \
-                     reached the decoder without the walker's real position"
-                )
+        let runtime = {
+            let sd = r.borrow();
+            match sd.jitcodes.get(idx) {
+                Some(jc) => {
+                    // Snapshot publication stores only a decodable JitCode `-live-`
+                    // coordinate. An unrepresentable coordinate must have declined
+                    // during capture, before it could reach this frame-boundary
+                    // decoder.
+                    let count = decode_live_var_count(
+                        &jc.payload.jitcode,
+                        pc,
+                        sd.op_live,
+                        &sd.liveness_info,
+                    );
+                    Some((
+                        count,
+                        jc.payload.metadata.n_py_instrs as usize,
+                        sd.liveness_info.len(),
+                    ))
+                }
+                // `record_guard_with_snapshot` (`history.rs`) mints the
+                // interpreter-side vable promotes' resume frame with no
+                // coordinate of its own, marked
+                // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps
+                // it with the real position
+                // (`walker_capture_inline_nonstandard_vable_guard`). Arriving
+                // here still carrying the mark means that re-stamp was missed
+                // and the guard was compiled against a resume coordinate that
+                // names no frame. The frame holds no boxes, so `0` is the
+                // arithmetically right answer and the decode would survive it
+                // — but the guard it belongs to cannot resume, so say so
+                // instead of continuing.
+                None if jitcode_index
+                    == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 =>
+                {
+                    panic!(
+                        "frame_value_count_at: guard resume frame is still \
+                         unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
+                         pc={pc}) — the `record_guard_with_snapshot` placeholder \
+                         reached the decoder without the walker's real position"
+                    )
+                }
+                None => None,
             }
-            None => return 0,
         };
-        let payload = &jc.payload;
-        // Snapshot publication stores only a decodable JitCode `-live-`
-        // coordinate. An unrepresentable coordinate must have declined during
-        // capture, before it could reach this frame-boundary decoder.
-        let resolved_jit_pc: Option<usize> = if pc >= 0
-            && payload
-                .jitcode
-                .can_decode_live_vars(pc as usize, sd.op_live)
-        {
-            Some(pc as usize)
-        } else {
-            None
+        let Some((count, n_py_instrs, live_len)) = runtime else {
+            return 0;
         };
-        if let Some(jit_pc) = resolved_jit_pc {
-            let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
-            let all_liveness: &[u8] = &sd.liveness_info;
-            if off + 2 < all_liveness.len() {
-                let length_i = all_liveness[off] as usize;
-                let length_r = all_liveness[off + 1] as usize;
-                let length_f = all_liveness[off + 2] as usize;
-                return length_i + length_r + length_f;
-            }
+        if let Some(count) = count {
+            return count;
+        }
+        // `MetaInterp::interpret` inlines extracted helper JitCodes whose
+        // `JitCode::index` is the build-time `all_jitcodes` slot. The
+        // runtime store at that number can be a different body; try the
+        // table the helper was assembled into.
+        if let Some(count) = decode_build_time_live_var_count(jitcode_index, pc) {
+            return count;
         }
         // A published non-decodable coordinate violates the capture contract.
         // This remains a fail-loud internal invariant, not a fallback path.
         panic!(
             "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
-             (n_py_instrs={}, all_liveness.len={}). Phase X-0/X-1 removed \
-             all known triggers — further hits are bugs.",
-            jitcode_index,
-            pc,
-            payload.metadata.n_py_instrs as usize,
-            sd.liveness_info.len(),
+             (n_py_instrs={n_py_instrs}, all_liveness.len={live_len}). Phase \
+             X-0/X-1 removed all known triggers — further hits are bugs.",
+            jitcode_index, pc,
         );
     })
+}
+
+fn decode_live_var_count(
+    jitcode: &majit_translate::jitcode::JitCode,
+    pc: i32,
+    op_live: u8,
+    all_liveness: &[u8],
+) -> Option<usize> {
+    if pc < 0 || !jitcode.can_decode_live_vars(pc as usize, op_live) {
+        return None;
+    }
+    let off = jitcode.get_live_vars_info(pc as usize, op_live);
+    if off + 2 >= all_liveness.len() {
+        return None;
+    }
+    let length_i = all_liveness[off] as usize;
+    let length_r = all_liveness[off + 1] as usize;
+    let length_f = all_liveness[off + 2] as usize;
+    Some(length_i + length_r + length_f)
+}
+
+fn decode_build_time_live_var_count(jitcode_index: i32, pc: i32) -> Option<usize> {
+    let op_live = crate::jitcode_runtime::insns_opname_to_byte()
+        .get("live/")
+        .copied()?;
+    let jitcode = crate::jitcode_runtime::get_jitcode_by_index(jitcode_index as usize)?;
+    decode_live_var_count(&jitcode, pc, op_live, &liveness_info_snapshot())
 }
 
 /// [`frame_value_count_at`] for a driver whose frames are numbered in the
