@@ -6329,7 +6329,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
     /// One enumeration step, with the step already claimed.
     fn scandir_iter_next_entry(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        with_scandir_iter(self_obj, |iterator| {
+        let result = with_scandir_iter(self_obj, |iterator| {
             let idx = iterator.index;
             let entries = iterator.entries;
             let len = unsafe { pyre_object::w_list_len(entries) } as i64;
@@ -6348,7 +6348,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             Err(crate::PyError::type_error(
                 "expected a 'posix.ScandirIterator' object",
             ))
-        })
+        });
+        // `W_ScandirIterator.next_w` exhausts through `fail` → `_close`.
+        // `_finalize_` is then a no-op (`if not self.dirp: return`).  The
+        // prompt-finalization census treats a still-registered finalizer as
+        // a reason to collect the whole heap on `gen.close()`, so the
+        // exhausted iterator needs the same `may_ignore_finalizer` as
+        // `scandir_iter_mark_closed`.
+        if matches!(&result, Err(e) if e.matches_stop_iteration()) {
+            crate::executioncontext::may_ignore_finalizer(self_obj);
+        }
+        result
     }
 
     fn scandir_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
