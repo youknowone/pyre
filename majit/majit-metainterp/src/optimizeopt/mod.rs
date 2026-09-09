@@ -2972,13 +2972,13 @@ impl OptContext {
         .filter_map(|key| self.resop_refs.get(key))
         .any(|op| {
             matches!(
-                *op.forwarded.borrow(),
+                op.forwarded.borrow(),
                 Forwarded::Const(_) | Forwarded::SmallWide(_)
             )
         });
         let inputarg_const = self.inputarg_refs.get(&raw).is_some_and(|ia| {
             matches!(
-                *ia.forwarded.borrow(),
+                ia.forwarded.borrow(),
                 Forwarded::Const(_) | Forwarded::SmallWide(_)
             )
         });
@@ -4062,7 +4062,7 @@ impl OptContext {
             );
             let has_replay_marker = arg_operand.bound_op().is_some_and(|op| {
                 !matches!(
-                    &*op.forwarded.borrow(),
+                    &op.forwarded.borrow(),
                     majit_ir::forwarding::Forwarded::None
                 )
             });

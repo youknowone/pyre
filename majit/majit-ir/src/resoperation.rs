@@ -1458,9 +1458,8 @@ pub type OpArgVec = SmallVec<[Operand; 4]>;
 
 const ARG_INLINE: usize = 4;
 
-/// Packed `N_aryOp._args`. `SmallVec<[Operand; 4]>` is 80 B (len+cap+inline);
-/// a one-byte length plus the same four inline slots is 72 B, which with
-/// the packed descr/extra slot keeps `Op` at 128 B (`RcBox` 144).
+/// Packed `N_aryOp._args`. Four `Operand`s are 64 B; the length lives on
+/// [`Op::arg_len`] so `ArgSlot` stays 64 B and `Op` can be 112 B.
 #[repr(C)]
 struct ArgHeap {
     ptr: *mut Operand,
@@ -1473,35 +1472,42 @@ union ArgData {
     heap: std::mem::ManuallyDrop<ArgHeap>,
 }
 
-struct ArgInner {
-    len: u8,
-    data: ArgData,
+/// Construction-time arg lengths. Nested `ArgSlot::new` (an operand
+/// that itself mints an `Op`) must not clobber the outer `op!` length.
+thread_local! {
+    static ARG_LEN_STACK: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// `N_aryOp._args` slot. `UnsafeCell` matches RPython's unrestricted
-/// `op._args[i] = ...` on a shared ResOp; a `RefCell` flag would keep
-/// `Rc<Op>` in the 176-byte class.
-pub struct ArgSlot(std::cell::UnsafeCell<ArgInner>);
+fn push_arg_len(len: u8) {
+    ARG_LEN_STACK.with(|s| s.borrow_mut().push(len));
+}
+
+fn pop_arg_len() -> u8 {
+    ARG_LEN_STACK.with(|s| s.borrow_mut().pop().unwrap_or(0))
+}
+
+/// `N_aryOp._args` slot. Length is [`Op`]'s `arg_len`; this is only the
+/// four-operand union. `UnsafeCell` matches RPython's unrestricted
+/// `op._args[i] = ...` on a shared ResOp.
+pub struct ArgSlot(std::cell::UnsafeCell<ArgData>);
 
 impl ArgSlot {
     pub fn new(v: OpArgVec) -> Self {
-        ArgSlot(std::cell::UnsafeCell::new(Self::pack_inner(v)))
+        let len = u8::try_from(v.len()).expect("ResOp arg count fits u8");
+        push_arg_len(len);
+        ArgSlot(std::cell::UnsafeCell::new(Self::pack_data(v)))
     }
 
-    fn pack_inner(v: OpArgVec) -> ArgInner {
+    fn pack_data(v: OpArgVec) -> ArgData {
         let len_us = v.len();
-        let len = u8::try_from(len_us).expect("ResOp arg count fits u8");
         if len_us <= ARG_INLINE {
             let mut inline: [std::mem::MaybeUninit<Operand>; ARG_INLINE] =
                 unsafe { std::mem::MaybeUninit::uninit().assume_init() };
             for (i, arg) in v.into_iter().enumerate() {
                 inline[i].write(arg);
             }
-            ArgInner {
-                len,
-                data: ArgData {
-                    inline: std::mem::ManuallyDrop::new(inline),
-                },
+            ArgData {
+                inline: std::mem::ManuallyDrop::new(inline),
             }
         } else {
             let mut vec = v.into_vec();
@@ -1510,86 +1516,74 @@ impl ArgSlot {
                 cap: vec.capacity(),
             };
             std::mem::forget(vec);
-            ArgInner {
-                len,
-                data: ArgData {
-                    heap: std::mem::ManuallyDrop::new(heap),
-                },
+            ArgData {
+                heap: std::mem::ManuallyDrop::new(heap),
             }
         }
     }
 
     #[inline]
-    pub fn borrow(&self) -> &[Operand] {
+    pub fn borrow(&self, len: u8) -> &[Operand] {
         unsafe {
-            let inner = &*self.0.get();
-            let len = inner.len as usize;
-            if len <= ARG_INLINE {
-                std::slice::from_raw_parts((*inner.data.inline).as_ptr().cast::<Operand>(), len)
+            let data = &*self.0.get();
+            let n = len as usize;
+            if n <= ARG_INLINE {
+                std::slice::from_raw_parts((*data.inline).as_ptr().cast::<Operand>(), n)
             } else {
-                std::slice::from_raw_parts(inner.data.heap.ptr, len)
+                std::slice::from_raw_parts(data.heap.ptr, n)
             }
         }
     }
 
     #[inline]
-    pub fn borrow_mut(&self) -> &mut [Operand] {
+    pub fn borrow_mut(&self, len: u8) -> &mut [Operand] {
         unsafe {
-            let inner = &mut *self.0.get();
-            let len = inner.len as usize;
-            if len <= ARG_INLINE {
-                std::slice::from_raw_parts_mut(
-                    (*inner.data.inline).as_mut_ptr().cast::<Operand>(),
-                    len,
-                )
+            let data = &mut *self.0.get();
+            let n = len as usize;
+            if n <= ARG_INLINE {
+                std::slice::from_raw_parts_mut((*data.inline).as_mut_ptr().cast::<Operand>(), n)
             } else {
-                std::slice::from_raw_parts_mut(inner.data.heap.ptr, len)
+                std::slice::from_raw_parts_mut(data.heap.ptr, n)
             }
         }
     }
 
-    pub fn clone_vec(&self) -> OpArgVec {
-        self.borrow().iter().cloned().collect()
+    pub fn clone_vec(&self, len: u8) -> OpArgVec {
+        self.borrow(len).iter().cloned().collect()
     }
 
-    pub fn replace(&self, v: OpArgVec) {
+    pub fn replace(&self, old_len: u8, v: OpArgVec) -> u8 {
+        let new_len = u8::try_from(v.len()).expect("ResOp arg count fits u8");
         unsafe {
-            let inner = &mut *self.0.get();
-            drop_arg_inner(inner);
-            std::ptr::write(inner, Self::pack_inner(v));
+            let data = &mut *self.0.get();
+            drop_arg_data(data, old_len);
+            std::ptr::write(data, Self::pack_data(v));
         }
+        new_len
+    }
+
+    pub fn take_last_len() -> u8 {
+        pop_arg_len()
     }
 }
 
-unsafe fn drop_arg_inner(inner: &mut ArgInner) {
+unsafe fn drop_arg_data(data: &mut ArgData, len: u8) {
     unsafe {
-        let len = inner.len as usize;
-        if len <= ARG_INLINE {
-            for slot in (*inner.data.inline).iter_mut().take(len) {
+        let n = len as usize;
+        if n <= ARG_INLINE {
+            for slot in (*data.inline).iter_mut().take(n) {
                 slot.assume_init_drop();
             }
         } else {
-            let heap = std::mem::ManuallyDrop::take(&mut inner.data.heap);
-            let _ = Vec::from_raw_parts(heap.ptr, len, heap.cap);
+            let heap = std::mem::ManuallyDrop::take(&mut data.heap);
+            let _ = Vec::from_raw_parts(heap.ptr, n, heap.cap);
         }
-    }
-}
-
-impl Clone for ArgSlot {
-    fn clone(&self) -> Self {
-        ArgSlot::new(self.clone_vec())
-    }
-}
-
-impl Drop for ArgSlot {
-    fn drop(&mut self) {
-        unsafe { drop_arg_inner(self.0.get_mut()) }
     }
 }
 
 impl std::fmt::Debug for ArgSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.borrow()).finish()
+        f.write_str("ArgSlot")
     }
 }
 
@@ -1819,23 +1813,75 @@ impl std::fmt::Debug for ExtraSlot {
     }
 }
 
-/// `_forwarded` slot. Same `UnsafeCell` trade as [`DescrSlot`].
-#[derive(Debug)]
-pub struct ForwardedSlot(std::cell::UnsafeCell<crate::forwarding::Forwarded>);
+/// Packed `_forwarded` word (8 B). Decode is [`Forwarded`] on the stack
+/// so `Rc<Op>` leaves the 144-byte class.
+pub struct ForwardedSlot(std::cell::UnsafeCell<u64>);
 
 impl ForwardedSlot {
     pub fn new(v: crate::forwarding::Forwarded) -> Self {
-        ForwardedSlot(std::cell::UnsafeCell::new(v))
+        ForwardedSlot(std::cell::UnsafeCell::new(
+            crate::forwarding::pack_forwarded(v),
+        ))
     }
 
     #[inline]
-    pub fn borrow(&self) -> &crate::forwarding::Forwarded {
-        unsafe { &*self.0.get() }
+    pub fn borrow(&self) -> crate::forwarding::Forwarded {
+        crate::forwarding::unpack_forwarded(unsafe { *self.0.get() })
     }
 
     #[inline]
-    pub fn borrow_mut(&self) -> &mut crate::forwarding::Forwarded {
-        unsafe { &mut *self.0.get() }
+    pub fn set(&self, v: crate::forwarding::Forwarded) {
+        let old = unsafe { *self.0.get() };
+        unsafe {
+            *self.0.get() = crate::forwarding::pack_forwarded(v);
+        }
+        crate::forwarding::drop_packed_forwarded(old);
+    }
+
+    #[inline]
+    pub fn borrow_mut(&self) -> ForwardedMutGuard<'_> {
+        ForwardedMutGuard {
+            slot: self,
+            view: self.borrow(),
+        }
+    }
+}
+
+impl Drop for ForwardedSlot {
+    fn drop(&mut self) {
+        crate::forwarding::drop_packed_forwarded(*self.0.get_mut());
+    }
+}
+
+impl std::fmt::Debug for ForwardedSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.borrow(), f)
+    }
+}
+
+/// Decoded `_forwarded` that writes back on drop.
+pub struct ForwardedMutGuard<'a> {
+    slot: &'a ForwardedSlot,
+    view: crate::forwarding::Forwarded,
+}
+
+impl std::ops::Deref for ForwardedMutGuard<'_> {
+    type Target = crate::forwarding::Forwarded;
+    fn deref(&self) -> &crate::forwarding::Forwarded {
+        &self.view
+    }
+}
+
+impl std::ops::DerefMut for ForwardedMutGuard<'_> {
+    fn deref_mut(&mut self) -> &mut crate::forwarding::Forwarded {
+        &mut self.view
+    }
+}
+
+impl Drop for ForwardedMutGuard<'_> {
+    fn drop(&mut self) {
+        let view = std::mem::replace(&mut self.view, crate::forwarding::Forwarded::None);
+        self.slot.set(view);
     }
 }
 
@@ -1862,6 +1908,8 @@ pub struct Op {
     /// Packed `history.py *FrontendOp` concrete stamp (`_resint` /
     /// `_resfloat` / `_resref`). `0` = unset; see `VALUE_*`.
     value_kind: std::cell::Cell<u8>,
+    /// `N_aryOp._args` length. Lives here so [`ArgSlot`] is 64 B.
+    pub(crate) arg_len: std::cell::Cell<u8>,
     /// Index of this op in the trace (set by the trace builder). Packed
     /// so the position can be patched via `&Op` once the op is shared
     /// (the trace-iterator finalizer and unroll's resume-position
@@ -1908,17 +1956,26 @@ impl Clone for Op {
     /// (`resoperation.py __init__`). Preserve identity-shared
     /// forwarding via `Rc::clone` on `OpRc` instead.
     fn clone(&self) -> Self {
-        Op {
+        let op = Op {
             opcode: self.opcode,
             type_: self.type_,
             value_kind: std::cell::Cell::new(VALUE_UNSET),
+            arg_len: std::cell::Cell::new(self.arg_len.get()),
             pos: OpPos::new(self.pos.get()),
             value_bits: std::cell::Cell::new(0),
-            args: ArgSlot::new(self.args.clone_vec()),
+            args: ArgSlot::new(self.args.clone_vec(self.arg_len.get())),
             descr: DescrSlot::from_parts(self.descr.borrow(), self.descr.extra_clone_box()),
             extra: ExtraSlot::new(None),
             forwarded: ForwardedSlot::new(Forwarded::None),
-        }
+        };
+        let _ = pop_arg_len();
+        op
+    }
+}
+
+impl Drop for Op {
+    fn drop(&mut self) {
+        unsafe { drop_arg_data(&mut *self.args.0.get(), self.arg_len.get()) }
     }
 }
 
@@ -2025,7 +2082,7 @@ impl Op {
     /// long-lived op graphs must expose the actual mutable slots to the GC
     /// walker instead of copying the pointer values aside.
     pub fn walk_const_ptr_refs_mut(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        for arg in self.args.borrow().iter() {
+        for arg in self.args_slice().iter() {
             arg.walk_const_ptr_refs(visitor);
         }
         if let Some(fail_args) = self.guard_fail_args() {
@@ -2036,35 +2093,55 @@ impl Op {
     }
 
     pub fn new(opcode: OpCode, args: &[Operand]) -> Self {
-        Op {
+        let collected: OpArgVec = args.iter().cloned().collect();
+        let arg_len = u8::try_from(collected.len()).expect("ResOp arg count fits u8");
+        let op = Op {
             opcode,
             type_: opcode.result_type(),
             value_kind: std::cell::Cell::new(VALUE_UNSET),
+            arg_len: std::cell::Cell::new(arg_len),
             pos: OpPos::new(OpRef::NONE),
             value_bits: std::cell::Cell::new(0),
-            args: ArgSlot::new(args.iter().cloned().collect()),
+            args: ArgSlot::new(collected),
             descr: DescrSlot::new(None),
             extra: ExtraSlot::new(None),
             forwarded: ForwardedSlot::new(Forwarded::None),
-        }
+        };
+        let _ = pop_arg_len();
+        op
     }
 
     pub fn with_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Self {
-        Op {
+        let collected: OpArgVec = args.iter().cloned().collect();
+        let arg_len = u8::try_from(collected.len()).expect("ResOp arg count fits u8");
+        let op = Op {
             opcode,
             type_: opcode.result_type(),
             value_kind: std::cell::Cell::new(VALUE_UNSET),
+            arg_len: std::cell::Cell::new(arg_len),
             pos: OpPos::new(OpRef::NONE),
             value_bits: std::cell::Cell::new(0),
-            args: ArgSlot::new(args.iter().cloned().collect()),
+            args: ArgSlot::new(collected),
             descr: DescrSlot::new(Some(descr)),
             extra: ExtraSlot::new(None),
             forwarded: ForwardedSlot::new(Forwarded::None),
-        }
+        };
+        let _ = pop_arg_len();
+        op
+    }
+
+    #[inline]
+    pub fn args_slice(&self) -> &[Operand] {
+        self.args.borrow(self.arg_len.get())
+    }
+
+    #[inline]
+    pub fn args_slice_mut(&self) -> &mut [Operand] {
+        self.args.borrow_mut(self.arg_len.get())
     }
 
     pub fn arg(&self, idx: usize) -> Operand {
-        self.args.borrow()[idx].clone()
+        self.args_slice()[idx].clone()
     }
 
     /// True iff argument `idx` is a live-tracking bound operand
@@ -2073,11 +2150,11 @@ impl Op {
     /// position-remap passes skip these — they auto-track a renumbered
     /// producer and need no rewrite.
     pub fn arg_is_bound(&self, idx: usize) -> bool {
-        self.args.borrow()[idx].is_bound()
+        self.args_slice()[idx].is_bound()
     }
 
     pub fn num_args(&self) -> usize {
-        self.args.borrow().len()
+        self.arg_len.get() as usize
     }
 
     pub fn result_type(&self) -> Type {
@@ -2156,16 +2233,18 @@ impl Op {
     ) -> Op {
         let new_args: OpArgVec = match args {
             Some(a) => a.iter().cloned().collect(),
-            None => self.args.clone_vec(),
+            None => self.args.clone_vec(self.arg_len.get()),
         };
         let new_descr = match descr {
             Some(d) => d,
             None => self.descr.borrow(),
         };
+        let new_len = u8::try_from(new_args.len()).expect("ResOp arg count fits u8");
         let newop = Op {
             opcode,
             type_: opcode.result_type(),
             value_kind: std::cell::Cell::new(VALUE_UNSET),
+            arg_len: std::cell::Cell::new(new_len),
             pos: OpPos::new(self.pos.get()),
             value_bits: std::cell::Cell::new(0),
             args: ArgSlot::new(new_args),
@@ -2173,6 +2252,7 @@ impl Op {
             extra: ExtraSlot::new(None),
             forwarded: ForwardedSlot::new(Forwarded::None),
         };
+        let _ = pop_arg_len();
         // resoperation.py GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
         //   newop.rd_resume_position = self.rd_resume_position
@@ -4415,8 +4495,8 @@ mod tests {
             let op = std::mem::size_of::<Op>();
             let rc_box = op + 2 * std::mem::size_of::<usize>();
             assert!(
-                op <= 128,
-                "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 160-byte class"
+                op <= 112,
+                "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 144-byte class"
             );
             let extra = std::mem::size_of::<GuardExtra>();
             assert!(
@@ -4424,8 +4504,12 @@ mod tests {
                 "GuardExtra grew to {extra} bytes; keep Box<GuardExtra> out of the 56-byte class"
             );
             assert!(
-                std::mem::size_of::<ArgSlot>() <= 72,
-                "ArgSlot grew; four inline operands must stay in 72 B"
+                std::mem::size_of::<ArgSlot>() <= 64,
+                "ArgSlot grew; four inline operands must stay in 64 B"
+            );
+            assert!(
+                std::mem::size_of::<ForwardedSlot>() <= 8,
+                "ForwardedSlot grew; packed word must stay 8 B"
             );
             assert_eq!(std::mem::size_of::<DescrSlot>(), 16);
         }
@@ -4450,10 +4534,12 @@ mod tests {
                 $($field)*
                 type_: Type::Void,
                 value_kind: std::cell::Cell::new(VALUE_UNSET),
+                arg_len: std::cell::Cell::new(0),
                 value_bits: std::cell::Cell::new(0),
                 forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
             };
             __op.type_ = __op.opcode.result_type();
+            __op.arg_len.set(ArgSlot::take_last_len());
             __op
         }};
     }

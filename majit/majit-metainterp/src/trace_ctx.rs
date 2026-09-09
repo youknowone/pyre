@@ -2427,8 +2427,7 @@ impl TraceCtx {
         eprintln!("[p2-ir] {label} num_ops={}", self.recorder.num_ops());
         for op in self.recorder.ops() {
             let args: Vec<String> = op
-                .args
-                .borrow()
+                .args_slice()
                 .iter()
                 .map(|a| match a {
                     Operand::Op(o) => format!("{:?}", o.pos.get()),
@@ -3709,7 +3708,7 @@ impl TraceCtx {
                 return None;
             }
             let descr = op.descr.borrow().clone()?;
-            let obj = op.args.borrow().first()?.to_opref();
+            let obj = op.args_slice().first()?.to_opref();
             (descr, obj)
         };
         let Value::Ref(obj_ref) = self.recover_ref_value(obj, depth - 1)? else {

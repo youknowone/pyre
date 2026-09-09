@@ -2796,7 +2796,7 @@ pub fn record_discarded_level_traceback_for_recording(exc_value: i64, w_code: i6
 /// OpRef` slot in `Op::args` / `Op::fail_args` is the canonical
 /// forwardable Ref site.
 fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
-    for arg in op.args.borrow().iter() {
+    for arg in op.args_slice().iter() {
         arg.walk_const_ptr_refs(visitor);
     }
     if let Some(fail_args) = op.guard_fail_args() {

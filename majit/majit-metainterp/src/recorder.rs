@@ -1548,7 +1548,7 @@ impl Trace {
             }
         }
         for op in &self.ops {
-            for arg in op.args.borrow().iter() {
+            for arg in op.args_slice().iter() {
                 if !is_pooled_const_ptr(arg) {
                     arg.walk_const_ptr_refs(visitor);
                 }

@@ -2173,7 +2173,7 @@ impl AbstractShortPreambleBuilderState {
             // and consume the marker.
             let Some(dep) = arg.bound_op() else { continue };
             if matches!(
-                &*dep.forwarded.borrow(),
+                &dep.forwarded.borrow(),
                 majit_ir::forwarding::Forwarded::None
             ) {
                 continue;

@@ -12704,7 +12704,7 @@ mod tests {
         );
         let call_op = call_ops[0];
         assert_eq!(
-            call_op.args.borrow().len(),
+            call_op.num_args(),
             2,
             "fresh reds in extract_live order: stackpos, &state",
         );

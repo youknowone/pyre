@@ -12,7 +12,7 @@
 //! Hosted in `majit-ir` so the slot can carry `Rc<Op>` / `Rc<InputArg>`
 //! without a `majit-metainterp -> majit-ir` circular dep.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[cfg(feature = "test-support")]
@@ -320,10 +320,10 @@ pub trait ForwardingHost {
 
 impl ForwardingHost for Op {
     fn get_forwarded(&self) -> Forwarded {
-        self.forwarded.borrow().clone()
+        self.forwarded.borrow()
     }
     fn store_forwarded(&self, value: Forwarded) {
-        *self.forwarded.borrow_mut() = value;
+        self.forwarded.set(value);
     }
     fn is_same_op(&self, op: &crate::resoperation::OpRc) -> bool {
         std::ptr::eq(self, Rc::as_ptr(op))
@@ -332,10 +332,10 @@ impl ForwardingHost for Op {
 
 impl ForwardingHost for InputArg {
     fn get_forwarded(&self) -> Forwarded {
-        self.forwarded.borrow().clone()
+        self.forwarded.borrow()
     }
     fn store_forwarded(&self, value: Forwarded) {
-        *self.forwarded.borrow_mut() = value;
+        self.forwarded.set(value);
     }
     fn is_same_inputarg(&self, ia: &crate::value::InputArgRc) -> bool {
         std::ptr::eq(self, Rc::as_ptr(ia))
@@ -416,6 +416,138 @@ pub type PtrInfoBorrowMut = BorrowGuardMut<PtrInfo>;
 pub type IntBoundBorrow = BorrowGuard<IntBound>;
 /// Owning exclusive borrow guard for `int_bound_mut()`.
 pub type IntBoundBorrowMut = BorrowGuardMut<IntBound>;
+
+/// Packed `_forwarded` word. Low 3 bits are the tag; an 8-aligned Rc
+/// pointer uses tag 0 (`None` is the zero word). SmallConst keeps the
+/// i32 payload and identity token in the remaining 61 bits so the slot
+/// on every `Op` is 8 B and `Rc<Op>` leaves the 144-byte class.
+const FW_TAG: u64 = 0b111;
+const FW_OP: u64 = 0;
+const FW_INPUTARG: u64 = 1;
+const FW_CONST: u64 = 2;
+const FW_SMALL_CONST: u64 = 3;
+const FW_SMALL_WIDE: u64 = 4;
+const FW_INFO_PTR: u64 = 5;
+const FW_INFO_BOUND: u64 = 6;
+const FW_INFO_OTHER: u64 = 7;
+
+pub(crate) fn pack_forwarded(v: Forwarded) -> u64 {
+    match v {
+        Forwarded::None => 0,
+        Forwarded::Op(rc) => {
+            let p = Rc::into_raw(rc) as u64;
+            debug_assert_eq!(p & FW_TAG, 0);
+            p
+        }
+        Forwarded::InputArg(rc) => {
+            let p = Rc::into_raw(rc) as u64;
+            debug_assert_eq!(p & FW_TAG, 0);
+            p | FW_INPUTARG
+        }
+        Forwarded::Const(rc) => {
+            let p = Rc::into_raw(rc) as u64;
+            debug_assert_eq!(p & FW_TAG, 0);
+            p | FW_CONST
+        }
+        Forwarded::SmallConst(enc) => {
+            let id = enc >> 32;
+            let val = enc as u32 as u64;
+            debug_assert!(id < (1 << 29), "SmallConst identity exceeds 29 bits");
+            FW_SMALL_CONST | (val << 3) | (id << 35)
+        }
+        Forwarded::SmallWide(id) => {
+            debug_assert!(id < (1 << 61));
+            FW_SMALL_WIDE | (id << 3)
+        }
+        Forwarded::Info(info) => pack_info(info),
+    }
+}
+
+fn pack_info(info: OpInfo) -> u64 {
+    match info {
+        OpInfo::Ptr(rc) => {
+            let p = Rc::into_raw(rc) as u64;
+            debug_assert_eq!(p & FW_TAG, 0);
+            p | FW_INFO_PTR
+        }
+        OpInfo::IntBound(rc) => {
+            let p = Rc::into_raw(rc) as u64;
+            debug_assert_eq!(p & FW_TAG, 0);
+            p | FW_INFO_BOUND
+        }
+        other => {
+            let p = Box::into_raw(Box::new(other)) as u64;
+            debug_assert_eq!(p & FW_TAG, 0);
+            p | FW_INFO_OTHER
+        }
+    }
+}
+
+pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
+    if w == 0 {
+        return Forwarded::None;
+    }
+    match w & FW_TAG {
+        FW_OP => {
+            let rc = unsafe { Rc::from_raw(w as *const Op) };
+            let out = Forwarded::Op(Rc::clone(&rc));
+            std::mem::forget(rc);
+            out
+        }
+        FW_INPUTARG => {
+            let rc = unsafe { Rc::from_raw((w & !FW_TAG) as *const InputArg) };
+            let out = Forwarded::InputArg(Rc::clone(&rc));
+            std::mem::forget(rc);
+            out
+        }
+        FW_CONST => {
+            let rc = unsafe { Rc::from_raw((w & !FW_TAG) as *const Cell<Value>) };
+            let out = Forwarded::Const(Rc::clone(&rc));
+            std::mem::forget(rc);
+            out
+        }
+        FW_SMALL_CONST => {
+            let val = ((w >> 3) as u32) as u64;
+            let id = w >> 35;
+            Forwarded::SmallConst((id << 32) | val)
+        }
+        FW_SMALL_WIDE => Forwarded::SmallWide(w >> 3),
+        FW_INFO_PTR => {
+            let rc = unsafe { Rc::from_raw((w & !FW_TAG) as *const RefCell<PtrInfo>) };
+            let out = Forwarded::Info(OpInfo::Ptr(Rc::clone(&rc)));
+            std::mem::forget(rc);
+            out
+        }
+        FW_INFO_BOUND => {
+            let rc = unsafe { Rc::from_raw((w & !FW_TAG) as *const RefCell<IntBound>) };
+            let out = Forwarded::Info(OpInfo::IntBound(Rc::clone(&rc)));
+            std::mem::forget(rc);
+            out
+        }
+        FW_INFO_OTHER => {
+            let boxed = unsafe { Box::from_raw((w & !FW_TAG) as *mut OpInfo) };
+            let out = Forwarded::Info((*boxed).clone());
+            std::mem::forget(boxed);
+            out
+        }
+        _ => Forwarded::None,
+    }
+}
+
+pub(crate) fn drop_packed_forwarded(w: u64) {
+    if w == 0 {
+        return;
+    }
+    match w & FW_TAG {
+        FW_OP => drop(unsafe { Rc::from_raw(w as *const Op) }),
+        FW_INPUTARG => drop(unsafe { Rc::from_raw((w & !FW_TAG) as *const InputArg) }),
+        FW_CONST => drop(unsafe { Rc::from_raw((w & !FW_TAG) as *const Cell<Value>) }),
+        FW_INFO_PTR => drop(unsafe { Rc::from_raw((w & !FW_TAG) as *const RefCell<PtrInfo>) }),
+        FW_INFO_BOUND => drop(unsafe { Rc::from_raw((w & !FW_TAG) as *const RefCell<IntBound>) }),
+        FW_INFO_OTHER => drop(unsafe { Box::from_raw((w & !FW_TAG) as *mut OpInfo) }),
+        _ => {}
+    }
+}
 
 /// Turn an `OpRef` into a **bound** [`Operand`](crate::operand::Operand) for
 /// op-argument / fail-arg fixtures: `None` / `Const` shed inline, an
