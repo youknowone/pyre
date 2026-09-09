@@ -2420,7 +2420,7 @@ fn emit_publish_finish_gcmap_null(sink: &mut PeepSink<'_, '_>) {
     sink.local_get(0);
     sink.i32_const(FIRST_ITEM_OFFSET as i32);
     sink.i32_sub();
-    emit_word_zero(sink);
+    sink.i64_const(0);
     emit_word_store(sink, JF_GCMAP_OFS as u64);
 }
 
