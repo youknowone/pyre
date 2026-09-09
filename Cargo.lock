@@ -952,7 +952,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -986,7 +986,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "socket2",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1096,7 +1096,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1682,7 +1682,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "160f2eade097f30263b548aae5deb12ad349c909baa710fa24b92c9090b2e006"
 dependencies = [
  "scopeguard",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3232,7 +3232,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3294,7 +3294,7 @@ dependencies = [
 [[package]]
 name = "rustpython-codegen"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=2bbb6e6f8bce020dc6c54b447c34354e74d67a0d#2bbb6e6f8bce020dc6c54b447c34354e74d67a0d"
+source = "git+https://github.com/RustPython/RustPython.git?rev=3fe1c328efef25ad4164ce419aa05d92a0b6c88f#3fe1c328efef25ad4164ce419aa05d92a0b6c88f"
 dependencies = [
  "bitflags 2.13.0",
  "indexmap",
@@ -3317,7 +3317,7 @@ dependencies = [
 [[package]]
 name = "rustpython-common"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=2bbb6e6f8bce020dc6c54b447c34354e74d67a0d#2bbb6e6f8bce020dc6c54b447c34354e74d67a0d"
+source = "git+https://github.com/RustPython/RustPython.git?rev=3fe1c328efef25ad4164ce419aa05d92a0b6c88f#3fe1c328efef25ad4164ce419aa05d92a0b6c88f"
 dependencies = [
  "ascii",
  "base64 0.23.1",
@@ -3357,7 +3357,7 @@ dependencies = [
 [[package]]
 name = "rustpython-compiler"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=2bbb6e6f8bce020dc6c54b447c34354e74d67a0d#2bbb6e6f8bce020dc6c54b447c34354e74d67a0d"
+source = "git+https://github.com/RustPython/RustPython.git?rev=3fe1c328efef25ad4164ce419aa05d92a0b6c88f#3fe1c328efef25ad4164ce419aa05d92a0b6c88f"
 dependencies = [
  "rustpython-codegen",
  "rustpython-compiler-core",
@@ -3371,7 +3371,7 @@ dependencies = [
 [[package]]
 name = "rustpython-compiler-core"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=2bbb6e6f8bce020dc6c54b447c34354e74d67a0d#2bbb6e6f8bce020dc6c54b447c34354e74d67a0d"
+source = "git+https://github.com/RustPython/RustPython.git?rev=3fe1c328efef25ad4164ce419aa05d92a0b6c88f#3fe1c328efef25ad4164ce419aa05d92a0b6c88f"
 dependencies = [
  "bitflags 2.13.0",
  "bitflagset",
@@ -3387,7 +3387,7 @@ dependencies = [
 [[package]]
 name = "rustpython-host_env"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=2bbb6e6f8bce020dc6c54b447c34354e74d67a0d#2bbb6e6f8bce020dc6c54b447c34354e74d67a0d"
+source = "git+https://github.com/RustPython/RustPython.git?rev=3fe1c328efef25ad4164ce419aa05d92a0b6c88f#3fe1c328efef25ad4164ce419aa05d92a0b6c88f"
 dependencies = [
  "bitflags 2.13.0",
  "cc",
@@ -3429,7 +3429,7 @@ dependencies = [
 [[package]]
 name = "rustpython-literal"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=2bbb6e6f8bce020dc6c54b447c34354e74d67a0d#2bbb6e6f8bce020dc6c54b447c34354e74d67a0d"
+source = "git+https://github.com/RustPython/RustPython.git?rev=3fe1c328efef25ad4164ce419aa05d92a0b6c88f#3fe1c328efef25ad4164ce419aa05d92a0b6c88f"
 dependencies = [
  "hexf-parse",
  "is-macro",
@@ -3514,7 +3514,7 @@ dependencies = [
 [[package]]
 name = "rustpython-sre_engine"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=2bbb6e6f8bce020dc6c54b447c34354e74d67a0d#2bbb6e6f8bce020dc6c54b447c34354e74d67a0d"
+source = "git+https://github.com/RustPython/RustPython.git?rev=3fe1c328efef25ad4164ce419aa05d92a0b6c88f#3fe1c328efef25ad4164ce419aa05d92a0b6c88f"
 dependencies = [
  "bitflags 2.13.0",
  "num_enum",
@@ -3526,7 +3526,7 @@ dependencies = [
 [[package]]
 name = "rustpython-unicode"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=2bbb6e6f8bce020dc6c54b447c34354e74d67a0d#2bbb6e6f8bce020dc6c54b447c34354e74d67a0d"
+source = "git+https://github.com/RustPython/RustPython.git?rev=3fe1c328efef25ad4164ce419aa05d92a0b6c88f#3fe1c328efef25ad4164ce419aa05d92a0b6c88f"
 dependencies = [
  "icu_casemap",
  "icu_locale",
@@ -3540,7 +3540,7 @@ dependencies = [
 [[package]]
 name = "rustpython-wtf8"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=2bbb6e6f8bce020dc6c54b447c34354e74d67a0d#2bbb6e6f8bce020dc6c54b447c34354e74d67a0d"
+source = "git+https://github.com/RustPython/RustPython.git?rev=3fe1c328efef25ad4164ce419aa05d92a0b6c88f#3fe1c328efef25ad4164ce419aa05d92a0b6c88f"
 dependencies = [
  "ascii",
  "bstr",
@@ -3849,7 +3849,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3899,7 +3899,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3983,7 +3983,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4897,7 +4897,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

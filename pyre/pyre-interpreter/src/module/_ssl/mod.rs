@@ -1128,14 +1128,15 @@ mod context_methods {
                 }
                 let name = pyre_native::ssl::cipher_name(index);
                 let bits = pyre_native::ssl::cipher_bits(index);
+                let description = pyre_native::ssl::cipher_description(index);
                 ciphers.push(dict_from_pairs(&[
-                    ("id", w_int_new(index as i64)),
+                    ("id", w_int_new(pyre_native::ssl::cipher_id(index))),
                     ("name", w_str_new(name)),
                     (
                         "protocol",
                         w_str_new(pyre_native::ssl::cipher_protocol(index)),
                     ),
-                    ("description", w_str_new(name)),
+                    ("description", w_str_new(&description)),
                     ("strength_bits", w_int_new(bits as i64)),
                     ("alg_bits", w_int_new(bits as i64)),
                     ("aead", w_bool_from(pyre_native::ssl::cipher_aead(index))),
@@ -1388,9 +1389,9 @@ mod context_methods {
                 .ok_or_else(|| crate::PyError::type_error("a bytes-like object is required"))?;
             // `PyBuffer_Release` before propagating: a parse failure must not
             // leave a `bytearray` argument permanently exported.
-            let parsed = parse_length_prefixed_protocols(buffer.as_bytes());
+            let parsed = pyre_native::ssl::parse_length_prefixed_alpn(buffer.as_bytes());
             buffer.release();
-            let protocols = parsed?;
+            let protocols = parsed.map_err(ssl_error)?;
             unsafe { pyre_native::ssl::context_set_alpn(self.backend, protocols) };
             Ok(())
         }
@@ -1410,21 +1411,6 @@ mod context_methods {
             )));
         }
         Ok(value)
-    }
-
-    fn parse_length_prefixed_protocols(data: &[u8]) -> Result<Vec<Vec<u8>>, crate::PyError> {
-        let mut protocols = Vec::new();
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let len = data[offset] as usize;
-            offset += 1;
-            if len == 0 || offset + len > data.len() {
-                return Err(ssl_error("invalid ALPN protocol list"));
-            }
-            protocols.push(data[offset..offset + len].to_vec());
-            offset += len;
-        }
-        Ok(protocols)
     }
 } // context_methods
 
@@ -3295,6 +3281,12 @@ crate::py_module! {
         "SSL_ERROR_EOF" => 8,
         "SSL_ERROR_INVALID_ERROR_CODE" => 10,
         "HOSTFLAG_NEVER_CHECK_SUBJECT" => 0x20,
+        "SSL3_RT_CHANGE_CIPHER_SPEC" => pyre_native::ssl::SSL3_RT_CHANGE_CIPHER_SPEC,
+        "SSL3_RT_ALERT" => pyre_native::ssl::SSL3_RT_ALERT,
+        "SSL3_RT_HANDSHAKE" => pyre_native::ssl::SSL3_RT_HANDSHAKE,
+        "SSL3_RT_APPLICATION_DATA" => pyre_native::ssl::SSL3_RT_APPLICATION_DATA,
+        "SSL3_RT_HEADER" => pyre_native::ssl::SSL3_RT_HEADER,
+        "SSL3_MT_CHANGE_CIPHER_SPEC" => pyre_native::ssl::SSL3_MT_CHANGE_CIPHER_SPEC,
         "ENCODING_PEM" => 1,
         "ENCODING_DER" => 2,
         "ENCODING_PEM_AUX" => 0x101

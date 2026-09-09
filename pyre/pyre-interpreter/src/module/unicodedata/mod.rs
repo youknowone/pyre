@@ -3,9 +3,10 @@
 //! Real implementation backed by the runtime-independent
 //! `rustpython-unicode` crate.  The module-level functions read the latest
 //! bundled database; `unicodedata.ucd_3_2_0` reads the Unicode 3.2.0 view
-//! (used by `stringprep`).  `lookup` / `normalize` / `is_normalized` are
+//! (used by `stringprep`).  `normalize` / `is_normalized` are
 //! version-independent, matching the crate, so the 3.2.0 instance shares those
-//! callables with the module.
+//! callables with the module. `lookup` consults the instance's UCD: the
+//! modern view resolves name aliases and named sequences; `ucd_3_2_0` does not.
 //!
 //! Signatures and error types/messages follow CPython 3.14.
 //!
@@ -206,11 +207,12 @@ fn name(args: &[PyObjectRef]) -> PyResult {
     name_impl(&MODERN, args)
 }
 
-// Version-independent queries: `lookup` / `normalize` / `is_normalized` do not
-// depend on the database version, so the 3.2.0 instance binds the same
-// callables.
+// Version-independent queries: `normalize` / `is_normalized` do not depend
+// on the database version, so the 3.2.0 instance binds the same callables.
+// `lookup` is versioned: aliases and named sequences exist only on the
+// modern UCD.
 
-fn lookup(args: &[PyObjectRef]) -> PyResult {
+fn lookup_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
         return Err(PyError::type_error(format!(
             "lookup expected 1 argument, got {}",
@@ -226,16 +228,26 @@ fn lookup(args: &[PyObjectRef]) -> PyResult {
     }
     let name = unsafe { w_str_get_wtf8(obj) };
     if let Ok(name) = name.as_str()
-        && let Some(ch) = ucd_core::lookup_character(name)
+        && let Some(found) = db.lookup(name)
     {
-        let mut buf = String::with_capacity(ch.len_utf8());
-        buf.push(ch);
-        return Ok(w_str_new_managed(&buf));
+        let text = match found {
+            ucd_core::LookupResult::Character(ch) => {
+                let mut buf = String::with_capacity(ch.len_utf8());
+                buf.push(ch);
+                buf
+            }
+            ucd_core::LookupResult::Sequence(seq) => seq.to_string(),
+        };
+        return Ok(w_str_new_managed(&text));
     }
     let mut msg = Wtf8Buf::from_string("undefined character name '".to_string());
     msg.push_wtf8(name);
     msg.push_str("'");
     Err(PyError::key_error(msg))
+}
+
+fn lookup(args: &[PyObjectRef]) -> PyResult {
+    lookup_impl(&MODERN, args)
 }
 
 /// Parse the normalization-form argument (`NFC`/`NFKC`/`NFD`/`NFKD`).
@@ -387,7 +399,10 @@ impl W_UCD {
         )
     }
     fn lookup(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        lookup(ucd_method_args(args))
+        lookup_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
     }
     fn normalize(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         normalize(ucd_method_args(args))

@@ -291,6 +291,26 @@ pub const PROTO_TLSV1_2: i32 = 0x0303;
 #[cfg(not(feature = "host_env"))]
 pub const PROTO_TLSV1_3: i32 = 0x0304;
 
+#[cfg(feature = "host_env")]
+pub use host_ssl::msg::{
+    SSL3_MT_CHANGE_CIPHER_SPEC, SSL3_RT_ALERT, SSL3_RT_CHANGE_CIPHER_SPEC, SSL3_RT_HANDSHAKE,
+    SSL3_RT_HEADER,
+};
+#[cfg(feature = "host_env")]
+pub const SSL3_RT_APPLICATION_DATA: i32 = host_ssl::msg::SSL3_RT_APPLICATION_DATA as i32;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_CHANGE_CIPHER_SPEC: i32 = 20;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_ALERT: i32 = 21;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_HANDSHAKE: i32 = 22;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_APPLICATION_DATA: i32 = 23;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_HEADER: i32 = 256;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_MT_CHANGE_CIPHER_SPEC: i32 = 0x0101;
+
 bitflags::bitflags! {
     /// `SSL_OP_*` bits the `_ssl` module publishes.  Both `DEFAULT_OPTIONS` and
     /// [`enabled_versions`] decode this space, so the two must not name the same
@@ -524,6 +544,30 @@ context_scalar!(
     maximum_version,
     i32
 );
+
+/// Parse `[len][proto]...` the way `ssl.py` hands it to `_set_alpn_protocols`.
+#[inline(never)]
+pub fn parse_length_prefixed_alpn(data: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+    #[cfg(feature = "host_env")]
+    {
+        host_ssl::parse_length_prefixed_alpn(data).map_err(|_| "invalid ALPN protocol list")
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let mut protocols = Vec::new();
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let len = data[offset] as usize;
+            offset += 1;
+            if len == 0 || offset + len > data.len() {
+                return Err("invalid ALPN protocol list");
+            }
+            protocols.push(data[offset..offset + len].to_vec());
+            offset += len;
+        }
+        Ok(protocols)
+    }
+}
 
 /// Store the wire-format ALPN list after the interpreter has validated it.
 ///
@@ -1680,6 +1724,26 @@ pub fn cipher_name(index: usize) -> &'static str {
     CIPHERS[index].name
 }
 #[inline(never)]
+pub fn cipher_id(index: usize) -> i64 {
+    #[cfg(feature = "host_env")]
+    {
+        if let Some(suite) = suite_by_openssl_name(CIPHERS[index].name) {
+            return i64::from(cipher::describe(&suite).id);
+        }
+    }
+    index as i64
+}
+#[inline(never)]
+pub fn cipher_description(index: usize) -> String {
+    #[cfg(feature = "host_env")]
+    {
+        if let Some(suite) = suite_by_openssl_name(CIPHERS[index].name) {
+            return cipher::describe(&suite).description;
+        }
+    }
+    CIPHERS[index].name.to_string()
+}
+#[inline(never)]
 pub fn cipher_protocol(index: usize) -> &'static str {
     CIPHERS[index].protocol
 }
@@ -1724,6 +1788,16 @@ pub fn default_cipher_string() -> String {
     {
         "rustls default cipher suites".to_string()
     }
+}
+
+#[cfg(feature = "host_env")]
+fn suite_by_openssl_name(name: &str) -> Option<rustls::SupportedCipherSuite> {
+    ensure_provider();
+    CryptoExt::get_ext()
+        .all_ciphers_or_default()
+        .iter()
+        .copied()
+        .find(|suite| cipher::describe(suite).name == name)
 }
 
 /// OpenSSL's name for each cipher suite rustls can negotiate.
@@ -3260,25 +3334,55 @@ fn rustls_error(error: impl std::fmt::Display) -> (i32, String) {
 /// exception text cannot drift apart.
 #[allow(deprecated)] // rustls can still return the compatibility variant.
 fn certificate_error_details(error: &rustls::CertificateError) -> (i32, &'static str) {
+    #[cfg(feature = "host_env")]
+    use host_ssl::x509::{
+        X509_V_ERR_CERT_HAS_EXPIRED, X509_V_ERR_CERT_NOT_YET_VALID, X509_V_ERR_CERT_REVOKED,
+        X509_V_ERR_HOSTNAME_MISMATCH, X509_V_ERR_INVALID_PURPOSE, X509_V_ERR_UNABLE_TO_GET_CRL,
+        X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY, X509_V_ERR_UNSPECIFIED,
+    };
     use rustls::CertificateError;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_UNSPECIFIED: i32 = 1;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_UNABLE_TO_GET_CRL: i32 = 3;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_CERT_NOT_YET_VALID: i32 = 9;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_CERT_HAS_EXPIRED: i32 = 10;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY: i32 = 20;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_CERT_REVOKED: i32 = 23;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_INVALID_PURPOSE: i32 = 26;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_HOSTNAME_MISMATCH: i32 = 62;
     let code = match error {
-        CertificateError::Expired | CertificateError::ExpiredContext { .. } => 10,
-        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => 9,
-        CertificateError::Revoked => 23,
-        CertificateError::UnknownIssuer => 20,
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+            X509_V_ERR_CERT_HAS_EXPIRED
+        }
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+            X509_V_ERR_CERT_NOT_YET_VALID
+        }
+        CertificateError::Revoked => X509_V_ERR_CERT_REVOKED,
+        CertificateError::UnknownIssuer => X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
         CertificateError::BadSignature => 7,
-        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => 62,
-        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => 26,
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+            X509_V_ERR_HOSTNAME_MISMATCH
+        }
+        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
+            X509_V_ERR_INVALID_PURPOSE
+        }
         CertificateError::BadEncoding => 5,
         CertificateError::UnhandledCriticalExtension => 34,
-        CertificateError::UnknownRevocationStatus => 3,
+        CertificateError::UnknownRevocationStatus => X509_V_ERR_UNABLE_TO_GET_CRL,
         CertificateError::ExpiredRevocationList
         | CertificateError::ExpiredRevocationListContext { .. } => 12,
         CertificateError::UnsupportedSignatureAlgorithm
         | CertificateError::UnsupportedSignatureAlgorithmContext { .. }
         | CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => 7,
         CertificateError::InvalidOcspResponse => 50,
-        _ => 1,
+        _ => X509_V_ERR_UNSPECIFIED,
     };
     (code, certificate_verify_message(code))
 }
