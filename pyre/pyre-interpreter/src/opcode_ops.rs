@@ -219,12 +219,27 @@ pub fn compare_value_from_tag(
     b: PyObjectRef,
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
-    // CONTAINS_OP routes through the compare-residual machinery: tag 6 =
-    // `in`, tag 7 = `not in`. `a` is the needle, `b` the container (flatten
-    // lowers the args as `[item, container]`).
-    if op_tag == 6 || op_tag == 7 {
+    // CONTAINS_OP routes through the compare-residual machinery.
+    // `a` is the needle, `b` the container (flatten lowers the args
+    // as `[item, container]`).
+    if crate::runtime_ops::compare_op_tag_is_contains(op_tag) {
         let found = crate::baseobjspace::contains(b, a)?;
-        let result = if op_tag == 7 { !found } else { found };
+        let result = if op_tag == crate::runtime_ops::COMPARE_OP_NOT_CONTAINS {
+            !found
+        } else {
+            found
+        };
+        return Ok(w_bool_from(result));
+    }
+    // IS_OP: `space.is_w`, not raw pointer identity — same contract as
+    // `bh_compare_fn`. Infallible.
+    if crate::runtime_ops::compare_op_tag_is_identity(op_tag) {
+        let same = crate::baseobjspace::is_w(a, b);
+        let result = if op_tag == crate::runtime_ops::COMPARE_OP_IS_NOT {
+            !same
+        } else {
+            same
+        };
         return Ok(w_bool_from(result));
     }
     let op = match op_tag {

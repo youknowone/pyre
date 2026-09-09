@@ -582,6 +582,22 @@ pub struct ExecutionContext {
 
 pub type PyExecutionContext = ExecutionContext;
 
+/// Hidden `mutate_w_tracefunc` for `_immutable_fields_ = ['w_tracefunc?']`.
+/// The EC is per-thread; this watcher list is the live thread's, not a
+/// Clone template's (`clone_for_thread`).
+thread_local! {
+    static W_TRACEFUNC_QMUT: pyre_object::quasiimmut::QuasiImmutField =
+        const { pyre_object::quasiimmut::QuasiImmutField::new() };
+}
+
+pub fn w_tracefunc_current_qmut() -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
+    W_TRACEFUNC_QMUT.with(pyre_object::quasiimmut::QuasiImmutField::get_current_qmut_instance)
+}
+
+fn notify_w_tracefunc_quasi_immut() {
+    W_TRACEFUNC_QMUT.with(pyre_object::quasiimmut::QuasiImmutField::invalidate);
+}
+
 /// `ExecutionContext.get_builtin()` cache read. This concrete accessor keeps
 /// the rtyper from having to bind generic `std::cell::Cell<T>::get` while
 /// preserving the exact `Cell<PyObjectRef>` storage used by the PyPy-parity
@@ -1432,20 +1448,25 @@ impl ExecutionContext {
     }
 
     pub fn settrace(&mut self, w_func: PyObjectRef) {
-        self.w_tracefunc = w_func;
-        if w_func.is_null() || w_func == pyre_object::w_none() {
-            self.w_tracefunc = pyre_object::PY_NULL;
+        let w_func = if w_func.is_null() || w_func == pyre_object::w_none() {
+            pyre_object::PY_NULL
         } else {
+            // executioncontext.py settrace: force compiled frames first,
+            // then publish the hook so a retrace sees it.
             self.force_all_frames(false);
-            // executioncontext.py settrace — increase the JIT's
-            // trace_limit when a tracefunc is installed; tracing
-            // generates a ton of extra ops per bytecode.
             crate::call::set_jit_param("trace_limit", 10000);
-        }
+            w_func
+        };
+        // `_immutable_fields_ = ['w_tracefunc?']`: the store is the
+        // `function_notify_quasi_immut` write.  Invalidate with it so
+        // loops that folded the slot fail `GUARD_NOT_INVALIDATED`.
+        notify_w_tracefunc_quasi_immut();
+        self.w_tracefunc = w_func;
     }
 
     pub fn gettrace(&self) -> PyObjectRef {
-        self.w_tracefunc
+        // executioncontext.py gettrace: `return jit.promote(self.w_tracefunc)`.
+        majit_metainterp::jit::promote(self.w_tracefunc)
     }
 
     /// `executioncontext.py setprofile`.

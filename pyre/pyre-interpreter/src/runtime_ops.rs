@@ -547,11 +547,28 @@ pub fn binary_op_tag_is_inplace(tag: i64) -> bool {
     (13..=24).contains(&tag)
 }
 
+/// COMPARE helper tags outside the 0..=5 rich-comparison range
+/// [`compare_op_from_tag`] decodes.  `contains` / `not_contains` are
+/// CONTAINS_OP; `is` / `is_not` are IS_OP (`space.is_w`);
+/// `ISINSTANCE_OP_TAG` is CHECK_EXC_MATCH.
+pub const COMPARE_OP_CONTAINS: i64 = 6;
+pub const COMPARE_OP_NOT_CONTAINS: i64 = 7;
+pub const COMPARE_OP_IS: i64 = 8;
+pub const COMPARE_OP_IS_NOT: i64 = 9;
+
 /// The `compare_fn` tag `CHECK_EXC_MATCH` passes for its
 /// `isinstance(exc, match_type)` check.  It is outside the 0..=5 range
 /// [`compare_op_from_tag`] decodes, so a `CompareOp` residual carrying it is
 /// the exception-match shape and nothing else.
 pub const ISINSTANCE_OP_TAG: i64 = 10;
+
+pub fn compare_op_tag_is_identity(tag: i64) -> bool {
+    tag == COMPARE_OP_IS || tag == COMPARE_OP_IS_NOT
+}
+
+pub fn compare_op_tag_is_contains(tag: i64) -> bool {
+    tag == COMPARE_OP_CONTAINS || tag == COMPARE_OP_NOT_CONTAINS
+}
 
 pub fn compare_op_tag(op: ComparisonOperator) -> i64 {
     match op {
