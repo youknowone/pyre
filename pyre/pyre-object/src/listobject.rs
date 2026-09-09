@@ -2768,12 +2768,10 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 // so the compiled loop residual-calls every integer append.
                 let item = plain_int_w(value);
                 let length = ll_list_int_length(list);
-                if length < ll_list_int_capacity(list) {
-                    ll_list_int_set_len(list, length + 1);
-                    ll_list_int_setitem_fast(list, length, item);
-                } else {
-                    list.int_items.push(item);
-                }
+                ll_list_int_resize_ge(obj, length + 1);
+                let obj = current_gc_ref(obj);
+                let list = &mut *(obj as *mut W_ListObject);
+                ll_list_int_setitem_fast(list, length, item);
             } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
                 let obj = current_gc_ref(obj);
                 let value = current_gc_ref(value);
