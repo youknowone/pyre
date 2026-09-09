@@ -223,6 +223,16 @@ impl Op {
         self.ensure_guard_extra().set_fail_args(fail_args);
     }
 
+    /// Share the source guard's `_fail_args` list (same `Rc` slice).
+    /// Avoids a second 4-/6-operand heap when stamp/copy already has
+    /// the replacements on `src`.
+    pub fn copy_failargs_shared(&self, src: &Self) {
+        match src.try_guard_extra().and_then(|g| g.fail_args_rc()) {
+            Some(rc) => self.ensure_guard_extra().set_fail_args_rc(rc),
+            None => self.clearfailargs(),
+        }
+    }
+
     /// In-place mutable view of the fail_args slot.  Lets callers iterate
     /// the SmallVec mutably (`fa.iter_mut()`, `fa[i] = …`) without going
     /// through a clone/setfailargs round-trip.  Returns `None` when the

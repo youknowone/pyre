@@ -3065,11 +3065,7 @@ impl OptContext {
             None => dst.cleardescr(),
         }
         if src.opcode.is_guard() {
-            if let Some(fa) = src.guard_fail_args() {
-                dst.setfailargs(fa.iter().cloned().collect());
-            } else {
-                dst.clearfailargs();
-            }
+            dst.copy_failargs_shared(src);
             match src.get_fail_arg_types() {
                 Some(ts) => dst.set_fail_arg_types(ts),
                 None => dst.clear_fail_arg_types(),
