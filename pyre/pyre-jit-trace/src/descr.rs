@@ -112,6 +112,16 @@ const CLASSMETHOD_W_FUNCTION_INDEX: u32 = WRAPPER_DESCR_TAG | 1;
 const CELL_FAMILY_DESCR_TAG: u32 = 0x5300_0000;
 const CELL_FAMILY_EVER_MUTATED_INDEX: u32 = CELL_FAMILY_DESCR_TAG;
 
+// `ExecutionContext.w_tracefunc` is a new `?` field.  `quasi_immut_descr`
+// and `function_quasi_immut_slot` select the pointer cast from
+// `descr.index()` alone, and the EC group's ordinal `2` is not an owner
+// identity — any other group's field 2 would take the same arm.  Reserved
+// in a tag of its own, disjoint from FIELD / ARRAY / SIZE / CELL / MAPDICT /
+// PROPERTY / WRAPPER / CELL_FAMILY / `object.typeptr` / NATIVE_MAPDICT /
+// the GC tid.
+const EC_DESCR_TAG: u32 = 0x5400_0000;
+const EC_W_TRACEFUNC_INDEX: u32 = EC_DESCR_TAG;
+
 // The generated native user layouts append mapdict fields at different base
 // sizes. HeapCache keys by descriptor index; give each translated STRUCT field
 // the distinct identity provided by descr.py's per-STRUCT cache.
@@ -3739,12 +3749,12 @@ pub fn function_w_text_signature_descr() -> DescrRef {
 /// The index carries no struct identity — `stable_field_index` derives it from
 /// `(offset, field_size, field_type, signed)` — so keying an arm on it is only
 /// safe while no other quasi-immutable descriptor can land on the same number.
-/// None can: the two that also address a real struct field
-/// ([`TYPE_VERSION_TAG_FIELD_DESCR`], [`MODULE_DICT_VERSION_FIELD_DESCR`]) are
-/// `Type::Int`, which `type_bits` separates from these nine `Type::Ref` slots,
-/// and the other five carry reserved [`MAPDICT_DESCR_TAG`] indices outside the
-/// `FIELD_DESCR_TAG` range altogether.  A descriptor that is not quasi-immutable
-/// reaches neither caller.
+/// The other owners that address a real struct field either use a different
+/// `Type` ([`TYPE_VERSION_TAG_FIELD_DESCR`], [`MODULE_DICT_VERSION_FIELD_DESCR`])
+/// or carry a reserved tag outside `FIELD_DESCR_TAG`
+/// ([`MAPDICT_DESCR_TAG`], [`PROPERTY_DESCR_TAG`], [`WRAPPER_DESCR_TAG`],
+/// [`CELL_FAMILY_DESCR_TAG`], [`EC_W_TRACEFUNC_INDEX`]).  A descriptor that
+/// is not quasi-immutable reaches neither caller.
 pub fn function_quasi_immut_slot(index: u32) -> Option<pyre_interpreter::function::QuasiImmutSlot> {
     use pyre_interpreter::function::QuasiImmutSlot;
     static SLOTS: LazyLock<Vec<(u32, QuasiImmutSlot)>> = LazyLock::new(|| {
@@ -5738,6 +5748,8 @@ pub fn ec_topframeref_descr() -> DescrRef {
 ///
 /// Marked `w_tracefunc?` so the portal pin is a `QUASIIMMUT_FIELD` marker
 /// plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
+/// The index is [`EC_W_TRACEFUNC_INDEX`], not the group's ordinal `2`:
+/// `quasi_immut_descr` casts from that number alone.
 /// Recorded at the portal merge point by `record_portal_tracefunc_guard`
 /// (`jitcode_dispatch/mod.rs`).  Same group as the two accessors above, so
 /// the read shares their struct identity and the heapcache collapses a run
@@ -5834,7 +5846,10 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     };
     let mut w_tracefunc = field(2, "w_tracefunc", pyre_interpreter::EC_W_TRACEFUNC_OFFSET);
     // `executioncontext.py _immutable_fields_ = ['w_tracefunc?']`:
-    // `descr.py:229` treats a `?` entry as pure (`!= False`) and quasi.
+    // `get_field_descr` treats a `?` entry as pure (`!= False`) and quasi.
+    // The reserved index is the owner identity `quasi_immut_descr` casts on;
+    // the ordinal `2` is not one.
+    w_tracefunc.index = EC_W_TRACEFUNC_INDEX;
     w_tracefunc.is_immutable = true;
     w_tracefunc.is_quasi_immutable = true;
     let mut specs = vec![
@@ -6542,6 +6557,16 @@ mod tests {
 
         assert_eq!(a.index(), b.index());
         assert_ne!(a.index(), c.index());
+    }
+
+    #[test]
+    fn ec_w_tracefunc_quasi_index_is_not_a_function_slot() {
+        let idx = ec_w_tracefunc_descr().index();
+        assert_eq!(idx, EC_W_TRACEFUNC_INDEX);
+        assert_ne!(idx, 2);
+        assert_ne!(idx, function_code_descr().index());
+        assert!(function_quasi_immut_slot(idx).is_none());
+        assert!(function_quasi_immut_slot(function_code_descr().index()).is_some());
     }
 
     #[test]

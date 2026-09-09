@@ -5521,14 +5521,17 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
             pyre_object::function::w_classmethod_current_w_function_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
             )
+        } else if index == crate::descr::ec_w_tracefunc_descr().index() {
+            // Ahead of `function_quasi_immut_slot`.  The reserved index is
+            // the owner identity; this order keeps an ordinal slip from
+            // casting an EC as a Function.
+            pyre_interpreter::executioncontext::ec_current_w_tracefunc_qmut(
+                struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
+            )
         } else if let Some(slot) = crate::descr::function_quasi_immut_slot(index) {
             pyre_interpreter::function::function_current_qmut_instance(
                 struct_ptr as pyre_object::PyObjectRef,
                 slot,
-            )
-        } else if index == crate::descr::ec_w_tracefunc_descr().index() {
-            pyre_interpreter::executioncontext::ec_current_w_tracefunc_qmut(
-                struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
             )
         } else {
             debug_assert!(
