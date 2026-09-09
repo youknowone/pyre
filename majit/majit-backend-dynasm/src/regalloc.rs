@@ -6620,7 +6620,9 @@ mod tests {
         let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
-        ra.j2_ops[0] = crate::j2plan::LirOp::Finish { args: vec![i0] };
+        ra.j2_ops[0] = crate::j2plan::LirOp::Finish {
+            args: vec![i0].into(),
+        };
 
         let ra_ops = ra.walk_operations();
         let dispatched = ra_ops.iter().find_map(|ra_op| {
@@ -6770,8 +6772,8 @@ mod tests {
         let expected_argloc = ra.loc(i1, Type::Int);
         ra.j2_ops[0] = crate::j2plan::LirOp::Guard {
             kind: crate::j2plan::GuardKind::True,
-            args: vec![i1],
-            fail_args: vec![],
+            args: vec![i1].into(),
+            fail_args: vec![].into(),
         };
 
         let ra_ops = ra.walk_operations();
@@ -6891,8 +6893,8 @@ mod tests {
         ra.j2_ops[0] = crate::j2plan::LirOp::Opcode {
             opcode: OpCode::SameAsI,
             dst: Some(i2),
-            args: vec![i1],
-            fail_args: vec![],
+            args: vec![i1].into(),
+            fail_args: vec![].into(),
         };
 
         let ra_ops = ra.walk_operations();

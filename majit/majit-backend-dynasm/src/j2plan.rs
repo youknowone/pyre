@@ -9,18 +9,23 @@
 use std::fmt;
 
 use majit_ir::{InputArg, Op, OpCode, OpRef};
+use smallvec::SmallVec;
+
+/// Guard / label / call operand lists. Four `OpRef`s stay inline so
+/// `lower_op` does not mint a 16 B `Vec` for the common guard.
+type LirRefs = SmallVec<[OpRef; 4]>;
 
 /// A lowered dynasm-backend operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LirOp {
     Label {
-        args: Vec<OpRef>,
+        args: LirRefs,
     },
     Jump {
-        args: Vec<OpRef>,
+        args: LirRefs,
     },
     Finish {
-        args: Vec<OpRef>,
+        args: LirRefs,
     },
     IntBin {
         kind: IntBinKind,
@@ -41,8 +46,8 @@ pub(crate) enum LirOp {
     },
     Guard {
         kind: GuardKind,
-        args: Vec<OpRef>,
-        fail_args: Vec<OpRef>,
+        args: LirRefs,
+        fail_args: LirRefs,
     },
     Load {
         kind: LoadKind,
@@ -65,13 +70,13 @@ pub(crate) enum LirOp {
     Call {
         opcode: OpCode,
         dst: Option<OpRef>,
-        args: Vec<OpRef>,
+        args: LirRefs,
     },
     Opcode {
         opcode: OpCode,
         dst: Option<OpRef>,
-        args: Vec<OpRef>,
-        fail_args: Vec<OpRef>,
+        args: LirRefs,
+        fail_args: LirRefs,
     },
 }
 
@@ -461,7 +466,7 @@ fn result_ref(op: &Op) -> Option<OpRef> {
     }
 }
 
-fn filtered_refs(args: &[OpRef]) -> Vec<OpRef> {
+fn filtered_refs(args: &[OpRef]) -> LirRefs {
     args.iter()
         .copied()
         .filter(|arg| !arg.is_none() && !arg.is_constant())
@@ -624,7 +629,9 @@ mod tests {
         assert_eq!(
             lowered,
             vec![
-                LirOp::Label { args: vec![i0] },
+                LirOp::Label {
+                    args: smallvec::smallvec![i0],
+                },
                 LirOp::IntBin {
                     kind: IntBinKind::Add,
                     dst: OpRef::int_op(1),
@@ -639,11 +646,11 @@ mod tests {
                 },
                 LirOp::Guard {
                     kind: GuardKind::True,
-                    args: vec![OpRef::int_op(2)],
-                    fail_args: vec![OpRef::int_op(1)],
+                    args: smallvec::smallvec![OpRef::int_op(2)],
+                    fail_args: smallvec::smallvec![OpRef::int_op(1)],
                 },
                 LirOp::Jump {
-                    args: vec![OpRef::int_op(1)],
+                    args: smallvec::smallvec![OpRef::int_op(1)],
                 },
             ]
         );

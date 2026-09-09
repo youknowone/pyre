@@ -4264,7 +4264,7 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
-        let frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 1]> = snapshot
+        let frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 4]> = snapshot
             .framestack
             .iter()
             .map(|frame| {
@@ -4291,8 +4291,8 @@ impl ResumeDataLoopMemo {
     /// RPython's `SnapshotIterator` reads the opencoder buffer lazily; it does
     /// not copy every live-box array once per guard. The optimizer stores the
     /// equivalent arrays separately, so this entry point borrows those slices
-    /// and only builds the one-element frame descriptor inline for the common
-    /// single-frame case.
+    /// and only builds the frame descriptor inline for the common
+    /// four-or-fewer-frame case.
     pub fn number_from_parts(
         &mut self,
         snapshot_boxes: &[SnapshotBox],
@@ -4303,7 +4303,7 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
-        let mut frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 1]> = SmallVec::new();
+        let mut frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 4]> = SmallVec::new();
         if let Some(sizes) = frame_sizes.filter(|sizes| sizes.len() > 1) {
             let mut offset = 0;
             for (i, &size) in sizes.iter().enumerate() {
