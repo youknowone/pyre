@@ -23551,6 +23551,13 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
     if let Some(scalar) = tyref_atomic_inner_scalar_str(ty, llbc) {
         return scalar.to_string();
     }
+    if tyref_atomic_leaf(ty, llbc) == Some("AtomicPtr") {
+        // Pointer-width, not a nested struct. `tyref_atomic_inner_scalar_str`
+        // leaves AtomicPtr out because the inner value is a pointer; the
+        // field walk must still see a pointer spelling, or `is_known_struct`
+        // treats `AtomicPtr<T>` as a by-value struct and drops `instantiate`.
+        return "*mut PyObject".to_string();
+    }
     // `Option<E>` over a densely numbered fieldless E uses E's scalar tag
     // plus one reserved value for `None`.  Preserve that physical width in
     // the containing struct's descriptor instead of treating it as a Ref.
@@ -32947,11 +32954,11 @@ mod tests {
             majit_ir::value::Type::Int
         );
 
-        // `AtomicPtr` keeps the wrapper spelling: its inner value is a
-        // pointer, which is what the wildcard already answers.
+        // `AtomicPtr` is a pointer word. Spell it as one so fielddescrof
+        // does not treat the wrapper as a nested struct and drop it.
         let ptr_ty = adt_ty(2, serde_json::json!([{"Literal": {"UInt": "U8"}}]));
         let ptr_str = super::tyref_to_field_layout_string(&ptr_ty, &llbc);
-        assert_eq!(ptr_str, "AtomicPtr<u8>");
+        assert_eq!(ptr_str, "*mut PyObject");
         assert_eq!(
             crate::codewriter::call::get_type_flag(&ptr_str).1,
             majit_ir::value::Type::Ref

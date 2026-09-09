@@ -120,9 +120,15 @@ pub fn set_instantiate(tp: &PyType, w_typeobject: PyObjectRef) {
 ///
 /// Returns the W_TypeObject (for `w_class`), or null if not yet initialized
 /// (bootstrap phase before `init_typeobjects()`).
+///
+/// `rclass.py` OBJECT_VTABLE marks every field immutable; `instantiate`
+/// is a pointer slot written once by `set_instantiate` before any
+/// bytecode runs. A plain word load is the getfield the translator
+/// already emits for that slot — `AtomicPtr::load(Acquire)` would stay
+/// a residual and keep `is_plain_int1` off IntegerListStrategy.
 #[inline]
 pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
-    tp.instantiate.load(Ordering::Acquire)
+    unsafe { *(&tp.instantiate as *const AtomicPtr<PyObject> as *const PyObjectRef) }
 }
 
 /// True when `obj`'s Python class is exactly the builtin type for its

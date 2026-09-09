@@ -1591,10 +1591,39 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Vec<")
         || type_name.starts_with("Option<")
         || type_name == "String"
+        || atomic_wrapper_leaf(type_name).is_some()
     {
         return false;
     }
     known_structs.contains(type_name)
+}
+
+/// Layout-transparent `core::sync::atomic` wrappers. `AtomicI64` occupies
+/// the same bytes as `i64`; `AtomicPtr<T>` the same as a pointer word.
+/// OBJECT_VTABLE spells `instantiate` as a function pointer, not a nested
+/// struct, so the field walk must not recurse into the wrapper.
+pub(crate) fn atomic_wrapper_leaf(
+    type_name: &str,
+) -> Option<(majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize)> {
+    let leaf = type_name.rsplit("::").next().unwrap_or(type_name);
+    let leaf = leaf.split('<').next().unwrap_or(leaf);
+    let word = crate::layout::target_word_size();
+    use majit_ir::descr::ArrayFlag;
+    match leaf {
+        "AtomicPtr" => Some((ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)),
+        "AtomicBool" => Some((ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1)),
+        "AtomicI64" => Some((ArrayFlag::Signed, majit_ir::value::Type::Int, 8)),
+        "AtomicI32" => Some((ArrayFlag::Signed, majit_ir::value::Type::Int, 4)),
+        "AtomicI16" => Some((ArrayFlag::Signed, majit_ir::value::Type::Int, 2)),
+        "AtomicI8" => Some((ArrayFlag::Signed, majit_ir::value::Type::Int, 1)),
+        "AtomicIsize" => Some((ArrayFlag::Signed, majit_ir::value::Type::Int, word)),
+        "AtomicU64" => Some((ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8)),
+        "AtomicU32" => Some((ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4)),
+        "AtomicU16" => Some((ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2)),
+        "AtomicU8" => Some((ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1)),
+        "AtomicUsize" => Some((ArrayFlag::Unsigned, majit_ir::value::Type::Int, word)),
+        _ => None,
+    }
 }
 
 impl StructLayout {
@@ -8947,6 +8976,7 @@ pub(crate) fn get_type_flag(
         s if s == "()" || s == "PhantomData" || s.starts_with("PhantomData<") => {
             (ArrayFlag::Void, majit_ir::value::Type::Void, 0)
         }
+        s if let Some(leaf) = atomic_wrapper_leaf(s) => leaf,
         // Unknown type — treat as GC pointer (conservative)
         _ => (
             ArrayFlag::Pointer,

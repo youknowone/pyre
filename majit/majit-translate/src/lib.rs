@@ -2641,6 +2641,20 @@ fn make_jitcodes(
         .indirectcalltargets
         .extend(builtin_wrapper_targets);
 
+    // Raw OBJECT_VTABLE-shaped structs publish every Charon-known field
+    // through fielddescrof. AtomicPtr/AtomicI64 are layout-transparent
+    // leaves, so `instantiate` names the same bytes `offset_of!` does
+    // even when the source reader stays an Acquire residual.
+    for descriptor in &pipeline_config.transform.struct_storage {
+        if descriptor.is_gc_managed {
+            continue;
+        }
+        let owner = majit_ir::descr::canonical_struct_name(&descriptor.owner);
+        codewriter
+            .assembler
+            .publish_raw_struct_fields(call_control, &owner);
+    }
+
     // RPython codewriter.py:85: self.assembler.finished(callinfocollection).
     codewriter
         .assembler
