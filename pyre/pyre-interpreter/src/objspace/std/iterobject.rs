@@ -66,3 +66,61 @@ pub(crate) fn typedef() -> *const TypeDef {
         ) as usize
     }) as *const TypeDef
 }
+
+/// W_ReverseSeqIterObject.typedef owns an independent declaration, unlike
+/// the forward list/tuple implementations sharing W_AbstractSeqIterObject.
+pub(crate) fn reverse_typedef() -> *const TypeDef {
+    static TYPEDEF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPEDEF.get_or_init(|| unsafe {
+        let mut rawdict = IndexMap::new();
+        for (name, func, arity, text_sig) in [
+            (
+                "__iter__",
+                crate::baseobjspace::iter_self_method as crate::gateway::BuiltinCodeFn,
+                1,
+                "($self, /)",
+            ),
+            (
+                "__next__",
+                crate::baseobjspace::iter_next_method,
+                1,
+                "($self, /)",
+            ),
+            (
+                "__reduce__",
+                crate::baseobjspace::list_reverse_iter_reduce_method,
+                1,
+                "($self, /)",
+            ),
+            (
+                "__setstate__",
+                crate::baseobjspace::list_reverse_iter_setstate_method,
+                2,
+                "($self, object, /)",
+            ),
+            (
+                "__length_hint__",
+                crate::baseobjspace::list_reverse_iter_length_hint_method,
+                1,
+                "($self, /)",
+            ),
+        ] {
+            let gateway = crate::gateway::interp2app(crate::gateway::builtin_code_new_with_arity(
+                name, func, arity,
+            ));
+            (*(gateway as *mut crate::gateway::interp2app))._explicit_text_sig = Some(text_sig);
+            rawdict.insert(name.into(), TypeDefValue::root(gateway));
+        }
+        // [3.14-spec] PyListRevIter_Type.tp_name (Objects/listobject.c,
+        // v3.14.6) is "list_reverseiterator", measured on python3.14t.
+        // PyPy W_ReverseSeqIterObject.typedef calls it
+        // "reversesequenceiterator". Preserve the existing public spelling;
+        // the declaration and its cache identity follow the PyPy owner.
+        TypeDef::from_rawdict(
+            "list_reverseiterator",
+            vec![],
+            rawdict,
+            &pyre_object::iterobject::LIST_REVERSE_ITER_TYPE,
+        ) as usize
+    }) as *const TypeDef
+}

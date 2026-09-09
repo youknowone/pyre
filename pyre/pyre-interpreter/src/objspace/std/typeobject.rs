@@ -223,6 +223,152 @@ mod tests {
     }
 
     #[test]
+    fn reverse_iterator_is_built_from_its_live_declaration() {
+        crate::typedef::init_typeobjects();
+        unsafe {
+            let registered = crate::typedef::gettypefor(&LIST_REVERSE_ITER_TYPE)
+                .unwrap()
+                .as_ptr();
+            let definition = (*w_type_get_layout_ptr(registered)).typedef;
+            assert_eq!((*definition).name.as_deref(), Some("list_reverseiterator"));
+            assert_eq!((*definition).rawdict.len(), 5);
+            assert!(!(*definition).acceptable_as_base_class());
+            let global = crate::baseobjspace::object_space();
+            assert_eq!(global.gettypeobject(definition).unwrap(), registered);
+            let other = ObjSpace::new().gettypeobject(definition).unwrap();
+            assert_ne!(other, registered);
+            assert_eq!((*w_type_get_layout_ptr(other)).typedef, definition);
+            for name in [
+                "__iter__",
+                "__next__",
+                "__reduce__",
+                "__setstate__",
+                "__length_hint__",
+            ] {
+                assert!(matches!(
+                    (*definition).rawdict.get(name),
+                    Some(TypeDefValue::Root(_))
+                ));
+                let first =
+                    w_dict_getitem_str(w_type_get_dict_ptr(registered).cast(), name).unwrap();
+                let second = w_dict_getitem_str(w_type_get_dict_ptr(other).cast(), name).unwrap();
+                assert_ne!(first, second, "{name} must bind per space");
+            }
+            // Invoke the actual type-dictionary Functions, not baseobjspace's
+            // separate getattr shortcut. The migrated declaration must execute.
+            let _roots = gc_roots::push_roots();
+            // __reduce__ resolves the live builtin through the execution
+            // context, just as W_ReverseSeqIterObject.descr_reduce does.
+            let context = Box::new(crate::PyExecutionContext::new());
+            struct RestoreContext(*const crate::PyExecutionContext);
+            impl Drop for RestoreContext {
+                fn drop(&mut self) {
+                    crate::call::set_last_exec_ctx(self.0);
+                }
+            }
+            let _context = RestoreContext(crate::call::getexecutioncontext());
+            crate::call::set_last_exec_ctx(&*context);
+            let iter_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(w_list_reverse_iter_new(w_list_new_range(1, 1, 3), 2));
+            let invoke = |name: &str, args: &[PyObjectRef]| {
+                let function =
+                    w_dict_getitem_str(w_type_get_dict_ptr(registered).cast(), name).unwrap();
+                crate::call::call_function_impl_result(function, args).unwrap()
+            };
+            assert_eq!(
+                invoke("__iter__", &[gc_roots::shadow_stack_get(iter_slot)]),
+                gc_roots::shadow_stack_get(iter_slot)
+            );
+            assert_eq!(
+                w_int_get_value(invoke(
+                    "__length_hint__",
+                    &[gc_roots::shadow_stack_get(iter_slot)]
+                )),
+                3
+            );
+            assert_eq!(
+                w_int_get_value(invoke("__next__", &[gc_roots::shadow_stack_get(iter_slot)])),
+                3
+            );
+            let reduction_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(invoke(
+                "__reduce__",
+                &[gc_roots::shadow_stack_get(iter_slot)],
+            ));
+            let reduction = gc_roots::shadow_stack_get(reduction_slot);
+            assert_eq!(w_tuple_len(reduction), 3);
+            assert_eq!(w_int_get_value(w_tuple_getitem(reduction, 2).unwrap()), 1);
+            let restored = crate::baseobjspace::call(
+                w_tuple_getitem(reduction, 0).unwrap(),
+                w_tuple_getitem(reduction, 1).unwrap(),
+                None,
+            );
+            assert!(!restored.is_null(), "{:?}", crate::call::take_call_error());
+            let restored_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(restored);
+            let state = w_tuple_getitem(gc_roots::shadow_stack_get(reduction_slot), 2).unwrap();
+            invoke(
+                "__setstate__",
+                &[gc_roots::shadow_stack_get(restored_slot), state],
+            );
+            assert_eq!(
+                w_int_get_value(invoke(
+                    "__next__",
+                    &[gc_roots::shadow_stack_get(restored_slot)]
+                )),
+                2
+            );
+            assert_eq!(
+                w_int_get_value(invoke(
+                    "__next__",
+                    &[gc_roots::shadow_stack_get(restored_slot)]
+                )),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_pycode_function_gets_typecache_metadata() {
+        crate::typedef::init_typeobjects();
+        let code = crate::compile::compile_source("42", crate::compile::Mode::Eval).unwrap();
+        let _roots = gc_roots::push_roots();
+        let code_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(crate::w_code_new(Box::into_raw(Box::new(code)).cast()));
+        let globals = w_module_dict_new();
+        let function = crate::function::function_new_with_fixed_code(
+            gc_roots::shadow_stack_get(code_slot).cast(),
+            "original".into(),
+            globals,
+        );
+        unsafe {
+            assert!(crate::function::is_function_with_fixed_code(function));
+            assert!(!crate::gateway::is_builtin_code(crate::function::getcode(
+                function
+            )));
+            let definition = TypeDef::from_rawdict(
+                "FixedCodeOwner",
+                vec![],
+                IndexMap::from([("method".into(), TypeDefValue::root(function))]),
+                &INSTANCE_TYPE,
+            );
+            let w_type = ObjSpace::new().gettypeobject(definition).unwrap();
+            let function =
+                w_dict_getitem_str(w_type_get_dict_ptr(w_type).cast(), "method").unwrap();
+            assert_eq!(
+                crate::function::function_get_qualname(function)
+                    .as_str()
+                    .unwrap(),
+                "FixedCodeOwner.method"
+            );
+            assert_eq!(
+                crate::function::fget_func_objclass(function).unwrap(),
+                w_type
+            );
+        }
+    }
+
+    #[test]
     fn getset_template_is_copied_for_each_cached_type_identity() {
         crate::typedef::init_typeobjects();
         let property = pyre_object::typedef::w_getset_property_new(

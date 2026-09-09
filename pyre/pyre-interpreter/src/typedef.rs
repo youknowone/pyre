@@ -1325,6 +1325,19 @@ pub fn init_typeobjects() {
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
             seq_iterator_type as usize,
         );
+        let reverse_iterator_type = unsafe {
+            crate::baseobjspace::object_space()
+                .gettypeobject(crate::objspace::std::iterobject::reverse_typedef())
+                .expect("reverse sequence iterator TypeDef construction")
+        };
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(reverse_iterator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(reverse_iterator_type, false);
+        }
+        reg.insert(
+            &pyre_object::iterobject::LIST_REVERSE_ITER_TYPE as *const PyType as usize,
+            reverse_iterator_type as usize,
+        );
         let callable_iterator_type = new_typeobject_with_base(
             "callable_iterator",
             init_callable_iterator_type,
@@ -1343,11 +1356,6 @@ pub fn init_typeobjects() {
                 &pyre_object::iterobject::LIST_ITER_TYPE as *const PyType,
                 "list_iterator",
                 init_list_iterator_type as fn(PyObjectRef),
-            ),
-            (
-                &pyre_object::iterobject::LIST_REVERSE_ITER_TYPE as *const PyType,
-                "list_reverseiterator",
-                init_list_reverse_iterator_type as fn(PyObjectRef),
             ),
             (
                 &pyre_object::iterobject::TUPLE_ITER_TYPE as *const PyType,
@@ -2720,22 +2728,23 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
         // `__get__`, so `str.maketrans` and `dict.fromkeys` stay ordinary
         // builtin callables; the stamping below still applies to both.
         let is_plain_entry = std::ptr::eq(function, descr);
-        if !function.is_null()
-            && pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE)
-        {
+        if !function.is_null() && crate::function::is_function_with_fixed_code(function) {
+            // TypeCache.build tests the Function subclass, not its Code
+            // subclass: fixed PyCode functions need ownership metadata too.
+            let qualname = format!("{}.{}", pyre_object::w_type_get_qualname(type_obj), key);
+            let _function_roots = pyre_object::gc_roots::push_roots();
+            let function_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(function);
+            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(descr);
+            let w_qualname = pyre_object::w_str_new(&qualname);
+            let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
+            let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
+            let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
+            crate::function::function_set_qualname(function, w_qualname);
+            crate::function::function_set_objclass(function, type_obj);
             let code = crate::function::getcode(function) as PyObjectRef;
             if !code.is_null() && crate::gateway::is_builtin_code(code) {
-                let qualname = format!("{}.{}", pyre_object::w_type_get_qualname(type_obj), key);
-                // Building the qualname string may collect, so pin the carrier
-                // and re-read both it and the type before stamping them.
-                let _function_roots = pyre_object::gc_roots::push_roots();
-                let function_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(function);
-                let w_qualname = pyre_object::w_str_new(&qualname);
-                let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
-                let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
-                crate::function::function_set_objclass(function, type_obj);
-                crate::function::function_set_qualname(function, w_qualname);
                 // Same `is_slot_wrapper` split the TypeDef sweep applies: the
                 // slot half becomes a `wrapper_descriptor`, the `tp_methods`
                 // half a `method_descriptor`.  Both sweeps reach a builtin
@@ -30877,57 +30886,6 @@ fn init_list_iterator_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__setstate__",
                 crate::baseobjspace::list_iter_setstate_method,
-                2,
-            ),
-        ),
-    ];
-    for (name, value) in entries {
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
-    }
-    set_iterator_text_signatures(
-        ns,
-        &[
-            ("__iter__", "($self, /)"),
-            ("__next__", "($self, /)"),
-            ("__length_hint__", "($self, /)"),
-            ("__reduce__", "($self, /)"),
-            ("__setstate__", "($self, object, /)"),
-        ],
-    );
-}
-
-fn init_list_reverse_iterator_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
-    let entries = [
-        (
-            "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
-        ),
-        (
-            "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
-        ),
-        (
-            "__length_hint__",
-            make_builtin_function_with_arity(
-                "__length_hint__",
-                crate::baseobjspace::list_reverse_iter_length_hint_method,
-                1,
-            ),
-        ),
-        (
-            "__reduce__",
-            make_builtin_function_with_arity(
-                "__reduce__",
-                crate::baseobjspace::list_reverse_iter_reduce_method,
-                1,
-            ),
-        ),
-        (
-            "__setstate__",
-            make_builtin_function_with_arity(
-                "__setstate__",
-                crate::baseobjspace::list_reverse_iter_setstate_method,
                 2,
             ),
         ),
