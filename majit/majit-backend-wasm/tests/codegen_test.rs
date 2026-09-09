@@ -2344,7 +2344,7 @@ fn entry_prologue_nulls_the_frozen_home_region() {
         external_jump_key: 0,
         frame,
         ca: codegen::CaParams {
-            entry_gcmap_ptr: 0x1000,
+            home_gcmap_ptr: 0x1000,
             ..codegen::CaParams::default()
         },
     };

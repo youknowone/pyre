@@ -2594,6 +2594,20 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_add();
 }
 
+/// Publish `build_home_gcmap` on the live frame (`local 0` is the items
+/// base). `ptr == 0` is the test path that never installs a map.
+fn emit_publish_home_gcmap(sink: &mut PeepSink<'_, '_>, ptr: i64) {
+    if ptr == 0 {
+        return;
+    }
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_GCMAP_OFS};
+    sink.local_get(0);
+    sink.i32_const(FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+    sink.i64_const(ptr);
+    emit_word_store(sink, JF_GCMAP_OFS as u64);
+}
+
 fn emit_word_store(sink: &mut PeepSink<'_, '_>, offset: u64) {
     if majit_backend::jitframe::SIZEOFSIGNED == 4 {
         sink.i32_wrap_i64();
@@ -2822,7 +2836,9 @@ fn emit_ca_malloc_cond_varsize_frame(
         emit_word_store(sink, ofs as u64);
     }
     // rewrite.rs after `gen_malloc_nursery_varsize_frame`: write
-    // `jf_frame` length and `jf_gcmap`.
+    // `jf_frame` length. Leave `jf_gcmap` null — assembler.py publishes
+    // the map at safepoints once homes are live. The callee entry stores
+    // `home_gcmap_ptr` after its home/input stores.
     sink.local_get(alloc_scratch_local);
     sink.local_get(ca_target_local);
     sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
@@ -3745,9 +3761,10 @@ pub struct CaParams {
     /// Active-GC state for the direct CA-only inline allocation/frame path.
     /// `None` retains the helpers (including under gc_stress).
     pub inline: Option<CaInlineParams>,
-    /// Per-loop `jf_gcmap` installed at key-0 entry after homes are nulled.
-    /// Zero leaves the map the allocator (or `execute_token`) already stored.
-    pub entry_gcmap_ptr: i64,
+    /// `build_home_gcmap` pointer published after the fresh-entry home/input
+    /// stores. Zero leaves `jf_gcmap` unset in the generated module (tests).
+    /// assembler.py writes `jf_gcmap` at safepoints once those slots are live.
+    pub home_gcmap_ptr: i64,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -5824,20 +5841,9 @@ fn build_function(
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
         }
     }
-    if ca.entry_gcmap_ptr != 0 {
-        // Frozen homes are now null or the entry Refs. Publish the map
-        // the allocator left unset so a later collection can walk them.
-        sink.local_get(0);
-        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-        sink.i32_sub();
-        sink.i64_const(ca.entry_gcmap_ptr);
-        if majit_backend::jitframe::SIZEOFSIGNED == 4 {
-            sink.i32_wrap_i64();
-            sink.i32_store(memarg(majit_backend::jitframe::JF_GCMAP_OFS as u64, 2));
-        } else {
-            sink.i64_store(memarg(majit_backend::jitframe::JF_GCMAP_OFS as u64, 3));
-        }
-    }
+    // assembler.py writes `jf_gcmap` at safepoints once the slots are live.
+    // CA alloc left the map null so leftover item words were not traced.
+    emit_publish_home_gcmap(&mut sink, ca.home_gcmap_ptr);
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
     if let Some((probe, type_idx)) = inline_trip {

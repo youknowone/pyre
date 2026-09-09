@@ -1990,7 +1990,7 @@ fn wasm_write_barrier_helpers() -> codegen::WriteBarrierHelpers {
 /// mixed-geometry frames from distinct CA bridges are each forwarded by their
 /// own geometry — no shared coarse single-stride scan that mis-reads a larger
 /// frame's interior as a smaller frame's slots.
-pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i64 {
+pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, _gcmap_ptr: i64) -> i64 {
     use majit_backend::jitframe::JitFrame;
     assert!(frame_bytes >= 0);
     assert_eq!(frame_bytes as usize % std::mem::size_of::<isize>(), 0);
@@ -2020,7 +2020,11 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
         // decoded as a fail-index by `install_post_finish_force_gcmap`.
         std::ptr::write_bytes(jf as *mut u8, 0, alloc_size);
         JitFrame::init(jf, std::ptr::null(), depth);
-        (*jf).jf_gcmap = gcmap_ptr as *const u8;
+        // assembler.py publishes `jf_gcmap` at safepoints once homes are
+        // live. The callee entry stores `home_gcmap_ptr` after its
+        // home/input stores. Installing the map here would trace leftover
+        // item words (`invalid type_id` in `copy_nursery_object`).
+        (*jf).jf_gcmap = std::ptr::null();
     }
     majit_gc::shadow_stack::push_jf(jf_ref);
     jf_ref.0 as i64
@@ -4148,10 +4152,6 @@ impl majit_backend::Backend for WasmBackend {
                 label_ref_slots,
             ),
         };
-        // Leaked before codegen so the key-0 prologue can publish it after
-        // nulling the frozen home region, instead of the CA bump filling
-        // the whole item area.
-        let home_gcmap_ptr = Box::leak(build_home_gcmap(frame)).as_ptr() as *const usize as usize;
         // `x86/assembler.py::assemble_loop` installs the generated frame
         // depth on the token's `CompiledLoopToken.frame_info`.  CALL_ASSEMBLER
         // redirect later propagates the replacement depth through that exact
@@ -4204,6 +4204,10 @@ impl majit_backend::Backend for WasmBackend {
         let fail_index_base = reserve_fail_descrs(guard_exit_count);
         let (bridge_cells_base, bridge_cells_owner) = codegen::alloc_bridge_cells(guard_exit_count);
         let bridge_param_dispatch = bridge_param_dispatch_for(guard_exit_count);
+        // assembler.py keeps `_finish_gcmap` with the compiled loop. Leak
+        // before the module build so the fresh-entry path can publish it
+        // after home/input stores, matching a safepoint write.
+        let home_gcmap_ptr = Box::leak(build_home_gcmap(frame)).as_ptr() as *const usize as usize;
         let module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             // Keep these rewritten operations exactly as intern_ref_constants
@@ -4235,7 +4239,7 @@ impl majit_backend::Backend for WasmBackend {
                 || codegen::CaParams {
                     ca_reload_fn_ptr: body_reload_fn_ptr(),
                     jf_top_addr: jf_top_addr(),
-                    entry_gcmap_ptr: home_gcmap_ptr as i64,
+                    home_gcmap_ptr: home_gcmap_ptr as i64,
                     ..codegen::CaParams::default()
                 },
                 |targets| codegen::CaParams {
@@ -4249,7 +4253,7 @@ impl majit_backend::Backend for WasmBackend {
                         as i64,
                     inline: ca_inline_params(ca_max_frame_bytes(targets)),
                     jf_top_addr: jf_top_addr(),
-                    entry_gcmap_ptr: home_gcmap_ptr as i64,
+                    home_gcmap_ptr: home_gcmap_ptr as i64,
                 },
             ),
         };
@@ -5159,6 +5163,8 @@ impl majit_backend::Backend for WasmBackend {
         // CALL_ASSEMBLER: the CA arm allocates a fresh callee using the target
         // token's frozen geometry. The earlier frame-fit decline guarantees a
         // movable callee cannot execute a trampoline-lowered op.
+        let home_gcmap_ptr =
+            Box::leak(build_home_gcmap(source_frame)).as_ptr() as *const usize as usize;
         let ca_params = if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
             codegen::CaParams {
                 emit_ca: true,
@@ -5176,12 +5182,14 @@ impl majit_backend::Backend for WasmBackend {
                 // per-op callee frame in this trace.
                 inline: ca_inline_params(ca_max_frame_bytes(targets)),
                 jf_top_addr: jf_top_addr(),
+                home_gcmap_ptr: home_gcmap_ptr as i64,
                 ..codegen::CaParams::default()
             }
         } else {
             codegen::CaParams {
                 ca_reload_fn_ptr: body_reload_fn_ptr(),
                 jf_top_addr: jf_top_addr(),
+                home_gcmap_ptr: home_gcmap_ptr as i64,
                 ..codegen::CaParams::default()
             }
         };
