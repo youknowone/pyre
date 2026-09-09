@@ -103,7 +103,7 @@ impl Renamer {
                     Type::Void => OpCode::Jump,
                 };
                 let op: OpRc = Rc::new(Op::new(opcode, &[]));
-                op.pos.set(OpRef::op_typed(pos, ty));
+                op.pos().set(OpRef::op_typed(pos, ty));
                 let b = Operand::from_bound_op(&op);
                 self.producer_roots.push(op);
                 b

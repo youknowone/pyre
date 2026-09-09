@@ -1131,7 +1131,7 @@ fn prepare_bridge_trace_from_owned(
         }
     };
     for op in bridge_ops.iter() {
-        consider(op.pos.get());
+        consider(op.pos().get());
         for a in op.getarglist().iter() {
             consider(a.to_opref());
         }
@@ -1175,13 +1175,14 @@ fn prepare_bridge_trace_from_owned(
                 *arg = rewritten;
             }
         });
-        let orig = op.pos.get();
+        let orig = op.pos().get();
         let is_void = orig.is_none() || op.opcode.result_type() == Type::Void;
         if !is_void {
-            op.pos.set(OpRef::op_typed(fresh, op.opcode.result_type()));
+            op.pos()
+                .set(OpRef::op_typed(fresh, op.opcode.result_type()));
             fresh += 1;
         } else if !orig.is_none() {
-            op.pos.set(OpRef::void_op(fresh));
+            op.pos().set(OpRef::void_op(fresh));
             fresh += 1;
         }
         if !is_void {
@@ -1219,7 +1220,7 @@ fn remap_prepared_arg(
         return None;
     }
     if let Some(prod) = arg.bound_op() {
-        let p = prod.pos.get();
+        let p = prod.pos().get();
         if p.is_none() || p.is_constant() || p.raw() >= bridge_inputarg_base {
             return None;
         }
@@ -1753,7 +1754,7 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>>(inputargs: &[InputArg], ops
         .iter()
         .map(|op| {
             let op = op.as_ref();
-            let mut hw = opref_high_water(op.pos.get());
+            let mut hw = opref_high_water(op.pos().get());
             for a in op.getarglist().iter() {
                 hw = hw.max(opref_high_water(a.to_opref()));
             }
@@ -8086,7 +8087,7 @@ impl<M: Clone> MetaInterp<M> {
                     .map(Operand::from_bound_inputarg)
                     .collect::<Vec<_>>(),
             );
-            label_op.pos.set(majit_ir::OpRef::NONE);
+            label_op.pos().set(majit_ir::OpRef::NONE);
             optimized_ops.insert(0, std::rc::Rc::new(label_op));
         }
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
@@ -8329,7 +8330,7 @@ impl<M: Clone> MetaInterp<M> {
                         .map(Operand::from_bound_inputarg)
                         .collect::<Vec<_>>(),
                 );
-                label_op.pos.set(majit_ir::OpRef::NONE);
+                label_op.pos().set(majit_ir::OpRef::NONE);
                 label_op.setdescr(target_token.as_jump_target_descr());
                 compiled_ops.insert(0, std::rc::Rc::new(label_op));
             }
@@ -11273,7 +11274,7 @@ impl<M: Clone> MetaInterp<M> {
                 .map(Operand::from_bound_inputarg)
                 .collect::<Vec<_>>(),
         );
-        label_op.pos.set(majit_ir::OpRef::NONE);
+        label_op.pos().set(majit_ir::OpRef::NONE);
         label_op.setdescr(target_token.as_jump_target_descr());
         compiled_ops.insert(0, std::rc::Rc::new(label_op));
 
@@ -11840,7 +11841,7 @@ impl<M: Clone> MetaInterp<M> {
     fn compiled_ops_concrete_at(compiled_ops: &[majit_ir::OpRc], raw: u32) -> Option<Value> {
         compiled_ops
             .iter()
-            .find(|op| op.pos.get().raw() == raw)
+            .find(|op| op.pos().get().raw() == raw)
             .and_then(|op| op.get_value())
     }
 
@@ -14374,7 +14375,7 @@ impl<M: Clone> MetaInterp<M> {
                 eprintln!(
                     "[jit][entry-bridge] op[{i}] {:?} pos={:?} args={:?} descr={:?}",
                     op.opcode,
-                    op.pos.get(),
+                    op.pos().get(),
                     op.getarglist(),
                     op.descr
                 );
@@ -14638,7 +14639,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         for op in bridge_ops.iter().map(std::borrow::Borrow::borrow) {
-            let pos = op.pos.get();
+            let pos = op.pos().get();
             if !pos.is_none()
                 && let Some(v) = op.get_value()
             {
@@ -22497,7 +22498,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos.get(), opref);
+        assert_eq!(op.pos().get(), opref);
     }
 
     extern "C" fn cond_call_void_helper(_cond: i64, _func_addr: i64) {}
@@ -22867,7 +22868,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos.get(), opref);
+        assert_eq!(op.pos().get(), opref);
     }
 
     #[test]
@@ -23024,7 +23025,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallMayForceI)
             .expect("CallMayForceI must be recorded");
-        assert_eq!(call_op.pos.get(), opref);
+        assert_eq!(call_op.pos().get(), opref);
         assert!(
             ctx.recorder
                 .ops()
@@ -23141,7 +23142,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos.get(), opref);
+        assert_eq!(op.pos().get(), opref);
         assert_eq!(op.num_args(), 3);
         assert_eq!(op.arg(0).to_opref(), funcbox_ref);
         assert_eq!(op.arg(1).to_opref(), OpRef::int_op(1));
@@ -23321,7 +23322,7 @@ mod metainterp_static_data_tests {
                 .constants_get_value(op.arg(0).to_opref())
                 .expect("typeptr constant");
             assert_eq!(typeptr, majit_ir::Value::Int(0xc1a55));
-            op.pos.get()
+            op.pos().get()
         };
 
         // pyjitpl.py:3392: class_of_last_exc_is_const = True after.
@@ -24649,7 +24650,7 @@ mod tests {
         let args: Vec<majit_ir::operand::Operand> =
             args.iter().map(|a| bound_operand(*a)).collect();
         let op = Op::new(opcode, &args);
-        op.pos.set(if pos == OpRef::NONE.raw() {
+        op.pos().set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
             OpRef::op_typed(pos, opcode.result_type())
@@ -24661,7 +24662,7 @@ mod tests {
         let args: Vec<majit_ir::operand::Operand> =
             args.iter().map(|a| bound_operand(*a)).collect();
         let op = Op::with_descr(opcode, &args, descr);
-        op.pos.set(if pos == OpRef::NONE.raw() {
+        op.pos().set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
             OpRef::op_typed(pos, opcode.result_type())
@@ -25161,7 +25162,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(10, Type::Int), (11, Type::Ref)]
         );
-        assert_eq!(prepared.ops[0].pos.get(), OpRef::ref_op(12));
+        assert_eq!(prepared.ops[0].pos().get(), OpRef::ref_op(12));
         assert_eq!(
             prepared.ops[0]
                 .getarglist()
@@ -25170,7 +25171,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![OpRef::input_arg_ref(11)]
         );
-        assert_eq!(prepared.ops[1].pos.get(), OpRef::int_op(13));
+        assert_eq!(prepared.ops[1].pos().get(), OpRef::int_op(13));
         assert_eq!(
             prepared.ops[1]
                 .getarglist()

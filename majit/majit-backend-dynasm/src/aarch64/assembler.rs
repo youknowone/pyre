@@ -4958,7 +4958,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; add x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_SUB: result = arg0 - arg1
@@ -4969,7 +4969,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; sub x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_MUL: result = arg0 * arg1
@@ -4980,7 +4980,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mul x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_AND: result = arg0 & arg1
@@ -4991,7 +4991,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; and x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_OR: result = arg0 | arg1
@@ -5002,7 +5002,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; orr x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_XOR: result = arg0 ^ arg1
@@ -5013,7 +5013,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; eor x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_NEG: result = -arg0
@@ -5023,7 +5023,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; neg x0, x0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_INVERT: result = ~arg0
@@ -5033,7 +5033,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mvn x0, x0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_LSHIFT: result = arg0 << arg1
@@ -5044,7 +5044,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; lsl x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_RSHIFT: result = arg0 >> arg1 (arithmetic/signed)
@@ -5055,7 +5055,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; asr x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// UINT_RSHIFT: result = arg0 >> arg1 (logical/unsigned)
@@ -5066,7 +5066,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; lsr x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     // ----------------------------------------------------------------
@@ -5080,7 +5080,7 @@ impl<'a> AssemblerARM64<'a> {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; adds x0, x0, x1);
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
         self.guard_success_cc = Some(CC_NO);
     }
 
@@ -5090,7 +5090,7 @@ impl<'a> AssemblerARM64<'a> {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; subs x0, x0, x1);
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
         self.guard_success_cc = Some(CC_NO);
     }
 
@@ -5110,7 +5110,7 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x3, x4
             ; mov x0, x2
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
         self.guard_success_cc = Some(CC_E);
     }
 
@@ -5151,8 +5151,8 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x0, 0
         );
         self.guard_success_cc = Some(CC_NE);
-        if !op.pos.get().is_none() {
-            self.emit_setcc_to_result(CC_NE, op.pos.get());
+        if !op.pos().get().is_none() {
+            self.emit_setcc_to_result(CC_NE, op.pos().get());
         }
     }
 
@@ -5164,8 +5164,8 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x0, 0
         );
         self.guard_success_cc = Some(CC_E);
-        if !op.pos.get().is_none() {
-            self.emit_setcc_to_result(CC_E, op.pos.get());
+        if !op.pos().get().is_none() {
+            self.emit_setcc_to_result(CC_E, op.pos().get());
         }
     }
 
@@ -5625,7 +5625,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fadd d0, d0, d1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_SUB: result = arg0 - arg1
@@ -5636,7 +5636,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fsub d0, d0, d1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_MUL: result = arg0 * arg1
@@ -5647,7 +5647,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fmul d0, d0, d1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_TRUEDIV: result = arg0 / arg1
@@ -5658,7 +5658,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fdiv d0, d0, d1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_NEG: result = -arg0
@@ -5670,7 +5670,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fneg d0, d0
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
@@ -5680,7 +5680,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; scvtf d0, x0
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// CAST_FLOAT_TO_INT: result = (i64)arg0 (truncation)
@@ -5690,7 +5690,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fcvtzs x0, d0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     // ----------------------------------------------------------------
@@ -5924,11 +5924,11 @@ impl<'a> AssemblerARM64<'a> {
             self.reload_frame_if_necessary();
             self.pop_gcmap();
         }
-        if !op.pos.get().is_none() {
+        if !op.pos().get().is_none() {
             if op.opcode.result_type() == Type::Float {
-                self.store_d0_to_result(op.pos.get());
+                self.store_d0_to_result(op.pos().get());
             } else {
-                self.store_rax_to_result(op.pos.get());
+                self.store_rax_to_result(op.pos().get());
             }
         }
         if std::env::var("MAJIT_TRACE_CALL_DIAG")
@@ -5937,7 +5937,7 @@ impl<'a> AssemblerARM64<'a> {
             == Some(self.trace_id)
         {
             self.emit_push_all_volatile_regs();
-            self.emit_mov_imm64(0, op.pos.get().raw() as i64);
+            self.emit_mov_imm64(0, op.pos().get().raw() as i64);
             dynasm!(self.mc ; .arch aarch64 ; mov x1, x29);
             self.emit_mov_imm64(
                 2,
@@ -6030,8 +6030,8 @@ impl<'a> AssemblerARM64<'a> {
         let nreg = self.load_loc_to_reg(&next_loc, 14);
         dynasm!(self.mc ; .arch aarch64 ; str X(nreg), [x17, 8]); // next @ base+8
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x17); // result = base
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
         dynasm!(self.mc ; .arch aarch64 ; b =>done);
 
@@ -6788,8 +6788,8 @@ impl<'a> AssemblerARM64<'a> {
         self.emit_mov_imm64(2, Self::new_alloc_fn_addr());
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
         self.inline_memzero(obj_size);
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -6818,8 +6818,8 @@ impl<'a> AssemblerARM64<'a> {
             self.emit_mov_imm64(1, w_class);
             dynasm!(self.mc ; .arch aarch64 ; str x1, [x0, w_class_offset as u32]);
         }
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -6899,7 +6899,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; umulh x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
@@ -6918,7 +6918,7 @@ impl<'a> AssemblerARM64<'a> {
                 ; asr x0, x0, sh32
             );
         }
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     // ================================================================
@@ -6932,7 +6932,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fabs d0, d0
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// CAST_FLOAT_TO_SINGLEFLOAT: f64 → f32 (bits in lower 32 of i64)
@@ -6943,7 +6943,7 @@ impl<'a> AssemblerARM64<'a> {
             ; fcvt s0, d0
             ; fmov w0, s0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
@@ -6954,7 +6954,7 @@ impl<'a> AssemblerARM64<'a> {
             ; fmov s0, w0
             ; fcvt d0, s0
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     // ================================================================
@@ -7119,8 +7119,8 @@ impl<'a> AssemblerARM64<'a> {
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
 
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -7189,8 +7189,8 @@ impl<'a> AssemblerARM64<'a> {
             ; blr x8
             ; ldp x29, x30, [sp], #16
         );
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -7240,8 +7240,8 @@ impl<'a> AssemblerARM64<'a> {
             ; str x1, [x0, 8]                    // store length at offset 8
         );
 
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -7446,10 +7446,10 @@ mod tests {
             OpCode::CallMallocNursery,
             &[Operand::from_opref(OpRef::const_int(32))],
         ));
-        malloc.pos.set(OpRef::ref_op(0));
+        malloc.pos().set(OpRef::ref_op(0));
 
         let finish = Op::new(OpCode::Finish, &[Operand::from_bound_op(&malloc)]);
-        finish.pos.set(OpRef::void_op(1));
+        finish.pos().set(OpRef::void_op(1));
         finish.set_fail_arg_types(vec![Type::Ref]);
         finish.setfailargs(vec![].into());
 
@@ -7480,14 +7480,14 @@ mod tests {
             ],
             make_array_descr_signed(0, 8, Type::Int, true),
         ));
-        word.pos.set(OpRef::int_op(first_pos));
+        word.pos().set(OpRef::int_op(first_pos));
         let armed = Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
-        armed.pos.set(OpRef::int_op(first_pos + 1));
+        armed.pos().set(OpRef::int_op(first_pos + 1));
         let guard = Rc::new(Op::new(
             OpCode::GuardFalse,
             &[Operand::from_bound_op(&armed)],
         ));
-        guard.pos.set(OpRef::void_op(first_pos + 2));
+        guard.pos().set(OpRef::void_op(first_pos + 2));
         guard.set_fail_arg_types(vec![]);
         guard.setfailargs(vec![].into());
         (word, armed, guard)
@@ -7504,7 +7504,7 @@ mod tests {
         let (word, armed, guard) = eval_breaker_poll_ops(word_addr, 0);
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(3));
+        finish.pos().set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
@@ -7563,13 +7563,13 @@ mod tests {
         // external entry address used by the source trace's closing JUMP.
         let target_descr = make_loop_target_descr(520, false);
         let label = Op::new(OpCode::Label, &[]);
-        label.pos.set(OpRef::void_op(0));
+        label.pos().set(OpRef::void_op(0));
         label.setdescr(target_descr.clone());
 
         let (word, armed, guard) = eval_breaker_poll_ops(word_addr, 1);
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(4));
+        finish.pos().set(OpRef::void_op(4));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
@@ -7587,7 +7587,7 @@ mod tests {
         // Enter the target loop body through an external branch. The ordinary
         // IR poll must still load the same constant-address word.
         let jump = Op::new(OpCode::Jump, &[]);
-        jump.pos.set(OpRef::void_op(0));
+        jump.pos().set(OpRef::void_op(0));
         jump.setdescr(target_descr);
         let source_token = JitCellToken::new(521);
         backend
@@ -7629,12 +7629,12 @@ mod tests {
             backend.attach_default_test_descrs();
             let target_descr = make_loop_target_descr(522, false);
             let label = Op::new(OpCode::Label, &[]);
-            label.pos.set(OpRef::void_op(0));
+            label.pos().set(OpRef::void_op(0));
             label.setdescr(target_descr.clone());
             let (word, armed, guard) =
                 eval_breaker_poll_ops(Arc::as_ptr(&worker_test_word) as usize, 1);
             let jump = Op::new(OpCode::Jump, &[]);
-            jump.pos.set(OpRef::void_op(4));
+            jump.pos().set(OpRef::void_op(4));
             jump.setdescr(target_descr);
             let token = JitCellToken::new(522);
             backend
@@ -7762,10 +7762,10 @@ mod tests {
                 index_operand,
             ],
         );
-        barrier.pos.set(OpRef::void_op(2));
+        barrier.pos().set(OpRef::void_op(2));
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(3));
+        finish.pos().set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 

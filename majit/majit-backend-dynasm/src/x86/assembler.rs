@@ -120,10 +120,10 @@ mod tests {
             OpCode::CallMallocNursery,
             &[Operand::from_opref(OpRef::const_int(32))],
         ));
-        malloc.pos.set(OpRef::ref_op(0));
+        malloc.pos().set(OpRef::ref_op(0));
 
         let finish = Op::new(OpCode::Finish, &[Operand::from_bound_op(&malloc)]);
-        finish.pos.set(OpRef::void_op(1));
+        finish.pos().set(OpRef::void_op(1));
         finish.set_fail_arg_types(vec![Type::Ref]);
         finish.setfailargs(vec![].into());
 
@@ -161,15 +161,15 @@ mod tests {
             ],
             make_array_descr_signed(0, 8, Type::Int, true),
         ));
-        word.pos.set(OpRef::int_op(0));
+        word.pos().set(OpRef::int_op(0));
         let armed = Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
-        armed.pos.set(OpRef::int_op(1));
+        armed.pos().set(OpRef::int_op(1));
         let guard = Op::new(OpCode::GuardFalse, &[Operand::from_bound_op(&armed)]);
-        guard.pos.set(OpRef::void_op(2));
+        guard.pos().set(OpRef::void_op(2));
         guard.set_fail_arg_types(vec![]);
         guard.setfailargs(vec![].into());
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(3));
+        finish.pos().set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
@@ -5971,7 +5971,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; add rax, rcx
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_SUB: result = arg0 - arg1
@@ -5983,7 +5983,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; sub rax, rcx
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_MUL: result = arg0 * arg1
@@ -5995,7 +5995,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; imul rax, rcx
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_AND: result = arg0 & arg1
@@ -6007,7 +6007,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; and rax, rcx
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_OR: result = arg0 | arg1
@@ -6019,7 +6019,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; or rax, rcx
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_XOR: result = arg0 ^ arg1
@@ -6031,7 +6031,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; xor rax, rcx
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_NEG: result = -arg0
@@ -6042,7 +6042,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; neg rax
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_INVERT: result = ~arg0
@@ -6053,7 +6053,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; not rax
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_LSHIFT: result = arg0 << arg1
@@ -6065,7 +6065,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; shl rax, cl
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_RSHIFT: result = arg0 >> arg1 (arithmetic/signed)
@@ -6077,7 +6077,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; sar rax, cl
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// UINT_RSHIFT: result = arg0 >> arg1 (logical/unsigned)
@@ -6089,7 +6089,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; shr rax, cl
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     // genop_* — overflow arithmetic (assembler.py:1413-1425)
@@ -6154,8 +6154,8 @@ impl<'a> Assembler386<'a> {
             ; test rax, rax
         );
         self.guard_success_cc = Some(CC_NE);
-        if !op.pos.get().is_none() {
-            self.emit_setcc_to_result(CC_NE, op.pos.get());
+        if !op.pos().get().is_none() {
+            self.emit_setcc_to_result(CC_NE, op.pos().get());
         }
     }
 
@@ -6168,8 +6168,8 @@ impl<'a> Assembler386<'a> {
             ; test rax, rax
         );
         self.guard_success_cc = Some(CC_E);
-        if !op.pos.get().is_none() {
-            self.emit_setcc_to_result(CC_E, op.pos.get());
+        if !op.pos().get().is_none() {
+            self.emit_setcc_to_result(CC_E, op.pos().get());
         }
     }
 
@@ -6606,7 +6606,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; addsd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_SUB: result = arg0 - arg1
@@ -6618,7 +6618,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; subsd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_MUL: result = arg0 * arg1
@@ -6630,7 +6630,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; mulsd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_TRUEDIV: result = arg0 / arg1
@@ -6642,7 +6642,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; divsd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_NEG: result = -arg0
@@ -6660,7 +6660,7 @@ impl<'a> Assembler386<'a> {
             ; movq xmm1, rax
             ; xorpd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
@@ -6674,7 +6674,7 @@ impl<'a> Assembler386<'a> {
             ; pxor xmm0, xmm0
             ; cvtsi2sd xmm0, rax
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// CAST_FLOAT_TO_INT: result = (i64)arg0 (truncation)
@@ -6685,7 +6685,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; cvttsd2si rax, xmm0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     // genop_* — memory operations
@@ -7162,8 +7162,8 @@ impl<'a> Assembler386<'a> {
         if can_collect {
             self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         }
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -7283,8 +7283,8 @@ impl<'a> Assembler386<'a> {
             ; mov [Rq(base_reg) + 8], Rq(next_reg)                  // next @ base+8
             ; mov rax, Rq(base_reg)                                 // result = base
         );
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
 
@@ -8063,8 +8063,8 @@ impl<'a> Assembler386<'a> {
         );
         self.emit_abi_call_rax_after_one_push();
         dynasm!(self.mc ; .arch x64 ; pop rax); // restore ptr
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -8109,8 +8109,8 @@ impl<'a> Assembler386<'a> {
                 );
             }
         }
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -8205,7 +8205,7 @@ impl<'a> Assembler386<'a> {
             ; mul rcx
             ; mov rax, rdx
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
@@ -8224,7 +8224,7 @@ impl<'a> Assembler386<'a> {
                 ; sar rax, sh
             );
         }
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     // genop_* — extended float operations
@@ -8239,7 +8239,7 @@ impl<'a> Assembler386<'a> {
             ; movq xmm1, rax
             ; andpd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// CAST_FLOAT_TO_SINGLEFLOAT: f64 → f32 (bits in lower 32 of i64)
@@ -8250,7 +8250,7 @@ impl<'a> Assembler386<'a> {
             ; cvtsd2ss xmm0, xmm0
             ; movd eax, xmm0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
@@ -8261,7 +8261,7 @@ impl<'a> Assembler386<'a> {
             ; movd xmm0, eax
             ; cvtss2sd xmm0, xmm0
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     // genop_* — GC memory operations
@@ -8407,8 +8407,8 @@ impl<'a> Assembler386<'a> {
 
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
 
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -8470,8 +8470,8 @@ impl<'a> Assembler386<'a> {
             ; mov rax, QWORD (crate::runner::dynasm_malloc_lowlevel_string as *const () as i64)
         );
         self.emit_abi_call_rax();
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -8517,8 +8517,8 @@ impl<'a> Assembler386<'a> {
             ; mov [rax + 8], rcx
         );
 
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 

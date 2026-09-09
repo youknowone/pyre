@@ -589,7 +589,7 @@ pub(crate) fn lower_typed_constants_to_const_pool(
 fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> rustc_hash::FxHashSet<u32> {
     let mut live_positions = rustc_hash::FxHashSet::default();
     for op in ops {
-        let pos = op.pos.get();
+        let pos = op.pos().get();
         if pos.is_none() || pos.is_constant() {
             continue;
         }
@@ -633,7 +633,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
     // `entry_or_insert_with` dedups positions appearing in more than one
     // store.
     let mut consider = |op: &majit_ir::OpRc| {
-        let pos = op.pos.get();
+        let pos = op.pos().get();
         if pos.is_none() || pos.is_constant() {
             return;
         }
@@ -736,7 +736,7 @@ impl Optimizer {
         ) {
             return false;
         }
-        let Some(forwarded) = ctx.read_forwarded(op.pos.get()) else {
+        let Some(forwarded) = ctx.read_forwarded(op.pos().get()) else {
             return false;
         };
         if !forwarded.is_const() {
@@ -1152,8 +1152,8 @@ impl Optimizer {
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let arg0 = ctx.materialize_operand_at(*label_arg);
             let mut op = majit_ir::Op::new(same_as_op, std::slice::from_ref(&arg0));
-            op.pos.set(ctx.reserve_pos_typed(tp));
-            let fresh = op.pos.get();
+            op.pos().set(ctx.reserve_pos_typed(tp));
+            let fresh = op.pos().get();
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
             // SAME_AS_*.type parity); the immediate push below makes
             // op_at(fresh) the authoritative type source. No
@@ -1632,7 +1632,7 @@ impl Optimizer {
     /// the emit set even though it was substituted post-hoc rather
     /// than directly emitted via `_emit_operation`.
     pub fn replace_guard_op(&mut self, ctx: &OptContext, old_pos: OpRef, new_guard: Op) {
-        let new_pos = new_guard.pos.get();
+        let new_pos = new_guard.pos().get();
         // replaces_guard is keyed by the raw `op` identity (optimizer.py:307),
         // so resolve to the producer box without following `_forwarded`.
         if let Some(op) = ctx.resolve_to_operand(old_pos) {
@@ -2431,7 +2431,7 @@ impl Optimizer {
         // force materializations) must not collide with them.
         let max_pos = ops
             .iter()
-            .map(|op| op.pos.get())
+            .map(|op| op.pos().get())
             .filter(|op| !op.is_none() && !op.is_constant())
             .map(|op| op.raw())
             .max()
@@ -2529,14 +2529,14 @@ impl Optimizer {
             // Phase-1 `_forwarded` the canonical resolvers observe.
             seed.into_iter()
                 .filter(|op| {
-                    let p = op.pos.get();
+                    let p = op.pos().get();
                     !p.is_none() && !p.is_constant()
                 })
                 .collect()
         } else if input_ops_from_ops {
             ops.iter()
                 .filter(|op| {
-                    let p = op.pos.get();
+                    let p = op.pos().get();
                     !p.is_none() && !p.is_constant()
                 })
                 .cloned()
@@ -2639,8 +2639,8 @@ impl Optimizer {
         // the Box.type retype invariant.
         let max_input = ops
             .iter()
-            .filter(|op| !op.pos.get().is_none() && op.result_type() != majit_ir::Type::Void)
-            .map(|op| op.pos.get().raw())
+            .filter(|op| !op.pos().get().is_none() && op.result_type() != majit_ir::Type::Void)
+            .map(|op| op.pos().get().raw())
             .max()
             .unwrap_or(0);
         let max_snapshot = self
@@ -3091,7 +3091,7 @@ impl Optimizer {
         // phase-wide OpRef→Type side table.
         self.phase1_emit_ops.clear();
         for op in &ctx.new_operations {
-            if !op.pos.get().is_none() && op.type_ != majit_ir::Type::Void {
+            if !op.pos().get().is_none() && op.type_ != majit_ir::Type::Void {
                 self.phase1_emit_ops.push(op.clone());
             }
         }
@@ -3212,7 +3212,7 @@ impl Optimizer {
                     let emitted_positions: indexmap::IndexSet<OpRef> = ctx
                         .new_operations
                         .iter()
-                        .map(|op| op.pos.get())
+                        .map(|op| op.pos().get())
                         .filter(|p| !p.is_none())
                         .collect();
                     let original_args = resolved_args.clone();
@@ -3256,7 +3256,7 @@ impl Optimizer {
                         let fresh = ctx.alloc_op_position_typed(arg_type);
                         let arg0 = ctx.materialize_operand_at(orig);
                         let mut op = Op::new(same_as, std::slice::from_ref(&arg0));
-                        op.pos.set(fresh);
+                        op.pos().set(fresh);
                         // unroll.py:146 + compile.py:327 parity: accumulate the
                         // alias op in `extra_same_as` and splice it between the
                         // preamble body and the label at final assembly. Emitting
@@ -3501,7 +3501,7 @@ impl Optimizer {
                         debug_assert!(
                             !seen.contains(&ptr),
                             "exported short boxes share a replay OpRc at {:?}",
-                            p.preamble_op.pos.get()
+                            p.preamble_op.pos().get()
                         );
                         seen.push(ptr);
                     }
@@ -3538,7 +3538,7 @@ impl Optimizer {
                         // channel keeps the fresh replay position minted by
                         // produced_const_ops.
                         if let Some(replay_result) = replay_result {
-                            preamble_op.pos.set(replay_result);
+                            preamble_op.pos().set(replay_result);
                         }
                         // optimizer.py force_box loop parity.
                         //
@@ -3642,7 +3642,7 @@ impl Optimizer {
                         eprintln!(
                             "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
                             entry.kind,
-                            entry.op.pos.get(),
+                            entry.op.pos().get(),
                             entry.op.opcode,
                             arg_oprefs,
                             entry.op.getdescr().map(|d| d.index()),
@@ -3845,9 +3845,9 @@ impl Optimizer {
             // Op positions: reassign ALL ops to start from final_num_inputs.
             for (new_idx, op) in ctx.new_operations.iter_mut().enumerate() {
                 let new_pos = fni + new_idx as u32;
-                if !op.pos.get().is_none() {
-                    remap.insert(op.pos.get().raw(), new_pos);
-                    op.pos.set(op.pos.get().with_raw(new_pos));
+                if !op.pos().get().is_none() {
+                    remap.insert(op.pos().get().raw(), new_pos);
+                    op.pos().set(op.pos().get().with_raw(new_pos));
                 }
             }
 
@@ -3875,7 +3875,7 @@ impl Optimizer {
             // more than one canonical store is captured a single time.
             let mut const_remaps: Vec<(majit_ir::OpRc, u32)> = Vec::new();
             let mut consider_const = |op: &majit_ir::OpRc| {
-                let old_idx = op.pos.get().raw();
+                let old_idx = op.pos().get().raw();
                 if remap.contains_key(&old_idx) || old_idx < num_inputs as u32 {
                     return;
                 }
@@ -3904,7 +3904,7 @@ impl Optimizer {
             // Non-const synthetics never entered `remap`, so they keep their
             // position; only const-folded producers are repositioned here.
             for (op, new_pos) in &const_remaps {
-                op.pos.set(op.pos.get().with_raw(*new_pos));
+                op.pos().set(op.pos().get().with_raw(*new_pos));
             }
 
             // Apply remap to all args and fail_args. Const operands carry
@@ -4014,13 +4014,13 @@ impl Optimizer {
                     .chain(state.const_short_boxes.iter_mut())
                 {
                     // Cell::get() returns a copy; the previous
-                    // `remap_opref(&mut entry.op.pos.get())` mutated that
+                    // `remap_opref(&mut entry.op.pos().get())` mutated that
                     // temporary and never wrote back.  Read into a local,
                     // remap, then `set(...)` to persist the new OpRef on
                     // the Cell.
-                    let mut new_pos = entry.op.pos.get();
+                    let mut new_pos = entry.op.pos().get();
                     remap_opref(&mut new_pos);
-                    entry.op.pos.set(new_pos);
+                    entry.op.pos().set(new_pos);
                     for i in 0..entry.op.num_args() {
                         // Bound operands live-track their producer's already
                         // remapped `op.pos` (the main loop set it above); only
@@ -4137,7 +4137,7 @@ impl Optimizer {
                     crate::debug::debug_print(&format!(
                         "idx={i} {:?} pos={:?}",
                         op.opcode,
-                        op.pos.get()
+                        op.pos().get()
                     ));
                 }
             }
@@ -4205,10 +4205,10 @@ impl Optimizer {
         let max_op_pos = ops
             .iter()
             .filter_map(|op| {
-                if op.pos.get().is_none() || op.pos.get().is_constant() {
+                if op.pos().get().is_none() || op.pos().get().is_constant() {
                     None
                 } else {
-                    Some(op.pos.get().raw())
+                    Some(op.pos().get().raw())
                 }
             })
             .max();
@@ -4315,7 +4315,11 @@ impl Optimizer {
                 front_target_tokens.len(),
             );
             for (i, op) in optimized_ops.iter().enumerate() {
-                eprintln!("@@@SMALLIR   B[{i}] {:?} pos={:?}", op.opcode, op.pos.get());
+                eprintln!(
+                    "@@@SMALLIR   B[{i}] {:?} pos={:?}",
+                    op.opcode,
+                    op.pos().get()
+                );
             }
         }
 
@@ -4724,13 +4728,13 @@ impl Optimizer {
         let queued = ctx
             .extra_operations_after
             .iter()
-            .position(|(_, op)| op.pos.get() == opref)
+            .position(|(_, op)| op.pos().get() == opref)
             .and_then(|at| ctx.extra_operations_after.remove(at))
             .or_else(|| {
                 ctx.extra_pending.iter_mut().rev().find_map(|level| {
                     level
                         .iter()
-                        .position(|(_, op)| op.pos.get() == opref)
+                        .position(|(_, op)| op.pos().get() == opref)
                         .and_then(|at| level.remove(at))
                 })
             });
@@ -5118,16 +5122,16 @@ impl Optimizer {
             // producer box without following `_forwarded`.
             if self.can_replace_guards
                 && let Some(replacement) = ctx
-                    .resolve_to_operand(op.pos.get())
+                    .resolve_to_operand(op.pos().get())
                     .and_then(|op_key| self.replaces_guard.swap_remove(&op_key))
             {
-                let target_pos = replacement.pos.get().raw() as usize;
+                let target_pos = replacement.pos().get().raw() as usize;
                 if target_pos < ctx.new_operations.len() {
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[opt] guard replacement op={:?} pos={:?} target_index={} len={}",
                             op.opcode,
-                            op.pos.get(),
+                            op.pos().get(),
                             target_pos,
                             ctx.new_operations.len()
                         );
@@ -5196,7 +5200,7 @@ impl Optimizer {
                 majit_ir::Type::Int,
                 "returns_bool op must have int result: {:?} pos={:?} args={:?}",
                 op.opcode,
-                op.pos.get(),
+                op.pos().get(),
                 op.getarglist()
             );
         }
@@ -5824,7 +5828,7 @@ impl Optimizer {
         };
         // optimizer.py: replace_op_with(op, opnum, [op.getarg(0)], descr)
         let mut newop = Op::new(new_opcode, &[arg0]);
-        newop.pos.set(op.pos.get());
+        newop.pos().set(op.pos().get());
         if let Some(d) = op.getdescr() {
             newop.setdescr(d);
         }
@@ -6024,7 +6028,7 @@ mod tests {
                 // Check if second arg is constant 0
                 if let Some(0) = ctx.get_constant_int_box(&op.arg(1).get_box_replacement(false)) {
                     // Replace with first arg
-                    let old = op.pos.get();
+                    let old = op.pos().get();
                     let new = op.arg(0).to_opref();
                     let b_old = ctx.materialize_operand_at(old);
                     let b_new = ctx.materialize_operand_at(new);
@@ -6075,8 +6079,8 @@ mod tests {
             _op_rc: &majit_ir::OpRc,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
-            if op.pos.get() == self.target {
-                let b = ctx.materialize_operand_at(op.pos.get());
+            if op.pos().get() == self.target {
+                let b = ctx.materialize_operand_at(op.pos().get());
                 ctx.make_constant_box(&b, majit_ir::Value::Int(self.value));
                 return OptimizationResult::Remove;
             }
@@ -6124,8 +6128,8 @@ mod tests {
             _op_rc: &majit_ir::OpRc,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
-            if op.pos.get() == self.target {
-                let b = ctx.materialize_operand_at(op.pos.get());
+            if op.pos().get() == self.target {
+                let b = ctx.materialize_operand_at(op.pos().get());
                 ctx.make_constant_box(&b, self.value);
                 return OptimizationResult::Remove;
             }
@@ -6149,8 +6153,8 @@ mod tests {
             _op_rc: &majit_ir::OpRc,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
-            if op.pos.get() == self.target {
-                let b = ctx.materialize_operand_at(op.pos.get());
+            if op.pos().get() == self.target {
+                let b = ctx.materialize_operand_at(op.pos().get());
                 ctx.make_constant_box(&b, self.value);
             }
             OptimizationResult::PassOn
@@ -6354,7 +6358,7 @@ mod tests {
         ) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
                 let mut restarted = Op::new(OpCode::IntSub, &[op.arg(0), op.arg(1)]);
-                restarted.pos.set(op.pos.get());
+                restarted.pos().set(op.pos().get());
                 return OptimizationResult::Restart(restarted);
             }
             OptimizationResult::PassOn
@@ -6446,7 +6450,7 @@ mod tests {
                 rooted_resop_operand(Type::Int, 1),
             ],
         )];
-        ops[0].pos.set(OpRef::int_op(2));
+        ops[0].pos().set(OpRef::int_op(2));
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 2);
 
@@ -6525,7 +6529,7 @@ mod tests {
             Op::new(OpCode::Finish, &[rooted_resop_operand(Type::Int, 9)]),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos
+            op.pos()
                 .set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
         }
 
@@ -6734,11 +6738,11 @@ mod tests {
             finish,
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos
+            op.pos()
                 .set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
         }
-        call_a.pos.set(ops[0].pos.get());
-        call_b.pos.set(ops[4].pos.get());
+        call_a.pos().set(ops[0].pos().get());
+        call_b.pos().set(ops[4].pos().get());
 
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
@@ -6749,11 +6753,11 @@ mod tests {
         let call_positions: indexmap::IndexSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::CallMayForceR)
-            .map(|op| op.pos.get())
+            .map(|op| op.pos().get())
             .collect();
         assert!(
-            call_positions.contains(&call_a.pos.get())
-                && call_positions.contains(&call_b.pos.get()),
+            call_positions.contains(&call_a.pos().get())
+                && call_positions.contains(&call_b.pos().get()),
             "optimized trace lost CallMayForceR producer(s): {result:?}"
         );
         let guarded = result
@@ -6821,15 +6825,15 @@ mod tests {
                 ],
             ),
         ];
-        ops[0].pos.set(OpRef::int_op(3));
-        ops[1].pos.set(OpRef::int_op(4));
-        ops[2].pos.set(OpRef::int_op(5));
-        ops[3].pos.set(OpRef::int_op(6));
+        ops[0].pos().set(OpRef::int_op(3));
+        ops[1].pos().set(OpRef::int_op(4));
+        ops[2].pos().set(OpRef::int_op(5));
+        ops[3].pos().set(OpRef::int_op(6));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
-        let positions: Vec<_> = result.iter().map(|op| op.pos.get()).collect();
+        let positions: Vec<_> = result.iter().map(|op| op.pos().get()).collect();
         assert_eq!(
             positions,
             vec![
@@ -6864,17 +6868,17 @@ mod tests {
                 ],
             ),
         ];
-        ops[0].pos.set(OpRef::int_op(3));
-        ops[1].pos.set(OpRef::int_op(4));
-        ops[2].pos.set(OpRef::int_op(5));
-        ops[3].pos.set(OpRef::int_op(6));
+        ops[0].pos().set(OpRef::int_op(3));
+        ops[1].pos().set(OpRef::int_op(4));
+        ops[2].pos().set(OpRef::int_op(5));
+        ops[3].pos().set(OpRef::int_op(6));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
-        assert_eq!(result[0].pos.get(), OpRef::int_op(5));
-        assert_eq!(result[1].pos.get(), OpRef::int_op(6));
-        assert_eq!(result[2].pos.get(), OpRef::int_op(7));
+        assert_eq!(result[0].pos().get(), OpRef::int_op(5));
+        assert_eq!(result[1].pos().get(), OpRef::int_op(6));
+        assert_eq!(result[2].pos().get(), OpRef::int_op(7));
         assert_eq!(result[2].arg(0).to_opref(), OpRef::int_op(5));
         assert_eq!(constants.get(&5), None);
         assert_eq!(constants.get(&8), Some(&majit_ir::Value::Int(123)));
@@ -6895,14 +6899,14 @@ mod tests {
                 rooted_resop_operand(Type::Int, 1),
             ],
         )];
-        ops[0].pos.set(OpRef::int_op(3));
+        ops[0].pos().set(OpRef::int_op(3));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].pos.get(), OpRef::int_op(3));
+        assert_eq!(result[0].pos().get(), OpRef::int_op(3));
         assert_eq!(constants.get(&3), None);
     }
 
@@ -6917,7 +6921,7 @@ mod tests {
                 rooted_resop_operand(Type::Int, 1),
             ],
         )];
-        ops[0].pos.set(OpRef::int_op(3));
+        ops[0].pos().set(OpRef::int_op(3));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
@@ -6925,7 +6929,7 @@ mod tests {
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].pos.get(), OpRef::int_op(3));
+        assert_eq!(result[0].pos().get(), OpRef::int_op(3));
         assert_eq!(result[0].opcode, OpCode::IntGt);
         assert_eq!(constants.get(&3), None);
     }
@@ -6945,8 +6949,8 @@ mod tests {
             ),
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]),
         ];
-        ops[0].pos.set(OpRef::int_op(2));
-        ops[1].pos.set(OpRef::void_op(3));
+        ops[0].pos().set(OpRef::int_op(2));
+        ops[1].pos().set(OpRef::void_op(3));
 
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -7077,8 +7081,8 @@ mod tests {
                 ],
             ),
         ];
-        ops[0].pos.set(OpRef::int_op(2));
-        ops[1].pos.set(OpRef::void_op(3));
+        ops[0].pos().set(OpRef::int_op(2));
+        ops[1].pos().set(OpRef::void_op(3));
 
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -7164,8 +7168,8 @@ mod tests {
                 ],
             ),
         ];
-        ops[0].pos.set(OpRef::int_op(2));
-        ops[1].pos.set(OpRef::void_op(3));
+        ops[0].pos().set(OpRef::int_op(2));
+        ops[1].pos().set(OpRef::void_op(3));
 
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -7174,15 +7178,15 @@ mod tests {
             let alloc_ref = set_op.arg(0);
             let new_idx = result
                 .iter()
-                .position(|op| op.opcode == OpCode::New && op.pos.get() == alloc_ref.to_opref())
+                .position(|op| op.opcode == OpCode::New && op.pos().get() == alloc_ref.to_opref())
                 .unwrap_or_else(|| panic!("missing New for {alloc_ref:?} in {result:?}"));
             let set_idx = result
                 .iter()
-                .position(|op| op.pos.get() == set_op.pos.get())
+                .position(|op| op.pos().get() == set_op.pos().get())
                 .unwrap_or_else(|| {
                     panic!(
                         "missing setfield pos {:?} in {:?}",
-                        set_op.pos.get(),
+                        set_op.pos().get(),
                         result
                     )
                 });
@@ -7224,8 +7228,8 @@ mod tests {
                 ],
             ),
         ];
-        ops[0].pos.set(OpRef::int_op(2));
-        ops[1].pos.set(OpRef::void_op(3));
+        ops[0].pos().set(OpRef::int_op(2));
+        ops[1].pos().set(OpRef::void_op(3));
 
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -7233,7 +7237,7 @@ mod tests {
         let new_positions: indexmap::IndexSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
-            .map(|op| op.pos.get().raw())
+            .map(|op| op.pos().get().raw())
             .collect();
         assert!(
             !new_positions.is_empty(),
@@ -7294,7 +7298,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos
+            op.pos()
                 .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
 
@@ -7706,7 +7710,7 @@ mod tests {
                 rooted_resop_operand(Type::Int, 10_000),
             ],
         );
-        preamble_op.pos.set(OpRef::int_op(14));
+        preamble_op.pos().set(OpRef::int_op(14));
         let b = ctx.materialize_operand_at(OpRef::int_op(10_000));
         ctx.make_constant_box(&b, majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
@@ -7732,7 +7736,7 @@ mod tests {
                         majit_ir::OpCode::SameAsI,
                         &[rooted_resop_operand(Type::Int, 14)],
                     );
-                    op.pos.set(OpRef::op_typed(14, op.result_type()));
+                    op.pos().set(OpRef::op_typed(14, op.result_type()));
                     std::rc::Rc::new(op)
                 },
                 same_as_source: None,
@@ -7740,7 +7744,7 @@ mod tests {
         );
 
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 14)]);
-        guard.pos.set(OpRef::op_typed(15, guard.result_type()));
+        guard.pos().set(OpRef::op_typed(15, guard.result_type()));
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
         ctx.snapshot_boxes = snapshots;

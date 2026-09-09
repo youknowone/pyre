@@ -308,7 +308,7 @@ impl Op {
     /// rather than borrowing the slot, dropping the `RefCell` borrow at
     /// the call boundary so a caller may freely `setarg` afterwards.
     pub fn getarglist(&self) -> crate::resoperation::OpArgVec {
-        self.args.clone_vec(self.arg_len.get())
+        self.args.clone_vec(self.arg_len_value())
     }
 
     /// `resoperation.py AbstractResOp.getarglist` parity for a reader
@@ -330,7 +330,7 @@ impl Op {
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
     /// an owned `SmallVec` of the stored operands.
     pub fn getarglist_copy(&self) -> crate::resoperation::OpArgVec {
-        self.args.clone_vec(self.arg_len.get())
+        self.args.clone_vec(self.arg_len_value())
     }
 
     /// `resoperation.py AbstractResOp.initarglist` parity — bulk
@@ -346,8 +346,8 @@ impl Op {
     pub fn initarglist(&self, args: impl IntoIterator<Item = crate::operand::Operand>) {
         let new_len = self
             .args
-            .replace(self.arg_len.get(), args.into_iter().collect());
-        self.arg_len.set(new_len);
+            .replace(self.arg_len_value(), args.into_iter().collect());
+        self.set_arg_len_value(new_len);
     }
 
     /// `resoperation.py AbstractResOp.setarg` parity — position-wise

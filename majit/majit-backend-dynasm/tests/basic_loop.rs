@@ -32,7 +32,7 @@ fn test_just_finish() {
     let inputargs = vec![];
 
     let finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos.set(OpRef::void_op(0));
+    finish_op.pos().set(OpRef::void_op(0));
     finish_op.set_fail_arg_types(vec![]);
     finish_op.setfailargs(vec![].into());
 
@@ -56,16 +56,16 @@ fn guard_not_forced_2_arms_returned_force_token_and_preserves_failargs() {
     let i0 = inputargs[0].opref();
 
     let force_token = Op::new(OpCode::ForceToken, &[]);
-    force_token.pos.set(OpRef::ref_op(1));
+    force_token.pos().set(OpRef::ref_op(1));
 
     let guard = Op::new(OpCode::GuardNotForced2, &[]);
-    guard.pos.set(OpRef::void_op(2));
+    guard.pos().set(OpRef::void_op(2));
     guard.setdescr(make_resume_guard_descr_typed(vec![Type::Int]));
     guard.set_fail_arg_types(vec![Type::Int]);
     guard.setfailargs(vec![rb(i0)].into());
 
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::ref_op(1))]);
-    finish.pos.set(OpRef::void_op(3));
+    finish.pos().set(OpRef::void_op(3));
     finish.set_fail_arg_types(vec![Type::Ref]);
     finish.setfailargs(vec![rb(OpRef::ref_op(1))].into());
 
@@ -99,10 +99,10 @@ fn test_simple_int_add() {
     let i0 = inputargs[0].opref();
 
     let add_op = Op::new(OpCode::IntAdd, &[rb(i0), rb(const_1)]);
-    add_op.pos.set(OpRef::int_op(1)); // result is OpRef::int_op(1)
+    add_op.pos().set(OpRef::int_op(1)); // result is OpRef::int_op(1)
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
-    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.pos().set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
@@ -137,10 +137,10 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     let i0 = inputargs[0].opref();
 
     let add_op = Op::new(OpCode::IntAdd, &[rb(i0), rb(const_1)]);
-    add_op.pos.set(OpRef::int_op(1));
+    add_op.pos().set(OpRef::int_op(1));
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
-    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.pos().set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
@@ -170,10 +170,10 @@ fn test_float_add() {
     let inputargs = vec![InputArg::from_type(Type::Float, 0)];
 
     let add_op = Op::new(OpCode::FloatAdd, &[rb(i0), rb(const_half)]);
-    add_op.pos.set(OpRef::float_op(1));
+    add_op.pos().set(OpRef::float_op(1));
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))]);
-    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.pos().set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![Type::Float]);
     finish_op.setfailargs(vec![rb(OpRef::float_op(1))].into());
 
@@ -219,15 +219,15 @@ fn test_setarrayitem_raw_float_roundtrip() {
         OpCode::SetarrayitemRaw,
         &[rb(base), rb(const_index), rb(value)],
     );
-    set_op.pos.set(OpRef::void_op(2));
+    set_op.pos().set(OpRef::void_op(2));
     set_op.setdescr(array_descr.clone());
 
     let get_op = Op::new(OpCode::GetarrayitemRawF, &[rb(base), rb(const_index)]);
-    get_op.pos.set(OpRef::float_op(3));
+    get_op.pos().set(OpRef::float_op(3));
     get_op.setdescr(array_descr);
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::float_op(3))]);
-    finish_op.pos.set(OpRef::void_op(4));
+    finish_op.pos().set(OpRef::void_op(4));
     finish_op.set_fail_arg_types(vec![Type::Float]);
     finish_op.setfailargs(vec![rb(OpRef::float_op(3))].into());
 
@@ -264,15 +264,15 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
     let value = inputargs[2].opref();
 
     let set_op = Op::new(OpCode::SetarrayitemRaw, &[rb(base), rb(index), rb(value)]);
-    set_op.pos.set(OpRef::void_op(3));
+    set_op.pos().set(OpRef::void_op(3));
     set_op.setdescr(array_descr.clone());
 
     let get_op = Op::new(OpCode::GetarrayitemRawF, &[rb(base), rb(index)]);
-    get_op.pos.set(OpRef::float_op(4));
+    get_op.pos().set(OpRef::float_op(4));
     get_op.setdescr(array_descr);
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::float_op(4))]);
-    finish_op.pos.set(OpRef::void_op(5));
+    finish_op.pos().set(OpRef::void_op(5));
     finish_op.set_fail_arg_types(vec![Type::Float]);
     finish_op.setfailargs(vec![rb(OpRef::float_op(4))].into());
 
@@ -311,28 +311,28 @@ fn test_guard_and_loop() {
     let loop_descr = make_loop_target_descr(token.number, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]);
-    label_op.pos.set(OpRef::void_op(100));
+    label_op.pos().set(OpRef::void_op(100));
     label_op.setdescr(loop_descr.clone());
 
     let add_op = Op::new(
         OpCode::IntAdd,
         &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
     );
-    add_op.pos.set(OpRef::int_op(1));
+    add_op.pos().set(OpRef::int_op(1));
 
     let lt_op = Op::new(
         OpCode::IntLt,
         &[rb(OpRef::int_op(1)), rb(OpRef::const_int(5))],
     );
-    lt_op.pos.set(OpRef::int_op(2));
+    lt_op.pos().set(OpRef::int_op(2));
 
     let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
-    guard_op.pos.set(OpRef::void_op(3));
+    guard_op.pos().set(OpRef::void_op(3));
     guard_op.set_fail_arg_types(vec![Type::Int]);
     guard_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let jump_op = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
-    jump_op.pos.set(OpRef::void_op(4));
+    jump_op.pos().set(OpRef::void_op(4));
     jump_op.setdescr(loop_descr);
 
     let ops = vec![label_op, add_op, lt_op, guard_op, jump_op];
@@ -366,18 +366,18 @@ fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
     let loop_descr = make_loop_target_descr(token.number, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(value)]);
-    label_op.pos.set(OpRef::void_op(0));
+    label_op.pos().set(OpRef::void_op(0));
     label_op.setdescr(loop_descr.clone());
 
     let guard_descr = make_resume_guard_descr_typed(vec![]);
     let guard_op = Op::new(OpCode::GuardValue, &[rb(value), rb(OpRef::const_int(7))]);
-    guard_op.pos.set(OpRef::void_op(1));
+    guard_op.pos().set(OpRef::void_op(1));
     guard_op.set_fail_arg_types(vec![]);
     guard_op.setfailargs(vec![].into());
     guard_op.setdescr(guard_descr.clone());
 
     let jump_op = Op::new(OpCode::Jump, &[rb(value)]);
-    jump_op.pos.set(OpRef::void_op(2));
+    jump_op.pos().set(OpRef::void_op(2));
     jump_op.setdescr(loop_descr);
 
     let ops_rc: Vec<Rc<Op>> = vec![Rc::new(label_op), Rc::new(guard_op), Rc::new(jump_op)];
@@ -429,46 +429,46 @@ fn test_float_loop_carried_across_jump() {
         OpCode::Label,
         &[rb(OpRef::input_arg_float(0)), rb(OpRef::input_arg_int(1))],
     );
-    label_op.pos.set(OpRef::void_op(100));
+    label_op.pos().set(OpRef::void_op(100));
     label_op.setdescr(loop_descr.clone());
 
     let lt_op = Op::new(
         OpCode::IntLt,
         &[rb(OpRef::input_arg_int(1)), rb(OpRef::const_int(5))],
     );
-    lt_op.pos.set(OpRef::int_op(2));
+    lt_op.pos().set(OpRef::int_op(2));
 
     let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
-    guard_op.pos.set(OpRef::void_op(3));
+    guard_op.pos().set(OpRef::void_op(3));
     guard_op.set_fail_arg_types(vec![Type::Float, Type::Int]);
     guard_op.setfailargs(vec![rb(OpRef::input_arg_float(0)), rb(OpRef::input_arg_int(1))].into());
 
     let cast_op = Op::new(OpCode::CastIntToFloat, &[rb(OpRef::input_arg_int(1))]);
-    cast_op.pos.set(OpRef::float_op(4));
+    cast_op.pos().set(OpRef::float_op(4));
 
     let mul_op = Op::new(
         OpCode::FloatMul,
         &[rb(OpRef::float_op(4)), rb(OpRef::const_float(0.5))],
     );
-    mul_op.pos.set(OpRef::float_op(5));
+    mul_op.pos().set(OpRef::float_op(5));
 
     let add_op = Op::new(
         OpCode::FloatAdd,
         &[rb(OpRef::input_arg_float(0)), rb(OpRef::float_op(5))],
     );
-    add_op.pos.set(OpRef::float_op(6));
+    add_op.pos().set(OpRef::float_op(6));
 
     let inc_op = Op::new(
         OpCode::IntAdd,
         &[rb(OpRef::input_arg_int(1)), rb(OpRef::const_int(1))],
     );
-    inc_op.pos.set(OpRef::int_op(7));
+    inc_op.pos().set(OpRef::int_op(7));
 
     let jump_op = Op::new(
         OpCode::Jump,
         &[rb(OpRef::float_op(6)), rb(OpRef::int_op(7))],
     );
-    jump_op.pos.set(OpRef::void_op(8));
+    jump_op.pos().set(OpRef::void_op(8));
     jump_op.setdescr(loop_descr);
 
     let ops = vec![
@@ -521,22 +521,22 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
     let i0 = inputargs[0].opref();
 
     let guard_gc_type = Op::new(OpCode::GuardGcType, &[rb(i0), rb(const_child_tid)]);
-    guard_gc_type.pos.set(OpRef::void_op(1));
+    guard_gc_type.pos().set(OpRef::void_op(1));
     guard_gc_type.set_fail_arg_types(vec![]);
     guard_gc_type.setfailargs(vec![].into());
 
     let guard_is_object = Op::new(OpCode::GuardIsObject, &[rb(i0)]);
-    guard_is_object.pos.set(OpRef::void_op(2));
+    guard_is_object.pos().set(OpRef::void_op(2));
     guard_is_object.set_fail_arg_types(vec![]);
     guard_is_object.setfailargs(vec![].into());
 
     let guard_subclass = Op::new(OpCode::GuardSubclass, &[rb(i0), rb(const_root_vtable)]);
-    guard_subclass.pos.set(OpRef::void_op(3));
+    guard_subclass.pos().set(OpRef::void_op(3));
     guard_subclass.set_fail_arg_types(vec![]);
     guard_subclass.setfailargs(vec![].into());
 
     let finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos.set(OpRef::void_op(4));
+    finish_op.pos().set(OpRef::void_op(4));
     finish_op.set_fail_arg_types(vec![]);
     finish_op.setfailargs(vec![].into());
 
@@ -573,11 +573,11 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
         let guard_gc_type = Op::new(OpCode::GuardGcType, &[rb(i0), rb(const_child_tid)]);
-        guard_gc_type.pos.set(OpRef::void_op(1));
+        guard_gc_type.pos().set(OpRef::void_op(1));
         guard_gc_type.set_fail_arg_types(vec![Type::Ref]);
         guard_gc_type.setfailargs(vec![rb(i0)].into());
         let finish_op = Op::new(OpCode::Finish, &[]);
-        finish_op.pos.set(OpRef::void_op(2));
+        finish_op.pos().set(OpRef::void_op(2));
         finish_op.set_fail_arg_types(vec![]);
         finish_op.setfailargs(vec![].into());
 
@@ -611,11 +611,11 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
         let guard_is_object = Op::new(OpCode::GuardIsObject, &[rb(i0)]);
-        guard_is_object.pos.set(OpRef::void_op(1));
+        guard_is_object.pos().set(OpRef::void_op(1));
         guard_is_object.set_fail_arg_types(vec![Type::Ref]);
         guard_is_object.setfailargs(vec![rb(i0)].into());
         let finish_op = Op::new(OpCode::Finish, &[]);
-        finish_op.pos.set(OpRef::void_op(2));
+        finish_op.pos().set(OpRef::void_op(2));
         finish_op.set_fail_arg_types(vec![]);
         finish_op.setfailargs(vec![].into());
 
@@ -656,11 +656,11 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
         let guard_subclass = Op::new(OpCode::GuardSubclass, &[rb(i0), rb(const_root_a_vtable)]);
-        guard_subclass.pos.set(OpRef::void_op(1));
+        guard_subclass.pos().set(OpRef::void_op(1));
         guard_subclass.set_fail_arg_types(vec![Type::Ref]);
         guard_subclass.setfailargs(vec![rb(i0)].into());
         let finish_op = Op::new(OpCode::Finish, &[]);
-        finish_op.pos.set(OpRef::void_op(2));
+        finish_op.pos().set(OpRef::void_op(2));
         finish_op.set_fail_arg_types(vec![]);
         finish_op.setfailargs(vec![].into());
 
@@ -694,12 +694,12 @@ fn test_exception_guards_use_dynasm_emit() {
     let inputargs = vec![];
 
     let guard_exception = Op::new(OpCode::GuardException, &[rb(const_expected_class)]);
-    guard_exception.pos.set(OpRef::ref_op(0));
+    guard_exception.pos().set(OpRef::ref_op(0));
     guard_exception.set_fail_arg_types(vec![]);
     guard_exception.setfailargs(vec![].into());
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::ref_op(0))]);
-    finish_op.pos.set(OpRef::void_op(1));
+    finish_op.pos().set(OpRef::void_op(1));
     finish_op.set_fail_arg_types(vec![Type::Ref]);
     finish_op.setfailargs(vec![rb(OpRef::ref_op(0))].into());
 
@@ -732,12 +732,12 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
 
     let inputargs = vec![];
     let guard_no_exception = Op::new(OpCode::GuardNoException, &[]);
-    guard_no_exception.pos.set(OpRef::void_op(0));
+    guard_no_exception.pos().set(OpRef::void_op(0));
     guard_no_exception.set_fail_arg_types(vec![]);
     guard_no_exception.setfailargs(vec![].into());
 
     let finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos.set(OpRef::void_op(1));
+    finish_op.pos().set(OpRef::void_op(1));
     finish_op.set_fail_arg_types(vec![]);
     finish_op.setfailargs(vec![].into());
 
@@ -765,11 +765,11 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
     always_backend.attach_default_test_descrs();
     let always_token = JitCellToken::new(44);
     let guard_always_fails = Op::new(OpCode::GuardAlwaysFails, &[]);
-    guard_always_fails.pos.set(OpRef::void_op(0));
+    guard_always_fails.pos().set(OpRef::void_op(0));
     guard_always_fails.set_fail_arg_types(vec![]);
     guard_always_fails.setfailargs(vec![].into());
     let finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos.set(OpRef::void_op(1));
+    finish_op.pos().set(OpRef::void_op(1));
     finish_op.set_fail_arg_types(vec![]);
     finish_op.setfailargs(vec![].into());
     let ops = vec![guard_always_fails, finish_op];
@@ -798,10 +798,10 @@ fn test_int_binop_wide_immediate_is_not_truncated() {
     let i0 = inputargs[0].opref();
 
     let and_op = Op::new(OpCode::IntAnd, &[rb(i0), rb(OpRef::const_int(mask))]);
-    and_op.pos.set(OpRef::int_op(1));
+    and_op.pos().set(OpRef::int_op(1));
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
-    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.pos().set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
@@ -831,10 +831,10 @@ fn test_int_add_wide_immediate_is_not_truncated() {
     let i0 = inputargs[0].opref();
 
     let add_op = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(addend))]);
-    add_op.pos.set(OpRef::int_op(1));
+    add_op.pos().set(OpRef::int_op(1));
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
-    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.pos().set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 

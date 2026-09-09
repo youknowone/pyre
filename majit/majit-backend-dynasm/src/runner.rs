@@ -2061,9 +2061,9 @@ impl DynasmBackend {
         // `pos` and `descr` are interior-mutable, so the incoming `OpRc`
         // identities stay shared with the optimizer — no `Op` clone.
         for (op_idx, op) in ops.iter().enumerate() {
-            if op.result_type() != Type::Void && op.pos.get().is_none() {
+            if op.result_type() != Type::Void && op.pos().get().is_none() {
                 let pos = num_inputs + op_idx as u32;
-                op.pos.set(match op.result_type() {
+                op.pos().set(match op.result_type() {
                     Type::Int => OpRef::int_op(pos),
                     Type::Float => OpRef::float_op(pos),
                     Type::Ref => OpRef::ref_op(pos),
@@ -4223,7 +4223,7 @@ mod tests {
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let op = Op::new(opcode, &bx);
-        op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
+        op.pos().set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(op)
     }
 

@@ -4787,10 +4787,10 @@ fn checked_cl_type_for_size(
 }
 
 fn op_var_index(op: &Op, op_idx: usize, num_inputs: usize) -> usize {
-    if op.pos.get().is_none() {
+    if op.pos().get().is_none() {
         num_inputs + op_idx
     } else {
-        op.pos.get().raw() as usize
+        op.pos().get().raw() as usize
     }
 }
 
@@ -5139,8 +5139,8 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> IndexSet<u32> {
         known.insert(input.index);
     }
     for op in ops {
-        if op.result_type() != Type::Void && !op.pos.get().is_none() {
-            known.insert(op.pos.get().raw());
+        if op.result_type() != Type::Void && !op.pos().get().is_none() {
+            known.insert(op.pos().get().raw());
         }
     }
     known
@@ -5206,11 +5206,11 @@ fn build_type_overrides(
             // resolves by raw u32 (variant-blind) so a typed `IntOp(n)`
             // still finds the inputarg at slot n. Synthetic ops without
             // `.pos` cannot collide with an inputarg slot anyway.
-            if op.pos.get().is_none() {
+            if op.pos().get().is_none() {
                 continue;
             }
-            let var_idx = op.pos.get().raw();
-            if let Some(ia_type) = type_index.inputarg_type(op.pos.get())
+            let var_idx = op.pos().get().raw();
+            if let Some(ia_type) = type_index.inputarg_type(op.pos().get())
                 && ia_type != result_type
             {
                 op_def_positions.insert(var_idx, op_idx);
@@ -5373,7 +5373,7 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
         let mut redefined: IndexSet<u32> = IndexSet::new();
         for op in ops.iter().skip(label_idx + 1) {
             if op.result_type() != Type::Void {
-                let result = op.pos.get();
+                let result = op.pos().get();
                 if !result.is_none() && result.inline_const_bits().is_none() {
                     redefined.insert(result.raw());
                 }
@@ -5705,12 +5705,12 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
         .map(|(op_idx, op)| {
             let normalized = op.clone();
             let rt = normalized.result_type();
-            if rt != Type::Void && normalized.pos.get().is_none() {
+            if rt != Type::Void && normalized.pos().get().is_none() {
                 // op_typed mints the typed Int/Float/Ref variant
                 // (resoperation.py AbstractResOp + IntOp/FloatOp/
                 // RefOp mixins) — the Void branch is filtered above.
                 normalized
-                    .pos
+                    .pos()
                     .set(OpRef::op_typed(num_inputs + op_idx as u32, rt));
             }
             normalized
@@ -18981,7 +18981,7 @@ mod tests {
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::new(opcode, &bx);
-        o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
+        o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
     }
 
@@ -18997,13 +18997,13 @@ mod tests {
             majit_ir::make_array_descr_signed(0, 8, Type::Int, true),
         );
         let armed = std::rc::Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
-        armed.pos.set(OpRef::int_op(1));
+        armed.pos().set(OpRef::int_op(1));
         let guard = Op::new(OpCode::GuardFalse, &[Operand::from_bound_op(&armed)]);
-        guard.pos.set(OpRef::void_op(2));
+        guard.pos().set(OpRef::void_op(2));
         guard.set_fail_arg_types(vec![]);
         guard.setfailargs(vec![].into());
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(3));
+        finish.pos().set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
         let ops = [
@@ -19051,7 +19051,7 @@ mod tests {
     ) -> majit_ir::OpRc {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::with_descr(opcode, &bx, descr);
-        o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
+        o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
         std::rc::Rc::new(o)
     }
 
@@ -20639,14 +20639,14 @@ mod tests {
         // Two fail args, and it holds: this exit is never taken, it only makes
         // the trace's value area two slots wide.
         let wide = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(4))]);
-        wide.pos.set(OpRef::NONE);
+        wide.pos().set(OpRef::NONE);
         wide.set_fail_arg_types(vec![Type::Int, Type::Int]);
         wide.setfailargs(vec![rb(OpRef::int_op(2)), rb(OpRef::int_op(3))].into());
         let guard = Op::new(
             OpCode::GuardValue,
             &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
         );
-        guard.pos.set(OpRef::NONE);
+        guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![Type::Int]);
         guard.setfailargs(vec![rb(OpRef::int_op(2))].into());
         let ops = [
@@ -27010,7 +27010,7 @@ mod tests {
 
         // Build a guard with explicit fail_args so we can inspect them.
         let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_op.pos.set(OpRef::int_op(OpRef::NONE.raw()));
+        guard_op.pos().set(OpRef::int_op(OpRef::NONE.raw()));
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(0)),
             rb(OpRef::input_arg_int(1)),
@@ -27062,7 +27062,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
+        guard_inv.pos().set(OpRef::int_op(OpRef::NONE.raw()));
         guard_inv.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -27112,7 +27112,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
+        guard_inv.pos().set(OpRef::int_op(OpRef::NONE.raw()));
         guard_inv.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),

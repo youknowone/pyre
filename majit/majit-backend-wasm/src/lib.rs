@@ -760,7 +760,7 @@ fn guard_fail_args_advanced(
     let advanced_ids: std::collections::HashSet<u32> = ops[start..]
         .iter()
         .filter(|op| advances_loop_state(op.opcode))
-        .map(|op| op.pos.get())
+        .map(|op| op.pos().get())
         .filter(|r| *r != majit_ir::OpRef::NONE && !r.is_constant())
         .map(|r| r.raw())
         .collect();
@@ -3401,9 +3401,9 @@ fn normalize_ops_for_codegen(inputargs: &[InputArg], ops: &[OpRc]) -> Vec<Op> {
         .map(|(op_idx, op)| {
             let normalized = (**op).clone();
             let rt = normalized.result_type();
-            if rt != majit_ir::Type::Void && normalized.pos.get().is_none() {
+            if rt != majit_ir::Type::Void && normalized.pos().get().is_none() {
                 normalized
-                    .pos
+                    .pos()
                     .set(majit_ir::OpRef::op_typed(num_inputs + op_idx as u32, rt));
             }
             normalized
@@ -6158,7 +6158,7 @@ mod tests {
         let mut backend = WasmBackend::new();
         let token = JitCellToken::new(1);
         let finish = Op::new(majit_ir::OpCode::Finish, &[]);
-        finish.pos.set(majit_ir::OpRef::void_op(0));
+        finish.pos().set(majit_ir::OpRef::void_op(0));
         finish.set_fail_arg_types(Vec::new());
         finish.setfailargs(Vec::new().into());
 
@@ -6395,8 +6395,8 @@ mod tests {
                     majit_ir::OpCode::IntAdd,
                     &[rb(previous), rb(majit_ir::OpRef::const_int(1))],
                 );
-                op.pos.set(majit_ir::OpRef::int_op(position));
-                previous = op.pos.get();
+                op.pos().set(majit_ir::OpRef::int_op(position));
+                previous = op.pos().get();
                 values.push(previous);
                 ops.push(std::rc::Rc::new(op));
             }
@@ -6405,13 +6405,13 @@ mod tests {
                     majit_ir::OpCode::GuardTrue,
                     &[rb(majit_ir::OpRef::const_int(1))],
                 );
-                guard.pos.set(majit_ir::OpRef::void_op(value_count + 1));
+                guard.pos().set(majit_ir::OpRef::void_op(value_count + 1));
                 guard.setfailargs(values.iter().copied().map(rb).collect::<Vec<_>>().into());
                 guard.set_fail_arg_types(vec![majit_ir::Type::Int; values.len()]);
                 ops.push(std::rc::Rc::new(guard));
             }
             let finish = Op::new(majit_ir::OpCode::Finish, &[rb(previous)]);
-            finish.pos.set(majit_ir::OpRef::void_op(value_count + 2));
+            finish.pos().set(majit_ir::OpRef::void_op(value_count + 2));
             finish.set_fail_arg_types(vec![majit_ir::Type::Int]);
             ops.push(std::rc::Rc::new(finish));
             backend

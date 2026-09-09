@@ -227,7 +227,7 @@ impl RustCodegen {
             "fn replace_with(original: &Op, opcode: OpCode, args: &[Operand]) -> OptimizationResult {",
             |this| {
                 this.emit("let new_op = Op::new(opcode, args);");
-                this.emit("new_op.pos.set(original.pos.get());");
+                this.emit("new_op.pos().set(original.pos().get());");
                 this.emit("OptimizationResult::Restart(new_op)");
             },
         );

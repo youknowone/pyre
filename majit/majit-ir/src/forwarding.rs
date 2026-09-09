@@ -583,7 +583,7 @@ pub(crate) mod test_support {
             Type::Void => OpCode::Jump,
         };
         let op = std::rc::Rc::new(Op::new(opcode, &[]));
-        op.pos.set(OpRef::op_typed(position, tp));
+        op.pos().set(OpRef::op_typed(position, tp));
         Operand::from_bound_op(&op)
     }
 }

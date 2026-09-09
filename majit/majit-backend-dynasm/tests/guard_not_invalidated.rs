@@ -34,16 +34,16 @@ fn compile_guarded_add(backend: &mut DynasmBackend, token: &JitCellToken) -> maj
 
     let guard_descr = make_resume_guard_descr_typed(vec![Type::Int]);
     let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
-    guard_op.pos.set(OpRef::void_op(0));
+    guard_op.pos().set(OpRef::void_op(0));
     guard_op.set_fail_arg_types(vec![Type::Int]);
     guard_op.setfailargs(vec![rb(i0)].into());
     guard_op.setdescr(guard_descr.clone());
 
     let add_op = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(1))]);
-    add_op.pos.set(OpRef::int_op(1));
+    add_op.pos().set(OpRef::int_op(1));
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
-    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.pos().set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
@@ -121,22 +121,22 @@ fn every_recorded_position_in_a_trace_is_written() {
     let i0 = inputargs[0].opref();
 
     let first = Op::new(OpCode::GuardNotInvalidated, &[]);
-    first.pos.set(OpRef::void_op(0));
+    first.pos().set(OpRef::void_op(0));
     first.set_fail_arg_types(vec![Type::Int]);
     first.setfailargs(vec![rb(i0)].into());
     first.setdescr(make_resume_guard_descr_typed(vec![Type::Int]));
 
     let add_op = Op::new(OpCode::IntAdd, &[rb(i0), rb(OpRef::const_int(1))]);
-    add_op.pos.set(OpRef::int_op(1));
+    add_op.pos().set(OpRef::int_op(1));
 
     let second = Op::new(OpCode::GuardNotInvalidated, &[]);
-    second.pos.set(OpRef::void_op(2));
+    second.pos().set(OpRef::void_op(2));
     second.set_fail_arg_types(vec![Type::Int]);
     second.setfailargs(vec![rb(OpRef::int_op(1))].into());
     second.setdescr(make_resume_guard_descr_typed(vec![Type::Int]));
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
-    finish_op.pos.set(OpRef::void_op(3));
+    finish_op.pos().set(OpRef::void_op(3));
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 

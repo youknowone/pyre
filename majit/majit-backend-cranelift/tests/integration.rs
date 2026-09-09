@@ -1057,7 +1057,7 @@ fn call_descr_can_raise(idx: u32) -> DescrRef {
 fn assign_positions(ops: &mut [Op], base: u32) {
     for (i, op) in ops.iter_mut().enumerate() {
         let pos = base + i as u32;
-        op.pos.set(OpRef::op_typed(pos, op.result_type()));
+        op.pos().set(OpRef::op_typed(pos, op.result_type()));
     }
 }
 

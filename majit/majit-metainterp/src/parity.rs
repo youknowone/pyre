@@ -59,7 +59,7 @@ fn render_op(op: &Op, constants: &IndexMap<u32, i64>, vars: &mut VarRenumbering)
     let mut line = if op.opcode.is_guard() || op.opcode.result_type() == Type::Void {
         format!("{:?}({args})", op.opcode)
     } else {
-        format!("v{} = {:?}({args})", vars.id_for(op.pos.get()), op.opcode)
+        format!("v{} = {:?}({args})", vars.id_for(op.pos().get()), op.opcode)
     };
 
     if let Some(fail_args) = op.guard_fail_args() {

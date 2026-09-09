@@ -529,7 +529,7 @@ impl ImportedShortPureOp {
         // `op.copy_and_change(opnum, args=arglist)`) still hands
         // `ProducedShortOp` a freshly allocated replay op rather than
         // `self.res` itself.
-        replay.pos.set(result);
+        replay.pos().set(result);
         if let Some(d) = descr.clone() {
             replay.setdescr(d);
         }
@@ -600,9 +600,9 @@ fn describe_operand_for_assert(b: &Operand) -> String {
         .and_then(|d| d.as_field_descr().map(|fd| fd.field_name().to_string()))
         .unwrap_or_default();
     if name.is_empty() {
-        format!("{:?} {:?}", op.opcode, op.pos.get())
+        format!("{:?} {:?}", op.opcode, op.pos().get())
     } else {
-        format!("{:?} {:?} `{name}`", op.opcode, op.pos.get())
+        format!("{:?} {:?} `{name}`", op.opcode, op.pos().get())
     }
 }
 
@@ -2127,7 +2127,7 @@ impl OptContext {
         self.input_ops_index.clear();
         self.input_ops_index.reserve(self.input_ops.len());
         for op in &self.input_ops {
-            self.input_ops_index.insert(op.pos.get(), op.clone());
+            self.input_ops_index.insert(op.pos().get(), op.clone());
         }
     }
 
@@ -2136,7 +2136,7 @@ impl OptContext {
     /// overwrites, so the last push at a given position wins — matching the
     /// `iter().rfind(...)` (last-occurrence) scan the index replaces.
     pub(crate) fn push_new_operation(&mut self, op: majit_ir::OpRc) {
-        self.new_operations_index.insert(op.pos.get(), op.clone());
+        self.new_operations_index.insert(op.pos().get(), op.clone());
         self.new_operations.push(op);
     }
 
@@ -2145,7 +2145,7 @@ impl OptContext {
     /// the new op into `new_operations_index`, so the index keeps agreeing
     /// with `new_operations` for the rest of the forward phase.
     pub(crate) fn replace_new_operation(&mut self, idx: usize, op: majit_ir::OpRc) {
-        self.new_operations_index.insert(op.pos.get(), op.clone());
+        self.new_operations_index.insert(op.pos().get(), op.clone());
         self.new_operations[idx] = op;
     }
 
@@ -2169,7 +2169,7 @@ impl OptContext {
         self.new_operations_index.clear();
         self.new_operations_index.reserve(self.new_operations.len());
         for op in &self.new_operations {
-            self.new_operations_index.insert(op.pos.get(), op.clone());
+            self.new_operations_index.insert(op.pos().get(), op.clone());
         }
     }
 
@@ -2183,7 +2183,8 @@ impl OptContext {
         self.phase1_emit_ops_index
             .reserve(self.phase1_emit_ops.len());
         for op in &self.phase1_emit_ops {
-            self.phase1_emit_ops_index.insert(op.pos.get(), op.clone());
+            self.phase1_emit_ops_index
+                .insert(op.pos().get(), op.clone());
         }
     }
 
@@ -2191,7 +2192,7 @@ impl OptContext {
     /// (pos -> vector index) in lockstep. At most one live entry per position
     /// (emit invariant), so a plain insert replaces any stale mapping.
     pub(crate) fn live_synthetics_push(&mut self, op: majit_ir::OpRc) {
-        let pos = op.pos.get();
+        let pos = op.pos().get();
         let idx = self.live_synthetics.len();
         self.live_synthetics.push(op);
         self.live_synthetics_index.insert(pos, idx);
@@ -2206,7 +2207,7 @@ impl OptContext {
         let removed = self.live_synthetics.swap_remove(i);
         if i < self.live_synthetics.len() {
             // The element formerly at the tail now lives at `i`.
-            let moved_pos = self.live_synthetics[i].pos.get();
+            let moved_pos = self.live_synthetics[i].pos().get();
             self.live_synthetics_index.insert(moved_pos, i);
         }
         Some(removed)
@@ -2233,7 +2234,7 @@ impl OptContext {
             majit_ir::Type::Void => OpCode::Jump,
         };
         let synthetic = std::rc::Rc::new(Op::new(opcode, &[]));
-        synthetic.pos.set(opref);
+        synthetic.pos().set(opref);
         self.resop_refs.insert(opref, synthetic.clone());
         self.live_synthetics_push(synthetic.clone());
         synthetic
@@ -2275,7 +2276,7 @@ impl OptContext {
     /// mirrors `emit`'s live_synthetics catch-up: a producer-less stand-in only
     /// ever holds `None`/`Info`, never a redirect.
     fn install_canonical_producer(&mut self, op: &majit_ir::OpRc) {
-        let pos = op.pos.get();
+        let pos = op.pos().get();
         if pos.is_none() || pos.is_constant() {
             return;
         }
@@ -2431,7 +2432,7 @@ impl OptContext {
             if let Some(ia) = o.bound_inputarg() {
                 self.inputarg_refs.insert(ia.index, ia);
             } else if let Some(op) = o.bound_op() {
-                self.resop_refs.insert(op.pos.get(), op);
+                self.resop_refs.insert(op.pos().get(), op);
             }
         }
     }
@@ -2460,7 +2461,7 @@ impl OptContext {
         // `live_synthetics` — the collision-safe stores `find_producer_op`
         // consults.
         for op in ops {
-            let pos = op.pos.get();
+            let pos = op.pos().get();
             if pos.is_none() || pos.is_constant() {
                 continue;
             }
@@ -2663,7 +2664,7 @@ impl OptContext {
             OpCode::SameAsI,
             &[Operand::const_from_value(Value::Int(value))],
         );
-        op.pos.set(pos_ref);
+        op.pos().set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         let b = self.materialize_operand_at(opref);
         self.make_constant_box(&b, Value::Int(value));
@@ -2679,7 +2680,7 @@ impl OptContext {
             OpCode::SameAsR,
             &[Operand::const_from_value(Value::Ref(value))],
         );
-        op.pos.set(pos_ref);
+        op.pos().set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         let b = self.materialize_operand_at(opref);
         self.make_constant_box(&b, Value::Ref(value));
@@ -2695,7 +2696,7 @@ impl OptContext {
             OpCode::SameAsF,
             &[Operand::const_from_value(Value::Float(value))],
         );
-        op.pos.set(pos_ref);
+        op.pos().set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         let b = self.materialize_operand_at(opref);
         self.make_constant_box(&b, Value::Float(value));
@@ -2993,7 +2994,7 @@ impl OptContext {
     /// Checked at the emit/emit_extra producer surfaces, where both the
     /// `Op` result type and the typed `OpRef` are available.
     fn debug_assert_box_type_invariant(op: &Op) {
-        let pos = op.pos.get();
+        let pos = op.pos().get();
         debug_assert_eq!(
             op.type_,
             op.opcode.result_type(),
@@ -3027,12 +3028,12 @@ impl OptContext {
     /// Used when the optimizer pass-through is the recorder/iterator op
     /// itself (`optimizer.py _newoperations.append(op)`).
     pub(crate) fn emit_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
-        if op.pos.get().is_none() || op.pos.get().is_constant() {
-            op.pos.set(self.reserve_pos_typed(op.result_type()));
+        if op.pos().get().is_none() || op.pos().get().is_constant() {
+            op.pos().set(self.reserve_pos_typed(op.result_type()));
         } else {
-            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos().get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos.get();
+        let pos_ref = op.pos().get();
         if op.opcode.is_guard() {
             if !self.in_final_emission {
                 let _ = self.emit_guard_operation(&op);
@@ -3070,7 +3071,7 @@ impl OptContext {
             }
             dst.set_rd_resume_position(src.rd_resume_position());
         }
-        dst.pos.set(src.pos.get());
+        dst.pos().set(src.pos().get());
     }
 
     /// `emit` variant that REUSES the recorder input op (the `live_synthetics`
@@ -3086,12 +3087,12 @@ impl OptContext {
     }
 
     fn emit_impl(&mut self, mut op: Op, reuse: bool) -> OpRef {
-        if op.pos.get().is_none() || op.pos.get().is_constant() {
+        if op.pos().get().is_none() || op.pos().get().is_constant() {
             // Tag the freshly allocated position with the producer op's
             // result type so the variant-tag readers
             // (`opref_type`/`OptBoxEnv::get_type`) resolve at priority 0
             // (resoperation.py `opclasses[opnum].type` parity).
-            op.pos.set(self.reserve_pos_typed(op.result_type()));
+            op.pos().set(self.reserve_pos_typed(op.result_type()));
         } else {
             // Position invariants for an op that already carries a position:
             //
@@ -3127,14 +3128,14 @@ impl OptContext {
                 !self
                     .new_operations
                     .iter()
-                    .any(|e| e.pos.get() == op.pos.get()),
+                    .any(|e| e.pos().get() == op.pos().get()),
                 "emit: OpRef collision at {:?} — new_operations already contains this position. \
                  Body optimization should use a fresh TraceIterator and reserve_pos() should be \
                  monotonic above all raw trace positions.",
-                op.pos.get(),
+                op.pos().get(),
             );
             let has_op_fwd = self
-                .get_box_replacement_operand_opt(op.pos.get())
+                .get_box_replacement_operand_opt(op.pos().get())
                 .is_some_and(|b| self.has_op_forwarding(&b));
             debug_assert!(
                 !(has_op_fwd && op.result_type() != majit_ir::Type::Void),
@@ -3142,11 +3143,11 @@ impl OptContext {
                  import_state should only forward inputarg slots in \
                  [inputarg_base..inputarg_base + num_inputs), and body op results \
                  live in a disjoint range above the parent trace high-water mark.",
-                op.pos.get(),
+                op.pos().get(),
             );
-            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos().get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos.get();
+        let pos_ref = op.pos().get();
         // RPython parity: emit() does NOT clear forwarding.
         // In RPython, Box._forwarded is never cleared by emit — each Box
         // has unique identity. The forwarding set by import_box must
@@ -3204,7 +3205,7 @@ impl OptContext {
         // the primary fast path. The Box.type invariant is checked by
         // `debug_assert_box_type_invariant` below.
         Self::debug_assert_box_type_invariant(&op);
-        let op_pos = op.pos.get();
+        let op_pos = op.pos().get();
         // Reuse path: when an unchanged op flows through to final emission, reuse
         // the recorder input op (the `live_synthetics` entry at this position) as
         // the emitted producer rather than cloning. The input op is what later
@@ -3372,13 +3373,13 @@ impl OptContext {
     /// re-dispatch (`send_extra_operation`, optimizer.py with
     /// `opt=first_optimization`) enters at pass 0.
     fn emit_extra_at(&mut self, start_pass: usize, op: majit_ir::OpRc) -> OpRef {
-        if op.pos.get().is_none() {
+        if op.pos().get().is_none() {
             // Typed allocation, same rationale as `emit`.
-            op.pos.set(self.reserve_pos_typed(op.result_type()));
+            op.pos().set(self.reserve_pos_typed(op.result_type()));
         } else {
-            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos().get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos.get();
+        let pos_ref = op.pos().get();
         // Queued ops carry their intrinsic `op.type_`
         // (resoperation.py:1693 parity). Once the queued op flushes
         // through `propagate_one` into `new_operations`, `op_at` resolves
@@ -3426,7 +3427,7 @@ impl OptContext {
                 // Rc (a synthetic producer registered on first
                 // materialization), stable across calls, so no warm-up is
                 // needed for the lookup keys to be ptr_eq.
-                let pos = entry.op.pos.get();
+                let pos = entry.op.pos().get();
                 let res = self.materialize_operand_at(pos);
                 (
                     res.clone(),
@@ -3664,11 +3665,11 @@ impl OptContext {
                         pure_call_opcode(produced_op.preamble_op.opcode),
                         &resolved_arg_boxes,
                     );
-                    op.pos.set(replay_pos(*source, produced_op));
+                    op.pos().set(replay_pos(*source, produced_op));
                     if let Some(d) = produced_op.preamble_op.getdescr() {
                         op.setdescr(d);
                     }
-                    let res = self.materialize_operand_at(op.pos.get());
+                    let res = self.materialize_operand_at(op.pos().get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         res,
@@ -3727,9 +3728,9 @@ impl OptContext {
                             // phase box that a retrace cannot bind.
                             let obj_b = produced_op.preamble_op.arg(0);
                             let mut op = Op::new(opcode, &[obj_b]);
-                            op.pos.set(replay_pos(*source, produced_op));
+                            op.pos().set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
-                            let res = self.materialize_operand_at(op.pos.get());
+                            let res = self.materialize_operand_at(op.pos().get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
@@ -3769,9 +3770,9 @@ impl OptContext {
                             let obj_b = produced_op.preamble_op.arg(0);
                             let index_b = produced_op.preamble_op.arg(1);
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
-                            op.pos.set(replay_pos(*source, produced_op));
+                            op.pos().set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
-                            let res = self.materialize_operand_at(op.pos.get());
+                            let res = self.materialize_operand_at(op.pos().get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
@@ -3810,8 +3811,8 @@ impl OptContext {
                     }
                     let func_b = dep_or_materialize(self, &produced, func_opref);
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
-                    op.pos.set(replay_pos(*source, produced_op));
-                    let res = self.materialize_operand_at(op.pos.get());
+                    op.pos().set(replay_pos(*source, produced_op));
+                    let res = self.materialize_operand_at(op.pos().get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         res,
@@ -3907,7 +3908,7 @@ impl OptContext {
             // `forwarded[pop.op]` does not collide with the replay's
             // info at `forwarded[pop.preamble_op.pos]`.
             if let Some(info) =
-                self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos.get())
+                self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos().get())
             {
                 self.setinfo_from_preamble_item_option(result, &info, None);
             }
@@ -4080,8 +4081,8 @@ impl OptContext {
             // returning None is the equivalent.
         }
         let result_info: Option<(OpRef, ForwardedInfo)> =
-            snapshot_forwarded(self, preamble_op.pos.get())
-                .map(|info| (preamble_op.pos.get(), info));
+            snapshot_forwarded(self, preamble_op.pos().get())
+                .map(|info| (preamble_op.pos().get(), info));
 
         // Phase 2: generate guards — `make_guards` takes `&mut self`
         // directly. Constants seed via reserve_const_ref + seed_constant
@@ -4669,7 +4670,7 @@ impl OptContext {
                     .extra_same_as()
                     .iter()
                     .map(|op| ImportedShortAlias {
-                        result: op.pos.get(),
+                        result: op.pos().get(),
                         same_as_source: op.arg(0),
                         same_as_opcode: op.opcode,
                     })
@@ -5198,7 +5199,7 @@ impl OptContext {
             .iter()
             .chain(self.phase1_emit_ops.iter())
             .chain(self.input_ops.iter())
-            .any(|op| op.pos.get().raw() == raw);
+            .any(|op| op.pos().get().raw() == raw);
         if raw_hit {
             return "b-typetag";
         }
@@ -6806,7 +6807,7 @@ impl OptContext {
                  ancestor — RPython resume.py:397 \
                  `assert resume_position >= 0` parity",
                 op.opcode,
-                op.pos.get(),
+                op.pos().get(),
                 op.rd_resume_position()
             );
         }
@@ -6889,7 +6890,7 @@ impl OptContext {
             eprintln!(
                 "[callee-rca][store-final-vable] op={:?} pos={:?} resume_pos={} vable={:?}",
                 op.opcode,
-                op.pos.get(),
+                op.pos().get(),
                 op.rd_resume_position(),
                 vable_debug,
             );
@@ -6925,7 +6926,7 @@ impl OptContext {
                 .collect();
             eprintln!(
                 "[jit][guard-resume] pos={:?} snapshot={:?} vable={:?}",
-                op.pos.get(),
+                op.pos().get(),
                 snapshot_debug,
                 vable_debug
             );
@@ -7000,7 +7001,7 @@ impl OptContext {
                 "[callee-rca][store-final-numbered] op={:?} pos={:?} resume_pos={} \
                  vable_items={:?} liveboxes={:?} livebox_types={:?} rd_consts={:?}",
                 op.opcode,
-                op.pos.get(),
+                op.pos().get(),
                 op.rd_resume_position(),
                 vable_items,
                 liveboxes,
@@ -7012,7 +7013,7 @@ impl OptContext {
         if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
             eprintln!(
                 "[jit][guard-resume] pos={:?} liveboxes={:?} rd_virtuals={} livebox_types={:?}",
-                op.pos.get(),
+                op.pos().get(),
                 liveboxes,
                 rd_virtuals.len(),
                 livebox_types
@@ -7069,7 +7070,7 @@ impl OptContext {
             eprintln!(
                 "[callee-rca][store-final-operands] op={:?} pos={:?} resume_pos={} final_oprefs={:?}",
                 op.opcode,
-                op.pos.get(),
+                op.pos().get(),
                 op.rd_resume_position(),
                 final_oprefs,
             );
@@ -7590,7 +7591,7 @@ impl OptContext {
             .new_operations
             .iter()
             .rev()
-            .find(|op| op.pos.get() == opref)
+            .find(|op| op.pos().get() == opref)
         {
             return Some(op);
         }
@@ -7604,7 +7605,7 @@ impl OptContext {
         self.phase1_emit_ops
             .iter()
             .rev()
-            .find(|op| op.pos.get() == opref)
+            .find(|op| op.pos().get() == opref)
             .map(|rc| rc.as_ref())
     }
 
@@ -9315,7 +9316,7 @@ mod input_ops_index_tests {
 
     fn op_at(pos: OpRef) -> majit_ir::OpRc {
         let op = Op::new(OpCode::SameAsI, &[]);
-        op.pos.set(pos);
+        op.pos().set(pos);
         Rc::new(op)
     }
 
@@ -9423,7 +9424,7 @@ mod boxref_forwarding_tests {
 
         // The producer emits at pos 2.
         let mut producer = Op::new(OpCode::IntLt, &[b0.clone(), b1.clone()]);
-        producer.pos.set(pos2);
+        producer.pos().set(pos2);
         ctx.emit(producer);
 
         // The frozen consumer arg must resolve to the emitted producer; the
@@ -10937,7 +10938,7 @@ mod ensure_ptr_info_arg0_tests {
             )],
             descr,
         );
-        op.pos.set(OpRef::int_op(1));
+        op.pos().set(OpRef::int_op(1));
         op
     }
 
@@ -10955,7 +10956,7 @@ mod ensure_ptr_info_arg0_tests {
             )],
             descr,
         );
-        op.pos.set(OpRef::int_op(1));
+        op.pos().set(OpRef::int_op(1));
         op
     }
 
@@ -11024,7 +11025,7 @@ mod ensure_ptr_info_arg0_tests {
                 )],
                 descr,
             );
-            op.pos.set(OpRef::int_op(1));
+            op.pos().set(OpRef::int_op(1));
             op
         };
         let seed_box = op.arg(0);
@@ -11061,7 +11062,7 @@ mod ensure_ptr_info_arg0_tests {
                 )],
                 descr,
             );
-            op.pos.set(OpRef::int_op(1));
+            op.pos().set(OpRef::int_op(1));
             op
         };
         let seed_box = op.arg(0);
@@ -11387,7 +11388,7 @@ mod imported_short_preamble_fallback_tests {
                 crate::history::test_support::rooted_resop_operand(majit_ir::Type::Int, 8),
             ],
         );
-        replay_op.pos.set(OpRef::int_op(14));
+        replay_op.pos().set(OpRef::int_op(14));
         // shortpreamble.py non-invented PureOp.produce_op: `op = self.res`.
         // pop.op carries the body-visible OpRef directly (no forwarding chain
         // installed for non-invented Pure).
@@ -11415,7 +11416,7 @@ mod imported_short_preamble_fallback_tests {
                 .collect::<Vec<_>>(),
             vec![OpRef::int_op(7), OpRef::int_op(8)]
         );
-        assert_eq!(sp.ops[0].op.pos.get(), OpRef::int_op(14));
+        assert_eq!(sp.ops[0].op.pos().get(), OpRef::int_op(14));
     }
 }
 
@@ -11536,6 +11537,6 @@ mod opt_box_env_tests {
         let op = materialised
             .bound_op()
             .expect("empty ResOp slot lazy-materialised the wrong host kind");
-        assert_eq!(op.pos.get(), result);
+        assert_eq!(op.pos().get(), result);
     }
 }

@@ -486,7 +486,7 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
 fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
     let op = Op::new(opcode, &bx);
-    op.pos.set(pos);
+    op.pos().set(pos);
     op
 }
 
@@ -3649,7 +3649,7 @@ fn test_exception_guards() {
         // GuardException(expected_type) — caught value bound to int_op(1).
         {
             let op = Op::new(OpCode::GuardException, &[rb(OpRef::input_arg_int(0))]);
-            op.pos.set(OpRef::int_op(1));
+            op.pos().set(OpRef::int_op(1));
             op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
             op
         },

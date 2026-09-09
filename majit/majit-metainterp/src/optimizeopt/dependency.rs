@@ -585,7 +585,7 @@ impl DependencyGraph {
 
             // dependency.py: define result variable
             if op.opcode.result_type() != majit_ir::Type::Void {
-                tracker.define(op.pos.get(), i);
+                tracker.define(op.pos().get(), i);
             }
 
             // dependency.py:626-644: build edges based on op type
@@ -758,7 +758,7 @@ impl DependencyGraph {
                 nodes_ref
                     .iter()
                     .filter_map(|n| n.getoperation())
-                    .find(|op| op.pos.get() == opref)
+                    .find(|op| op.pos().get() == opref)
                     .map(|op| op.opcode.result_type())
                     .unwrap_or(majit_ir::Type::Int)
             };
@@ -1197,7 +1197,7 @@ impl IndexVar {
     /// `get_or_create`) and
     /// re-installed here, carrying `Operand::Op`/`InputArg`. The first-var arm
     /// binds a synthetic producer via `bound_from_opref` only when no operand
-    /// was captured (a synthetic-result var). The CHAINED `var = op.pos.get()`
+    /// was captured (a synthetic-result var). The CHAINED `var = op.pos().get()`
     /// references (when `coefficient_mul != 1`, i.e. an `IntAdd` / `IntSub`
     /// consuming the prior `IntMul`) point at the just-created local `Op`
     /// value — this fn returns `Vec<Op>`, not `Vec<OpRc>`, so there is no
@@ -1238,7 +1238,7 @@ impl IndexVar {
                     majit_ir::operand::Operand::from_opref(c),
                 ],
             );
-            var = op.pos.get();
+            var = op.pos().get();
             tolist.push(op);
         }
         // dependency.py:1072-1074: coefficient_div != 1 → assert 0
@@ -1256,7 +1256,7 @@ impl IndexVar {
                     majit_ir::operand::Operand::from_opref(c),
                 ],
             );
-            var = op.pos.get();
+            var = op.pos().get();
             tolist.push(op);
         }
         if self.constant < 0 {
@@ -1271,7 +1271,7 @@ impl IndexVar {
             );
             #[allow(unused_assignments)]
             {
-                var = op.pos.get();
+                var = op.pos().get();
             }
             tolist.push(op);
         }
@@ -1295,7 +1295,7 @@ impl IndexVar {
         let ops = self.get_operations(next_const);
         let mut last = self.var;
         for op in ops {
-            last = op.pos.get();
+            last = op.pos().get();
             new_ops.push(op);
         }
         last
@@ -1588,7 +1588,7 @@ impl<'a> IntegralForwardModification<'a> {
 
     /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.
     fn inspect_additive(&mut self, op: &Op, is_sub: bool) {
-        let result = op.pos.get();
+        let result = op.pos().get();
         let b0 = op.arg(0);
         let b1 = op.arg(1);
         let a0 = b0.to_opref();
@@ -1629,7 +1629,7 @@ impl<'a> IntegralForwardModification<'a> {
 
     /// dependency.py:922-948: operation_INT_MUL.
     fn inspect_multiplicative(&mut self, op: &Op) {
-        let result = op.pos.get();
+        let result = op.pos().get();
         let b0 = op.arg(0);
         let b1 = op.arg(1);
         let a0 = b0.to_opref();

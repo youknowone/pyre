@@ -324,7 +324,7 @@ impl Fixture {
         let r1 = inputargs[1].opref();
 
         let force_token = Op::new(OpCode::ForceToken, &[]);
-        force_token.pos.set(OpRef::ref_op(2));
+        force_token.pos().set(OpRef::ref_op(2));
 
         let call = Op::new(
             OpCode::CallMayForceN,
@@ -333,7 +333,7 @@ impl Fixture {
                 rb(OpRef::ref_op(2)),
             ],
         );
-        call.pos.set(OpRef::void_op(3));
+        call.pos().set(OpRef::void_op(3));
         call.setdescr(Arc::new(MayForceCallDescr {
             arg_types: vec![Type::Ref],
         }) as DescrRef);
@@ -341,12 +341,12 @@ impl Fixture {
         // Both probes are fail args here, so they are live across the call and
         // the call's gcmap has to cover the slots they spill to.
         let guard = Op::new(OpCode::GuardNotForced, &[]);
-        guard.pos.set(OpRef::void_op(4));
+        guard.pos().set(OpRef::void_op(4));
         guard.set_fail_arg_types(vec![Type::Ref, Type::Ref]);
         guard.setfailargs(vec![rb(r0), rb(r1)].into());
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(5));
+        finish.pos().set(OpRef::void_op(5));
         finish.set_fail_arg_types(vec![Type::Ref, Type::Ref]);
         finish.setfailargs(vec![rb(r0), rb(r1)].into());
 

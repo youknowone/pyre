@@ -40,7 +40,7 @@ fn add_ir() -> (Vec<InputArg>, Vec<OpRc>) {
             Operand::from_bound_inputarg(&y),
         ],
     ));
-    add.pos.set(OpRef::int_op(1));
+    add.pos().set(OpRef::int_op(1));
     let finish = OpRc::new(Op::with_descr(
         OpCode::Finish,
         &[Operand::from_bound_op(&add)],

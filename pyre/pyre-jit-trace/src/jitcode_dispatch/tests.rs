@@ -2293,7 +2293,7 @@ fn drive_int_add_jump_if_ovf(
         .last()
         .expect("overflow guard snapshot must contain its frame")
         .pc;
-    let resbox = ops[0].pos.get();
+    let resbox = ops[0].pos().get();
     (
         opcodes,
         guard_num_args,
@@ -2461,7 +2461,7 @@ fn drive_alloc_with_descr(
     );
     assert_eq!(
         dst,
-        ops[0].pos.get(),
+        ops[0].pos().get(),
         "the `>r` decorator writes the allocation into the ref bank"
     );
     assert_eq!(next_pc, 4, "`d>r` consumes a 2B descr plus a 1B dst");
@@ -3161,7 +3161,7 @@ fn raw_load_i_records_the_load_against_the_descr() {
     );
     assert_eq!(
         regs_i[2],
-        last.pos.get(),
+        last.pos().get(),
         "the `>i` decorator writes the dst"
     );
 }
@@ -6199,7 +6199,7 @@ fn top_level_raise_settles_the_vable_token() {
     let token_op = tc
         .ops()
         .iter()
-        .find(|op| op.pos.get() == value)
+        .find(|op| op.pos().get() == value)
         .expect("stored token is produced by an operation");
     assert_eq!(
         token_op.opcode,
@@ -7470,8 +7470,8 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
     );
     assert_eq!(
         dst_post,
-        last.pos.get(),
-        "`{opname}` dst must hold the recorder's result OpRef (op.pos.get())",
+        last.pos().get(),
+        "`{opname}` dst must hold the recorder's result OpRef (op.pos().get())",
     );
 }
 
@@ -7841,7 +7841,7 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
             .collect::<Vec<_>>(),
         vec![arg0, arg1]
     );
-    assert_eq!(dst_post, last.pos.get());
+    assert_eq!(dst_post, last.pos().get());
 }
 
 #[test]
@@ -7933,7 +7933,7 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         vec![arg],
         "`{opname}` args must be [registers_f[src]]",
     );
-    assert_eq!(dst_post, last.pos.get());
+    assert_eq!(dst_post, last.pos().get());
 }
 
 #[test]
@@ -8018,7 +8018,7 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
             .collect::<Vec<_>>(),
         vec![arg]
     );
-    assert_eq!(dst_post, last.pos.get());
+    assert_eq!(dst_post, last.pos().get());
 }
 
 #[test]
@@ -8139,7 +8139,7 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
             .collect::<Vec<_>>(),
         vec![arg0, arg1]
     );
-    assert_eq!(dst_post, last.pos.get());
+    assert_eq!(dst_post, last.pos().get());
 }
 
 #[test]
@@ -10841,8 +10841,8 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
         .expect("a CallR op must be in the recorded trace");
     assert_eq!(
         dst_ref,
-        call_op.pos.get(),
-        "registers_r[dst] must be the recorded CallR's OpRef (op.pos.get())",
+        call_op.pos().get(),
+        "registers_r[dst] must be the recorded CallR's OpRef (op.pos().get())",
     );
 }
 
@@ -10935,7 +10935,7 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
         .iter()
         .find(|o| o.opcode == OpCode::CallR)
         .expect("CallR must be in the trace")
-        .pos
+        .pos()
         .get();
     assert_ne!(regs_r[3], dst_pre, "dst must be overwritten");
     assert_eq!(
@@ -11024,7 +11024,7 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
         .iter()
         .find(|o| o.opcode == OpCode::CallR)
         .expect("CallR must be in the trace")
-        .pos
+        .pos()
         .get();
     assert_ne!(regs_r[2], dst_pre, "dst must be overwritten");
     assert_eq!(
@@ -11308,8 +11308,8 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
     );
     assert_eq!(
         dst_post,
-        call_op.pos.get(),
-        "registers_i[dst] must be the recorded CallI's OpRef (op.pos.get())",
+        call_op.pos().get(),
+        "registers_i[dst] must be the recorded CallI's OpRef (op.pos().get())",
     );
 }
 
@@ -11531,8 +11531,8 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
     let dst_post = wc.registers_r.get(0).expect("ref register in range");
     assert_eq!(
         dst_post,
-        call_op.pos.get(),
-        "registers_r[dst] must be the recorded CallR's OpRef (op.pos.get())",
+        call_op.pos().get(),
+        "registers_r[dst] must be the recorded CallR's OpRef (op.pos().get())",
     );
 }
 
@@ -12910,7 +12910,7 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
         std::sync::Arc::ptr_eq(&recorded_descr, &descr),
         "GetfieldGcI descr must be descr_refs[d] (the field descr)",
     );
-    assert_eq!(dst_post, last.pos.get());
+    assert_eq!(dst_post, last.pos().get());
 }
 
 #[test]
@@ -13077,7 +13077,7 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
             .collect::<Vec<_>>(),
         vec![obj]
     );
-    assert_eq!(dst_post, last.pos.get());
+    assert_eq!(dst_post, last.pos().get());
 }
 
 #[test]
@@ -13244,7 +13244,7 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
         std::sync::Arc::ptr_eq(&recorded_descr, &descr),
         "GetfieldGcI descr must be descr_refs[d] (the field descr)",
     );
-    assert_eq!(dst_post, last.pos.get());
+    assert_eq!(dst_post, last.pos().get());
 }
 
 #[test]
@@ -13671,7 +13671,7 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
         &last.getdescr().expect("must carry array descr"),
         &descr,
     ));
-    assert_eq!(dst_post, last.pos.get());
+    assert_eq!(dst_post, last.pos().get());
 }
 
 /// Backend stub for the pure-getarrayitem bypass test: the required

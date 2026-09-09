@@ -1501,7 +1501,7 @@ impl UnrollOptimizer {
                         eprintln!(
                             "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=[{}]",
                             op.opcode,
-                            op.pos.get(),
+                            op.pos().get(),
                             op.rd_resume_position(),
                             rd_numb_len,
                             fa_raw.join(", ")
@@ -1510,7 +1510,7 @@ impl UnrollOptimizer {
                         eprintln!(
                             "[jit] p2 guard {:?} pos={:?} resume_pos={} rd_numb={} fail_args_raw=<none>",
                             op.opcode,
-                            op.pos.get(),
+                            op.pos().get(),
                             op.rd_resume_position(),
                             rd_numb_len,
                         );
@@ -1533,7 +1533,7 @@ impl UnrollOptimizer {
                 eprintln!(
                     "[jit] p2[{i}]: {:?} pos={:?} args={:?}",
                     op.opcode,
-                    op.pos.get(),
+                    op.pos().get(),
                     op.getarglist()
                 );
             }
@@ -2248,10 +2248,10 @@ impl UnrollOptimizer {
         {
             let mut seen: indexmap::IndexSet<u32> = indexmap::IndexSet::new();
             combined.retain(|op| {
-                if op.pos.get().is_none() || op.result_type() == Type::Void {
+                if op.pos().get().is_none() || op.result_type() == Type::Void {
                     return true;
                 }
-                seen.insert(op.pos.get().raw())
+                seen.insert(op.pos().get().raw())
             });
         }
         crate::optimizeopt::optimizer::sanitize_backend_constants_for_ops(
@@ -2689,9 +2689,9 @@ impl ExportedState {
         }
 
         fn visit_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
-            let mut pos = op.pos.get();
+            let mut pos = op.pos().get();
             visit_opref(&mut pos, visitor);
-            op.pos.set(pos);
+            op.pos().set(pos);
             op.walk_const_ptr_refs_mut(visitor);
         }
 
@@ -2799,7 +2799,7 @@ impl ExportedState {
             }
         };
         let visit_op = |op: &Op, visit: &mut dyn FnMut(OpRef)| {
-            visit(op.pos.get());
+            visit(op.pos().get());
             for arg in op.getarglist().iter() {
                 visit(arg.to_opref());
             }
@@ -2895,7 +2895,7 @@ impl ExportedState {
             high = high.max(ia.index.saturating_add(1));
         }
         for op in &self.partial_trace_operations {
-            let pos = op.pos.get();
+            let pos = op.pos().get();
             if !pos.is_none() && !pos.is_constant() {
                 high = high.max(pos.raw().saturating_add(1));
             }
@@ -4111,8 +4111,8 @@ impl OptUnroll {
                     let frame_operand = ctx.materialize_operand_at(frame_arg);
                     let mut load = Op::new(opcode, std::slice::from_ref(&frame_operand));
                     load.setdescr(descr);
-                    load.pos.set(ctx.reserve_pos_typed(tp));
-                    let loaded = load.pos.get();
+                    load.pos().set(ctx.reserve_pos_typed(tp));
+                    let loaded = load.pos().get();
                     if let Err(e) = optimizer.send_extra_operation(&load, ctx) {
                         ctx.signal_invalid_loop(e.0);
                         return None;
@@ -4480,7 +4480,7 @@ impl OptUnroll {
                     }
                 }
                 let new_ref = ctx.alloc_op_position_typed(new_op.result_type());
-                new_op.pos.set(new_ref);
+                new_op.pos().set(new_ref);
                 // unroll.py:412-414: mapping[sop] = op; i += 1; send_extra_operation(op)
                 // RPython sets mapping BEFORE send_extra_operation.
                 //
@@ -4505,9 +4505,9 @@ impl OptUnroll {
                 // disjointness for the allocation case only; the redundant
                 // reconstruction op is left unmapped (dead) and elided by DCE.
                 let skip_insert =
-                    sp_op.opcode.is_malloc() && seeded_input_keys.contains(&sp_op.pos.get());
+                    sp_op.opcode.is_malloc() && seeded_input_keys.contains(&sp_op.pos().get());
                 if !skip_insert {
-                    mapping.insert(sp_op.pos.get(), new_ref);
+                    mapping.insert(sp_op.pos().get(), new_ref);
                 }
                 replay_index += 1;
                 // unroll.py:414 lets send_extra_operation raise InvalidLoop.
@@ -4897,9 +4897,9 @@ impl OptUnroll {
                         crate::optimizeopt::shortpreamble::PreambleOpKind::InputArg
                             | crate::optimizeopt::shortpreamble::PreambleOpKind::Guard
                     )
-                    || !result_map.contains_key(&produced.preamble_op.pos.get()),
+                    || !result_map.contains_key(&produced.preamble_op.pos().get()),
                 "ProducedShortOp::produce_op failed for source {:?} kind {:?}",
-                produced.preamble_op.pos.get(),
+                produced.preamble_op.pos().get(),
                 produced.kind
             );
         }
@@ -4914,7 +4914,7 @@ impl OptUnroll {
         for (_, produced) in &const_short_boxes {
             let info = self.collect_exported_info(produced.res.to_opref(), ctx, None);
             if let Some(info) = &info {
-                ctx.set_preamble_forwarded_info(produced.preamble_op.pos.get(), info);
+                ctx.set_preamble_forwarded_info(produced.preamble_op.pos().get(), info);
             }
         }
         // unroll.py:512-513 covers both groups upstream, because
@@ -5318,7 +5318,7 @@ fn emit_alias_same_as_for_imports(
             alias.same_as_opcode,
             std::slice::from_ref(&alias.same_as_source),
         );
-        op.pos.set(alias.result);
+        op.pos().set(alias.result);
         result.push(std::rc::Rc::new(op));
     }
 }
@@ -5368,7 +5368,7 @@ fn push_fallthrough_same_as(
     }
     let arg_source = ctx.materialize_operand_at(source);
     let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[arg_source]);
-    same_as.pos.set(arg);
+    same_as.pos().set(arg);
     fallthrough_aliases.push(same_as);
 }
 
@@ -5447,7 +5447,7 @@ fn assemble_peeled_trace_with_jump_args(
             start_label_args_box_operand.push(ctx.materialize_operand_at(*a));
         }
         let mut start_label = Op::new(OpCode::Label, &start_label_args_box_operand);
-        start_label.pos.set(OpRef::NONE);
+        start_label.pos().set(OpRef::NONE);
         start_label.setdescr(start_label_descr);
         result.push(std::rc::Rc::new(start_label));
     }
@@ -5465,13 +5465,13 @@ fn assemble_peeled_trace_with_jump_args(
     // are referenced by the body Label args and must not be reused.
     let result_max = result
         .iter()
-        .map(|op| op.pos.get().raw())
+        .map(|op| op.pos().get().raw())
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(inputarg_base + body_num_inputs as u32);
     let p1_all_max = p1_ops
         .iter()
-        .map(|op| op.pos.get().raw())
+        .map(|op| op.pos().get().raw())
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(0);
@@ -5524,11 +5524,11 @@ fn assemble_peeled_trace_with_jump_args(
             })
             .collect();
         for op in &result {
-            if !op.pos.get().is_none()
+            if !op.pos().get().is_none()
                 && op.opcode != OpCode::Jump
                 && op.result_type() != Type::Void
             {
-                s.insert(op.pos.get());
+                s.insert(op.pos().get());
             }
         }
         s
@@ -5556,8 +5556,8 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
     for op in p2_ops.iter() {
-        if is_trace_runtime_ref(op.pos.get(), constants) {
-            max_pos = max_pos.max(op.pos.get().raw().saturating_add(1));
+        if is_trace_runtime_ref(op.pos().get(), constants) {
+            max_pos = max_pos.max(op.pos().get().raw().saturating_add(1));
         }
         for arg in op.getarglist().iter() {
             if is_trace_runtime_ref(arg.to_opref(), constants) {
@@ -5638,7 +5638,7 @@ fn assemble_peeled_trace_with_jump_args(
                     let tp = const_op.type_();
                     if tp != Type::Void {
                         let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[const_op]);
-                        same_as.pos.set(arg);
+                        same_as.pos().set(arg);
                         fallthrough_aliases.push(same_as);
                     }
                     continue;
@@ -5658,8 +5658,8 @@ fn assemble_peeled_trace_with_jump_args(
                 consider_arg(a.to_opref());
             }
             op.visit_failarg_oprefs(&mut consider_arg);
-            if op.result_type() != Type::Void && !op.pos.get().is_none() {
-                seen_body_defs.insert(op.pos.get());
+            if op.result_type() != Type::Void && !op.pos().get().is_none() {
+                seen_body_defs.insert(op.pos().get());
             }
         }
     }
@@ -5682,7 +5682,7 @@ fn assemble_peeled_trace_with_jump_args(
             let tp = const_op.type_();
             if tp != Type::Void {
                 let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[const_op]);
-                same_as.pos.set(arg);
+                same_as.pos().set(arg);
                 fallthrough_aliases.push(same_as);
             }
         }
@@ -5701,7 +5701,7 @@ fn assemble_peeled_trace_with_jump_args(
     // variant-aware Hash matches when downstream consumers compare
     // label_op.pos against Op-keyed maps.
     label_op
-        .pos
+        .pos()
         .set(OpRef::op_typed(label_pos, label_op.result_type()));
     if let Some(ref d) = loop_label_descr {
         label_op.setdescr(d.clone());
@@ -5717,7 +5717,7 @@ fn assemble_peeled_trace_with_jump_args(
         .unwrap_or(label_pos);
     let max_emitted_pos = result
         .iter()
-        .map(|op| op.pos.get().raw())
+        .map(|op| op.pos().get().raw())
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(label_pos);
@@ -5732,7 +5732,7 @@ fn assemble_peeled_trace_with_jump_args(
     // position already emitted into `result`.
     let max_p2_pos = p2_ops
         .iter()
-        .map(|op| op.pos.get().raw())
+        .map(|op| op.pos().get().raw())
         .filter(|&p| p != u32::MAX)
         .max()
         .unwrap_or(0);
@@ -5780,7 +5780,7 @@ fn assemble_peeled_trace_with_jump_args(
         // Only map non-Void ops that actually produce a result.
         // Void ops (SetfieldGc, guards, Jump) don't define values at
         // their position — mapping them creates phantom OpRefs.
-        if op.pos.get().raw() != u32::MAX && op.result_type() != Type::Void {
+        if op.pos().get().raw() != u32::MAX && op.result_type() != Type::Void {
             // history.py:220 box.type / resoperation.py/589/615 IntOp /
             // RefOp / FloatOp.type — the fresh result Box inherits the
             // producing op's type tag so downstream readers (`opref_type`
@@ -5788,7 +5788,7 @@ fn assemble_peeled_trace_with_jump_args(
             // see the correct `box.type` instead of a default-int guess.
             let fresh = OpRef::op_typed(next_body_pos, op.result_type());
             next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
-            body_result_remap.insert(op.pos.get(), fresh);
+            body_result_remap.insert(op.pos().get(), fresh);
         }
     }
 
@@ -5804,8 +5804,8 @@ fn assemble_peeled_trace_with_jump_args(
         let mut new_op = (**op).clone();
         let mut original_args: Vec<OpRef> =
             op.getarglist_copy().iter().map(|a| a.to_opref()).collect();
-        if let Some(&mapped_pos) = body_result_remap.get(&op.pos.get()) {
-            new_op.pos.set(mapped_pos);
+        if let Some(&mapped_pos) = body_result_remap.get(&op.pos().get()) {
+            new_op.pos().set(mapped_pos);
         }
         // Body op args were already resolved at emit time by
         // optimizer.py / Optimizer::emit_operation. Do not walk
@@ -5899,8 +5899,8 @@ fn assemble_peeled_trace_with_jump_args(
                     consider_arg(a.to_opref());
                 }
                 later_op.visit_failarg_oprefs(&mut consider_arg);
-                if later_op.result_type() != Type::Void && !later_op.pos.get().is_none() {
-                    seen_after_label_defs.insert(later_op.pos.get());
+                if later_op.result_type() != Type::Void && !later_op.pos().get().is_none() {
+                    seen_after_label_defs.insert(later_op.pos().get());
                 }
             }
             // RPython Box parity: do not dedup the inner-label extension
@@ -6120,17 +6120,17 @@ fn assemble_peeled_trace_with_jump_args(
         // therefore emit body guards with unique descrs already; no
         // post-process re-stamping is needed.
         let new_rc = std::rc::Rc::new(new_op);
-        if new_rc.result_type() != Type::Void && !new_rc.pos.get().is_none() {
-            emitted_at.insert(new_rc.pos.get(), new_rc.clone());
+        if new_rc.result_type() != Type::Void && !new_rc.pos().get().is_none() {
+            emitted_at.insert(new_rc.pos().get(), new_rc.clone());
         }
         result.push(new_rc);
         if op.opcode == OpCode::Label {
             current_inner_label_index = Some(result.len() - 1);
             defs_since_inner_label.clear();
         }
-        if op.result_type() != Type::Void && !op.pos.get().is_none() {
-            seen_body_defs.insert(op.pos.get());
-            defs_since_inner_label.insert(result.last().unwrap().pos.get());
+        if op.result_type() != Type::Void && !op.pos().get().is_none() {
+            seen_body_defs.insert(op.pos().get());
+            defs_since_inner_label.insert(result.last().unwrap().pos().get());
         }
     }
 
@@ -6142,7 +6142,7 @@ fn assemble_peeled_trace_with_jump_args(
             .map(|(idx, op)| {
                 (
                     idx,
-                    op.pos.get(),
+                    op.pos().get(),
                     op.getarglist()
                         .iter()
                         .map(|a| a.to_opref())
@@ -6157,7 +6157,7 @@ fn assemble_peeled_trace_with_jump_args(
             .map(|(idx, op)| {
                 (
                     idx,
-                    op.pos.get(),
+                    op.pos().get(),
                     op.getarglist()
                         .iter()
                         .map(|a| a.to_opref())
@@ -6273,13 +6273,13 @@ impl OptUnroll {
             .collect();
         let mut ref_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
-            ref_map.insert(op.pos.get(), new_pos);
+            ref_map.insert(op.pos().get(), new_pos);
         }
 
         // Emit peeled iteration with remapped refs.
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             let mut peeled = op.clone();
-            peeled.pos.set(new_pos);
+            peeled.pos().set(new_pos);
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..peeled.num_args() {
                 let arg = peeled.arg(i);
@@ -6312,7 +6312,7 @@ impl OptUnroll {
         let jump_label_args: Vec<majit_ir::operand::Operand> =
             (0..jump_op.num_args()).map(|i| jump_op.arg(i)).collect();
         let mut label_op = Op::new(OpCode::Label, &jump_label_args);
-        label_op.pos.set(label_pos);
+        label_op.pos().set(label_pos);
         ctx.emit(label_op);
 
         // Reserve body positions, tagged per source op ( ).
@@ -6323,13 +6323,13 @@ impl OptUnroll {
             .collect();
         let mut orig_ref_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
-            orig_ref_map.insert(op.pos.get(), new_pos);
+            orig_ref_map.insert(op.pos().get(), new_pos);
         }
 
         // Emit original body ops with remapped positions and refs.
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             let mut body_op = op.clone();
-            body_op.pos.set(new_pos);
+            body_op.pos().set(new_pos);
             // optimizer.py:651-652 setarg loop parity.
             for i in 0..body_op.num_args() {
                 let arg = body_op.arg(i);
@@ -6473,7 +6473,7 @@ impl Optimization for OptUnroll {
             // Reserve the Jump's own position so it lands above any
             // inputarg range and above every body op allocated by
             // peel_iteration. Jump is Void-typed.
-            jump.pos.set(ctx.reserve_pos_typed(jump.result_type()));
+            jump.pos().set(ctx.reserve_pos_typed(jump.result_type()));
             return OptimizationResult::Emit(jump);
         }
 
@@ -6559,7 +6559,7 @@ mod tests {
     /// Assign sequential positions to ops starting from `base`.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos
+            op.pos()
                 .set(OpRef::op_typed(base + i as u32, op.opcode.result_type()));
         }
     }
@@ -6661,7 +6661,7 @@ mod tests {
                         rooted_resop_operand(Type::Int, 1),
                     ],
                 );
-                op.pos.set(OpRef::int_op(2));
+                op.pos().set(OpRef::int_op(2));
                 op
             },
             Op::new(
@@ -6716,7 +6716,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 1),
                 ],
             );
-            op.pos.set(OpRef::int_op(2));
+            op.pos().set(OpRef::int_op(2));
             op
         }];
         let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
@@ -6986,7 +6986,7 @@ mod tests {
         assert_eq!(result.len(), 6);
 
         // All positions should be unique.
-        let positions: Vec<OpRef> = result.iter().map(|op| op.pos.get()).collect();
+        let positions: Vec<OpRef> = result.iter().map(|op| op.pos().get()).collect();
         for (i, pos) in positions.iter().enumerate() {
             for (j, other) in positions.iter().enumerate() {
                 if i != j {
@@ -7042,7 +7042,7 @@ mod tests {
         assert_eq!(peeled_add.opcode, OpCode::IntAdd);
         assert_eq!(peeled_mul.opcode, OpCode::IntMul);
         // peeled_mul should reference peeled_add's position, not original op0.
-        assert_eq!(peeled_mul.arg(0).to_opref(), peeled_add.pos.get());
+        assert_eq!(peeled_mul.arg(0).to_opref(), peeled_add.pos().get());
         // Second arg (input ref) should be unchanged.
         assert_eq!(peeled_mul.arg(1).to_opref(), OpRef::int_op(101));
 
@@ -7052,7 +7052,7 @@ mod tests {
         assert_eq!(body_add.opcode, OpCode::IntAdd);
         assert_eq!(body_mul.opcode, OpCode::IntMul);
         // body_mul should reference body_add's position.
-        assert_eq!(body_mul.arg(0).to_opref(), body_add.pos.get());
+        assert_eq!(body_mul.arg(0).to_opref(), body_add.pos().get());
         assert_eq!(body_mul.arg(1).to_opref(), OpRef::int_op(101));
     }
 
@@ -7138,7 +7138,7 @@ mod tests {
         // Check peeled guard's fail_args.
         let peeled_guard = &result[1];
         assert_eq!(peeled_guard.opcode, OpCode::GuardTrue);
-        let peeled_add_pos = result[0].pos.get();
+        let peeled_add_pos = result[0].pos().get();
         assert_eq!(
             peeled_guard.guard_fail_args().unwrap()[0].to_opref(),
             peeled_add_pos,
@@ -7148,7 +7148,7 @@ mod tests {
         // Check body guard's fail_args.
         let body_guard = &result[4]; // after Label (idx 3) and body_add (idx 3)
         assert_eq!(body_guard.opcode, OpCode::GuardTrue);
-        let body_add_pos = result[3].pos.get();
+        let body_add_pos = result[3].pos().get();
         assert_eq!(
             body_guard.guard_fail_args().unwrap()[0].to_opref(),
             body_add_pos,
@@ -7179,7 +7179,7 @@ mod tests {
         let jump = result.last().unwrap();
         assert_eq!(jump.opcode, OpCode::Jump);
 
-        let body_add_pos = result[2].pos.get();
+        let body_add_pos = result[2].pos().get();
         assert_eq!(
             jump.arg(0).to_opref(),
             body_add_pos,
@@ -7317,7 +7317,7 @@ mod tests {
         // All ops should have valid (non-NONE) positions.
         for op in &result {
             assert!(
-                !op.pos.get().is_none(),
+                !op.pos().get().is_none(),
                 "op {:?} should have a valid pos",
                 op.opcode
             );
@@ -7410,9 +7410,9 @@ mod tests {
         assert_eq!(result.len(), 8);
 
         // Peeled iteration refs:
-        let p0 = result[0].pos.get();
-        let p1 = result[1].pos.get();
-        let _p2 = result[2].pos.get();
+        let p0 = result[0].pos().get();
+        let p1 = result[1].pos().get();
+        let _p2 = result[2].pos().get();
         assert_eq!(
             result[1].arg(0).to_opref(),
             p0,
@@ -7430,9 +7430,9 @@ mod tests {
         );
 
         // Body refs:
-        let b0 = result[4].pos.get();
-        let b1 = result[5].pos.get();
-        let b2 = result[6].pos.get();
+        let b0 = result[4].pos().get();
+        let b1 = result[5].pos().get();
+        let b2 = result[6].pos().get();
         assert_eq!(
             result[5].arg(0).to_opref(),
             b0,
@@ -7683,7 +7683,7 @@ mod tests {
                     Operand::from_opref(OpRef::const_int(MASK)),
                 ],
             );
-            op.pos.set(masked);
+            op.pos().set(masked);
             std::rc::Rc::new(op)
         };
         let dep_op = {
@@ -7694,7 +7694,7 @@ mod tests {
                     Operand::from_opref(OpRef::const_int(2160)),
                 ],
             );
-            op.pos.set(dependent);
+            op.pos().set(dependent);
             std::rc::Rc::new(op)
         };
         let mask_box = ctx.materialize_operand_at(masked);
@@ -7829,7 +7829,7 @@ mod tests {
                         std::slice::from_ref(&si0),
                         field_descr.clone(),
                     );
-                    op.pos.set(OpRef::int_op(11));
+                    op.pos().set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
                 source_op: Some({
@@ -7838,7 +7838,7 @@ mod tests {
                         std::slice::from_ref(&source_receiver),
                         field_descr.clone(),
                     );
-                    op.pos.set(OpRef::int_op(11));
+                    op.pos().set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 }),
                 res: rooted_resop_operand(Type::Int, 11),
@@ -7948,7 +7948,7 @@ mod tests {
                         std::slice::from_ref(&si0),
                         field_descr.clone(),
                     );
-                    op.pos.set(OpRef::int_op(11));
+                    op.pos().set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
                 source_op: Some({
@@ -7957,7 +7957,7 @@ mod tests {
                         std::slice::from_ref(&source_receiver),
                         field_descr.clone(),
                     );
-                    op.pos.set(OpRef::int_op(11));
+                    op.pos().set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 }),
                 res: Operand::from_opref(OpRef::const_int(7)),
@@ -8046,7 +8046,7 @@ mod tests {
                         &[Operand::from_opref(OpRef::const_ptr(ptr))],
                         field_descr.clone(),
                     );
-                    op.pos.set(OpRef::int_op(11));
+                    op.pos().set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
                 source_op: None,
@@ -8127,7 +8127,7 @@ mod tests {
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
-                    op.pos.set(OpRef::int_op(11));
+                    op.pos().set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
                 source_op: None,
@@ -8203,7 +8203,7 @@ mod tests {
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
-                    op.pos.set(source);
+                    op.pos().set(source);
                     std::rc::Rc::new(op)
                 },
                 source_op: None,
@@ -8270,7 +8270,7 @@ mod tests {
                             rooted_resop_operand(Type::Int, 1),
                         ],
                     );
-                    op.pos.set(OpRef::int_op(20));
+                    op.pos().set(OpRef::int_op(20));
                     std::rc::Rc::new(op)
                 },
                 source_op: None,
@@ -8361,7 +8361,7 @@ mod tests {
                         &[rooted_resop_operand(Type::Ref, 3)],
                         majit_ir::descr::make_field_descr_full(56, 0, 8, Type::Ref, false),
                     );
-                    op.pos.set(OpRef::ref_op(19));
+                    op.pos().set(OpRef::ref_op(19));
                     std::rc::Rc::new(op)
                 },
                 source_op: None,
@@ -8453,7 +8453,7 @@ mod tests {
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::IntAdd, &[si0.clone(), si1.clone()]);
-                    op.pos.set(OpRef::int_op(30));
+                    op.pos().set(OpRef::int_op(30));
                     std::rc::Rc::new(op)
                 },
                 source_op: None,
@@ -8525,7 +8525,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 1),
                 ],
             );
-            op.pos.set(OpRef::int_op(3));
+            op.pos().set(OpRef::int_op(3));
             op
         }];
         let p2_ops = vec![
@@ -8537,7 +8537,7 @@ mod tests {
                         rooted_resop_operand(Type::Int, 0),
                     ],
                 );
-                op.pos.set(OpRef::int_op(1));
+                op.pos().set(OpRef::int_op(1));
                 op
             },
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 50)]),
@@ -8573,9 +8573,9 @@ mod tests {
         );
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(combined[3].opcode, OpCode::IntMul);
-        assert_eq!(combined[3].arg(0).to_opref(), combined[1].pos.get());
+        assert_eq!(combined[3].arg(0).to_opref(), combined[1].pos().get());
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(combined[4].arg(0).to_opref(), combined[1].pos.get());
+        assert_eq!(combined[4].arg(0).to_opref(), combined[1].pos().get());
     }
 
     #[test]
@@ -8590,7 +8590,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 1),
                 ],
             );
-            op.pos.set(OpRef::int_op(3));
+            op.pos().set(OpRef::int_op(3));
             op
         }];
         let p2_ops = vec![
@@ -8602,7 +8602,7 @@ mod tests {
                         rooted_resop_operand(Type::Int, 0),
                     ],
                 );
-                op.pos.set(OpRef::int_op(4));
+                op.pos().set(OpRef::int_op(4));
                 op
             },
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 4)]),
@@ -8669,7 +8669,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 1),
                 ],
             );
-            op.pos.set(OpRef::int_op(3));
+            op.pos().set(OpRef::int_op(3));
             op
         }];
         let p2_ops = vec![Op::new(
@@ -8728,7 +8728,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 1),
                 ],
             );
-            op.pos.set(OpRef::int_op(11));
+            op.pos().set(OpRef::int_op(11));
             op
         }];
         let p2_ops = vec![
@@ -8740,7 +8740,7 @@ mod tests {
                         Operand::from_opref(OpRef::const_int(2)),
                     ],
                 );
-                op.pos.set(OpRef::int_op(4));
+                op.pos().set(OpRef::int_op(4));
                 op
             },
             {
@@ -8751,7 +8751,7 @@ mod tests {
                         Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
-                op.pos.set(OpRef::int_op(11));
+                op.pos().set(OpRef::int_op(11));
                 op
             },
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 11)]),
@@ -8786,16 +8786,16 @@ mod tests {
         assert_eq!(combined[2].arg(0).to_opref(), OpRef::int_op(11));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
         assert_eq!(combined[3].arg(0).to_opref(), OpRef::int_op(11));
-        assert_ne!(combined[3].pos.get(), OpRef::int_op(11));
+        assert_ne!(combined[3].pos().get(), OpRef::int_op(11));
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(combined[4].arg(0).to_opref(), combined[3].pos.get());
+        assert_eq!(combined[4].arg(0).to_opref(), combined[3].pos().get());
     }
 
     #[test]
     fn test_assemble_peeled_trace_preserves_visible_preamble_box_over_body_collision() {
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::GetfieldGcR, &[rooted_resop_operand(Type::Int, 3)]);
-            op.pos.set(OpRef::int_op(19));
+            op.pos().set(OpRef::int_op(19));
             op.setdescr(majit_ir::descr::make_field_descr_full(
                 56,
                 0,
@@ -8831,7 +8831,7 @@ mod tests {
                         Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
-                op.pos.set(OpRef::int_op(19));
+                op.pos().set(OpRef::int_op(19));
                 op
             },
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 19)]),
@@ -8857,9 +8857,9 @@ mod tests {
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
         assert_eq!(combined[2].arg(1).to_opref(), OpRef::int_op(19));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
-        assert_ne!(combined[3].pos.get(), OpRef::int_op(19));
+        assert_ne!(combined[3].pos().get(), OpRef::int_op(19));
         assert_eq!(combined[4].opcode, OpCode::Jump);
-        assert_eq!(combined[4].arg(0).to_opref(), combined[3].pos.get());
+        assert_eq!(combined[4].arg(0).to_opref(), combined[3].pos().get());
     }
 
     #[test]
@@ -8877,7 +8877,7 @@ mod tests {
                     rooted_resop_operand(Type::Int, 1),
                 ],
             );
-            op.pos.set(OpRef::int_op(3));
+            op.pos().set(OpRef::int_op(3));
             op
         }];
         let p2_ops = vec![
@@ -8889,7 +8889,7 @@ mod tests {
                         rooted_resop_operand(Type::Int, 10),
                     ],
                 );
-                op.pos.set(OpRef::int_op(1));
+                op.pos().set(OpRef::int_op(1));
                 op
             },
             Op::new(
@@ -8926,7 +8926,7 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            &[OpRef::int_op(10), combined[1].pos.get()]
+            &[OpRef::int_op(10), combined[1].pos().get()]
         );
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(
@@ -8935,7 +8935,7 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            &[OpRef::int_op(10), combined[1].pos.get()]
+            &[OpRef::int_op(10), combined[1].pos().get()]
         );
     }
 
@@ -8947,7 +8947,7 @@ mod tests {
         // snapshot must round-trip unchanged.
         let p1_ops = vec![{
             let mut op = Op::new(OpCode::SameAsI, &[rooted_resop_operand(Type::Int, 37)]);
-            op.pos.set(OpRef::void_op(857));
+            op.pos().set(OpRef::void_op(857));
             op
         }];
         let p2_ops = vec![
@@ -9050,7 +9050,7 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::GetfieldGcI, &[rooted_resop_operand(Type::Int, 50)]);
-                op.pos.set(OpRef::int_op(1));
+                op.pos().set(OpRef::int_op(1));
                 op.setdescr(majit_ir::descr::make_field_descr_full(
                     0,
                     0,
@@ -9134,7 +9134,7 @@ mod tests {
                         Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
-                op.pos.set(OpRef::int_op(64));
+                op.pos().set(OpRef::int_op(64));
                 op
             },
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 64)]),
@@ -9183,7 +9183,7 @@ mod tests {
             &[OpRef::int_op(64)]
         );
         assert_eq!(combined[2].opcode, OpCode::IntAdd);
-        assert_ne!(combined[2].pos.get(), OpRef::int_op(64));
+        assert_ne!(combined[2].pos().get(), OpRef::int_op(64));
     }
 
     #[test]
@@ -9260,7 +9260,7 @@ mod tests {
                         rooted_resop_operand(Type::Int, 1),
                     ],
                 );
-                op.pos.set(OpRef::int_op(2));
+                op.pos().set(OpRef::int_op(2));
                 op
             },
             {
@@ -9314,7 +9314,7 @@ mod tests {
                         Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
-                op.pos.set(OpRef::int_op(20));
+                op.pos().set(OpRef::int_op(20));
                 op
             },
             {
@@ -9379,7 +9379,7 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::New, &[]);
-                op.pos.set(OpRef::ref_op(1));
+                op.pos().set(OpRef::ref_op(1));
                 op
             },
             Op::new(
@@ -9412,10 +9412,10 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(combined[1].opcode, OpCode::New);
-        assert_ne!(combined[1].pos.get(), OpRef::int_op(2));
-        assert_ne!(combined[1].pos.get(), OpRef::int_op(4));
+        assert_ne!(combined[1].pos().get(), OpRef::int_op(2));
+        assert_ne!(combined[1].pos().get(), OpRef::int_op(4));
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].arg(0).to_opref(), combined[1].pos.get());
+        assert_eq!(combined[2].arg(0).to_opref(), combined[1].pos().get());
     }
 
     #[test]
@@ -9481,7 +9481,7 @@ mod tests {
                         Operand::from_opref(OpRef::const_int(1)),
                     ],
                 );
-                op.pos.set(OpRef::int_op(20));
+                op.pos().set(OpRef::int_op(20));
                 op
             },
             {
@@ -9588,7 +9588,7 @@ mod tests {
                         rooted_resop_operand(Type::Int, 1),
                     ],
                 );
-                op.pos.set(OpRef::void_op(3));
+                op.pos().set(OpRef::void_op(3));
                 op
             },
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]),
@@ -9660,7 +9660,7 @@ mod tests {
 
         // A guard carrying the PREAMBLE trace's resume coordinate.
         let mut guard = Op::new(OpCode::GuardTrue, &[short_input_operand]);
-        guard.pos.set(OpRef::void_op(13));
+        guard.pos().set(OpRef::void_op(13));
         guard.set_rd_resume_position(4242);
 
         let mut short_preamble = ShortPreamble::empty();

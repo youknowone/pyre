@@ -511,12 +511,12 @@ impl OptVirtualize {
         if let Some(descr) = op.getdescr() {
             ctx.register_pure_from_args1_with_descr(
                 OpCode::ArraylenGc,
-                op.pos.get(),
+                op.pos().get(),
                 size_ref,
                 descr,
             );
         } else {
-            ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos.get(), size_ref);
+            ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos().get(), size_ref);
         }
         OptimizationResult::PassOn
     }
@@ -731,7 +731,7 @@ impl OptVirtualize {
                 // build time, so the value reads as no known class while the flag stays valid.
                 && let Some(class_val) = vinfo.known_class.filter(|&c| c != 0)
             {
-                let b = ctx.materialize_operand_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos().get());
                 // PyPy's `handle_getfield_typeptr` removes this load before
                 // optimization and carries the vtable as a `ConstInt`.  Pyre's
                 // object model can still expose the header as GETFIELD_GC_R;
@@ -778,7 +778,7 @@ impl OptVirtualize {
                     .and_then(|sd| sd.w_class_obj())
                     .filter(|&w| w != 0)
                 {
-                    let b = ctx.materialize_operand_at(op.pos.get());
+                    let b = ctx.materialize_operand_at(op.pos().get());
                     ctx.make_constant_box(
                         &b,
                         majit_ir::Value::Ref(majit_ir::GcRef(w_class as usize)),
@@ -904,7 +904,7 @@ impl OptVirtualize {
                     _ => None,
                 };
                 if let Some(vtable) = vtable {
-                    let b = ctx.materialize_operand_at(op.pos.get());
+                    let b = ctx.materialize_operand_at(op.pos().get());
                     ctx.make_constant_box(&b, Value::Int(vtable as i64));
                     return OptimizationResult::Remove;
                 }
@@ -942,7 +942,7 @@ impl OptVirtualize {
                     majit_ir::OpCode::GetfieldGcF => Value::Float(0.0),
                     _ => Value::Int(0),
                 };
-                let b = ctx.materialize_operand_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos().get());
                 ctx.make_constant_box(&b, zero);
                 return OptimizationResult::Remove;
             }
@@ -1045,7 +1045,7 @@ impl OptVirtualize {
             array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
         {
             let len = vinfo.items.len() as i64;
-            let b = ctx.materialize_operand_at(op.pos.get());
+            let b = ctx.materialize_operand_at(op.pos().get());
             ctx.make_constant_box(&b, Value::Int(len));
             return OptimizationResult::Remove;
         }
@@ -3749,7 +3749,7 @@ mod tests {
             // (`opref.ty()`) resolves via the variant tag without
             // falling through to the inputarg-slot fallback (which
             // collides with low op-position raws).
-            op.pos
+            op.pos()
                 .set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
     }
@@ -3996,7 +3996,7 @@ mod tests {
         // result box (oparser object-identity); GetfieldRawI (ops[0]) is
         // Int-typed so its result position is `OpRef::int_op(0)`.
         let array_ptr_box =
-            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos.get().raw());
+            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos().get().raw());
         ops[1].setarg(0, array_ptr_box.clone());
         ops[2].setarg(0, array_ptr_box);
 
@@ -4108,7 +4108,7 @@ mod tests {
             )],
         );
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
-        get.pos.set(OpRef::int_op(10));
+        get.pos().set(OpRef::int_op(10));
 
         let result = pass.propagate_forward(&get, &std::rc::Rc::new(get.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -4198,7 +4198,7 @@ mod tests {
             )],
         );
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
-        get_field.pos.set(OpRef::int_op(10));
+        get_field.pos().set(OpRef::int_op(10));
         resolve_op_args(&mut get_field, &mut ctx);
         assert!(matches!(
             pass.propagate_forward(&get_field, &std::rc::Rc::new(get_field.clone()), &mut ctx),
@@ -4243,7 +4243,7 @@ mod tests {
             )],
         );
         get_field.setdescr(test_vable_field_descr(24, Type::Int, 1));
-        get_field.pos.set(OpRef::int_op(10));
+        get_field.pos().set(OpRef::int_op(10));
         resolve_op_args(&mut get_field, &mut ctx);
         assert!(matches!(
             pass.propagate_forward(&get_field, &std::rc::Rc::new(get_field.clone()), &mut ctx),
@@ -4324,7 +4324,7 @@ mod tests {
         // vable inputarg. GetfieldRawI (ops[0]) is Int-typed so its result
         // position is `OpRef::int_op(0)`.
         let array_ptr_box =
-            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos.get().raw());
+            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos().get().raw());
         ops[1].setarg(0, array_ptr_box.clone());
         ops[2].setarg(0, array_ptr_box);
 
@@ -4443,7 +4443,7 @@ mod tests {
         // GetfieldRawI (ops[0]) is Int-typed so its result position is
         // `OpRef::int_op(0)`; bind the element ops to its result box.
         let array_ptr_box =
-            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos.get().raw());
+            crate::history::test_support::rooted_resop_operand(Type::Int, ops[0].pos().get().raw());
         ops[1].setarg(0, array_ptr_box.clone());
         ops[2].setarg(0, array_ptr_box.clone());
         ops[3].setarg(0, array_ptr_box);
@@ -5051,7 +5051,7 @@ mod tests {
         pass.setup();
 
         let mut new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
-        new_op.pos.set(OpRef::ref_op(0));
+        new_op.pos().set(OpRef::ref_op(0));
         let new_op_rc = std::rc::Rc::new(new_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&new_op_rc));
         assert!(matches!(
@@ -5067,7 +5067,7 @@ mod tests {
             ],
             fd,
         );
-        set_op.pos.set(OpRef::int_op(1));
+        set_op.pos().set(OpRef::int_op(1));
         resolve_op_args(&mut set_op, &mut ctx);
         assert!(matches!(
             pass.propagate_forward(&set_op, &std::rc::Rc::new(set_op.clone()), &mut ctx),
@@ -6837,9 +6837,9 @@ mod tests {
                 )],
             ),
         ];
-        ops[0].pos.set(OpRef::ref_op(1));
-        ops[1].pos.set(OpRef::void_op(2));
-        ops[2].pos.set(OpRef::void_op(3));
+        ops[0].pos().set(OpRef::ref_op(1));
+        ops[1].pos().set(OpRef::void_op(2));
+        ops[2].pos().set(OpRef::void_op(3));
         let mut opt = Optimizer::default_pipeline();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -6957,7 +6957,7 @@ mod tests {
             ),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos
+            op.pos()
                 .set(OpRef::op_typed((idx + 2) as u32, op.opcode.result_type()));
         }
 
@@ -6970,7 +6970,7 @@ mod tests {
         let new_positions: Vec<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
-            .map(|op| op.pos.get())
+            .map(|op| op.pos().get())
             .collect();
         assert_eq!(
             new_positions.len(),

@@ -24,7 +24,7 @@ pub struct OpTypeIndex<'a, T: AsRef<Op> = Op> {
     /// uniqueness assertion (x86/assembler.py:516-518 +
     /// aarch64/assembler.py:54-56 `assert len(set(inputargs)) == len(inputargs)`).
     inputarg_pos: Cow<'a, PosIndex>,
-    /// `op.pos.get().raw()` -> slice index in ops, skipping Void/None ops.
+    /// `op.pos().get().raw()` -> slice index in ops, skipping Void/None ops.
     /// Raw uniqueness is enforced at build time per RPython Box identity
     /// (Box `is` semantics in `rpython/jit/metainterp/resoperation.py:38`).
     op_pos: Cow<'a, PosIndex>,
@@ -173,8 +173,8 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
         let boxes = || {
             ops.iter()
                 .map(|op| op.as_ref())
-                .filter(|op| !op.pos.get().is_none() && op.type_ != Type::Void)
-                .map(|op| op.pos.get().raw())
+                .filter(|op| !op.pos().get().is_none() && op.type_ != Type::Void)
+                .map(|op| op.pos().get().raw())
         };
         let (Some(base), Some(max)) = (boxes().min(), boxes().max()) else {
             return PosIndex::new();
@@ -182,13 +182,13 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
         let mut pos = PosIndex::spanning(base, max);
         for (idx, op) in ops.iter().enumerate() {
             let op = op.as_ref();
-            if op.pos.get().is_none() || op.type_ == Type::Void {
+            if op.pos().get().is_none() || op.type_ == Type::Void {
                 continue;
             }
-            if let Some(prev) = pos.bind(op.pos.get().raw(), idx as u32) {
+            if let Some(prev) = pos.bind(op.pos().get().raw(), idx as u32) {
                 panic!(
                     "OpTypeIndex: raw {} bound to ops[{}] {:?} and ops[{}] {:?} — Box identity broken",
-                    op.pos.get().raw(),
+                    op.pos().get().raw(),
                     prev,
                     ops[prev as usize].as_ref().opcode,
                     idx,

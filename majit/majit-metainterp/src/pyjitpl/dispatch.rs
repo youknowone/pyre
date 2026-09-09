@@ -12724,7 +12724,7 @@ mod tests {
         // caller's return register.
         assert_eq!(
             finish_args[0],
-            call_op.pos.get(),
+            call_op.pos().get(),
             "the recursive CALL_ASSEMBLER result must be wired into the caller's return register",
         );
     }
@@ -12921,7 +12921,7 @@ mod tests {
         assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
         assert_eq!(
             finish_args[0],
-            call_ops[0].pos.get(),
+            call_ops[0].pos().get(),
             "the recursive CALL_ASSEMBLER[Ref] result must be wired into the caller's ref return register",
         );
     }
@@ -12987,7 +12987,7 @@ mod tests {
         assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
         assert_eq!(
             finish_args[0],
-            call_ops[0].pos.get(),
+            call_ops[0].pos().get(),
             "the recursive CALL_ASSEMBLER[Float] result must be wired into the caller's float return register",
         );
     }
@@ -13242,7 +13242,7 @@ mod tests {
         assert_eq!(finish_args.len(), 1);
         assert_eq!(
             finish_args[0],
-            ops[call].pos.get(),
+            ops[call].pos().get(),
             "the finish value must be the recursive CALL_ASSEMBLER result",
         );
     }
@@ -13700,11 +13700,11 @@ mod tests {
         );
 
         // The New (sbox) result feeds BOTH SetfieldGc records as arg 0.
-        let new_pos = recorder.ops()[0].pos.get().raw();
+        let new_pos = recorder.ops()[0].pos().get().raw();
         assert_eq!(recorder.ops()[1].arg(0).position(), Some(new_pos));
         assert_eq!(recorder.ops()[3].arg(0).position(), Some(new_pos));
         // The NewArrayClear (abox) result feeds the items SetfieldGc as arg 1.
-        let arr_pos = recorder.ops()[2].pos.get().raw();
+        let arr_pos = recorder.ops()[2].pos().get().raw();
         assert_eq!(recorder.ops()[3].arg(1).position(), Some(arr_pos));
 
         // The recorded field descrs carry the resolved byte offsets.

@@ -1750,8 +1750,8 @@ pub(crate) fn normalize_closing_jump_args(
 
     let defined: indexmap::IndexSet<OpRef> = ops
         .iter()
-        .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos.get().is_none())
-        .map(|op| op.pos.get())
+        .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos().get().is_none())
+        .map(|op| op.pos().get())
         .collect();
 
     let Some(jump) = ops.iter().rfind(|op| op.opcode == OpCode::Jump) else {
@@ -1963,11 +1963,11 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             if let Some(bound) = get_local_box_replacement(forwarding, orig_arg.to_opref()) {
                 if !replaced {
                     emitted = op.copy_and_change(op.opcode, None, None);
-                    if op.result_type() != Type::Void && !op.pos.get().is_none() {
+                    if op.result_type() != Type::Void && !op.pos().get().is_none() {
                         let new_pos = OpRef::op_typed(*next_opref, op.result_type());
                         *next_opref += 1;
-                        emitted.pos.set(new_pos);
-                        forwarded_source = Some(op.pos.get());
+                        emitted.pos().set(new_pos);
+                        forwarded_source = Some(op.pos().get());
                     }
                     replaced = true;
                 }
@@ -2022,7 +2022,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         }
     };
     for op in ops.iter() {
-        consider(op.pos.get());
+        consider(op.pos().get());
         for b in op.getarglist().iter() {
             consider(b.to_opref());
         }
@@ -2082,7 +2082,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         let new_opref = OpRef::op_typed(next_opref, field.field_type);
         next_opref += 1;
         let mut op = Op::new(opcode, std::slice::from_ref(&vable_box));
-        op.pos.set(new_opref);
+        op.pos().set(new_opref);
         op.setdescr(descr);
         let op = std::rc::Rc::new(op);
         set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&op));
@@ -2113,7 +2113,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         let array_opref = OpRef::ref_op(next_opref);
         next_opref += 1;
         let mut arr_load = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&vable_box));
-        arr_load.pos.set(array_opref);
+        arr_load.pos().set(array_opref);
         arr_load.setdescr(array_field_descr.clone());
         let arr_load = std::rc::Rc::new(arr_load);
         let array_box = Operand::from_bound_op(&arr_load);
@@ -2193,7 +2193,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 let ptr_opref = OpRef::int_op(next_opref);
                 next_opref += 1;
                 let mut ptr_load = Op::new(OpCode::GetfieldGcI, std::slice::from_ref(&array_box));
-                ptr_load.pos.set(ptr_opref);
+                ptr_load.pos().set(ptr_opref);
                 ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
                     std::mem::size_of::<usize>(),
@@ -2231,7 +2231,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 item_opcode,
                 &[item_base.clone(), Operand::from_opref(const_opref)],
             );
-            elem_op.pos.set(new_opref);
+            elem_op.pos().set(new_opref);
             elem_op.setdescr(item_descr.clone());
             let elem_op = std::rc::Rc::new(elem_op);
             set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&elem_op));
@@ -2613,7 +2613,7 @@ pub fn compile_tmp_callback(
         // resoperation.py IntOp/FloatOp/RefOp mixin: the result
         // box of a typed CALL is a typed ResOp variant.
         let call_result_ref = OpRef::op_typed(num_inputs, jitdriver_sd.result_type);
-        call_op.pos.set(call_result_ref);
+        call_op.pos().set(call_result_ref);
         vec![Operand::from_bound_op(&call_op)]
     };
     //
@@ -2905,7 +2905,7 @@ mod tests {
         // box, so patch_new_loop's forwarding rewrites them through op identity.
         let op0: majit_ir::OpRc = {
             let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, 1)]);
-            op.pos.set(OpRef::ref_op(10));
+            op.pos().set(OpRef::ref_op(10));
             std::rc::Rc::new(op)
         };
         let op0_result = majit_ir::operand::Operand::from_bound_op(&op0);
@@ -2915,7 +2915,7 @@ mod tests {
         ));
         let op2: majit_ir::OpRc = {
             let mut op = Op::new(OpCode::GetfieldGcI, &[op0_result]);
-            op.pos.set(OpRef::int_op(11));
+            op.pos().set(OpRef::int_op(11));
             op.setdescr(majit_ir::descr::make_field_descr(
                 16,
                 8,
@@ -2941,7 +2941,7 @@ mod tests {
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
         assert_eq!(ops.len(), 4);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
-        let vable_field = ops[0].pos.get();
+        let vable_field = ops[0].pos().get();
 
         assert_eq!(ops[1].opcode, OpCode::SameAsR);
         assert_eq!(
@@ -2952,7 +2952,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vable_field]
         );
-        let forwarded_same_as = ops[1].pos.get();
+        let forwarded_same_as = ops[1].pos().get();
         assert_ne!(forwarded_same_as, OpRef::ref_op(10));
 
         assert_eq!(ops[2].opcode, OpCode::Label);
@@ -3026,12 +3026,12 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![ops[0].pos.get()]
+            vec![ops[0].pos().get()]
         );
         assert_eq!(ops[2].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[2].arg(0).to_opref(), ops[1].pos.get());
+        assert_eq!(ops[2].arg(0).to_opref(), ops[1].pos().get());
         assert_eq!(ops[3].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[3].arg(0).to_opref(), ops[1].pos.get());
+        assert_eq!(ops[3].arg(0).to_opref(), ops[1].pos().get());
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
             ops[4]
@@ -3039,7 +3039,11 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![OpRef::input_arg_ref(0), ops[2].pos.get(), ops[3].pos.get()]
+            vec![
+                OpRef::input_arg_ref(0),
+                ops[2].pos().get(),
+                ops[3].pos().get()
+            ]
         );
     }
 
@@ -3114,8 +3118,8 @@ mod tests {
             vec![
                 OpRef::input_arg_int(0),
                 OpRef::input_arg_ref(1),
-                ops[2].pos.get(),
-                ops[3].pos.get()
+                ops[2].pos().get(),
+                ops[3].pos().get()
             ]
         );
     }

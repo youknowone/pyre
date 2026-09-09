@@ -315,7 +315,7 @@ impl std::fmt::Debug for Operand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.view() {
             Opnd::None => f.write_str("None"),
-            Opnd::Op(op) => f.debug_tuple("Op").field(&op.pos.get()).finish(),
+            Opnd::Op(op) => f.debug_tuple("Op").field(&op.pos().get()).finish(),
             Opnd::InputArg(ia) => f.debug_tuple("InputArg").field(&ia.index).finish(),
             Opnd::SmallInt(enc) => f
                 .debug_tuple("SmallInt")
@@ -430,7 +430,7 @@ impl Operand {
                     Type::Void => OpCode::Jump,
                 };
                 let op: OpRc = Rc::new(Op::new(opcode, &[]));
-                op.pos.set(r);
+                op.pos().set(r);
                 Operand::from_bound_op(&op)
             }
         }
@@ -446,7 +446,7 @@ impl Operand {
     pub fn to_opref(&self) -> OpRef {
         match self.view() {
             Opnd::None => OpRef::NONE,
-            Opnd::Op(op) => op.pos.get(),
+            Opnd::Op(op) => op.pos().get(),
             Opnd::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
             Opnd::SmallInt(encoded) => OpRef::const_int(small_int_value(encoded)),
             Opnd::SmallWide(id) => match wide_value(id) {
@@ -469,7 +469,7 @@ impl Operand {
     /// `InputArg`; `Const` / `None` have no canonical position.
     pub fn position(&self) -> Option<u32> {
         match self.view() {
-            Opnd::Op(op) => Some(op.pos.get().raw()),
+            Opnd::Op(op) => Some(op.pos().get().raw()),
             Opnd::InputArg(ia) => Some(ia.index),
             _ => None,
         }
@@ -478,7 +478,7 @@ impl Operand {
     /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
     pub fn type_(&self) -> Type {
         match self.view() {
-            Opnd::Op(op) => op.pos.get().ty().unwrap_or(Type::Void),
+            Opnd::Op(op) => op.pos().get().ty().unwrap_or(Type::Void),
             Opnd::InputArg(ia) => ia.tp,
             Opnd::SmallInt(_) => Type::Int,
             Opnd::SmallWide(id) => wide_value(id).get_type(),
@@ -861,7 +861,7 @@ mod tests {
 
     fn op_at(pos: u32, tp: Type) -> OpRc {
         let op = Rc::new(Op::new(OpCode::SameAsI, &[]));
-        op.pos.set(OpRef::op_typed(pos, tp));
+        op.pos().set(OpRef::op_typed(pos, tp));
         op
     }
 

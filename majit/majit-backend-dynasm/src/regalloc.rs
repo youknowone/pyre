@@ -431,7 +431,7 @@ pub fn compute_vars_longevity<T: AsRef<Op>>(
     for i in (0..operations.len()).rev() {
         let op = operations[i].as_ref();
         let opnum = op.opcode;
-        let opref = op.pos.get();
+        let opref = op.pos().get();
         let i = i as i32;
 
         if !longevity.contains(opref) {
@@ -2416,7 +2416,7 @@ impl<'a> RegAlloc<'a> {
             self.xrm.position = i as i32;
 
             // x86/regalloc.py:383-386 skip dead ops
-            if op.opcode.has_no_side_effect() && !self.longevity.contains(op.pos.get()) {
+            if op.opcode.has_no_side_effect() && !self.longevity.contains(op.pos().get()) {
                 self._free_op_vars(op);
                 output.push(RegAllocOp::Skip);
                 continue;
@@ -2481,10 +2481,10 @@ impl<'a> RegAlloc<'a> {
             }
         }
         // Free the result itself if it's dead
-        if !op.pos.get().is_none() && !op.pos.get().is_constant() {
+        if !op.pos().get().is_none() && !op.pos().get().is_constant() {
             let tp = op.opcode.result_type();
             if tp != Type::Void {
-                self.possibly_free_var(op.pos.get(), tp);
+                self.possibly_free_var(op.pos().get(), tp);
             }
         }
     }
@@ -2899,17 +2899,23 @@ impl<'a> RegAlloc<'a> {
     ) {
         match opcode {
             OpCode::NurseryPtrIncrement if args.len() >= 2 => {
-                self.consider_int_add_j2(dst.unwrap_or(op.pos.get()), args[0], args[1], i, output);
+                self.consider_int_add_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    args[1],
+                    i,
+                    output,
+                );
             }
             OpCode::IntForceGeZero if !args.is_empty() => {
-                self.consider_unary_int_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+                self.consider_unary_int_j2(dst.unwrap_or(op.pos().get()), args[0], i, output);
             }
             OpCode::IntFloorDiv | OpCode::IntMod if args.len() >= 2 => {
-                self.consider_binop_j2(dst.unwrap_or(op.pos.get()), args[0], args[1], i, output);
+                self.consider_binop_j2(dst.unwrap_or(op.pos().get()), args[0], args[1], i, output);
             }
             OpCode::UintMulHigh if args.len() >= 2 => {
                 self.consider_uint_mul_high_j2(
-                    dst.unwrap_or(op.pos.get()),
+                    dst.unwrap_or(op.pos().get()),
                     args[0],
                     args[1],
                     i,
@@ -2918,7 +2924,7 @@ impl<'a> RegAlloc<'a> {
             }
             OpCode::IntSignext if args.len() >= 2 => {
                 self.consider_int_signext_j2(
-                    dst.unwrap_or(op.pos.get()),
+                    dst.unwrap_or(op.pos().get()),
                     args[0],
                     args[1],
                     i,
@@ -2928,7 +2934,13 @@ impl<'a> RegAlloc<'a> {
             OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv
                 if args.len() >= 2 =>
             {
-                self.consider_float_op_j2(dst.unwrap_or(op.pos.get()), args[0], args[1], i, output);
+                self.consider_float_op_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    args[1],
+                    i,
+                    output,
+                );
             }
             OpCode::FloatNeg
             | OpCode::FloatAbs
@@ -2936,7 +2948,7 @@ impl<'a> RegAlloc<'a> {
             | OpCode::CastSinglefloatToFloat
                 if !args.is_empty() =>
             {
-                self.consider_float_unary_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+                self.consider_float_unary_j2(dst.unwrap_or(op.pos().get()), args[0], i, output);
             }
             OpCode::FloatLt
             | OpCode::FloatLe
@@ -2947,7 +2959,7 @@ impl<'a> RegAlloc<'a> {
                 if args.len() >= 2 =>
             {
                 self.consider_float_cmp_j2(
-                    dst.unwrap_or(op.pos.get()),
+                    dst.unwrap_or(op.pos().get()),
                     args[0],
                     args[1],
                     i,
@@ -2955,17 +2967,37 @@ impl<'a> RegAlloc<'a> {
                 );
             }
             OpCode::CastIntToFloat if !args.is_empty() => {
-                self.consider_cast_int_to_float_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+                self.consider_cast_int_to_float_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
             }
             OpCode::CastFloatToInt if !args.is_empty() => {
-                self.consider_cast_float_to_int_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+                self.consider_cast_float_to_int_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
             }
             // Same bank split as the non-j2 arm — see the citation there.
             OpCode::ConvertFloatBytesToLonglong if !args.is_empty() => {
-                self.consider_cast_float_to_int_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+                self.consider_cast_float_to_int_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
             }
             OpCode::ConvertLonglongBytesToFloat if !args.is_empty() => {
-                self.consider_cast_int_to_float_j2(dst.unwrap_or(op.pos.get()), args[0], i, output);
+                self.consider_cast_int_to_float_j2(
+                    dst.unwrap_or(op.pos().get()),
+                    args[0],
+                    i,
+                    output,
+                );
             }
             OpCode::CastPtrToInt
             | OpCode::CastIntToPtr
@@ -2977,7 +3009,7 @@ impl<'a> RegAlloc<'a> {
             | OpCode::VirtualRefR
                 if !args.is_empty() =>
             {
-                self.consider_same_as_j2(dst.unwrap_or(op.pos.get()), args[0], op, i, output);
+                self.consider_same_as_j2(dst.unwrap_or(op.pos().get()), args[0], op, i, output);
             }
             OpCode::GetfieldGcI
             | OpCode::GetfieldGcR
@@ -2990,7 +3022,7 @@ impl<'a> RegAlloc<'a> {
             | OpCode::Unicodelen
                 if !args.is_empty() =>
             {
-                self.consider_getfield_j2(dst.unwrap_or(op.pos.get()), args[0], op, i, output);
+                self.consider_getfield_j2(dst.unwrap_or(op.pos().get()), args[0], op, i, output);
             }
             OpCode::GetarrayitemGcI
             | OpCode::GetarrayitemGcR
@@ -3009,7 +3041,7 @@ impl<'a> RegAlloc<'a> {
                 if args.len() >= 2 =>
             {
                 self.consider_getarrayitem_j2(
-                    dst.unwrap_or(op.pos.get()),
+                    dst.unwrap_or(op.pos().get()),
                     args[0],
                     args[1],
                     op,
@@ -3046,18 +3078,18 @@ impl<'a> RegAlloc<'a> {
                 self.consider_raw_call_like_j2(dst, args, op, i, output, SAVE_DEFAULT_REGS);
             }
             OpCode::ForceToken => {
-                self.consider_force_token_j2(dst.unwrap_or(op.pos.get()), i, output)
+                self.consider_force_token_j2(dst.unwrap_or(op.pos().get()), i, output)
             }
             OpCode::LoadEffectiveAddress if args.len() >= 4 => {
                 self.consider_load_effective_address_j2(
-                    dst.unwrap_or(op.pos.get()),
+                    dst.unwrap_or(op.pos().get()),
                     args,
                     i,
                     output,
                 );
             }
             OpCode::SaveException | OpCode::SaveExcClass => {
-                self.consider_no_arg_result_j2(dst.unwrap_or(op.pos.get()), op, i, output);
+                self.consider_no_arg_result_j2(dst.unwrap_or(op.pos().get()), op, i, output);
             }
             OpCode::RestoreException if args.len() >= 2 => {
                 self.consider_restore_exception_j2(args, i, output);
@@ -3511,7 +3543,7 @@ impl<'a> RegAlloc<'a> {
         let tp = self.tp(x);
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let loc = self.rm.force_result_in_reg(
-            op.pos.get(),
+            op.pos().get(),
             x,
             tp,
             &args,
@@ -3543,7 +3575,7 @@ impl<'a> RegAlloc<'a> {
         self.possibly_free_var(x, self.tp(x));
         let y = op.arg(1).to_opref();
         let argloc = self.loc(y, self.tp(y));
-        let resloc = Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Int, &[], None, false));
+        let resloc = Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Int, &[], None, false));
         self.perform(i, vec![loc, argloc], Some(resloc), output);
     }
 
@@ -3590,7 +3622,7 @@ impl<'a> RegAlloc<'a> {
             let args: Vec<OpRef> =
                 op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
             let loc1 = self.rm.force_result_in_reg(
-                op.pos.get(),
+                op.pos().get(),
                 op.arg(0).to_opref(),
                 Type::Int,
                 &args,
@@ -3607,7 +3639,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_unary_int(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let loc = self.rm.force_result_in_reg(
-            op.pos.get(),
+            op.pos().get(),
             op.arg(0).to_opref(),
             Type::Int,
             &args,
@@ -3656,7 +3688,7 @@ impl<'a> RegAlloc<'a> {
                 .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
             // result in edx
             self.rm.force_allocate_reg(
-                op.pos.get(),
+                op.pos().get(),
                 &[],
                 Some(EDX),
                 false,
@@ -3671,7 +3703,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_int_signext(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let argloc = self.loc(op.arg(0).to_opref(), Type::Int);
         let numbytesloc = self.loc(op.arg(1).to_opref(), Type::Int);
-        let resloc = Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Int, &[], None, false));
+        let resloc = Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Int, &[], None, false));
         self.perform(i, vec![argloc, numbytesloc], Some(resloc), output);
     }
 
@@ -3781,7 +3813,7 @@ impl<'a> RegAlloc<'a> {
         }
         // x86/regalloc.py force_allocate_reg_or_cc.
         let ops_ref: &[OpRc] = self.operations;
-        let result_loc = self.force_allocate_reg_or_cc(op.pos.get(), ops_ref, i);
+        let result_loc = self.force_allocate_reg_or_cc(op.pos().get(), ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
 
@@ -3913,11 +3945,11 @@ impl<'a> RegAlloc<'a> {
             &mut self.longevity,
             &mut self.fm,
         ));
-        let resloc = if self.longevity.contains(op.pos.get()) {
+        let resloc = if self.longevity.contains(op.pos().get()) {
             let mut forbidden = guard_args;
             forbidden.push(tmp);
             Some(Loc::Reg(self.rm.force_allocate_reg(
-                op.pos.get(),
+                op.pos().get(),
                 &forbidden,
                 None,
                 false,
@@ -4014,11 +4046,11 @@ impl<'a> RegAlloc<'a> {
             &mut self.fm,
         ));
         // x86/regalloc.py:473-477
-        let resloc = if self.longevity.contains(op.pos.get()) {
+        let resloc = if self.longevity.contains(op.pos().get()) {
             let mut forbidden = args.clone();
             forbidden.push(tmp);
             Some(Loc::Reg(self.rm.force_allocate_reg(
-                op.pos.get(),
+                op.pos().get(),
                 &forbidden,
                 None,
                 false,
@@ -4163,7 +4195,7 @@ impl<'a> RegAlloc<'a> {
         self.rm.free_temp_vars(&mut self.longevity, &mut self.fm);
         self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
         // aarch64/regalloc.py:887
-        let resloc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
+        let resloc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
         self.perform(i, vec![argloc], Some(resloc), output);
     }
 
@@ -4203,7 +4235,7 @@ impl<'a> RegAlloc<'a> {
         );
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let loc0 = self.xrm.force_result_in_reg(
-            op.pos.get(),
+            op.pos().get(),
             op.arg(0).to_opref(),
             Type::Float,
             &args,
@@ -4249,7 +4281,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_float_unary(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
         let loc = self.xrm.force_result_in_reg(
-            op.pos.get(),
+            op.pos().get(),
             op.arg(0).to_opref(),
             Type::Float,
             &args,
@@ -4295,7 +4327,7 @@ impl<'a> RegAlloc<'a> {
         // x86/regalloc.py:682 — a float comparison whose only consumer is the
         // next guard leaves its answer in the flags, like the integer one.
         let ops_ref: &[OpRc] = self.operations;
-        let result_loc = self.force_allocate_reg_or_cc(op.pos.get(), ops_ref, i);
+        let result_loc = self.force_allocate_reg_or_cc(op.pos().get(), ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
 
@@ -4322,7 +4354,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_cast_int_to_float(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Int, &[], None, false);
         let result_loc =
-            Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Float, &[], None, false));
+            Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Float, &[], None, false));
         self.perform(i, vec![loc0], Some(result_loc), output);
     }
 
@@ -4342,7 +4374,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_cast_float_to_int(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Float, &[], None, false);
         let result_loc =
-            Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Int, &[], None, false));
+            Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Int, &[], None, false));
         self.perform(i, vec![loc0], Some(result_loc), output);
     }
 
@@ -4362,7 +4394,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_getfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let base_loc = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
         let tp = op.opcode.result_type();
-        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
+        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
         self.perform(i, vec![base_loc], Some(result_loc), output);
     }
 
@@ -4388,7 +4420,7 @@ impl<'a> RegAlloc<'a> {
         let index_loc =
             self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
         let tp = op.opcode.result_type();
-        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
+        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
         self.perform(i, vec![base_loc, index_loc], Some(result_loc), output);
     }
 
@@ -4417,7 +4449,7 @@ impl<'a> RegAlloc<'a> {
         let index_loc =
             self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
         let tp = op.opcode.result_type();
-        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
+        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
         self.perform(i, vec![base_loc, index_loc], Some(result_loc), output);
     }
 
@@ -4603,7 +4635,7 @@ impl<'a> RegAlloc<'a> {
         };
         // aarch64/regalloc.py:545
         let tp = op.opcode.result_type();
-        let res_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
+        let res_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
         // aarch64/regalloc.py:546: return [base_loc, ofs_loc, res_loc, imm(nsize)]
         self.perform(
             i,
@@ -4646,7 +4678,7 @@ impl<'a> RegAlloc<'a> {
         };
         // aarch64/regalloc.py:571
         let tp = op.opcode.result_type();
-        let res_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
+        let res_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
         // aarch64/regalloc.py:572: return [res_loc, base_loc, index_loc, imm(nsize), imm(ofs)]
         self.perform(
             i,
@@ -4676,7 +4708,7 @@ impl<'a> RegAlloc<'a> {
             self.make_sure_var_in_reg(op.arg(1).to_opref(), Type::Int, &args, None, false);
         // x86/regalloc.py:1177
         let tp = op.opcode.result_type();
-        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
+        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
         // x86/regalloc.py:1178-1186 — scale/offset/size are ConstInt boxes.
         // `op.getarg(3)` / `op.getarg(4)` raise IndexError if missing in
         // RPython; `gc/rewrite.rs::emit_gc_load_indexed` lowers every
@@ -5117,9 +5149,9 @@ impl<'a> RegAlloc<'a> {
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
             let r = if result_tp == Type::Float {
-                self.xrm.after_call(op.pos.get(), &mut self.longevity)
+                self.xrm.after_call(op.pos().get(), &mut self.longevity)
             } else {
-                self.rm.after_call(op.pos.get(), &mut self.longevity)
+                self.rm.after_call(op.pos().get(), &mut self.longevity)
             };
             Some(Loc::Reg(r))
         } else {
@@ -5216,7 +5248,7 @@ impl<'a> RegAlloc<'a> {
 
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
-            let dst = dst.unwrap_or(op.pos.get());
+            let dst = dst.unwrap_or(op.pos().get());
             let r = if result_tp == Type::Float {
                 self.xrm.after_call(dst, &mut self.longevity)
             } else {
@@ -5292,9 +5324,9 @@ impl<'a> RegAlloc<'a> {
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
             let r = if result_tp == Type::Float {
-                self.xrm.after_call(op.pos.get(), &mut self.longevity)
+                self.xrm.after_call(op.pos().get(), &mut self.longevity)
             } else {
-                self.rm.after_call(op.pos.get(), &mut self.longevity)
+                self.rm.after_call(op.pos().get(), &mut self.longevity)
             };
             Some(Loc::Reg(r))
         } else {
@@ -5357,7 +5389,7 @@ impl<'a> RegAlloc<'a> {
 
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
-            let dst = dst.unwrap_or(op.pos.get());
+            let dst = dst.unwrap_or(op.pos().get());
             let r = if result_tp == Type::Float {
                 self.xrm.after_call(dst, &mut self.longevity)
             } else {
@@ -5430,9 +5462,9 @@ impl<'a> RegAlloc<'a> {
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
             let r = if result_tp == Type::Float {
-                self.xrm.after_call(op.pos.get(), &mut self.longevity)
+                self.xrm.after_call(op.pos().get(), &mut self.longevity)
             } else {
-                self.rm.after_call(op.pos.get(), &mut self.longevity)
+                self.rm.after_call(op.pos().get(), &mut self.longevity)
             };
             Some(Loc::Reg(r))
         } else {
@@ -5482,7 +5514,7 @@ impl<'a> RegAlloc<'a> {
 
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
-            let dst = dst.unwrap_or(op.pos.get());
+            let dst = dst.unwrap_or(op.pos().get());
             let r = if result_tp == Type::Float {
                 self.xrm.after_call(dst, &mut self.longevity)
             } else {
@@ -5520,7 +5552,7 @@ impl<'a> RegAlloc<'a> {
         // aarch64/regalloc.py: force_allocate_reg(op, selected_reg=r.x0)
         // x86/regalloc.py: force_allocate_reg(op, selected_reg=ecx)
         let result_reg = self.rm.force_allocate_reg(
-            op.pos.get(),
+            op.pos().get(),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
@@ -5643,7 +5675,7 @@ impl<'a> RegAlloc<'a> {
         self.possibly_free_var(size_box, Type::Int);
         // aarch64/regalloc.py:988
         let result_reg = self.rm.force_allocate_reg(
-            op.pos.get(),
+            op.pos().get(),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
@@ -5747,7 +5779,7 @@ impl<'a> RegAlloc<'a> {
         );
         // aarch64/regalloc.py:1018
         let result_reg = self.rm.force_allocate_reg(
-            op.pos.get(),
+            op.pos().get(),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
@@ -6002,7 +6034,7 @@ impl<'a> RegAlloc<'a> {
     /// force_token: result = frame pointer (EBP)
     fn consider_force_token(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let result_loc =
-            Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Ref, &[], None, false));
+            Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Ref, &[], None, false));
         self.perform(i, vec![], Some(result_loc), output);
     }
 
@@ -6018,7 +6050,7 @@ impl<'a> RegAlloc<'a> {
             locs.push(self.loc(arg.to_opref(), Type::Int));
         }
         let result_loc =
-            Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Int, &[], None, false));
+            Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Int, &[], None, false));
         self.perform(i, locs, Some(result_loc), output);
     }
 
@@ -6040,7 +6072,7 @@ impl<'a> RegAlloc<'a> {
     /// No-arg result (save_exception, save_exc_class)
     fn consider_no_arg_result(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let tp = op.opcode.result_type();
-        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos.get(), tp, &[], None, false));
+        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
         self.perform(i, vec![], Some(result_loc), output);
     }
 
@@ -6289,7 +6321,7 @@ mod tests {
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let op = Op::new(opcode, &bx);
-        op.pos.set(OpRef::int_op(pos));
+        op.pos().set(OpRef::int_op(pos));
         op
     }
 
@@ -6453,9 +6485,9 @@ mod tests {
         let inputargs = vec![InputArg::from_type(Type::Ref, live_ref.raw())];
 
         let malloc = Op::new(OpCode::CallMallocNursery, &[rb(size)]);
-        malloc.pos.set(malloc_result);
+        malloc.pos().set(malloc_result);
         let finish = Op::new(OpCode::Finish, &[rb(live_ref), rb(malloc_result)]);
-        finish.pos.set(OpRef::int_op(1));
+        finish.pos().set(OpRef::int_op(1));
         finish.setfailargs(vec![].into());
         finish.set_fail_arg_types(vec![Type::Ref, Type::Ref]);
         let ops = vec![malloc, finish];
@@ -6512,14 +6544,14 @@ mod tests {
         let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
 
         let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
-        add.pos.set(i1);
+        add.pos().set(i1);
         let is_true = Op::new(OpCode::IntIsTrue, &[rb(i1)]);
-        is_true.pos.set(i2);
+        is_true.pos().set(i2);
         let guard = Op::new(OpCode::GuardTrue, &[rb(i2)]);
-        guard.pos.set(OpRef::int_op(3));
+        guard.pos().set(OpRef::int_op(3));
         guard.setfailargs(vec![rb(i1)].into());
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::int_op(4));
+        finish.pos().set(OpRef::int_op(4));
         finish.setfailargs(vec![].into());
         finish.set_fail_arg_types(vec![]);
 
@@ -6567,19 +6599,19 @@ mod tests {
         ];
 
         let mul_ovf = Op::new(OpCode::IntMulOvf, &[rb(i0), rb(i1)]);
-        mul_ovf.pos.set(i2);
+        mul_ovf.pos().set(i2);
         let guard = Op::new(OpCode::GuardNoOverflow, &[]);
-        guard.pos.set(OpRef::int_op(4));
+        guard.pos().set(OpRef::int_op(4));
         guard.setfailargs(vec![rb(i2)].into());
         let finish = Op::new(OpCode::Finish, &[rb(i2)]);
-        finish.pos.set(OpRef::int_op(5));
+        finish.pos().set(OpRef::int_op(5));
         finish.setfailargs(vec![].into());
         finish.set_fail_arg_types(vec![]);
 
         let mut ops = vec![mul_ovf];
         if interpose_comparison {
             let gt = Op::new(OpCode::IntGt, &[rb(i0), rb(i1)]);
-            gt.pos.set(i3);
+            gt.pos().set(i3);
             ops.push(gt);
         }
         ops.push(guard);
@@ -6662,9 +6694,9 @@ mod tests {
         ];
 
         let raw = Op::new(OpCode::IntIsTrue, &[rb(i0)]);
-        raw.pos.set(i2);
+        raw.pos().set(i2);
         let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos.set(OpRef::int_op(3));
+        finish.pos().set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
         let ops = rcs(ops);
@@ -6718,12 +6750,12 @@ mod tests {
             OpCode::CallMallocNurseryVarsize,
             &[rb(OpRef::const_int(0)), rb(OpRef::const_int(8)), rb(i0)],
         );
-        malloc.pos.set(OpRef::ref_op(1));
+        malloc.pos().set(OpRef::ref_op(1));
         // The length outlives the allocation, which is the case upstream calls
         // typical: "it's typically also present in the next operation that will
         // copy it inside the new array".
         let finish = Op::new(OpCode::Finish, &[rb(i0)]);
-        finish.pos.set(OpRef::void_op(2));
+        finish.pos().set(OpRef::void_op(2));
         let ops = vec![malloc, finish];
 
         let ops = rcs(ops);
@@ -6760,10 +6792,10 @@ mod tests {
         ];
 
         let raw = Op::new(OpCode::GuardTrue, &[rb(i0)]);
-        raw.pos.set(OpRef::int_op(2));
+        raw.pos().set(OpRef::int_op(2));
         raw.setfailargs(vec![].into());
         let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos.set(OpRef::int_op(3));
+        finish.pos().set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
         let ops = rcs(ops);
@@ -6798,9 +6830,9 @@ mod tests {
         ];
 
         let raw = Op::new(OpCode::GcLoadI, &[rb(i0), rb(c0), rb(c8)]);
-        raw.pos.set(i2);
+        raw.pos().set(i2);
         let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos.set(OpRef::int_op(3));
+        finish.pos().set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
         let ops = rcs(ops);
@@ -6844,7 +6876,7 @@ mod tests {
 
         let raw = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i2), rb(c8)]);
         let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos.set(OpRef::int_op(3));
+        finish.pos().set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
         let ops = rcs(ops);
@@ -6881,9 +6913,9 @@ mod tests {
         ];
 
         let raw = Op::new(OpCode::SameAsI, &[rb(i0)]);
-        raw.pos.set(i2);
+        raw.pos().set(i2);
         let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos.set(OpRef::int_op(3));
+        finish.pos().set(OpRef::int_op(3));
         let ops = vec![raw, finish];
 
         let ops = rcs(ops);
@@ -6923,7 +6955,7 @@ mod tests {
         // value threaded through the guard's arglocs.
         let token = OpRef::ref_op(0);
         let force = Op::new(OpCode::ForceToken, &[]);
-        force.pos.set(token);
+        force.pos().set(token);
         let inputargs = vec![];
         let ops = vec![force, make_guard(OpCode::GuardNotForced2, 1, &[], &[token])];
 

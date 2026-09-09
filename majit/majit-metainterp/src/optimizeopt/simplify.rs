@@ -27,7 +27,7 @@ impl OptSimplify {
     fn rewrite_call(op: &Op) -> Op {
         let new_opcode = OpCode::call_for_type(op.result_type());
         let new_op = op.copy_and_change(new_opcode, None, None);
-        new_op.pos.set(op.pos.get());
+        new_op.pos().set(op.pos().get());
         new_op
     }
 }
@@ -60,7 +60,7 @@ impl Optimization for OptSimplify {
             // VIRTUAL_REF -> SAME_AS_R (just forward the first arg)
             OpCode::VirtualRefR => {
                 let mut new_op = Op::new(OpCode::SameAsR, &[op.arg(0)]);
-                new_op.pos.set(op.pos.get());
+                new_op.pos().set(op.pos().get());
                 OptimizationResult::Emit(new_op)
             }
 

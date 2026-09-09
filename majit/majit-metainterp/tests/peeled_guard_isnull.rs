@@ -16,7 +16,7 @@ use majit_metainterp::optimizeopt::unroll::UnrollOptimizer;
 
 fn positioned(opcode: OpCode, args: &[Operand], raw: u32) -> Op {
     let op = Op::new(opcode, args);
-    op.pos.set(OpRef::op_typed(raw, opcode.result_type()));
+    op.pos().set(OpRef::op_typed(raw, opcode.result_type()));
     op
 }
 

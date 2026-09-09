@@ -391,8 +391,8 @@ impl<'a> ResOpGen<'a> {
                 for arg in op.getarglist() {
                     self.add_link_for_box(&mut links, arg.to_opref());
                 }
-                if op.result_type() != Type::Void && !op.pos.get().is_none() {
-                    self.add_link_for_box(&mut links, op.pos.get());
+                if op.result_type() != Type::Void && !op.pos().get().is_none() {
+                    self.add_link_for_box(&mut links, op.pos().get());
                 }
             }
         }
@@ -622,7 +622,7 @@ mod tests {
                 Operand::from_bound_inputarg(&i1),
             ],
         );
-        op.pos.set(OpRef::int_op(2));
+        op.pos().set(OpRef::int_op(2));
         let jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
         let procedure = vec![op, jump];
 
@@ -644,7 +644,7 @@ mod tests {
                 Operand::from_bound_inputarg(&i1),
             ],
         );
-        op.pos.set(OpRef::int_op(1));
+        op.pos().set(OpRef::int_op(1));
         let procedure = vec![op];
         let mut page = ResOpGraphPage::default();
 

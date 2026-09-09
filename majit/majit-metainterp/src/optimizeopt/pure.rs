@@ -446,7 +446,7 @@ impl OptPure {
     /// pure.py: pure(opnum, op)
     pub fn pure(&mut self, op: &Op) {
         let key = PureOpKey::from_op(op);
-        self.cache.insert(key, op.pos.get());
+        self.cache.insert(key, op.pos().get());
     }
 
     /// Record a pure operation with explicit args.
@@ -928,7 +928,7 @@ impl Optimization for OptPure {
                         .is_some()
                 });
                 if all_args_const && let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
-                    let b = ctx.materialize_operand_at(postponed.pos.get());
+                    let b = ctx.materialize_operand_at(postponed.pos().get());
                     ctx.make_constant_box(&b, Value::Int(folded));
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
@@ -994,7 +994,7 @@ impl Optimization for OptPure {
                     postponed.setarg(i, ctx.materialize_operand_at(forced));
                 }
                 // Record and emit both the OVF op and the guard.
-                self.cache.insert(key, postponed.pos.get());
+                self.cache.insert(key, postponed.pos().get());
                 // pure.py:321-322: an is_ovf op followed by GUARD_NO_OVERFLOW is
                 // hoistable into the short preamble, like an is_always_pure op
                 // (pure.py). Push it so produce_potential_short_preamble_ops
@@ -1084,7 +1084,7 @@ impl Optimization for OptPure {
                 // driver aborts the trace at its next barrier per
                 // `unroll.py:119-123`.
                 if let Some(folded_value) = ctx.constant_fold(op) {
-                    let b = ctx.materialize_operand_at(op.pos.get());
+                    let b = ctx.materialize_operand_at(op.pos().get());
                     ctx.make_constant_box(&b, folded_value);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove;
@@ -1112,7 +1112,7 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
-            self.cache.insert(key, op.pos.get());
+            self.cache.insert(key, op.pos().get());
             self.short_preamble_pure_ops.push(op.clone());
             return OptimizationResult::PassOn;
         }
@@ -1126,7 +1126,7 @@ impl Optimization for OptPure {
 
             // pure.py:191-196: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
-                let b = ctx.materialize_operand_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos().get());
                 ctx.make_constant_box(&b, value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
@@ -1151,7 +1151,7 @@ impl Optimization for OptPure {
                         start_index,
                         ctx,
                     ) {
-                        let cached_src = old_op.pos.get();
+                        let cached_src = old_op.pos().get();
                         let b_old = Operand::from_bound_op(op_rc);
                         let b_cached = ctx.get_box_replacement_operand(cached_src);
                         ctx.make_equal_to(&b_old, &b_cached);
@@ -1225,7 +1225,7 @@ impl Optimization for OptPure {
             }
 
             let key = PureOpKey::from_call_op(op, start_index);
-            self.cache.insert(key, op.pos.get());
+            self.cache.insert(key, op.pos().get());
             // pure.py: `CallPureOptimizationResult.callback()` appends
             // `len(_newoperations) - 1` AFTER `emit_result` has routed the op
             // through the remaining optimizations. Recording it here (before
@@ -1323,7 +1323,7 @@ impl Optimization for OptPure {
             // echoes from the OpRef table.
             let imported_args = entry.pop.preamble_op.getarglist();
             let mut imported_op = Op::new(entry.opcode, &imported_args);
-            imported_op.pos.set(entry.result);
+            imported_op.pos().set(entry.result);
             if let Some(d) = entry.descr.clone() {
                 imported_op.setdescr(d);
             }
@@ -1372,7 +1372,7 @@ mod tests {
         preamble_op: Op,
         label_arg_idx: Option<usize>,
     ) {
-        let source = preamble_op.pos.get();
+        let source = preamble_op.pos().get();
         let short_inputargs: Vec<OpRef> = match label_arg_idx {
             Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
             None => vec![OpRef::int_op(0)],
@@ -1408,7 +1408,7 @@ mod tests {
                 .map(|p| p.preamble_op)
                 .unwrap_or_else(|| {
                     let mut same_as = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_box));
-                    same_as.pos.set(source);
+                    same_as.pos().set(source);
                     std::rc::Rc::new(same_as)
                 });
             let pop = crate::optimizeopt::info::PreambleOp {
@@ -1433,7 +1433,7 @@ mod tests {
             // resoperation.py:1693 parity). Argument OpRefs in these
             // fixtures must use the matching typed factory at the same
             // raw N to satisfy variant-aware Eq against `op.pos`.
-            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
+            op.pos().set(OpRef::op_typed(i as u32, op.result_type()));
         }
     }
 
@@ -1518,7 +1518,7 @@ mod tests {
                 Some(d) => std::rc::Rc::new(Op::with_descr(spec.opcode, &arg_ops, d.clone())),
                 None => std::rc::Rc::new(Op::new(spec.opcode, &arg_ops)),
             };
-            op.pos.set(OpRef::op_typed(
+            op.pos().set(OpRef::op_typed(
                 num_inputs + i as u32,
                 spec.opcode.result_type(),
             ));
@@ -1729,7 +1729,7 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallR);
-        assert_eq!(result[0].pos.get().ty(), Some(Type::Ref));
+        assert_eq!(result[0].pos().get().ty(), Some(Type::Ref));
     }
 
     #[test]
@@ -1918,14 +1918,14 @@ mod tests {
         // Simulate: op0 = int_add(a, b)
         let op0 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
         let mut op0 = op0;
-        op0.pos.set(OpRef::int_op(2));
+        op0.pos().set(OpRef::int_op(2));
         let result0 = pass.propagate_forward(&op0, &std::rc::Rc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
         let op1 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
         let mut op1 = op1;
-        op1.pos.set(OpRef::int_op(3));
+        op1.pos().set(OpRef::int_op(3));
         let result1 = pass.propagate_forward(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
     }
@@ -2027,9 +2027,9 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallF);
-        assert_eq!(result[0].pos.get().ty(), Some(Type::Float));
+        assert_eq!(result[0].pos().get().ty(), Some(Type::Float));
         assert_eq!(result[1].opcode, OpCode::CallN);
-        assert_eq!(result[1].pos.get().ty(), Some(Type::Void));
+        assert_eq!(result[1].pos().get().ty(), Some(Type::Void));
     }
 
     #[test]
@@ -2384,7 +2384,7 @@ mod tests {
         let arg_box = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.make_constant_box(&arg_box, Value::Int(2));
         let mut op = Op::with_descr(OpCode::GetfieldGcI, std::slice::from_ref(&arg_box), descr);
-        op.pos.set(OpRef::int_op(0));
+        op.pos().set(OpRef::int_op(0));
 
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
@@ -2454,7 +2454,7 @@ mod tests {
             OpCode::IntAdd,
             &[Operand::const_from_value(Value::Int(5)), x_box.clone()],
         );
-        q.pos.set(OpRef::int_op(99));
+        q.pos().set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
             Some(OpRef::int_op(42)),
@@ -2466,7 +2466,7 @@ mod tests {
             OpCode::IntAdd,
             &[Operand::const_from_value(Value::Int(5)), x8_box.clone()],
         );
-        q_miss.pos.set(OpRef::int_op(100));
+        q_miss.pos().set(OpRef::int_op(100));
         assert_eq!(pass.get_pure_result(&q_miss, &ctx), None);
     }
 
@@ -2491,7 +2491,7 @@ mod tests {
         // Query op carries the canonical ctx boxes (query_arg forwards to
         // canonical_arg via make_equal_to) — no position-only mint.
         let mut q = Op::new(OpCode::IntAdd, &[b_query.clone(), b_other.clone()]);
-        q.pos.set(OpRef::int_op(99));
+        q.pos().set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
             Some(result),
@@ -2513,7 +2513,7 @@ mod tests {
 
         // Manually record a pure operation via the API
         let mut op = Op::new(OpCode::IntAdd, &[b10.clone(), b20.clone()]);
-        op.pos.set(OpRef::int_op(0));
+        op.pos().set(OpRef::int_op(0));
         pass.pure(&op);
 
         // Should find it via get_pure_result
@@ -2527,7 +2527,7 @@ mod tests {
             OpRef::int_op(5),
         );
         let mut lookup_mul = Op::new(OpCode::IntMul, &[b30.clone(), b40.clone()]);
-        lookup_mul.pos.set(OpRef::int_op(99));
+        lookup_mul.pos().set(OpRef::int_op(99));
         assert!(pass.get_pure_result(&lookup_mul, &ctx).is_some());
     }
 
@@ -2654,7 +2654,7 @@ mod tests {
             .collect();
         assert_eq!(pure.len(), 1);
         assert_eq!(pure[0].1.preamble_op.opcode, OpCode::IntAdd);
-        assert_eq!(pure[0].1.preamble_op.pos.get(), OpRef::int_op(2));
+        assert_eq!(pure[0].1.preamble_op.pos().get(), OpRef::int_op(2));
     }
 
     #[test]
@@ -2718,7 +2718,7 @@ mod tests {
             OpCode::CallPureI,
             &[Operand::const_from_value(Value::Int(0x1234)), arg0.clone()],
         );
-        op.pos.set(OpRef::int_op(2));
+        op.pos().set(OpRef::int_op(2));
         op.setdescr(call_descr);
         // Register the dispatched op as the producer at its position so the
         // collapsed `from_bound_op(op_rc)` resolves to the same box the test
@@ -2744,7 +2744,7 @@ mod tests {
         let a0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let a1 = ctx.materialize_operand_at(OpRef::int_op(1));
         let mut op = Op::new(OpCode::IntAdd, &[a0.clone(), a1.clone()]);
-        op.pos.set(OpRef::int_op(2));
+        op.pos().set(OpRef::int_op(2));
         let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
@@ -2783,7 +2783,7 @@ mod tests {
         let a0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let a1 = ctx.materialize_operand_at(OpRef::int_op(1));
         let mut op = Op::new(OpCode::CallPureI, &[a100.clone(), a0.clone(), a1.clone()]);
-        op.pos.set(OpRef::int_op(2));
+        op.pos().set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![
                 majit_ir::Type::Int,
@@ -2842,7 +2842,7 @@ mod tests {
 
         let a0 = ctx.materialize_operand_at(OpRef::int_op(0));
         let mut op = Op::new(OpCode::CallLoopinvariantI, &[func_box.clone(), a0.clone()]);
-        op.pos.set(OpRef::int_op(2));
+        op.pos().set(OpRef::int_op(2));
         op.setdescr(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
             majit_ir::Type::Int,
@@ -3004,7 +3004,7 @@ mod tests {
                 ],
             )],
         );
-        let op_pos = ops[0].pos.get().raw();
+        let op_pos = ops[0].pos().get().raw();
 
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
@@ -3069,7 +3069,7 @@ mod tests {
         // `build_trace` types op.pos via result_type() → CallPureR gives a
         // Ref-typed position OpRef.
         assert_eq!(
-            ops[0].pos.get().ty(),
+            ops[0].pos().get().ty(),
             Some(Type::Ref),
             "CallPureR position must be Ref-typed (resoperation.py:638)"
         );

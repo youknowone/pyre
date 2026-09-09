@@ -336,7 +336,7 @@ where
             }
         };
         for op in trace[start..end].iter().map(std::borrow::Borrow::borrow) {
-            consider(op.pos.get());
+            consider(op.pos().get());
             for a in op.getarglist().iter() {
                 consider(a.to_opref());
             }
@@ -525,10 +525,10 @@ where
         // `OpRef::from_raw(num_inputs + i)`, matching `recorder.record_op`'s
         // monotonic `op_count`).
         let is_void_result =
-            src.pos.get().is_none() || src.opcode.result_type() == majit_ir::Type::Void;
+            src.pos().get().is_none() || src.opcode.result_type() == majit_ir::Type::Void;
         let mut cache_slot: Option<usize> = None;
         if !is_void_result {
-            let orig = src.pos.get().raw() as usize;
+            let orig = src.pos().get().raw() as usize;
             if orig >= self._cache.len() {
                 self._cache.resize(orig + 1, None);
             }
@@ -542,7 +542,7 @@ where
             // `opcode.result_type()`.
             let fresh = OpRef::op_typed(self._fresh, src.opcode.result_type());
             self._fresh += 1;
-            res.pos.set(fresh);
+            res.pos().set(fresh);
             cache_slot = Some(orig);
             // RPython `_index` parity: advance past the cache slot we
             // just wrote. In RPython this happens via `_index += 1`
@@ -551,7 +551,7 @@ where
             // directly to keep `_cache[_index - 1]` (`replace_last_cached`)
             // pointing at the slot we just wrote.
             self._index = orig as u32 + 1;
-        } else if !src.pos.get().is_none() {
+        } else if !src.pos().get().is_none() {
             // Void op carrying a raw trace position: still allocate a
             // fresh OpRef so the `_fresh` counter stays in lockstep with
             // the raw trace position counter. The op is not cached
@@ -560,9 +560,9 @@ where
             // (resoperation.py:260) → VoidOp variant.
             let f = OpRef::void_op(self._fresh);
             self._fresh += 1;
-            res.pos.set(f);
+            res.pos().set(f);
         } else {
-            res.pos.set(src.pos.get());
+            res.pos().set(src.pos().get());
         }
         let res = std::rc::Rc::new(res);
         // opencoder.py `self._cache[self._index] = res` — cache
@@ -972,7 +972,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // `op_typed` which lands on the matching variant.
         let fresh_pos = OpRef::op_typed(self._fresh, opcode.result_type());
         self._fresh += 1;
-        op.pos.set(fresh_pos);
+        op.pos().set(fresh_pos);
         // opencoder.py `self._cache[self._index] = res` — the
         // fresh op IS the cached box object, so a later TAGBOX arg binds
         // to this exact `Rc` (`from_bound_op` → `Operand::Op`).
@@ -1666,7 +1666,7 @@ impl Trace {
     /// Return the first materialized op whose `.pos == pos`. O(n) byte
     /// walk; `None` if no op claims that position.
     pub fn get_op_by_pos(&self, pos: OpRef) -> Option<OpRc> {
-        self.get_byte_iter().find(|op| op.pos.get() == pos)
+        self.get_byte_iter().find(|op| op.pos().get() == pos)
     }
 
     /// Return the last recorded op, or `None` if the trace is empty.
@@ -3149,7 +3149,7 @@ mod tests {
         let op_args: Vec<majit_ir::operand::Operand> =
             args.iter().map(|a| box_arg_operand(*a)).collect();
         let mut op = majit_ir::Op::new(opcode, &op_args);
-        op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
+        op.pos().set(OpRef::op_typed(pos, opcode.result_type()));
         op
     }
 
@@ -3188,14 +3188,14 @@ mod tests {
 
         // First IntAdd: result at fresh BoxInt(2), args translated via cache.
         let r1 = iter.next().unwrap();
-        assert_eq!(r1.pos.get(), iop(2));
+        assert_eq!(r1.pos().get(), iop(2));
         assert_eq!(r1.arg(0).to_opref(), iarg(0));
         assert_eq!(r1.arg(1).to_opref(), iarg(1));
 
         // Second IntAdd: result at fresh BoxInt(3); first arg references the
         // previous result (raw pos 2 → cached BoxInt(2)).
         let r2 = iter.next().unwrap();
-        assert_eq!(r2.pos.get(), iop(3));
+        assert_eq!(r2.pos().get(), iop(3));
         assert_eq!(r2.arg(0).to_opref(), iop(2));
         assert_eq!(r2.arg(1).to_opref(), iarg(0));
 
@@ -3244,7 +3244,7 @@ mod tests {
         let add = iter.next().unwrap();
         assert_eq!(add.arg(0).to_opref(), iarg(10));
         assert_eq!(add.arg(1).to_opref(), iarg(11));
-        assert_eq!(add.pos.get(), iop(12));
+        assert_eq!(add.pos().get(), iop(12));
     }
 
     #[test]
@@ -3285,10 +3285,10 @@ mod tests {
             p2_ops.push(op);
         }
         assert_eq!(inputarg_oprefs(&p2), vec![iarg(4), iarg(5)]);
-        assert_eq!(p2_ops[0].pos.get(), iop(6));
+        assert_eq!(p2_ops[0].pos().get(), iop(6));
         assert_eq!(p2_ops[0].arg(0).to_opref(), iarg(4));
         assert_eq!(p2_ops[0].arg(1).to_opref(), iarg(5));
-        assert_eq!(p2_ops[1].pos.get(), iop(7));
+        assert_eq!(p2_ops[1].pos().get(), iop(7));
         assert_eq!(p2_ops[1].arg(0).to_opref(), iop(6));
         assert_eq!(p2_ops[1].arg(1).to_opref(), iarg(4));
         assert_eq!(p2_ops[2].arg(0).to_opref(), iop(7));
@@ -3296,12 +3296,12 @@ mod tests {
         // No Phase 1 OpRef equals any Phase 2 OpRef.
         let p1_positions: Vec<u32> = p1_ops
             .iter()
-            .map(|op| op.pos.get().raw())
+            .map(|op| op.pos().get().raw())
             .filter(|&p| p != u32::MAX)
             .collect();
         let p2_positions: Vec<u32> = p2_ops
             .iter()
-            .map(|op| op.pos.get().raw())
+            .map(|op| op.pos().get().raw())
             .filter(|&p| p != u32::MAX)
             .collect();
         assert!(p1_positions.iter().all(|p| !p2_positions.contains(p)));
@@ -3318,7 +3318,7 @@ mod tests {
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         let r = iter.next().unwrap();
-        assert_eq!(r.pos.get(), iop(1));
+        assert_eq!(r.pos().get(), iop(1));
         assert_eq!(r.arg(0).to_opref(), iarg(0));
         assert_eq!(r.arg(1).to_opref(), const_ref);
     }
@@ -3346,7 +3346,7 @@ mod tests {
         let r1 = iter.next().unwrap();
         // After writing raw pos 1, _index should be 2 (next slot).
         assert_eq!(iter._index, 2);
-        assert_eq!(r1.pos.get(), iop(101));
+        assert_eq!(r1.pos().get(), iop(101));
         // replace_last_cached(oldbox=BoxInt(101), new_box=BoxInt(999))
         // must target _cache[_index - 1] = _cache[1], where the last
         // write placed BoxInt(101).
@@ -3376,7 +3376,7 @@ mod tests {
         let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10);
         let r1 = iter.next().unwrap();
-        assert_eq!(r1.pos.get(), iop(11));
+        assert_eq!(r1.pos().get(), iop(11));
         assert_eq!(r1.arg(0).to_opref(), iarg(10));
         assert_eq!(r1.arg(1).to_opref(), iarg(10));
         let r2 = iter.next().unwrap();
@@ -3411,7 +3411,7 @@ mod tests {
         assert_eq!(cache_opref(&iter, 1), Some(rarg(101)));
 
         let op0 = iter.next().unwrap();
-        assert_eq!(op0.pos.get(), iop(104));
+        assert_eq!(op0.pos().get(), iop(104));
         assert_eq!(
             op0.getarglist()
                 .iter()
@@ -3428,7 +3428,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![iop(104), rarg(101)]
         );
-        assert_eq!(op1.pos.get(), rop(105));
+        assert_eq!(op1.pos().get(), rop(105));
         assert_eq!(cache_opref(&iter, 1), Some(rop(105)));
 
         let finish = iter.next().unwrap();
@@ -3664,7 +3664,7 @@ mod tests {
         // The first arg of IntMul referenced the first op's result via
         // TAGBOX.  The iterator's `_cache` must map raw position 2 →
         // `add.pos` (the fresh OpRef emitted one `next()` ago).
-        assert_eq!(mul.arg(0).to_opref(), add.pos.get());
+        assert_eq!(mul.arg(0).to_opref(), add.pos().get());
         assert_eq!(mul.arg(1).to_opref(), fresh_i0);
         assert!(it.done());
     }
@@ -4325,7 +4325,7 @@ mod tests {
         let _ = buf.record_op2(OpCode::IntMul, Box::ResOp(2), Box::ResOp(0), None);
         let first = buf.get_op_by_pos(iop(4)).expect("first op present");
         assert_eq!(first.opcode, OpCode::IntAdd);
-        assert_eq!(first.pos.get(), iop(4));
+        assert_eq!(first.pos().get(), iop(4));
         let second = buf.get_op_by_pos(iop(5)).expect("second op present");
         assert_eq!(second.opcode, OpCode::IntMul);
         assert!(buf.get_op_by_pos(iop(99)).is_none());
@@ -4641,7 +4641,7 @@ mod tests {
         assert_eq!(l0.arg(0).to_opref(), fresh_i0);
         assert_eq!(l0.arg(1).to_opref(), fresh_i1);
         // assert l[1].getarg(0) is l[0]
-        assert_eq!(l1.arg(0).to_opref(), l0.pos.get());
+        assert_eq!(l1.arg(0).to_opref(), l0.pos().get());
         // assert l[1].getarg(1).getint() == 1 — inline-resolved constant.
         drop(it);
         assert_eq!(

@@ -830,8 +830,8 @@ impl PtrInfoExt for PtrInfo {
                     // identity. Allocate a fresh Int OpRef on `lenop.pos`
                     // so the chained INT_GE/INT_LE/INT_AND check against
                     // the producer result, not the sentinel `OpRef::NONE`.
-                    lenop.pos.set(ctx.alloc_op_position_typed(Type::Int));
-                    let lenop_pos = lenop.pos.get();
+                    lenop.pos().set(ctx.alloc_op_position_typed(Type::Int));
+                    let lenop_pos = lenop.pos().get();
                     short.push(lenop);
                     info.lenbound.make_guards(lenop_pos, short, ctx);
                 }
@@ -856,8 +856,8 @@ impl PtrInfoExt for PtrInfo {
                 let mut eq_op = Op::new(OpCode::IntEq, &[op_b.clone(), zero.clone()]);
                 // info.py:381 `op = ResOperation(INT_EQ, [...])` then
                 // `[op]` — INT_EQ result identity for GUARD_FALSE.
-                eq_op.pos.set(ctx.alloc_op_position_typed(Type::Int));
-                let eq_pos = eq_op.pos.get();
+                eq_op.pos().set(ctx.alloc_op_position_typed(Type::Int));
+                let eq_pos = eq_op.pos().get();
                 short.push(eq_op);
                 // info.py:381 reuses the INT_EQ ResOperation object as the
                 // GUARD_FALSE arg by identity. The producer lives in `short`,
@@ -883,8 +883,8 @@ impl PtrInfoExt for PtrInfo {
                     // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
                     // is consumed by `bound.make_guards(lenop, ...)`.
                     // Materialize the producer result before the chain.
-                    lenop.pos.set(ctx.alloc_op_position_typed(Type::Int));
-                    let lenop_pos = lenop.pos.get();
+                    lenop.pos().set(ctx.alloc_op_position_typed(Type::Int));
+                    let lenop_pos = lenop.pos().get();
                     short.push(lenop);
                     // intutils.py IntBound.make_guards: emits the
                     // chained INT_GE/INT_LE/INT_AND → GUARD_TRUE/GUARD_VALUE
@@ -1269,7 +1269,7 @@ fn force_box_impl(
             // Preserve that identity here instead of inventing a fresh
             // OpRef, so later passes (earlyforce → heap → call) all talk
             // about the same concrete allocation.
-            new_op.pos.set(opref);
+            new_op.pos().set(opref);
             new_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, new_op);
             // info.py `newop.set_forwarded(self)` — unconditional.
@@ -1335,7 +1335,7 @@ fn force_box_impl(
             // Preserve that identity here instead of inventing a fresh
             // OpRef, so later passes (earlyforce → heap → call) all talk
             // about the same concrete allocation.
-            new_op.pos.set(opref);
+            new_op.pos().set(opref);
             new_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, new_op);
             // info.py `newop.set_forwarded(self)` — unconditional.
@@ -1406,7 +1406,7 @@ fn force_box_impl(
             };
             let arg_len = ctx.materialize_operand_at(len_ref);
             let mut alloc_op = Op::new(alloc_opcode, std::slice::from_ref(&arg_len));
-            alloc_op.pos.set(opref);
+            alloc_op.pos().set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
             if opref != alloc_ref {
@@ -1468,7 +1468,7 @@ fn force_box_impl(
             let len_ref = ctx.emit_constant_int(num_elements as i64);
             let arg_len = ctx.materialize_operand_at(len_ref);
             let mut alloc_op = Op::new(OpCode::NewArrayClear, std::slice::from_ref(&arg_len));
-            alloc_op.pos.set(opref);
+            alloc_op.pos().set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
             if opref != alloc_ref {
@@ -1530,7 +1530,7 @@ fn force_box_impl(
             let arg_func = ctx.materialize_operand_at(func_ref);
             let arg_size = ctx.materialize_operand_at(size_ref);
             let mut call_op = Op::new(OpCode::CallI, &[arg_func.clone(), arg_size.clone()]);
-            call_op.pos.set(opref);
+            call_op.pos().set(opref);
             if let Some(d) = calldescr {
                 call_op.setdescr(d);
             }
@@ -1618,7 +1618,7 @@ fn force_box_impl(
             let arg_parent = ctx.resolve_operand_operand(&parent_forced);
             let arg_offset = ctx.materialize_operand_at(offset_ref);
             let mut add_op = Op::new(OpCode::IntAdd, &[arg_parent.clone(), arg_offset.clone()]);
-            add_op.pos.set(opref);
+            add_op.pos().set(opref);
             let new_ref = emit_op(ctx, add_op);
             // Preserve raw-slice identity; mark non-virtual via
             // `parent = OpRef::NONE` (RPython `self.parent = None`).
@@ -1696,7 +1696,7 @@ fn force_box_impl(
             };
             let arg_length = ctx.materialize_operand_at(lengthbox);
             let mut newstr_op = Op::new(new_opcode, std::slice::from_ref(&arg_length));
-            newstr_op.pos.set(opref);
+            newstr_op.pos().set(opref);
             let newop = emit_op(ctx, newstr_op);
 
             // vstring.py:98: newop.set_forwarded(self) — unconditional.
@@ -2481,7 +2481,7 @@ mod tests {
                 majit_ir::operand::Operand::from_opref(OpRef::const_int(0)),
             ],
         );
-        replay.pos.set(OpRef::int_op(88));
+        replay.pos().set(OpRef::int_op(88));
         let pop = PreambleOp {
             op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(88)),
             invented_name: false,

@@ -2433,7 +2433,7 @@ impl TraceCtx {
                     if a.is_none() {
                         "_".to_string()
                     } else if let Some(o) = a.bound_op() {
-                        format!("{:?}", o.pos.get())
+                        format!("{:?}", o.pos().get())
                     } else if let Some(ia) = a.bound_inputarg() {
                         format!("IA{}", ia.index)
                     } else if a.is_null_ref() {
@@ -2445,7 +2445,7 @@ impl TraceCtx {
                 .collect();
             eprintln!(
                 "[p2-ir]   {:?} = {:?} [{}]",
-                op.pos.get(),
+                op.pos().get(),
                 op.opcode,
                 args.join(" ")
             );

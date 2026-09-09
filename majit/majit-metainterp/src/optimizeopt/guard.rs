@@ -179,7 +179,7 @@ impl Guard {
         });
         let mut last = var.var;
         for op in ops {
-            last = op.pos.get();
+            last = op.pos().get();
             new_ops.push(op);
         }
         // guard.py:131: opt.renamer.start_renaming(old_arg, box)
@@ -265,7 +265,7 @@ impl Guard {
         let mut guard_op = Op::new(
             self.op.opcode,
             &[majit_ir::operand::Operand::bound_from_opref(
-                compare.pos.get(),
+                compare.pos().get(),
             )],
         );
         guard_op.setdescr(fresh_descr);
@@ -396,7 +396,7 @@ impl Guard {
         let mut guard = Op::new(
             self.op.opcode,
             &[majit_ir::operand::Operand::bound_from_opref(
-                cmp_op.pos.get(),
+                cmp_op.pos().get(),
             )],
         );
         if let Some(d) = self.op.getdescr() {
@@ -426,7 +426,7 @@ impl Guard {
         if self.index > 0 {
             // guard.py:154: if operations[self.index-1] is self.cmp_op
             if let Some(ref prev) = ops[self.index - 1]
-                && prev.pos.get() == self.cmp_op.pos.get()
+                && prev.pos().get() == self.cmp_op.pos().get()
             {
                 ops[self.index - 1] = None;
             }
@@ -485,7 +485,7 @@ impl GuardStrengthenOpt {
             }
             // guard.py: Guard.of(op.getarg(0), operations, i, self.index_vars)
             let bool_arg = op.arg(0).to_opref();
-            let cmp_op = ops.iter().rfind(|o| o.pos.get() == bool_arg);
+            let cmp_op = ops.iter().rfind(|o| o.pos().get() == bool_arg);
             if let Some(cmp) = cmp_op
                 && let Some(guard) = Guard::of(i, op, cmp, &self.index_vars)
             {
@@ -575,7 +575,7 @@ impl GuardStrengthenOpt {
             }
             // guard.py: non-void index_var → emit_operations + rename
             if op.opcode.result_type() != majit_ir::Type::Void
-                && let Some(index_var) = index_vars.get(&op.pos.get())
+                && let Some(index_var) = index_vars.get(&op.pos().get())
                 && !index_var.is_identity()
             {
                 let ncp = &mut self.next_const_pos;
@@ -586,7 +586,7 @@ impl GuardStrengthenOpt {
                     cv.insert(cref, value);
                     cref
                 });
-                self.renamer.insert(op.pos.get(), result);
+                self.renamer.insert(op.pos().get(), result);
                 continue;
             }
             // guard.py: self.emit_operation(op)
@@ -832,7 +832,7 @@ mod tests {
         // so `from_bound_op` reads the final pos.
         let producers: [&OpRc; 5] = [&guard_true, &sub, &guard_ovf1, &mul, &guard_ovf2];
         for (i, op) in producers.iter().enumerate() {
-            op.pos
+            op.pos()
                 .set(OpRef::op_typed(100 + i as u32, op.result_type()));
             seed_guard_descrs(op);
         }
@@ -843,7 +843,7 @@ mod tests {
             OpCode::Jump,
             &[sub_box.clone(), sub_box.clone(), mul_box],
         ));
-        jump.pos.set(OpRef::op_typed(105, jump.result_type()));
+        jump.pos().set(OpRef::op_typed(105, jump.result_type()));
 
         let ops: Vec<OpRc> = vec![guard_true, sub, guard_ovf1, mul, guard_ovf2, jump];
 
@@ -904,14 +904,14 @@ mod tests {
         let i1 = rooted_inputarg_operand(Type::Int, 1);
         // v = (i0 > i1): intbounds bounds the comparison result to [0,1].
         let int_gt = std::rc::Rc::new(Op::new(OpCode::IntGt, &[i0, i1]));
-        int_gt.pos.set(OpRef::int_op(100));
+        int_gt.pos().set(OpRef::int_op(100));
         let v = Operand::from_bound_op(&int_gt);
         // guard_value(v, 1)
         let guard_value = std::rc::Rc::new(Op::new(
             OpCode::GuardValue,
             &[v, Operand::const_from_value(Value::Int(1))],
         ));
-        guard_value.pos.set(OpRef::void_op(0));
+        guard_value.pos().set(OpRef::void_op(0));
 
         let ops: Vec<OpRc> = vec![int_gt, guard_value];
         let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
