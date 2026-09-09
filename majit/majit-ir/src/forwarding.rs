@@ -320,10 +320,10 @@ pub trait ForwardingHost {
 
 impl ForwardingHost for Op {
     fn get_forwarded(&self) -> Forwarded {
-        self.forwarded.borrow()
+        self.forwarded().borrow()
     }
     fn store_forwarded(&self, value: Forwarded) {
-        self.forwarded.set(value);
+        self.forwarded().set(value);
     }
     fn is_same_op(&self, op: &crate::resoperation::OpRc) -> bool {
         std::ptr::eq(self, Rc::as_ptr(op))

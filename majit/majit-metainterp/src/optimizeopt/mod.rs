@@ -2296,8 +2296,8 @@ impl OptContext {
         if let Some(superseded) = self.live_synthetics_swap_remove_pos(pos)
             && !std::rc::Rc::ptr_eq(&superseded, op)
         {
-            let carried = superseded.forwarded.borrow().clone();
-            *op.forwarded.borrow_mut() = carried;
+            let carried = superseded.forwarded().borrow().clone();
+            *op.forwarded().borrow_mut() = carried;
             // replace_op_with parity (optimizer.py): forward the
             // superseded stand-in to `op`. A consumer dispatched before
             // this supersession bound its operand to `superseded` (the
@@ -2337,7 +2337,7 @@ impl OptContext {
                 .map(|ia| ia.forwarded.borrow().clone()),
             _ => self
                 .find_producer_op(opref)
-                .map(|op| op.forwarded.borrow().clone()),
+                .map(|op| op.forwarded().borrow().clone()),
         }
     }
 
@@ -2411,7 +2411,7 @@ impl OptContext {
             }
             _ => {
                 if let Some(op) = self.find_producer_op(opref) {
-                    *op.forwarded.borrow_mut() = majit_ir::forwarding::Forwarded::None;
+                    *op.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::None;
                 }
             }
         }
@@ -2972,7 +2972,7 @@ impl OptContext {
         .filter_map(|key| self.resop_refs.get(key))
         .any(|op| {
             matches!(
-                op.forwarded.borrow(),
+                op.forwarded().borrow(),
                 Forwarded::Const(_) | Forwarded::SmallWide(_)
             )
         });
@@ -3282,7 +3282,7 @@ impl OptContext {
         // `_forwarded` host every `find_producer_op` reaches before this emit
         // supersedes it.
         if let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) {
-            *op_rc.forwarded.borrow_mut() = synth.forwarded.borrow().clone();
+            *op_rc.forwarded().borrow_mut() = synth.forwarded().borrow().clone();
             // replace_op_with parity (optimizer.py): forward the superseded
             // stand-in to the emitted producer. A consumer dispatched BEFORE
             // this producer emitted (forward reference) bound its operand to
@@ -4062,7 +4062,7 @@ impl OptContext {
             );
             let has_replay_marker = arg_operand.bound_op().is_some_and(|op| {
                 !matches!(
-                    &op.forwarded.borrow(),
+                    &op.forwarded().borrow(),
                     majit_ir::forwarding::Forwarded::None
                 )
             });

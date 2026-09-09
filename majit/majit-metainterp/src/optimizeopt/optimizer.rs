@@ -638,7 +638,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
             return;
         }
         let idx = pos.raw();
-        let Some(value) = op.forwarded.borrow().const_value() else {
+        let Some(value) = op.forwarded().borrow().const_value() else {
             return;
         };
         // A ref constant is never resolved from this backend pool: a referenced
@@ -3879,7 +3879,7 @@ impl Optimizer {
                 if remap.contains_key(&old_idx) || old_idx < num_inputs as u32 {
                     return;
                 }
-                if !op.forwarded.borrow().is_const() {
+                if !op.forwarded().borrow().is_const() {
                     return;
                 }
                 remap.insert(old_idx, next_const_pos);

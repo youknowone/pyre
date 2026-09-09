@@ -2776,7 +2776,7 @@ impl ExportedState {
         }
         for op in &self.partial_trace_operations {
             visit_op(op, visitor);
-            visit_forwarded(&mut op.forwarded.borrow_mut(), visitor);
+            visit_forwarded(&mut op.forwarded().borrow_mut(), visitor);
         }
     }
 
@@ -2991,7 +2991,7 @@ impl ExportedState {
             );
         }
         for (i, op) in self.partial_trace_operations.iter().enumerate() {
-            let forwarded = op.forwarded.borrow().clone();
+            let forwarded = op.forwarded().borrow().clone();
             root_forwarded_gcref(
                 &forwarded,
                 ExportedGcRefField::PartialTraceOpInfoPtrInfoConstant(i),
@@ -3068,12 +3068,12 @@ impl ExportedState {
                 }
                 ExportedGcRefField::PartialTraceOpInfoPtrInfoConstant(i) => {
                     if let Some(op) = self.partial_trace_operations.get(*i) {
-                        refresh_forwarded_ptrinfo_constant(&op.forwarded.borrow(), updated);
+                        refresh_forwarded_ptrinfo_constant(&op.forwarded().borrow(), updated);
                     }
                 }
                 ExportedGcRefField::PartialTraceOpConstRef(i) => {
                     if let Some(op) = self.partial_trace_operations.get(*i) {
-                        refresh_forwarded_const_ref(&op.forwarded.borrow(), updated);
+                        refresh_forwarded_const_ref(&op.forwarded().borrow(), updated);
                     }
                 }
             }
