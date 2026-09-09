@@ -233,6 +233,8 @@ const MAJIT_ONLY: &[&str] = &[
     "arraybase_vable/rdd>i",
     "newlist_clear/idddd>r",
     "rvmprof_code/ii",
+    // `opimpl_unreachable` aborts the walk instead of panicking.
+    "unreachable/",
 ];
 
 /// Keys pyre's walker answers and majit's tracer does not.
@@ -274,8 +276,7 @@ const PYRE_ONLY: &[&str] = &[
 /// than the list itself: fourteen of these are never assembled at all — the
 /// registration-gap snapshot in `jitcode_runtime.rs` pins most of them
 /// against `build_emitted_insns()`, the opnames the build actually emitted.
-/// The two the build does emit are both accounted for. `unreachable/` marks
-/// a point control cannot reach, so no walk arrives at it. And
+/// The two the build does emit are both accounted for. And
 /// `vtable_method_ptr/rd>i` is the pyre-only `dyn Trait` method-pointer
 /// reification quarantined in `extension_insns()`, whose blackhole handler
 /// is `handler_vtable_method_ptr_bail` — a deliberate refusal, with walking
@@ -298,7 +299,6 @@ const NEITHER: &[&str] = &[
     "newlist/idddd>r",
     "newlist_hint/idddd>r",
     "record_quasiimmut_field/rdd",
-    "unreachable/",
     "vtable_method_ptr/rd>i",
 ];
 
