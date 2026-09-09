@@ -1308,8 +1308,7 @@ impl GuardExtra {
     }
 
     pub(crate) fn set_fail_args(&mut self, args: impl IntoIterator<Item = Operand>) {
-        let vec: Vec<Operand> = args.into_iter().collect();
-        self.fail_args = Some(std::rc::Rc::from(vec));
+        self.fail_args = Some(std::rc::Rc::from_iter(args));
     }
 
     pub(crate) fn set_fail_args_rc(&mut self, args: std::rc::Rc<[Operand]>) {
@@ -2988,7 +2987,8 @@ impl Op {
                 }
             }
         }
-        self.setfailargs(boxes.into());
+        self.ensure_guard_extra()
+            .set_fail_args_rc(std::rc::Rc::from(boxes));
     }
 
     pub fn guard_fail_args(&self) -> Option<&[Operand]> {
