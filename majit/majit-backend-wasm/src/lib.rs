@@ -341,8 +341,9 @@ fn classify_inline_install_error(error: &BackendError) {
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
-/// Off for the loop-body half of the class. See `inline_nonheader_enable`.
-static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(false);
+/// On: non-header regions are placed outside the header `loop`, so they
+/// do not tax the fall-through path. See `inline_nonheader_enable`.
+static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(true);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Above this many exits, duplicating a parameter bridge arm at every guard is
 /// larger and slower to compile than the shared frame-entry epilogue.
@@ -496,18 +497,16 @@ fn inline_bridge_enabled() -> bool {
 /// min of 15 interleaved runs with each arm's startup floor subtracted.
 /// `spectral_norm` measures 0.95x and `fannkuch` 0.98x on the same change.
 ///
-/// ⛔ The loop-body half stays off, on wall time rather than on correctness.
-/// Admitting it declines nothing on 81 corpus fixtures and removes 49.4M of
-/// their 257.3M crossings — 19.2%, 41 fixtures moved, none the wrong way — and
-/// buys 0.74x on `short_circuit_value_local_kept` and 0.67x on
-/// `short_circuit_boxed_int_cross_fn`. It still costs 1.23x on `spectral_norm`,
-/// which sheds 99.7% of its own crossings and gets slower anyway, because
-/// admitting a region costs the owner a re-emission and taxes its fall-through
-/// path 18 ops on every iteration that does NOT fail the guard. A preamble
-/// guard's region is not on that fall-through, which is why the two halves
-/// separate.
+/// Loop-body non-header regions are placed outside the header `loop` (the
+/// same placement as preamble regions), so they do not tax the fall-through
+/// path. On by default; [`inline_nonheader_disable`] opts out.
 pub fn inline_nonheader_enable() {
     INLINE_NONHEADER_ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Restore the pre-default policy: only preamble non-header regions merge.
+pub fn inline_nonheader_disable() {
+    INLINE_NONHEADER_ENABLED.store(false, Ordering::Relaxed);
 }
 
 fn inline_nonheader_enabled() -> bool {
@@ -962,6 +961,12 @@ fn stamp_and_publish_label_targets(
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 
+thread_local! {
+    /// Cranelift/dynasm `JIT_THREADLOCAL_SLOTS` parity: `THREADLOCALREF_GET`
+    /// indexes this array by byte offset / 8.
+    static JIT_THREADLOCAL_SLOTS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Residual-call scratch shared by emitted wasm and the host trampoline.
 /// Trampoline use is strictly LIFO: the host materialises every argument
 /// before invoking the callee, and the guest loads the result immediately on
@@ -1021,6 +1026,27 @@ pub fn jit_exc_type_addr() -> usize {
 /// Address of `JIT_CALL_AREA`, embedded as an immediate in JIT-emitted wasm.
 pub fn jit_call_area_addr() -> usize {
     &JIT_CALL_AREA as *const _ as usize
+}
+
+/// Read a thread-local slot at the given byte offset.
+pub extern "C" fn wasm_jit_threadlocalref_get(offset: i64) -> i64 {
+    JIT_THREADLOCAL_SLOTS.with(|slots| {
+        let slots = slots.borrow();
+        let idx = (offset / 8) as usize;
+        slots.get(idx).copied().unwrap_or(0)
+    })
+}
+
+/// Write a thread-local slot that compiled traces may read back.
+pub fn jit_threadlocalref_set(offset: i64, value: i64) {
+    JIT_THREADLOCAL_SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        let idx = (offset / 8) as usize;
+        if idx >= slots.len() {
+            slots.resize(idx + 1, 0);
+        }
+        slots[idx] = value;
+    });
 }
 
 /// The per-thread GC box, and the accessors every trampoline reaches it through.
@@ -1574,7 +1600,14 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
 /// where its collector could not see it. Returns `GcRef(0)` when no GC is
 /// bound, leaving the caller on its own path.
 fn wasm_alloc_nursery_headerless_no_collect(size: usize) -> GcRef {
-    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_headerless_no_collect(size)).unwrap_or(GcRef(0))
+    let obj = with_wasm_active_gc_mut(|gc| gc.alloc_nursery_headerless_no_collect(size))
+        .unwrap_or(GcRef(0));
+    if !obj.is_null() && size != 0 {
+        unsafe {
+            core::ptr::write_bytes(obj.0 as *mut u8, 0, size);
+        }
+    }
+    obj
 }
 
 /// Placement-reporting companion of [`wasm_alloc_nursery_typed`].
@@ -1732,7 +1765,65 @@ pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
         gc.alloc_nursery_typed(type_id as u32, size as usize).0 as i64
     })
     .unwrap_or(0);
+    zero_alloc_payload(obj, size as usize);
     oom_signal_if_zero(obj)
+}
+
+/// Headerless nursery overflow helper. Returns the raw allocation base with
+/// no GC header, matching cranelift's `gc_alloc_nursery_headerless_shim`.
+pub extern "C" fn wasm_jit_alloc_headerless(size: i64) -> i64 {
+    let Ok(size) = usize::try_from(size) else {
+        return oom_signal_if_zero(0);
+    };
+    if size == 0 {
+        return oom_signal_if_zero(0);
+    }
+    let size = size.saturating_add(7) & !7;
+    let obj = with_wasm_active_gc_mut(|gc| {
+        if let Some(base) = try_headerless_nursery_bump(gc, size) {
+            return base as i64;
+        }
+        gc.collect_nursery();
+        if let Some(base) = try_headerless_nursery_bump(gc, size) {
+            return base as i64;
+        }
+        0
+    })
+    .unwrap_or(0);
+    if obj != 0 && size != 0 {
+        unsafe {
+            core::ptr::write_bytes(obj as *mut u8, 0, size);
+        }
+    }
+    oom_signal_if_zero(obj)
+}
+
+fn try_headerless_nursery_bump(gc: &mut dyn majit_gc::GcAllocator, size: usize) -> Option<usize> {
+    let nf_addr = gc.nursery_free_addr();
+    let nt_addr = gc.nursery_top_addr();
+    if nf_addr == 0 || nt_addr == 0 {
+        return None;
+    }
+    unsafe {
+        let nf = nf_addr as *mut usize;
+        let nt = nt_addr as *const usize;
+        let free = nf.read();
+        let top = nt.read();
+        let new_free = free.checked_add(size)?;
+        if new_free > top {
+            return None;
+        }
+        nf.write(new_free);
+        Some(free)
+    }
+}
+
+fn zero_alloc_payload(obj: i64, payload: usize) {
+    if obj != 0 && payload != 0 {
+        unsafe {
+            core::ptr::write_bytes(obj as *mut u8, 0, payload);
+        }
+    }
 }
 
 /// JIT-trace variable-size allocation trampoline target for `NewArray` /
@@ -1757,16 +1848,17 @@ pub extern "C" fn wasm_jit_alloc_array(
             item_size as usize,
             length,
         );
-        if obj.is_null() {
-            0
-        } else {
-            unsafe {
-                *((obj.0 as *mut u8).add(len_offset as usize) as *mut usize) = length;
-            }
-            obj.0 as i64
-        }
+        if obj.is_null() { 0 } else { obj.0 as i64 }
     })
     .unwrap_or(0);
+    if obj != 0 {
+        let payload =
+            (base_size as usize).saturating_add((item_size as usize).saturating_mul(length));
+        zero_alloc_payload(obj, payload);
+        unsafe {
+            *((obj as *mut u8).add(len_offset as usize) as *mut usize) = length;
+        }
+    }
     oom_signal_if_zero(obj)
 }
 
@@ -1834,6 +1926,8 @@ fn alloc_helpers() -> codegen::AllocHelpers {
         new_array_fn_ptr: wasm_jit_alloc_array as *const () as usize as i64,
         new_oldgen_fn_ptr: wasm_jit_alloc_oldgen as *const () as usize as i64,
         new_array_oldgen_fn_ptr: wasm_jit_alloc_array_oldgen as *const () as usize as i64,
+        headerless_fn_ptr: wasm_jit_alloc_headerless as *const () as usize as i64,
+        threadlocal_fn_ptr: wasm_jit_threadlocalref_get as *const () as usize as i64,
         fmod_fn_ptr: wasm_jit_fmod as *const () as usize as i64,
     }
 }
@@ -1907,15 +2001,23 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
     // own execution. Steady recursive frames die young; only frames that live
     // through a collection are promoted instead of inflating the old-gen major
     // collection threshold on every call.
-    let jf_ref = with_wasm_active_gc_mut(|gc| {
-        gc.alloc_nursery_typed(wasm_jitframe_tid(), JitFrame::alloc_size(depth))
-    })
-    .unwrap_or(GcRef(0));
+    let alloc_size = JitFrame::alloc_size(depth);
+    let jf_ref =
+        with_wasm_active_gc_mut(|gc| gc.alloc_nursery_typed(wasm_jitframe_tid(), alloc_size))
+            .unwrap_or(GcRef(0));
     if jf_ref.0 == 0 {
-        return 0;
+        return oom_signal_if_zero(0);
     }
     let jf = jf_ref.0 as *mut JitFrame;
     unsafe {
+        // `JitFrame::init` requires a zeroed fixed header. Native execute
+        // uses calloc; wasm used to get the same from nursery reset. Reset
+        // now leaves recycled bytes dirty (`malloc_zero_filled = False`),
+        // and wasm skips rewrite's `emit_setfield` zeros of jf_descr /
+        // jf_force_descr / jf_savedata / jf_guard_exc / jf_forward. A
+        // leftover word in those slots is traced as a young object or
+        // decoded as a fail-index by `install_post_finish_force_gcmap`.
+        std::ptr::write_bytes(jf as *mut u8, 0, alloc_size);
         JitFrame::init(jf, std::ptr::null(), depth);
         (*jf).jf_gcmap = gcmap_ptr as *const u8;
     }
@@ -1936,6 +2038,9 @@ pub extern "C" fn wasm_jit_ca_pop_frame(_items_base: i64) -> i64 {
     // generated caller last refreshed its callee local. The shadow-stack root
     // is forwarded by that collection; the argument may still name old space.
     let jf = majit_gc::shadow_stack::jf_top_ptr().0 as *mut majit_backend::jitframe::JitFrame;
+    if jf.is_null() {
+        return 0;
+    }
     install_post_finish_force_gcmap(jf);
     wasm_jit_write_barrier(jf as i64);
     majit_gc::shadow_stack::pop_jf_top();
@@ -1962,35 +2067,28 @@ pub extern "C" fn wasm_jit_ca_reload_caller_frame() -> i64 {
         + majit_backend::jitframe::FIRST_ITEM_OFFSET as i64
 }
 
-/// Build the per-frame `jf_gcmap` for a CA callee frame: mark the input slots
-/// (at `FRAME_SLOT_BASE`) and the home slots (at `HOME_SLOT_BASE`), in the
-/// `JitFrame`'s Signed-granular item indexing (see [`build_home_gcmap`] for the
-/// wasm32 layout). The collector's `is_nursery_object_start` gate skips any
-/// marked slot that does not hold a live nursery object base, so a slot holding
-/// a scalar or an already-promoted Ref is traced harmlessly.
+/// Build the per-frame `jf_gcmap` for a CA callee frame: mark only the home
+/// slots, in the `JitFrame`'s Signed-granular item indexing (see
+/// [`build_home_gcmap`] for the wasm32 layout).
+///
+/// Ref inputs are copied into those homes in the callee prologue before any
+/// later allocation. `FRAME_SLOT_BASE` is the value/fail-arg area and is
+/// reused by guard spills, so a static bit there would offer the collector an
+/// integer. `is_nursery_object_start` is only `non-null && in nursery`, so
+/// that integer is copied as an object if it happens to land in range.
 ///
 /// Returned buffer is leaked by the caller (one per bridge) and lives for the
 /// program's life.
-fn build_callee_gcmap(
-    input_types: &[majit_ir::Type],
-    frame: codegen::FrameGeometry,
-) -> Box<[usize]> {
+fn build_callee_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;
-    let mut indices: Vec<usize> = Vec::with_capacity(input_types.len() + frame.home_slots);
-    for (i, &tp) in input_types.iter().enumerate() {
-        if tp == majit_ir::Type::Ref {
-            indices.push((codegen::FRAME_SLOT_BASE as usize + i * 8) / sign);
-        }
-    }
+    let mut indices: Vec<usize> = Vec::with_capacity(frame.home_slots);
     for h in 0..frame.home_slots {
         indices.push((frame.home_slot_base as usize + h * 8) / sign);
     }
     let max_index = indices.iter().copied().max().unwrap_or(0);
     // `wasm_jit_ca_alloc_frame` sets `jf_frame` from `ca_frame_bytes`, not the
-    // full geometry. Inputs and homes must therefore fit that actual item
-    // allocation; fail/deopt outputs live in the low value slots and are
-    // covered by the same bound.
+    // full geometry. Homes must therefore fit that actual item allocation.
     debug_assert!(
         max_index < frame.ca_frame_bytes as usize / sign,
         "CA gcmap exceeds the allocated JitFrame item area"
@@ -2103,6 +2201,8 @@ pub struct WasmBackend {
     /// tokens are held for the backend's life and give `used` back with it.
     asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
     trace_counter: u64,
+    /// One-shot header PC the metainterp publishes before `compile_loop`.
+    next_header_pc: u64,
     /// Optimizer constant pool (constant-namespace OpRef → i64 value).
     constants: indexmap::IndexMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
@@ -2623,6 +2723,7 @@ impl WasmBackend {
             asm_memory_stats: std::sync::Arc::new(majit_backend::AsmMemoryManagerStats::default()),
             asm_memory_blocks: Vec::new(),
             trace_counter: 0,
+            next_header_pc: 0,
             constants: indexmap::IndexMap::new(),
             vtable_offset: None,
         }
@@ -2854,14 +2955,41 @@ impl WasmBackend {
             return;
         };
         diag_bump(55);
-        let PendingInline { owner, region } = pending;
-        let source_fail_index = region.source_fail_index;
-        if !self.install_inline_region(&owner, region) {
-            // The probe cleared the dispatch cell to get here. A merge that
-            // does not install leaves the out-of-line bridge as the only route
-            // to that guard, so put the cell back rather than leave the guard
-            // bailing to the host for the rest of the run.
-            Self::restore_dispatch_cell(&owner, source_fail_index);
+        let owner = pending.owner.clone();
+        let mut regions = vec![pending.region];
+        // Other trips for this owner would each re-emit the whole module.
+        // Fold them into this rebuild so one Cranelift compile covers them.
+        let extra_ids: Vec<i64> = TRIPPED_INLINES.with(|tripped| {
+            let mut queue = tripped.borrow_mut();
+            let mut keep = Vec::new();
+            let mut extra = Vec::new();
+            for id in queue.drain(..) {
+                let same_owner = PENDING_INLINES.with(|pending| {
+                    pending
+                        .borrow()
+                        .get(&id)
+                        .is_some_and(|item| Arc::ptr_eq(&item.owner, &owner))
+                });
+                if same_owner {
+                    extra.push(id);
+                } else {
+                    keep.push(id);
+                }
+            }
+            *queue = keep;
+            extra
+        });
+        for id in extra_ids {
+            diag_bump(55);
+            if let Some(item) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&id)) {
+                regions.push(item.region);
+            }
+        }
+        let fail_indices: Vec<u32> = regions.iter().map(|r| r.source_fail_index).collect();
+        if !self.install_inline_region_batch(&owner, regions) {
+            for source_fail_index in fail_indices {
+                Self::restore_dispatch_cell(&owner, source_fail_index);
+            }
         }
     }
 
@@ -2898,8 +3026,19 @@ impl WasmBackend {
     fn install_inline_region(
         &mut self,
         owner: &JitCellToken,
-        mut region: codegen::InlinedBridge,
+        region: codegen::InlinedBridge,
     ) -> bool {
+        self.install_inline_region_batch(owner, vec![region])
+    }
+
+    fn install_inline_region_batch(
+        &mut self,
+        owner: &JitCellToken,
+        regions: Vec<codegen::InlinedBridge>,
+    ) -> bool {
+        if regions.is_empty() {
+            return true;
+        }
         if owner.is_invalidated() {
             diag_bump(50);
             return false;
@@ -2915,24 +3054,33 @@ impl WasmBackend {
             diag_bump(35);
             return false;
         };
-        let source_fail_index = region.source_fail_index;
-        if candidate
-            .inlined_bridges
-            .iter()
-            .any(|r| r.source_fail_index == source_fail_index)
-        {
-            diag_bump(36);
+        let mut attached = 0usize;
+        for mut region in regions {
+            let source_fail_index = region.source_fail_index;
+            if candidate
+                .inlined_bridges
+                .iter()
+                .any(|r| r.source_fail_index == source_fail_index)
+            {
+                diag_bump(36);
+                continue;
+            }
+            // Re-decided here rather than carried: the candidate may have taken
+            // more regions since, and the placement depends on them. Keep a
+            // non-header region's own outside placement so a deferred install
+            // cannot drop it back inside the loop.
+            region.outside_loop = region.outside_loop
+                || codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
+                || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
+            if region.outside_loop {
+                diag_bump(52);
+            }
+            candidate.inlined_bridges.push(region);
+            attached += 1;
+        }
+        if attached == 0 {
             return false;
         }
-        // Re-decided here rather than carried: the candidate may have taken
-        // more regions since, and the placement depends on them.
-        region.outside_loop =
-            codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
-                || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
-        if region.outside_loop {
-            diag_bump(52);
-        }
-        candidate.inlined_bridges.push(region);
         let mut merged_ops = candidate.ops.clone();
         for region in &candidate.inlined_bridges {
             merged_ops.extend(region.ops.iter().cloned());
@@ -2949,19 +3097,31 @@ impl WasmBackend {
         candidate.classptr_to_typeid = self.collect_classptr_typeid_table(&merged_ops);
         candidate.guard_gc_type_info = self.collect_guard_gc_type_info(&merged_ops);
         candidate.nursery = nursery_alloc_params(&merged_ops);
-        // The merged region supersedes the bridge's own dispatch cell. Remove
-        // it before reemit so the fresh array cannot replay a contradictory
+        // The merged regions supersede their own dispatch cells. Remove
+        // them before reemit so the fresh array cannot replay a contradictory
         // slot — the bridge on the stack right now finishes its pass either
         // way, and nothing enters it again.
         let source_cells_base = source_loop.bridge_cells_base.get();
-        let old_bridge_slot = source_loop
-            .bridge_slots
-            .borrow_mut()
-            .remove(&source_fail_index);
-        #[cfg(target_arch = "wasm32")]
-        if source_cells_base != 0 {
-            let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
-            unsafe { core::ptr::write(cell, 0) };
+        let attached_fail_indices: Vec<u32> = candidate.inlined_bridges
+            [candidate.inlined_bridges.len() - attached..]
+            .iter()
+            .map(|region| region.source_fail_index)
+            .collect();
+        let mut old_bridge_slots = Vec::new();
+        for &source_fail_index in &attached_fail_indices {
+            if let Some(slot) = source_loop
+                .bridge_slots
+                .borrow_mut()
+                .remove(&source_fail_index)
+            {
+                old_bridge_slots.push((source_fail_index, slot));
+            }
+            #[cfg(target_arch = "wasm32")]
+            if source_cells_base != 0 {
+                let cell =
+                    (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
+                unsafe { core::ptr::write(cell, 0) };
+            }
         }
         // Eligibility IS the emission: `reemit_loop` runs the same
         // `build_wasm_module` over the same candidate, and nothing it does
@@ -2973,7 +3133,9 @@ impl WasmBackend {
         match self.reemit_loop(owner) {
             Ok(()) => {
                 diag_bump(31);
-                diag_bump(32);
+                for _ in 0..attached {
+                    diag_bump(32);
+                }
                 // The region runs from the owner's module, so its
                 // `GUARD_NOT_INVALIDATED` reads the owner's root flag. Name that
                 // as this compile's generation, or the quasi-immutable
@@ -2984,7 +3146,7 @@ impl WasmBackend {
             }
             Err(error) => {
                 source_loop.reemit.replace(old_inputs);
-                if let Some(slot) = old_bridge_slot {
+                for (source_fail_index, slot) in old_bridge_slots {
                     source_loop
                         .bridge_slots
                         .borrow_mut()
@@ -2995,6 +3157,7 @@ impl WasmBackend {
                             as *mut u32;
                         unsafe { core::ptr::write(cell, slot) };
                     }
+                    let _ = source_fail_index;
                 }
                 record_inline_trial_error(&error);
                 classify_inline_install_error(&error);
@@ -3689,6 +3852,15 @@ fn install_post_finish_force_gcmap(jf: *mut majit_backend::jitframe::JitFrame) {
     unsafe { (*jf).jf_gcmap = fail_descr.force_gcmap_ptr as *const u8 };
 }
 
+/// Drop the host execution root the way `wasm_jit_ca_pop_frame` drops a
+/// callee: remember the (old-gen) frame so a virtualizable token that still
+/// points at it can find young homes after the shadow-stack root is gone.
+#[cfg(any(target_arch = "wasm32", test))]
+fn remember_and_drop_execution_frame(jf: *mut majit_backend::jitframe::JitFrame, saved: usize) {
+    wasm_jit_write_barrier(jf as i64);
+    majit_gc::shadow_stack::pop_jf_to(saved);
+}
+
 impl majit_backend::Backend for WasmBackend {
     /// `force(token)` where the token is what `FORCE_TOKEN` parked in the
     /// virtualizable: the running frame's `JitFrame`, whose data region starts
@@ -3890,6 +4062,7 @@ impl majit_backend::Backend for WasmBackend {
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
         diag_bump(23);
+        let _header_pc = std::mem::take(&mut self.next_header_pc);
         // `x86/assembler.py:514` parity — bump
         // `cpu.tracker.total_compiled_loops` at the same point PyPy
         // creates the `CompiledLoopToken`.
@@ -3951,6 +4124,10 @@ impl majit_backend::Backend for WasmBackend {
                 label_ref_slots,
             ),
         };
+        // Leaked before codegen so the key-0 prologue can publish it after
+        // nulling the frozen home region, instead of the CA bump filling
+        // the whole item area.
+        let home_gcmap_ptr = Box::leak(build_home_gcmap(frame)).as_ptr() as *const usize as usize;
         // `x86/assembler.py::assemble_loop` installs the generated frame
         // depth on the token's `CompiledLoopToken.frame_info`.  CALL_ASSEMBLER
         // redirect later propagates the replacement depth through that exact
@@ -4034,6 +4211,7 @@ impl majit_backend::Backend for WasmBackend {
                 || codegen::CaParams {
                     ca_reload_fn_ptr: body_reload_fn_ptr(),
                     jf_top_addr: jf_top_addr(),
+                    entry_gcmap_ptr: home_gcmap_ptr as i64,
                     ..codegen::CaParams::default()
                 },
                 |targets| codegen::CaParams {
@@ -4047,6 +4225,7 @@ impl majit_backend::Backend for WasmBackend {
                         as i64,
                     inline: ca_inline_params(ca_max_frame_bytes(targets)),
                     jf_top_addr: jf_top_addr(),
+                    entry_gcmap_ptr: home_gcmap_ptr as i64,
                 },
             ),
         };
@@ -4170,7 +4349,6 @@ impl majit_backend::Backend for WasmBackend {
         // GUARD_NOT_FORCED_2 frame can be reached through a virtualizable token
         // after the host deadframe wrapper has returned, so this map cannot be
         // scoped to one `execute_token` call.
-        let home_gcmap_ptr = Box::leak(build_home_gcmap(frame)).as_ptr() as *const usize as usize;
 
         let compiled = CompiledWasmLoop {
             token_number: token.number,
@@ -4247,9 +4425,7 @@ impl majit_backend::Backend for WasmBackend {
                     .find(|(target_token, _)| *target_token == token.number)
                     .map(|(_, target)| target.callee_gcmap_ptr)
             })
-            .unwrap_or_else(|| {
-                Box::leak(build_callee_gcmap(&compiled.input_types, compiled.frame)).as_ptr() as i64
-            });
+            .unwrap_or_else(|| Box::leak(build_callee_gcmap(compiled.frame)).as_ptr() as i64);
         // The module has now acquired its host-appended shared-table slot and
         // its finish index. Publish those mutable pieces before exposing the
         // immutable geometry metadata: previously compiled CALL_ASSEMBLER
@@ -4324,8 +4500,9 @@ impl majit_backend::Backend for WasmBackend {
         failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_EXC, descr);
     }
 
-    // `set_next_header_pc` uses the trait default (no-op) — wasm does
-    // not currently honour it.
+    fn set_next_header_pc(&mut self, header_pc: u64) {
+        self.next_header_pc = header_pc;
+    }
 
     fn compile_bridge(
         &mut self,
@@ -4704,7 +4881,7 @@ impl majit_backend::Backend for WasmBackend {
             });
         // Set by the inline block below to the owner of a merge candidate whose
         // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
-        let mut defer_inline: Option<(Arc<JitCellToken>, u32)> = None;
+        let mut defer_inline: Option<(Arc<JitCellToken>, u32, bool)> = None;
         if inline_bridge_enabled() {
             // `model.py`: a bridge compiled after `invalidate_loop`
             // starts valid, and only a later invalidation activates its
@@ -4789,10 +4966,9 @@ impl majit_backend::Backend for WasmBackend {
                     && !inline_nonheader_enabled()
                 {
                     // Resuming at the header lets a region inside the `loop`
-                    // `br` straight to it. Resuming at an earlier LABEL from
-                    // there goes through the `loop`-wrapped dispatch, which is
-                    // correct but opt-in (`inline_nonheader_enable`) until it is
-                    // worth its re-emission.
+                    // `br` straight to it. Resuming at an earlier LABEL is
+                    // placed outside the header loop (no fall-through tax)
+                    // and is on by default.
                     diag_bump(38);
                     decline("not_header");
                 } else if inline_trip_helper_slot() == 0 {
@@ -4814,6 +4990,7 @@ impl majit_backend::Backend for WasmBackend {
                     // costs the later region its `br` to the header and not the
                     // merge.
                     let outside_loop = source_in_preamble
+                        || !resumes_at_loop_header
                         || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
                     // The `is_none` arm above already declined, so this holds.
                     let Some(merged_fail_index) = merged_source_fail_index else {
@@ -4864,7 +5041,7 @@ impl majit_backend::Backend for WasmBackend {
                         // bypasses that cost decision entirely. Everything else
                         // about this compile is the ordinary out-of-line path
                         // below.
-                        defer_inline = Some((owner, merged_fail_index));
+                        defer_inline = Some((owner, merged_fail_index, outside_loop));
                         diag_bump(54);
                         decline("deferred");
                     } else if region_external.is_some() {
@@ -4969,6 +5146,7 @@ impl majit_backend::Backend for WasmBackend {
                 // per-op callee frame in this trace.
                 inline: ca_inline_params(ca_max_frame_bytes(targets)),
                 jf_top_addr: jf_top_addr(),
+                ..codegen::CaParams::default()
             }
         } else {
             codegen::CaParams {
@@ -4982,16 +5160,17 @@ impl majit_backend::Backend for WasmBackend {
         // the sub-bridges chained onto this bridge's guards
         // (`chained_bridge_slots`, keyed by that id) are replayed into the
         // merged region's cells when the owner is finally rebuilt.
-        let inline_trip = defer_inline.map(|(owner, merged_fail_index)| {
+        let inline_trip = defer_inline.map(|(owner, merged_fail_index, outside_loop)| {
             if region_external.is_some() {
                 diag_bump(51);
             }
             let region = codegen::InlinedBridge {
                 source_fail_index: merged_fail_index,
                 external_jump: region_external.clone(),
-                // Decided against the candidate as it stands when the merge
-                // actually runs, which may have taken more regions by then.
-                outside_loop: false,
+                // This region's own placement (`!resumes_at_loop_header` /
+                // preamble) cannot change later. Install still ORs in any
+                // outside sibling that landed first.
+                outside_loop,
                 trace_id,
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                 ops: ops_owned.clone(),
@@ -5427,9 +5606,8 @@ impl majit_backend::Backend for WasmBackend {
                 assert!(jf_ref.0 != 0, "wasm JitFrame allocation failed");
                 let jf = jf_ref.0 as *mut JitFrame;
                 // `JitFrame::init` requires zero-filled storage, which the
-                // native `calloc` entry (`runner.rs` `execute_token`) and the
-                // wasm nursery reset (`nursery.rs` `reset`) both provide but
-                // the old-gen arena does not — `ArenaCollection::malloc`
+                // native `calloc` entry (`runner.rs` `execute_token`) provides
+                // but the old-gen arena does not — `ArenaCollection::malloc`
                 // deliberately returns recycled bytes. `build_home_gcmap`
                 // marks every Ref home of the frozen geometry, so a home the
                 // trace has not defined yet when a collection lands must read
@@ -5477,7 +5655,7 @@ impl majit_backend::Backend for WasmBackend {
                 // virtualizable token is an independent edge to this JITFRAME;
                 // its lazy force may arrive after the execution root is gone.
                 install_post_finish_force_gcmap(jf);
-                majit_gc::shadow_stack::pop_jf_to(saved);
+                remember_and_drop_execution_frame(jf, saved);
 
                 return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
             }
@@ -5807,6 +5985,69 @@ mod tests {
         }
     }
 
+    fn gcmap_has_index(buf: &[usize], index: usize) -> bool {
+        let bits = usize::BITS as usize;
+        let word = 1 + index / bits;
+        word < buf.len() && buf[word] & (1usize << (index % bits)) != 0
+    }
+
+    #[test]
+    fn callee_gcmap_marks_homes_not_overwritable_input_slots() {
+        // FRAME_SLOT_BASE is the value/fail-arg area. A static gcmap bit there
+        // stays set after a guard spill overwrites the slot with an integer,
+        // and `is_nursery_object_start` is only a nursery range check.
+        let frame = codegen::FrameGeometry::compact(4, 2, 0);
+        let buf = build_callee_gcmap(frame);
+        let sign = std::mem::size_of::<isize>();
+        let input0 = codegen::FRAME_SLOT_BASE as usize / sign;
+        let home0 = frame.home_slot_base as usize / sign;
+        let home1 = (frame.home_slot_base as usize + 8) / sign;
+        assert!(
+            !gcmap_has_index(&buf, input0),
+            "Ref input slot {input0} must not stay marked; fail-arg spills reuse it"
+        );
+        assert!(gcmap_has_index(&buf, home0), "home 0 (item {home0})");
+        assert!(gcmap_has_index(&buf, home1), "home 1 (item {home1})");
+    }
+
+    #[test]
+    fn headerless_helper_rejects_non_positive_size() {
+        let gc = MiniMarkGC::new();
+        install_gc_box(Box::new(gc));
+        assert_eq!(wasm_jit_alloc_headerless(-1), 0);
+        assert_eq!(wasm_jit_alloc_headerless(0), 0);
+    }
+
+    #[test]
+    fn ca_alloc_frame_zeros_recycled_nursery_bytes() {
+        use majit_backend::jitframe::{JitFrame, jitframe_type_info};
+        use majit_gc::GcAllocator;
+
+        let mut gc = MiniMarkGC::new();
+        let tid = gc.register_type(jitframe_type_info());
+        let poison = gc.alloc_nursery_typed(tid, JitFrame::alloc_size(1));
+        assert_ne!(poison.0, 0);
+        unsafe {
+            std::ptr::write_bytes(poison.0 as *mut u8, 0xAA, JitFrame::alloc_size(1));
+        }
+        gc.collect_nursery();
+
+        set_wasm_jitframe_tid(tid);
+        install_gc_box(Box::new(gc));
+        let frame = wasm_jit_ca_alloc_frame(std::mem::size_of::<isize>() as i64, 0);
+        assert_ne!(frame, 0);
+        unsafe {
+            let jf = frame as *const JitFrame;
+            assert_eq!((*jf).jf_descr, 0);
+            assert_eq!((*jf).jf_force_descr, 0);
+            assert_eq!((*jf).jf_savedata, 0);
+            assert_eq!((*jf).jf_guard_exc, 0);
+            assert!((*jf).jf_forward.is_null());
+        }
+        wasm_jit_ca_pop_frame(0);
+        set_wasm_jitframe_tid(0);
+    }
+
     #[test]
     fn typed_blackhole_allocation_never_falls_back_to_raw_memory() {
         // No active wasm GC is installed on this test thread.  A typed descr
@@ -6052,5 +6293,42 @@ mod tests {
         // in place, so a wasm local holding frame_ptr would remain valid.
         let len_after = unsafe { *((frame_ptr as *const u8).add(JF_FRAME_OFS) as *const isize) };
         assert_eq!(len_after, depth as isize, "old-gen frame moved/corrupted");
+    }
+
+    /// Host `execute_token` pops the old-gen JitFrame after FINISH. A
+    /// virtualizable token may still hold that frame, so the pop must
+    /// remember it first — the same footer `wasm_jit_ca_pop_frame` already
+    /// runs. Without the barrier the next minor collection never walks the
+    /// homes and a recycled nursery address is left in a gcmap slot.
+    #[test]
+    fn oldgen_jitframe_must_be_remembered_before_host_pop() {
+        use majit_backend::jitframe::{
+            FIRST_ITEM_OFFSET, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
+        };
+        use majit_gc::GcAllocator;
+
+        let mut gc = MiniMarkGC::new();
+        let jf_tid = gc.register_type(jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let frame = gc.alloc_oldgen_typed(jf_tid, JitFrame::alloc_size(2));
+        let frame_ptr = frame.0 as *mut JitFrame;
+        unsafe { JitFrame::init(frame_ptr, std::ptr::null(), 2) };
+        let young_before = gc.alloc_nursery_typed(payload_tid, 16).0;
+        let gcmap: [usize; 2] = [1, 0b1];
+        unsafe {
+            *((frame_ptr as *mut u8).add(FIRST_ITEM_OFFSET) as *mut usize) = young_before;
+            *((frame_ptr as *mut u8).add(JF_GCMAP_OFS as usize) as *mut *const u8) =
+                gcmap.as_ptr() as *const u8;
+        }
+        install_gc_box(Box::new(gc));
+        let saved = majit_gc::shadow_stack::push_jf(frame);
+        remember_and_drop_execution_frame(frame_ptr, saved);
+        with_wasm_active_gc_mut(|gc| gc.collect_nursery());
+        let item0 = unsafe { *((frame_ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const usize) };
+        assert_ne!(item0, 0, "young home cleared after host pop");
+        assert_ne!(
+            item0, young_before,
+            "young home not forwarded: frame was not in the remembered set"
+        );
     }
 }

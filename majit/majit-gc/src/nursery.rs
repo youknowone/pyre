@@ -257,27 +257,10 @@ impl Nursery {
     /// sites initialize their own GC-pointer fields.  Poison mode mirrors
     /// llarena.py mode 3 for detecting violations of that contract.
     ///
-    /// WASM-ONLY ADAPTATION, paired with `MiniMarkGC::clear_nursery_substitute`.
-    /// The wasm backend runs no part of `GcRewriterImpl` — the omission is
-    /// total rather than selective by allocation shape — and lowers `New`,
-    /// `NewArray`, the `non_moving` old-gen routing and the write barrier in
-    /// its own codegen instead. Two of the pass's zeroing duties go with it:
-    /// the `clear_gc_fields` NULL stores that follow `handle_new`, and the
-    /// clear half of `NewArrayClear`, which wasm lowers exactly like
-    /// `NewArray` — `wasm_jit_alloc_array` stamps the length and nothing
-    /// else. Zero-filling the recycled bytes is what makes both hold. The
-    /// `ZeroArray` that pass would have emitted never arrives, and the wasm
-    /// codegen declines a trace carrying one rather than lean on this arm.
-    /// The rewrite module's other half, `remove_ref_constants`, does run on
-    /// wasm, so "skips the GC rewrite" names `GcRewriterImpl` and not the
-    /// module.
-    ///
-    /// Deleting this arm takes either the whole pass — which additionally
-    /// needs a `ZeroArray` lowering and a descr-carrying `GC_LOAD`/`GC_STORE`
-    /// lowering, the arm that panics today — or explicit initialization at
-    /// four sites: the `New` and `NewArray` inline nursery bumps and the
-    /// `wasm_jit_alloc` / `wasm_jit_alloc_array` helpers.
-    /// `clear_nursery_substitute` goes at the same time, not before.
+    /// Allocation sites initialize their own payload. The wasm backend
+    /// skips `GcRewriterImpl.clear_gc_fields`, so its `New*` / `NewArray*`
+    /// bumps and `wasm_jit_alloc*` helpers emit `memory.fill` / `write_bytes`
+    /// themselves. Recycled nursery bytes stay dirty, matching native.
     pub fn reset(&mut self) {
         self.reset_range(self.start as usize, self.start as usize + self.size);
         self.ptrs.free = self.start;
@@ -286,9 +269,8 @@ impl Nursery {
     /// Reset one free range while leaving pinned-object bytes intact.
     ///
     /// `IncrementalMiniMarkGC._minor_collection` calls `arena_reset` once for
-    /// every gap between surviving pinned objects.  Keeping the range operation
-    /// here gives wasm the same zero-fill adaptation as [`Self::reset`] without
-    /// destroying the pinned objects that delimit those gaps.
+    /// every gap between surviving pinned objects. Poison mode fills the gap
+    /// with 0xAA; otherwise the bytes stay as the last occupant left them.
     pub fn reset_range(&mut self, start: usize, end: usize) {
         debug_assert!(start >= self.start as usize);
         debug_assert!(start <= end);
@@ -304,16 +286,9 @@ impl Nursery {
             return;
         }
         let (start, len) = (lo, hi - lo);
-        #[cfg(target_arch = "wasm32")]
-        unsafe {
-            ptr::write_bytes(start as *mut u8, 0, len);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if self.poison_on_reset {
-                unsafe {
-                    ptr::write_bytes(start as *mut u8, 0xAA, len);
-                }
+        if self.poison_on_reset {
+            unsafe {
+                ptr::write_bytes(start as *mut u8, 0xAA, len);
             }
         }
     }

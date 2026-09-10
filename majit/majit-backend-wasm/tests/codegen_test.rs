@@ -131,14 +131,10 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
         .unwrap_or_else(|err| panic!("invalid {name}= in wasm JIT stats: {err}\n{stderr}"))
 }
 
-/// CALL_ASSEMBLER must not refill a frame the allocator already zeroed.
-/// Two fills are expected:
-///
-/// - Entry prologues clear the current frame's GC Ref homes. #1683
-///   coalesces those stores into `memory.fill` on local 0.
-/// - The inline bump installs `build_callee_gcmap` before the callee
-///   writes homes, so it `memory.fill`s the `jf_frame` items. rewrite.py
-///   `gen_malloc_frame` only nulls the five GCREF header fields.
+/// CALL_ASSEMBLER must not refill a frame. The inline bump leaves
+/// `jf_gcmap` unset; the callee prologue nulls the frozen home region
+/// and then publishes the map. The only expected `memory.fill` is that
+/// entry home clear.
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
     let lines: Vec<_> = stderr.lines().map(str::trim).collect();
@@ -152,24 +148,9 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3] == "i32.add"
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
-        // Guest traces are wasm32: JitFrame is seven pointer fields plus
-        // the Signed length word, so FIRST_ITEM_OFFSET is 32. The length
-        // load is `WasmCaRuntimeTarget.callee_frame_bytes`.
-        let frame_bytes_load = format!(
-            "i64.load32_u offset={}",
-            majit_backend_wasm::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS
-        );
-        let is_ca_item_zero = index >= 7
-            && lines[index - 7].starts_with("local.get ")
-            && lines[index - 6] == "i32.const 32"
-            && lines[index - 5] == "i32.add"
-            && lines[index - 4] == "i32.const 0"
-            && lines[index - 3].starts_with("local.get ")
-            && lines[index - 2] == frame_bytes_load
-            && lines[index - 1] == "i32.wrap_i64";
         assert!(
-            is_entry_home_clear || is_ca_item_zero,
-            "recursive CA refilled a nursery frame instead of relying on its zeroed payload:\n{stderr}"
+            is_entry_home_clear,
+            "recursive CA filled a nursery frame on the bump path:\n{stderr}"
         );
     }
 }
@@ -2107,26 +2088,10 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         .0;
     validate_wasm(&bytes);
     let mut saw_nursery_free = false;
-    let mut saw_first_item = false;
-    let mut saw_frame_bytes_load = false;
     let mut saw_item_fill = false;
     count_operators(&bytes, |op| {
         if matches!(op, wasmparser::Operator::I32Const { value } if *value == nursery_free as i32) {
             saw_nursery_free = true;
-        }
-        if matches!(
-            op,
-            wasmparser::Operator::I32Const { value }
-                if *value == majit_backend::jitframe::FIRST_ITEM_OFFSET as i32
-        ) {
-            saw_first_item = true;
-        }
-        if matches!(
-            op,
-            wasmparser::Operator::I64Load32U { memarg }
-                if memarg.offset == majit_backend_wasm::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS
-        ) {
-            saw_frame_bytes_load = true;
         }
         if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
             saw_item_fill = true;
@@ -2137,8 +2102,69 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         "malloc_cond_varsize_frame must load nursery_free"
     );
     assert!(
-        saw_first_item && saw_frame_bytes_load && saw_item_fill,
-        "malloc_cond_varsize_frame must memory.fill jf_frame items from FIRST_ITEM_OFFSET for frame_bytes"
+        !saw_item_fill,
+        "inline CA bump must not memory.fill the item area; the callee publishes jf_gcmap after nulling the frozen home region"
+    );
+}
+
+/// `build_home_gcmap` marks every frozen home, not just this trace's live
+/// Ref homes. Recycled nursery bytes in the unused padding must be nulled
+/// before that map is published, or a later minor walk treats them as
+/// young objects (`invalid type_id` from an oldgen type-3 JitFrame).
+#[test]
+fn entry_prologue_nulls_the_frozen_home_region() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))])];
+    let frame = codegen::FrameGeometry::compact(64, 128, 2);
+    let home_fill_bytes = (frame.home_slots as i32) * 8;
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca: codegen::CaParams {
+            entry_gcmap_ptr: 0x1000,
+            ..codegen::CaParams::default()
+        },
+    };
+    let bytes = codegen::build_wasm_module(&inputs)
+        .expect("frozen-home entry prologue should compile")
+        .0;
+    validate_wasm(&bytes);
+    let mut last_i32 = None;
+    let mut fill_lengths = Vec::new();
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I32Const { value } => last_i32 = Some(*value),
+        wasmparser::Operator::MemoryFill { .. } => {
+            fill_lengths.push(last_i32.expect("memory.fill without a preceding i32.const"));
+        }
+        _ => {}
+    });
+    assert!(
+        fill_lengths.contains(&home_fill_bytes),
+        "key-0 must memory.fill the whole frozen home region ({home_fill_bytes} bytes); fills were {fill_lengths:?}"
+    );
+    assert!(
+        !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),
+        "must not refill ca_frame_bytes; fills were {fill_lengths:?}"
     );
 }
 
@@ -3562,6 +3588,113 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
     );
 }
 
+/// A preamble `LoadFromGcTable` used only as a later guard failarg is
+/// rematerialized at the spill. rewrite.py clears `gcrefs_recently_loaded`
+/// at LABEL, so the local is not a LABEL arg and is stale after the first
+/// collecting back edge — cranelift `resolve_failarg_opref`.
+#[test]
+fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::LoadFromGcTable,
+            &[OpRef::const_int(0)],
+            OpRef::ref_op(1),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(2)],
+            &[OpRef::ref_op(1), OpRef::int_op(2)],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]),
+    ];
+    let gc_table_base = 4096;
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(5, 3, 1),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+
+    let mut control_stack = Vec::new();
+    let mut gc_table_address_on_stack = false;
+    let mut loads_inside_loop = 0usize;
+    let mut loads_outside_loop = 0usize;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::Loop { .. } => {
+                        control_stack.push(true);
+                        gc_table_address_on_stack = false;
+                    }
+                    wasmparser::Operator::Block { .. } | wasmparser::Operator::If { .. } => {
+                        control_stack.push(false);
+                        gc_table_address_on_stack = false;
+                    }
+                    wasmparser::Operator::End => {
+                        control_stack.pop();
+                        gc_table_address_on_stack = false;
+                    }
+                    wasmparser::Operator::I32Const { value } if value == gc_table_base as i32 => {
+                        gc_table_address_on_stack = true;
+                    }
+                    wasmparser::Operator::I64Load32U { .. } if gc_table_address_on_stack => {
+                        if control_stack.contains(&true) {
+                            loads_inside_loop += 1;
+                        } else {
+                            loads_outside_loop += 1;
+                        }
+                        gc_table_address_on_stack = false;
+                    }
+                    _ => gc_table_address_on_stack = false,
+                }
+            }
+        }
+    }
+    assert_eq!(
+        loads_outside_loop, 1,
+        "the preamble LoadFromGcTable stays outside the loop"
+    );
+    assert_eq!(
+        loads_inside_loop, 1,
+        "the guard failarg must rematerialize the table load inside the loop"
+    );
+}
+
 #[test]
 fn test_peeled_label_captures_missing_ref_livein_in_frozen_frame() {
     let inputargs = vec![
@@ -4320,6 +4453,8 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
                 new_array_fn_ptr: NEW_ARRAY_FN,
                 new_oldgen_fn_ptr: NEW_OLDGEN_FN,
                 new_array_oldgen_fn_ptr: NEW_ARRAY_OLDGEN_FN,
+                headerless_fn_ptr: 0x55,
+                threadlocal_fn_ptr: 0x66,
                 fmod_fn_ptr: 0,
             },
             wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
@@ -7060,7 +7195,102 @@ fn fused_cond_call_n_consumes_the_comparison_i32() {
 }
 
 #[test]
-fn threadlocalref_get_does_not_read_an_unrelated_tls_allocation() {
+fn fused_cond_call_value_consumes_the_comparison_i32() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let compare = make_op(
+        OpCode::IntEq,
+        &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        OpRef::int_op(2),
+    );
+    let call = make_op(
+        OpCode::CondCallValueI,
+        &[
+            OpRef::int_op(2),
+            OpRef::const_int(0x30),
+            OpRef::input_arg_int(0),
+        ],
+        OpRef::int_op(3),
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0x5200_0000,
+        vec![Type::Int],
+        Type::Int,
+        true,
+        8,
+        EffectInfo::default(),
+    )));
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]);
+    let (bytes, _) = build_module_default(
+        &inputargs,
+        &[compare, call, finish],
+        &indexmap::IndexMap::new(),
+    );
+    validate_wasm(&bytes);
+
+    let mut seq: Vec<String> = Vec::new();
+    count_operators(&bytes, |op| seq.push(format!("{op:?}")));
+    let eq_at = seq
+        .iter()
+        .position(|o| o == "I64Eq")
+        .expect("the comparison must still be emitted");
+    assert_eq!(seq.iter().filter(|o| *o == "I64Eq").count(), 1);
+    assert_eq!(
+        seq.get(eq_at + 1).map(String::as_str),
+        Some("I64ExtendI32U"),
+        "fused CondCallValue consumes the comparison i32 directly: {seq:#?}"
+    );
+    assert!(
+        seq.get(eq_at + 2)
+            .is_some_and(|o| o.starts_with("LocalTee")),
+        "fused arm tees the result; unfused would LocalSet the compare: {seq:#?}"
+    );
+}
+
+#[test]
+fn fused_guard_isnull_uses_the_comparison_directly() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let compare = make_op(
+        OpCode::IntEq,
+        &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        OpRef::int_op(2),
+    );
+    let guard = make_guard(
+        OpCode::GuardIsnull,
+        &[OpRef::int_op(2)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
+    let (bytes, _) = build_module_default(
+        &inputargs,
+        &[compare, guard, finish],
+        &indexmap::IndexMap::new(),
+    );
+    validate_wasm(&bytes);
+    let mut i64_eq = 0;
+    let mut i64_extend = 0;
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eq => i64_eq += 1,
+        wasmparser::Operator::I64ExtendI32U => i64_extend += 1,
+        _ => {}
+    });
+    assert_eq!(i64_eq, 1);
+    assert_eq!(
+        i64_extend, 0,
+        "fused GuardIsnull must not materialize a local"
+    );
+}
+
+#[test]
+fn threadlocalref_get_lowers_through_the_tls_helper() {
     for offset in [-8, 0, 7, 8, 512, i64::MAX] {
         let mut inputs = inline_region_inputs(
             &[],
@@ -7075,10 +7305,19 @@ fn threadlocalref_get_does_not_read_an_unrelated_tls_allocation() {
             vec![],
         );
         inputs.inputargs = vec![InputArg::from_type(Type::Int, 0)];
-        assert!(matches!(
-            codegen::build_wasm_module(&inputs),
-            Err(majit_backend::BackendError::Unsupported(_))
-        ));
+        inputs.alloc.threadlocal_fn_ptr = 0x66;
+        let (bytes, _, _) =
+            codegen::build_wasm_module(&inputs).expect("ThreadlocalrefGet should lower");
+        validate_wasm(&bytes);
+
+        inputs.alloc.threadlocal_fn_ptr = 0;
+        assert!(
+            matches!(
+                codegen::build_wasm_module(&inputs),
+                Err(majit_backend::BackendError::Unsupported(_))
+            ),
+            "ThreadlocalrefGet must decline without a TLS helper"
+        );
     }
 }
 
@@ -7289,6 +7528,8 @@ fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInput
             new_array_fn_ptr: 0x22,
             new_oldgen_fn_ptr: 0x33,
             new_array_oldgen_fn_ptr: 0x44,
+            headerless_fn_ptr: 0x55,
+            threadlocal_fn_ptr: 0x66,
             fmod_fn_ptr: 0,
         },
         wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
@@ -7574,6 +7815,23 @@ fn call_malloc_nursery_uses_one_inline_bump() {
 }
 
 #[test]
+fn inline_nursery_new_zeros_its_payload() {
+    let inputs = nursery_new_inputs(vec![plain_new(1, 53), finish_int_arg0()], 53);
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    let mut fills = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
+            fills += 1;
+        }
+    });
+    assert!(
+        fills >= 1,
+        "inline New must memory.fill its payload instead of relying on a nursery reset fill"
+    );
+}
+
+#[test]
 fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
     let incr = make_op(
         OpCode::NurseryPtrIncrement,
@@ -7601,22 +7859,85 @@ fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
 }
 
 #[test]
-fn unlowered_call_malloc_nursery_variants_decline() {
-    for opcode in [
+fn call_malloc_nursery_variants_lower() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let headerless = make_op(
         OpCode::CallMallocNurseryHeaderless,
-        OpCode::CallMallocNurseryVarsize,
+        &[OpRef::const_int(32)],
+        OpRef::ref_op(1),
+    );
+    let inputs = nursery_new_inputs(vec![headerless, finish_int_arg0()], 53);
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("headerless should lower");
+    validate_wasm(&bytes);
+    assert_eq!(nursery_top_compare_count(&bytes), 1);
+    assert!(const_immediates(&bytes).contains(&0x55));
+
+    let headerless_odd = make_op(
+        OpCode::CallMallocNurseryHeaderless,
+        &[OpRef::const_int(20)],
+        OpRef::ref_op(1),
+    );
+    let inputs = nursery_new_inputs(vec![headerless_odd, finish_int_arg0()], 53);
+    let (bytes, _, _) =
+        codegen::build_wasm_module(&inputs).expect("unaligned headerless should lower");
+    validate_wasm(&bytes);
+    assert!(
+        const_immediates(&bytes).contains(&24),
+        "headerless bump must 8-align so the next header is aligned"
+    );
+
+    let frame = make_op(
         OpCode::CallMallocNurseryVarsizeFrame,
-    ] {
-        let op = make_op(opcode, &[OpRef::const_int(32)], OpRef::ref_op(1));
-        let inputs = nursery_new_inputs(vec![op, finish_int_arg0()], 53);
-        assert!(
-            matches!(
-                codegen::build_wasm_module(&inputs),
-                Err(majit_backend::BackendError::Unsupported(_))
-            ),
-            "{opcode:?} must decline until it has a malloc_cond arm"
-        );
-    }
+        &[OpRef::const_int(60)],
+        OpRef::ref_op(1),
+    );
+    let inputs = nursery_new_inputs(vec![frame, finish_int_arg0()], 53);
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize frame should lower");
+    validate_wasm(&bytes);
+    assert_eq!(nursery_top_compare_count(&bytes), 1);
+    assert!(const_immediates(&bytes).contains(&0x11));
+    assert!(
+        const_immediates(&bytes).contains(&64),
+        "odd jfi_frame_size must 8-align before the nursery bump"
+    );
+
+    let varsize = make_op(
+        OpCode::CallMallocNurseryVarsize,
+        &[
+            OpRef::const_int(0),
+            OpRef::const_int(8),
+            OpRef::const_int(4),
+        ],
+        OpRef::ref_op(1),
+    );
+    varsize.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 8, 53, Type::Int)));
+    let inputs = nursery_new_inputs(vec![varsize, finish_int_arg0()], 53);
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
+    validate_wasm(&bytes);
+    assert_eq!(nursery_top_compare_count(&bytes), 0);
+    assert!(const_immediates(&bytes).contains(&0x22));
+}
+
+#[test]
+fn newstr_without_a_descr_injects_the_builtin_layout() {
+    let newstr = make_op(OpCode::Newstr, &[OpRef::const_int(3)], OpRef::ref_op(1));
+    let inputs = nursery_new_inputs(vec![newstr, finish_int_arg0()], 53);
+    let (bytes, _, _) =
+        codegen::build_wasm_module(&inputs).expect("Newstr without descr should inject and lower");
+    validate_wasm(&bytes);
+    let immediates = const_immediates(&bytes);
+    assert!(
+        immediates.contains(&0x22),
+        "Newstr uses the array allocator"
+    );
+    let base_size = (2 * std::mem::size_of::<usize>() + 1) as i64;
+    let len_offset = std::mem::size_of::<usize>() as i64;
+    assert!(
+        immediates.contains(&base_size) && immediates.contains(&len_offset),
+        "the injected builtin str descr must supply the base size and length offset: {immediates:?}"
+    );
 }
 
 #[test]
