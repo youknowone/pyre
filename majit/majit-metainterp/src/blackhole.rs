@@ -1914,18 +1914,24 @@ impl BlackholeInterpreter {
         // callee — so no handler re-seats the frame it is dispatching in.
         let jitcode_arc = std::sync::Arc::clone(&self.jitcode);
         let code: &[u8] = &jitcode_arc.code;
+        // `blackhole.py` `dispatch_loop` keeps `position` as a loop local.
+        // Write `self.position` only when leaving the inlined match (return,
+        // INLINE_CALL, or the function-pointer fallback).
+        let mut position = self.position;
+        let live_hook_absent = LIVE_MARKER_HOOK.get().is_none();
         loop {
-            if self.position >= code.len() {
+            if position >= code.len() {
+                self.position = position;
                 if trace {
                     eprintln!(
                         "[bh-trace] finished at pos={} reg0={}",
-                        self.position,
+                        position,
                         self.registers_i.first().copied().unwrap_or(-1)
                     );
                 }
                 return BhRunOutcome::EndOfCode;
             }
-            let pos_before = self.position;
+            let pos_before = position;
             self.last_opcode_position = pos_before;
             if check_startpoints && let Some(startpoints) = self.jitcode.startpoints.as_ref() {
                 assert!(
@@ -1936,7 +1942,7 @@ impl BlackholeInterpreter {
                     self.jitcode.try_index(),
                 );
             }
-            let opcode = code[self.position];
+            let opcode = code[position];
             // The remaining `shift` epilogue at pc 210 is `-live-`,
             // `goto/L`, `goto_if_not`, `int_copy`, getfield/setfield of
             // `left`/`right`/`marked`/`empty`, `int_eq`/`int_add`,
@@ -1947,46 +1953,46 @@ impl BlackholeInterpreter {
             // mid-node PC.
             if !trace {
                 match opcode {
-                    jitcode::insns::BC_LIVE if LIVE_MARKER_HOOK.get().is_none() => {
-                        self.position += 1 + majit_translate::liveness::OFFSET_SIZE;
+                    jitcode::insns::BC_LIVE if live_hook_absent => {
+                        position += 1 + majit_translate::liveness::OFFSET_SIZE;
                         continue;
                     }
                     jitcode::insns::BC_JUMP => {
-                        let p = self.position + 1;
-                        self.position = (code[p] as usize) | ((code[p + 1] as usize) << 8);
+                        let p = position + 1;
+                        position = (code[p] as usize) | ((code[p + 1] as usize) << 8);
                         continue;
                     }
                     jitcode::insns::BC_GOTO_IF_NOT | jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
                         // `if mark` / `if old_left` lower to
                         // `goto_if_not_int_is_true`; `bhimpl_goto_if_not_int_is_true`
                         // is `bhimpl_goto_if_not`.
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let a = self.registers_i[code[p] as usize];
                         let target = (code[p + 1] as usize) | ((code[p + 2] as usize) << 8);
-                        self.position = bhimpl_goto_if_not(a, target, p + 3);
+                        position = bhimpl_goto_if_not(a, target, p + 3);
                         continue;
                     }
                     jitcode::insns::BC_INT_IS_TRUE => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let a = self.registers_i[code[p] as usize];
                         self.registers_i[code[p + 1] as usize] = bhimpl_int_is_true(a);
-                        self.position = p + 2;
+                        position = p + 2;
                         continue;
                     }
                     jitcode::insns::BC_MOVE_I => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         self.registers_i[code[p + 1] as usize] = self.registers_i[code[p] as usize];
-                        self.position = p + 2;
+                        position = p + 2;
                         continue;
                     }
                     jitcode::insns::BC_MOVE_I_C => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         self.registers_i[code[p + 1] as usize] = code[p] as i8 as i64;
-                        self.position = p + 2;
+                        position = p + 2;
                         continue;
                     }
                     jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_I_PURE => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let struct_ptr = self.registers_r[code[p] as usize];
                         let (val, dest, pos) = {
                             let (descr, pos) = read_descr(self, code, p + 1);
@@ -1997,11 +2003,11 @@ impl BlackholeInterpreter {
                             )
                         };
                         self.registers_i[dest] = val;
-                        self.position = pos + 1;
+                        position = pos + 1;
                         continue;
                     }
                     jitcode::insns::BC_GETFIELD_GC_R | jitcode::insns::BC_GETFIELD_GC_R_PURE => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let struct_ptr = self.registers_r[code[p] as usize];
                         let (val, dest, pos) = {
                             let (descr, pos) = read_descr(self, code, p + 1);
@@ -2012,51 +2018,51 @@ impl BlackholeInterpreter {
                             )
                         };
                         self.registers_r[dest] = val;
-                        self.position = pos + 1;
+                        position = pos + 1;
                         continue;
                     }
                     jitcode::insns::BC_INT_EQ => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let a = self.registers_i[code[p] as usize];
                         let b = self.registers_i[code[p + 1] as usize];
                         self.registers_i[code[p + 2] as usize] = bhimpl_int_eq(a, b);
-                        self.position = p + 3;
+                        position = p + 3;
                         continue;
                     }
                     jitcode::insns::BC_INT_NE => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let a = self.registers_i[code[p] as usize];
                         let b = self.registers_i[code[p + 1] as usize];
                         self.registers_i[code[p + 2] as usize] = bhimpl_int_ne(a, b);
-                        self.position = p + 3;
+                        position = p + 3;
                         continue;
                     }
                     jitcode::insns::BC_INT_LT => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let a = self.registers_i[code[p] as usize];
                         let b = self.registers_i[code[p + 1] as usize];
                         self.registers_i[code[p + 2] as usize] = bhimpl_int_lt(a, b);
-                        self.position = p + 3;
+                        position = p + 3;
                         continue;
                     }
                     jitcode::insns::BC_INT_ADD => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let a = self.registers_i[code[p] as usize];
                         let b = self.registers_i[code[p + 1] as usize];
                         self.registers_i[code[p + 2] as usize] = bhimpl_int_add(a, b);
-                        self.position = p + 3;
+                        position = p + 3;
                         continue;
                     }
                     jitcode::insns::BC_GOTO_IF_NOT_INT_EQ => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let a = self.registers_i[code[p] as usize];
                         let b = self.registers_i[code[p + 1] as usize];
                         let target = (code[p + 2] as usize) | ((code[p + 3] as usize) << 8);
-                        self.position = if a == b { p + 4 } else { target };
+                        position = if a == b { p + 4 } else { target };
                         continue;
                     }
                     jitcode::insns::BC_SETFIELD_GC_I => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let struct_ptr = self.registers_r[code[p] as usize];
                         let value = self.registers_i[code[p + 1] as usize];
                         let pos = {
@@ -2064,11 +2070,11 @@ impl BlackholeInterpreter {
                             bh_store_int_field(struct_ptr, value, descr);
                             pos
                         };
-                        self.position = pos;
+                        position = pos;
                         continue;
                     }
                     jitcode::insns::BC_SETFIELD_GC_I_C => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         let struct_ptr = self.registers_r[code[p] as usize];
                         let value = code[p + 1] as i8 as i64;
                         let pos = {
@@ -2076,28 +2082,29 @@ impl BlackholeInterpreter {
                             bh_store_int_field(struct_ptr, value, descr);
                             pos
                         };
-                        self.position = pos;
+                        position = pos;
                         continue;
                     }
                     jitcode::insns::BC_INT_RETURN => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         self.tmpreg_i = self.registers_i[code[p] as usize];
                         self.return_type = BhReturnType::Int;
                         self.position = p + 1;
                         return BhRunOutcome::LeaveFrame;
                     }
                     jitcode::insns::BC_INT_RETURN_C => {
-                        let p = self.position + 1;
+                        let p = position + 1;
                         self.tmpreg_i = code[p] as i8 as i64;
                         self.return_type = BhReturnType::Int;
                         self.position = p + 1;
                         return BhRunOutcome::LeaveFrame;
                     }
                     jitcode::insns::BC_INLINE_CALL => {
-                        let p = self.position + 1;
+                        let p = position + 1;
+                        self.position = position;
                         match handler_inline_call_nested_ext(self, code, p) {
                             Ok(new_pos) => {
-                                self.position = new_pos;
+                                position = new_pos;
                                 continue;
                             }
                             Err(DispatchError::LeaveFrame) => {
@@ -2116,6 +2123,7 @@ impl BlackholeInterpreter {
                                 // sees the post-op cursor.
                                 self.position = resume_position;
                                 if self.handle_exception_in_frame(exc) {
+                                    position = self.position;
                                     continue;
                                 }
                                 self.got_exception = true;
@@ -2127,6 +2135,7 @@ impl BlackholeInterpreter {
                     _ => {}
                 }
             }
+            self.position = position;
             self.position += 1;
             if trace {
                 eprintln!(
@@ -2138,7 +2147,9 @@ impl BlackholeInterpreter {
                 );
             }
             match self.dispatch_step(opcode, code) {
-                Ok(()) => {}
+                Ok(()) => {
+                    position = self.position;
+                }
                 Err(DispatchError::LeaveFrame) => {
                     if trace {
                         eprintln!(
@@ -2169,6 +2180,7 @@ impl BlackholeInterpreter {
                     }
                     if self.handle_exception_in_frame(exc) {
                         // Handler found, continue execution at handler target
+                        position = self.position;
                         continue;
                     }
                     // No handler: propagate exception via got_exception flag

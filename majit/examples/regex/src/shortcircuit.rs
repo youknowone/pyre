@@ -781,6 +781,41 @@ mod tests {
             !majit_metainterp::blackhole::native_entry_args_intact(&jitcode, 210),
             "Sequence after left child has already called; restart is unsafe"
         );
+        let starts = jitcode.startpoints.as_ref().expect("assembled shift");
+        let mut leftover = std::collections::BTreeMap::<u8, usize>::new();
+        for &pc in starts {
+            let op = jitcode.code[pc];
+            if !matches!(
+                op,
+                majit_metainterp::jitcode::insns::BC_LIVE
+                    | majit_metainterp::jitcode::insns::BC_JUMP
+                    | majit_metainterp::jitcode::insns::BC_GOTO_IF_NOT
+                    | majit_metainterp::jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE
+                    | majit_metainterp::jitcode::insns::BC_INT_IS_TRUE
+                    | majit_metainterp::jitcode::insns::BC_MOVE_I
+                    | majit_metainterp::jitcode::insns::BC_MOVE_I_C
+                    | majit_metainterp::jitcode::insns::BC_GETFIELD_GC_I
+                    | majit_metainterp::jitcode::insns::BC_GETFIELD_GC_I_PURE
+                    | majit_metainterp::jitcode::insns::BC_GETFIELD_GC_R
+                    | majit_metainterp::jitcode::insns::BC_GETFIELD_GC_R_PURE
+                    | majit_metainterp::jitcode::insns::BC_SETFIELD_GC_I
+                    | majit_metainterp::jitcode::insns::BC_SETFIELD_GC_I_C
+                    | majit_metainterp::jitcode::insns::BC_INT_EQ
+                    | majit_metainterp::jitcode::insns::BC_INT_NE
+                    | majit_metainterp::jitcode::insns::BC_INT_LT
+                    | majit_metainterp::jitcode::insns::BC_INT_ADD
+                    | majit_metainterp::jitcode::insns::BC_GOTO_IF_NOT_INT_EQ
+                    | majit_metainterp::jitcode::insns::BC_INT_RETURN
+                    | majit_metainterp::jitcode::insns::BC_INT_RETURN_C
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL
+            ) {
+                *leftover.entry(op).or_insert(0) += 1;
+            }
+        }
+        assert!(
+            leftover.is_empty(),
+            "shift jitcode still has blackhole opcodes outside run_inner: {leftover:?}"
+        );
     }
     use super::*;
     use crate::regex::{bench_regex, count, lower, nonmatching, vectors};

@@ -49,19 +49,26 @@ pub fn append_numbering(buf: &mut Vec<u8>, item: i32) {
 /// the buffer to contain a complete varint at `index`. A truncated
 /// buffer is a bug in resume data generation and should panic loudly
 /// via the standard slice indexing rather than silently returning 0.
+#[inline]
 pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
-    let mut value = buf[index] as i64;
-    let mut index = index + 1;
+    let b0 = buf[index] as i64;
+    // resumecode.py `numb_next_item`: one-byte items are `item < 2**7`
+    // after zigzag. Same decode as the multi-byte path, without the
+    // continuation loads.
+    if b0 & (1 << 7) == 0 {
+        let value = if b0 & 1 != 0 { -1 - b0 } else { b0 };
+        return ((value >> 1) as i32, index + 1);
+    }
 
-    if value & (1 << 7) != 0 {
-        value &= (1 << 7) - 1;
-        value |= (buf[index] as i64) << 7;
+    let mut value = b0;
+    let mut index = index + 1;
+    value &= (1 << 7) - 1;
+    value |= (buf[index] as i64) << 7;
+    index += 1;
+    if value & (1 << 14) != 0 {
+        value &= (1 << 14) - 1;
+        value |= (buf[index] as i64) << 14;
         index += 1;
-        if value & (1 << 14) != 0 {
-            value &= (1 << 14) - 1;
-            value |= (buf[index] as i64) << 14;
-            index += 1;
-        }
     }
 
     if value & 1 != 0 {
@@ -195,6 +202,7 @@ impl<'a> Reader<'a> {
     }
 
     /// resumecode.py: next_item
+    #[inline]
     pub fn next_item(&mut self) -> i32 {
         let (result, new_pos) = decode_varint(self.code, self.cur_pos);
         self.cur_pos = new_pos;
@@ -219,5 +227,35 @@ impl<'a> Reader<'a> {
 
     pub fn has_more(&self) -> bool {
         self.cur_pos < self.code.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(values: &[i32]) {
+        let mut buf = Vec::new();
+        for &v in values {
+            encode_varint(&mut buf, v);
+        }
+        let mut index = 0;
+        for &expected in values {
+            let (got, next) = decode_varint(&buf, index);
+            assert_eq!(got, expected, "decode {expected}");
+            index = next;
+        }
+        assert_eq!(index, buf.len());
+    }
+
+    #[test]
+    fn decode_varint_one_byte_items() {
+        // zigzag `item < 2**7` is one byte: 0, ±1, ±63.
+        roundtrip(&[0, 1, -1, 63, -63]);
+    }
+
+    #[test]
+    fn decode_varint_two_and_three_byte_items() {
+        roundtrip(&[64, -64, 127, -128, 8191, -8192, 16383, -16384]);
     }
 }

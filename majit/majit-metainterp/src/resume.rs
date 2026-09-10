@@ -7616,8 +7616,13 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py next_int
+    #[inline]
     pub fn next_int(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item() as i16;
+        // resume.py decode_int `TAGINT`: the payload is the signed value.
+        if (tagged as u16) & TAGMASK as u16 == TAGINT as u16 {
+            return (tagged >> 2) as i64;
+        }
         self.decode_int(tagged)
     }
 
