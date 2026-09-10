@@ -6678,18 +6678,22 @@ impl<S: JitState> JitDriver<S> {
             if let Some(rd_numb) = fd.rd_numb() {
                 let rd_consts_slice: &[Const] = fd.rd_consts().unwrap_or(&[]);
 
-                // `resume.py _prepare_virtuals` reads `storage.rd_virtuals`,
-                // the reader-shaped list built at compile time. The descr
-                // carries the compile-time `RdVirtualInfo` list; converting it
-                // here is one pass per failure, and none at all for the
-                // common guard that has no virtuals.
-                let virtual_infos: Vec<crate::resume::VirtualInfo> = fd
-                    .rd_virtuals()
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|rd| crate::resume::virtual_info_from_rd(rd))
-                    .collect();
-                let rd_virtuals_slice = Some(virtual_infos.as_slice());
+                // `resume.py _prepare_virtuals` is a no-op when
+                // `storage.rd_virtuals` is empty (the regex `and`/`or`
+                // leaf: nvirtuals=0). Skip the per-failure convert and
+                // the two empty `VirtualCache` vecs `prepare_virtuals`
+                // would mint for `Some(&[])`.
+                let virtual_infos;
+                let rd_virtuals_slice = match fd.rd_virtuals() {
+                    Some(rds) if !rds.is_empty() => {
+                        virtual_infos = rds
+                            .iter()
+                            .map(|rd| crate::resume::virtual_info_from_rd(rd))
+                            .collect::<Vec<_>>();
+                        Some(virtual_infos.as_slice())
+                    }
+                    _ => None,
+                };
 
                 // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
                 // curbh.setposition(jitcode, pc)`.  Per-driver

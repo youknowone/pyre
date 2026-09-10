@@ -7615,6 +7615,9 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py _prepare_virtuals
     fn prepare_virtuals(&mut self, virtuals: Option<&'a [VirtualInfo]>) {
         if let Some(v) = virtuals {
+            if v.is_empty() {
+                return;
+            }
             self.rd_virtuals = Some(v);
             // resume.py:990-991
             self.virtuals_cache = VirtualCache::from_caches(vec![0; v.len()], vec![0; v.len()]);
