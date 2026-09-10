@@ -3328,7 +3328,7 @@ impl WasmBackend {
                         unsafe { core::ptr::write(cell, bridge_slot) };
                     }
                 }
-                let (num_ref_homes, used_label_homes) = metas
+                let (prev_homes, used_label_homes) = metas
                     .get(&region.trace_id)
                     .map(|m| (m.num_ref_homes, m.used_label_homes))
                     .unwrap_or_else(|| {
@@ -3337,6 +3337,10 @@ impl WasmBackend {
                             codegen::label_ref_capture_slots(&region.inputargs, &region.ops),
                         )
                     });
+                // `RefHomes::collect` reassigns across the merged stream, so
+                // this region's standalone count can sit below the slots its
+                // rebased refs now occupy. Floor to the merged extent.
+                let num_ref_homes = prev_homes.max(widened);
                 metas.insert(
                     region.trace_id,
                     ChainedTraceMeta {
