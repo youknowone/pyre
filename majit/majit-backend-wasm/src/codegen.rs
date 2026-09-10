@@ -4228,7 +4228,7 @@ pub struct AllocHelpers {
     pub fmod_fn_ptr: i64,
 }
 
-type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize);
+type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize, usize);
 
 /// Counts entries into an out-of-line bridge module and calls out once there
 /// have been enough of them to pay for merging that bridge into its owner.
@@ -5308,7 +5308,8 @@ pub fn build_wasm_module(
     }
     module.section(&codes);
 
-    Ok((module.finish(), guards, num_ref_homes))
+    let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
+    Ok((module.finish(), guards, num_ref_homes, used_labels))
 }
 
 fn build_label_param_shim(wide_func_idx: u32) -> Function {

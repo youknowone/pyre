@@ -3218,8 +3218,9 @@ impl WasmBackend {
         inputs.ca.compute_home_gcmap = true;
         inputs.ca.home_gcmap_has_prior = true;
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
-        inputs.ca.home_gcmap_min_labels = compiled.used_label_homes;
-        let (wasm_bytes, guard_exits, merged_ref_homes) = codegen::build_wasm_module(&inputs)?;
+        inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
+        let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
+            codegen::build_wasm_module(&inputs)?;
         let code_size = wasm_bytes.len();
         let descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
@@ -3298,37 +3299,19 @@ impl WasmBackend {
         compiled.module_bytes.set(code_size as u32);
         compiled.num_guard_cells.set(guard_exits.len());
         let widened = merged_ref_homes.max(compiled.num_ref_homes.get());
+        let widened_labels = merged_labels.max(compiled.used_label_homes.get());
         compiled.num_ref_homes.set(widened);
-        compiled.home_gcmap_ptr.set(leak_home_gcmap(
-            compiled.frame,
-            widened,
-            compiled.used_label_homes,
-        ));
+        compiled.used_label_homes.set(widened_labels);
+        compiled
+            .home_gcmap_ptr
+            .set(leak_home_gcmap(compiled.frame, widened, widened_labels));
         {
             let mut metas = compiled.chained_trace_meta.borrow_mut();
             let mut offset = own_guard_count;
             for region in &inputs.inlined_bridges {
                 let count = codegen::guard_exit_count(&region.inputargs, &region.ops);
                 let exits = &guard_exits[offset..offset + count];
-                // This region's guards are carved out of the array that was
-                // just reallocated, so every bridge already chained onto one of
-                // them has lost its dispatch entry. Unreplayed, that guard
-                // deopts to the tracer on every failure and retraces a bridge
-                // it can never reach.
-                #[cfg(target_arch = "wasm32")]
-                if new_cells_base != 0 {
-                    for (&(trace_id, fail_index), &bridge_slot) in
-                        compiled.chained_bridge_slots.borrow().iter()
-                    {
-                        if trace_id != region.trace_id || fail_index as usize >= count {
-                            continue;
-                        }
-                        let cell = (new_cells_base as usize + (offset + fail_index as usize) * 4)
-                            as *mut u32;
-                        unsafe { core::ptr::write(cell, bridge_slot) };
-                    }
-                }
-                let (prev_homes, used_label_homes) = metas
+                let (prev_homes, prev_labels) = metas
                     .get(&region.trace_id)
                     .map(|m| (m.num_ref_homes, m.used_label_homes))
                     .unwrap_or_else(|| {
@@ -3341,6 +3324,34 @@ impl WasmBackend {
                 // this region's standalone count can sit below the slots its
                 // rebased refs now occupy. Floor to the merged extent.
                 let num_ref_homes = prev_homes.max(widened);
+                let used_label_homes = prev_labels.max(widened_labels);
+                // Existing nested sub-bridges still publish the standalone
+                // map. Replaying them after the extent grew would collect
+                // through that short prefix. Drop them so the next fail
+                // retraces against the merged floor.
+                let extent_grew = prev_homes < widened || prev_labels < widened_labels;
+                if extent_grew {
+                    compiled
+                        .chained_bridge_slots
+                        .borrow_mut()
+                        .retain(|&(tid, _), _| tid != region.trace_id);
+                } else if new_cells_base != 0 {
+                    // This region's guards are carved out of the array that
+                    // was just reallocated. Replay still-valid nested
+                    // sub-bridges into the new cells; unreplayed, a guard
+                    // deopts and retraces a bridge it can never reach.
+                    #[cfg(target_arch = "wasm32")]
+                    for (&(trace_id, fail_index), &bridge_slot) in
+                        compiled.chained_bridge_slots.borrow().iter()
+                    {
+                        if trace_id != region.trace_id || fail_index as usize >= count {
+                            continue;
+                        }
+                        let cell = (new_cells_base as usize + (offset + fail_index as usize) * 4)
+                            as *mut u32;
+                        unsafe { core::ptr::write(cell, bridge_slot) };
+                    }
+                }
                 metas.insert(
                     region.trace_id,
                     ChainedTraceMeta {
@@ -4275,7 +4286,7 @@ impl majit_backend::Backend for WasmBackend {
                 },
             ),
         };
-        let (wasm_bytes, guard_exits, num_ref_homes) =
+        let (wasm_bytes, guard_exits, num_ref_homes, _used_labels) =
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
                 Err(err) => {
@@ -4410,7 +4421,7 @@ impl majit_backend::Backend for WasmBackend {
             num_inputs: inputargs.len(),
             max_output_slots,
             num_ref_homes: std::cell::Cell::new(num_ref_homes),
-            used_label_homes,
+            used_label_homes: std::cell::Cell::new(used_label_homes),
             frame,
             home_gcmap_ptr: std::cell::Cell::new(home_gcmap_ptr),
             bridge_cells_base: std::cell::Cell::new(bridge_cells_base),
@@ -4631,7 +4642,7 @@ impl majit_backend::Backend for WasmBackend {
             let source_used_homes = if is_direct {
                 (
                     source_loop.num_ref_homes.get(),
-                    source_loop.used_label_homes,
+                    source_loop.used_label_homes.get(),
                 )
             } else {
                 source_loop
@@ -4641,7 +4652,7 @@ impl majit_backend::Backend for WasmBackend {
                     .map(|m| (m.num_ref_homes, m.used_label_homes))
                     .unwrap_or((
                         source_loop.num_ref_homes.get(),
-                        source_loop.used_label_homes,
+                        source_loop.used_label_homes.get(),
                     ))
             };
             let guard = if is_direct {
@@ -5317,7 +5328,7 @@ impl majit_backend::Backend for WasmBackend {
             frame: source_frame,
             ca: ca_params,
         };
-        let (wasm_bytes, guard_exits, _num_ref_homes) =
+        let (wasm_bytes, guard_exits, _num_ref_homes, _used_labels) =
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
                 Err(err) => {

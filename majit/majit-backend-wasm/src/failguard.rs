@@ -1113,8 +1113,9 @@ pub struct CompiledWasmLoop {
     pub num_ref_homes: Cell<usize>,
     /// LABEL-capture homes this loop actually initialized. Frozen geometry
     /// may reserve more; a later bridge's published map must still cover
-    /// these so a keyed tail-call cannot drop them.
-    pub used_label_homes: usize,
+    /// these so a keyed tail-call cannot drop them. `Cell` so `reemit_loop`
+    /// can raise it when a merge publishes a wider capture tail.
+    pub used_label_homes: Cell<usize>,
     /// Geometry frozen when this token was first compiled. Every bridge
     /// chained onto it is emitted against this exact layout.
     pub frame: crate::codegen::FrameGeometry,
