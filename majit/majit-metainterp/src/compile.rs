@@ -2066,7 +2066,16 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         .filter(|r| r.ty() == Some(Type::Ref) && !field_raws.contains(&r.raw()))
         .collect();
 
-    if inputargs.len() <= entry_prefix_len {
+    // `compile.py:458 assert i == len(inputargs)` requires the expanded
+    // list to be exactly prefix + statics + baked array items. Virtualstate
+    // + densify can leave a *partial* tail (some array slots still present,
+    // others dropped because they went virtual) or a *long* tail (identity
+    // leftovers still riding as inputargs). Either shape is not the
+    // RPython list: walking the live `vable_array_lengths` against it
+    // overruns or fails the equality. Rebuild to the expected shape, then
+    // remap leftover field/identity refs the same way the prefix-only
+    // reduce path already does.
+    if inputargs.len() != expanded_len {
         // Virtualstate + densify may already have reduced `inputargs` to the
         // red prefix (`start_state.renamed_inputargs`). Skip-unmodified
         // store-back and short-preamble `used_boxes` leave the original
@@ -2075,7 +2084,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         // `loop.inputargs`. Rebuild the expanded field list when a leftover
         // names a field slot; a leftover Ref that is not a field is the
         // virtualizable identity and rewrites onto the vable red.
-        if leftover_fields.is_empty() {
+        if leftover_fields.is_empty() && inputargs.len() <= entry_prefix_len {
             if leftover_identity.is_empty() {
                 return;
             }
@@ -3250,6 +3259,60 @@ mod tests {
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
             vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(0)]
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_rebuilds_partially_reduced_array_tail() {
+        // Virtualstate kept a prefix of the array InputArgs (6 of 8) and
+        // dropped the rest. The live vable still reports length 8, so a
+        // walk that trusts `vable_array_lengths` against the partial list
+        // overruns (`i + 8 > 8` after the red + 4 statics, or here
+        // red + 2 kept items). Rebuild to the baked shape first.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            16,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(24));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 2),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_ref(2),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[4],
+            1,
+            0,
+            &mut constants,
+            &[],
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetarrayitemRawR),
+            "partial tail must still emit the baked GETARRAYITEM reloads"
         );
     }
 
