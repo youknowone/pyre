@@ -781,9 +781,9 @@ fn guard_fail_args_advanced(
 
 use failguard::{
     CallAssemblerTarget, ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr,
-    WasmFrameData, ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot,
-    call_assembler_target, global_fail_descr, label_target, publish_call_assembler_target,
-    publish_label_target, register_fail_descrs, reserve_fail_descrs,
+    WasmFrameData, ca_dispatch_mark_gnf2, ca_dispatch_publish, ca_dispatch_redirect,
+    ca_dispatch_slot, call_assembler_target, global_fail_descr, label_target,
+    publish_call_assembler_target, publish_label_target, register_fail_descrs, reserve_fail_descrs,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
@@ -5421,6 +5421,33 @@ impl majit_backend::Backend for WasmBackend {
         } else {
             diag_bump(28);
         }
+        // Arm the GNF2 flag before the source guard cell becomes the
+        // new bridge. An out-of-line GNF2 bridge runs in the source
+        // loop's CA frame; a CALL_ASSEMBLER already inside the callee
+        // can finish through this cell as soon as it is written.
+        if ops
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2)
+        {
+            ca_dispatch_mark_gnf2(original_token.number);
+            if let Some(mut target) = call_assembler_target(original_token.number) {
+                if target.has_guard_not_forced_2 == 0 {
+                    target.has_guard_not_forced_2 = 1;
+                    ca_dispatch_publish(
+                        original_token.number,
+                        target.func_handle,
+                        target.compiled_ptr as u32,
+                        target.callee_frame_bytes,
+                        target.dispatch_key_ofs as u32,
+                        target.callee_gcmap_ptr,
+                        target.home_slot_base,
+                        target.home_slots,
+                        1,
+                    );
+                    publish_call_assembler_target(original_token.number, target);
+                }
+            }
+        }
         #[cfg(target_arch = "wasm32")]
         if source_cells_base != 0 && bridge_slot != 0 {
             let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
@@ -5474,33 +5501,6 @@ impl majit_backend::Backend for WasmBackend {
                 match self.reemit_loop(original_token) {
                     Ok(()) => diag_bump(31),
                     Err(_) => diag_bump(30),
-                }
-            }
-        }
-
-        // An out-of-line bridge runs in the source loop's CA frame. If that
-        // bridge retains `_finish_gcmap`, callers of the source token must
-        // take the write-barrier pop even when the original loop ops did not
-        // contain `GUARD_NOT_FORCED_2`.
-        if ops
-            .iter()
-            .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2)
-        {
-            if let Some(mut target) = call_assembler_target(original_token.number) {
-                if target.has_guard_not_forced_2 == 0 {
-                    target.has_guard_not_forced_2 = 1;
-                    ca_dispatch_publish(
-                        original_token.number,
-                        target.func_handle,
-                        target.compiled_ptr as u32,
-                        target.callee_frame_bytes,
-                        target.dispatch_key_ofs as u32,
-                        target.callee_gcmap_ptr,
-                        target.home_slot_base,
-                        target.home_slots,
-                        1,
-                    );
-                    publish_call_assembler_target(original_token.number, target);
                 }
             }
         }
@@ -6219,6 +6219,32 @@ mod tests {
             1,
             "a later publish without GNF2 must not clear the cell flag"
         );
+        drop(table);
+        failguard::ca_dispatch_remove(token_number);
+    }
+
+    #[test]
+    fn mark_gnf2_sets_the_cell_without_a_new_snapshot() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let token_number = 9_900_001;
+        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 0);
+        failguard::ca_dispatch_mark_gnf2(token_number);
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&token_number))
+            .expect("published dispatch entry");
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        {
+            let targets = entry.targets.lock().unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].has_guard_not_forced_2, 0);
+        }
         drop(table);
         failguard::ca_dispatch_remove(token_number);
     }

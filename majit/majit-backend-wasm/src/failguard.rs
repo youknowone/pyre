@@ -656,6 +656,19 @@ pub fn ca_dispatch_slot(number: u64) -> u32 {
     (&**entry as *const WasmCaDispatchEntry as usize) as u32
 }
 
+/// Raise the monotonic GNF2 flag on an existing dispatch cell.
+///
+/// Does not create an entry and does not publish a new snapshot. Call
+/// this before arming a newly compiled `GUARD_NOT_FORCED_2` bridge so
+/// an in-flight CALL_ASSEMBLER footer sees the flag before the callee
+/// can finish through that bridge.
+pub fn ca_dispatch_mark_gnf2(number: u64) {
+    let table = WASM_CA_DISPATCH.lock();
+    if let Some(entry) = table.as_ref().and_then(|table| table.get(&number)) {
+        entry.has_guard_not_forced_2.store(1, Ordering::Release);
+    }
+}
+
 /// Publish an installed loop after its module has acquired a shared-table
 /// slot.  All runtime fields live in one immutable snapshot, and the release
 /// store publishes its address only after the snapshot is fully initialized.
