@@ -1925,6 +1925,18 @@ impl BlackholeInterpreter {
                         self.position = bhimpl_goto_if_not(a, target, p + 3);
                         continue;
                     }
+                    jitcode::insns::BC_MOVE_I => {
+                        let p = self.position + 1;
+                        self.registers_i[code[p + 1] as usize] = self.registers_i[code[p] as usize];
+                        self.position = p + 2;
+                        continue;
+                    }
+                    jitcode::insns::BC_MOVE_I_C => {
+                        let p = self.position + 1;
+                        self.registers_i[code[p + 1] as usize] = code[p] as i8 as i64;
+                        self.position = p + 2;
+                        continue;
+                    }
                     _ => {}
                 }
             }
