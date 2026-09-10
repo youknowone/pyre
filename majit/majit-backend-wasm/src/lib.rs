@@ -4253,6 +4253,7 @@ impl majit_backend::Backend for WasmBackend {
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
                 Err(err) => {
+                    diag_bump(25);
                     record_last_compile_err(&err);
                     return Err(err);
                 }

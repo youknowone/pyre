@@ -10559,9 +10559,15 @@ fn unbound_pool_const_seeds(
         for a in op.getarglist().iter() {
             consider(a.to_opref(), op.opcode, false, &mut seeds);
         }
-        if let Some(fa) = op.getfailargs() {
-            for a in fa.iter() {
-                consider(a.to_opref(), op.opcode, true, &mut seeds);
+        // Same live extent `emit_guard_fail_args_spill` writes. A hole
+        // (`rd_locs == 0xFFFF`) is spilled as zero and is not a read of
+        // the named box; past-extent failargs are not written at all.
+        let fail_args = exit_fail_args(op);
+        let live = live_fail_arg_mask(op.getdescr().as_ref(), fail_args.len());
+        let extent = live_fail_arg_extent(op.getdescr().as_ref(), fail_args.len());
+        for (i, &a) in fail_args.iter().take(extent).enumerate() {
+            if live.get(i).copied().unwrap_or(true) {
+                consider(a, op.opcode, true, &mut seeds);
             }
         }
     }
