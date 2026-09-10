@@ -5078,18 +5078,12 @@ pub fn id(w_obj: PyObjectRef) -> PyObjectRef {
 /// the in-place `+=` / `*=` bug-to-bug compatibility branch in
 /// descroperation.
 pub fn flag_sequence_bug_compat(w_type: PyObjectRef) -> bool {
-    use pyre_object::pyobject;
-    is_w(w_type, crate::typedef::gettypeobject(&pyobject::LIST_TYPE))
-        || is_w(w_type, crate::typedef::gettypeobject(&pyobject::TUPLE_TYPE))
-        || is_w(w_type, crate::typedef::gettypeobject(&pyobject::STR_TYPE))
-        || is_w(
-            w_type,
-            crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
-        )
-        || is_w(
-            w_type,
-            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
-        )
+    // typeobject.py:167 — a W_TypeObject field, not an identity table.
+    // TypeCache.build copies TypeDef.flag_sequence_bug_compat; heap
+    // subclasses keep the False default.
+    !w_type.is_null()
+        && unsafe { pyre_object::is_type(w_type) }
+        && unsafe { pyre_object::typeobject::w_type_get_flag_sequence_bug_compat(w_type) }
 }
 
 /// Python-level `not` operation. descroperation.py:289-290

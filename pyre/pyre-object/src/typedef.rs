@@ -72,6 +72,9 @@ pub struct TypeDef {
     /// TypeDef.__init__: initialization-time declaration, not a flag inferred
     /// from the generated W_TypeObject's name or namespace.
     pub method_descriptor: bool,
+    /// typeobject.py `typedef.flag_sequence_bug_compat`. Copied onto the
+    /// W_TypeObject by TypeCache.build; not inherited by subclasses.
+    pub flag_sequence_bug_compat: bool,
 }
 
 impl TypeDef {
@@ -92,6 +95,7 @@ impl TypeDef {
             acceptable_as_base_class: std::sync::atomic::AtomicBool::new(acceptable_as_base_class),
             hasdict,
             method_descriptor: false,
+            flag_sequence_bug_compat: false,
         }
     }
 

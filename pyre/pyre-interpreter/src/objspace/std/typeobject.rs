@@ -108,6 +108,7 @@ impl TypeCache {
         unsafe {
             w_type_set_hasdict(w_type, definition.hasdict);
             w_type_set_weakrefable(w_type, definition.weakrefable);
+            w_type_set_flag_sequence_bug_compat(w_type, definition.flag_sequence_bug_compat);
             crate::baseobjspace::compute_and_set_mro(w_type).map_err(CacheError::Build)?;
             let best = crate::call::find_best_base(gc_roots::shadow_stack_get(bases_slot))
                 .map_err(CacheError::Build)?;
@@ -202,6 +203,47 @@ mod tests {
                 TypeDef::from_rawdict("Child", vec![definition], IndexMap::new(), &INSTANCE_TYPE);
             let child = a.gettypeobject(child).unwrap();
             assert_eq!(w_tuple_getitem(w_type_get_bases(child), 0), Some(first));
+        }
+    }
+
+    #[test]
+    fn sequence_bug_compat_is_a_typeobject_field_not_an_identity_table() {
+        crate::typedef::init_typeobjects();
+        unsafe {
+            for (tp, expect) in [
+                (&LIST_TYPE, true),
+                (&TUPLE_TYPE, true),
+                (&STR_TYPE, true),
+                (&pyre_object::bytesobject::BYTES_TYPE, true),
+                (&pyre_object::bytearrayobject::BYTEARRAY_TYPE, true),
+                (&DICT_TYPE, false),
+                (&INT_TYPE, false),
+            ] {
+                let w_type = crate::typedef::gettypefor(tp).unwrap().as_ptr();
+                assert_eq!(
+                    crate::baseobjspace::flag_sequence_bug_compat(w_type),
+                    expect,
+                    "{}",
+                    (*tp).name
+                );
+            }
+            let definition = TypeDef::from_rawdict(
+                "NotASequence",
+                vec![],
+                IndexMap::new(),
+                &INSTANCE_TYPE,
+            );
+            let w_type = ObjSpace::new().gettypeobject(definition).unwrap();
+            assert!(!crate::baseobjspace::flag_sequence_bug_compat(w_type));
+            let flagged = TypeDef::from_rawdict(
+                "CompatSequence",
+                vec![],
+                IndexMap::new(),
+                &INSTANCE_TYPE,
+            ) as *mut TypeDef;
+            (*flagged).flag_sequence_bug_compat = true;
+            let flagged = ObjSpace::new().gettypeobject(flagged).unwrap();
+            assert!(crate::baseobjspace::flag_sequence_bug_compat(flagged));
         }
     }
 

@@ -270,6 +270,11 @@ pub struct W_TypeObject {
     /// `__del__` (computed at type creation, typeobject.py:1406/1475, and
     /// kept fresh by `mutated`).
     pub hasuserdel: bool,
+    /// typeobject.py:167 `flag_sequence_bug_compat` — set on the builtin
+    /// sequence TypeDefs (list/tuple/bytes/bytearray/str). Subclasses do
+    /// not inherit it; `TypeCache.build` copies the TypeDef bit and heap
+    /// types stay false.
+    pub flag_sequence_bug_compat: bool,
     /// typeobject.py:169 `flag_map_or_seq` (`'?'`, `'M'`, `'S'`).
     ///
     /// Default `'?'` per typeobject.py:216.  Inherited from base
@@ -585,6 +590,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         hasdict: false,
         weakrefable: false,
         hasuserdel: false,
+        flag_sequence_bug_compat: false,
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
         weak_subclasses: std::ptr::null_mut(),
@@ -724,6 +730,7 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         hasdict: false,
         weakrefable: false,
         hasuserdel: false,
+        flag_sequence_bug_compat: false,
         // typeobject.py:216 default; built-in dict/list/tuple
         // override via `w_type_set_flag_map_or_seq` at typedef
         // registration time (see `typedef.rs`).
@@ -1097,6 +1104,20 @@ pub unsafe fn w_type_get_hasdict(obj: PyObjectRef) -> bool {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_hasdict(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).hasdict = v;
+}
+
+/// typeobject.py `flag_sequence_bug_compat` getter/setter.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_get_flag_sequence_bug_compat(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).flag_sequence_bug_compat
+}
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_set_flag_sequence_bug_compat(obj: PyObjectRef, v: bool) {
+    (*(obj as *mut W_TypeObject)).flag_sequence_bug_compat = v;
 }
 
 /// typeobject.py:295 `self._version_tag` — the raw cache-version field

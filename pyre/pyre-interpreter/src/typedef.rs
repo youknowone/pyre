@@ -1950,6 +1950,24 @@ pub fn init_typeobjects() {
                 pyre_object::typeobject::w_type_set_flag_map_or_seq(w_typeobject, flag);
             }
         }
+        // typeobject.py TypeCache.build: `w_type.flag_sequence_bug_compat =
+        // typedef.flag_sequence_bug_compat` for list/tuple/bytes/bytearray/str.
+        for pytype in [
+            &pyre_object::pyobject::LIST_TYPE,
+            &pyre_object::pyobject::TUPLE_TYPE,
+            &pyre_object::pyobject::STR_TYPE,
+            &pyre_object::bytesobject::BYTES_TYPE,
+            &pyre_object::bytearrayobject::BYTEARRAY_TYPE,
+        ] {
+            let w_typeobject = *reg
+                .get(&(pytype as *const PyType as usize))
+                .expect(
+                    "built-in type object must be registered before flag_sequence_bug_compat init",
+                ) as PyObjectRef;
+            unsafe {
+                pyre_object::typeobject::w_type_set_flag_sequence_bug_compat(w_typeobject, true);
+            }
+        }
         // `Py_TPFLAGS_HAVE_GC` — cleared for the builtin types whose CPython
         // counterpart declares no `tp_traverse`, so `_PyType_PreHeaderSize`
         // charges them no collector pre-header and `sys.getsizeof` adds none.
