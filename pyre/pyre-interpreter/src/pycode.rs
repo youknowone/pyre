@@ -829,9 +829,9 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
         // reference in the shadow stack across it; reload the possibly moved
         // wrapper before publishing the cache field.
         let w_qualname = w_str_new_managed(&(*code_ptr).qualname);
-        publish_code_slot_store(roots.get(code_slot));
-        let w_code = roots.get(code_slot);
-        (*(w_code as *mut PyCode)).w_qualname = w_qualname;
+        let published = publish_code_slot_store_rooting(roots.get(code_slot), &[w_qualname]);
+        let w_qualname = published.get(0);
+        (*(published.owner() as *mut PyCode)).w_qualname = w_qualname;
         w_qualname
     }
 }
@@ -863,9 +863,9 @@ pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
         // reference in the shadow stack across it; reload the possibly moved
         // wrapper before publishing the cache field.
         let w_name = w_str_new_managed(&(*code_ptr).obj_name);
-        publish_code_slot_store(roots.get(code_slot));
-        let w_code = roots.get(code_slot);
-        (*(w_code as *mut PyCode)).w_name = w_name;
+        let published = publish_code_slot_store_rooting(roots.get(code_slot), &[w_name]);
+        let w_name = published.get(0);
+        (*(published.owner() as *mut PyCode)).w_name = w_name;
         w_name
     }
 }
@@ -2225,7 +2225,7 @@ pub unsafe fn code_varname_from_oparg(
             .filter(|cell| !code.varnames.iter().any(|var| var == *cell));
         let pure_cellvar_count = pure_cellvars.clone().count();
         if let Some(name) = pure_cellvars.skip(index as usize).next() {
-            return Ok(w_str_new(name));
+            return Ok(w_str_new_managed(name));
         }
         index -= pure_cellvar_count as i64;
         let fi = index as usize;

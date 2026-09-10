@@ -4049,11 +4049,13 @@ pub(crate) fn emit_report_to_sys_stderr(buf: &[u8]) {
         Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
         None => pyre_object::w_str_new_managed(&String::from_utf8_lossy(buf)),
     };
-    // Read the stream back after that allocation, not before it.
+    let _ = pyre_object::gc_roots::pin_root(w_text);
+    let text_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Read the stream and text back after that allocation, not before it.
     let result = crate::baseobjspace::call_method(
         pyre_object::gc_roots::shadow_stack_get(sp),
         "write",
-        &[w_text],
+        &[pyre_object::gc_roots::shadow_stack_get(text_slot)],
     );
     if result.is_null() {
         let _ = crate::call::take_call_error();
