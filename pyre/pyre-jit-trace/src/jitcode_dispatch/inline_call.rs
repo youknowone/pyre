@@ -3630,8 +3630,8 @@ fn walker_ec_enter(
 /// from `pyframe.py execute_frame` rather than from `enter` / `leave`.
 /// Whatever inlines the callee inlines those `ec.gettrace()` reads with it, so
 /// upstream's trace carries a guard on them and a tracer installed later cannot
-/// be missed.  This walker inlines neither, so an inlined callee reports
-/// nothing for as long as the loop stays compiled.
+/// be missed.  The walker records the same reads via `record_gettrace_promote`
+/// at the enter / leave sites.
 ///
 /// What keeps the omission sound is that there is no inlined callee to lose
 /// events for while a hook is installed:
@@ -5253,8 +5253,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
     // `executioncontext.py leave` adds `_trace(frame, 'leaveframe', ...)` when
     // a profiler is installed.  `walker_ec_enter` / `walker_ec_leave` port the
-    // frame-chain half of that bracket and nothing else, and the walker has no
-    // route to record `_trace` — it calls back into app-level Python with the
+    // frame-chain half; `record_gettrace_promote` records the `gettrace()`
+    // reads those two hooks start with.  The walker still has no route to
+    // record `_trace` itself — it calls back into app-level Python with the
     // callee frame as an argument.  So while a hook is installed there is no
     // shape of this inline that can report what the callee owes, and the
     // answer is the one `codewriter/policy.py look_inside_graph` gives for a
@@ -7003,6 +7004,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ca_concrete_frame,
                 concrete_ec,
             );
+            // `execute_frame.call_trace` — `gettrace()` — sits between
+            // `enter` and `dispatch`.  Snapshot failure still has to reach
+            // the matching `leave` below, so a recording miss here drops
+            // the pin rather than unwinding past the vref.
+            let _ = super::record_gettrace_promote(ctx, op.pc);
             // This inlined level is an activation `execute_frame` would have
             // charged the recursion counter for.  Counting it at RUN time is
             // what a recorded call would do, and that is exactly wrong here: a
@@ -7562,6 +7568,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // permanently `mark_as_escaped` the caller and force a vref that never
         // needed forcing.
         let got_exception = matches!(callee_outcome, Ok((DispatchOutcome::SubRaise { .. }, _)));
+        // `execute_frame.return_trace` — a second `gettrace()` — sits
+        // between `dispatch` and `leave`.  Same finally pairing as enter.
+        let _ = super::record_gettrace_promote(ctx, op.pc);
         walker_ec_leave(
             ctx.trace_ctx,
             ca_callee_frame,

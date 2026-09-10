@@ -11769,11 +11769,28 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
-    // An inlined callee's own header is not the portal loop the compiled code
-    // re-enters, and the sub-walk's boxes describe the callee frame.
+    // An inlined callee records `gettrace` at `walker_ec_enter` /
+    // `walker_ec_leave` (`execute_frame.call_trace` / `return_trace`).
+    // This pin is the portal dispatch loop's counterpart, for the
+    // top-level frame whose `execute_frame` sits outside the portal.
     if ctx.fbw_mode.inline_subwalk {
         return Ok(());
     }
+    record_gettrace_promote(ctx, op_pc)
+}
+
+/// `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`.
+///
+/// `call_trace` / `return_trace` both start with this read.  The slot is
+/// `w_tracefunc?`, so the pin is a `QUASIIMMUT_FIELD` marker plus
+/// `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.  The
+/// `GuardIsnull` is the `promote(None)` half.  The read is registered
+/// with the heapcache, so a run of calls with no intervening store
+/// collapses to one loop-invariant read.
+pub(crate) fn record_gettrace_promote<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() || !unsafe { (*ec).w_tracefunc }.is_null() {
         return Ok(());
@@ -11790,10 +11807,6 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     {
         return Ok(());
     }
-    // `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`
-    // on a `w_tracefunc?` slot.  The marker plus `GUARD_NOT_INVALIDATED`
-    // is what `?` costs; `settrace` invalidates the watchers.  The
-    // `GuardIsnull` is the `promote(None)` half this portal records.
     crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     let read = ctx
@@ -13598,8 +13611,9 @@ fn handle<Sym: WalkSym>(
             record_portal_debugdata_guard(ctx, op.pc)?;
             // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
             // (pyframe.py) read the global trace function on every call the
-            // loop makes.  The walker records neither for an inlined callee,
-            // so the loop pins the slot instead.
+            // loop makes.  Inlined callees record those reads at enter/leave;
+            // the top-level portal starts after `call_trace`, so this pin
+            // is the dispatch-loop counterpart for a hook installed later.
             record_portal_tracefunc_guard(ctx, op.pc)?;
 
             // pyjitpl.py, the tail of `MIFrame.debug_merge_point`,
