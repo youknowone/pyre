@@ -9252,24 +9252,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         })? {
                             return Ok((outcome, op.next_pc));
                         }
-                        // Same cut as flatten `inline_call` of
-                        // `binary_value_from_tag`: emit the machine-int body
-                        // before walking `add`.  A user `__add__` that does
-                        // `return self.x + o` residualizes this BINARY; the
-                        // descent then walks `descr_add` and dies on an
-                        // unallocated float register (`RegisterOutOfRange`
-                        // bank `f`).
-                        if let Some(DispatchOutcome::SubReturn {
-                            result: Some(boxed),
-                        }) = spec_gate(SpecFold::BinaryOpDescent, || {
-                            try_emit_exact_int_binop(ctx, op.pc, op_tag, &r_args, dst, dst_bank)
-                        })? {
-                            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
-                            return Ok((DispatchOutcome::Continue, op.next_pc));
-                        }
-                        // Descend the helper whole ahead of the remaining hand
-                        // folds, so their `consulted` counts read whether the
-                        // descent took the site.
+                        // Descend the helper whole ahead of the hand folds, so
+                        // their `consulted` counts read whether the descent
+                        // took the site.
                         if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
                             try_walker_orthodox_binary_op(
                                 ctx, op.pc, op_tag, tag_opref, &r_args, dst, dst_bank,
