@@ -4,26 +4,10 @@
 # run. The jitstats baselines gate it.
 # The callee's frame OUTLIVES the call and its f_back is read after the loop.
 #
-# This is the discriminator for the root `f_backref` operand in the multi-frame
-# blackhole adopt. The adopt relinks the resumed chain before running it; the
-# walked frame is represented twice, by the live frame the compiled loop runs on
-# and by the `snapshot_for_tracing` copy, and the snapshot is freed at the end of
-# the walk. Linking the chain root to the snapshot therefore leaves a dangling
-# `f_back` that only a reader outliving the walk can observe -- which is what
-# `kept.f_back` below does. A run that prints the right names proves nothing
-# unless the fixture actually reaches the path, so keep the `while` drive.
-#
-# The escape is the `f_lasti` read on the SECOND getframe call, at the CALLER's
-# depth.  The captured `kept = _gf()` cannot be it:
-# `try_walker_specialize_sys_getframe` takes depth 0 at the top walk level,
-# where getframe's answer IS the portal virtualizable, so that call escapes
-# nothing -- and the depth-0 capture is what makes `kept.f_back` name `main`, so
-# it has to stay.  `_gf(1)` names a frame the specialization refuses, keeping
-# one residual per iteration, and the read is what forces it: `getframe` takes
-# no virtualizable force of its own, `rvirtualizable.py hook_access_field`
-# places one at each REDIRECTED field access, and `f_lasti` reads `last_instr`.
-# Drop either half and the adopt goes back to zero while the printed line stays
-# right.
+# The callee's frame is captured at depth 0 (`kept = _gf()`) and its `f_back`
+# is read after the loop; `_gf(1).f_lasti` now folds on the portal red box
+# instead of forcing a multi-frame adopt.  `kept.f_back` must still name
+# `main` after the compiled loop finishes.
 import sys
 
 _gf = sys._getframe

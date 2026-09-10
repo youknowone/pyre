@@ -25,12 +25,9 @@
 # `max-pypy-ratio` for the same reason `exception_reused_object_tb_not_doubled`
 # has none — this is a shape oracle, not a workload.
 #
-# `sys._getframe` takes no virtualizable force of its own: `rvirtualizable.py
-# hook_access_field` places one at each REDIRECTED field access, so `raiser`'s
-# escape is the `f_lasti` read -- `last_instr` is one of the five
-# `virtualizable_gen.rs` declares -- and it escapes the portal once per call
-# rather than twice.  That halving is this file's recorded
-# `fbw_blackhole_adopted_single_frame` 10 -> 5, with `loops_aborted` unmoved.
+# `raiser`'s `_getframe(1).f_lasti` now folds on the portal red box, so the
+# method body no longer forces a virtualizable escape.  The oracle is still
+# that the body runs once per iteration (`Force.hits == N`).
 #
 # Expected output: (40000, 40000, 40000)
 import sys

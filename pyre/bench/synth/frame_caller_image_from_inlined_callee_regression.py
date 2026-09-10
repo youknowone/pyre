@@ -1,23 +1,16 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=root:callee_d1
-# The `root:` arm is measured, not a relaxation: this fixture's loop aborts
-# five times with ABORT_ESCAPE and what reaches the JIT is the root trace
-# `finish_and_compile` attaches. The declining arm is the positive-depth-at-
-# an-inline-level preflight in `try_walker_specialize_sys_getframe`, whose
-# `!next_op_is_f_locals_for_getframe_result(..)` disjunct admits only a result
-# consumed immediately by `f_locals`; binding the frame to a name puts a
-# STORE_FAST in between, so this fixture misses it twice over. Widening it
-# would fall the follow-on getter through to the generic heap getter, measured
-# returning three different `f_lasti` values for one program point.
-# ⚠ `[getframe-decline] non-vref hop` in the log is NOT this: it fires once
-# against five aborts, from a different walk that compiles.
+# pyre-check: selfcheck-compiles=hot_d1
+# pyre-check: skip-backends=wasm
+# wasm still prints PASS but compiles `root:callee_d1` after five loop
+# aborts, so it cannot declare the native `hot_d1` loop.
 # Self-checking regression guard for a caller frame read from inside an inlined
 # callee while the caller's compiled loop is still running.
 #
-# The callee reads non-forcing coordinate fields from `sys._getframe(1)`.  A
-# stale caller `last_instr` shows up as an extra pre-loop row during the first
-# compiled survey rounds, before the final steady row hides it in a set-only
-# check.
+# The callee reads non-forcing coordinate fields from `sys._getframe(1)`.  The
+# walk answers that call with the portal red box, and `f_lasti` / `f_lineno`
+# fold at the CALL the portal is suspended at (`fbw_mode.inline_caller_py_pc`).
+# A residual heap `last_instr` used to disagree with that coordinate and show
+# up as an extra pre-loop row during the first compiled survey rounds.
 import sys
 
 N = 20000

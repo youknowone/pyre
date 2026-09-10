@@ -1,13 +1,12 @@
 # A callee reads its CALLER's resume coordinate -- `f_lineno` and `f_lasti` --
 # from two DIFFERENT call sites in the same hot loop.
 #
-# `f_lineno` and `f_lasti` both resolve off the frame's `last_instr`, which
-# compiled code does not store per opcode, so the value only reaches the frame
-# if the force publishes it.  A single call site makes that unobservable: the
-# caller's coordinate is then constant by construction and a frozen read is
-# indistinguishable from a live one.  Calling from two lines makes the correct
-# answer ALTERNATE, so a frame left holding one leg's coordinate collapses the
-# two rows into one.
+# `f_lineno` and `f_lasti` fold at the CALL the portal is suspended at
+# (`fbw_mode.inline_caller_py_pc`).  A single call site makes that
+# unobservable: the caller's coordinate is then constant by construction and a
+# frozen read is indistinguishable from a live one.  Calling from two lines
+# makes the correct answer ALTERNATE, so a fold that reused one site's
+# coordinate would collapse the two rows into one.
 #
 # The staleness this pins runs in the other direction too: a publish that is
 # withdrawn too early -- put back at the residual's return instead of at walk
@@ -37,12 +36,9 @@
 # Neither read goes through `.f_locals`: that getset forces the frame on its
 # own, and a forcing read would mask exactly the staleness under test.
 #
-# `sys._getframe` forces only the frame it RETURNS, so this file takes one
-# escape per call rather than the two it took when the walk also forced the top
-# of the stack. That is the whole of its recorded
-# `fbw_blackhole_adopted_single_frame` 5 -> 0 / `loops_aborted` 10 -> 5, and
-# `outer`'s loop compiles now — which makes the assertion above stricter, not
-# weaker, since the coordinate it reads comes out of a compiled activation.
+# The two call sites compile in the same loop; the assertion is therefore on
+# the folded CALL coordinates, not on a residual force that published
+# `last_instr`.
 import sys
 
 N = 60000

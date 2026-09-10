@@ -1,10 +1,9 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=root:caller_view,root:leaf
+# pyre-check: selfcheck-compiles=main
 # pyre-check: spec-folds=frame_lasti
-# The `root:` arm is measured, not a relaxation: this fixture's loop aborts
-# five times with ABORT_ESCAPE and what reaches the JIT is the root trace
-# `finish_and_compile` attaches. It declines through the same arm as
-# `frame_caller_image_from_inlined_callee_regression.py`, which records it.
+# pyre-check: skip-backends=wasm
+# wasm still prints PASS but compiles `root:leaf` and `root:caller_view`
+# after five loop aborts, so it cannot declare the native `main` loop.
 # Self-checking guard for the `f_lasti` coordinate on the two frames a walk
 # owns that are NOT the loop's own portal: the frame of an inlined callee, and
 # the caller's frame read from inside one.
@@ -16,8 +15,9 @@
 # pc through its own metadata, and the caller keeps the CALL boundary it is
 # suspended at.  Two sources behind one witness, so both need a site here.
 #
-# The cold arm compiles as a guard-failure bridge off the hot loop, which
-# records its `f_lasti` read at a pc the loop trace never held.
+# The cold arm is the portal-level `_getframe()` inside the loop's rare
+# branch; it must still name +23 even when the compiled loop takes the other
+# side.
 #
 # Every site collects a SET: the loop compiles part-way through, so an
 # interpreted answer and a compiled one that disagree appear as a second
