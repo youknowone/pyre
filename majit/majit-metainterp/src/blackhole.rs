@@ -1932,11 +1932,20 @@ impl BlackholeInterpreter {
             // (see above). The slice is only read.
             unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) }
         };
-        // `blackhole.py` `dispatch_loop` keeps `position` as a loop local.
-        // Write `self.position` only when leaving the inlined match (return,
-        // INLINE_CALL, or the function-pointer fallback).
+        // `blackhole.py` `dispatch_loop` keeps `position` as a loop local
+        // and increments it past the opcode before the inlined handler
+        // (`opcode = ord(code[position]); position += 1`).
         let mut position = self.position;
         let live_hook_absent = LIVE_MARKER_HOOK.get().is_none();
+        // SAFETY: `self.jitcode` / `registers_*` are not reseated by an
+        // inlined handler. INLINE_CALL and the function-pointer fallback
+        // refresh the register pointers below.
+        let exec_descrs: &[crate::jitcode::RuntimeBhDescr] = unsafe {
+            let slice = self.jitcode.exec.descrs.as_slice();
+            std::slice::from_raw_parts(slice.as_ptr(), slice.len())
+        };
+        let mut regs_i = self.registers_i.as_mut_ptr();
+        let mut regs_r = self.registers_r.as_mut_ptr();
         loop {
             if position >= code.len() {
                 self.position = position;
@@ -1949,17 +1958,19 @@ impl BlackholeInterpreter {
                 }
                 return BhRunOutcome::EndOfCode;
             }
-            let pos_before = position;
             if check_startpoints && let Some(startpoints) = self.jitcode.startpoints.as_ref() {
                 assert!(
-                    startpoints.contains(&pos_before),
-                    "run_inner: position {pos_before} is in the middle of an instruction \
+                    startpoints.contains(&position),
+                    "run_inner: position {position} is in the middle of an instruction \
                      (jitcode {:?} index {:?})",
                     self.jitcode.name,
                     self.jitcode.try_index(),
                 );
             }
-            let opcode = code[position];
+            // SAFETY: `position < code.len()` just held.
+            let opcode = unsafe { *code.get_unchecked(position) };
+            let pos_before = position;
+            position += 1;
             // The remaining `shift` epilogue at pc 210 is `-live-`,
             // `goto/L`, `goto_if_not`, `int_copy`, getfield/setfield of
             // `left`/`right`/`marked`/`empty`, `int_eq`/`int_add`,
@@ -1971,158 +1982,163 @@ impl BlackholeInterpreter {
             if !trace {
                 match opcode {
                     jitcode::insns::BC_LIVE if live_hook_absent => {
-                        position += 1 + majit_translate::liveness::OFFSET_SIZE;
+                        position += majit_translate::liveness::OFFSET_SIZE;
                         continue;
                     }
                     jitcode::insns::BC_JUMP => {
-                        let p = position + 1;
-                        position = (code[p] as usize) | ((code[p + 1] as usize) << 8);
+                        // SAFETY: well-formed `goto/L` carries two operand bytes.
+                        position = unsafe { bh_code_u16(code, position) };
                         continue;
                     }
                     jitcode::insns::BC_GOTO_IF_NOT | jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
                         // `if mark` / `if old_left` lower to
                         // `goto_if_not_int_is_true`; `bhimpl_goto_if_not_int_is_true`
                         // is `bhimpl_goto_if_not`.
-                        let p = position + 1;
-                        let a = self.registers_i[code[p] as usize];
-                        let target = (code[p + 1] as usize) | ((code[p + 2] as usize) << 8);
-                        position = bhimpl_goto_if_not(a, target, p + 3);
+                        // SAFETY: operand bytes and the named int register exist.
+                        let a = unsafe { *regs_i.add(*code.get_unchecked(position) as usize) };
+                        let target = unsafe { bh_code_u16(code, position + 1) };
+                        position = bhimpl_goto_if_not(a, target, position + 3);
                         continue;
                     }
                     jitcode::insns::BC_INT_IS_TRUE => {
-                        let p = position + 1;
-                        let a = self.registers_i[code[p] as usize];
-                        self.registers_i[code[p + 1] as usize] = bhimpl_int_is_true(a);
-                        position = p + 2;
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 1) as usize) =
+                                bhimpl_int_is_true(a);
+                        }
+                        position += 2;
                         continue;
                     }
                     jitcode::insns::BC_MOVE_I => {
-                        let p = position + 1;
-                        self.registers_i[code[p + 1] as usize] = self.registers_i[code[p] as usize];
-                        position = p + 2;
+                        unsafe {
+                            let src = *regs_i.add(*code.get_unchecked(position) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 1) as usize) = src;
+                        }
+                        position += 2;
                         continue;
                     }
                     jitcode::insns::BC_MOVE_I_C => {
-                        let p = position + 1;
-                        self.registers_i[code[p + 1] as usize] = code[p] as i8 as i64;
-                        position = p + 2;
+                        unsafe {
+                            let src = *code.get_unchecked(position) as i8 as i64;
+                            *regs_i.add(*code.get_unchecked(position + 1) as usize) = src;
+                        }
+                        position += 2;
                         continue;
                     }
                     jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_I_PURE => {
-                        let p = position + 1;
-                        let struct_ptr = self.registers_r[code[p] as usize];
-                        let (val, dest, pos) = {
-                            let (descr, pos) = read_descr(self, code, p + 1);
-                            (
-                                bh_load_int_field(struct_ptr, descr),
-                                code[pos] as usize,
-                                pos,
-                            )
-                        };
-                        self.registers_i[dest] = val;
-                        position = pos + 1;
+                        unsafe {
+                            let struct_ptr = *regs_r.add(*code.get_unchecked(position) as usize);
+                            let (descr, pos) =
+                                read_descr_fast(exec_descrs, self, code, position + 1);
+                            let dest = *code.get_unchecked(pos) as usize;
+                            *regs_i.add(dest) = bh_load_int_field(struct_ptr, descr);
+                            position = pos + 1;
+                        }
                         continue;
                     }
                     jitcode::insns::BC_GETFIELD_GC_R | jitcode::insns::BC_GETFIELD_GC_R_PURE => {
-                        let p = position + 1;
-                        let struct_ptr = self.registers_r[code[p] as usize];
-                        let (val, dest, pos) = {
-                            let (descr, pos) = read_descr(self, code, p + 1);
-                            (
-                                bh_load_ref_field(struct_ptr, descr),
-                                code[pos] as usize,
-                                pos,
-                            )
-                        };
-                        self.registers_r[dest] = val;
-                        position = pos + 1;
+                        unsafe {
+                            let struct_ptr = *regs_r.add(*code.get_unchecked(position) as usize);
+                            let (descr, pos) =
+                                read_descr_fast(exec_descrs, self, code, position + 1);
+                            let dest = *code.get_unchecked(pos) as usize;
+                            *regs_r.add(dest) = bh_load_ref_field(struct_ptr, descr);
+                            position = pos + 1;
+                        }
                         continue;
                     }
                     jitcode::insns::BC_INT_EQ => {
-                        let p = position + 1;
-                        let a = self.registers_i[code[p] as usize];
-                        let b = self.registers_i[code[p + 1] as usize];
-                        self.registers_i[code[p + 2] as usize] = bhimpl_int_eq(a, b);
-                        position = p + 3;
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 2) as usize) =
+                                bhimpl_int_eq(a, b);
+                        }
+                        position += 3;
                         continue;
                     }
                     jitcode::insns::BC_INT_NE => {
-                        let p = position + 1;
-                        let a = self.registers_i[code[p] as usize];
-                        let b = self.registers_i[code[p + 1] as usize];
-                        self.registers_i[code[p + 2] as usize] = bhimpl_int_ne(a, b);
-                        position = p + 3;
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 2) as usize) =
+                                bhimpl_int_ne(a, b);
+                        }
+                        position += 3;
                         continue;
                     }
                     jitcode::insns::BC_INT_LT => {
-                        let p = position + 1;
-                        let a = self.registers_i[code[p] as usize];
-                        let b = self.registers_i[code[p + 1] as usize];
-                        self.registers_i[code[p + 2] as usize] = bhimpl_int_lt(a, b);
-                        position = p + 3;
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 2) as usize) =
+                                bhimpl_int_lt(a, b);
+                        }
+                        position += 3;
                         continue;
                     }
                     jitcode::insns::BC_INT_ADD => {
-                        let p = position + 1;
-                        let a = self.registers_i[code[p] as usize];
-                        let b = self.registers_i[code[p + 1] as usize];
-                        self.registers_i[code[p + 2] as usize] = bhimpl_int_add(a, b);
-                        position = p + 3;
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 2) as usize) =
+                                bhimpl_int_add(a, b);
+                        }
+                        position += 3;
                         continue;
                     }
                     jitcode::insns::BC_GOTO_IF_NOT_INT_EQ => {
-                        let p = position + 1;
-                        let a = self.registers_i[code[p] as usize];
-                        let b = self.registers_i[code[p + 1] as usize];
-                        let target = (code[p + 2] as usize) | ((code[p + 3] as usize) << 8);
-                        position = if a == b { p + 4 } else { target };
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            let target = bh_code_u16(code, position + 2);
+                            position = if a == b { position + 4 } else { target };
+                        }
                         continue;
                     }
                     jitcode::insns::BC_SETFIELD_GC_I => {
-                        let p = position + 1;
-                        let struct_ptr = self.registers_r[code[p] as usize];
-                        let value = self.registers_i[code[p + 1] as usize];
-                        let pos = {
-                            let (descr, pos) = read_descr(self, code, p + 2);
+                        unsafe {
+                            let struct_ptr = *regs_r.add(*code.get_unchecked(position) as usize);
+                            let value = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            let (descr, pos) =
+                                read_descr_fast(exec_descrs, self, code, position + 2);
                             bh_store_int_field(struct_ptr, value, descr);
-                            pos
-                        };
-                        position = pos;
+                            position = pos;
+                        }
                         continue;
                     }
                     jitcode::insns::BC_SETFIELD_GC_I_C => {
-                        let p = position + 1;
-                        let struct_ptr = self.registers_r[code[p] as usize];
-                        let value = code[p + 1] as i8 as i64;
-                        let pos = {
-                            let (descr, pos) = read_descr(self, code, p + 2);
+                        unsafe {
+                            let struct_ptr = *regs_r.add(*code.get_unchecked(position) as usize);
+                            let value = *code.get_unchecked(position + 1) as i8 as i64;
+                            let (descr, pos) =
+                                read_descr_fast(exec_descrs, self, code, position + 2);
                             bh_store_int_field(struct_ptr, value, descr);
-                            pos
-                        };
-                        position = pos;
+                            position = pos;
+                        }
                         continue;
                     }
                     jitcode::insns::BC_INT_RETURN => {
-                        let p = position + 1;
-                        self.tmpreg_i = self.registers_i[code[p] as usize];
+                        self.tmpreg_i =
+                            unsafe { *regs_i.add(*code.get_unchecked(position) as usize) };
                         self.return_type = BhReturnType::Int;
-                        self.position = p + 1;
+                        self.position = position + 1;
                         return BhRunOutcome::LeaveFrame;
                     }
                     jitcode::insns::BC_INT_RETURN_C => {
-                        let p = position + 1;
-                        self.tmpreg_i = code[p] as i8 as i64;
+                        self.tmpreg_i = unsafe { *code.get_unchecked(position) as i8 as i64 };
                         self.return_type = BhReturnType::Int;
-                        self.position = p + 1;
+                        self.position = position + 1;
                         return BhRunOutcome::LeaveFrame;
                     }
                     jitcode::insns::BC_INLINE_CALL => {
-                        let p = position + 1;
-                        self.position = position;
+                        self.position = pos_before;
                         self.last_opcode_position = pos_before;
-                        match handler_inline_call_nested_ext(self, code, p) {
+                        match handler_inline_call_nested_ext(self, code, position) {
                             Ok(new_pos) => {
                                 position = new_pos;
+                                regs_i = self.registers_i.as_mut_ptr();
+                                regs_r = self.registers_r.as_mut_ptr();
                                 continue;
                             }
                             Err(DispatchError::LeaveFrame) => {
@@ -2142,6 +2158,8 @@ impl BlackholeInterpreter {
                                 self.position = resume_position;
                                 if self.handle_exception_in_frame(exc) {
                                     position = self.position;
+                                    regs_i = self.registers_i.as_mut_ptr();
+                                    regs_r = self.registers_r.as_mut_ptr();
                                     continue;
                                 }
                                 self.got_exception = true;
@@ -2153,9 +2171,10 @@ impl BlackholeInterpreter {
                     _ => {}
                 }
             }
+            // Fallback: position is already past the opcode, matching
+            // `dispatch_loop` / `dispatch_step`.
             self.position = position;
             self.last_opcode_position = pos_before;
-            self.position += 1;
             if trace {
                 eprintln!(
                     "[bh-trace] pos={} op={} reg0={} reg1={}",
@@ -2168,6 +2187,8 @@ impl BlackholeInterpreter {
             match self.dispatch_step(opcode, code) {
                 Ok(()) => {
                     position = self.position;
+                    regs_i = self.registers_i.as_mut_ptr();
+                    regs_r = self.registers_r.as_mut_ptr();
                 }
                 Err(DispatchError::LeaveFrame) => {
                     if trace {
@@ -2200,6 +2221,8 @@ impl BlackholeInterpreter {
                     if self.handle_exception_in_frame(exc) {
                         // Handler found, continue execution at handler target
                         position = self.position;
+                        regs_i = self.registers_i.as_mut_ptr();
+                        regs_r = self.registers_r.as_mut_ptr();
                         continue;
                     }
                     // No handler: propagate exception via got_exception flag
@@ -4698,6 +4721,28 @@ mod tests {
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], 42);
+        }
+
+        #[test]
+        fn dispatch_loop_int_eq_then_int_return() {
+            // Translated `dispatch_loop` increments past the opcode first.
+            // `int_eq` + `int_return` is the shift-epilogue exit.
+            let mut b = JitCodeBuilder::default();
+            b.load_const_i_value(0, 3);
+            b.load_const_i_value(1, 3);
+            b.record_binop_i(2, OpCode::IntEq, 0, 1);
+            b.int_return(2);
+            let jitcode = b.finish();
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            match bh.run() {
+                BhRunOutcome::LeaveFrame => {}
+                other => panic!("expected LeaveFrame, got {other:?}"),
+            }
+            assert_eq!(bh.tmpreg_i, 1);
+            assert_eq!(bh.return_type, BhReturnType::Int);
         }
 
         #[test]
@@ -8747,6 +8792,33 @@ fn bh_store_float_field(struct_ptr: i64, value: f64, descr: &BhDescr) {
 }
 
 // CPU-dependent field and array operations
+/// Two-byte little-endian operand. Translated `dispatch_loop` reads
+/// `ord(code[position]) | (ord(code[position+1]) << 8)` with no check.
+#[inline(always)]
+unsafe fn bh_code_u16(code: &[u8], pos: usize) -> usize {
+    unsafe { (*code.get_unchecked(pos) as usize) | ((*code.get_unchecked(pos + 1) as usize) << 8) }
+}
+
+/// `d` argcode against the jitcode's own descr pool, then the builder table.
+/// RPython is `self.descrs[index]`; the runtime jitcode pool is that list
+/// for a `JitCodeBuilder` helper.
+#[inline(always)]
+unsafe fn read_descr_fast<'a>(
+    exec_descrs: &'a [crate::jitcode::RuntimeBhDescr],
+    bh: &'a BlackholeInterpreter,
+    code: &[u8],
+    pos: usize,
+) -> (&'a BhDescr, usize) {
+    let descr_idx = unsafe { bh_code_u16(code, pos) };
+    if descr_idx < exec_descrs.len() {
+        let descr = unsafe { exec_descrs.get_unchecked(descr_idx) }
+            .as_bh_descr()
+            .unwrap_or_else(|| panic!("d-arg descrs[{descr_idx}] is not a BhDescr entry"));
+        return (descr, pos + 2);
+    }
+    read_descr(bh, code, pos)
+}
+
 /// RPython `blackhole.py:150-157`: read a 2-byte descriptor index from
 /// bytecode and return `(descr_object, new_position)`.
 ///
