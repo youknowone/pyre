@@ -1994,10 +1994,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
                     libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
                 }
-                Ok(pyre_object::w_tuple_new(vec![
-                    socket_from_fd(fds[0], family, ty, proto)?,
-                    socket_from_fd(fds[1], family, ty, proto)?,
-                ]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(socket_from_fd(fds[0], family, ty, proto)?);
+                fields.push(socket_from_fd(fds[1], family, ty, proto)?);
+                Ok(pyre_object::w_tuple_new(fields.take()))
             }),
         );
 
@@ -2174,28 +2174,34 @@ fn unpack_hostent(he: *mut rffi::Hostent) -> Result<pyre_object::PyObjectRef, cr
                 index += 1;
             }
         }
-        let aliases = alias_strings
-            .iter()
-            .map(|alias| pyre_object::w_str_new_managed(alias))
-            .collect();
-        let addrs = addr_strings
-            .iter()
-            .map(|addr| pyre_object::w_str_new_managed(addr))
-            .collect();
         // `w_list_new` roots the items it is handed, not the header it returns,
         // and that header is a movable nursery object (`rlist.py:116 LIST =
         // GcStruct`). Each list therefore stays pinned across the allocation
         // that follows it and is re-read from its slot afterwards.
-        let _roots = pyre_object::gc_roots::push_roots();
+        let _headers = pyre_object::gc_roots::push_roots();
+        let aliases = {
+            let mut items = pyre_object::gc_roots::RootedItems::new();
+            for alias in &alias_strings {
+                items.push(pyre_object::w_str_new_managed(alias));
+            }
+            pyre_object::w_list_new(items.take())
+        };
         let aliases_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(aliases));
+        let _ = pyre_object::gc_roots::pin_root(aliases);
+        let addrs = {
+            let mut items = pyre_object::gc_roots::RootedItems::new();
+            for addr in &addr_strings {
+                items.push(pyre_object::w_str_new_managed(addr));
+            }
+            pyre_object::w_list_new(items.take())
+        };
         let addrs_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(addrs));
-        Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new_managed(&name),
-            pyre_object::gc_roots::shadow_stack_get(aliases_slot),
-            pyre_object::gc_roots::shadow_stack_get(addrs_slot),
-        ]))
+        let _ = pyre_object::gc_roots::pin_root(addrs);
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_str_new_managed(&name));
+        fields.push(pyre_object::gc_roots::shadow_stack_get(aliases_slot));
+        fields.push(pyre_object::gc_roots::shadow_stack_get(addrs_slot));
+        Ok(pyre_object::w_tuple_new(fields.take()))
     }
 }
 
@@ -2570,10 +2576,10 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         .to_string_lossy()
                         .into_owned()
                 };
-                Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_str_new_managed(&host_s),
-                    pyre_object::w_str_new_managed(&serv_s),
-                ]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_str_new_managed(&host_s));
+                fields.push(pyre_object::w_str_new_managed(&serv_s));
+                Ok(pyre_object::w_tuple_new(fields.take()))
             },
             2,
         ),
@@ -3180,10 +3186,14 @@ fn windows_if_nameindex() -> Result<pyre_object::PyObjectRef, crate::PyError> {
                 return Err(win32(status));
             }
             let end = name.iter().position(|&unit| unit == 0).unwrap_or(name.len());
-            let entry = pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(i64::from(row.InterfaceIndex)),
-                pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(&name[..end])),
-            ]);
+            let entry = {
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(i64::from(row.InterfaceIndex)));
+                fields.push(pyre_object::w_str_from_wtf8(
+                    rustpython_wtf8::Wtf8Buf::from_wide(&name[..end]),
+                ));
+                pyre_object::w_tuple_new(fields.take())
+            };
             unsafe {
                 pyre_object::listobject::w_list_append(
                     pyre_object::gc_roots::shadow_stack_get(list_slot),
@@ -3394,10 +3404,10 @@ fn unpack_bluetooth_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObj
 
     let bth: bt::SOCKADDR_BTH =
         unsafe { core::ptr::read_unaligned(storage as *const _ as *const bt::SOCKADDR_BTH) };
-    pyre_object::w_tuple_new(vec![
-        pyre_object::w_str_new_managed(&bdaddr_string(bth.btAddr)),
-        pyre_object::w_int_new(i64::from(bth.port)),
-    ])
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_str_new_managed(&bdaddr_string(bth.btAddr)));
+    fields.push(pyre_object::w_int_new(i64::from(bth.port)));
+    pyre_object::w_tuple_new(fields.take())
 }
 
 /// `HV_PROTOCOL_RAW` — the only protocol an `AF_HYPERV` socket is opened with.
@@ -3520,10 +3530,10 @@ fn unpack_hyperv_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObject
     let hv = unsafe { &*(storage as *const _ as *const SockaddrHv) };
     let vm_id = hyperv_guid_string(&hv.vm_id);
     let service_id = hyperv_guid_string(&hv.service_id);
-    pyre_object::w_tuple_new(vec![
-        pyre_object::w_str_new_managed(&vm_id),
-        pyre_object::w_str_new_managed(&service_id),
-    ])
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_str_new_managed(&vm_id));
+    fields.push(pyre_object::w_str_new_managed(&service_id));
+    pyre_object::w_tuple_new(fields.take())
 }
 
 /// `_PyLong_UInt16_Converter` / `_PyLong_UInt32_Converter`, the argument
@@ -3954,10 +3964,10 @@ fn unpack_inet_addr(
             unsafe { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() }
         };
         let port = u16::from_be(sin.sin_port) as i64;
-        pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new_managed(&host),
-            pyre_object::w_int_new(port),
-        ])
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_str_new_managed(&host));
+        fields.push(pyre_object::w_int_new(port));
+        pyre_object::w_tuple_new(fields.take())
     } else if family == rffi::AF_INET6 {
         let sin6 = unsafe { &*(storage as *const _ as *const rffi::sockaddr_in6) };
         let mut buf = [0u8; 64];
@@ -3975,12 +3985,12 @@ fn unpack_inet_addr(
             unsafe { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() }
         };
         let port = u16::from_be(sin6.sin6_port) as i64;
-        pyre_object::w_tuple_new(vec![
-            pyre_object::w_str_new_managed(&host),
-            pyre_object::w_int_new(port),
-            pyre_object::w_int_new(u32::from_be(sin6.sin6_flowinfo) as i64),
-            pyre_object::w_int_new(rffi::sockaddr_in6_get_scope_id(sin6) as i64),
-        ])
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_str_new_managed(&host));
+        fields.push(pyre_object::w_int_new(port));
+        fields.push(pyre_object::w_int_new(u32::from_be(sin6.sin6_flowinfo) as i64));
+        fields.push(pyre_object::w_int_new(rffi::sockaddr_in6_get_scope_id(sin6) as i64));
+        pyre_object::w_tuple_new(fields.take())
     } else {
         #[cfg(unix)]
         if family == libc::AF_UNIX {
@@ -4459,9 +4469,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // already closed over an exec (rsocket uses
                 // accept4(SOCK_CLOEXEC) on Linux; this is the portable path).
                 rffi::set_cloexec(cfd);
-                let new_sock = socket_from_fd(cfd, family, ty, proto)?;
-                let addr = unpack_inet_addr(&storage, slen);
-                Ok(pyre_object::w_tuple_new(vec![new_sock, addr]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(socket_from_fd(cfd, family, ty, proto)?);
+                fields.push(unpack_inet_addr(&storage, slen));
+                Ok(pyre_object::w_tuple_new(fields.take()))
             },
             1,
         ),
@@ -4501,11 +4512,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     crate::module::signal::interp_signal::checksignals_now()?;
                 };
                 rffi::set_cloexec(cfd);
-                let addr = unpack_inet_addr(&storage, slen);
-                Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_int_new(rffi::socket_to_i64(cfd)),
-                    addr,
-                ]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(rffi::socket_to_i64(cfd)));
+                fields.push(unpack_inet_addr(&storage, slen));
+                Ok(pyre_object::w_tuple_new(fields.take()))
             },
             1,
         ),
@@ -4893,11 +4903,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 crate::module::signal::interp_signal::checksignals_now()?;
             };
             buf.truncate(got as usize);
-            let addr = unpack_inet_addr(&storage, slen);
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::bytesobject::w_bytes_from_bytes(&buf),
-                addr,
-            ]))
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&buf));
+            fields.push(unpack_inet_addr(&storage, slen));
+            Ok(pyre_object::w_tuple_new(fields.take()))
         }),
     ) };
 
@@ -5048,11 +5057,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // (`converted_error` eintr_retry).
                 crate::module::signal::interp_signal::checksignals_now()?;
             };
-            let addr = unpack_inet_addr(&storage, slen);
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(got as i64),
-                addr,
-            ]))
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_int_new(got as i64));
+            fields.push(unpack_inet_addr(&storage, slen));
+            Ok(pyre_object::w_tuple_new(fields.take()))
         }),
     ) };
 
@@ -5203,13 +5211,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                 }
             }
-            let addr = unpack_inet_addr(&storage, msg_namelen);
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::bytesobject::w_bytes_from_bytes(&data),
-                pyre_object::w_list_new(anc_items.take()),
-                pyre_object::w_int_new(msg_flags as i64),
-                addr,
-            ]))
+            let anc_list = pyre_object::w_list_new(anc_items.take());
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&data));
+            fields.push(anc_list);
+            fields.push(pyre_object::w_int_new(msg_flags as i64));
+            fields.push(unpack_inet_addr(&storage, msg_namelen));
+            Ok(pyre_object::w_tuple_new(fields.take()))
         }),
     ) };
 
@@ -5362,13 +5370,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                 }
             }
-            let addr = unpack_inet_addr(&storage, msg_namelen);
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(got as i64),
-                pyre_object::w_list_new(anc_items.take()),
-                pyre_object::w_int_new(msg_flags as i64),
-                addr,
-            ]))
+            let anc_list = pyre_object::w_list_new(anc_items.take());
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_int_new(got as i64));
+            fields.push(anc_list);
+            fields.push(pyre_object::w_int_new(msg_flags as i64));
+            fields.push(unpack_inet_addr(&storage, msg_namelen));
+            Ok(pyre_object::w_tuple_new(fields.take()))
         }),
     ) };
 

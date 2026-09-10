@@ -199,10 +199,11 @@ fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
     let put_str = |k: &str, b: &[u8]| put(k, crate::typedef::charp2uni(b));
     let put_int = |k: &str, v: i64| put(k, pyre_object::w_int_new(v));
     let put_grouping = |k: &str, v: &[i64]| {
-        put(
-            k,
-            pyre_object::w_list_new(v.iter().map(|&x| pyre_object::w_int_new(x)).collect()),
-        )
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        for &x in v {
+            items.push(pyre_object::w_int_new(x));
+        }
+        put(k, pyre_object::w_list_new(items.take()))
     };
     put_str("decimal_point", &c.decimal_point);
     put_str("thousands_sep", &c.thousands_sep);
@@ -407,19 +408,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 let language = windows_default_locale_component(LOCALE_SISO639LANGNAME);
                 let territory = windows_default_locale_component(LOCALE_SISO3166CTRYNAME);
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
                 let locale = match (language, territory) {
                     (Some(language), Some(territory)) => {
                         pyre_object::w_str_new_managed(&format!("{language}_{territory}"))
                     }
                     _ => pyre_object::w_none(),
                 };
+                fields.push(locale);
                 // The active ANSI code page, spelled `cp<n>` whatever it is:
                 // code page 65001 answers `cp65001`, not `utf-8`.  Mapping it
                 // to a codec name is `locale.getdefaultlocale`'s job, not this
                 // hook's.
                 let codepage = active_acp();
-                let encoding = pyre_object::w_str_new_managed(&format!("cp{codepage}"));
-                Ok(pyre_object::w_tuple_new(vec![locale, encoding]))
+                fields.push(pyre_object::w_str_new_managed(&format!("cp{codepage}")));
+                Ok(pyre_object::w_tuple_new(fields.take()))
             },
             0,
         ),

@@ -354,10 +354,10 @@ pub(crate) fn compat_map(
     };
     // Build the (module, name) key before touching the cached slots, then read
     // each mapping slot immediately before its probe.
-    let key = pyre_object::tupleobject::w_tuple_new(vec![
-        pyre_object::w_str_new_managed(module),
-        pyre_object::w_str_new_managed(name),
-    ]);
+    let mut key_items = pyre_object::gc_roots::RootedItems::new();
+    key_items.push(pyre_object::w_str_new_managed(module));
+    key_items.push(pyre_object::w_str_new_managed(name));
+    let key = pyre_object::tupleobject::w_tuple_new(key_items.take());
     // `finditem` below is generic: a replaced or non-dict `*_MAPPING` routes
     // through `getitem`, which can run Python and drive a collection. Pin the
     // freshly built key so a collection there cannot sweep it mid-lookup — the

@@ -616,10 +616,10 @@ impl W_TextIOWrapper {
         if cookie.start_pos == 0 && cookie.dec_flags == 0 {
             super::call_method_result(self.w_decoder, "reset", &[])?;
         } else {
-            let state = w_tuple_new(vec![
-                pyre_object::bytesobject::w_bytes_empty(),
-                w_int_new(cookie.dec_flags as i64),
-            ]);
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::bytesobject::w_bytes_empty());
+            fields.push(w_int_new(cookie.dec_flags as i64));
+            let state = w_tuple_new(fields.take());
             super::call_method_result(self.w_decoder, "setstate", &[state])?;
         }
         Ok(())

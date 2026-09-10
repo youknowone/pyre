@@ -1293,11 +1293,16 @@ pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult
         && !unsafe { pyre_object::is_none(w_self) }
         && !unsafe { pyre_object::is_module(w_self) }
     {
-        let name = pyre_object::w_str_new(unsafe { crate::function_get_name(obj) });
-        return Ok(pyre_object::w_tuple_new(vec![
-            crate::baseobjspace::builtin_callable("getattr"),
-            pyre_object::w_tuple_new(vec![w_self, name]),
-        ]));
+        let mut args = pyre_object::gc_roots::RootedItems::new();
+        args.push(w_self);
+        args.push(pyre_object::w_str_new(unsafe {
+            crate::function_get_name(obj)
+        }));
+        let args = pyre_object::w_tuple_new(args.take());
+        let mut result = pyre_object::gc_roots::RootedItems::new();
+        result.push(crate::baseobjspace::builtin_callable("getattr"));
+        result.push(args);
+        return Ok(pyre_object::w_tuple_new(result.take()));
     }
     Ok(pyre_object::w_str_from_wtf8(unsafe {
         function_get_qualname(obj)
@@ -3588,10 +3593,14 @@ pub unsafe fn descr_method__reduce__(obj: PyObjectRef) -> Result<PyObjectRef, cr
     let function = unsafe { pyre_object::w_method_get_func(obj) };
     let instance = unsafe { pyre_object::w_method_get_self(obj) };
     let name = crate::baseobjspace::getattr_str(function, "__name__")?;
-    Ok(pyre_object::w_tuple_new(vec![
-        crate::baseobjspace::builtin_callable("getattr"),
-        pyre_object::w_tuple_new(vec![instance, name]),
-    ]))
+    let mut args = pyre_object::gc_roots::RootedItems::new();
+    args.push(instance);
+    args.push(name);
+    let args = pyre_object::w_tuple_new(args.take());
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(crate::baseobjspace::builtin_callable("getattr"));
+    result.push(args);
+    Ok(pyre_object::w_tuple_new(result.take()))
 }
 
 #[inline]

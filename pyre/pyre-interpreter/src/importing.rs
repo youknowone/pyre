@@ -977,27 +977,33 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
             // one liveness pin covers it to the end of the call.
             let roots = pyre_object::gc_roots::push_roots();
             let first = roots.pin_root(first);
-            let rest = parts
-                .into_iter()
-                .map(|part| match part {
-                    FieldNamePart::Attribute(s) => pyre_object::w_tuple_new(vec![
-                        pyre_object::w_bool_from(true),
-                        pyre_object::w_str_from_wtf8(s),
-                    ]),
-                    FieldNamePart::Index(n) => pyre_object::w_tuple_new(vec![
-                        pyre_object::w_bool_from(false),
-                        pyre_object::w_int_new(n as i64),
-                    ]),
-                    FieldNamePart::StringIndex(s) => pyre_object::w_tuple_new(vec![
-                        pyre_object::w_bool_from(false),
-                        pyre_object::w_str_from_wtf8(s),
-                    ]),
-                })
-                .collect();
-            Ok(pyre_object::w_tuple_new(vec![
-                first,
-                pyre_object::w_list_new(rest),
-            ]))
+            let mut rest = pyre_object::gc_roots::RootedItems::new();
+            for part in parts {
+                let entry = {
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    match part {
+                        FieldNamePart::Attribute(s) => {
+                            fields.push(pyre_object::w_bool_from(true));
+                            fields.push(pyre_object::w_str_from_wtf8(s));
+                        }
+                        FieldNamePart::Index(n) => {
+                            fields.push(pyre_object::w_bool_from(false));
+                            fields.push(pyre_object::w_int_new(n as i64));
+                        }
+                        FieldNamePart::StringIndex(s) => {
+                            fields.push(pyre_object::w_bool_from(false));
+                            fields.push(pyre_object::w_str_from_wtf8(s));
+                        }
+                    }
+                    pyre_object::w_tuple_new(fields.take())
+                };
+                rest.push(entry);
+            }
+            let rest_list = pyre_object::w_list_new(rest.take());
+            let mut result = pyre_object::gc_roots::RootedItems::new();
+            result.push(first);
+            result.push(rest_list);
+            Ok(pyre_object::w_tuple_new(result.take()))
         }),
     );
     Ok(())
@@ -1544,10 +1550,10 @@ fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ns,
         "get_traced_memory",
         crate::make_builtin_function("get_traced_memory", |_| {
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(0),
-                pyre_object::w_int_new(0),
-            ]))
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_int_new(0));
+            fields.push(pyre_object::w_int_new(0));
+            Ok(pyre_object::w_tuple_new(fields.take()))
         }),
     );
     crate::module_ns_store(

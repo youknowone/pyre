@@ -60,6 +60,26 @@ struct MiniXmlParser<'a> {
     char_buffer: String,
 }
 
+/// Pins each handler argument as it is produced. An array literal would
+/// mint every argument first, so a later allocation could sweep an earlier
+/// managed string before any root existed.
+struct HandlerArgs<'p, 'a> {
+    parser: &'p mut MiniXmlParser<'a>,
+    name: &'static str,
+    items: pyre_object::gc_roots::RootedItems,
+}
+
+impl<'p, 'a> HandlerArgs<'p, 'a> {
+    fn arg(mut self, item: PyObjectRef) -> Self {
+        self.items.push(item);
+        self
+    }
+
+    fn call(self) -> Result<(), crate::PyError> {
+        self.parser.call_handler(self.name, &self.items.take())
+    }
+}
+
 impl<'a> MiniXmlParser<'a> {
     fn new(parser: PyObjectRef, input: &'a str, isfinal: bool, suppress_until: usize) -> Self {
         Self {
@@ -275,10 +295,11 @@ impl<'a> MiniXmlParser<'a> {
         } {
             validate_decl_encoding(&enc).map_err(|m| self.make_error(m))?;
         }
-        self.call_handler(
-            "XmlDeclHandler",
-            &[w_str_new_managed(&version), encoding, standalone],
-        )?;
+        self.handler_args("XmlDeclHandler")
+            .arg(w_str_new_managed(&version))
+            .arg(encoding)
+            .arg(standalone)
+            .call()?;
         if unsafe { is_int(standalone) && w_int_get_value(standalone) == 0 } {
             crate::baseobjspace::setdictvalue_native(
                 self.parser,
@@ -305,7 +326,9 @@ impl<'a> MiniXmlParser<'a> {
             self.bump_char();
         }
         self.set_event_position(event_pos);
-        self.call_handler("CommentHandler", &[w_str_new_managed(&text)])
+        self.handler_args("CommentHandler")
+            .arg(w_str_new_managed(&text))
+            .call()
     }
 
     fn parse_pi(&mut self) -> Result<(), crate::PyError> {
@@ -326,10 +349,10 @@ impl<'a> MiniXmlParser<'a> {
             self.bump_char();
         }
         self.set_event_position(event_pos);
-        self.call_handler(
-            "ProcessingInstructionHandler",
-            &[w_str_new_managed(&target), w_str_new_managed(&data)],
-        )
+        self.handler_args("ProcessingInstructionHandler")
+            .arg(w_str_new_managed(&target))
+            .arg(w_str_new_managed(&data))
+            .call()
     }
 
     fn parse_cdata(&mut self) -> Result<(), crate::PyError> {
@@ -399,17 +422,21 @@ impl<'a> MiniXmlParser<'a> {
         if self.consume("[") {
             has_internal_subset = true;
             self.set_event_position(event_pos);
-            self.call_handler(
-                "StartDoctypeDeclHandler",
-                &[w_str_new_managed(&name), sysid, pubid, w_int_new(1)],
-            )?;
+            self.handler_args("StartDoctypeDeclHandler")
+                .arg(w_str_new_managed(&name))
+                .arg(sysid)
+                .arg(pubid)
+                .arg(w_int_new(1))
+                .call()?;
             self.parse_internal_subset()?;
         } else {
             self.set_event_position(event_pos);
-            self.call_handler(
-                "StartDoctypeDeclHandler",
-                &[w_str_new_managed(&name), sysid, pubid, w_int_new(0)],
-            )?;
+            self.handler_args("StartDoctypeDeclHandler")
+                .arg(w_str_new_managed(&name))
+                .arg(sysid)
+                .arg(pubid)
+                .arg(w_int_new(0))
+                .call()?;
         }
         self.skip_ws();
         self.expect(">")?;
@@ -509,24 +536,24 @@ impl<'a> MiniXmlParser<'a> {
         let _ = &mut base;
         self.set_event_position(event_pos);
         if !unsafe { is_none(notation) } {
-            self.call_handler(
-                "UnparsedEntityDeclHandler",
-                &[w_str_new_managed(&name), base, sysid, pubid, notation],
-            )?;
+            self.handler_args("UnparsedEntityDeclHandler")
+                .arg(w_str_new_managed(&name))
+                .arg(base)
+                .arg(sysid)
+                .arg(pubid)
+                .arg(notation)
+                .call()?;
             return Ok(());
         }
-        self.call_handler(
-            "EntityDeclHandler",
-            &[
-                w_str_new_managed(&name),
-                w_int_new(is_param),
-                value,
-                base,
-                sysid,
-                pubid,
-                notation,
-            ],
-        )
+        self.handler_args("EntityDeclHandler")
+            .arg(w_str_new_managed(&name))
+            .arg(w_int_new(is_param))
+            .arg(value)
+            .arg(base)
+            .arg(sysid)
+            .arg(pubid)
+            .arg(notation)
+            .call()
     }
 
     fn skip_parameter_entity_ref(&mut self) -> Result<(), crate::PyError> {
@@ -572,7 +599,10 @@ impl<'a> MiniXmlParser<'a> {
         ]);
         let model = roots.pin_root(model);
         self.set_event_position(event_pos);
-        self.call_handler("ElementDeclHandler", &[w_str_new_managed(&name), model])
+        self.handler_args("ElementDeclHandler")
+            .arg(w_str_new_managed(&name))
+            .arg(model)
+            .call()
     }
 
     fn parse_attlist_decl(&mut self) -> Result<(), crate::PyError> {
@@ -602,16 +632,13 @@ impl<'a> MiniXmlParser<'a> {
                 0
             };
             self.set_event_position(event_pos);
-            self.call_handler(
-                "AttlistDeclHandler",
-                &[
-                    w_str_new_managed(&elem),
-                    w_str_new_managed(&attr),
-                    w_str_new_managed(&kind),
-                    w_none(),
-                    w_int_new(required),
-                ],
-            )?;
+            self.handler_args("AttlistDeclHandler")
+                .arg(w_str_new_managed(&elem))
+                .arg(w_str_new_managed(&attr))
+                .arg(w_str_new_managed(&kind))
+                .arg(w_none())
+                .arg(w_int_new(required))
+                .call()?;
         }
     }
 
@@ -646,10 +673,12 @@ impl<'a> MiniXmlParser<'a> {
         }
         self.skip_until_gt()?;
         self.set_event_position(event_pos);
-        self.call_handler(
-            "NotationDeclHandler",
-            &[w_str_new_managed(&name), w_none(), sysid, pubid],
-        )
+        self.handler_args("NotationDeclHandler")
+            .arg(w_str_new_managed(&name))
+            .arg(w_none())
+            .arg(sysid)
+            .arg(pubid)
+            .call()
     }
 
     fn skip_declaration(&mut self) -> Result<(), crate::PyError> {
@@ -895,6 +924,14 @@ impl<'a> MiniXmlParser<'a> {
         self.call_handler_raw("CharacterDataHandler", &[w_str_new_managed(&text)])
     }
 
+    fn handler_args(&mut self, name: &'static str) -> HandlerArgs<'_, 'a> {
+        HandlerArgs {
+            parser: self,
+            name,
+            items: pyre_object::gc_roots::RootedItems::new(),
+        }
+    }
+
     fn call_handler(&mut self, name: &str, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
         // The handler lookup below is a full `getattr`, and the flush hands
         // buffered text to a Python handler; both run Python and so can collect,
@@ -1024,10 +1061,10 @@ impl<'a> MiniXmlParser<'a> {
                 } else {
                     w_str_new_managed(&prefix)
                 };
-                self.call_handler(
-                    "StartNamespaceDeclHandler",
-                    &[w_prefix, w_str_new_managed(value)],
-                )?;
+                self.handler_args("StartNamespaceDeclHandler")
+                    .arg(w_prefix)
+                    .arg(w_str_new_managed(value))
+                    .call()?;
             }
         }
         Ok(())
@@ -1138,11 +1175,11 @@ impl<'a> MiniXmlParser<'a> {
                         .map_err(|_| "error in processing external entity reference".to_string())?;
                 }
                 _ if content => {
-                    self.call_handler(
-                        "SkippedEntityHandler",
-                        &[w_str_new_managed(ent), w_int_new(0)],
-                    )
-                    .map_err(|_| "undefined entity".to_string())?;
+                    self.handler_args("SkippedEntityHandler")
+                        .arg(w_str_new_managed(ent))
+                        .arg(w_int_new(0))
+                        .call()
+                        .map_err(|_| "undefined entity".to_string())?;
                 }
                 _ => return Err("undefined entity".to_string()),
             }

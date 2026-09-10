@@ -616,10 +616,10 @@ fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyR
         byte_index,
     )?;
     let _ = gc_roots::pin_root(value);
-    Ok(pyre_object::w_tuple_new(vec![
-        gc_roots::shadow_stack_get(slot + 3),
-        pyre_object::w_int_new(next as i64),
-    ]))
+    let mut fields = gc_roots::RootedItems::new();
+    fields.push(gc_roots::shadow_stack_get(slot + 3));
+    fields.push(pyre_object::w_int_new(next as i64));
+    Ok(pyre_object::w_tuple_new(fields.take()))
 }
 
 // CPython 3.14 Modules/_json.c:PyInit__json uses PyType_FromSpec;

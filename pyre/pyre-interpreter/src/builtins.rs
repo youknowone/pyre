@@ -8102,11 +8102,13 @@ fn base_exception_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         .unwrap_or_else(|| crate::baseobjspace::exception_getclass(w_self));
     let w_args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(w_self) };
     let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(w_self) };
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(cls);
+    result.push(w_args);
     if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
-        Ok(pyre_object::w_tuple_new(vec![cls, w_args, w_dict]))
-    } else {
-        Ok(pyre_object::w_tuple_new(vec![cls, w_args]))
+        result.push(w_dict);
     }
+    Ok(pyre_object::w_tuple_new(result.take()))
 }
 
 /// `BaseException_setstate` / `ImportError_setstate` reject a non-dict state
@@ -8305,11 +8307,13 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let cls = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_args = pyre_object::gc_roots::shadow_stack_get(base + 2);
     let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(cls);
+    result.push(w_args);
     if unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
-        Ok(pyre_object::w_tuple_new(vec![cls, w_args, w_dict]))
-    } else {
-        Ok(pyre_object::w_tuple_new(vec![cls, w_args]))
+        result.push(w_dict);
     }
+    Ok(pyre_object::w_tuple_new(result.take()))
 }
 
 /// `interp_exceptions.py W_ImportError.descr_setstate` plus
@@ -8396,11 +8400,13 @@ fn os_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
     let w_full_args = pyre_object::w_tuple_new(items);
     let w_dict = unsafe { interp_exceptions::w_exception_peek_dict(w_self) };
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(cls);
+    result.push(w_full_args);
     if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
-        Ok(pyre_object::w_tuple_new(vec![cls, w_full_args, w_dict]))
-    } else {
-        Ok(pyre_object::w_tuple_new(vec![cls, w_full_args]))
+        result.push(w_dict);
     }
+    Ok(pyre_object::w_tuple_new(result.take()))
 }
 
 /// `ImportError.__init__` — consume the `name` / `path` / `name_from`

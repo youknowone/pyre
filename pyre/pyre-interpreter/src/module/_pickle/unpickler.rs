@@ -1707,14 +1707,12 @@ fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
     if let Ok(sys) = import_module("sys")
         && let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit")
     {
-        call_fn(
-            audit,
-            &[
-                pyre_object::w_str_new("pickle.find_class"),
-                pyre_object::w_str_new_managed(module),
-                pyre_object::w_str_new_managed(name),
-            ],
-        )?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let audit = _roots.pin_root(audit);
+        let w_event = _roots.pin_root(pyre_object::w_str_new("pickle.find_class"));
+        let w_module = _roots.pin_root(pyre_object::w_str_new_managed(module));
+        let w_name = _roots.pin_root(pyre_object::w_str_new_managed(name));
+        call_fn(audit, &[w_event, w_module, w_name])?;
     }
     Ok(())
 }
@@ -1804,10 +1802,15 @@ fn decode_string(slot: usize, data: &[u8]) -> Result<PyObjectRef, PyError> {
     let _ = pyre_object::gc_roots::pin_root(w_encoding);
     let e = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_errors = pyre_object::w_str_new_managed(&errors);
+    let _ = pyre_object::gc_roots::pin_root(w_errors);
+    let err_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     call_meth(
         pyre_object::gc_roots::shadow_stack_get(b),
         "decode",
-        &[pyre_object::gc_roots::shadow_stack_get(e), w_errors],
+        &[
+            pyre_object::gc_roots::shadow_stack_get(e),
+            pyre_object::gc_roots::shadow_stack_get(err_slot),
+        ],
     )
 }
 

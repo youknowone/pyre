@@ -438,7 +438,7 @@ impl W_Hmac {
             .ok_or_else(|| unsupported_digestmod("unsupported hash type"))?;
         let _roots = gc_roots::push_roots();
         let name_slot = gc_roots::shadow_stack_len();
-        let _ = gc_roots::pin_root(w_str_new(&format!("hmac-{name}")));
+        let _ = gc_roots::pin_root(w_str_new_managed(&format!("hmac-{name}")));
         let obj = W_Hmac::allocate_stable(W_Hmac {
             ob: PyObject::default(),
             name: gc_roots::shadow_stack_get(name_slot),

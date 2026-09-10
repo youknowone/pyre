@@ -41,7 +41,9 @@ pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError>
             })?;
             let res = crate::call::call_function_impl_result(fileno, &[])?;
             if !pyre_object::is_int_or_long(res) {
-                return Err(crate::PyError::type_error("fileno() returned a non-integer"));
+                return Err(crate::PyError::type_error(
+                    "fileno() returned a non-integer",
+                ));
             }
             res
         };
@@ -215,17 +217,17 @@ impl Poll {
         self.running = false;
         let _ = ret;
 
-        let retval: Vec<PyObjectRef> = pollfds
-            .iter()
-            .filter(|pfd| pfd.revents != 0)
-            .map(|pfd| {
-                pyre_object::w_tuple_new(vec![
-                    pyre_object::w_int_new(pfd.fd as i64),
-                    pyre_object::w_int_new(pfd.revents as i64),
-                ])
-            })
-            .collect();
-        Ok(pyre_object::w_list_new(retval))
+        let mut retval = pyre_object::gc_roots::RootedItems::new();
+        for pfd in pollfds.iter().filter(|pfd| pfd.revents != 0) {
+            let entry = {
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(pfd.fd as i64));
+                fields.push(pyre_object::w_int_new(pfd.revents as i64));
+                pyre_object::w_tuple_new(fields.take())
+            };
+            retval.push(entry);
+        }
+        Ok(pyre_object::w_list_new(retval.take()))
     }
 }
 
@@ -407,9 +409,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         std::time::Duration::try_from_secs_f64(s)
                             .ok()
                             .and_then(|d| std::time::Instant::now().checked_add(d))
-                            .ok_or_else(|| {
-                                crate::PyError::value_error("timeout is too large")
-                            })?,
+                            .ok_or_else(|| crate::PyError::value_error("timeout is too large"))?,
                     ),
                 };
                 let mut rset = host_select::FdSet::new();

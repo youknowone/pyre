@@ -1670,10 +1670,10 @@ pub fn frexp(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let (m, e) = pymath::math::frexp(try_get_double(args[0])?);
-    Ok(w_tuple_new(vec![
-        floatobject::w_float_new(m),
-        w_int_new(e as i64),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(floatobject::w_float_new(m));
+    fields.push(w_int_new(e as i64));
+    Ok(w_tuple_new(fields.take()))
 }
 
 pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
@@ -1722,10 +1722,10 @@ pub fn modf(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let (frac, integer) = pymath::math::modf(try_get_double(args[0])?);
-    Ok(w_tuple_new(vec![
-        floatobject::w_float_new(frac),
-        floatobject::w_float_new(integer),
-    ]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(floatobject::w_float_new(frac));
+    fields.push(floatobject::w_float_new(integer));
+    Ok(w_tuple_new(fields.take()))
 }
 
 pub fn nextafter(args: &[PyObjectRef]) -> PyResult {

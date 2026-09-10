@@ -1120,10 +1120,10 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 .expect("divisor was checked nonzero");
             let q = RBigIntGcRoot::new(q);
             let r = RBigIntGcRoot::new(r);
-            return Ok(w_tuple_new(vec![
-                bigint_result(q.translated_alias()),
-                bigint_result(r.translated_alias()),
-            ]));
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(bigint_result(q.translated_alias()));
+            fields.push(bigint_result(r.translated_alias()));
+            return Ok(w_tuple_new(fields.take()));
         }
         let mut q = va / vb;
         let mut r = va % vb;
@@ -1131,7 +1131,10 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             q -= 1;
             r += vb;
         }
-        return Ok(w_tuple_new(vec![w_int_new(q), w_int_new(r)]));
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_int_new(q));
+        fields.push(w_int_new(r));
+        return Ok(w_tuple_new(fields.take()));
     }
 
     // longobject.py `_make_descr_binop(_divmod, _int_divmod)` preserves a
@@ -1174,12 +1177,15 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         } else {
             w_long_new(r.translated_alias())
         };
-        Ok(w_tuple_new(vec![w_q, w_r]))
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_q);
+        fields.push(w_r);
+        Ok(w_tuple_new(fields.take()))
     } else {
-        Ok(w_tuple_new(vec![
-            bigint_result(q.translated_alias()),
-            bigint_result(r.translated_alias()),
-        ]))
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(bigint_result(q.translated_alias()));
+        fields.push(bigint_result(r.translated_alias()));
+        Ok(w_tuple_new(fields.take()))
     }
 }
 
@@ -4268,7 +4274,10 @@ pub(crate) fn divmod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 let y = as_float(b);
                 reject_float_coercion_overflow(b, y)?;
                 let (q, r) = float_divmod_w(x, y)?;
-                return Ok(w_tuple_new(vec![w_float_new(q), w_float_new(r)]));
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(w_float_new(q));
+                fields.push(w_float_new(r));
+                return Ok(w_tuple_new(fields.take()));
             }
             return integer_divmod_pair(a, b);
         }
@@ -4832,7 +4841,10 @@ pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
                 let y = as_float(b);
                 reject_float_coercion_overflow(b, y)?;
                 let (q, r) = float_divmod_w(x, y)?;
-                return Ok(w_tuple_new(vec![w_float_new(q), w_float_new(r)]));
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(w_float_new(q));
+                fields.push(w_float_new(r));
+                return Ok(w_tuple_new(fields.take()));
             }
             return integer_divmod_pair(a, b);
         }

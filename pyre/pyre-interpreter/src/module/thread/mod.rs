@@ -1238,7 +1238,10 @@ mod rlock_class {
                     "cannot release un-acquired lock",
                 ));
             }
-            let saved = w_tuple_new(vec![w_int_new(state.count), w_int_new(state.owner)]);
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_int_new(state.count));
+            fields.push(w_int_new(state.owner));
+            let saved = w_tuple_new(fields.take());
             state.count = 0;
             state.owner = 0;
             self.ready.notify_one();

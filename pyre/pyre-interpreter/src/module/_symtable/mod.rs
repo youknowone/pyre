@@ -135,15 +135,15 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(table.line_number as i64));
     let line_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-    pyre_object::tupleobject::w_tuple_new(vec![
-        pyre_object::gc_roots::shadow_stack_get(name_slot),
-        pyre_object::gc_roots::shadow_stack_get(type_slot),
-        pyre_object::gc_roots::shadow_stack_get(line_slot),
-        pyre_object::w_bool_from(table.is_nested),
-        pyre_object::gc_roots::shadow_stack_get(symbols_slot),
-        pyre_object::gc_roots::shadow_stack_get(varnames_slot),
-        pyre_object::gc_roots::shadow_stack_get(children_slot),
-    ])
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::gc_roots::shadow_stack_get(name_slot));
+    fields.push(pyre_object::gc_roots::shadow_stack_get(type_slot));
+    fields.push(pyre_object::gc_roots::shadow_stack_get(line_slot));
+    fields.push(pyre_object::w_bool_from(table.is_nested));
+    fields.push(pyre_object::gc_roots::shadow_stack_get(symbols_slot));
+    fields.push(pyre_object::gc_roots::shadow_stack_get(varnames_slot));
+    fields.push(pyre_object::gc_roots::shadow_stack_get(children_slot));
+    pyre_object::tupleobject::w_tuple_new(fields.take())
 }
 
 fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {

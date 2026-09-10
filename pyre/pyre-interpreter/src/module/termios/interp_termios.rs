@@ -4,7 +4,6 @@
 //! the host_env real impl and the no-host_env stub are renamed to
 //! `register_module` so moduledef::init can call a single name.
 
-
 /// `interp_termios.py convert_error` — every termios syscall
 /// failure is raised as the cached module exception `termios.error`
 /// (`wrap_oserror(space, e, w_exception_class=w_error)`), not a bare
@@ -67,9 +66,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     ));
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                let t = host_termios::tcgetattr(fd).map_err(|e| {
-                    termios_converted_error(e.raw_os_error().unwrap_or(0))
-                })?;
+                let t = host_termios::tcgetattr(fd)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 let ispeed = host_termios::cfgetispeed(&t);
                 let ospeed = host_termios::cfgetospeed(&t);
                 let cc_list = make_cc_bytes(&t.c_cc[..]);
@@ -137,19 +135,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let cc_obj = fields[6];
 
             // Start from the current settings so we preserve any platform-private fields.
-            let mut t = host_termios::tcgetattr(fd).map_err(|e| {
-                termios_converted_error(e.raw_os_error().unwrap_or(0))
-            })?;
+            let mut t = host_termios::tcgetattr(fd)
+                .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
             t.c_iflag = iflag;
             t.c_oflag = oflag;
             t.c_cflag = cflag;
             t.c_lflag = lflag;
-            host_termios::cfsetispeed(&mut t, ispeed).map_err(|e| {
-                termios_converted_error(e.raw_os_error().unwrap_or(0))
-            })?;
-            host_termios::cfsetospeed(&mut t, ospeed).map_err(|e| {
-                termios_converted_error(e.raw_os_error().unwrap_or(0))
-            })?;
+            host_termios::cfsetispeed(&mut t, ispeed)
+                .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+            host_termios::cfsetospeed(&mut t, ospeed)
+                .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
 
             // interp_termios.py:30-33 — c_cc is any iterable; an int element
             // goes through bytes([x]) (range 0..=255), a bytes element keeps
@@ -184,9 +179,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 t.c_cc[i] = byte;
             }
-            host_termios::tcsetattr(fd, when, &t).map_err(|e| {
-                termios_converted_error(e.raw_os_error().unwrap_or(0))
-            })?;
+            host_termios::tcsetattr(fd, when, &t)
+                .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
             Ok(pyre_object::w_none())
         }),
     );
@@ -205,9 +199,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 // `@unwrap_spec(duration=int)`.
                 let dur = crate::baseobjspace::int_w(args[1])? as i32;
-                host_termios::tcsendbreak(fd, dur).map_err(|e| {
-                    termios_converted_error(e.raw_os_error().unwrap_or(0))
-                })?;
+                host_termios::tcsendbreak(fd, dur)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 Ok(pyre_object::w_none())
             },
             2,
@@ -224,9 +217,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     return Err(crate::PyError::type_error("tcdrain() requires 1 argument"));
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                host_termios::tcdrain(fd).map_err(|e| {
-                    termios_converted_error(e.raw_os_error().unwrap_or(0))
-                })?;
+                host_termios::tcdrain(fd)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 Ok(pyre_object::w_none())
             },
             1,
@@ -245,9 +237,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 // `@unwrap_spec(queue=int)`.
                 let q = crate::baseobjspace::int_w(args[1])? as i32;
-                host_termios::tcflush(fd, q).map_err(|e| {
-                    termios_converted_error(e.raw_os_error().unwrap_or(0))
-                })?;
+                host_termios::tcflush(fd, q)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 Ok(pyre_object::w_none())
             },
             2,
@@ -266,9 +257,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 // `@unwrap_spec(action=int)`.
                 let action = crate::baseobjspace::int_w(args[1])? as i32;
-                host_termios::tcflow(fd, action).map_err(|e| {
-                    termios_converted_error(e.raw_os_error().unwrap_or(0))
-                })?;
+                host_termios::tcflow(fd, action)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 Ok(pyre_object::w_none())
             },
             2,
@@ -287,15 +277,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     ));
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                let (rows, cols) = host_termios::tcgetwinsize(fd).map_err(|e| {
-                    termios_converted_error(e.raw_os_error().unwrap_or(0))
-                })?;
+                let (rows, cols) = host_termios::tcgetwinsize(fd)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 // PyPy `interp_termios.tcgetwinsize` returns
                 // `(ws_row, ws_col)`.
-                Ok(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_int_new(rows as i64),
-                    pyre_object::w_int_new(cols as i64),
-                ]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(rows as i64));
+                fields.push(pyre_object::w_int_new(cols as i64));
+                Ok(pyre_object::w_tuple_new(fields.take()))
             },
             1,
         ),
@@ -318,9 +307,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // from unpackiterable) is reported as a TypeError.
                 let winsz = crate::baseobjspace::unpackiterable(args[1], 2).map_err(|e| {
                     if e.kind == crate::PyErrorKind::ValueError {
-                        crate::PyError::type_error(
-                            "tcsetwinsize: argument 2 must be a 2-sequence",
-                        )
+                        crate::PyError::type_error("tcsetwinsize: argument 2 must be a 2-sequence")
                     } else {
                         e
                     }
@@ -329,18 +316,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let cols = crate::baseobjspace::int_w(winsz[1])?;
                 // PyPy `interp_termios.tcsetwinsize` performs this overflow
                 // guard before setting the window size.
-                let rows = u16::try_from(rows).map_err(|_| {
-                    crate::PyError::overflow_error("winsize value(s) out of range")
-                })?;
-                let cols = u16::try_from(cols).map_err(|_| {
-                    crate::PyError::overflow_error("winsize value(s) out of range")
-                })?;
+                let rows = u16::try_from(rows)
+                    .map_err(|_| crate::PyError::overflow_error("winsize value(s) out of range"))?;
+                let cols = u16::try_from(cols)
+                    .map_err(|_| crate::PyError::overflow_error("winsize value(s) out of range"))?;
                 // `host_termios::tcsetwinsize` performs the same initial
                 // TIOCGWINSZ that `interp_termios.tcsetwinsize` does,
                 // preserving `ws_xpixel` / `ws_ypixel` across the set.
-                host_termios::tcsetwinsize(fd, rows, cols).map_err(|e| {
-                    termios_converted_error(e.raw_os_error().unwrap_or(0))
-                })?;
+                host_termios::tcsetwinsize(fd, rows, cols)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 Ok(pyre_object::w_none())
             },
             2,

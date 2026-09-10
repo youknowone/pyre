@@ -3278,17 +3278,24 @@ pub(crate) fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         if reverse {
             entries.reverse();
         }
-        let mut items = Vec::new();
+        let mut items = pyre_object::gc_roots::RootedItems::new();
         for (k, v) in entries.into_iter().skip(index) {
-            let item = match kind {
-                pyre_object::dictmultiobject::DictViewKind::Keys => k,
-                pyre_object::dictmultiobject::DictViewKind::Values => v,
-                pyre_object::dictmultiobject::DictViewKind::Items => w_tuple_new(vec![k, v]),
-            };
-            items.push(item);
+            match kind {
+                pyre_object::dictmultiobject::DictViewKind::Keys => items.push(k),
+                pyre_object::dictmultiobject::DictViewKind::Values => items.push(v),
+                pyre_object::dictmultiobject::DictViewKind::Items => {
+                    items.push(w_tuple_new(vec![k, v]))
+                }
+            }
         }
-        let state = w_tuple_new(vec![w_list_new(items)]);
-        Ok(w_tuple_new(vec![builtin_callable("iter"), state]))
+        let list = w_list_new(items.take());
+        let mut state = pyre_object::gc_roots::RootedItems::new();
+        state.push(list);
+        let state = w_tuple_new(state.take());
+        let mut result = pyre_object::gc_roots::RootedItems::new();
+        result.push(builtin_callable("iter"));
+        result.push(state);
+        Ok(w_tuple_new(result.take()))
     }
 }
 

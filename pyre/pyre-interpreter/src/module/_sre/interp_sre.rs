@@ -1903,12 +1903,18 @@ fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 fn sre_match_regs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_receiver(args)?;
     let n = unsafe { (*m).spans_len };
-    let mut regs = Vec::with_capacity(n);
+    let mut regs = pyre_object::gc_roots::RootedItems::new();
     for gi in 0..n {
         let (start, end) = unsafe { w_sre_match_get_span(m as PyObjectRef, gi) }.unwrap_or((-1, -1));
-        regs.push(w_tuple_new(vec![w_int_new(start), w_int_new(end)]));
+        let pair = {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_int_new(start));
+            fields.push(w_int_new(end));
+            w_tuple_new(fields.take())
+        };
+        regs.push(pair);
     }
-    Ok(w_tuple_new(regs))
+    Ok(w_tuple_new(regs.take()))
 }
 
 /// `start_w` (interp_sre.py).
@@ -1929,7 +1935,10 @@ fn sre_match_end(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn sre_match_span(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
     let (start, end) = do_span(m, args.get(1).copied())?;
-    Ok(w_tuple_new(vec![w_int_new(start), w_int_new(end)]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_int_new(start));
+    fields.push(w_int_new(end));
+    Ok(w_tuple_new(fields.take()))
 }
 
 /// `descr_getitem` (interp_sre.py) — `m[index]` resolves the

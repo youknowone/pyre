@@ -4678,23 +4678,23 @@ impl PyFrame {
     /// PyPy-compatible pickle state helper.
     #[inline]
     pub fn _reduce_state(&self) -> PyObjectRef {
-        pyre_object::w_tuple_new(vec![
-            pyre_object::w_none(),
-            pyre_object::w_none(),
-            pyre_object::w_none(),
-            pyre_object::w_int_new(self.last_instr as i64),
-            pyre_object::w_int_new(self.valuestackdepth as i64),
-        ])
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_none());
+        fields.push(pyre_object::w_none());
+        fields.push(pyre_object::w_none());
+        fields.push(pyre_object::w_int_new(self.last_instr as i64));
+        fields.push(pyre_object::w_int_new(self.valuestackdepth as i64));
+        pyre_object::w_tuple_new(fields.take())
     }
 
     /// PyPy-compatible `descr__reduce__`.
     #[inline]
     pub fn descr__reduce__(&self) -> PyObjectRef {
-        pyre_object::w_tuple_new(vec![
-            pyre_object::w_none(),
-            pyre_object::w_none(),
-            self._reduce_state(),
-        ])
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_none());
+        fields.push(pyre_object::w_none());
+        fields.push(self._reduce_state());
+        pyre_object::w_tuple_new(fields.take())
     }
 
     /// PyPy-compatible `descr__setstate__`.
