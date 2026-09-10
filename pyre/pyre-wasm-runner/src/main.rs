@@ -1019,9 +1019,6 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
-            const FLAG_VALID: u64 = 1;
-            const FLAG_COMMITTED: u64 = 2;
-            const FLAG_BRIDGE: u64 = 4;
             const SHIFT_EFFECTS: u32 = 8;
             const SHIFT_JOURNAL: u32 = 24;
             const SHIFT_EXEC_MF: u32 = 40;
@@ -1051,18 +1048,18 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                     }
                 }
                 let flags = slot(base + NAME_SLOTS);
-                if flags & FLAG_VALID == 0 {
+                if flags & FbwRingFlags::VALID.bits() == 0 {
                     continue;
                 }
                 let field = |shift: u32| (flags >> shift) & FIELD_MASK;
                 eprintln!(
                     "[fbw-census] end={end} committed={} leg={} bridge={} exec_mf={} \
                      effects={} journaled={}",
-                    flags & FLAG_COMMITTED != 0,
+                    flags & FbwRingFlags::COMMITTED.bits() != 0,
                     // The leg is the top byte, so the shift already isolates
                     // it; the mask keeps the width of the read on the page.
                     (flags >> SHIFT_LEG) & 0xff,
-                    flags & FLAG_BRIDGE != 0,
+                    flags & FbwRingFlags::BRIDGE.bits() != 0,
                     field(SHIFT_EXEC_MF),
                     field(SHIFT_EFFECTS),
                     field(SHIFT_JOURNAL),
