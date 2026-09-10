@@ -3218,7 +3218,11 @@ impl WasmBackend {
         inputs.bridge_cells_base = new_cells_base;
         inputs.ca.compute_home_gcmap = true;
         inputs.ca.home_gcmap_has_prior = true;
-        inputs.ca.home_gcmap_null_grown_labels = true;
+        // Do not null grown LABEL homes on every keyed entry. A later
+        // loop-closing bridge writes those captures and tail-calls back;
+        // zeroing them here would restore nulls. Stale pre-growth bridges
+        // are dropped below when the merged extent grows. Key-0 still
+        // clears the full used-label range.
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
@@ -3287,12 +3291,20 @@ impl WasmBackend {
                 *start += guard_growth;
             }
         }
+        let old_homes = compiled.num_ref_homes.get();
+        let old_labels = compiled.used_label_homes.get();
+        let widened = merged_ref_homes.max(old_homes);
+        let widened_labels = merged_labels.max(old_labels);
+        let owner_extent_grew = old_homes < widened || old_labels < widened_labels;
         #[cfg(target_arch = "wasm32")]
-        if new_cells_base != 0 {
+        if new_cells_base != 0 && !owner_extent_grew {
             for (&fail_index, &bridge_slot) in compiled.bridge_slots.borrow().iter() {
                 let cell = (new_cells_base as usize + fail_index as usize * 4) as *mut u32;
                 unsafe { core::ptr::write(cell, bridge_slot) };
             }
+        }
+        if owner_extent_grew {
+            compiled.bridge_slots.borrow_mut().clear();
         }
         if let Some(owner) = new_cells_owner {
             compiled._bridge_owned_cells.borrow_mut().push(owner);
@@ -3300,8 +3312,6 @@ impl WasmBackend {
         compiled.bridge_cells_base.set(new_cells_base);
         compiled.module_bytes.set(code_size as u32);
         compiled.num_guard_cells.set(guard_exits.len());
-        let widened = merged_ref_homes.max(compiled.num_ref_homes.get());
-        let widened_labels = merged_labels.max(compiled.used_label_homes.get());
         compiled.num_ref_homes.set(widened);
         compiled.used_label_homes.set(widened_labels);
         compiled

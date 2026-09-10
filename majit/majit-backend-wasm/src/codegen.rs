@@ -3815,13 +3815,12 @@ pub struct CaParams {
     /// on a first compile, where min=0 must not wipe live homes on keyed
     /// resume. Distinguishes a 0→N merge from an initial compile.
     pub home_gcmap_has_prior: bool,
-    /// True only for a loop re-emission that may mark more LABEL-capture
-    /// homes than the previous publication. Those new slots were never
-    /// stored on a recycled CALL_ASSEMBLER frame that keyed in from an
-    /// older bridge, so they must be nulled before the widened map is
-    /// installed. A compiled bridge with more captures than its source
-    /// leaves this false: it writes those slots on the first crossing
-    /// and a later keyed tail-call restores them.
+    /// True only when a re-emitted module must null newly marked LABEL
+    /// homes for a keyed caller whose map did not include them. Re-emission
+    /// itself leaves this false and drops stale owner bridges when the
+    /// merged extent grows; key-0 still clears the full used-label range.
+    /// A compiled bridge with more captures than its source also leaves
+    /// this false: it writes those slots on the first crossing.
     pub home_gcmap_null_grown_labels: bool,
 }
 
