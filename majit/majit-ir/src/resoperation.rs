@@ -3083,13 +3083,36 @@ impl Drop for ForwardedMutGuard<'_> {
 /// `resoperation.py` subclass payload: `GuardResOp` / `VectorOp` /
 /// `VectorGuardOp`. Stored behind `Op.extra` so `PlainResOp` stays slim.
 #[derive(Clone, Debug)]
+pub(crate) struct VectorGuardExtra {
+    pub guard: GuardExtra,
+    pub vec: VectorizationInfo,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum OpKindExtra {
     Guard(GuardExtra),
     Vector(VectorizationInfo),
-    VectorGuard {
-        guard: GuardExtra,
-        vec: VectorizationInfo,
-    },
+    /// Boxed so `OpKindExtra` stays Guard-sized; inlined VectorGuard
+    /// made `BothPayload` 56 B on the regex and/or leaf.
+    VectorGuard(Box<VectorGuardExtra>),
+}
+
+impl OpKindExtra {
+    fn guard_ref(&self) -> Option<&GuardExtra> {
+        match self {
+            OpKindExtra::Guard(g) => Some(g),
+            OpKindExtra::VectorGuard(vg) => Some(&vg.guard),
+            OpKindExtra::Vector(_) => None,
+        }
+    }
+
+    fn guard_mut(&mut self) -> Option<&mut GuardExtra> {
+        match self {
+            OpKindExtra::Guard(g) => Some(g),
+            OpKindExtra::VectorGuard(vg) => Some(&mut vg.guard),
+            OpKindExtra::Vector(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3386,9 +3409,10 @@ impl Op {
     #[inline]
     pub fn rd_resume_position(&self) -> i32 {
         match self.descr.extra_ref() {
-            Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => {
-                g.rd_resume_position
-            }
+            Some(extra) => extra
+                .guard_ref()
+                .map(|g| g.rd_resume_position)
+                .unwrap_or(-1),
             _ => -1,
         }
     }
@@ -3508,12 +3532,10 @@ impl Op {
     }
 
     pub fn guard_fail_args(&self) -> Option<&[Operand]> {
-        match self.descr.extra_ref() {
-            Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => {
-                g.fail_args()
-            }
-            _ => None,
-        }
+        self.descr
+            .extra_ref()
+            .and_then(OpKindExtra::guard_ref)
+            .and_then(GuardExtra::fail_args)
     }
 
     /// Walk fail-arg `OpRef`s without cloning the live list.
@@ -3527,8 +3549,8 @@ impl Op {
 
     pub(crate) fn strip_guard_extra(&self) {
         match self.descr.extra_ref() {
-            Some(OpKindExtra::VectorGuard { vec, .. }) => {
-                let vec = vec.clone();
+            Some(OpKindExtra::VectorGuard(vg)) => {
+                let vec = vg.vec.clone();
                 self.descr
                     .extra_replace(Some(Box::new(OpKindExtra::Vector(vec))));
             }
@@ -3540,46 +3562,41 @@ impl Op {
     }
 
     pub(crate) fn try_guard_extra(&self) -> Option<&GuardExtra> {
-        match self.descr.extra_ref() {
-            Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => Some(g),
-            _ => None,
-        }
+        self.descr.extra_ref().and_then(OpKindExtra::guard_ref)
     }
 
     pub(crate) fn try_guard_extra_mut(&self) -> Option<&mut GuardExtra> {
-        match self.descr.extra_mut() {
-            Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => Some(g),
-            _ => None,
-        }
+        self.descr.extra_mut().and_then(OpKindExtra::guard_mut)
     }
 
     pub(crate) fn ensure_guard_extra(&self) -> &mut GuardExtra {
         match self.descr.extra_ref() {
-            Some(OpKindExtra::Guard(_) | OpKindExtra::VectorGuard { .. }) => {}
+            Some(OpKindExtra::Guard(_) | OpKindExtra::VectorGuard(_)) => {}
             Some(OpKindExtra::Vector(v)) => {
                 let vec = v.clone();
                 self.descr
-                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard {
-                        guard: GuardExtra::new(),
-                        vec,
-                    })));
+                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard(Box::new(
+                        VectorGuardExtra {
+                            guard: GuardExtra::new(),
+                            vec,
+                        },
+                    )))));
             }
             None => {
                 self.descr
                     .extra_replace(Some(Box::new(OpKindExtra::Guard(GuardExtra::new()))));
             }
         }
-        match self.descr.extra_mut().expect("ensure_guard_extra") {
-            OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. } => g,
-            OpKindExtra::Vector(_) => unreachable!("ensure_guard_extra upgraded Vector"),
-        }
+        self.descr
+            .extra_mut()
+            .and_then(OpKindExtra::guard_mut)
+            .expect("ensure_guard_extra")
     }
 
     pub(crate) fn vecinfo_slot(&self) -> Option<VectorizationInfo> {
         match self.descr.extra_ref() {
-            Some(OpKindExtra::Vector(v) | OpKindExtra::VectorGuard { vec: v, .. }) => {
-                Some(v.clone())
-            }
+            Some(OpKindExtra::Vector(v)) => Some(v.clone()),
+            Some(OpKindExtra::VectorGuard(vg)) => Some(vg.vec.clone()),
             _ => None,
         }
     }
@@ -3587,14 +3604,13 @@ impl Op {
     pub(crate) fn set_vecinfo_slot(&self, info: VectorizationInfo) {
         match self.descr.extra_mut() {
             Some(OpKindExtra::Vector(v)) => *v = info,
-            Some(OpKindExtra::VectorGuard { vec, .. }) => *vec = info,
+            Some(OpKindExtra::VectorGuard(vg)) => vg.vec = info,
             Some(OpKindExtra::Guard(g)) => {
                 let guard = g.clone();
                 self.descr
-                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard {
-                        guard,
-                        vec: info,
-                    })));
+                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard(Box::new(
+                        VectorGuardExtra { guard, vec: info },
+                    )))));
             }
             None => self
                 .descr
@@ -3604,8 +3620,8 @@ impl Op {
 
     pub(crate) fn clear_vecinfo_slot(&self) {
         match self.descr.extra_ref() {
-            Some(OpKindExtra::VectorGuard { guard, .. }) => {
-                let guard = guard.clone();
+            Some(OpKindExtra::VectorGuard(vg)) => {
+                let guard = vg.guard.clone();
                 self.descr
                     .extra_replace(Some(Box::new(OpKindExtra::Guard(guard))));
             }
@@ -5704,6 +5720,16 @@ mod tests {
             assert!(
                 extra <= 32,
                 "GuardExtra grew to {extra} bytes; keep Box<GuardExtra> out of the 56-byte class"
+            );
+            let kind = std::mem::size_of::<OpKindExtra>();
+            let both = std::mem::size_of::<BothPayload>();
+            assert!(
+                kind <= 40,
+                "OpKindExtra grew to {kind} B; VectorGuard must stay boxed"
+            );
+            assert!(
+                both < 56,
+                "BothPayload grew to {both} B; descr+extra must leave the 56-byte class"
             );
             assert!(
                 std::mem::size_of::<ArgSlot>() <= 16,

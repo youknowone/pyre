@@ -240,8 +240,8 @@ impl Op {
     /// shared `Rc<Op>` can rewrite failargs on the same ResOperation.
     pub fn fail_args_mut(&self) -> Option<&mut [crate::operand::Operand]> {
         match self.descr.extra_mut()? {
-            crate::resoperation::OpKindExtra::Guard(g)
-            | crate::resoperation::OpKindExtra::VectorGuard { guard: g, .. } => g.fail_args_mut(),
+            crate::resoperation::OpKindExtra::Guard(g) => g.fail_args_mut(),
+            crate::resoperation::OpKindExtra::VectorGuard(vg) => vg.guard.fail_args_mut(),
             crate::resoperation::OpKindExtra::Vector(_) => None,
         }
     }
