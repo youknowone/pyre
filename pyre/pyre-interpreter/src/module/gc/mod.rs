@@ -1759,11 +1759,13 @@ crate::py_module! {
         // code allocates without passing any counter site, and a virtualized
         // allocation is removed outright.  Counting by walking instead is what
         // `gc.get_objects` costs, four orders of magnitude above this call.
-        "get_count"     / 0 = |_| Ok(w_tuple_new(vec![
-            w_int_new(0),
-            w_int_new(majit_gc::active_minor_collections_since_major() as i64),
-            w_int_new(0),
-        ])),
+        "get_count"     / 0 = |_| {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_int_new(0));
+            fields.push(w_int_new(majit_gc::active_minor_collections_since_major() as i64));
+            fields.push(w_int_new(0));
+            Ok(w_tuple_new(fields.take()))
+        },
         "get_debug"     / 0 = |_| Ok(w_int_new(GC_DEBUG.load(Ordering::Relaxed))),
         "set_debug"     / 1 = |args| {
             // `gc_set_debug_impl` parses a C int through the index protocol.

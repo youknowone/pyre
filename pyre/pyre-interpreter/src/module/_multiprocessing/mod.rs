@@ -621,7 +621,7 @@ fn semlock_instance(
     store!("maxvalue", w_int_new(maxvalue));
     store!(
         "name",
-        kept_name.map_or_else(w_none, |name| w_str_new(&name))
+        kept_name.map_or_else(w_none, |name| w_str_new_managed(&name))
     );
     // interp_semaphore.py `self.count = 0`, `self.last_tid = -1`.
     store!("count", w_int_new(0));

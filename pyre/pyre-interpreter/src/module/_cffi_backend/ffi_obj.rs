@@ -93,7 +93,7 @@ pub(crate) fn ffi_error(message: impl Into<String>) -> PyError {
     let mut error = PyError::runtime_error(message.clone());
     if let Ok(w_exc) = crate::builtins::exc_exception_new(&[
         newtype::ffi_error(),
-        pyre_object::w_str_new(&message),
+        pyre_object::w_str_new_managed(&message),
     ]) {
         error.exc_object = w_exc;
     }
@@ -795,7 +795,7 @@ fn ffi_getctype(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         result.push(')');
     }
     result.push_str(&ct.name()[at..]);
-    Ok(pyre_object::w_str_new(&result))
+    Ok(pyre_object::w_str_new_managed(&result))
 }
 
 fn ffi_memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {

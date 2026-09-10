@@ -107,11 +107,11 @@ fn get_intrinsic1_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 }
 
 fn get_intrinsic2_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_list_new(
-        oparg::IntrinsicFunction2::iter()
-            .map(|value| w_str_new(value.desc()))
-            .collect(),
-    ))
+    let mut items = pyre_object::gc_roots::RootedItems::new();
+    for value in oparg::IntrinsicFunction2::iter() {
+        items.push(w_str_new_managed(value.desc()));
+    }
+    Ok(w_list_new(items.take()))
 }
 
 fn get_nb_ops(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -121,8 +121,8 @@ fn get_nb_ops(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     for value in oparg::BinaryOperator::iter() {
         let row = {
             let mut names = pyre_object::gc_roots::RootedItems::new();
-            names.push(w_str_new(value.desc()));
-            names.push(w_str_new(&value.to_string()));
+            names.push(w_str_new_managed(value.desc()));
+            names.push(w_str_new_managed(&value.to_string()));
             w_tuple_new(names.take())
         };
         rows.push(row);
@@ -131,11 +131,11 @@ fn get_nb_ops(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn special_method_names_impl() -> PyObjectRef {
-    w_list_new(
-        oparg::SpecialMethod::iter()
-            .map(|value| w_str_new(&value.to_string()))
-            .collect(),
-    )
+    let mut items = pyre_object::gc_roots::RootedItems::new();
+    for value in oparg::SpecialMethod::iter() {
+        items.push(w_str_new_managed(&value.to_string()));
+    }
+    w_list_new(items.take())
 }
 
 crate::py_module! {

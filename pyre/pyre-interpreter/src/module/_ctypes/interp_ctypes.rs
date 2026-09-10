@@ -645,7 +645,7 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
             // string: `FormatMessageW` failing is not an error here.
             let message = host_ctypes::format_error_message(code)
                 .unwrap_or_else(|| "<no description>".to_string());
-            Ok(pyre_object::w_str_new(&message))
+            Ok(pyre_object::w_str_new_managed(&message))
         }),
     );
 

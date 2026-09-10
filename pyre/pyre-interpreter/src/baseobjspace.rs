@@ -2664,8 +2664,15 @@ pub(crate) fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
     // callable: `pickle.save_global` matches it to `builtins.range`, and
     // `range(start, stop, step)` rebuilds the instance.
     let range_ctor = builtin_callable("range");
-    let state = w_tuple_new(vec![start, stop, step]);
-    Ok(w_tuple_new(vec![range_ctor, state]))
+    let mut state = pyre_object::gc_roots::RootedItems::new();
+    state.push(start);
+    state.push(stop);
+    state.push(step);
+    let state = w_tuple_new(state.take());
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(range_ctor);
+    result.push(state);
+    Ok(w_tuple_new(result.take()))
 }
 
 /// `range.__hash__()` — `functional.py W_Range.descr_hash`: hashes the

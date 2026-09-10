@@ -10526,7 +10526,10 @@ fn exception_group_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     }
     let condition = exception_group_condition(args[1])?;
     let (yes, no) = exception_group_split_inner(args[0], &condition)?;
-    Ok(pyre_object::w_tuple_new(vec![yes, no]))
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(yes);
+    fields.push(no);
+    Ok(pyre_object::w_tuple_new(fields.take()))
 }
 
 fn exception_group_derive(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

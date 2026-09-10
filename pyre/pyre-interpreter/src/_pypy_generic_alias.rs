@@ -868,17 +868,24 @@ fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
         // the callable globally pickleable without a synthetic module.
         let orig = make_generic_alias(origin, ga_args)?;
         let iterator = crate::baseobjspace::iter(orig)?;
-        return Ok(w_tuple_new(vec![
-            crate::baseobjspace::builtin_callable("next"),
-            w_tuple_new(vec![iterator]),
-        ]));
+        let mut args = pyre_object::gc_roots::RootedItems::new();
+        args.push(iterator);
+        let args = w_tuple_new(args.take());
+        let mut result = pyre_object::gc_roots::RootedItems::new();
+        result.push(crate::baseobjspace::builtin_callable("next"));
+        result.push(args);
+        return Ok(w_tuple_new(result.take()));
     }
     // `(type(self), (origin, args))`.
     let ga_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
-    Ok(w_tuple_new(vec![
-        ga_type,
-        w_tuple_new(vec![origin, ga_args]),
-    ]))
+    let mut args = pyre_object::gc_roots::RootedItems::new();
+    args.push(origin);
+    args.push(ga_args);
+    let args = w_tuple_new(args.take());
+    let mut result = pyre_object::gc_roots::RootedItems::new();
+    result.push(ga_type);
+    result.push(args);
+    Ok(w_tuple_new(result.take()))
 }
 
 /// `GenericAlias.__unpacked__` getset — the unpacked flag as a bool.
@@ -928,7 +935,7 @@ pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
     // One `w_str_new` per name, each allocating over the names already boxed.
     let mut items = pyre_object::gc_roots::RootedItems::new();
     for s in names.iter() {
-        items.push(w_str_new(s));
+        items.push(w_str_new_managed(s));
     }
     Ok(w_list_new(items.take()))
 }

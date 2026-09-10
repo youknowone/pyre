@@ -143,7 +143,7 @@ fn ffi_error(message: impl Into<String>) -> PyError {
     let mut error = PyError::new(PyErrorKind::RuntimeError, message.clone());
     if let Ok(w_exc) = crate::builtins::exc_exception_new(&[
         newtype::ffi_error(),
-        pyre_object::w_str_new(&message),
+        pyre_object::w_str_new_managed(&message),
     ]) {
         error.exc_object = w_exc;
     }

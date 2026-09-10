@@ -590,10 +590,11 @@ pub unsafe extern "C" fn PyDict_Values(object: *mut CPyObject) -> *mut CPyObject
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Items(object: *mut CPyObject) -> *mut CPyObject {
     view_list(object, "PyDict_Items", |dict| {
-        unsafe { pyre_object::dictmultiobject::w_dict_items(dict) }
-            .into_iter()
-            .map(|(key, value)| pyre_object::tupleobject::w_tuple_new(vec![key, value]))
-            .collect()
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        for (key, value) in unsafe { pyre_object::dictmultiobject::w_dict_items(dict) } {
+            items.push(pyre_object::tupleobject::w_tuple_new(vec![key, value]));
+        }
+        items.take()
     })
 }
 
