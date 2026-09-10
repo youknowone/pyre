@@ -7,7 +7,8 @@
 use pyre_object::nestedscope::CellFamily;
 use pyre_object::pyobject::*;
 use pyre_object::{
-    w_bool_from, w_bool_get_value, w_int_new, w_list_new, w_seq_iter_new, w_str_new, w_tuple_new,
+    w_bool_from, w_bool_get_value, w_int_new, w_list_new, w_seq_iter_new, w_str_new,
+    w_str_new_managed, w_tuple_new,
 };
 use rustpython_compiler_core::SourceLocation;
 use rustpython_compiler_core::bytecode::PyCodeLocationInfoKind;
@@ -827,7 +828,7 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
         // `w_str_new` is a collection point. RPython keeps the live `self`
         // reference in the shadow stack across it; reload the possibly moved
         // wrapper before publishing the cache field.
-        let w_qualname = w_str_new(&(*code_ptr).qualname);
+        let w_qualname = w_str_new_managed(&(*code_ptr).qualname);
         publish_code_slot_store(roots.get(code_slot));
         let w_code = roots.get(code_slot);
         (*(w_code as *mut PyCode)).w_qualname = w_qualname;
@@ -861,7 +862,7 @@ pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
         // `w_str_new` is a collection point. RPython keeps the live `self`
         // reference in the shadow stack across it; reload the possibly moved
         // wrapper before publishing the cache field.
-        let w_name = w_str_new(&(*code_ptr).obj_name);
+        let w_name = w_str_new_managed(&(*code_ptr).obj_name);
         publish_code_slot_store(roots.get(code_slot));
         let w_code = roots.get(code_slot);
         (*(w_code as *mut PyCode)).w_name = w_name;
@@ -886,7 +887,7 @@ pub unsafe fn w_code_filename_obj(w_code: PyObjectRef) -> PyObjectRef {
     let pycode = unsafe { &*(w_code as *const PyCode) };
     if pycode.filename_bytes.is_null() {
         let code = unsafe { &*(pycode.code_ptr as *const crate::CodeObject) };
-        w_str_new(&code.source_path)
+        w_str_new_managed(&code.source_path)
     } else {
         crate::gateway::fsdecode_filename_bytes(unsafe { &*pycode.filename_bytes })
     }
@@ -2141,8 +2142,8 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
         Ok(())
     }
     let mut result = 20_250_211i64;
-    add_obj(&mut result, w_str_new(&code.obj_name))?;
-    add_obj(&mut result, w_str_new(&code.qualname))?;
+    add_obj(&mut result, w_str_new_managed(&code.obj_name))?;
+    add_obj(&mut result, w_str_new_managed(&code.qualname))?;
     for value in [
         code.arg_count as i64,
         code.posonlyarg_count as i64,
@@ -2215,7 +2216,7 @@ pub unsafe fn code_varname_from_oparg(
         // rewrites — keep the bounds check a plain `lt + getitem`.
         let vi = index as usize;
         if vi < code.varnames.len() {
-            return Ok(w_str_new(&code.varnames[vi]));
+            return Ok(w_str_new_managed(&code.varnames[vi]));
         }
         index -= code.varnames.len() as i64;
         let pure_cellvars = code
@@ -2229,7 +2230,7 @@ pub unsafe fn code_varname_from_oparg(
         index -= pure_cellvar_count as i64;
         let fi = index as usize;
         if fi < code.freevars.len() {
-            return Ok(w_str_new(&code.freevars[fi]));
+            return Ok(w_str_new_managed(&code.freevars[fi]));
         }
     }
     Err(crate::PyError::new(

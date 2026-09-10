@@ -213,7 +213,7 @@ fn socket_converted_error(
     if let Some(e) = errno {
         args.push(pyre_object::w_int_new(e as i64));
     }
-    args.push(pyre_object::w_str_new(message));
+    args.push(pyre_object::w_str_new_managed(message));
 
     // Every class this resolves to is an OSError subclass, and
     // `converted_error` reaches them through `space.call_function`, so the

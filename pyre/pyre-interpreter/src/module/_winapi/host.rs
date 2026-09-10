@@ -825,9 +825,9 @@ pub fn _mimetypes_read_windows_registry(on_type_read: PyObjectRef) -> Result<(),
                 // once both exist.
                 let _entry_roots = pyre_object::gc_roots::push_roots();
                 let type_slot =
-                    pyre_object::gc_roots::pin_roots(&[pyre_object::w_str_new(&mime_type)]);
+                    pyre_object::gc_roots::pin_roots(&[pyre_object::w_str_new_managed(&mime_type)]);
                 let extension_slot =
-                    pyre_object::gc_roots::pin_roots(&[pyre_object::w_str_new(&extension)]);
+                    pyre_object::gc_roots::pin_roots(&[pyre_object::w_str_new_managed(&extension)]);
                 crate::call::call_function_impl_result(
                     roots.get(callback_slot),
                     &[

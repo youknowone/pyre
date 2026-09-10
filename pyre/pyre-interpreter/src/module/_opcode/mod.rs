@@ -99,11 +99,11 @@ fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 // the whole table. Prepending it again shifted every real name one slot up and
 // mislabelled every intrinsic in `dis` output.
 fn get_intrinsic1_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_list_new(
-        oparg::IntrinsicFunction1::iter()
-            .map(|value| w_str_new(value.desc()))
-            .collect(),
-    ))
+    let mut items = pyre_object::gc_roots::RootedItems::new();
+    for value in oparg::IntrinsicFunction1::iter() {
+        items.push(w_str_new_managed(value.desc()));
+    }
+    Ok(w_list_new(items.take()))
 }
 
 fn get_intrinsic2_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

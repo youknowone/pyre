@@ -399,7 +399,8 @@ fn warn_invalid_escape_sequence(
     let category_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(category);
     let message_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&warning_message(escape)));
+    let _ =
+        pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&warning_message(escape)));
     let filename_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(filename));
 

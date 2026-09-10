@@ -867,12 +867,12 @@ fn make_token_tuple(
     let _roots = gc_roots::push_roots();
     let base = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(w_int_new(token_type as i64));
-    let _ = gc_roots::pin_root(w_str_new(&text));
+    let _ = gc_roots::pin_root(w_str_new_managed(&text));
     let _ = gc_roots::pin_root(w_int_new(start_line as i64));
     let _ = gc_roots::pin_root(w_int_new(start_col as i64));
     let _ = gc_roots::pin_root(w_int_new(end_line as i64));
     let _ = gc_roots::pin_root(w_int_new(end_col as i64));
-    let _ = gc_roots::pin_root(w_str_new(&line));
+    let _ = gc_roots::pin_root(w_str_new_managed(&line));
     let start = w_tuple_new(vec![
         gc_roots::shadow_stack_get(base + 2),
         gc_roots::shadow_stack_get(base + 3),

@@ -65,7 +65,7 @@ fn json_decode_error(msg: String, doc: PyObjectRef, pos: usize) -> PyError {
         return PyError::value_error(format!("{msg}: line 1 column 1 (char {pos})"));
     };
     let args = [
-        pyre_object::w_str_new(&msg),
+        pyre_object::w_str_new_managed(&msg),
         doc,
         pyre_object::w_int_new(pos as i64),
     ];

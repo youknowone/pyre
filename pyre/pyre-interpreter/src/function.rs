@@ -1552,7 +1552,7 @@ pub unsafe fn fget_func_qualname(obj: PyObjectRef) -> PyObjectRef {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let value = pyre_object::w_str_new(&qualname);
+        let value = pyre_object::w_str_new_managed(&qualname);
         function_set_qualname(pyre_object::gc_roots::shadow_stack_get(obj_slot), value);
         value
     }

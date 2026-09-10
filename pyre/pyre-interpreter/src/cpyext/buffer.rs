@@ -359,7 +359,7 @@ fn acquire(
     }
 
     let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_str_new(&format));
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(&format));
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
     let r_obj = owner_slot
@@ -995,7 +995,7 @@ pub unsafe extern "C" fn PyBuffer_SizeFromFormat(format: *const c_char) -> isize
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.base();
         let _ = roots.pin_root(module);
-        let _ = roots.pin_root(pyre_object::w_str_new(&format));
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(&format));
         let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
         let calcsize = crate::baseobjspace::getattr_str(reload(0), "calcsize")?;
         let size = crate::call::call_function_impl_result(calcsize, &[reload(1)])?;
@@ -1480,7 +1480,7 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
     let copy_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::bytesobject::w_bytes_from_bytes(&block));
     let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_str_new(&format));
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(&format));
     let copy = pyre_object::gc_roots::shadow_stack_get(copy_slot);
     let w_fmt = pyre_object::gc_roots::shadow_stack_get(fmt_slot);
     let out = pyre_object::memoryview::w_memoryview_alloc_header(false, false);

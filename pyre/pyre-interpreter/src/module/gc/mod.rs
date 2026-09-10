@@ -1188,7 +1188,7 @@ fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), cr
         pyre_object::gc_roots::shadow_stack_get(raw_slot),
     )?;
     for (name, value) in formatted {
-        let text = w_str_new(&format_gc_stat(value));
+        let text = w_str_new_managed(&format_gc_stat(value));
         let _ = pyre_object::gc_roots::pin_root(text);
         let text_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         crate::baseobjspace::setattr_str(

@@ -334,7 +334,7 @@ fn char_obj(cp: u32) -> PyObjectRef {
     let s: String = char::from_u32(cp)
         .map(|c| c.to_string())
         .unwrap_or_default();
-    pyre_object::w_str_new(&s)
+    pyre_object::w_str_new_managed(&s)
 }
 
 fn opt_char_obj(cp: Option<u32>) -> PyObjectRef {
@@ -367,7 +367,7 @@ fn config_to_dialect(cfg: &DialectConfig) -> Result<PyObjectRef, PyError> {
     set("_csv_escapechar", opt_char_obj(cfg.escapechar))?;
     set(
         "_csv_lineterminator",
-        pyre_object::w_str_new(&cfg.lineterminator),
+        pyre_object::w_str_new_managed(&cfg.lineterminator),
     )?;
     set("_csv_quotechar", opt_char_obj(cfg.quotechar))?;
     set("_csv_quoting", pyre_object::w_int_new(cfg.quoting))?;
@@ -880,7 +880,7 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         {
             pyre_object::w_none()
         } else {
-            let ws = pyre_object::w_str_new(&s);
+            let ws = pyre_object::w_str_new_managed(&s);
             if unquoted
                 && len != 0
                 && (cfg.quoting == QUOTE_NONNUMERIC || cfg.quoting == QUOTE_STRINGS)

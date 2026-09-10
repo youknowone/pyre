@@ -1799,9 +1799,12 @@ impl W_TextIOWrapper {
         }
         if let Some(value) = new_encoding.as_ref() {
             self.w_encoding = w_str_new_managed(value);
+            self.publish_refs();
             self.w_errors = w_str_new_managed(new_errors.as_deref().unwrap_or("strict"));
+            self.publish_refs();
         } else if let Some(value) = new_errors.as_ref() {
             self.w_errors = w_str_new_managed(value);
+            self.publish_refs();
         }
         if let Some(codec) = new_codec {
             self.set_encoder_decoder(codec)?;

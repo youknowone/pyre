@@ -2026,7 +2026,7 @@ pub(super) fn decoded_to_pyobject(d: host_ctypes::DecodedValue) -> PyObjectRef {
         D::Float(f) => pyre_object::w_float_new(f),
         D::Bool(b) => pyre_object::w_bool_from(b),
         D::Pointer(p) => u64_to_pyobject(p as u64),
-        D::String(s) => pyre_object::w_str_new(&s),
+        D::String(s) => pyre_object::w_str_new_managed(&s),
         D::None => pyre_object::w_none(),
     }
 }

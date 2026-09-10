@@ -271,7 +271,7 @@ pub unsafe extern "C" fn PyDict_DelItemString(object: *mut CPyObject, key: *cons
     else {
         return -1;
     };
-    let w_key = pyre_object::w_str_new(&name);
+    let w_key = pyre_object::w_str_new_managed(&name);
     match trap(crate::baseobjspace::delitem(dict, w_key)) {
         Some(()) => 0,
         None => -1,
@@ -526,7 +526,7 @@ pub unsafe extern "C" fn PyDict_PopString(
         }
         return -1;
     };
-    unsafe { pop_from(dict, pyre_object::w_str_new(&name), result) }
+    unsafe { pop_from(dict, pyre_object::w_str_new_managed(&name), result) }
 }
 
 /// `PyDictProxy_New(mapping)` — the read-only view `types.MappingProxyType`
@@ -545,14 +545,14 @@ pub unsafe extern "C" fn PyDictProxy_New(object: *mut CPyObject) -> *mut CPyObje
 fn view_list(
     object: *mut CPyObject,
     name: &str,
-    part: fn(PyObjectRef) -> Vec<PyObjectRef>,
+    part: impl FnOnce(PyObjectRef) -> PyObjectRef,
 ) -> *mut CPyObject {
     let Some(dict) = dict_argument(object, name) else {
         return std::ptr::null_mut();
     };
     let roots = pyre_object::gc_roots::push_roots();
     let dict = roots.pin_root(dict);
-    pyobject::make_ref(pyre_object::listobject::w_list_new(part(dict)))
+    pyobject::make_ref(part(dict))
 }
 
 /// `PyDict_Keys(dict)`.
@@ -562,10 +562,12 @@ fn view_list(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Keys(object: *mut CPyObject) -> *mut CPyObject {
     view_list(object, "PyDict_Keys", |dict| {
-        unsafe { pyre_object::dictmultiobject::w_dict_items(dict) }
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect()
+        pyre_object::listobject::w_list_new(
+            unsafe { pyre_object::dictmultiobject::w_dict_items(dict) }
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect(),
+        )
     })
 }
 
@@ -576,10 +578,12 @@ pub unsafe extern "C" fn PyDict_Keys(object: *mut CPyObject) -> *mut CPyObject {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Values(object: *mut CPyObject) -> *mut CPyObject {
     view_list(object, "PyDict_Values", |dict| {
-        unsafe { pyre_object::dictmultiobject::w_dict_items(dict) }
-            .into_iter()
-            .map(|(_, value)| value)
-            .collect()
+        pyre_object::listobject::w_list_new(
+            unsafe { pyre_object::dictmultiobject::w_dict_items(dict) }
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect(),
+        )
     })
 }
 
@@ -594,7 +598,7 @@ pub unsafe extern "C" fn PyDict_Items(object: *mut CPyObject) -> *mut CPyObject 
         for (key, value) in unsafe { pyre_object::dictmultiobject::w_dict_items(dict) } {
             items.push(pyre_object::tupleobject::w_tuple_new(vec![key, value]));
         }
-        items.take()
+        pyre_object::listobject::w_list_new(items.take())
     })
 }
 

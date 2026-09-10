@@ -153,7 +153,7 @@ pub(super) fn stginfo_new(data: StgInfoData) -> PyObjectRef {
             d,
             K_FORMAT,
             match data.format {
-                Some(s) => pyre_object::w_str_new(&s),
+                Some(s) => pyre_object::w_str_new_managed(&s),
                 None => pyre_object::w_none(),
             },
         );

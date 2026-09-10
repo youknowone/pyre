@@ -92,7 +92,7 @@ fn win32_runtime_error(code: u32) -> crate::PyError {
     let cls_slot = roots.base();
     let _ = roots.pin_root(cls);
     let _ = roots.pin_root(pyre_object::w_int_new(0));
-    let _ = roots.pin_root(pyre_object::w_str_new(&message));
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(&message));
     let _ = roots.pin_root(pyre_object::w_none());
     let _ = roots.pin_root(pyre_object::w_int_new(i64::from(code as i32)));
     let _ = roots.pin_root(pyre_object::w_none());

@@ -244,7 +244,7 @@ pub unsafe extern "C" fn PyUnicodeDecodeError_Create(
     // Each argument is pinned as it is made: the next one allocates, and a
     // collection there moves whatever is only held in a local.
     let encoding_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_str_new(&encoding));
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(&encoding));
     let object_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::bytesobject::w_bytes_from_bytes(bytes));
     let start_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -252,7 +252,7 @@ pub unsafe extern "C" fn PyUnicodeDecodeError_Create(
     let end_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_int_new(end as i64));
     let reason_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_str_new(&reason));
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(&reason));
     let reload = pyre_object::gc_roots::shadow_stack_get;
     let made = crate::call::call_function_impl_result(
         reload(class_slot),

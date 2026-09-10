@@ -2068,7 +2068,11 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             20 => "utf-32-le",
             _ => "utf-32-be",
         };
-        let decoded = call_method(args[3], "decode", &[pyre_object::w_str_new(encoding)])?;
+        let decoded = call_method(
+            args[3],
+            "decode",
+            &[pyre_object::w_str_new_managed(encoding)],
+        )?;
         array_fromunicode(obj, decoded)?;
         return Ok(obj);
     }

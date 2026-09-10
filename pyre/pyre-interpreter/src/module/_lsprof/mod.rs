@@ -755,7 +755,7 @@ mod profiler_methods {
             // leaves the first one installed.
             crate::module::sys::vm::monitoring_use_tool_id(
                 crate::module::sys::vm::MONITORING_PROFILER_ID,
-                w_str_new("cProfile"),
+                w_str_new_managed("cProfile"),
             )?;
             if let Some(value) = subcalls {
                 self.subcalls = value;

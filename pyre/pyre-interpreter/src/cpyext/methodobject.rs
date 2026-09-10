@@ -540,7 +540,7 @@ fn text_or_none(pointer: *const c_char) -> PyObjectRef {
     if pointer.is_null() {
         return pyre_object::w_none();
     }
-    pyre_object::w_str_new(&unsafe { CStr::from_ptr(pointer) }.to_string_lossy())
+    pyre_object::w_str_new_managed(&unsafe { CStr::from_ptr(pointer) }.to_string_lossy())
 }
 
 fn text_or_empty(pointer: *const c_char) -> String {

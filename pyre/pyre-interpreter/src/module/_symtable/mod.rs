@@ -112,7 +112,7 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
     let varnames_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     for name in &table.varnames {
         let value_roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(name));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
         let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         unsafe {
             pyre_object::listobject::w_list_append(
@@ -128,7 +128,7 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
     let children_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     append_public_children(table, children_slot);
 
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&table.name));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&table.name));
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(table_type(table) as i64));
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;

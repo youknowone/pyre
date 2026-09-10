@@ -1128,7 +1128,7 @@ mod win_nt {
         let filename = if path.is_empty() {
             pyre_object::PY_NULL
         } else {
-            pyre_object::w_str_new(path)
+            pyre_object::w_str_new_managed(path)
         };
         io_err_with_filename(error, filename)
     }
@@ -2786,7 +2786,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let w_filename = if path.is_empty() {
             pyre_object::PY_NULL
         } else {
-            pyre_object::w_str_new(path)
+            pyre_object::w_str_new_managed(path)
         };
         crate::PyError::os_error_syscall(errno, w_filename)
     }

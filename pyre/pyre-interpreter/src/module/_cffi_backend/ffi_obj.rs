@@ -974,7 +974,7 @@ fn ffi_list_types(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         let typename = unsafe { *ctx.typenames.offset(i) };
         let name = unsafe { CStr::from_ptr(typename.name) }.to_string_lossy();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_str_new(&name));
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(&name));
         unsafe {
             pyre_object::listobject::w_list_append(roots.get(typedefs_slot), roots.get(name_slot))
         };
@@ -986,7 +986,7 @@ fn ffi_list_types(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             continue;
         }
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_str_new(&name));
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(&name));
         let target = if su.flags & parse_c_type::F_UNION != 0 {
             unions_slot
         } else {
