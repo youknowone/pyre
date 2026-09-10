@@ -106,11 +106,20 @@ impl TypeCache {
             crate::typedef::w_type(),
         );
         unsafe {
-            w_type_set_hasdict(w_type, definition.hasdict);
-            w_type_set_weakrefable(w_type, definition.weakrefable);
+            // typeobject.py TypeCache.build: overridetypedef is
+            // `typedef.applevel_subclasses_base.typedef` or `typedef`.
+            let overridetypedef = if definition.applevel_subclasses_base.is_null() {
+                definition as *const TypeDef
+            } else {
+                definition.applevel_subclasses_base
+            };
+            let override_def = &*overridetypedef;
+            // setup_builtin_type reads hasdict/weakrefable/heaptype off
+            // instancetypedef (the override), not the derived declaration.
+            w_type_set_hasdict(w_type, override_def.hasdict);
+            w_type_set_weakrefable(w_type, override_def.weakrefable);
             w_type_set_flag_sequence_bug_compat(w_type, definition.flag_sequence_bug_compat);
-            // typeobject.py TypeCache.build: `is_heaptype=overridetypedef.heaptype`.
-            w_type_set_heaptype(w_type, definition.heaptype);
+            w_type_set_heaptype(w_type, override_def.heaptype);
             w_type_set_acceptable_as_base_class(w_type, definition.acceptable_as_base_class());
             crate::baseobjspace::compute_and_set_mro(w_type).map_err(CacheError::Build)?;
             let best = crate::call::find_best_base(gc_roots::shadow_stack_get(bases_slot))
@@ -120,18 +129,19 @@ impl TypeCache {
             } else {
                 w_type_get_layout_ptr(best)
             };
-            let layout =
-                if !parent_layout.is_null() && std::ptr::eq((*parent_layout).typedef, definition) {
-                    parent_layout
-                } else {
-                    typeobject::leak_layout(typeobject::Layout {
-                        typedef: definition,
-                        nslots: 0,
-                        newslotnames: vec![],
-                        base_layout: parent_layout,
-                        dict_data_slot: typeobject::DICT_DATA_SLOT_UNRESOLVED,
-                    })
-                };
+            let layout = if !parent_layout.is_null()
+                && std::ptr::eq((*parent_layout).typedef, overridetypedef)
+            {
+                parent_layout
+            } else {
+                typeobject::leak_layout(typeobject::Layout {
+                    typedef: overridetypedef,
+                    nslots: 0,
+                    newslotnames: vec![],
+                    base_layout: parent_layout,
+                    dict_data_slot: typeobject::DICT_DATA_SLOT_UNRESOLVED,
+                })
+            };
             w_type_set_layout(w_type, layout);
             crate::typedef::stamp_new_descr_self(gc_roots::shadow_stack_get(ns_slot), w_type);
         }
@@ -261,6 +271,26 @@ mod tests {
             let heap = ObjSpace::new().gettypeobject(heap).unwrap();
             assert!(w_type_is_heaptype(heap));
             assert!(w_type_get_acceptable_as_base_class(heap));
+        }
+    }
+
+    #[test]
+    fn typecache_build_reuses_applevel_subclasses_base_layout() {
+        crate::typedef::init_typeobjects();
+        unsafe {
+            let space = ObjSpace::new();
+            let base_def = TypeDef::from_rawdict("IOBase", vec![], IndexMap::new(), &INSTANCE_TYPE);
+            let base = space.gettypeobject(base_def).unwrap();
+            let derived_def =
+                TypeDef::from_rawdict("RawIO", vec![base_def], IndexMap::new(), &INSTANCE_TYPE)
+                    as *mut TypeDef;
+            (*derived_def).applevel_subclasses_base = base_def;
+            let derived = space.gettypeobject(derived_def).unwrap();
+            assert!(std::ptr::eq(
+                w_type_get_layout_ptr(derived),
+                w_type_get_layout_ptr(base)
+            ));
+            assert_eq!((*w_type_get_layout_ptr(derived)).typedef, base_def);
         }
     }
 

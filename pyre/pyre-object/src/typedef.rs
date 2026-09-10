@@ -78,6 +78,10 @@ pub struct TypeDef {
     /// TypeDef.__init__: `self.heaptype = False`. TypeCache.build passes
     /// `is_heaptype=overridetypedef.heaptype` into W_TypeObject.__init__.
     pub heaptype: bool,
+    /// TypeDef.__init__: `self.applevel_subclasses_base = None`. TypeCache.build
+    /// uses `applevel_subclasses_base.typedef` as `overridetypedef` so the
+    /// derived declaration reuses that base's Layout.
+    pub applevel_subclasses_base: *const TypeDef,
 }
 
 impl TypeDef {
@@ -100,6 +104,7 @@ impl TypeDef {
             method_descriptor: false,
             flag_sequence_bug_compat: false,
             heaptype: false,
+            applevel_subclasses_base: std::ptr::null(),
         }
     }
 
