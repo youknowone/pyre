@@ -10262,26 +10262,41 @@ impl JitState for PyreJitState {
             values.push(value);
         }
 
+        // Portal interpret (`pypyjit_create_sym`) never fills
+        // `concrete_locals`. Inventing `PY_NULL` for those slots makes
+        // `restore_values` wipe function locals (`i`, `total`) after
+        // CloseLoop — the next interpreter step then raises
+        // UnboundLocalError. Residuals already mutated the live PyFrame,
+        // so read it when the shadow is empty. Omit the slots if there is
+        // no frame either: restore only writes `values.get(idx)`, so the
+        // live locals stay.
         let array_slots = live_arg_boxes.len().saturating_sub(num_scalars);
-        for slot in 0..array_slots {
-            let concrete = if slot < sym.nlocals {
-                sym.concrete_locals
-                    .get(slot)
-                    .copied()
-                    .unwrap_or(ConcreteValue::Ref(PY_NULL))
-            } else {
-                let stack_idx = slot - sym.nlocals;
-                let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
-                if stack_idx < live_stack {
-                    sym.concrete_stack
-                        .get(stack_idx)
+        if !sym.concrete_locals.is_empty() {
+            for slot in 0..array_slots {
+                let concrete = if slot < sym.nlocals {
+                    sym.concrete_locals
+                        .get(slot)
                         .copied()
                         .unwrap_or(ConcreteValue::Ref(PY_NULL))
                 } else {
-                    ConcreteValue::Ref(PY_NULL)
-                }
-            };
-            values.push(Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize)));
+                    let stack_idx = slot - sym.nlocals;
+                    let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
+                    if stack_idx < live_stack {
+                        sym.concrete_stack
+                            .get(stack_idx)
+                            .copied()
+                            .unwrap_or(ConcreteValue::Ref(PY_NULL))
+                    } else {
+                        ConcreteValue::Ref(PY_NULL)
+                    }
+                };
+                values.push(Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize)));
+            }
+        } else if frame_addr != 0 {
+            for slot in 0..array_slots {
+                let obj = concrete_stack_value(frame_addr, slot).unwrap_or(PY_NULL);
+                values.push(Value::Ref(majit_ir::GcRef(obj as usize)));
+            }
         }
 
         Some(values)
