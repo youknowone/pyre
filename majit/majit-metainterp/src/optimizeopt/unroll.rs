@@ -77,6 +77,32 @@ fn is_trace_runtime_ref(opref: OpRef, constants: &majit_ir::ConstMap<majit_ir::V
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
+/// A body use-before-def whose `_forwarded` terminal is a non-null
+/// ConstPtr is not a loop-carried runtime box. rewrite.py `used_boxes`
+/// / `remove_constptr` drop Const; the flat OpRef model remints it as
+/// an InputArg at a dead index, so assemble emits a SameAs of the
+/// Const before the Label (defining that index) instead of appending
+/// it to the header. Int/Float consts stay live-in: GuardTrue/False
+/// postprocess may install those after emit, and baking them as the
+/// first-iteration value is a 0-fill.
+fn const_ref_replacement(ctx: &OptContext, opref: OpRef) -> Option<Operand> {
+    let as_const_ref = |term: Operand| match term.const_value() {
+        Some(Value::Ref(gcref)) if !gcref.is_null() => Some(term),
+        _ => None,
+    };
+    if let Some(term) = as_const_ref(ctx.get_box_replacement_operand(opref)) {
+        return Some(term);
+    }
+    // Compact remap keeps the InputArg variant when it repositions a
+    // folded Ref producer (`with_raw`). The Const lives on the ResOp
+    // at the same raw; `find_producer_op` is variant-aware and misses
+    // the InputArgRef use.
+    if matches!(opref, OpRef::InputArgRef(_)) {
+        return as_const_ref(ctx.get_box_replacement_operand(OpRef::ref_op(opref.raw())));
+    }
+    None
+}
+
 fn callee_rca_virtual_state_summary(
     vs: &crate::optimizeopt::virtualstate::VirtualState,
 ) -> Vec<String> {
@@ -5574,6 +5600,19 @@ fn assemble_peeled_trace_with_jump_args(
                 {
                     continue;
                 }
+                // Folded ConstPtr: define the reminted index in the
+                // preamble rather than carrying it on the header.
+                // `forget_optimization_info` then clears `_forwarded`,
+                // so the backend only sees the SameAs + Const.
+                if let Some(const_op) = const_ref_replacement(ctx, arg) {
+                    let tp = const_op.type_();
+                    if tp != Type::Void {
+                        let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[const_op]);
+                        same_as.pos.set(arg);
+                        fallthrough_aliases.push(same_as);
+                    }
+                    continue;
+                }
                 // RPython Box identity parity: Phase 2 may forward a
                 // preamble-defined Box to a fresh body-visible Box. The
                 // Label carries the forwarded Box, but first fall-through
@@ -5610,6 +5649,44 @@ fn assemble_peeled_trace_with_jump_args(
             }
             if op.result_type() != Type::Void && !op.pos.get().is_none() {
                 seen_body_defs.insert(op.pos.get());
+            }
+        }
+    }
+
+    for &arg in &full_label_args {
+        if arg.is_none() {
+            continue;
+        }
+        if fallthrough_aliases.iter().any(|op| op.pos.get() == arg) {
+            continue;
+        }
+        if let Some(source) = preamble_defs.iter().copied().find(|&source| {
+            source != arg
+                && !matches!(
+                    source,
+                    OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+                )
+                && (ctx.get_replacement_opref(source) == arg || source.raw() == arg.raw())
+        }) {
+            let tp = ctx
+                .opref_type(arg)
+                .or_else(|| ctx.opref_type(source))
+                .or_else(|| arg.ty())
+                .unwrap_or_else(|| source.ty().unwrap_or(Type::Ref));
+            if tp != Type::Void {
+                let arg_source = ctx.materialize_operand_at(source);
+                let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[arg_source]);
+                same_as.pos.set(arg);
+                fallthrough_aliases.push(same_as);
+            }
+            continue;
+        }
+        if let Some(const_op) = const_ref_replacement(ctx, arg) {
+            let tp = const_op.type_();
+            if tp != Type::Void {
+                let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[const_op]);
+                same_as.pos.set(arg);
+                fallthrough_aliases.push(same_as);
             }
         }
     }

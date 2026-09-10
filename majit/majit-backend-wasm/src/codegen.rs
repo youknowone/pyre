@@ -9717,9 +9717,25 @@ fn unbound_pool_const_seeds(
         }
     }
     if !unresolved.is_empty() {
+        let labels: Vec<Vec<OpRef>> = ops
+            .iter()
+            .filter(|op| op.opcode == OpCode::Label)
+            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+            .collect();
+        let sameas: Vec<OpRef> = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.opcode,
+                    OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
+                )
+            })
+            .map(|op| op.pos.get())
+            .collect();
+        let in_idx: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
         return Err(BackendError::Unsupported(format!(
             "wasm codegen: value{unresolved:?} read with no producing op and no \
-             constant-pool entry"
+             constant-pool entry; inputargs={in_idx:?} labels={labels:?} sameas={sameas:?}"
         )));
     }
     Ok(seeds)
