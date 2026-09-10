@@ -3327,14 +3327,20 @@ impl WasmBackend {
                 let used_label_homes = prev_labels.max(widened_labels);
                 // Existing nested sub-bridges still publish the standalone
                 // map. Replaying them after the extent grew would collect
-                // through that short prefix. Drop them so the next fail
-                // retraces against the merged floor.
+                // through that short prefix. Drop the dispatch slots and
+                // the `bridge_descr_ranges` attach record so
+                // `bridge_was_compiled` does not treat the retired module
+                // as live; the next fail retraces against the merged floor.
                 let extent_grew = prev_homes < widened || prev_labels < widened_labels;
                 if extent_grew {
                     compiled
                         .chained_bridge_slots
                         .borrow_mut()
                         .retain(|&(tid, _), _| tid != region.trace_id);
+                    compiled
+                        .bridge_descr_ranges
+                        .borrow_mut()
+                        .retain(|&(tid, _, _, _)| tid != region.trace_id);
                 } else if new_cells_base != 0 {
                     // This region's guards are carved out of the array that
                     // was just reallocated. Replay still-valid nested
