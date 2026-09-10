@@ -424,6 +424,10 @@ pub struct CallAssemblerTarget {
     /// loaded with the other runtime snapshot fields.
     pub home_slot_base: u32,
     pub home_slots: u32,
+    /// Callee retains `_finish_gcmap` (`GUARD_NOT_FORCED_2`). The caller
+    /// pop footer must use the write-barrier helper when this is set,
+    /// even if the caller module itself has no GNF2.
+    pub has_guard_not_forced_2: u32,
 }
 
 /// Compiled loop targets keyed by their `JitCellToken` number. Unlike label
@@ -458,6 +462,7 @@ pub struct WasmCaRuntimeTarget {
     pub callee_gcmap_ptr: i64,
     pub home_slot_base: u32,
     pub home_slots: u32,
+    pub has_guard_not_forced_2: u32,
 }
 
 /// Stable cell baked by callers.  A redirect publishes one pointer to an
@@ -487,6 +492,8 @@ pub const WASM_CA_TARGET_HOME_SLOT_BASE_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, home_slot_base) as u64;
 pub const WASM_CA_TARGET_HOME_SLOTS_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, home_slots) as u64;
+pub const WASM_CA_TARGET_HAS_GNF2_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, has_guard_not_forced_2) as u64;
 
 /// `make_and_attach_done_descrs` gives every cpu one `DoneWithThisFrame*` per
 /// result kind plus one `ExitFrameWithExceptionDescrRef`, and
@@ -651,6 +658,7 @@ pub fn ca_dispatch_publish(
     callee_gcmap_ptr: i64,
     home_slot_base: u32,
     home_slots: u32,
+    has_guard_not_forced_2: u32,
 ) {
     let _ = ca_dispatch_slot(number);
     let table = WASM_CA_DISPATCH.lock();
@@ -667,6 +675,7 @@ pub fn ca_dispatch_publish(
             && current.callee_gcmap_ptr == callee_gcmap_ptr
             && current.home_slot_base == home_slot_base
             && current.home_slots == home_slots
+            && current.has_guard_not_forced_2 == has_guard_not_forced_2
     }) {
         return;
     }
@@ -678,6 +687,7 @@ pub fn ca_dispatch_publish(
         callee_gcmap_ptr,
         home_slot_base,
         home_slots,
+        has_guard_not_forced_2,
     });
     let target_ptr = (&*target as *const WasmCaRuntimeTarget as usize) as u32;
     targets.push(target);
@@ -694,6 +704,7 @@ pub fn ca_dispatch_redirect(
     callee_gcmap_ptr: i64,
     home_slot_base: u32,
     home_slots: u32,
+    has_guard_not_forced_2: u32,
 ) {
     ca_dispatch_publish(
         old_number,
@@ -704,6 +715,7 @@ pub fn ca_dispatch_redirect(
         callee_gcmap_ptr,
         home_slot_base,
         home_slots,
+        has_guard_not_forced_2,
     );
 }
 

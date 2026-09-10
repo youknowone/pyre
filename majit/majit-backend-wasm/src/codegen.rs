@@ -2462,10 +2462,12 @@ fn emit_ca_pop_shadowstack(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
 ///
 /// `genop_finish` publishes `_finish_gcmap` (or NULL) before the footer.
 /// A CA callee's `FINISH` now does that publish inside generated wasm, so
-/// the caller footer is the x86 `SUB`. A `GUARD_NOT_FORCED_2` token still
-/// keeps the frame reachable after the pop; those traces keep
-/// `wasm_jit_ca_pop_frame` (finish map + write barrier + pop) until
-/// Finish grows the `_finish_gcmap` store.
+/// the caller footer is the x86 `SUB`. A callee that retains
+/// `GUARD_NOT_FORCED_2` still keeps the frame reachable after the pop;
+/// those traces keep `wasm_jit_ca_pop_frame` (finish map + write barrier
+/// + pop). The flag is the callee's, loaded from the redirectable
+/// snapshot — the caller's own ops do not describe the frame being
+/// popped, including after `redirect_call_assembler`.
 fn emit_ca_pop_footer(
     sink: &mut PeepSink<'_, '_>,
     inline: CaInlineParams,
@@ -2473,13 +2475,12 @@ fn emit_ca_pop_footer(
     ca_pop_fn_ptr: i64,
     ca_cfp_local: u32,
     scratch: u32,
-    has_guard_not_forced_2: bool,
+    ca_target_local: u32,
 ) {
     use majit_backend::jitframe::{JF_FORCE_DESCR_OFS, JF_GCMAP_OFS, SIZEOFSIGNED};
-    if !has_guard_not_forced_2 {
-        emit_ca_pop_shadowstack(sink, inline.jf_top_addr);
-        return;
-    }
+    sink.local_get(ca_target_local);
+    sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HAS_GNF2_OFS));
+    sink.if_(BlockType::Empty);
     let ss_word = std::mem::size_of::<usize>() as i32;
     // `assembler.py` `_reload_frame_if_necessary`: `top[-WORD]` is the
     // jitframe, not the CA items base (which a collection may have moved).
@@ -2512,6 +2513,9 @@ fn emit_ca_pop_footer(
     sink.i32_const(ca_pop_fn_ptr as i32);
     sink.call_indirect(0, residual_type_base + 1);
     sink.drop();
+    sink.end();
+    sink.else_();
+    emit_ca_pop_shadowstack(sink, inline.jf_top_addr);
     sink.end();
 }
 
@@ -5703,7 +5707,8 @@ fn build_function(
     // `_finish_gcmap` is retained only for GUARD_NOT_FORCED_2
     // (`store_force_descr` / `genop_finish`). A leftover `jf_force_descr`
     // from the GUARD_NOT_FORCED that follows CALL_ASSEMBLER is not that map.
-    let has_guard_not_forced_2 = ops.iter().any(|op| op.opcode == OpCode::GuardNotForced2);
+    // The CA pop footer loads the callee's flag from the snapshot; this
+    // module's ops do not describe the frame being popped.
 
     // A merged region whose closing JUMP names a LABEL published by another
     // module leaves this function the way its out-of-line bridge did — by
@@ -8723,7 +8728,7 @@ fn build_function(
                         ca.ca_pop_fn_ptr,
                         ca_cfp_local,
                         alloc_scratch_local,
-                        has_guard_not_forced_2,
+                        ca_target_local,
                     );
                 } else if let Some(base) = residual_type_base {
                     sink.local_get(ca_cfp_local);
@@ -8754,13 +8759,26 @@ fn build_function(
                 let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
                 // Simple `_call_footer_shadowstack` does not collect, and
                 // local 0 already holds the caller from the post-call reload.
-                if ca.inline.is_none() || has_guard_not_forced_2 {
+                // The helper path can collect; that is a property of the
+                // callee snapshot, not of this module's ops.
+                if ca.inline.is_none() {
                     emit_reload_ca_frame_if_necessary(
                         &mut sink,
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.inline,
                     );
+                } else {
+                    sink.local_get(ca_target_local);
+                    sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HAS_GNF2_OFS));
+                    sink.if_(BlockType::Empty);
+                    emit_reload_ca_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.inline,
+                    );
+                    sink.end();
                 }
                 emit_reload_refs_from_homes(
                     &mut sink,

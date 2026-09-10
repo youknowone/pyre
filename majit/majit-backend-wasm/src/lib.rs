@@ -3354,6 +3354,11 @@ impl WasmBackend {
         if let Some(mut target) = call_assembler_target(token.number) {
             target.func_handle = old_handle;
             target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
+            target.has_guard_not_forced_2 = inputs
+                .ops
+                .iter()
+                .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2)
+                as u32;
             ca_dispatch_publish(
                 token.number,
                 old_handle,
@@ -3363,6 +3368,7 @@ impl WasmBackend {
                 target.callee_gcmap_ptr,
                 target.home_slot_base,
                 target.home_slots,
+                target.has_guard_not_forced_2,
             );
             publish_call_assembler_target(token.number, target);
         }
@@ -3577,6 +3583,7 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
                 registered.callee_gcmap_ptr,
                 registered.home_slot_base,
                 registered.home_slots,
+                registered.has_guard_not_forced_2,
             );
             publish_call_assembler_target(target_token, registered.clone());
         }
@@ -4435,6 +4442,9 @@ impl majit_backend::Backend for WasmBackend {
         // its finish index. Publish those mutable pieces before exposing the
         // immutable geometry metadata: previously compiled CALL_ASSEMBLER
         // modules load this stable entry at runtime.
+        let has_guard_not_forced_2 =
+            ops.iter()
+                .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2) as u32;
         ca_dispatch_publish(
             token.number,
             compiled.eager_func_handle(),
@@ -4444,6 +4454,7 @@ impl majit_backend::Backend for WasmBackend {
             callee_gcmap_ptr,
             compiled.frame.home_slot_base as u32,
             compiled.frame.home_slots as u32,
+            has_guard_not_forced_2,
         );
         publish_call_assembler_target(
             token.number,
@@ -4457,6 +4468,7 @@ impl majit_backend::Backend for WasmBackend {
                 compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
                 home_slot_base: compiled.frame.home_slot_base as u32,
                 home_slots: compiled.frame.home_slots as u32,
+                has_guard_not_forced_2,
             },
         );
         if let Some(targets) = ca_targets.as_ref() {
@@ -5888,6 +5900,7 @@ impl majit_backend::Backend for WasmBackend {
                 new_target.callee_gcmap_ptr,
                 new_target.home_slot_base,
                 new_target.home_slots,
+                new_target.has_guard_not_forced_2,
             );
             publish_call_assembler_target(new.number, new_target.clone());
         }
@@ -5930,6 +5943,7 @@ impl majit_backend::Backend for WasmBackend {
             new_target.callee_gcmap_ptr,
             new_target.home_slot_base,
             new_target.home_slots,
+            new_target.has_guard_not_forced_2,
         );
         transfer_call_assembler_target_activity(&old_target, &new_target);
         new_target.token_number = old.number;
@@ -6126,15 +6140,31 @@ mod tests {
     fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let token_number = 9_900_000;
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0);
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0);
+        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 0);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
             .as_ref()
             .and_then(|table| table.get(&token_number))
             .expect("published dispatch entry");
-        assert_eq!(entry.targets.lock().unwrap().len(), 1);
+        {
+            let targets = entry.targets.lock().unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].has_guard_not_forced_2, 0);
+        }
+        drop(table);
+        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 1);
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&token_number))
+            .expect("published dispatch entry");
+        {
+            let targets = entry.targets.lock().unwrap();
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[1].has_guard_not_forced_2, 1);
+        }
         drop(table);
         failguard::ca_dispatch_remove(token_number);
     }

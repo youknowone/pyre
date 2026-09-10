@@ -2236,13 +2236,14 @@ fn entry_prologue_nulls_the_frozen_home_region() {
     );
 }
 
-/// Without `GUARD_NOT_FORCED_2` there is no `_finish_gcmap`. The CA
-/// caller footer is `_call_footer_shadowstack` — the x86 `SUB` — not a
-/// runtime `jf_force_descr` check that would take the write-barrier
-/// helper on every leftover `GUARD_NOT_FORCED` from the call itself.
+/// The CA pop footer must not bake the caller's `GUARD_NOT_FORCED_2`.
+/// After `redirect_call_assembler` the callee can differ, so the footer
+/// loads `WasmCaRuntimeTarget.has_guard_not_forced_2` and keeps both the
+/// shadowstack `SUB` and the write-barrier helper. A leftover caller
+/// `GUARD_NOT_FORCED` must not change that shape.
 #[test]
-fn call_assembler_without_gnf2_pops_with_shadowstack_sub() {
-    fn build(with_gnf2: bool) -> Vec<u8> {
+fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
+    fn build(with_caller_gnf2: bool) -> Vec<u8> {
         let token = 0x5a5a_u64;
         let ca_pop_fn_ptr = 0x77_i64;
         let inputargs = vec![InputArg::from_type(Type::Int, 0)];
@@ -2257,7 +2258,7 @@ fn call_assembler_without_gnf2_pops_with_shadowstack_sub() {
             target_token: token,
         }));
         let mut ops = vec![call];
-        if with_gnf2 {
+        if with_caller_gnf2 {
             ops.push(make_guard(
                 OpCode::GuardNotForced2,
                 &[],
@@ -2327,18 +2328,40 @@ fn call_assembler_without_gnf2_pops_with_shadowstack_sub() {
         saw
     }
 
+    fn loads_callee_gnf2(bytes: &[u8]) -> bool {
+        let mut saw = false;
+        count_operators(bytes, |op| {
+            if matches!(
+                op,
+                wasmparser::Operator::I32Load { memarg }
+                    if memarg.offset == majit_backend_wasm::failguard::WASM_CA_TARGET_HAS_GNF2_OFS
+            ) {
+                saw = true;
+            }
+        });
+        saw
+    }
+
     let without = build(false);
     validate_wasm(&without);
     assert!(
-        !mentions_pop_helper(&without),
-        "no GUARD_NOT_FORCED_2: pop is SUB, not wasm_jit_ca_pop_frame"
+        loads_callee_gnf2(&without),
+        "CA pop must load callee GUARD_NOT_FORCED_2 from the snapshot"
+    );
+    assert!(
+        mentions_pop_helper(&without),
+        "redirectable callee GNF2 keeps the write-barrier pop helper"
     );
 
     let with = build(true);
     validate_wasm(&with);
     assert!(
+        loads_callee_gnf2(&with),
+        "caller GUARD_NOT_FORCED_2 must not replace the snapshot load"
+    );
+    assert!(
         mentions_pop_helper(&with),
-        "GUARD_NOT_FORCED_2 keeps the write-barrier pop helper"
+        "caller GUARD_NOT_FORCED_2 must not change the pop helper shape"
     );
 }
 
