@@ -1199,24 +1199,24 @@ impl PtrInfo {
         match self {
             PtrInfo::Instance(v) => {
                 v.fields.retain(|(k, _)| *k != field_idx);
-                v.fields.push((field_idx, FieldEntry::Preamble(pop)));
+                v.fields.push((field_idx, FieldEntry::preamble(pop)));
             }
             PtrInfo::Struct(v) => {
                 v.fields.retain(|(k, _)| *k != field_idx);
-                v.fields.push((field_idx, FieldEntry::Preamble(pop)));
+                v.fields.push((field_idx, FieldEntry::preamble(pop)));
             }
             // The catch-all below re-seats `self` as an `InstancePtrInfo`,
             // which would drop the tracked virtualizable state. Store the
             // hoisted field alongside the other ordinary heap fields instead.
             PtrInfo::Virtualizable(v) => {
                 v.heap_fields.retain(|(k, _)| *k != field_idx);
-                v.heap_fields.push((field_idx, FieldEntry::Preamble(pop)));
+                v.heap_fields.push((field_idx, FieldEntry::preamble(pop)));
             }
             _ => {
                 *self = PtrInfo::Instance(InstancePtrInfo {
                     descr: None,
                     known_class: None,
-                    fields: vec![(field_idx, FieldEntry::Preamble(pop))],
+                    fields: vec![(field_idx, FieldEntry::preamble(pop))],
                     last_guard_pos: -1,
                 });
             }
@@ -1230,7 +1230,7 @@ impl PtrInfo {
             if index >= v.items.len() {
                 v.items.resize(index + 1, FieldEntry::Value(Operand::None));
             }
-            v.items[index] = FieldEntry::Preamble(pop);
+            v.items[index] = FieldEntry::preamble(pop);
         }
     }
 

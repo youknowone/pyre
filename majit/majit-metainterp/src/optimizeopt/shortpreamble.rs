@@ -1969,7 +1969,7 @@ impl ProducedShortOp {
                         );
                     }
                     array_info.items[idx] =
-                        crate::optimizeopt::info::FieldEntry::Preamble(pop_for_array);
+                        crate::optimizeopt::info::FieldEntry::preamble(pop_for_array);
                 }
             });
         }

@@ -61,7 +61,15 @@ pub enum FieldEntry {
     /// `OpRef::ConstPtr` that a moving collection cannot reach.
     Value(crate::operand::Operand),
     /// shortpreamble.py PreambleOp — sentinel stored during Phase 2 import.
-    Preamble(PreambleOp),
+    /// Boxed so `(u32, FieldEntry)` stays 16 B and a one-field
+    /// `PtrInfo` clone does not mint the 48-byte class.
+    Preamble(Box<PreambleOp>),
+}
+
+impl FieldEntry {
+    pub fn preamble(pop: PreambleOp) -> Self {
+        FieldEntry::Preamble(Box::new(pop))
+    }
 }
 
 impl FieldEntry {
@@ -83,7 +91,7 @@ impl FieldEntry {
     /// Extract the `PreambleOp` if this is a `Preamble` entry.
     pub fn as_preamble(&self) -> Option<&PreambleOp> {
         match self {
-            FieldEntry::Preamble(pop) => Some(pop),
+            FieldEntry::Preamble(pop) => Some(pop.as_ref()),
             FieldEntry::Value(_) => None,
         }
     }
@@ -119,8 +127,22 @@ impl FieldEntry {
     /// Consume and extract the `PreambleOp` if this is a `Preamble` entry.
     pub fn into_preamble(self) -> Option<PreambleOp> {
         match self {
-            FieldEntry::Preamble(pop) => Some(pop),
+            FieldEntry::Preamble(pop) => Some(*pop),
             FieldEntry::Value(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_entry_value_pair_leaves_the_48_byte_class() {
+        assert!(
+            std::mem::size_of::<(u32, FieldEntry)>() <= 24,
+            "(u32, FieldEntry) is {} B; a one-field PtrInfo clone must not mint 48 B",
+            std::mem::size_of::<(u32, FieldEntry)>()
+        );
     }
 }
