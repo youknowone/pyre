@@ -188,60 +188,76 @@ fn write_openat_path(_ctx: *mut libc::c_void) {}
 const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
 const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
 const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
-const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
-const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
-const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
-const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
-const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
-const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
-const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
-const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
-const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
-const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
-const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
-const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
-const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
-const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
-const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
-const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
-const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
-const LANDLOCK_ABI1_FS: u64 = LANDLOCK_ACCESS_FS_EXECUTE
-    | LANDLOCK_ACCESS_FS_WRITE_FILE
-    | LANDLOCK_ACCESS_FS_READ_FILE
-    | LANDLOCK_ACCESS_FS_READ_DIR
-    | LANDLOCK_ACCESS_FS_REMOVE_DIR
-    | LANDLOCK_ACCESS_FS_REMOVE_FILE
-    | LANDLOCK_ACCESS_FS_MAKE_CHAR
-    | LANDLOCK_ACCESS_FS_MAKE_DIR
-    | LANDLOCK_ACCESS_FS_MAKE_REG
-    | LANDLOCK_ACCESS_FS_MAKE_SOCK
-    | LANDLOCK_ACCESS_FS_MAKE_FIFO
-    | LANDLOCK_ACCESS_FS_MAKE_BLOCK
-    | LANDLOCK_ACCESS_FS_MAKE_SYM;
+bitflags::bitflags! {
+    /// `landlock.h` `LANDLOCK_CREATE_RULESET_*` flags.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct LandlockCreateRuleset: u32 {
+        const VERSION = 1 << 0;
+        const ERRATA = 1 << 1;
+    }
+}
+
+bitflags::bitflags! {
+    /// `landlock.h` `LANDLOCK_ACCESS_FS_*` bits.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct LandlockAccessFs: u64 {
+        const EXECUTE = 1 << 0;
+        const WRITE_FILE = 1 << 1;
+        const READ_FILE = 1 << 2;
+        const READ_DIR = 1 << 3;
+        const REMOVE_DIR = 1 << 4;
+        const REMOVE_FILE = 1 << 5;
+        const MAKE_CHAR = 1 << 6;
+        const MAKE_DIR = 1 << 7;
+        const MAKE_REG = 1 << 8;
+        const MAKE_SOCK = 1 << 9;
+        const MAKE_FIFO = 1 << 10;
+        const MAKE_BLOCK = 1 << 11;
+        const MAKE_SYM = 1 << 12;
+        const REFER = 1 << 13;
+        const TRUNCATE = 1 << 14;
+        const IOCTL_DEV = 1 << 15;
+        const ABI1 = Self::EXECUTE.bits()
+            | Self::WRITE_FILE.bits()
+            | Self::READ_FILE.bits()
+            | Self::READ_DIR.bits()
+            | Self::REMOVE_DIR.bits()
+            | Self::REMOVE_FILE.bits()
+            | Self::MAKE_CHAR.bits()
+            | Self::MAKE_DIR.bits()
+            | Self::MAKE_REG.bits()
+            | Self::MAKE_SOCK.bits()
+            | Self::MAKE_FIFO.bits()
+            | Self::MAKE_BLOCK.bits()
+            | Self::MAKE_SYM.bits();
+    }
+}
 
 #[repr(C)]
 struct LandlockRulesetAttr {
-    handled_access_fs: u64,
+    handled_access_fs: LandlockAccessFs,
 }
 
 #[repr(C, packed)]
 struct LandlockPathBeneath {
-    allowed_access: u64,
+    allowed_access: LandlockAccessFs,
     parent_fd: i32,
 }
 
-fn landlock_handled_fs(abi: i64) -> u64 {
-    let mut access = LANDLOCK_ABI1_FS;
+fn landlock_handled_fs(abi: i64) -> LandlockAccessFs {
+    let mut access = LandlockAccessFs::ABI1;
     if abi >= 2 {
-        access |= LANDLOCK_ACCESS_FS_REFER;
+        access |= LandlockAccessFs::REFER;
     }
     if abi >= 3 {
-        access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+        access |= LandlockAccessFs::TRUNCATE;
     }
     if abi >= 5 {
-        access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+        access |= LandlockAccessFs::IOCTL_DEV;
     }
     access
 }
@@ -258,7 +274,7 @@ fn restrict_filesystem_to_proc_maps() -> io::Result<()> {
             SYS_LANDLOCK_CREATE_RULESET,
             core::ptr::null::<u8>(),
             0usize,
-            LANDLOCK_CREATE_RULESET_VERSION,
+            LandlockCreateRuleset::VERSION.bits(),
         )
     };
     if abi < 0 {
@@ -290,7 +306,7 @@ fn restrict_filesystem_to_proc_maps() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let path_attr = LandlockPathBeneath {
-        allowed_access: LANDLOCK_ACCESS_FS_READ_FILE,
+        allowed_access: LandlockAccessFs::READ_FILE,
         parent_fd: maps,
     };
     let added = unsafe {

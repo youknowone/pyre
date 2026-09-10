@@ -10,6 +10,7 @@ description = "RPython-style sandbox protocol, virtual filesystem and controller
 parking_lot = { workspace = true }
 libc = { workspace = true }
 indexmap = { workspace = true }
+bitflags = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

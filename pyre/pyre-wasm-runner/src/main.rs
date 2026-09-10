@@ -23,6 +23,17 @@
 mod host_path;
 mod wasmi_host;
 
+bitflags::bitflags! {
+    /// Mirror of `pyre_jit_trace::trace::fbw_diag::RingFlags`.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct FbwRingFlags: u64 {
+        const VALID = 1 << 0;
+        const COMMITTED = 1 << 1;
+        const BRIDGE = 1 << 2;
+    }
+}
+
 use std::path::{Path, PathBuf};
 
 use wasmtime::error::Context;
@@ -989,9 +1000,9 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
-            const FLAG_VALID: u64 = 0x1;
-            const FLAG_COMMITTED: u64 = 0x2;
-            const FLAG_BRIDGE: u64 = 0x4;
+            const FLAG_VALID: u64 = 1;
+            const FLAG_COMMITTED: u64 = 2;
+            const FLAG_BRIDGE: u64 = 4;
             const SHIFT_EFFECTS: u32 = 8;
             const SHIFT_JOURNAL: u32 = 24;
             const SHIFT_EXEC_MF: u32 = 40;

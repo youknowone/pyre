@@ -117,11 +117,24 @@ pub const UNKNOWN_PRIM: isize = -1;
 pub const UNKNOWN_FLOAT_PRIM: isize = -2;
 pub const UNKNOWN_LONG_DOUBLE: isize = -3;
 
-pub const F_UNION: c_int = 0x01;
-pub const F_CHECK_FIELDS: c_int = 0x02;
-pub const F_PACKED: c_int = 0x04;
-pub const F_EXTERNAL: c_int = 0x08;
-pub const F_OPAQUE: c_int = 0x10;
+bitflags::bitflags! {
+    /// `_cffi_backend` `F_*` bits on a realized type.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct CffiTypeFlags: c_int {
+        const UNION = 0x01;
+        const CHECK_FIELDS = 0x02;
+        const PACKED = 0x04;
+        const EXTERNAL = 0x08;
+        const OPAQUE = 0x10;
+    }
+}
+
+pub const F_UNION: c_int = CffiTypeFlags::UNION.bits();
+pub const F_CHECK_FIELDS: c_int = CffiTypeFlags::CHECK_FIELDS.bits();
+pub const F_PACKED: c_int = CffiTypeFlags::PACKED.bits();
+pub const F_EXTERNAL: c_int = CffiTypeFlags::EXTERNAL.bits();
+pub const F_OPAQUE: c_int = CffiTypeFlags::OPAQUE.bits();
 
 #[repr(C)]
 #[derive(Clone, Copy)]

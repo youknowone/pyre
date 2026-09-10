@@ -47,41 +47,65 @@ pub const KIND_FUNC: i64 = 13;
 
 // ── the boolean class attributes ────────────────────────────────────────
 
+bitflags::bitflags! {
+    /// Boolean class attributes packed onto `W_CType.flags`.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct CTypeFlags: i64 {
+        const PRIMITIVE_INTEGER = 1 << 0;
+        const NONFUNC_POINTER_OR_ARRAY = 1 << 1;
+        const ACCEPT_STR = 1 << 2;
+        const VOID_PTR = 1 << 3;
+        const VOIDCHAR_PTR = 1 << 4;
+        const ONEBYTE_PTR = 1 << 5;
+        const FILE_PTR = 1 << 6;
+        const VALUE_FITS_LONG = 1 << 7;
+        const VALUE_SMALLER_THAN_LONG = 1 << 8;
+        const VALUE_FITS_ULONG = 1 << 9;
+        const SIGNED_WCHAR = 1 << 10;
+        const ELLIPSIS = 1 << 11;
+        const ENUM = 1 << 12;
+        const CUSTOM_FIELD_POS = 1 << 13;
+        const WITH_VAR_ARRAY = 1 << 14;
+        const WITH_PACKED_CHANGE = 1 << 15;
+    }
+}
+
 /// `W_CType.is_primitive_integer`.
-pub const F_PRIMITIVE_INTEGER: i64 = 1 << 0;
+pub const F_PRIMITIVE_INTEGER: i64 = CTypeFlags::PRIMITIVE_INTEGER.bits();
 /// `W_CType.is_nonfunc_pointer_or_array`.
-pub const F_NONFUNC_POINTER_OR_ARRAY: i64 = 1 << 1;
+pub const F_NONFUNC_POINTER_OR_ARRAY: i64 = CTypeFlags::NONFUNC_POINTER_OR_ARRAY.bits();
 /// `W_CTypePtrOrArray.accept_str`.
-pub const F_ACCEPT_STR: i64 = 1 << 2;
+pub const F_ACCEPT_STR: i64 = CTypeFlags::ACCEPT_STR.bits();
 /// `W_CTypePtrBase.is_void_ptr`.
-pub const F_VOID_PTR: i64 = 1 << 3;
+pub const F_VOID_PTR: i64 = CTypeFlags::VOID_PTR.bits();
 /// `W_CTypePtrBase.is_voidchar_ptr`.
-pub const F_VOIDCHAR_PTR: i64 = 1 << 4;
+pub const F_VOIDCHAR_PTR: i64 = CTypeFlags::VOIDCHAR_PTR.bits();
 /// `W_CTypePtrBase.is_onebyte_ptr`.
-pub const F_ONEBYTE_PTR: i64 = 1 << 5;
+pub const F_ONEBYTE_PTR: i64 = CTypeFlags::ONEBYTE_PTR.bits();
 /// `W_CTypePointer.is_file`.
-pub const F_FILE_PTR: i64 = 1 << 6;
+pub const F_FILE_PTR: i64 = CTypeFlags::FILE_PTR.bits();
 /// `W_CTypePrimitiveSigned.value_fits_long` /
 /// `W_CTypePrimitiveUnsigned.value_fits_long`.
-pub const F_VALUE_FITS_LONG: i64 = 1 << 7;
+pub const F_VALUE_FITS_LONG: i64 = CTypeFlags::VALUE_FITS_LONG.bits();
 /// `W_CTypePrimitiveSigned.value_smaller_than_long`.
-pub const F_VALUE_SMALLER_THAN_LONG: i64 = 1 << 8;
+pub const F_VALUE_SMALLER_THAN_LONG: i64 = CTypeFlags::VALUE_SMALLER_THAN_LONG.bits();
 /// `W_CTypePrimitiveUnsigned.value_fits_ulong`.
-pub const F_VALUE_FITS_ULONG: i64 = 1 << 9;
+pub const F_VALUE_FITS_ULONG: i64 = CTypeFlags::VALUE_FITS_ULONG.bits();
 /// `W_CTypePrimitiveUniChar.is_signed_wchar`.
-pub const F_SIGNED_WCHAR: i64 = 1 << 10;
+pub const F_SIGNED_WCHAR: i64 = CTypeFlags::SIGNED_WCHAR.bits();
 /// `W_CTypeFunc.ellipsis`.
-pub const F_ELLIPSIS: i64 = 1 << 11;
+pub const F_ELLIPSIS: i64 = CTypeFlags::ELLIPSIS.bits();
 /// The ctype is `ctypeenum.py W_CTypeEnumSigned` or `W_CTypeEnumUnsigned`.
 /// `_Mixin_Enum` mixes into the primitive signed and unsigned classes, so an
 /// enum keeps their kind and only adds the two enumerator maps.
-pub const F_ENUM: i64 = 1 << 12;
+pub const F_ENUM: i64 = CTypeFlags::ENUM.bits();
 /// `W_CTypeStructOrUnion._custom_field_pos`.
-pub const F_CUSTOM_FIELD_POS: i64 = 1 << 13;
+pub const F_CUSTOM_FIELD_POS: i64 = CTypeFlags::CUSTOM_FIELD_POS.bits();
 /// `W_CTypeStructOrUnion._with_var_array`.
-pub const F_WITH_VAR_ARRAY: i64 = 1 << 14;
+pub const F_WITH_VAR_ARRAY: i64 = CTypeFlags::WITH_VAR_ARRAY.bits();
 /// `W_CTypeStructOrUnion._with_packed_change`.
-pub const F_WITH_PACKED_CHANGE: i64 = 1 << 15;
+pub const F_WITH_PACKED_CHANGE: i64 = CTypeFlags::WITH_PACKED_CHANGE.bits();
 
 /// `ctypeobj.py W_CType` and the RPython subclasses that share its typedef.
 ///

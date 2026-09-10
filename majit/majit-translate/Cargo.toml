@@ -9,6 +9,7 @@ description = "Rust port of RPython's translation pipeline (flowspace → annota
 [dependencies]
 bincode = "1.3"
 parking_lot = { workspace = true }
+bitflags = { workspace = true }
 syn = { workspace = true, features = ["parsing"] }
 quote = { workspace = true }
 # `span-locations` exposes `Span::start()` / `Span::end()` for spans

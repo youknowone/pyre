@@ -25,7 +25,7 @@ use sha1::{Digest, Sha1};
 use x509_parser::prelude::FromDer;
 
 #[cfg(feature = "host_env")]
-use rustpython_host_env::ssl::{self as host_ssl, cipher, msg, providers::CryptoExt};
+use rustpython_host_env::ssl::{self as host_ssl, cipher, keylog, msg, providers::CryptoExt};
 
 #[cfg(not(feature = "host_env"))]
 static INSTALL_PROVIDER: Once = Once::new();
@@ -261,10 +261,9 @@ enum EcdhCurve {
 
 #[cfg(feature = "host_env")]
 pub use host_ssl::{
-    CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, PROTOCOL_TLS, PROTOCOL_TLS_CLIENT,
-    PROTOCOL_TLS_SERVER, PROTOCOL_TLSV1, PROTOCOL_TLSV1_1, PROTOCOL_TLSV1_2, PROTOCOL_TLSV1_3,
-    VERIFY_ALLOW_PROXY_CERTS, VERIFY_CRL_CHECK_CHAIN, VERIFY_CRL_CHECK_LEAF, VERIFY_DEFAULT,
-    VERIFY_X509_PARTIAL_CHAIN, VERIFY_X509_STRICT, VERIFY_X509_TRUSTED_FIRST,
+    CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, PROTO_TLSV1_2, PROTO_TLSV1_3, PROTOCOL_TLS,
+    PROTOCOL_TLS_CLIENT, PROTOCOL_TLS_SERVER, PROTOCOL_TLSV1, PROTOCOL_TLSV1_1, PROTOCOL_TLSV1_2,
+    PROTOCOL_TLSV1_3,
 };
 
 #[cfg(not(feature = "host_env"))]
@@ -287,39 +286,86 @@ pub const CERT_NONE: i32 = 0;
 pub const CERT_OPTIONAL: i32 = 1;
 #[cfg(not(feature = "host_env"))]
 pub const CERT_REQUIRED: i32 = 2;
+#[cfg(not(feature = "host_env"))]
+pub const PROTO_TLSV1_2: i32 = 0x0303;
+#[cfg(not(feature = "host_env"))]
+pub const PROTO_TLSV1_3: i32 = 0x0304;
 
-/// `SSL_OP_*` bits the `_ssl` module publishes.  Both `DEFAULT_OPTIONS` and
-/// [`enabled_versions`] decode this space, so the two must not name the same
-/// bit differently.
-const OP_ALL: u64 = 0x0000_0bfb;
-const OP_NO_SSLV3: u64 = 0x0200_0000;
-const OP_NO_TLSV1_2: u64 = 0x0800_0000;
-const OP_NO_TLSV1_3: u64 = 0x2000_0000;
-const OP_NO_COMPRESSION: u64 = 0x0002_0000;
-const OP_CIPHER_SERVER_PREFERENCE: u64 = 0x0040_0000;
-const OP_ENABLE_MIDDLEBOX_COMPAT: u64 = 0x0010_0000;
+#[cfg(feature = "host_env")]
+pub use host_ssl::msg::{
+    SSL3_MT_CHANGE_CIPHER_SPEC, SSL3_RT_ALERT, SSL3_RT_CHANGE_CIPHER_SPEC, SSL3_RT_HANDSHAKE,
+    SSL3_RT_HEADER,
+};
+#[cfg(feature = "host_env")]
+pub const SSL3_RT_APPLICATION_DATA: i32 = host_ssl::msg::SSL3_RT_APPLICATION_DATA as i32;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_CHANGE_CIPHER_SPEC: i32 = 20;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_ALERT: i32 = 21;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_HANDSHAKE: i32 = 22;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_APPLICATION_DATA: i32 = 23;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_RT_HEADER: i32 = 256;
+#[cfg(not(feature = "host_env"))]
+pub const SSL3_MT_CHANGE_CIPHER_SPEC: i32 = 0x0101;
 
-pub const DEFAULT_OPTIONS: u64 = OP_ALL
-    | OP_NO_SSLV3
-    | OP_NO_COMPRESSION
-    | OP_CIPHER_SERVER_PREFERENCE
-    | OP_ENABLE_MIDDLEBOX_COMPAT;
+bitflags::bitflags! {
+    /// `SSL_OP_*` bits the `_ssl` module publishes.  Both `DEFAULT_OPTIONS` and
+    /// [`enabled_versions`] decode this space, so the two must not name the same
+    /// bit differently.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct SslOp: u64 {
+        const ALL = 0x0000_0bfb;
+        const NO_SSLV3 = 0x0200_0000;
+        const NO_TLSV1 = 0x0400_0000;
+        const NO_TLSV1_1 = 0x1000_0000;
+        const NO_TLSV1_2 = 0x0800_0000;
+        const NO_TLSV1_3 = 0x2000_0000;
+        const NO_COMPRESSION = 0x0002_0000;
+        const CIPHER_SERVER_PREFERENCE = 0x0040_0000;
+        const ENABLE_MIDDLEBOX_COMPAT = 0x0010_0000;
+        const NO_TICKET = 0x0000_4000;
+        const LEGACY_SERVER_CONNECT = 0x4;
+        const NO_RENEGOTIATION = 0x4000_0000;
+        const IGNORE_UNEXPECTED_EOF = 0x80;
+        const DEFAULT = Self::ALL.bits()
+            | Self::NO_SSLV3.bits()
+            | Self::NO_COMPRESSION.bits()
+            | Self::CIPHER_SERVER_PREFERENCE.bits()
+            | Self::ENABLE_MIDDLEBOX_COMPAT.bits();
+    }
+}
 
-/// `X509_V_FLAG_*` bits carried by `SSLContext.verify_flags`.
-#[cfg(not(feature = "host_env"))]
-pub const VERIFY_DEFAULT: i32 = 0;
-#[cfg(not(feature = "host_env"))]
-pub const VERIFY_CRL_CHECK_LEAF: i32 = 4;
-#[cfg(not(feature = "host_env"))]
-pub const VERIFY_CRL_CHECK_CHAIN: i32 = 12;
-#[cfg(not(feature = "host_env"))]
-pub const VERIFY_X509_STRICT: i32 = 32;
-#[cfg(not(feature = "host_env"))]
-pub const VERIFY_ALLOW_PROXY_CERTS: i32 = 64;
-#[cfg(not(feature = "host_env"))]
-pub const VERIFY_X509_TRUSTED_FIRST: i32 = 32768;
-#[cfg(not(feature = "host_env"))]
-pub const VERIFY_X509_PARTIAL_CHAIN: i32 = 0x80000;
+const OP_NO_TLSV1_2: u64 = SslOp::NO_TLSV1_2.bits();
+const OP_NO_TLSV1_3: u64 = SslOp::NO_TLSV1_3.bits();
+
+pub const DEFAULT_OPTIONS: u64 = SslOp::DEFAULT.bits();
+
+bitflags::bitflags! {
+    /// `X509_V_FLAG_*` bits carried by `SSLContext.verify_flags`.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct VerifyFlags: i32 {
+        const DEFAULT = 0;
+        const CRL_CHECK_LEAF = 4;
+        const CRL_CHECK_CHAIN = 12;
+        const X509_STRICT = 32;
+        const ALLOW_PROXY_CERTS = 64;
+        const X509_TRUSTED_FIRST = 32768;
+        const X509_PARTIAL_CHAIN = 0x80000;
+    }
+}
+
+pub const VERIFY_DEFAULT: i32 = VerifyFlags::DEFAULT.bits();
+pub const VERIFY_CRL_CHECK_LEAF: i32 = VerifyFlags::CRL_CHECK_LEAF.bits();
+pub const VERIFY_CRL_CHECK_CHAIN: i32 = VerifyFlags::CRL_CHECK_CHAIN.bits();
+pub const VERIFY_X509_STRICT: i32 = VerifyFlags::X509_STRICT.bits();
+pub const VERIFY_ALLOW_PROXY_CERTS: i32 = VerifyFlags::ALLOW_PROXY_CERTS.bits();
+pub const VERIFY_X509_TRUSTED_FIRST: i32 = VerifyFlags::X509_TRUSTED_FIRST.bits();
+pub const VERIFY_X509_PARTIAL_CHAIN: i32 = VerifyFlags::X509_PARTIAL_CHAIN.bits();
 
 /// Revocation scope requested by `verify_flags`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -498,6 +544,30 @@ context_scalar!(
     maximum_version,
     i32
 );
+
+/// Parse `[len][proto]...` the way `ssl.py` hands it to `_set_alpn_protocols`.
+#[inline(never)]
+pub fn parse_length_prefixed_alpn(data: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+    #[cfg(feature = "host_env")]
+    {
+        host_ssl::parse_length_prefixed_alpn(data).map_err(|_| "invalid ALPN protocol list")
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let mut protocols = Vec::new();
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let len = data[offset] as usize;
+            offset += 1;
+            if len == 0 || offset + len > data.len() {
+                return Err("invalid ALPN protocol list");
+            }
+            protocols.push(data[offset..offset + len].to_vec());
+            offset += len;
+        }
+        Ok(protocols)
+    }
+}
 
 /// Store the wire-format ALPN list after the interpreter has validated it.
 ///
@@ -1654,6 +1724,26 @@ pub fn cipher_name(index: usize) -> &'static str {
     CIPHERS[index].name
 }
 #[inline(never)]
+pub fn cipher_id(index: usize) -> i64 {
+    #[cfg(feature = "host_env")]
+    {
+        if let Some(suite) = suite_by_openssl_name(CIPHERS[index].name) {
+            return i64::from(cipher::describe(&suite).id);
+        }
+    }
+    index as i64
+}
+#[inline(never)]
+pub fn cipher_description(index: usize) -> String {
+    #[cfg(feature = "host_env")]
+    {
+        if let Some(suite) = suite_by_openssl_name(CIPHERS[index].name) {
+            return cipher::describe(&suite).description;
+        }
+    }
+    CIPHERS[index].name.to_string()
+}
+#[inline(never)]
 pub fn cipher_protocol(index: usize) -> &'static str {
     CIPHERS[index].protocol
 }
@@ -1698,6 +1788,16 @@ pub fn default_cipher_string() -> String {
     {
         "rustls default cipher suites".to_string()
     }
+}
+
+#[cfg(feature = "host_env")]
+fn suite_by_openssl_name(name: &str) -> Option<rustls::SupportedCipherSuite> {
+    ensure_provider();
+    CryptoExt::get_ext()
+        .all_ciphers_or_default()
+        .iter()
+        .copied()
+        .find(|suite| cipher::describe(suite).name == name)
 }
 
 /// OpenSSL's name for each cipher suite rustls can negotiate.
@@ -2882,8 +2982,6 @@ fn server_config(
 fn enabled_versions(
     context: &Context,
 ) -> NativeResult<&'static [&'static rustls::SupportedProtocolVersion]> {
-    static TLS12_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
-    static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
     let minimum = context.minimum_version;
     let maximum = context.maximum_version;
     let tls12 = (minimum < 0 || minimum <= 0x303)
@@ -2892,11 +2990,24 @@ fn enabled_versions(
     let tls13 = (minimum < 0 || minimum <= 0x304)
         && (maximum < 0 || maximum >= 0x304)
         && context.options & OP_NO_TLSV1_3 == 0;
-    match (tls12, tls13) {
-        (true, true) => Ok(rustls::DEFAULT_VERSIONS),
-        (true, false) => Ok(TLS12_ONLY),
-        (false, true) => Ok(TLS13_ONLY),
-        (false, false) => Err((0, "[SSL] no protocols available".to_string())),
+    if !tls12 && !tls13 {
+        return Err((0, "[SSL] no protocols available".to_string()));
+    }
+    #[cfg(feature = "host_env")]
+    {
+        let options = (context.options & (OP_NO_TLSV1_2 | OP_NO_TLSV1_3)) as i32;
+        Ok(host_ssl::rustls_versions(minimum, maximum, options))
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        static TLS12_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+        static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+        match (tls12, tls13) {
+            (true, true) => Ok(rustls::DEFAULT_VERSIONS),
+            (true, false) => Ok(TLS12_ONLY),
+            (false, true) => Ok(TLS13_ONLY),
+            (false, false) => unreachable!("empty protocol set rejected above"),
+        }
     }
 }
 
@@ -3023,7 +3134,7 @@ impl TlsRecordObserver {
 #[derive(Debug, Default)]
 struct ContextKeyLog {
     #[cfg(feature = "host_env")]
-    file: rustpython_host_env::fs::AppendLog,
+    file: keylog::KeyLog,
     #[cfg(not(feature = "host_env"))]
     file: Mutex<Option<std::fs::File>>,
 }
@@ -3031,10 +3142,7 @@ struct ContextKeyLog {
 impl ContextKeyLog {
     #[cfg(feature = "host_env")]
     fn set_path(&self, path: Option<&std::path::Path>) -> std::io::Result<()> {
-        self.file.set_path(
-            path,
-            b"# TLS secrets log file, generated by OpenSSL / Python\n",
-        )
+        self.file.0.set_path(path, keylog::HEADER)
     }
 
     #[cfg(not(feature = "host_env"))]
@@ -3063,7 +3171,7 @@ impl ContextKeyLog {
 
     #[cfg(feature = "host_env")]
     fn enabled(&self) -> bool {
-        self.file.enabled()
+        self.file.0.enabled()
     }
 
     #[cfg(not(feature = "host_env"))]
@@ -3072,28 +3180,27 @@ impl ContextKeyLog {
     }
 
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut line =
-            Vec::with_capacity(label.len() + 2 * (client_random.len() + secret.len()) + 3);
-        line.extend_from_slice(label.as_bytes());
-        line.push(b' ');
-        for byte in client_random {
-            line.push(HEX[(byte >> 4) as usize]);
-            line.push(HEX[(byte & 0x0f) as usize]);
-        }
-        line.push(b' ');
-        for byte in secret {
-            line.push(HEX[(byte >> 4) as usize]);
-            line.push(HEX[(byte & 0x0f) as usize]);
-        }
-        line.push(b'\n');
-
         // Like PyPy's OpenSSL callback, the asynchronous logger cannot
         // propagate write errors into the handshake; setter errors are eager.
         #[cfg(feature = "host_env")]
-        let _ = self.file.write(&line);
+        rustls::KeyLog::log(&self.file, label, client_random, secret);
         #[cfg(not(feature = "host_env"))]
         {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut line =
+                Vec::with_capacity(label.len() + 2 * (client_random.len() + secret.len()) + 3);
+            line.extend_from_slice(label.as_bytes());
+            line.push(b' ');
+            for byte in client_random {
+                line.push(HEX[(byte >> 4) as usize]);
+                line.push(HEX[(byte & 0x0f) as usize]);
+            }
+            line.push(b' ');
+            for byte in secret {
+                line.push(HEX[(byte >> 4) as usize]);
+                line.push(HEX[(byte & 0x0f) as usize]);
+            }
+            line.push(b'\n');
             let mut slot = self.file.lock();
             if let Some(file) = slot.as_mut() {
                 // Rustls' callback has no error return, just like the OpenSSL
@@ -3227,25 +3334,55 @@ fn rustls_error(error: impl std::fmt::Display) -> (i32, String) {
 /// exception text cannot drift apart.
 #[allow(deprecated)] // rustls can still return the compatibility variant.
 fn certificate_error_details(error: &rustls::CertificateError) -> (i32, &'static str) {
+    #[cfg(feature = "host_env")]
+    use host_ssl::x509::{
+        X509_V_ERR_CERT_HAS_EXPIRED, X509_V_ERR_CERT_NOT_YET_VALID, X509_V_ERR_CERT_REVOKED,
+        X509_V_ERR_HOSTNAME_MISMATCH, X509_V_ERR_INVALID_PURPOSE, X509_V_ERR_UNABLE_TO_GET_CRL,
+        X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY, X509_V_ERR_UNSPECIFIED,
+    };
     use rustls::CertificateError;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_UNSPECIFIED: i32 = 1;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_UNABLE_TO_GET_CRL: i32 = 3;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_CERT_NOT_YET_VALID: i32 = 9;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_CERT_HAS_EXPIRED: i32 = 10;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY: i32 = 20;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_CERT_REVOKED: i32 = 23;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_INVALID_PURPOSE: i32 = 26;
+    #[cfg(not(feature = "host_env"))]
+    const X509_V_ERR_HOSTNAME_MISMATCH: i32 = 62;
     let code = match error {
-        CertificateError::Expired | CertificateError::ExpiredContext { .. } => 10,
-        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => 9,
-        CertificateError::Revoked => 23,
-        CertificateError::UnknownIssuer => 20,
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+            X509_V_ERR_CERT_HAS_EXPIRED
+        }
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+            X509_V_ERR_CERT_NOT_YET_VALID
+        }
+        CertificateError::Revoked => X509_V_ERR_CERT_REVOKED,
+        CertificateError::UnknownIssuer => X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY,
         CertificateError::BadSignature => 7,
-        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => 62,
-        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => 26,
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+            X509_V_ERR_HOSTNAME_MISMATCH
+        }
+        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
+            X509_V_ERR_INVALID_PURPOSE
+        }
         CertificateError::BadEncoding => 5,
         CertificateError::UnhandledCriticalExtension => 34,
-        CertificateError::UnknownRevocationStatus => 3,
+        CertificateError::UnknownRevocationStatus => X509_V_ERR_UNABLE_TO_GET_CRL,
         CertificateError::ExpiredRevocationList
         | CertificateError::ExpiredRevocationListContext { .. } => 12,
         CertificateError::UnsupportedSignatureAlgorithm
         | CertificateError::UnsupportedSignatureAlgorithmContext { .. }
         | CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => 7,
         CertificateError::InvalidOcspResponse => 50,
-        _ => 1,
+        _ => X509_V_ERR_UNSPECIFIED,
     };
     (code, certificate_verify_message(code))
 }

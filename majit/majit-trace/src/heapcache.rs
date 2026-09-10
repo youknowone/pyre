@@ -81,18 +81,32 @@ pub trait SameConstantOracle {
 // In majit these are tracked via separate HashSets (is_unescaped,
 // seen_allocation, etc.), but we define the constants for reference.
 
+bitflags::bitflags! {
+    /// heapcache.py `HF_*` flags stored per-box on RefFrontendOp.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct HeapFlags: u8 {
+        const LIKELY_VIRTUAL = 0x01;
+        const KNOWN_CLASS = 0x02;
+        const KNOWN_NULLITY = 0x04;
+        const SEEN_ALLOCATION = 0x08;
+        const IS_UNESCAPED = 0x10;
+        const NONSTD_VABLE = 0x20;
+    }
+}
+
 /// heapcache.py: HF_LIKELY_VIRTUAL
-pub const HF_LIKELY_VIRTUAL: u8 = 0x01;
+pub const HF_LIKELY_VIRTUAL: u8 = HeapFlags::LIKELY_VIRTUAL.bits();
 /// heapcache.py: HF_KNOWN_CLASS
-pub const HF_KNOWN_CLASS: u8 = 0x02;
+pub const HF_KNOWN_CLASS: u8 = HeapFlags::KNOWN_CLASS.bits();
 /// heapcache.py: HF_KNOWN_NULLITY
-pub const HF_KNOWN_NULLITY: u8 = 0x04;
+pub const HF_KNOWN_NULLITY: u8 = HeapFlags::KNOWN_NULLITY.bits();
 /// heapcache.py: HF_SEEN_ALLOCATION
-pub const HF_SEEN_ALLOCATION: u8 = 0x08;
+pub const HF_SEEN_ALLOCATION: u8 = HeapFlags::SEEN_ALLOCATION.bits();
 /// heapcache.py: HF_IS_UNESCAPED
-pub const HF_IS_UNESCAPED: u8 = 0x10;
+pub const HF_IS_UNESCAPED: u8 = HeapFlags::IS_UNESCAPED.bits();
 /// heapcache.py: HF_NONSTD_VABLE
-pub const HF_NONSTD_VABLE: u8 = 0x20;
+pub const HF_NONSTD_VABLE: u8 = HeapFlags::NONSTD_VABLE.bits();
 
 /// heapcache.py helper aliases.
 const HF_VERSION_INC: u32 = 0x40;

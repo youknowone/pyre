@@ -66,6 +66,16 @@ pub const CO_VARARGS: u32 = 0x0004;
 /// RPython `CO_VARKEYWORDS` (`sourcetools.py`).
 pub const CO_VARKEYWORDS: u32 = 0x0008;
 
+bitflags::bitflags! {
+    /// RPython `sourcetools.py` `CO_*` compile flags.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct CoFlags: u32 {
+        const VARARGS = CO_VARARGS;
+        const VARKEYWORDS = CO_VARKEYWORDS;
+    }
+}
+
 /// RPython `has_varargs(func)` for callers that already have
 /// `co_flags` (`sourcetools.py:250-252`).
 pub fn has_varargs_flags(co_flags: u32) -> bool {

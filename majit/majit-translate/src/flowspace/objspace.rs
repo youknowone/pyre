@@ -29,7 +29,7 @@ use super::pygraph::PyGraph;
 /// RPython `CO_NEWLOCALS` compile flag (0x0002). Used to verify that a
 /// code object allocates its own `f_locals` dict rather than sharing
 /// the caller's — RPython functions must always set this.
-pub const CO_NEWLOCALS: u32 = 0x0002;
+pub const CO_NEWLOCALS: u32 = super::bytecode::CO_NEWLOCALS;
 
 /// RPython `objspace.py` — `_assert_rpythonic(func)`.
 ///
