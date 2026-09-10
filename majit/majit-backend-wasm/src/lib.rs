@@ -3328,6 +3328,15 @@ impl WasmBackend {
                         unsafe { core::ptr::write(cell, bridge_slot) };
                     }
                 }
+                let (num_ref_homes, used_label_homes) = metas
+                    .get(&region.trace_id)
+                    .map(|m| (m.num_ref_homes, m.used_label_homes))
+                    .unwrap_or_else(|| {
+                        (
+                            codegen::count_ref_homes(&region.inputargs, &region.ops),
+                            codegen::label_ref_capture_slots(&region.inputargs, &region.ops),
+                        )
+                    });
                 metas.insert(
                     region.trace_id,
                     ChainedTraceMeta {
@@ -3344,6 +3353,8 @@ impl WasmBackend {
                             })
                             .collect(),
                         bridge_param_dispatch: inputs.bridge_param_dispatch,
+                        num_ref_homes,
+                        used_label_homes,
                     },
                 );
                 offset += count;
@@ -4588,7 +4599,14 @@ impl majit_backend::Backend for WasmBackend {
 
         // Scalars read from the source loop up front, so the immutable borrow of
         // `original_token` is released before the `&mut self` codegen calls.
-        let (source_guard, source_func_handle, source_has_preamble, source_frame, is_direct) = {
+        let (
+            source_guard,
+            source_func_handle,
+            source_has_preamble,
+            source_frame,
+            is_direct,
+            source_used_homes,
+        ) = {
             let source_loop = original_token
                 .compiled
                 .get()
@@ -4606,6 +4624,22 @@ impl majit_backend::Backend for WasmBackend {
             // per-fail-arg advance flags. `None` = foreign trace (declined
             // below, diag 3).
             let is_direct = source_trace_id == source_loop.trace_id;
+            let source_used_homes = if is_direct {
+                (
+                    source_loop.num_ref_homes.get(),
+                    source_loop.used_label_homes,
+                )
+            } else {
+                source_loop
+                    .chained_trace_meta
+                    .borrow()
+                    .get(&source_trace_id)
+                    .map(|m| (m.num_ref_homes, m.used_label_homes))
+                    .unwrap_or((
+                        source_loop.num_ref_homes.get(),
+                        source_loop.used_label_homes,
+                    ))
+            };
             let guard = if is_direct {
                 Some((
                     source_loop.bridge_cells_base.get(),
@@ -4647,6 +4681,7 @@ impl majit_backend::Backend for WasmBackend {
                 source_loop.has_preamble,
                 source_loop.frame,
                 is_direct,
+                source_used_homes,
             )
         };
 
@@ -5169,11 +5204,9 @@ impl majit_backend::Backend for WasmBackend {
         // token's frozen geometry. The earlier frame-fit decline guarantees a
         // movable callee cannot execute a trampoline-lowered op.
         // A keyed tail-call back into the source skips that module's
-        // fresh-entry publish, so this map must cover the source loop's
-        // already-initialized homes.
-        let source_used_homes = compiled_wasm_loop(original_token)
-            .map(|loop_| (loop_.num_ref_homes.get(), loop_.used_label_homes))
-            .unwrap_or((0, 0));
+        // fresh-entry publish, so this map must cover the source trace's
+        // already-initialized homes (the root loop, or the parent
+        // chained bridge when this is a nested sub-bridge).
         let ca_params = if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
             codegen::CaParams {
                 emit_ca: true,
@@ -5406,6 +5439,9 @@ impl majit_backend::Backend for WasmBackend {
                         })
                         .collect(),
                     bridge_param_dispatch,
+                    num_ref_homes: bridge_ref_homes.max(source_used_homes.0),
+                    used_label_homes: codegen::label_ref_capture_slots(inputargs, ops)
+                        .max(source_used_homes.1),
                 },
             );
             // The bridge module lives as long as this source loop, so hand its

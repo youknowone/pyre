@@ -1061,6 +1061,11 @@ pub struct ChainedTraceMeta {
     pub guard_fail_arg_counts: Vec<usize>,
     /// Whether this trace's guard epilogue has typed parameter dispatch arms.
     pub bridge_param_dispatch: bool,
+    /// Ordinary Ref homes this out-of-line bridge published. A nested
+    /// sub-bridge must floor its map to this, not the root loop's count.
+    pub num_ref_homes: usize,
+    /// LABEL-capture homes this bridge published.
+    pub used_label_homes: usize,
 }
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
