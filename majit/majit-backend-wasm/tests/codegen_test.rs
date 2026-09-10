@@ -132,8 +132,9 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
 }
 
 /// CALL_ASSEMBLER must not refill a frame. The inline bump leaves
-/// `jf_gcmap` unset; the callee prologue nulls homes and then publishes
-/// the map. The only expected `memory.fill` is the entry home clear.
+/// `jf_gcmap` unset; the callee prologue nulls the frozen home region
+/// and then publishes the map. The only expected `memory.fill` is that
+/// entry home clear.
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
     let lines: Vec<_> = stderr.lines().map(str::trim).collect();
@@ -2102,7 +2103,68 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     );
     assert!(
         !saw_item_fill,
-        "inline CA bump must not memory.fill the item area; the callee publishes jf_gcmap after nulling homes"
+        "inline CA bump must not memory.fill the item area; the callee publishes jf_gcmap after nulling the frozen home region"
+    );
+}
+
+/// `build_home_gcmap` marks every frozen home, not just this trace's live
+/// Ref homes. Recycled nursery bytes in the unused padding must be nulled
+/// before that map is published, or a later minor walk treats them as
+/// young objects (`invalid type_id` from an oldgen type-3 JitFrame).
+#[test]
+fn entry_prologue_nulls_the_frozen_home_region() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))])];
+    let frame = codegen::FrameGeometry::compact(64, 128, 2);
+    let home_fill_bytes = (frame.home_slots as i32) * 8;
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca: codegen::CaParams {
+            entry_gcmap_ptr: 0x1000,
+            ..codegen::CaParams::default()
+        },
+    };
+    let bytes = codegen::build_wasm_module(&inputs)
+        .expect("frozen-home entry prologue should compile")
+        .0;
+    validate_wasm(&bytes);
+    let mut last_i32 = None;
+    let mut fill_lengths = Vec::new();
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I32Const { value } => last_i32 = Some(*value),
+        wasmparser::Operator::MemoryFill { .. } => {
+            fill_lengths.push(last_i32.expect("memory.fill without a preceding i32.const"));
+        }
+        _ => {}
+    });
+    assert!(
+        fill_lengths.contains(&home_fill_bytes),
+        "key-0 must memory.fill the whole frozen home region ({home_fill_bytes} bytes); fills were {fill_lengths:?}"
+    );
+    assert!(
+        !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),
+        "must not refill ca_frame_bytes; fills were {fill_lengths:?}"
     );
 }
 

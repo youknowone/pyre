@@ -4089,7 +4089,8 @@ impl majit_backend::Backend for WasmBackend {
             ),
         };
         // Leaked before codegen so the key-0 prologue can publish it after
-        // nulling homes, instead of the CA bump filling the whole item area.
+        // nulling the frozen home region, instead of the CA bump filling
+        // the whole item area.
         let home_gcmap_ptr = Box::leak(build_home_gcmap(frame)).as_ptr() as *const usize as usize;
         // `x86/assembler.py::assemble_loop` installs the generated frame
         // depth on the token's `CompiledLoopToken.frame_info`.  CALL_ASSEMBLER

@@ -2652,8 +2652,9 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.i32_shr_u();
     sink.i64_extend_i32_u();
     emit_word_store(sink, JF_FRAME_OFS as u64);
-    // Leave `jf_gcmap` null. The callee key-0 prologue nulls homes and
-    // then publishes the map — the same moment PyPy's assembler writes
+    // Leave `jf_gcmap` null. The callee key-0 prologue nulls the whole
+    // frozen home region (live homes plus chain padding) and then
+    // publishes the map — the same moment PyPy's assembler writes
     // `_finish_gcmap` / the live gcmap, once those slots are valid or
     // null. Filling `ca_frame_bytes` here on every recursive bump is
     // what made `recursion_past_unroll_bound_from_loop` 4.9x dynasm.
@@ -5577,11 +5578,13 @@ fn build_function(
         emit_trace_entry_census(&mut sink, census, bridge_slot_local, None);
     }
 
-    // Fresh entry owns key 0 and must clear both the trace's ordinary homes
-    // and its high LABEL-capture homes.  A resume dispatch branches past this
-    // code, preserving captures written when the source loop first crossed
-    // the LABEL.  Chained bridges have no capture plan and clear only their
-    // own low ordinary-home prefix.
+    // Fresh entry owns key 0. `build_home_gcmap` marks every frozen home,
+    // including the chain-padding slots a later bridge may use and the high
+    // LABEL-capture homes. The nursery bump leaves `jf_gcmap` null and does
+    // not fill items, so unused padding still holds recycled nursery bytes;
+    // those must be null before the map is published. A resume dispatch
+    // branches past this code, preserving captures written when the source
+    // loop first crossed the LABEL.
     // A home the input loop fills below needs no null first: its store follows
     // immediately and nothing between the two allocates, so no collection can
     // read the slot while it is stale. Homes no input fills keep their clear
@@ -5597,16 +5600,9 @@ fn build_function(
             input_filled_home[h as usize] = true;
         }
     }
-    emit_null_home_slots(&mut sink, frame, 0..ref_homes.len() as u64, |h| {
-        !input_filled_home[h as usize]
+    emit_null_home_slots(&mut sink, frame, 0..frame.home_slots as u64, |h| {
+        (h as usize) >= input_filled_home.len() || !input_filled_home[h as usize]
     });
-    let label_base = frame.ordinary_home_slots() as u64;
-    emit_null_home_slots(
-        &mut sink,
-        frame,
-        label_base..label_base + label_resume.ref_slots as u64,
-        |_| true,
-    );
 
     // Load inputs from frame into locals, and store Ref inputs to their homes.
     // The input value lives at the frame slot its producer wrote it to: the
@@ -5644,8 +5640,8 @@ fn build_function(
         }
     }
     if ca.entry_gcmap_ptr != 0 {
-        // Homes are now null or the entry Refs. Publish the map the
-        // allocator left unset so a later collection can walk them.
+        // Frozen homes are now null or the entry Refs. Publish the map
+        // the allocator left unset so a later collection can walk them.
         sink.local_get(0);
         sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
         sink.i32_sub();
