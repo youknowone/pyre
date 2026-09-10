@@ -12558,8 +12558,18 @@ pub(crate) fn promote_published_null_return<Sym: WalkSym>(
     pc: usize,
 ) -> DispatchOutcome {
     let _ = pc;
-    if !matches!(outcome, DispatchOutcome::SubReturn { .. }) {
+    let DispatchOutcome::SubReturn { result: Some(op) } = outcome else {
         return outcome;
+    };
+    // A void return (`None`) or a real box must not be treated as a raise
+    // just because the caller still holds a stale last_exc.  Only the
+    // published-NULL arm of `jit_*_from_tag` is that shape.
+    let published_null = matches!(
+        ctx.trace_ctx.box_value(op),
+        Some(majit_ir::Value::Ref(r)) if r.0 == 0
+    );
+    if !published_null {
+        return DispatchOutcome::SubReturn { result: Some(op) };
     }
     match ctx.last_exc_value() {
         Some(_) => {
@@ -12578,7 +12588,7 @@ pub(crate) fn promote_published_null_return<Sym: WalkSym>(
                 exc_concrete: ctx.last_exc_value_concrete(),
             }
         }
-        None => outcome,
+        None => DispatchOutcome::SubReturn { result: Some(op) },
     }
 }
 
@@ -13905,6 +13915,8 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 
     if dst_bank == 'r'
         && args.len() == 2
+        && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+            .is_some_and(|jc| jc.code.as_ptr() == sub_body.code.as_ptr())
         && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(sub_index, &[])
         && matches!(
             pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
@@ -14113,6 +14125,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     if dst_bank == 'r'
         && int_args.len() == 1
         && ref_args.len() == 2
+        && super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body)
         && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
         && matches!(
             pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
@@ -14164,7 +14177,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // `binary_value_from_tag`, so the residual_call BINARY_OP descent
     // gate is never consulted.  Run the same orthodox descent here
     // before residualizing the whole helper via fnaddr.
-    let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
     let is_binary_from_tag =
         super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body);
     if is_binary_from_tag
@@ -14173,6 +14185,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         && ref_args.len() == 2
         && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
     {
+        let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
         if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
             super::specialize::try_walker_orthodox_binary_op(
                 ctx,
