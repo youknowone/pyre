@@ -5351,24 +5351,27 @@ fn emit_alias_same_as_for_imports(
 /// that the LABEL carries. First fall-through only has the preamble source;
 /// the flat OpRef model needs an explicit SameAs so that local is written
 /// before the join. Resume and JUMP write it themselves.
+///
+/// `stream_defs` is the values the assembled preamble actually writes
+/// (op results already in `result`, plus start-label args). Phase-2
+/// inputarg slots are not in that stream; SameAs from one of those
+/// makes dynasm/cranelift `loc()` an `InputArgRef` the compiled loop
+/// never received.
 fn push_fallthrough_same_as(
     fallthrough_aliases: &mut Vec<Op>,
-    preamble_defs: &indexmap::IndexSet<OpRef>,
+    stream_defs: &indexmap::IndexSet<OpRef>,
     arg: OpRef,
     constants: &majit_ir::ConstMap<majit_ir::Value>,
     ctx: &mut crate::optimizeopt::OptContext,
 ) {
-    if !is_trace_runtime_ref(arg, constants) || preamble_defs.contains(&arg) {
+    if !is_trace_runtime_ref(arg, constants) || stream_defs.contains(&arg) {
         return;
     }
-    let Some(source) = preamble_defs.iter().copied().find(|&source| {
-        source != arg
-            && !matches!(
-                source,
-                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
-            )
-            && ctx.get_replacement_opref(source) == arg
-    }) else {
+    let Some(source) = stream_defs
+        .iter()
+        .copied()
+        .find(|&source| source != arg && ctx.get_replacement_opref(source) == arg)
+    else {
         return;
     };
     let tp = ctx
@@ -5619,6 +5622,16 @@ fn assemble_peeled_trace_with_jump_args(
     // once in the label arglist.
     let mut label_set: indexmap::IndexSet<OpRef> = full_label_args.iter().copied().collect();
     let mut fallthrough_aliases = Vec::new();
+    let mut stream_defs: indexmap::IndexSet<OpRef> = start_label_args
+        .iter()
+        .copied()
+        .filter(|a| is_trace_runtime_ref(*a, constants))
+        .collect();
+    for op in &result {
+        if !op.pos.get().is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
+            stream_defs.insert(op.pos.get());
+        }
+    }
     {
         let mut seen_body_defs = indexmap::IndexSet::new();
         for op in p2_ops {
@@ -5661,7 +5674,7 @@ fn assemble_peeled_trace_with_jump_args(
                 }
                 push_fallthrough_same_as(
                     &mut fallthrough_aliases,
-                    &preamble_defs,
+                    &stream_defs,
                     arg,
                     constants,
                     ctx,
@@ -5679,7 +5692,6 @@ fn assemble_peeled_trace_with_jump_args(
     // SameAs for every LABEL arg that is a forwarded preamble box, not
     // only extras discovered from a body use-before-def. Base label_args
     // sit in `label_set` from the start, so the scan above never saw them.
-    // Skip InputArg sources: those slots are not compiled-loop inputs.
     for &arg in &full_label_args {
         if arg.is_none() {
             continue;
@@ -5687,13 +5699,7 @@ fn assemble_peeled_trace_with_jump_args(
         if fallthrough_aliases.iter().any(|op| op.pos.get() == arg) {
             continue;
         }
-        push_fallthrough_same_as(
-            &mut fallthrough_aliases,
-            &preamble_defs,
-            arg,
-            constants,
-            ctx,
-        );
+        push_fallthrough_same_as(&mut fallthrough_aliases, &stream_defs, arg, constants, ctx);
         if fallthrough_aliases.iter().any(|op| op.pos.get() == arg) {
             continue;
         }
@@ -8677,6 +8683,68 @@ mod tests {
         assert_eq!(combined[2].arg(0).to_opref(), OpRef::int_op(50));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
         assert_eq!(combined[3].arg(0).to_opref(), OpRef::int_op(50));
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_skips_same_as_from_a_phase2_inputarg() {
+        // A forwarded Phase-2 inputarg slot is not in the assembled
+        // preamble. SameAs from it would hand dynasm an InputArgRef
+        // the compiled loop never received.
+        let p1_ops = vec![{
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
+                ],
+            );
+            op.pos.set(OpRef::int_op(3));
+            op
+        }];
+        let p2_ops = vec![Op::new(
+            OpCode::Jump,
+            &[rooted_resop_operand(Type::Int, 50)],
+        )];
+        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
+        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
+        let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
+        let src = ctx.materialize_operand_at(OpRef::input_arg_int(100));
+        let dst = ctx.materialize_operand_at(OpRef::int_op(50));
+        ctx.make_equal_to(&src, &dst);
+
+        let combined = assemble_peeled_trace_with_jump_args(
+            &p1_ops_rc,
+            &p2_ops_rc,
+            &[OpRef::int_op(50)],
+            &[OpRef::int_op(0)],
+            &[],
+            &[],
+            1,
+            100,
+            true,
+            &[],
+            &majit_ir::ConstMap::default(),
+            None,
+            None,
+            &[],
+            &mut Vec::new(),
+            &mut ctx,
+        );
+
+        assert!(
+            combined.iter().all(|op| !matches!(
+                op.opcode,
+                OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
+            )),
+            "SameAs must not be sourced from a Phase-2 inputarg absent from the preamble stream"
+        );
+        assert_eq!(combined[1].opcode, OpCode::Label);
     }
 
     #[test]
