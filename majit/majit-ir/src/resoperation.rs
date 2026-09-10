@@ -1182,19 +1182,19 @@ pub trait BoxEnv {
     /// `cached_boxes`, `cached_virtuals`) key by box identity — RPython's
     /// dict-by-`is` — so two reaches of one box must compare equal. An
     /// `Operand`'s `==` / `Hash` route through its producer Rc, so two reaches
-    /// of one logical box are `ptr_eq`. Const is classified by `is_const` /
-    /// `getconst` before any map insert and never reaches here.
+    /// of one logical box are `ptr_eq`. A non-Const may resolve to a Const;
+    /// callers classify the returned box before any identity-map insertion.
     fn get_box_replacement_operand(&self, opref: OpRef) -> Operand;
-    /// resume.py:204 — isinstance(box, Const)
-    fn is_const(&self, opref: OpRef) -> bool;
+    /// resume.py `_number_boxes`: isinstance(box, Const) on the resolved box.
+    fn is_const(&self, box_: &Operand) -> bool;
     /// Constant value + type. Only valid when is_const returns true.
-    fn get_const(&self, opref: OpRef) -> (i64, Type);
+    fn get_const(&self, box_: &Operand) -> (i64, Type);
     /// resume.py:211,214 — box.type
     fn get_type(&self, opref: OpRef) -> Type;
     /// resume.py:212-213 — getptrinfo(box) is not None and info.is_virtual()
-    fn is_virtual_ref(&self, opref: OpRef) -> bool;
+    fn is_virtual_ref(&self, box_: &Operand) -> bool;
     /// resume.py:215-216 — getrawptrinfo(box) is not None and info.is_virtual()
-    fn is_virtual_raw(&self, opref: OpRef) -> bool;
+    fn is_virtual_raw(&self, box_: &Operand) -> bool;
     /// resume.py:419-426 — getptrinfo(box).visitor_walk_recursive(box, self)
     ///
     /// Returns virtual field info for the given OpRef if it is a virtual

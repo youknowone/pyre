@@ -58,6 +58,20 @@ pub fn majit_log_enabled() -> bool {
     *ENABLED
 }
 
+/// Log backend emission events without enabling per-execution diagnostics.
+/// The version marker lets census consumers reject an older binary rather
+/// than interpreting an unsupported option as zero emitted operations.
+pub fn majit_ops_log_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let enabled = std::env::var_os("MAJIT_LOG_OPS").is_some();
+        if enabled {
+            eprintln!("[dynasm] op-log-version=1");
+        }
+        enabled
+    });
+    *ENABLED || majit_log_enabled()
+}
+
 /// Whether `MAJIT_DUMP` is set, cached at first access.
 pub fn majit_dump_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =

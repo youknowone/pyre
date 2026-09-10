@@ -1951,7 +1951,11 @@ impl Optimizer {
     /// Mirrors force_box_inline (mod.rs) contract.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // optimizer.py: op = get_box_replacement(op)
-        let resolved = ctx.get_replacement_opref(opref);
+        if opref.is_constant() {
+            return opref;
+        }
+        let resolved_op = ctx.get_box_replacement_operand_opt(opref);
+        let resolved = resolved_op.as_ref().map_or(opref, |op| op.to_opref());
         // optimizer.py:351-359: potential_extra_ops.pop(op) → sb.add_preamble_op.
         // The pool is keyed by the pure op's result Box. When that result
         // folded to an inline Const, the Const can never be a pool key (the
@@ -1991,15 +1995,14 @@ impl Optimizer {
         // A forced operand whose IntBound is already constant materializes as a
         // ConstInt before the virtual-force branch. Read the bound without
         // installing one (peek), so a plain int box keeps flowing unchanged.
-        if let Some(rb) = ctx.get_box_replacement_operand_opt(resolved)
+        if let Some(rb) = resolved_op.as_ref()
             && rb.const_value().is_none()
             && rb.type_() == majit_ir::Type::Int
-            && let Some(bound) = ctx.peek_intbound_box(&rb)
+            && let Some(bound) = ctx.peek_intbound_box(rb)
             && bound.is_constant()
         {
             return ctx.make_constant_int(bound.get_constant_int());
         }
-        let resolved_op = ctx.get_box_replacement_operand_opt(opref);
         if resolved_op.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
             // Virtualizable represents an existing heap object with tracked
             // fields — not a deferred allocation. force_box must not take
@@ -5129,7 +5132,7 @@ impl Optimizer {
         // ops and get_producing_op consumers can read info off op.arg(i) —
         // the same canonicalization the pass-entry resolver applies.
         for i in 0..op.num_args() {
-            let original_arg = op.arg(i).clone();
+            let original_arg = op.arg(i);
             let forced = self.force_box(original_arg.to_opref(), ctx);
             self.flush_queued_producer(forced, ctx)?;
             let resolved = if original_arg.is_constant() && original_arg.to_opref() == forced {
@@ -7718,7 +7721,11 @@ mod tests {
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
         ctx.snapshot_boxes = snapshots;
-        let _ = opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
+        let _ = opt.emit_operation(
+            std::borrow::Cow::Owned(seeded_ops.pop().unwrap()),
+            &mut ctx,
+            false,
+        );
 
         assert!(!ctx.in_final_emission);
 
@@ -7806,7 +7813,11 @@ mod tests {
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
         ctx.snapshot_boxes = snapshots;
-        let _ = opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
+        let _ = opt.emit_operation(
+            std::borrow::Cow::Owned(seeded_ops.pop().unwrap()),
+            &mut ctx,
+            false,
+        );
 
         let sp = ctx
             .build_imported_short_preamble()

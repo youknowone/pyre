@@ -485,12 +485,9 @@ pub enum CompileOutcome {
 
 struct SimpleCompileViews<'a> {
     data: compile::SimpleCompileData<'a>,
-    trace_snapshots: Vec<crate::recorder::Snapshot>,
-    /// Deep-cloned `Op` copies of the trace's `Vec<OpRc>` storage.
-    /// The optimizer pipeline still threads `&[Op]` internally; the
-    /// `TreeLoop.ops`-side `Rc<Op>` identity is preserved by re-wrapping
-    /// at the post-optimize boundary (see `TreeLoop::new`).
-    trace_ops: Vec<Op>,
+    /// compile.py `SimpleCompileData`: inspect the trace before optimization;
+    /// logging and operation counts do not need a second set of operations.
+    trace_ops: &'a [majit_ir::OpRc],
 }
 
 fn make_simple_compile_views<'a>(
@@ -499,17 +496,33 @@ fn make_simple_compile_views<'a>(
     enable_opts: &'a [String],
 ) -> SimpleCompileViews<'a> {
     let data = compile::SimpleCompileData::new(trace, None, call_pure_results, enable_opts);
-    let trace_snapshots = data.base.snapshots().to_vec();
-    let trace_ops: Vec<Op> = data
-        .base
-        .operations()
-        .iter()
-        .map(|rc| (**rc).clone())
-        .collect();
-    SimpleCompileViews {
-        data,
-        trace_snapshots,
-        trace_ops,
+    let trace_ops = data.base.operations();
+    SimpleCompileViews { data, trace_ops }
+}
+
+#[cfg(test)]
+mod simple_compile_view_tests {
+    use super::*;
+
+    #[test]
+    fn compile_views_borrow_the_recorded_operations_and_snapshots() {
+        let trace = TreeLoop::with_snapshots(
+            Vec::new(),
+            vec![Op::new(OpCode::Finish, &[])],
+            vec![crate::recorder::Snapshot {
+                frames: Vec::new(),
+                vable_boxes: Vec::new(),
+                vref_boxes: Vec::new(),
+            }],
+        );
+        let pure_results = crate::optimizeopt::util::args_dict();
+        let views = make_simple_compile_views(&trace, &pure_results, &[]);
+        assert!(std::ptr::eq(views.trace_ops.as_ptr(), trace.ops.as_ptr()));
+        assert!(std::ptr::eq(
+            views.data.base.snapshots().as_ptr(),
+            trace.snapshots.as_ptr(),
+        ));
+        assert_eq!(std::rc::Rc::strong_count(&trace.ops[0]), 1);
     }
 }
 
@@ -953,12 +966,18 @@ fn snapshot_map_from_byte_recorder(
             }
         }
     };
-    recorder.for_each_captured_snapshot_arrays(|vable_t, vref_t, frames_t, py_pcs| {
-        let n_boxes: usize = frames_t.iter().map(|(_, _, tagged)| tagged.len()).sum();
+    recorder.for_each_captured_snapshot_arrays(|it, py_pcs| {
+        let n_boxes: usize = it
+            .framestack
+            .iter()
+            .map(|&snap_idx| it.iter_array(snap_idx).len())
+            .sum();
         let mut boxes = crate::optimizeopt::SnapshotBoxList::with_capacity(n_boxes);
-        let mut frame_sizes = Vec::with_capacity(frames_t.len());
-        let mut frame_pcs = Vec::with_capacity(frames_t.len());
-        for (fi, (jc, pc, tagged)) in frames_t.into_iter().enumerate() {
+        let mut frame_sizes = Vec::with_capacity(it.framestack.len());
+        let mut frame_pcs = Vec::with_capacity(it.framestack.len());
+        for (fi, &snap_idx) in it.framestack.iter().enumerate() {
+            let (jc, pc) = it.unpack_jitcode_pc(snap_idx);
+            let tagged = it.iter_array(snap_idx);
             frame_sizes.push(tagged.len());
             frame_pcs.push((
                 crate::recorder::Trace::decode_jitcode_index(jc) as i32,
@@ -971,12 +990,12 @@ fn snapshot_map_from_byte_recorder(
                     .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique))),
             );
         }
-        let vable_boxes: crate::optimizeopt::SnapshotBoxList = vable_t
-            .into_iter()
+        let vable_boxes: crate::optimizeopt::SnapshotBoxList = it
+            .iter_vable_array()
             .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
             .collect();
-        let vref_boxes: crate::optimizeopt::SnapshotBoxList = vref_t
-            .into_iter()
+        let vref_boxes: crate::optimizeopt::SnapshotBoxList = it
+            .iter_vref_array()
             .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
             .collect();
         box_map.push(Some(boxes));
@@ -986,6 +1005,97 @@ fn snapshot_map_from_byte_recorder(
         frame_pcs_map.push(Some(frame_pcs));
     });
     (box_map, size_map, vable_map, vref_map, frame_pcs_map)
+}
+
+#[cfg(test)]
+mod byte_snapshot_map_tests {
+    use super::*;
+    use crate::recorder::{Snapshot, SnapshotFrame, SnapshotTagged, Trace};
+
+    #[test]
+    fn byte_snapshot_maps_match_materialized_maps() {
+        let mut rec = Trace::new();
+        let input = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(Arc::new(crate::MetaInterpStaticData::new()));
+        let result = rec.record_op(OpCode::IntAdd, &[input, OpRef::const_int(7)]);
+        for frames in [
+            vec![],
+            vec![
+                SnapshotFrame {
+                    jitcode_index: 3,
+                    pc: 11,
+                    py_pc: 22,
+                    boxes: vec![SnapshotTagged::Box(input, Type::Int)],
+                },
+                SnapshotFrame {
+                    jitcode_index: 4,
+                    pc: 33,
+                    py_pc: 44,
+                    boxes: vec![
+                        SnapshotTagged::Box(result, Type::Int),
+                        SnapshotTagged::Const(7, Type::Int),
+                    ],
+                },
+            ],
+        ] {
+            rec.record_guard(OpCode::GuardTrue, &[result], None);
+            rec.encode_captured_snapshot(&Snapshot {
+                frames,
+                vable_boxes: vec![SnapshotTagged::Box(input, Type::Int); 128],
+                vref_boxes: vec![SnapshotTagged::Const(0, Type::Ref)],
+            });
+        }
+        let decoded = rec.decode_captured_snapshots().unwrap();
+        let actual = snapshot_map_from_byte_recorder(&rec, &mut Default::default());
+        let expected = snapshot_map_from_trace_snapshots(&decoded, &mut Default::default());
+        let values = |maps: &SnapshotBoxes| {
+            maps.iter()
+                .map(|entry| {
+                    entry
+                        .as_ref()
+                        .map(|boxes| boxes.iter().map(|b| (b.opref, b.tp)).collect::<Vec<_>>())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(&actual.0), values(&expected.0));
+        assert_eq!(actual.1, expected.1);
+        assert_eq!(values(&actual.2), values(&expected.2));
+        assert_eq!(values(&actual.3), values(&expected.3));
+        assert_eq!(actual.4, expected.4);
+
+        // compile_loop builds these maps before recording its terminal JUMP
+        // and consuming the byte recorder. Neither action may renumber the
+        // input/result identities already present in resumedata.
+        rec.close_loop(&[result]);
+        let trace = rec.get_trace();
+        assert_eq!(
+            OpRef::input_arg_typed(trace.inputargs[0].index, trace.inputargs[0].tp),
+            input
+        );
+        assert_eq!(trace.ops[0].pos.get(), result);
+        assert_eq!(actual.0[1].as_ref().unwrap()[0].opref, input);
+        assert_eq!(actual.0[1].as_ref().unwrap()[1].opref, result);
+    }
+
+    #[test]
+    fn snapshot_roots_follow_map_buffers_into_optimizer() {
+        let mut boxes = vec![Some(vec![SnapshotBox::typed(
+            OpRef::ConstPtr(GcRef(0x1000)),
+            Type::Ref,
+        )])];
+        let slots = collect_snapshot_const_ptr_slots(&mut [&mut boxes]);
+        let maps = (boxes, Vec::<Vec<usize>>::new());
+        let mut optimizer = Optimizer::default_pipeline();
+        optimizer.snapshot_boxes = maps.0;
+        assert_eq!(slots.len(), 1);
+        // Simulate the collector forwarding a rooted constant after the map
+        // tuple and its Vec handles moved into the final optimizer owner.
+        unsafe { *(slots[0] as *mut OpRef) = OpRef::ConstPtr(GcRef(0x2000)) };
+        assert_eq!(
+            optimizer.snapshot_boxes[0].as_ref().unwrap()[0].opref,
+            OpRef::ConstPtr(GcRef(0x2000))
+        );
+    }
 }
 
 struct PreparedBridgeTrace {
@@ -7517,7 +7627,17 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:221: call_pure_results = metainterp.call_pure_results
         let call_pure_results = ctx.call_pure_results.clone();
 
-        let snapshots = ctx.take_snapshots();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
+        // resume.py ResumeDataLoopMemo.number reads encoded arrays directly.
+        // The materialized cut adapter still needs snapshots to remap their
+        // box namespace; an uncut trace can build the final maps immediately.
+        let byte_snapshot_maps = (cross_loop_cut.is_none() && ctx.recorder.has_byte_buffer())
+            .then(|| snapshot_maps_from_ctx(&mut ctx, &mut constants));
+        let snapshots = if byte_snapshot_maps.is_some() {
+            Vec::new()
+        } else {
+            ctx.take_snapshots()
+        };
         let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED. This allows external invalidation
@@ -7530,10 +7650,8 @@ impl<M: Clone> MetaInterp<M> {
         // GUARD_NOT_INVALIDATED are both emitted during tracing in
         // close_loop_args_at (state.rs) via record_guard → capture_resumedata.
         recorder.close_loop(jump_args);
-        // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
-        // downstream consumers (`trace.snapshots`) still observe the
-        // captured resumedata. `recorder.get_trace()` on its own returns
-        // a snapshot-less TreeLoop.
+        // Only the materialized cut/legacy path needs TreeLoop snapshots.
+        // Uncut byte snapshots already live in the final maps above.
         let mut trace = recorder.get_trace();
         trace.snapshots = snapshots;
 
@@ -7586,19 +7704,13 @@ impl<M: Clone> MetaInterp<M> {
         let enable_opts = self.warm_state.get_enable_opts();
         let preamble_data =
             compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, enable_opts);
-        let trace_snapshots = preamble_data.base.snapshots().to_vec();
-
-        // The recorder carries Const values inline on the OpRef variants
-        // (history.py:227/268/314), so there is no legacy TraceCtx
-        // ConstantPool to drain — this backend typed-constant egress map
-        // starts fresh.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let trace_snapshots = preamble_data.base.snapshots();
 
         // Materialize Vec<Op> from the trace's `Vec<OpRc>` so the
         // optimizer's `&[Op]` surface gets owned data. The deep-clone
         // mirrors PyPy's `cls()` fresh ResOperation per iteration —
         // optimizer mutations don't leak into TreeLoop.ops identity.
-        let mut trace_ops: Vec<Op> = preamble_data
+        let trace_ops: Vec<Op> = preamble_data
             .base
             .operations()
             .iter()
@@ -7656,17 +7768,11 @@ impl<M: Clone> MetaInterp<M> {
         );
         let no_unroll = no_unroll_reason.is_some();
 
-        // Save trace_ops + constants snapshot for potential unroll-free retry
-        // (pyjitpl.py:3016-3021).
-        //
-        // `compile.py:271-273` reaches `compile_simple_loop` by branching before
-        // `PreambleCompileData` exists, and hands it the same trace object. Pyre
-        // reaches that compile through the retry below instead, so the copy is
-        // what stands in for the branch: it exists because a peeling attempt
-        // that ran first may have left the recorded operations forwarded. When
-        // the attempt is skipped they are still as the recorder left them, and
-        // the retry takes them rather than a copy.
-        let trace_ops_snapshot: Option<Vec<Op>> = (!no_unroll).then(|| trace_ops.clone());
+        // compile.py `compile_loop`: a simple-loop retry reads the same trace.
+        // Unroll's TraceIterator allocates fresh operations for each phase;
+        // these intermediate Op values never become forwarding hosts. Keep
+        // them for the retry rather than copying them again. The backend
+        // constant map is mutable, so preserve its pre-optimization contents.
         let constants_snapshot = constants.clone();
 
         // Use UnrollOptimizer for preamble peeling when available.
@@ -7741,7 +7847,8 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = byte_snapshot_maps
+            .unwrap_or_else(|| snapshot_map_from_trace_snapshots(trace_snapshots, &mut constants));
         // history.py/261/307 — `Const{Int,Float,Ptr}.type` is an
         // intrinsic attribute on the Box itself, so no raw-u32 type
         // side-table propagation is needed; callers recover the type
@@ -7934,15 +8041,15 @@ impl<M: Clone> MetaInterp<M> {
                             Some(preamble_data.base.operations().to_vec());
                         // Consumed here and nowhere else, so the operations move
                         // into their `Rc`s instead of being copied into them.
-                        let trace_ops_snapshot_rc: Vec<majit_ir::OpRc> = trace_ops_snapshot
-                            .unwrap_or_else(|| std::mem::take(&mut trace_ops))
-                            .into_iter()
-                            .map(OpRc::new)
-                            .collect();
+                        // Unroll's TraceIterator allocates fresh operations
+                        // (see constants_snapshot above). The recorder Rcs
+                        // are still the original trace.
+                        let retry_ops: Vec<majit_ir::OpRc> =
+                            preamble_data.base.operations().to_vec();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.run_optimize_from_inputs(
-                                    &trace_ops_snapshot_rc,
+                                    &retry_ops,
                                     &mut retry_constants,
                                     num_trace_inputargs,
                                     false,
@@ -10619,32 +10726,23 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap()
             .recorder
             .finish(finish_args, finish_descr);
-        // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
-        // downstream consumers (`trace.snapshots`) still observe the
-        // captured resumedata. `recorder.get_trace()` on its own returns
-        // a snapshot-less TreeLoop. Taking the parked ctx here ends the
-        // walk_active_trace_refs coverage; `compile_snapshot_refs` picks
-        // up the snapshot ConstPtrs a few lines below.
+        // resume.py ResumeDataLoopMemo.number consumes the encoded snapshot
+        // arrays without a materialized intermediate. Taking the parked ctx
+        // ends walk_active_trace_refs coverage; compile_snapshot_refs roots
+        // the final maps below, before optimization can invoke the GC.
         let mut ctx = self.compile_tracing.take().unwrap();
-        let snapshots = ctx.take_snapshots();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
+        let snapshot_maps = snapshot_maps_from_ctx(&mut ctx, &mut constants);
         let recorder = ctx.recorder;
-        let mut trace = recorder.get_trace();
-        trace.snapshots = snapshots;
+        let trace = recorder.get_trace();
         let SimpleCompileViews {
             data: simple_data,
-            trace_snapshots,
             trace_ops,
         } = make_simple_compile_views(
             &trace,
             &call_pure_results,
             self.warm_state.get_enable_opts(),
         );
-
-        // The recorder carries Const values inline on the OpRef variants
-        // (history.py:227/268/314), so there is no legacy TraceCtx
-        // ConstantPool to drain — this backend typed-constant egress map
-        // starts fresh.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let num_ops_before = trace_ops.len();
         let mut optimizer = if let Some(config) = vable_config {
@@ -10673,7 +10771,7 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = snapshot_maps;
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
             &mut snapshot_vable_map,
@@ -11111,29 +11209,20 @@ impl<M: Clone> MetaInterp<M> {
             self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
 
         let call_pure_results = ctx.call_pure_results.clone();
-        let snapshots = ctx.take_snapshots();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
+        // resume.py ResumeDataLoopMemo.number reads byte arrays directly;
+        // keep only the final maps that the optimizer consumes and roots.
+        let snapshot_maps = snapshot_maps_from_ctx(&mut ctx, &mut constants);
         let recorder = ctx.recorder;
-        // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
-        // downstream consumers (`trace.snapshots`) still observe the
-        // captured resumedata. `recorder.get_trace()` on its own returns
-        // a snapshot-less TreeLoop.
-        let mut trace = recorder.get_trace();
-        trace.snapshots = snapshots;
+        let trace = recorder.get_trace();
         let SimpleCompileViews {
             data: simple_data,
-            trace_snapshots,
             trace_ops,
         } = make_simple_compile_views(
             &trace,
             &call_pure_results,
             self.warm_state.get_enable_opts(),
         );
-
-        // The recorder carries Const values inline on the OpRef variants
-        // (history.py:227/268/314), so there is no legacy TraceCtx
-        // ConstantPool to drain — this backend typed-constant egress map
-        // starts fresh.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
@@ -11174,7 +11263,7 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = snapshot_maps;
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
             &mut snapshot_vable_map,

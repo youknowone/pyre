@@ -721,16 +721,17 @@ impl OptVirtualize {
             });
         }
 
-        if let Some(info) = struct_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        if let Some(info) = struct_box.as_ref().and_then(Operand::ptr_info) {
             // info.py getfield: return _fields[fielddescr.get_index()].
             // For Virtual, ob_type (typeptr) is not in fields — fold from
             // known_class (info.py get_known_class).
-            if let PtrInfo::Virtual(ref vinfo) = info
+            if let PtrInfo::Virtual(vinfo) = &*info
                 && is_typeptr
                 // A stored class of 0 means the allocation's vtable address was unavailable at
                 // build time, so the value reads as no known class while the flag stays valid.
                 && let Some(class_val) = vinfo.known_class.filter(|&c| c != 0)
             {
+                drop(info);
                 let b = ctx.materialize_operand_at(op.pos().get());
                 // PyPy's `handle_getfield_typeptr` removes this load before
                 // optimization and carries the vtable as a `ConstInt`.  Pyre's
@@ -759,7 +760,7 @@ impl OptVirtualize {
             // descr's type (builtins built by `new_with_vtable` inherit the
             // type's `get_instantiate`).
             if field_descr.is_w_class()
-                && let PtrInfo::Virtual(ref vinfo) = info
+                && let PtrInfo::Virtual(vinfo) = &*info
             {
                 let stored = vinfo
                     .descr
@@ -767,6 +768,7 @@ impl OptVirtualize {
                     .and_then(|sd| sd.class_word_index_in_parent().map(|idx| idx as u32))
                     .and_then(|widx| get_field(&vinfo.fields, widx));
                 if let Some(val_ref) = stored {
+                    drop(info);
                     let b_old = Operand::from_bound_op(op_rc);
                     let b_val = ctx.get_box_replacement_operand(val_ref);
                     ctx.make_equal_to(&b_old, &b_val);
@@ -778,6 +780,7 @@ impl OptVirtualize {
                     .and_then(|sd| sd.w_class_obj())
                     .filter(|&w| w != 0)
                 {
+                    drop(info);
                     let b = ctx.materialize_operand_at(op.pos().get());
                     ctx.make_constant_box(
                         &b,
@@ -840,7 +843,7 @@ impl OptVirtualize {
             // release, so the guard has to.  `Virtualizable` is not covered --
             // its fields come from the state-field JIT's own descr set, which
             // `vstate.descr` does not index.
-            let slot_identifies_field = match &info {
+            let slot_identifies_field = match &*info {
                 PtrInfo::Virtual(vinfo) => {
                     field_slot_identifies(&vinfo.descr, field_idx, field_descr)
                 }
@@ -854,7 +857,7 @@ impl OptVirtualize {
             if !slot_resolvable && crate::majit_log_enabled() {
                 // What the skip is worth: a populated slot is the value
                 // `get_field` would have forwarded for a field not in it.
-                let populated = match &info {
+                let populated = match &*info {
                     PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx).is_some(),
                     PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx).is_some(),
                     _ => false,
@@ -867,13 +870,14 @@ impl OptVirtualize {
                     field_descr.offset(),
                 );
             }
-            let field_val = match &info {
+            let field_val = match &*info {
                 _ if !slot_resolvable => None,
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
                 _ => None,
             };
             if let Some(val_ref) = field_val {
+                drop(info);
                 let b_old = Operand::from_bound_op(op_rc);
                 let b_val = ctx
                     .get_box_replacement_operand_opt(val_ref)
@@ -890,7 +894,7 @@ impl OptVirtualize {
                 && matches!(op.opcode, majit_ir::OpCode::GetfieldGcI)
                 && is_typeptr
             {
-                let vtable = match &info {
+                let vtable = match &*info {
                     PtrInfo::Virtual(vinfo) => vinfo
                         .descr
                         .as_size_descr()
@@ -904,6 +908,7 @@ impl OptVirtualize {
                     _ => None,
                 };
                 if let Some(vtable) = vtable {
+                    drop(info);
                     let b = ctx.materialize_operand_at(op.pos().get());
                     ctx.make_constant_box(&b, Value::Int(vtable as i64));
                     return OptimizationResult::Remove;
@@ -933,8 +938,9 @@ impl OptVirtualize {
             // only.
             let folds_to_zero = !is_raw_op
                 && !field_descr.is_header_field()
-                && matches!(info, PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_));
+                && matches!(&*info, PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_));
             if folds_to_zero {
+                drop(info);
                 // optimizer.py new_const: CONST_NULL for a pointer
                 // field, CONST_ZERO_FLOAT for a float field, else CONST_0.
                 let zero = match op.opcode {
@@ -1003,8 +1009,8 @@ impl OptVirtualize {
     ) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
 
-        if let Some(info) = array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
-            && let PtrInfo::VirtualArray(vinfo) = info
+        if let Some(info) = array_box.as_ref().and_then(Operand::ptr_info)
+            && let PtrInfo::VirtualArray(vinfo) = &*info
             && let Some(index) = ctx
                 .resolve_operand_operand_opt(&op.arg(1))
                 .and_then(|b_| ctx.get_constant_int_box(&b_))
@@ -1021,6 +1027,7 @@ impl OptVirtualize {
                     "virtual array getitem from uninitialized slot",
                 );
             }
+            drop(info);
             let b_old = Operand::from_bound_op(op_rc);
             let b_item = ctx
                 .get_box_replacement_operand_opt(item_ref)
@@ -1041,10 +1048,14 @@ impl OptVirtualize {
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
 
-        if let Some(PtrInfo::VirtualArray(vinfo)) =
-            array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
-        {
-            let len = vinfo.items.len() as i64;
+        let length = array_box
+            .as_ref()
+            .and_then(Operand::ptr_info)
+            .and_then(|info| match &*info {
+                PtrInfo::VirtualArray(vinfo) => Some(vinfo.items.len() as i64),
+                _ => None,
+            });
+        if let Some(len) = length {
             let b = ctx.materialize_operand_at(op.pos().get());
             ctx.make_constant_box(&b, Value::Int(len));
             return OptimizationResult::Remove;

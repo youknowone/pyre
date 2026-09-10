@@ -149,9 +149,11 @@ pub fn serialize_optimizer_knowledge(
         return Ok(());
     };
     // bridgeopt.py:93: triples_struct = optimizer.optheap.serialize_optheap(available_boxes)
+    let is_const =
+        |opref: OpRef| opref.is_constant() || env.is_const(&env.get_box_replacement_operand(opref));
     let field_ok = |obj: OpRef, val: OpRef| {
-        (env.is_const(obj) || available_boxes.contains(&obj))
-            && (env.is_const(val) || available_boxes.contains(&val))
+        (is_const(obj) || available_boxes.contains(&obj))
+            && (is_const(val) || available_boxes.contains(&val))
     };
     numb_state.append_int(
         knowledge
@@ -199,11 +201,11 @@ pub fn serialize_optimizer_knowledge(
         knowledge
             .loopinvariant_results
             .iter()
-            .filter(|&&(_, result)| env.is_const(result) || available_boxes.contains(&result))
+            .filter(|&&(_, result)| is_const(result) || available_boxes.contains(&result))
             .count() as i64,
     );
     for &(const_ptr, result) in &knowledge.loopinvariant_results {
-        if !(env.is_const(result) || available_boxes.contains(&result)) {
+        if !(is_const(result) || available_boxes.contains(&result)) {
             continue;
         }
         let const_tag = memo.getconst_int(const_ptr)?;

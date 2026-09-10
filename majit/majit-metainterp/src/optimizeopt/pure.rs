@@ -22,37 +22,25 @@ enum ExtraCallPureEntry {
 
 /// Key for looking up a previously computed pure operation.
 ///
-/// Identifies an operation by its opcode, argument OpRefs, and descriptor.
+/// RecentPureOps keeps native argument boxes, as pure.py does, so later
+/// forwarding writes are visible without recreating their identities.
+/// The existing imported-call adapter still uses positional arguments.
 ///
 /// RPython's optimizeopt/pure.py includes the descriptor in pure-op identity
 /// checks for operations like GETFIELD_GC_PURE_*; otherwise distinct immutable
 /// fields on the same object can be incorrectly CSE'd together.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct PureOpKey {
+struct PureOpKey<A = OpRef> {
     opcode: OpCode,
-    args: Vec<OpRef>,
+    args: smallvec::SmallVec<[A; 2]>,
     descr_identity: Option<usize>,
 }
 
-impl PureOpKey {
-    fn from_op(op: &Op) -> Self {
-        PureOpKey {
+impl PureOpKey<Operand> {
+    fn from_operand_op(op: &Op) -> Self {
+        Self {
             opcode: op.opcode,
-            args: op.getarglist().iter().map(|a| a.to_opref()).collect(),
-            descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
-        }
-    }
-
-    /// pure.py:185 parity: COND_CALL_VALUE uses start_index=1 to skip arg[0].
-    /// The key uses CALL_PURE opcode so that COND_CALL_VALUE and CALL_PURE
-    /// share the same cache namespace (RPython uses the same dict).
-    fn from_call_op(op: &Op, start_index: usize) -> Self {
-        PureOpKey {
-            opcode: OpCode::call_pure_for_type(op.result_type()),
-            args: op.getarglist()[start_index..]
-                .iter()
-                .map(|a| a.to_opref())
-                .collect(),
+            args: op.with_arglist(|args| args.iter().cloned().collect()),
             descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
         }
     }
@@ -80,7 +68,7 @@ struct KnownResultEntry {
 /// - Typical hit is within first few entries
 pub struct RecentPureOps {
     /// Ring buffer of (key, result) pairs. None = empty slot.
-    lst: Vec<Option<(PureOpKey, OpRef)>>,
+    lst: Vec<Option<(PureOpKey<Operand>, OpRef)>>,
     next_index: usize,
 }
 
@@ -93,7 +81,7 @@ impl RecentPureOps {
     }
 
     /// pure.py — add(op): record a pure operation result.
-    fn insert(&mut self, key: PureOpKey, result: OpRef) {
+    fn insert(&mut self, key: PureOpKey<Operand>, result: OpRef) {
         self.lst[self.next_index] = Some((key, result));
         self.next_index += 1;
         if self.next_index >= self.lst.len() {
@@ -108,59 +96,77 @@ impl RecentPureOps {
     /// runs against ALWAYS_PURE ops with 1 or 2 args (`LOAD_EFFECTIVE_ADDRESS`
     /// has 4 args but is emitted by `rewrite.py` after OptPure).
     ///
-    /// `same_box(query, stored)` mirrors RPython's `box.same_box(other)`
-    /// (history.py, :244): identity for non-Const Boxes (the
-    /// caller is expected to apply `get_box_replacement` to both sides
-    /// first), value equality for Const subclasses. Without this hook,
-    /// raw `OpRef ==` would miss CSE for two distinct constant slots
-    /// holding the same value — a divergence introduced by variant-
-    /// aware OpRef Eq.
-    fn lookup<F: Fn(OpRef, OpRef) -> bool>(
-        &self,
-        key: &PureOpKey,
-        same_box: F,
-        commutative: bool,
-    ) -> Option<OpRef> {
-        match key.args.len() {
-            1 => self.lookup1(key.opcode, key.args[0], key.descr_identity, same_box),
-            2 => self.lookup2(
-                key.opcode,
-                key.args[0],
-                key.args[1],
-                key.descr_identity,
-                commutative,
-                same_box,
-            ),
-            _ => panic!(
-                "RecentPureOps::lookup: numargs must be 1 or 2, got {}",
-                key.args.len()
-            ),
-        }
+    /// Matching uses producer identity after forwarding, or constant value
+    /// equality (`history.py Const.same_box`).
+    fn lookup(&self, op: &Op, ctx: &OptContext, commutative: bool) -> Option<(OpCode, OpRef)> {
+        // pure.py RecentPureOps.lookup resolves each query argument once,
+        // before scanning the history. Only stored arguments are resolved
+        // inside lookup1/lookup2.
+        let descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
+        op.with_arglist(|args| {
+            let arg0 = args
+                .first()
+                .and_then(|arg| ctx.resolve_operand_operand_opt(arg));
+            let arg1 = args
+                .get(1)
+                .and_then(|arg| ctx.resolve_operand_operand_opt(arg));
+            let same_box =
+                |(raw, query): (OpRef, Option<&Operand>),
+                 (stored, resolved): (OpRef, Option<&Operand>)| match (
+                    query, resolved,
+                ) {
+                    (Some(query), Some(stored)) => query.same_box(&stored),
+                    _ => ctx.same_box(raw, stored),
+                };
+            match args.len() {
+                1 => self.lookup1(
+                    (args[0].to_opref(), arg0.as_ref()),
+                    descr_identity,
+                    |query, stored| {
+                        same_box(
+                            query,
+                            (stored.to_opref(), Some(&stored.get_box_replacement(false))),
+                        )
+                    },
+                ),
+                2 => self.lookup2(
+                    (args[0].to_opref(), arg0.as_ref()),
+                    (args[1].to_opref(), arg1.as_ref()),
+                    descr_identity,
+                    commutative,
+                    |stored| (stored.to_opref(), stored.get_box_replacement(false)),
+                    |query, (stored, resolved)| same_box(query, (*stored, Some(resolved))),
+                ),
+                _ => panic!(
+                    "RecentPureOps::lookup: numargs must be 1 or 2, got {}",
+                    args.len()
+                ),
+            }
+        })
     }
 
     /// pure.py lookup1(opt, box0, descr).
     ///
     /// RPython: `box0.same_box(get_box_replacement(op.getarg(0)))`.
     /// `same_box` is identity for non-constants, value equality for constants.
-    /// The `same_box` callback combines get_box_replacement + value comparison.
-    fn lookup1(
+    /// `Q` can carry an already-resolved query; the callback resolves stored args.
+    fn lookup1<Q: Copy>(
         &self,
-        opcode: OpCode,
-        arg0: OpRef,
+        arg0: Q,
         descr_identity: Option<usize>,
-        same_box: impl Fn(OpRef, OpRef) -> bool,
-    ) -> Option<OpRef> {
+        same_box: impl Fn(Q, &Operand) -> bool,
+    ) -> Option<(OpCode, OpRef)> {
         for entry in &self.lst {
             let Some((k, result)) = entry else { break };
-            if k.opcode != opcode || k.args.len() != 1 {
+            if k.args.len() != 1 {
                 continue;
             }
             if k.descr_identity != descr_identity {
                 continue;
             }
             // pure.py:62 — box0.same_box(get_box_replacement(op.getarg(0)))
-            if same_box(arg0, k.args[0]) {
-                return Some(*result);
+            if same_box(arg0, &k.args[0]) {
+                return Some((k.opcode, *result));
             }
         }
         None
@@ -168,30 +174,32 @@ impl RecentPureOps {
 
     /// pure.py lookup2(opt, box0, box1, descr, commutative).
     ///
-    /// `same_box` applies get_box_replacement internally and uses
-    /// value equality for constants (history.py Const.same_box).
-    fn lookup2(
+    /// The callback compares a query against a forwarded stored argument.
+    fn lookup2<Q: Copy, S>(
         &self,
-        opcode: OpCode,
-        arg0: OpRef,
-        arg1: OpRef,
+        arg0: Q,
+        arg1: Q,
         descr_identity: Option<usize>,
         commutative: bool,
-        same_box: impl Fn(OpRef, OpRef) -> bool,
-    ) -> Option<OpRef> {
+        resolve: impl Fn(&Operand) -> S,
+        same_box: impl Fn(Q, &S) -> bool,
+    ) -> Option<(OpCode, OpRef)> {
         for entry in &self.lst {
             let Some((k, result)) = entry else { break };
-            if k.opcode != opcode || k.args.len() != 2 {
+            if k.args.len() != 2 {
                 continue;
             }
             if k.descr_identity != descr_identity {
                 continue;
             }
-            // pure.py:72-75 — same_box includes get_box_replacement
-            if (same_box(arg0, k.args[0]) && same_box(arg1, k.args[1]))
-                || (commutative && same_box(arg1, k.args[0]) && same_box(arg0, k.args[1]))
+            // pure.py RecentPureOps.lookup2 resolves each stored operand once,
+            // then compares both orders against those same terminal boxes.
+            let stored0 = resolve(&k.args[0]);
+            let stored1 = resolve(&k.args[1]);
+            if (same_box(arg0, &stored0) && same_box(arg1, &stored1))
+                || (commutative && same_box(arg1, &stored0) && same_box(arg0, &stored1))
             {
-                return Some(*result);
+                return Some((k.opcode, *result));
             }
         }
         None
@@ -240,16 +248,11 @@ impl RecentPureOpTable {
         self.buckets[idx].as_mut()
     }
 
-    fn lookup<F: Fn(OpRef, OpRef) -> bool>(
-        &self,
-        key: &PureOpKey,
-        same_box: F,
-        commutative: bool,
-    ) -> Option<OpRef> {
-        self.bucket(key.opcode)?.lookup(key, same_box, commutative)
+    fn lookup(&self, op: &Op, ctx: &OptContext, commutative: bool) -> Option<(OpCode, OpRef)> {
+        self.bucket(op.opcode)?.lookup(op, ctx, commutative)
     }
 
-    fn insert(&mut self, key: PureOpKey, result: OpRef) {
+    fn insert(&mut self, key: PureOpKey<Operand>, result: OpRef) {
         if let Some(bucket) = self.bucket_mut(key.opcode) {
             bucket.insert(key, result);
         }
@@ -263,7 +266,12 @@ impl RecentPureOpTable {
         same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
         self.bucket(opcode)
-            .and_then(|bucket| bucket.lookup1(opcode, arg0, descr_identity, same_box))
+            .and_then(|bucket| {
+                bucket.lookup1(arg0, descr_identity, |query, stored| {
+                    same_box(query, stored.to_opref())
+                })
+            })
+            .map(|(_, result)| result)
     }
 
     fn lookup2(
@@ -275,9 +283,18 @@ impl RecentPureOpTable {
         commutative: bool,
         same_box: impl Fn(OpRef, OpRef) -> bool,
     ) -> Option<OpRef> {
-        self.bucket(opcode).and_then(|bucket| {
-            bucket.lookup2(opcode, arg0, arg1, descr_identity, commutative, same_box)
-        })
+        self.bucket(opcode)
+            .and_then(|bucket| {
+                bucket.lookup2(
+                    arg0,
+                    arg1,
+                    descr_identity,
+                    commutative,
+                    |arg| arg.to_opref(),
+                    |query, stored| same_box(query, *stored),
+                )
+            })
+            .map(|(_, result)| result)
     }
 
     fn history_length(&self) -> usize {
@@ -321,7 +338,7 @@ pub struct OptPure {
     /// RPython pure.py / shortpreamble.py: pure ops that phase 2 should be
     /// able to reproduce from the preamble via optimizer state, not by
     /// textual body replay.
-    short_preamble_pure_ops: Vec<Op>,
+    short_preamble_pure_ops: Vec<majit_ir::OpRc>,
     /// Whether the last emitted operation was removed (for GUARD_NO_EXCEPTION elimination).
     /// pure.py: last_emitted_operation is REMOVED check.
     last_emitted_was_removed: bool,
@@ -383,7 +400,7 @@ impl OptPure {
             .map(|(args, result)| {
                 let key = PureOpKey {
                     opcode: OpCode::CallPureI,
-                    args,
+                    args: smallvec::SmallVec::from_vec(args),
                     descr_identity: None,
                 };
                 ExtraCallPureEntry::Direct { key, result }
@@ -426,35 +443,36 @@ impl OptPure {
     ///
     /// pure.py `RecentPureOps.lookup` dispatches to `lookup1` /
     /// `lookup2` so that arg comparison goes through `box.same_box`.
-    /// Pyre's typed OpRef Eq matches `same_box` for non-constants
-    /// (identity), but constants need value equality
-    /// (history.py): two distinct ConstInt slots with the same
-    /// value are `same_box` true even though `OpRef ==` is false.
-    fn lookup_pure(&self, key: &PureOpKey, ctx: &OptContext) -> Option<OpRef> {
-        // pure.py:62 / :72-73 — `box.same_box(get_box_replacement(other))`
-        // routes through `OptContext::same_box`, which walks both sides
-        // through `get_box_replacement` and dispatches Const value equality
-        // for the `history.py Const.same_box → same_constant` overload.
-        let same_box = |query: OpRef, stored: OpRef| -> bool { ctx.same_box(query, stored) };
+    /// Resolve forwarding before comparing producer identity or constant value.
+    fn lookup_pure(&self, op: &Op, ctx: &OptContext) -> Option<(OpCode, OpRef)> {
         // pure.py — `commutative` is forwarded into `lookup2`,
         // which checks both `(arg0, arg1)` and `(arg1, arg0)` orderings.
-        let commutative = Self::is_commutative(key.opcode);
-        self.cache.lookup(key, same_box, commutative)
+        let commutative = Self::is_commutative(op.opcode);
+        self.cache.lookup(op, ctx, commutative)
     }
 
     /// Record a pure operation in the CSE cache.
     /// pure.py: pure(opnum, op)
     pub fn pure(&mut self, op: &Op) {
-        let key = PureOpKey::from_op(op);
+        let key = PureOpKey::from_operand_op(op);
         self.cache.insert(key, op.pos().get());
     }
 
     /// Record a pure operation with explicit args.
     /// pure.py: pure_from_args(opnum, args, op, descr=None)
-    pub fn pure_from_args(&mut self, opcode: OpCode, args: &[OpRef], result: OpRef) {
+    pub fn pure_from_args(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        result: OpRef,
+        ctx: &mut OptContext,
+    ) {
         let key = PureOpKey {
             opcode,
-            args: args.to_vec(),
+            args: args
+                .iter()
+                .map(|arg| ctx.materialize_operand_at(*arg).get_box_replacement(false))
+                .collect(),
             descr_identity: None,
         };
         self.cache.insert(key, result);
@@ -462,8 +480,14 @@ impl OptPure {
 
     /// pure.py: pure_from_args1(opnum, arg0, op)
     /// Specialized version for unary operations.
-    pub fn pure_from_args1(&mut self, opcode: OpCode, arg0: OpRef, result: OpRef) {
-        self.pure_from_args(opcode, &[arg0], result);
+    pub fn pure_from_args1(
+        &mut self,
+        opcode: OpCode,
+        arg0: OpRef,
+        result: OpRef,
+        ctx: &mut OptContext,
+    ) {
+        self.pure_from_args(opcode, &[arg0], result, ctx);
     }
 
     /// pure.py: pure_from_args1(opnum, arg0, op, descr=...) — same as
@@ -478,10 +502,11 @@ impl OptPure {
         arg0: OpRef,
         result: OpRef,
         descr: majit_ir::DescrRef,
+        ctx: &mut OptContext,
     ) {
         let key = PureOpKey {
             opcode,
-            args: vec![arg0],
+            args: smallvec::smallvec![ctx.materialize_operand_at(arg0).get_box_replacement(false)],
             descr_identity: Some(majit_ir::descr::descr_identity(&descr)),
         };
         self.cache.insert(key, result);
@@ -489,15 +514,21 @@ impl OptPure {
 
     /// pure.py: pure_from_args2(opnum, arg0, arg1, op)
     /// Specialized version for binary operations.
-    pub fn pure_from_args2(&mut self, opcode: OpCode, arg0: OpRef, arg1: OpRef, result: OpRef) {
-        self.pure_from_args(opcode, &[arg0, arg1], result);
+    pub fn pure_from_args2(
+        &mut self,
+        opcode: OpCode,
+        arg0: OpRef,
+        arg1: OpRef,
+        result: OpRef,
+        ctx: &mut OptContext,
+    ) {
+        self.pure_from_args(opcode, &[arg0, arg1], result, ctx);
     }
 
     /// Look up a previously recorded pure operation result.
     /// pure.py: get_pure_result(op)
     pub fn get_pure_result(&self, op: &Op, ctx: &OptContext) -> Option<OpRef> {
-        let key = PureOpKey::from_op(op);
-        self.lookup_pure(&key, ctx)
+        self.lookup_pure(op, ctx).map(|(_, result)| result)
     }
 
     /// pure.py lookup1(opt, box0, descr).
@@ -586,11 +617,13 @@ impl OptPure {
             // Both stored and query are walked through the forwarding chain
             // via `OptContext::same_box` (pure.py:62, :72-73 +
             // history.py Const.same_box → same_constant).
-            let args_match = entry
-                .args
-                .iter()
-                .zip(op.getarglist().iter())
-                .all(|(&stored, query)| ctx.same_box(stored, query.to_opref()));
+            let args_match = op.with_arglist(|args| {
+                entry
+                    .args
+                    .iter()
+                    .zip(args)
+                    .all(|(&stored, query)| ctx.same_box(stored, query.to_opref()))
+            });
             if args_match {
                 // pure.py: force_preamble_op — isinstance check → force → replace
                 if let Some(result) = entry.forced_result {
@@ -604,62 +637,6 @@ impl OptPure {
                     continue;
                 }
                 entry.forced_result = Some(forced);
-                return Some(forced);
-            }
-        }
-        // Fallback: search ctx.imported_short_pure_ops directly.
-        // Active until install_preamble_pure_ops is enabled, which
-        // transfers these entries into preamble_pure_ops above.
-        let mut matched_entry = None;
-        for entry in &ctx.imported_short_pure_ops {
-            if entry.opcode != op.opcode {
-                continue;
-            }
-            if entry.descr.as_ref().map(majit_ir::descr::descr_identity) != descr_identity {
-                continue;
-            }
-            if entry.args.len() != op.num_args() {
-                continue;
-            }
-            // same_box: identity for non-constants, same_constant for constants.
-            let mut args_match = true;
-            for (expected, arg) in entry.args.iter().zip(op.getarglist().iter()) {
-                let arg = arg.to_opref();
-                match expected {
-                    crate::optimizeopt::ImportedShortPureArg::OpRef(expected_ref) => {
-                        if arg != *expected_ref {
-                            args_match = false;
-                            break;
-                        }
-                    }
-                    crate::optimizeopt::ImportedShortPureArg::Const(expected_value, _source) => {
-                        // Normalize through forwarding so a box that became
-                        // constant via `make_constant` / replace_op chains
-                        // still matches, mirroring `_same_args` and
-                        // `preamble_pure_ops` upstream paths
-                        // (optimizer.py get_box_replacement).
-                        match ctx
-                            .get_box_replacement_operand_opt(arg)
-                            .and_then(|b| b.const_value())
-                        {
-                            Some(v) if v == *expected_value => {}
-                            _ => {
-                                args_match = false;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if !args_match {
-                continue;
-            }
-            matched_entry = Some(entry.clone());
-            break;
-        }
-        if let Some(matched_entry) = matched_entry {
-            let forced = ctx.force_op_from_preamble_op(&matched_entry.pop);
-            if Self::matches_result_type(op, forced, ctx) {
                 return Some(forced);
             }
         }
@@ -695,7 +672,7 @@ impl OptPure {
     ) {
         let key = PureOpKey {
             opcode,
-            args,
+            args: smallvec::SmallVec::from_vec(args),
             descr_identity,
         };
         self.extra_call_pure
@@ -861,17 +838,21 @@ impl Optimization for OptPure {
         // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships)
         // and virtualize pass (ARRAYLEN_GC with array descr keying per
         // virtualize.py:220).
-        for (opcode, arg0, result, descr) in ctx.pending_pure_from_args.drain(..) {
+        for index in 0..ctx.pending_pure_from_args.len() {
+            let (opcode, arg0, result, descr) = ctx.pending_pure_from_args[index].clone();
             match descr {
-                Some(d) => self.pure_from_args1_with_descr(opcode, arg0, result, d),
-                None => self.pure_from_args1(opcode, arg0, result),
+                Some(d) => self.pure_from_args1_with_descr(opcode, arg0, result, d, ctx),
+                None => self.pure_from_args1(opcode, arg0, result, ctx),
             }
         }
+        ctx.pending_pure_from_args.clear();
         // optimizer.py: pure_from_args2 parity — consume binary registrations
         // (INSTANCE_PTR_EQ/NE swapped-args from rewrite.py:565,571).
-        for (opcode, arg0, arg1, result) in ctx.pending_pure_from_args2.drain(..) {
-            self.pure_from_args2(opcode, arg0, arg1, result);
+        for index in 0..ctx.pending_pure_from_args2.len() {
+            let (opcode, arg0, arg1, result) = ctx.pending_pure_from_args2[index];
+            self.pure_from_args2(opcode, arg0, arg1, result, ctx);
         }
+        ctx.pending_pure_from_args2.clear();
 
         // Don't reset for GUARD_NO_EXCEPTION — it needs the previous state.
         if op.opcode != OpCode::GuardNoException {
@@ -948,9 +929,8 @@ impl Optimization for OptPure {
                 // The lookup may surface a non-OVF op of the same shape
                 // (e.g. INT_ADD vs INT_ADD_OVF). _can_reuse_oldop accepts
                 // it only when the cached opnum matches our OVF opnum.
-                let key = PureOpKey::from_op(&postponed);
-                if let Some(cached_ref) = self.lookup_pure(&key, ctx)
-                    && Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true)
+                if let Some((old_opcode, cached_ref)) = self.lookup_pure(&postponed, ctx)
+                    && Self::_can_reuse_oldop(old_opcode, postponed.opcode, true)
                 {
                     let b_old = postponed_box.clone();
                     let b_cached = ctx.get_box_replacement_operand(cached_ref);
@@ -958,37 +938,11 @@ impl Optimization for OptPure {
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
                 }
-                // pure.py:162-171: an OVF op cannot reuse a non-OVF result
-                // even when the args/descr are identical (the prior op
-                // may have overflowed silently). Discard the non-OVF
-                // lookup but document the inverse case for future readers.
-                let non_ovf_opcode = match postponed.opcode {
-                    OpCode::IntAddOvf => Some(OpCode::IntAdd),
-                    OpCode::IntSubOvf => Some(OpCode::IntSub),
-                    OpCode::IntMulOvf => Some(OpCode::IntMul),
-                    _ => None,
-                };
-                if let Some(non_ovf) = non_ovf_opcode {
-                    let non_ovf_key = PureOpKey {
-                        opcode: non_ovf,
-                        args: postponed
-                            .getarglist()
-                            .iter()
-                            .map(|a| a.to_opref())
-                            .collect(),
-                        descr_identity: None,
-                    };
-                    if let Some(cached_ref) = self.lookup_pure(&non_ovf_key, ctx) {
-                        // _can_reuse_oldop(non_ovf, ovf=true) is false:
-                        // skip even though the keys would otherwise match.
-                        debug_assert!(!Self::_can_reuse_oldop(non_ovf, postponed.opcode, true));
-                        let _ = cached_ref;
-                    }
-                }
 
                 // Resolve the args to their forwarded terminals before the op
                 // is recorded in `self.cache` under its arg identities
                 // (optimizer.py force_box loop).
+                let key = PureOpKey::from_operand_op(&postponed);
                 for i in 0..postponed.num_args() {
                     let forced = self.force_box(&postponed.arg(i), ctx);
                     postponed.setarg(i, ctx.materialize_operand_at(forced));
@@ -1000,7 +954,8 @@ impl Optimization for OptPure {
                 // (pure.py). Push it so produce_potential_short_preamble_ops
                 // replays it and a loop-invariant overflow-checked op is computed
                 // once in the peeled preamble instead of every iteration.
-                self.short_preamble_pure_ops.push(postponed.clone());
+                self.short_preamble_pure_ops
+                    .push(OpRc::new(postponed.clone()));
                 self.emit_postponed_downstream(postponed, ctx);
                 return OptimizationResult::PassOn; // guard passes through
             } else {
@@ -1099,10 +1054,8 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
-            let key = PureOpKey::from_op(op);
-
             // CSE: exact same operation already computed?
-            if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
+            if let Some((_, cached_ref)) = self.lookup_pure(op, ctx) {
                 let b_old = Operand::from_bound_op(op_rc);
                 let b_cached = ctx
                     .get_box_replacement_operand_opt(cached_ref)
@@ -1112,8 +1065,17 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
+            let key = PureOpKey::from_operand_op(op);
             self.cache.insert(key, op.pos().get());
-            self.short_preamble_pure_ops.push(op.clone());
+            // pure.py produce_potential_short_preamble_ops reads the actual
+            // operations. Retain this producer when it is the live op; a
+            // preceding replacement still needs its own operation object.
+            let shared = if std::ptr::eq(op, op_rc.as_ref()) {
+                op_rc.clone()
+            } else {
+                OpRc::new(op.clone())
+            };
+            self.short_preamble_pure_ops.push(shared);
             return OptimizationResult::PassOn;
         }
 
@@ -1224,8 +1186,7 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
-            let key = PureOpKey::from_call_op(op, start_index);
-            self.cache.insert(key, op.pos().get());
+
             // pure.py: `CallPureOptimizationResult.callback()` appends
             // `len(_newoperations) - 1` AFTER `emit_result` has routed the op
             // through the remaining optimizations. Recording it here (before
@@ -1246,7 +1207,8 @@ impl Optimization for OptPure {
                 // pure.py:222-225: replace CALL_PURE with CALL.
                 let new_op = self.demote_call_pure(op);
                 if !Self::call_pure_can_raise(op) {
-                    self.short_preamble_pure_ops.push(new_op.clone());
+                    self.short_preamble_pure_ops
+                        .push(OpRc::new(new_op.clone()));
                 }
                 return OptimizationResult::Replace(new_op);
             } else {
@@ -1289,9 +1251,13 @@ impl Optimization for OptPure {
 
     /// pure.py `CallPureOptimizationResult` — the demoted CALL / un-demoted
     /// COND_CALL_VALUE carry a post-emit callback that records the call's
-    /// position. Only those two opcode families need postprocess here.
+    /// position. `DefaultOptimizationResult._callback` also publishes boolean
+    /// bounds even when OptHeap postpones the operation's final emission.
     fn have_postprocess_op(&self, opcode: OpCode) -> bool {
-        opcode.is_real_call() || opcode.is_cond_call_value()
+        opcode.is_real_call()
+            || opcode.is_cond_call_value()
+            || opcode.returns_bool()
+            || opcode.is_always_pure()
     }
 
     /// pure.py `CallPureOptimizationResult.callback`:
@@ -1306,8 +1272,21 @@ impl Optimization for OptPure {
     /// `_newoperations`, so `len - 1` is the call's final index — past any
     /// postponed op OptHeap flushed ahead of it. The one-shot armed in
     /// `optimize_call_pure` selects exactly the op this callback belongs to.
-    fn propagate_postprocess(&mut self, _op: &Op, ctx: &mut OptContext) {
-        if self.pending_call_pure_position {
+    fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
+        // pure.py DefaultOptimizationResult._callback: consumers need this
+        // fact before a postponed comparison reaches Optimizer.emit.
+        if op.opcode.returns_bool() {
+            let result = ctx.materialize_operand_at(op.pos().get());
+            ctx.with_intbound_mut(&result, |bound| bound.make_bool());
+        }
+        // pure.py DefaultOptimizationResult._callback records a saved pure
+        // op after downstream passes and emission have processed it.
+        if op.opcode.is_always_pure() {
+            self.pure(op);
+        }
+        if self.pending_call_pure_position
+            && (op.opcode.is_real_call() || op.opcode.is_cond_call_value())
+        {
             self.pending_call_pure_position = false;
             self.call_pure_positions
                 .push(ctx.new_operations.len().saturating_sub(1));
@@ -1333,7 +1312,8 @@ impl Optimization for OptPure {
             if let Some(d) = entry.descr.clone() {
                 imported_op.setdescr(d);
             }
-            self.short_preamble_pure_ops.push(imported_op);
+            self.short_preamble_pure_ops
+                .push(OpRc::new(imported_op));
             let resolved_args: Vec<OpRef> = entry
                 .args
                 .iter()
@@ -1364,7 +1344,7 @@ impl Optimization for OptPure {
         ctx: &mut OptContext,
     ) {
         for op in &self.short_preamble_pure_ops {
-            sb.add_pure_op(ctx, op.clone());
+            sb.add_pure_op(ctx, (**op).clone());
         }
     }
 }
@@ -1927,6 +1907,8 @@ mod tests {
         op0.pos().set(OpRef::int_op(2));
         let result0 = pass.propagate_forward(&op0, &OpRc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
+        assert!(pass.get_pure_result(&op0, &ctx).is_none());
+        pass.propagate_postprocess(&op0, &mut ctx);
 
         // Simulate: op1 = int_add(a, b) with same args
         let op1 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
@@ -1937,20 +1919,113 @@ mod tests {
     }
 
     #[test]
+    fn pure_history_does_not_merge_distinct_unregistered_producers() {
+        let ctx = OptContext::with_num_inputs(16, 0);
+        let mut pass = OptPure::new();
+        let make_arg = || {
+            let op = std::rc::Rc::new(Op::new(
+                OpCode::SameAsI,
+                &[Operand::const_from_value(Value::Int(7))],
+            ));
+            op.pos.set(OpRef::int_op(2));
+            Operand::from_bound_op(&op)
+        };
+        let first = make_arg();
+        let different = make_arg();
+        let op = Op::new(OpCode::IntNeg, &[first]);
+        op.pos.set(OpRef::int_op(4));
+        pass.pure(&op);
+        let query = Op::new(OpCode::IntNeg, &[different]);
+        assert_eq!(pass.get_pure_result(&query, &ctx), None);
+    }
+
+    #[test]
+    fn pure_history_retains_argument_boxes_and_observes_forwarding() {
+        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let mut pass = OptPure::new();
+        let a = ctx.materialize_operand_at(OpRef::int_op(2));
+        let b = ctx.materialize_operand_at(OpRef::int_op(3));
+        let op = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
+        op.pos.set(OpRef::int_op(4));
+        pass.pure(&op);
+        let stored = &pass.cache.bucket(OpCode::IntAdd).unwrap().lst[0]
+            .as_ref()
+            .unwrap()
+            .0
+            .args[0];
+        assert!(std::rc::Rc::ptr_eq(
+            &stored.bound_op().unwrap(),
+            &a.bound_op().unwrap(),
+        ));
+        ctx.make_constant_box(&a, Value::Int(7));
+        let query = Op::new(
+            OpCode::IntAdd,
+            &[Operand::const_from_value(Value::Int(7)), b],
+        );
+        assert_eq!(pass.get_pure_result(&query, &ctx), Some(OpRef::int_op(4)));
+    }
+
+    #[test]
+    fn commutative_lookup_resolves_each_stored_argument_once() {
+        let mut recent = RecentPureOps::new(4);
+        recent.insert(
+            PureOpKey {
+                opcode: OpCode::IntAdd,
+                args: smallvec::smallvec![
+                    Operand::const_from_value(Value::Int(2)),
+                    Operand::const_from_value(Value::Int(1))
+                ],
+                descr_identity: None,
+            },
+            OpRef::int_op(3),
+        );
+        let resolved = std::cell::Cell::new(0);
+        let result = recent.lookup2(
+            OpRef::const_int(1),
+            OpRef::const_int(2),
+            None,
+            true,
+            |arg| {
+                resolved.set(resolved.get() + 1);
+                arg.to_opref()
+            },
+            |query, stored| query == *stored,
+        );
+        assert_eq!(result, Some((OpCode::IntAdd, OpRef::int_op(3))));
+        assert_eq!(resolved.get(), 2);
+    }
+
+    #[test]
+    fn pure_keys_keep_unary_and_binary_arguments_inline() {
+        for arity in [1, 2, 8] {
+            let args: Vec<_> = (0..arity)
+                .map(|i| Operand::const_from_value(Value::Int(i)))
+                .collect();
+            let op = Op::new(OpCode::CallPureI, &args);
+            let key = PureOpKey::from_operand_op(&op);
+            assert_eq!(key.args.len(), arity as usize);
+            assert_eq!(key.args.spilled(), arity > 2);
+            for (i, arg) in key.args.iter().enumerate() {
+                assert_eq!(arg.to_opref(), OpRef::const_int(i as i64));
+            }
+        }
+    }
+
+    #[test]
     fn test_pure_op_key_equality() {
         let key1 = PureOpKey {
             opcode: OpCode::IntAdd,
-            args: vec![OpRef::int_op(0), OpRef::int_op(1)],
+            args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)],
             descr_identity: None,
         };
         let key2 = PureOpKey {
             opcode: OpCode::IntAdd,
-            args: vec![OpRef::int_op(0), OpRef::int_op(1)],
+            args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)],
             descr_identity: None,
         };
         let key3 = PureOpKey {
             opcode: OpCode::IntAdd,
-            args: vec![OpRef::int_op(1), OpRef::int_op(0)],
+            args: smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(0)],
             descr_identity: None,
         };
         assert_eq!(key1, key2);
@@ -2454,7 +2529,7 @@ mod tests {
         let x = OpRef::int_op(7);
         let x_box = ctx.materialize_operand_at(x);
         let x8_box = ctx.materialize_operand_at(OpRef::int_op(8));
-        pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
+        pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42), &mut ctx);
 
         let mut q = Op::new(
             OpCode::IntAdd,
@@ -2492,7 +2567,7 @@ mod tests {
         ctx.make_equal_to(&b_query.clone(), &b_canonical.clone());
         let b_other = ctx.materialize_operand_at(other_arg);
 
-        pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
+        pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result, &mut ctx);
 
         // Query op carries the canonical ctx boxes (query_arg forwards to
         // canonical_arg via make_equal_to) — no position-only mint.
@@ -2531,6 +2606,7 @@ mod tests {
             OpCode::IntMul,
             &[OpRef::int_op(30), OpRef::int_op(40)],
             OpRef::int_op(5),
+            &mut ctx,
         );
         let mut lookup_mul = Op::new(OpCode::IntMul, &[b30.clone(), b40.clone()]);
         lookup_mul.pos().set(OpRef::int_op(99));
@@ -2550,7 +2626,7 @@ mod tests {
         // lookup_known_result (which only searches known_result_call_pure).
         let key = super::PureOpKey {
             opcode: OpCode::CallPureI,
-            args,
+            args: smallvec::SmallVec::from_vec(args),
             descr_identity: None,
         };
         // Verify entries exist in extra_call_pure
@@ -2909,12 +2985,14 @@ mod tests {
     #[test]
     fn test_lookup1_lookup2() {
         let mut pass = OptPure::new();
+        let mut ctx = OptContext::with_num_inputs(64, 0);
 
         // Record via pure_from_args
         pass.pure_from_args(
             OpCode::IntAdd,
             &[OpRef::int_op(10), OpRef::int_op(20)],
             OpRef::int_op(30),
+            &mut ctx,
         );
 
         // same_box: identity comparison (no constants, no forwarding)
@@ -2957,7 +3035,12 @@ mod tests {
         );
 
         // lookup1 for a unary op
-        pass.pure_from_args(OpCode::IntNeg, &[OpRef::int_op(10)], OpRef::int_op(40));
+        pass.pure_from_args(
+            OpCode::IntNeg,
+            &[OpRef::int_op(10)],
+            OpRef::int_op(40),
+            &mut ctx,
+        );
         assert!(
             pass.lookup1(OpCode::IntNeg, OpRef::int_op(10), None, sb)
                 .is_some()
