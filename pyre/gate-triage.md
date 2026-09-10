@@ -382,7 +382,7 @@ It goes when the flag carries its own provenance.
 
 `PYRE_PORTAL_METATRACE` drives one metainterp-owned walk over the build-time
 jd0 portal jitcode after the selected admitted back-edge and prints the
-`[jd0-mt]` summary. It requires a `PYRE_PORTAL_SPLIT=1` build. An aborted walk
+`[jd0-mt]` summary. An aborted walk
 finishes its live MIFrames through the blackhole before returning to the
 native portal; an incomplete generated instruction is a failed probe, not
 permission to replay its Python opcode. Terminal-return and compiled-exit

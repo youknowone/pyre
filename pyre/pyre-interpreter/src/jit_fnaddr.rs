@@ -44,6 +44,9 @@ residual_scalar!(
 /// `OpArg` is `#[repr(transparent)] struct OpArg(u32)` — one word.
 impl ResidualSlot for rustpython_compiler_core::bytecode::OpArg {}
 
+/// `LoadAttr` is `#[repr(transparent)] struct LoadAttr(u32)` — one word.
+impl ResidualSlot for rustpython_compiler_core::bytecode::oparg::LoadAttr {}
+
 /// `Arg<T>` is the zero-sized oparg marker (`struct Arg<T>(PhantomData<T>)`).
 /// It consumes no slot at all rather than one: a zero-sized parameter is not
 /// passed in the Rust ABI, and the codewriter classifies it `Type::Void`,
@@ -919,11 +922,81 @@ fn residual_cast_int_to_ptr(value: i64) -> *const u8 {
     value as *const u8
 }
 
+/// Word-ABI wrapper for `classify_callable`: Result lowering already
+/// advertises `(r) -> i`, so the residual/inline call must return the
+/// `CallableKind` discriminant and publish `PyError` on `BH_LAST_EXC_VALUE`.
+fn jit_classify_callable(callable: pyre_object::PyObjectRef) -> i64 {
+    match crate::runtime_ops::classify_callable(callable) {
+        Ok(crate::runtime_ops::CallableKind::Builtin) => 0,
+        Ok(crate::runtime_ops::CallableKind::User) => 1,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
+}
+
+/// `pyopcode.py _load_global_failed` raises. The residual ABI cannot return
+/// `PyError` by value; publish the exception object and answer the void-word.
+fn jit_load_global_failed(w_varname: pyre_object::PyObjectRef) -> i64 {
+    crate::runtime_ops::jit_publish_residual_error(crate::eval::load_global_failed(w_varname))
+}
+
+/// `getitem_list` is `(r, r) -> r` once `PyResult` is erased.
+unsafe fn jit_getitem_list(
+    obj: pyre_object::PyObjectRef,
+    index: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    match crate::baseobjspace::getitem_list(obj, index) {
+        Ok(value) => value,
+        Err(error) => {
+            crate::runtime_ops::jit_publish_residual_error(error);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// `rbuilder.py` `StringBuilder` default `init_size=100`, STR item size 1.
+fn jit_stringbuilder_new() -> i64 {
+    pyre_object::rbuilder::rbuilder_runtime::ll_new(100, 1)
+}
+
 /// [`jit_trace_fnaddrs`] and the [`is_abi_unsound_argument_residual`] set,
 /// which the publication sites fill in one pass.
 fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     let mut entries = Vec::new();
     let mut abi_unsound_arguments = Vec::new();
+
+    // `LoadAttr` is a transparent u32; `name_idx` is a shift. Publish the
+    // inherent method so a residual CALL is a real function pointer.
+    p1(
+        &mut entries,
+        "bytecode::oparg::LoadAttr::name_idx",
+        rustpython_compiler_core::bytecode::oparg::LoadAttr::name_idx,
+    );
+    p1(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::classify_callable",
+        jit_classify_callable,
+    );
+    p1(
+        &mut entries,
+        "pyre_interpreter::eval::load_global_failed",
+        jit_load_global_failed,
+    );
+    up2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::getitem_list",
+        jit_getitem_list,
+    );
+    p0(
+        &mut entries,
+        "__majit_stringbuilder_new",
+        jit_stringbuilder_new,
+    );
+    pa1(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_current_object_address",
+        "pyre_object::try_gc_current_object_address",
+        pyre_object::gc_hook::try_gc_current_object_address,
+    );
 
     // `eval::FrameAnchor` is interpreter runtime rooting, outside the LLBC
     // module set.  `majit-translate` declares these three functions through
@@ -2533,6 +2606,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_mul",
+        crate::objspace::descroperation::jit_bigint_mul,
+    );
+    // The MIR front residualizes the source `bigint_mul` path; the word-ABI
+    // payload is the same `jit_bigint_mul` already published above.
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::bigint_mul",
         crate::objspace::descroperation::jit_bigint_mul,
     );
     cp2(

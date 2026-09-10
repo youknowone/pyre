@@ -3035,7 +3035,7 @@ impl NamespaceOpcodeHandler for PyFrame {
 /// `stroruni.concat` out of the inlined lookup graph: a borrowed `&str`
 /// name is two words and a residual concat would see a null GCREF.
 #[majit_macros::dont_look_inside]
-fn load_global_failed(w_varname: PyObjectRef) -> PyError {
+pub(crate) fn load_global_failed(w_varname: PyObjectRef) -> PyError {
     let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_varname) };
     PyError::name_error_with_name_obj(format!("name '{name}' is not defined"), w_varname)
 }

@@ -12655,29 +12655,40 @@ fn interpret_unresolved_inline_call(
             bh.got_exception = true;
             break 'callee Err(DispatchError::LeaveFrame);
         }
-        if let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() {
-            let caller_dst = dest.map(|(_, dst)| dst).expect(
-                "inline_call interpret: callee returns a value but the caller \
-                 declared no destination",
-            );
-            match return_kind {
-                JitArgKind::Int => {
-                    bh.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
-                }
-                JitArgKind::Ref => {
-                    bh.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
-                }
-                JitArgKind::Float => {
-                    bh.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
-                }
+        // `bhimpl_int_return` wrote `tmpreg_*` and `_return_type` before
+        // `LeaveFrame`. A helper body can encode its exceptblock after the
+        // return opcode, so the last two bytes of the stream are not a typed
+        // return; the opcode that actually ran is. `_setup_return_value_*`.
+        match callee.return_type {
+            BhReturnType::Int => {
+                let caller_dst = dest.map(|(_, dst)| dst).expect(
+                    "inline_call interpret: callee returned Int but the caller \
+                     declared no destination",
+                );
+                bh.registers_i[caller_dst] = callee.tmpreg_i;
             }
-        } else {
-            assert!(
-                dest.is_none(),
-                "inline_call interpret: callee jitcode {:?} ends without a \
-                 typed return, but the caller declared dest {dest:?}",
-                callee.jitcode.name,
-            );
+            BhReturnType::Ref => {
+                let caller_dst = dest.map(|(_, dst)| dst).expect(
+                    "inline_call interpret: callee returned Ref but the caller \
+                     declared no destination",
+                );
+                bh.registers_r[caller_dst] = callee.tmpreg_r;
+            }
+            BhReturnType::Float => {
+                let caller_dst = dest.map(|(_, dst)| dst).expect(
+                    "inline_call interpret: callee returned Float but the caller \
+                     declared no destination",
+                );
+                bh.registers_f[caller_dst] = callee.tmpreg_f;
+            }
+            BhReturnType::Void => {
+                assert!(
+                    dest.is_none(),
+                    "inline_call interpret: callee jitcode {:?} returned void, \
+                     but the caller declared dest {dest:?}",
+                    callee.jitcode.name,
+                );
+            }
         }
         Ok(post_p)
     };
@@ -13426,32 +13437,30 @@ fn handler_inline_call_nested_ext(
             break 'callee Err(DispatchError::LeaveFrame);
         }
 
-        let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() else {
-            // No trailing return opcode means the callee produced no value.
-            // The caller emitted `NO_RETURN_REG` as the single dest byte
-            // (`inline_call_*_v`).  A real dest here names a register
-            // nothing will write.
-            assert!(
-                dest.is_none(),
-                "inline_call: callee jitcode {:?} index {:?} ends without a \
-                 typed return opcode, but the caller declared dest {dest:?}",
-                callee.jitcode.name,
-                callee.jitcode.try_index(),
-            );
-            break 'callee Ok(p);
-        };
-        {
-            let caller_dst = dest.expect("inline return missing caller destination");
-            match return_kind {
-                JitArgKind::Int => {
-                    bh.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
-                }
-                JitArgKind::Ref => {
-                    bh.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
-                }
-                JitArgKind::Float => {
-                    bh.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
-                }
+        // The executed `*_return` wrote `tmpreg_*`. `trailing_return_info`
+        // looks at the last two bytes, which is the exceptblock `reraise`
+        // after a successful `int_return`. `_setup_return_value_*`.
+        match callee.return_type {
+            BhReturnType::Int => {
+                let caller_dst = dest.expect("inline return missing caller destination");
+                bh.registers_i[caller_dst] = callee.tmpreg_i;
+            }
+            BhReturnType::Ref => {
+                let caller_dst = dest.expect("inline return missing caller destination");
+                bh.registers_r[caller_dst] = callee.tmpreg_r;
+            }
+            BhReturnType::Float => {
+                let caller_dst = dest.expect("inline return missing caller destination");
+                bh.registers_f[caller_dst] = callee.tmpreg_f;
+            }
+            BhReturnType::Void => {
+                assert!(
+                    dest.is_none(),
+                    "inline_call: callee jitcode {:?} index {:?} returned void, \
+                     but the caller declared dest {dest:?}",
+                    callee.jitcode.name,
+                    callee.jitcode.try_index(),
+                );
             }
         }
 
