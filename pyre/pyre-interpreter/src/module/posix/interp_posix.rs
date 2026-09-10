@@ -6372,6 +6372,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
         let result = scandir_iter_next_entry(self_obj);
         scandir_iter_release_next(self_obj);
+        // interp_scandir.py `fail()` → `_close()` when `nextentry` is exhausted.
+        // `_close` is what makes `_finalize_` a no-op; `may_ignore_finalizer`
+        // is the same answer the prompt-finalization census needs so a
+        // consumer still holding the iterator (`os.fwalk` after its
+        // `for entry` loop) does not pay a whole-heap collect on `gen.close()`.
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.matches_stop_iteration())
+        {
+            scandir_iter_mark_closed(self_obj);
+        }
         result
     }
     fn scandir_iter_is_open(self_obj: PyObjectRef) -> bool {
