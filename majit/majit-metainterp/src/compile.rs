@@ -3529,13 +3529,13 @@ impl FailDescr for ResumeAtPositionDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.payload.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.payload.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.inner.payload.set_rd_numb(value)
     }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
     fn rd_consts(&self) -> Option<&[Const]> {
@@ -3804,13 +3804,13 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.payload.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.payload.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.inner.payload.set_rd_numb(value)
     }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
     fn rd_consts(&self) -> Option<&[Const]> {
@@ -4060,13 +4060,13 @@ impl FailDescr for ResumeGuardExcDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.payload.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.payload.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.inner.payload.set_rd_numb(value)
     }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
     fn rd_consts(&self) -> Option<&[Const]> {
@@ -4494,7 +4494,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.prev().as_fail_descr().and_then(|fd| fd.rd_numb())
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.prev().as_fail_descr().and_then(|fd| fd.rd_numb_arc())
     }
     fn set_rd_numb(&self, _value: Option<Vec<u8>>) {
@@ -4802,7 +4802,7 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
@@ -5240,13 +5240,13 @@ impl FailDescr for CompileLoopVersionDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.payload.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.payload.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.inner.payload.set_rd_numb(value)
     }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
     fn rd_consts(&self) -> Option<&[Const]> {

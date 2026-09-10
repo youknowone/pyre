@@ -3967,11 +3967,11 @@ pub trait FailDescr: Descr {
     }
 
     /// `compile.py self.rd_numb = other.rd_numb` parity: the
-    /// reference-share variant of `rd_numb()`.  `Arc<[u8]>` lets
+    /// reference-share variant of `rd_numb()`.  `NumberingRef` lets
     /// `copy_all_attributes_from` clone the donor's payload with a
     /// single refcount bump rather than allocating a fresh buffer.
     /// Returns `None` for non-resume descrs.
-    fn rd_numb_arc(&self) -> Option<std::sync::Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<crate::NumberingRef> {
         None
     }
 
@@ -3989,7 +3989,7 @@ pub trait FailDescr: Descr {
     /// `compile.py self.rd_numb = other.rd_numb` reference-share
     /// setter.  Default panics for non-resume descrs (same contract as
     /// `set_rd_numb`).
-    fn set_rd_numb_arc(&self, _value: Option<std::sync::Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, _value: Option<crate::NumberingRef>) {
         panic!(
             "set_rd_numb_arc invoked on a FailDescr that does not \
              carry rd_numb (compile.py:855 `_attrs_` only on \

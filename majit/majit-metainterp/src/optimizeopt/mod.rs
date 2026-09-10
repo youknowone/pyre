@@ -118,8 +118,8 @@ impl IntoIterator for ExtraQueue {
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;
 /// this adapter copies OpRefs into a side table. A six-box list is one
 /// 96 B `Layout::array` (`SnapshotBox` is one `OpRef`); twelve boxes
-/// mint from the chunked slab instead. `create_numbering_arc` remains
-/// the leftover 96 B site (`resumecode.create_numbering` /
+/// mint from the chunked slab instead. `create_numbering_arc` mints a
+/// `NumberingRef` slab cell (`resumecode.create_numbering` /
 /// `lltype.malloc(NUMBERING)`).
 const SNAP_LIST_SLAB: usize = 12;
 const SNAP_LIST_SLAB_BYTES: usize = SNAP_LIST_SLAB * std::mem::size_of::<SnapshotBox>();

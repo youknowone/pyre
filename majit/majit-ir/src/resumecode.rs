@@ -162,16 +162,17 @@ impl Writer {
         buf
     }
 
-    /// Encode onto the stack when the numbering fits, then one `Arc` copy.
-    /// Avoids the 64 B `Vec` that `create_numbering` used to hand to
-    /// `set_rd_numb` for a second 64 B `Arc`.
-    pub fn create_numbering_arc(&self) -> std::sync::Arc<[u8]> {
+    /// Encode onto the stack when the numbering fits, then one slab cell.
+    /// `lltype.malloc(NUMBERING)` is one GC object; a per-guard `Arc<[u8]>`
+    /// was a 96 B class. Cells come from a chunked slab so identity is
+    /// still a pointer.
+    pub fn create_numbering_arc(&self) -> NumberingRef {
         let mut buf = smallvec::SmallVec::<[u8; 128]>::new();
         for &item in &self.current {
             let (bytes, n) = encode_varint_bytes(item);
             buf.extend_from_slice(&bytes[..n]);
         }
-        std::sync::Arc::from(buf.as_slice())
+        NumberingRef::from_bytes(&buf)
     }
 
     /// resumecode.py: patch_current_size
@@ -230,6 +231,179 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// One `NUMBERING` object. Small payloads live in a chunked slab so
+/// `create_numbering` does not mint a 96 B `Arc<[u8]>` per guard.
+const NUMB_DATA: usize = 80;
+const NUMB_CHUNK: usize = 256;
+
+struct NumbCell {
+    refs: std::sync::atomic::AtomicUsize,
+    len: u16,
+    bytes: [u8; NUMB_DATA],
+}
+
+struct NumbHeap {
+    chunks: Vec<(*mut NumbCell, usize)>,
+    free: Vec<*mut NumbCell>,
+}
+
+unsafe impl Send for NumbHeap {}
+
+impl NumbHeap {
+    const fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self, bytes: &[u8]) -> *mut NumbCell {
+        debug_assert!(bytes.len() <= NUMB_DATA);
+        let cell = if let Some(cell) = self.free.pop() {
+            cell
+        } else {
+            self.fresh_cell()
+        };
+        unsafe {
+            (*cell).refs.store(1, std::sync::atomic::Ordering::Relaxed);
+            (*cell).len = bytes.len() as u16;
+            (&mut (*cell).bytes)[..bytes.len()].copy_from_slice(bytes);
+        }
+        cell
+    }
+
+    fn fresh_cell(&mut self) -> *mut NumbCell {
+        if let Some((ptr, used)) = self.chunks.last_mut() {
+            if *used < NUMB_CHUNK {
+                let cell = unsafe { (*ptr).add(*used) };
+                *used += 1;
+                return cell;
+            }
+        }
+        let layout = std::alloc::Layout::array::<NumbCell>(NUMB_CHUNK).expect("numb slab");
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut NumbCell };
+        assert!(!ptr.is_null(), "numb slab alloc");
+        self.chunks.push((ptr, 1));
+        ptr
+    }
+
+    fn release(&mut self, cell: *mut NumbCell) {
+        self.free.push(cell);
+    }
+}
+
+static NUMB_HEAP: std::sync::Mutex<NumbHeap> = std::sync::Mutex::new(NumbHeap::new());
+
+/// Handle for a `NUMBERING` buffer. Clone is a refcount bump.
+#[derive(Debug)]
+pub struct NumberingRef {
+    inner: NumberingInner,
+}
+
+#[derive(Debug)]
+enum NumberingInner {
+    Slab(std::ptr::NonNull<NumbCell>),
+    Heap(std::sync::Arc<[u8]>),
+}
+
+unsafe impl Send for NumberingRef {}
+unsafe impl Sync for NumberingRef {}
+
+impl NumberingRef {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        if bytes.len() <= NUMB_DATA {
+            let cell = NUMB_HEAP
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .alloc(bytes);
+            Self {
+                inner: NumberingInner::Slab(std::ptr::NonNull::new(cell).expect("numb cell")),
+            }
+        } else {
+            Self {
+                inner: NumberingInner::Heap(std::sync::Arc::from(bytes)),
+            }
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.inner {
+            NumberingInner::Slab(ptr) => unsafe {
+                let cell = ptr.as_ref();
+                &cell.bytes[..cell.len as usize]
+            },
+            NumberingInner::Heap(arc) => arc.as_ref(),
+        }
+    }
+
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        match (&a.inner, &b.inner) {
+            (NumberingInner::Slab(x), NumberingInner::Slab(y)) => x.as_ptr() == y.as_ptr(),
+            (NumberingInner::Heap(x), NumberingInner::Heap(y)) => std::sync::Arc::ptr_eq(x, y),
+            _ => false,
+        }
+    }
+}
+
+impl Clone for NumberingRef {
+    fn clone(&self) -> Self {
+        match &self.inner {
+            NumberingInner::Slab(ptr) => {
+                unsafe {
+                    (*ptr.as_ptr())
+                        .refs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Self {
+                    inner: NumberingInner::Slab(*ptr),
+                }
+            }
+            NumberingInner::Heap(arc) => Self {
+                inner: NumberingInner::Heap(std::sync::Arc::clone(arc)),
+            },
+        }
+    }
+}
+
+impl Drop for NumberingRef {
+    fn drop(&mut self) {
+        if let NumberingInner::Slab(ptr) = self.inner {
+            let prev = unsafe {
+                (*ptr.as_ptr())
+                    .refs
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release)
+            };
+            if prev == 1 {
+                NUMB_HEAP
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .release(ptr.as_ptr());
+            }
+        }
+    }
+}
+
+impl PartialEq for NumberingRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for NumberingRef {}
+
+impl AsRef<[u8]> for NumberingRef {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::Deref for NumberingRef {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +431,27 @@ mod tests {
     #[test]
     fn decode_varint_two_and_three_byte_items() {
         roundtrip(&[64, -64, 127, -128, 8191, -8192, 16383, -16384]);
+    }
+
+    #[test]
+    fn numbering_ref_slab_shares_identity() {
+        let mut w = Writer::new(8);
+        for i in 0..20 {
+            w.append_int(i);
+        }
+        let a = w.create_numbering_arc();
+        let b = a.clone();
+        assert!(NumberingRef::ptr_eq(&a, &b));
+        assert_eq!(a.as_slice(), b.as_slice());
+        assert_eq!(a.as_slice(), w.create_numbering());
+    }
+
+    #[test]
+    fn numbering_ref_large_payload_round_trips() {
+        let bytes = vec![0x5a; NUMB_DATA + 8];
+        let a = NumberingRef::from_bytes(&bytes);
+        assert_eq!(a.as_slice(), bytes.as_slice());
+        let b = a.clone();
+        assert!(NumberingRef::ptr_eq(&a, &b));
     }
 }

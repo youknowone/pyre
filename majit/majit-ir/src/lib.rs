@@ -50,6 +50,7 @@ pub use resoperation::{
     AbstractValue, ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT,
     Op, OpCode, OpRc, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
+pub use resumecode::NumberingRef;
 pub use value::{
     CallArgWord, CallResultWord, Const, FAILARGS_LIMIT, GREEN_UHASH_MULT, GREEN_UHASH_SEED, GcRef,
     GreenAsI64, GreenKey, GreenType, InputArg, InputArgRc, JitDriverVar, RefCurrentFn,

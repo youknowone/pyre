@@ -274,7 +274,7 @@ impl NumberingState {
     pub fn create_numbering(&self) -> Vec<u8> {
         self.writer.create_numbering()
     }
-    pub fn create_numbering_arc(&self) -> Arc<[u8]> {
+    pub fn create_numbering_arc(&self) -> majit_ir::NumberingRef {
         self.writer.create_numbering_arc()
     }
 }
@@ -676,7 +676,7 @@ impl<T> std::ops::Deref for SharedResumeSlice<T> {
 pub struct ResumeStorage {
     /// resume.py:466 `storage.rd_numb` — packed byte stream (NUMBERING
     /// lltype equivalent). Immutable once installed.
-    pub rd_numb: Arc<[u8]>,
+    pub rd_numb: majit_ir::NumberingRef,
     /// resume.py:467 `storage.rd_consts` — shared constant pool.
     ///
     /// Interior mutability: the minor-collection root walker visits
@@ -830,7 +830,7 @@ impl ResumeStorage {
         rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) -> Arc<Self> {
         Arc::new(ResumeStorage {
-            rd_numb: Arc::from(rd_numb),
+            rd_numb: majit_ir::NumberingRef::from_bytes(&rd_numb),
             rd_consts: majit_ir::SharedConstPool::new(rd_consts),
             rd_virtuals: rd_virtuals.into(),
             rd_pendingfields: rd_pendingfields.into(),
@@ -909,7 +909,7 @@ impl ResumeStorage {
     }
 
     pub fn with_shared_consts(
-        rd_numb: Arc<[u8]>,
+        rd_numb: majit_ir::NumberingRef,
         rd_consts: Arc<majit_ir::SharedConstPool>,
         rd_virtuals: Option<Arc<[std::rc::Rc<majit_ir::RdVirtualInfo>]>>,
         rd_pendingfields: Option<Arc<[majit_ir::GuardPendingFieldEntry]>>,
@@ -4582,7 +4582,7 @@ impl ResumeDataLoopMemo {
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
     ) -> Result<
         (
-            Arc<[u8]>,
+            majit_ir::NumberingRef,
             Arc<majit_ir::SharedConstPool>,
             Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
             Vec<majit_ir::OpRef>,
@@ -8719,10 +8719,24 @@ pub fn blackhole_from_resumedata<'a>(
     // already built the virtuals and applied the pending fields; redoing
     // either would rebuild the objects it handed to the interpreter and
     // replay its heap writes.
+    let empty_pending = rd_guard_pendingfields.is_none_or(|p| p.is_empty());
+    let empty_virtuals = rd_virtuals.is_none_or(|v| v.is_empty());
     let _resume_roots = if resuming_after_guard_not_forced {
-        prepare_resume_heap_with_roots(&mut resumereader, None, None)
+        Some(prepare_resume_heap_with_roots(
+            &mut resumereader,
+            None,
+            None,
+        ))
+    } else if empty_virtuals && empty_pending {
+        // regex leaf: nvirtuals=0 and no pending fields. Skip the
+        // empty `VirtualCache` root and the pending-field walk.
+        None
     } else {
-        prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, rd_guard_pendingfields)
+        Some(prepare_resume_heap_with_roots(
+            &mut resumereader,
+            rd_virtuals,
+            rd_guard_pendingfields,
+        ))
     };
 
     // resume.py:1325

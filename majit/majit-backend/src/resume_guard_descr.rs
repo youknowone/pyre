@@ -452,13 +452,13 @@ impl FailDescr for ResumeGuardDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.payload.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.payload.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.payload.set_rd_numb(value)
     }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.payload.set_rd_numb_arc(value)
     }
     fn rd_consts(&self) -> Option<&[Const]> {

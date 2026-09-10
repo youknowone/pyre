@@ -9,7 +9,7 @@ use std::cell::UnsafeCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use majit_ir::{Const, GuardPendingFieldEntry, RdVirtualInfo, SharedConstPool};
+use majit_ir::{Const, GuardPendingFieldEntry, NumberingRef, RdVirtualInfo, SharedConstPool};
 
 /// Resume-payload backing store for ResumeGuardDescr (`compile.py`).
 ///
@@ -28,7 +28,7 @@ use majit_ir::{Const, GuardPendingFieldEntry, RdVirtualInfo, SharedConstPool};
 /// (rare) write.
 #[derive(Debug)]
 pub struct RdPayload {
-    rd_numb: UnsafeCell<Option<Arc<[u8]>>>,
+    rd_numb: UnsafeCell<Option<NumberingRef>>,
     rd_consts: UnsafeCell<Option<Arc<SharedConstPool>>>,
     rd_virtuals: UnsafeCell<Option<Arc<[Rc<RdVirtualInfo>]>>>,
     rd_pendingfields: UnsafeCell<Option<Arc<[GuardPendingFieldEntry]>>>,
@@ -55,7 +55,7 @@ impl RdPayload {
     /// `RdPayload` whose four slots share `Arc<[T]>` refcounts with a
     /// donor descr, matching RPython's reference-share semantics.
     pub fn from_arcs(
-        rd_numb: Option<Arc<[u8]>>,
+        rd_numb: Option<NumberingRef>,
         rd_consts: Option<Arc<SharedConstPool>>,
         rd_virtuals: Option<Arc<[Rc<RdVirtualInfo>]>>,
         rd_pendingfields: Option<Arc<[GuardPendingFieldEntry]>>,
@@ -89,13 +89,13 @@ impl RdPayload {
     pub fn rd_numb(&self) -> Option<&[u8]> {
         unsafe { (*self.rd_numb.get()).as_deref() }
     }
-    pub fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    pub fn rd_numb_arc(&self) -> Option<NumberingRef> {
         unsafe { (*self.rd_numb.get()).clone() }
     }
     pub fn set_rd_numb(&self, value: Option<Vec<u8>>) {
-        unsafe { *self.rd_numb.get() = value.map(Arc::from) }
+        unsafe { *self.rd_numb.get() = value.map(|v| NumberingRef::from_bytes(&v)) }
     }
-    pub fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    pub fn set_rd_numb_arc(&self, value: Option<NumberingRef>) {
         unsafe { *self.rd_numb.get() = value }
     }
 

@@ -132,9 +132,9 @@ impl Op {
 
     /// `compile.py ResumeGuardCopiedDescr.get_resumestorage(): return prev`
     /// parity. Reads `rd_numb` from `op.descr` — `ResumeGuardCopiedDescr`
-    /// chases `prev` automatically.  Returns `Arc<[u8]>` so the slice
+    /// chases `prev` automatically.  Returns `NumberingRef` so the slice
     /// stays valid once the borrow on `op.descr` drops.
-    pub fn resolved_rd_numb(&self) -> Option<Arc<[u8]>> {
+    pub fn resolved_rd_numb(&self) -> Option<crate::NumberingRef> {
         self.descr.borrow().as_ref()?.as_fail_descr()?.rd_numb_arc()
     }
 
