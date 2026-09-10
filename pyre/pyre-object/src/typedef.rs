@@ -75,6 +75,9 @@ pub struct TypeDef {
     /// typeobject.py `typedef.flag_sequence_bug_compat`. Copied onto the
     /// W_TypeObject by TypeCache.build; not inherited by subclasses.
     pub flag_sequence_bug_compat: bool,
+    /// TypeDef.__init__: `self.heaptype = False`. TypeCache.build passes
+    /// `is_heaptype=overridetypedef.heaptype` into W_TypeObject.__init__.
+    pub heaptype: bool,
 }
 
 impl TypeDef {
@@ -96,6 +99,7 @@ impl TypeDef {
             hasdict,
             method_descriptor: false,
             flag_sequence_bug_compat: false,
+            heaptype: false,
         }
     }
 

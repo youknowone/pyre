@@ -109,6 +109,9 @@ impl TypeCache {
             w_type_set_hasdict(w_type, definition.hasdict);
             w_type_set_weakrefable(w_type, definition.weakrefable);
             w_type_set_flag_sequence_bug_compat(w_type, definition.flag_sequence_bug_compat);
+            // typeobject.py TypeCache.build: `is_heaptype=overridetypedef.heaptype`.
+            w_type_set_heaptype(w_type, definition.heaptype);
+            w_type_set_acceptable_as_base_class(w_type, definition.acceptable_as_base_class());
             crate::baseobjspace::compute_and_set_mro(w_type).map_err(CacheError::Build)?;
             let best = crate::call::find_best_base(gc_roots::shadow_stack_get(bases_slot))
                 .map_err(CacheError::Build)?;
@@ -237,6 +240,27 @@ mod tests {
             (*flagged).flag_sequence_bug_compat = true;
             let flagged = ObjSpace::new().gettypeobject(flagged).unwrap();
             assert!(crate::baseobjspace::flag_sequence_bug_compat(flagged));
+        }
+    }
+
+    #[test]
+    fn typecache_build_copies_heaptype_and_acceptable_as_base_class() {
+        crate::typedef::init_typeobjects();
+        unsafe {
+            let definition =
+                TypeDef::from_rawdict("NoNew", vec![], IndexMap::new(), &INSTANCE_TYPE);
+            let w_type = ObjSpace::new().gettypeobject(definition).unwrap();
+            assert!(!w_type_is_heaptype(w_type));
+            assert!(!(*definition).acceptable_as_base_class());
+            assert!(!w_type_get_acceptable_as_base_class(w_type));
+
+            let heap = TypeDef::from_rawdict("HeapDecl", vec![], IndexMap::new(), &INSTANCE_TYPE)
+                as *mut TypeDef;
+            (*heap).heaptype = true;
+            (*heap).set_acceptable_as_base_class(true);
+            let heap = ObjSpace::new().gettypeobject(heap).unwrap();
+            assert!(w_type_is_heaptype(heap));
+            assert!(w_type_get_acceptable_as_base_class(heap));
         }
     }
 
