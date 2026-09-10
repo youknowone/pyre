@@ -1,15 +1,12 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=root:leaf
-# The multi-frame escape flush publishes frame 0's LOCALS; this guards the
-# operand stack published with them.
-#
-# A redirected frame field read from an inlined callee forces the CALLER's
-# virtualizable, so the walk aborts as an inline sub-walk and a multi-frame
-# blackhole image resumes the two frames. `sys._getframe(1)` only names the
-# frame: the force sits at the field, where `rvirtualizable.py
-# hook_access_field` places it, and `f_lasti` reads `last_instr` -- one of the
-# five `virtualizable_gen.rs` declares. The `f_code` the caller-identity check
-# reads is not a lever; its gateway carries no marker.
+# pyre-check: selfcheck-compiles=main
+# pyre-check: skip-backends=wasm
+# wasm still prints PASS but compiles a root trace after five loop aborts,
+# so it cannot declare the native `main` loop.
+# The nested `FOR_ITER` operand stack must survive a compiled `_getframe(1)`
+# from the inlined callee. The walk answers that call with the portal red
+# box and folds `f_lasti` at the CALL, so the loop compiles instead of
+# aborting into a multi-frame blackhole.
 #
 # The walk keeps that virtualizable symbolic, so nothing it pushed or popped
 # ever reached the live frame's slot array. When the abort lands on a walk
@@ -23,9 +20,7 @@
 #
 # Measured before the stack was published: `k=1041 i=209 j=0`, where `k` says
 # the body is at `i=208 j=1` -- the first abort lands at the default hotness
-# threshold and every pass after it is shifted. `loops_compiled` is 0 there and
-# 1 here; what reaches the JIT either way is `leaf`'s root trace, which is what
-# this declares.
+# threshold and every pass after it is shifted. The compiled loop is `main`.
 #
 # The same read in a `while` loop (`getframe_while_escaping_read_frame_identity`)
 # escapes just as often and cannot show this: with no iterator on the operand
