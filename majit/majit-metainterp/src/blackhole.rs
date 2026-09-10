@@ -105,11 +105,29 @@ pub type BhOpcodeHandler =
 /// Named (not a closure) so `unwired_opnames()` can compare fn pointers
 /// reliably — closures get a fresh anonymous type per call site.
 fn unwired_handler_placeholder(
-    _bh: &mut BlackholeInterpreter,
+    bh: &mut BlackholeInterpreter,
     _code: &[u8],
     _position: usize,
 ) -> Result<usize, DispatchError> {
-    panic!("missing bhimpl for opcode (use wire_handler to register)")
+    // Grain never installs MiniMark. A walk that inlined a helper
+    // (`malformed`) and aborted leaves the blackhole on that helper
+    // body; those Charon-lowered opcodes are not in this table.
+    // Leave to the portal merge point rather than panic. Hosts that
+    // registered a MemoryError provider still fail loud.
+    if majit_backend::memory_error_singleton_ref() == 0 {
+        return Err(DispatchError::LeaveFrame);
+    }
+    panic!(
+        "dispatch_step: unwired opcode pos={} entry={} table_len={} \
+         jitcode={:?} index={:?} startpoint={} — extend the builder's \
+         setup_insns to cover this opname",
+        bh.last_opcode_position,
+        bh.entry_position,
+        bh.dispatch_table.len(),
+        bh.jitcode.name,
+        bh.jitcode.try_index(),
+        bh.jitcode.is_valid_startpoint(bh.last_opcode_position),
+    )
 }
 
 /// Return type of a blackhole frame.
@@ -584,7 +602,10 @@ impl Default for BlackholeInterpreter {
             virtualizable_info: std::ptr::null(),
             jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
             virtualizable_stack_base: 0,
-            dispatch_table: std::sync::Arc::new(Vec::new()),
+            dispatch_table: std::sync::Arc::new(vec![
+                unwired_handler_placeholder as BhOpcodeHandler;
+                256
+            ]),
             inline_callee_scratch: None,
             native_inline_args_i_scratch: Vec::new(),
             native_inline_args_r_scratch: Vec::new(),
@@ -1876,38 +1897,11 @@ impl BlackholeInterpreter {
     /// and return the post-operand position; we then store it back into
     /// `self.position`.
     fn dispatch_step(&mut self, opcode: u8, code: &[u8]) -> Result<(), DispatchError> {
-        let handler = self
-            .dispatch_table
-            .get(opcode as usize)
-            .copied()
-            .unwrap_or(unwired_handler_placeholder);
-        if handler as *const () as usize == unwired_handler_placeholder as *const () as usize {
-            // RPython parity (`blackhole.py setup_insns`
-            // resolving every key via `_get_method`): a missing handler
-            // is `AttributeError` at builder-construction time.  pyre
-            // hits this branch only when a builder has not registered
-            // every BC_* it intends to emit.
-            //
-            // Grain never installs MiniMark. A walk that inlined a helper
-            // (`malformed`) and aborted leaves the blackhole on that helper
-            // body; those Charon-lowered opcodes are not in this table.
-            // Leave to the portal merge point rather than panic. Hosts that
-            // registered a MemoryError provider still fail loud.
-            if majit_backend::memory_error_singleton_ref() == 0 {
-                return Err(DispatchError::LeaveFrame);
-            }
-            panic!(
-                "dispatch_step: unwired opcode={opcode:#x} pos={} entry={} \
-                 table_len={} jitcode={:?} index={:?} startpoint={} — extend the \
-                 builder's setup_insns to cover this opname",
-                self.last_opcode_position,
-                self.entry_position,
-                self.dispatch_table.len(),
-                self.jitcode.name,
-                self.jitcode.try_index(),
-                self.jitcode.is_valid_startpoint(self.last_opcode_position),
-            );
-        }
+        // `blackhole.py dispatch_loop`: `self.dispatch_table[opcode_byte](...)`.
+        // The table is 256 slots (`setup_insns`), so a u8 index cannot miss.
+        // Unwired bytes are the placeholder, which LeaveFrames on Grain and
+        // panics when a MemoryError provider is registered.
+        let handler = self.dispatch_table[opcode as usize];
         match handler(self, code, self.position) {
             Ok(new_pos) => {
                 self.position = new_pos;
@@ -2404,7 +2398,10 @@ impl BlackholeInterpBuilder {
             op_rvmprof_code: majit_translate::insns::BC_ABSENT,
             // blackhole.py `EMPTY_LIST_I = [] # shared`.
             descrs: EMPTY_DESCR_TABLE,
-            dispatch_table: std::sync::Arc::new(Vec::new()),
+            dispatch_table: std::sync::Arc::new(vec![
+                unwired_handler_placeholder as BhOpcodeHandler;
+                256
+            ]),
             jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
         }
     }
@@ -2465,27 +2462,11 @@ impl BlackholeInterpBuilder {
         assert!(insns.len() <= 256, "too many instructions!");
         // RPython blackhole.py:68-71: build reverse table.
         //
-        // TODO: RPython sizes `_insns` by `len(insns)`
-        // because every opname is dynamically numbered `0..len-1`
-        // (`Assembler.insns.setdefault(key, len(self.insns))`), so the
-        // length and the maximum byte coincide.  Pyre's canonical-routing
-        // (`majit-translate::insns::insn_byte_opt`) pins canonical keys
-        // to fixed `BC_*` bytes (sparse, up to 168) and pushes
-        // translator-only keys past `CANONICAL_BYTE_CEILING`, so the
-        // byte space is sparse and `len(insns) < max_byte + 1`.  Size
-        // the reverse table by `max_byte + 1` instead so a byte read at
-        // dispatch time does not index past the end.  Empty slots in
-        // the gaps stay as `String::new()` and surface as the
-        // unwired-handler placeholder if dispatched against — same
-        // behaviour RPython relies on for unregistered opcodes.
-        // Empty `insns` → empty reverse table (RPython parity:
-        // `[None] * len(insns)` with `len == 0`).  Non-empty → size to
-        // `max_byte + 1` so a byte read at dispatch time does not
-        // index past the end.
-        let table_len = match insns.values().copied().max() {
-            Some(max_byte) => (max_byte as usize) + 1,
-            None => 0,
-        };
+        // RPython sizes `_insns` by `len(insns)` because the assembler
+        // numbers densely `0..n-1`. Pyre's `BC_*` bytes are sparse, so a
+        // u8 opcode indexes a 256-slot table. Empty gaps stay `String::new()`
+        // and the unwired placeholder (LeaveFrame on Grain).
+        let table_len = 256;
         self._insns = vec![String::new(); table_len];
         for (key, &value) in insns {
             // `blackhole.py` `assert self._insns[value] is None`:
