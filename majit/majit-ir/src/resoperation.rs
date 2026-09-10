@@ -1655,6 +1655,52 @@ fn unpack_stamp(stamp: u32) -> Option<crate::value::Value> {
 pub type OpArgVec = SmallVec<[Operand; 4]>;
 
 const ARG_INLINE: usize = 2;
+/// Extra-arg slab holds four `Operand`s (32 B). Lengths 3–4 use it;
+/// longer lists still heap-grow a `Vec`.
+const ARG_SLAB: usize = 4;
+const ARG_SLAB_BIT: usize = 1 << (usize::BITS - 1);
+const ARG_SLAB_CHUNK: usize = 2048;
+
+struct Arg32Heap {
+    chunks: Vec<(*mut Operand, usize)>,
+    free: Vec<*mut Operand>,
+}
+
+unsafe impl Send for Arg32Heap {}
+unsafe impl Sync for Arg32Heap {}
+
+static ARG32_HEAP: std::sync::Mutex<Arg32Heap> = std::sync::Mutex::new(Arg32Heap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn alloc_arg32() -> *mut Operand {
+    let mut heap = ARG32_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < ARG_SLAB_CHUNK
+    {
+        let p = unsafe { (*base).add(*used * ARG_SLAB) };
+        *used += 1;
+        return p;
+    }
+    let layout = std::alloc::Layout::array::<Operand>(ARG_SLAB_CHUNK * ARG_SLAB)
+        .expect("32-byte arg slot chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut Operand };
+    assert!(!base.is_null(), "32-byte arg slot chunk alloc failed");
+    heap.chunks.push((base, 1));
+    base
+}
+
+fn free_arg32(p: *mut Operand) {
+    ARG32_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
 
 /// Packed `N_aryOp._args`. Two `Operand`s are 16 B; the length lives on
 /// [`Op::arg_len`]. Three-or-more args heap-grow.
@@ -1706,6 +1752,21 @@ impl ArgSlot {
             }
             ArgData {
                 inline: std::mem::ManuallyDrop::new(inline),
+            }
+        } else if len_us <= ARG_SLAB {
+            // 3–4 args: 32 B payload from the reserved slot slab so
+            // GC_STORE's extra pair does not mint the 32-byte class.
+            let ptr = alloc_arg32();
+            for (i, arg) in v.into_iter().enumerate() {
+                unsafe {
+                    ptr.add(i).write(arg);
+                }
+            }
+            ArgData {
+                heap: std::mem::ManuallyDrop::new(ArgHeap {
+                    ptr,
+                    cap: ARG_SLAB | ARG_SLAB_BIT,
+                }),
             }
         } else {
             let mut vec = v.into_vec();
@@ -1774,7 +1835,14 @@ unsafe fn drop_arg_data(data: &mut ArgData, len: u8) {
             }
         } else {
             let heap = std::mem::ManuallyDrop::take(&mut data.heap);
-            let _ = Vec::from_raw_parts(heap.ptr, n, heap.cap);
+            if heap.cap & ARG_SLAB_BIT != 0 {
+                for i in 0..n {
+                    heap.ptr.add(i).drop_in_place();
+                }
+                free_arg32(heap.ptr);
+            } else {
+                let _ = Vec::from_raw_parts(heap.ptr, n, heap.cap);
+            }
         }
     }
 }
