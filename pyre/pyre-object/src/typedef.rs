@@ -63,6 +63,10 @@ pub struct TypeDef {
     /// TypeCache.build. IndexMap preserves Python dict insertion order.
     pub rawdict: indexmap::IndexMap<String, TypeDefValue>,
     pub doc: Option<String>,
+    /// TypeDef.__init__: `self.text_signature = _text_signature_`. Applied to
+    /// the W_TypeObject by TypeCache.build from the override declaration
+    /// (`setup_builtin_type`).
+    pub text_signature: Option<String>,
     pub weakrefable: bool,
     /// Existing allocation-vtable representation of the interpreter class;
     /// replace with the canonical class metadata when rpy_cls is connected.
@@ -97,6 +101,7 @@ impl TypeDef {
             bases: Vec::new(),
             rawdict: indexmap::IndexMap::new(),
             doc: None,
+            text_signature: None,
             weakrefable: false,
             instance_type,
             acceptable_as_base_class: std::sync::atomic::AtomicBool::new(acceptable_as_base_class),

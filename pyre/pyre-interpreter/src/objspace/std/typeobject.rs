@@ -120,7 +120,15 @@ impl TypeCache {
             w_type_set_weakrefable(w_type, override_def.weakrefable);
             w_type_set_flag_sequence_bug_compat(w_type, definition.flag_sequence_bug_compat);
             w_type_set_heaptype(w_type, override_def.heaptype);
-            w_type_set_acceptable_as_base_class(w_type, definition.acceptable_as_base_class());
+            if let Some(signature) = &override_def.text_signature {
+                // setup_builtin_type: `w_self.text_signature =
+                // instancetypedef.text_signature`.
+                w_type_set_text_signature(w_type, signature);
+            }
+            // `W_TypeObject.acceptable_as_base_class` reads
+            // `self.layout.typedef.acceptable_as_base_class` — the override
+            // declaration, not the derived one.
+            w_type_set_acceptable_as_base_class(w_type, override_def.acceptable_as_base_class());
             crate::baseobjspace::compute_and_set_mro(w_type).map_err(CacheError::Build)?;
             let best = crate::call::find_best_base(gc_roots::shadow_stack_get(bases_slot))
                 .map_err(CacheError::Build)?;
@@ -143,7 +151,23 @@ impl TypeCache {
                 })
             };
             w_type_set_layout(w_type, layout);
-            crate::typedef::stamp_new_descr_self(gc_roots::shadow_stack_get(ns_slot), w_type);
+            if std::ptr::eq(definition as *const TypeDef, overridetypedef) {
+                // TypeCache.build's else arm: qualify member functions.
+                crate::typedef::stamp_new_descr_self(gc_roots::shadow_stack_get(ns_slot), w_type);
+            } else {
+                // `typedef is not overridetypedef`: the qualname/objclass pass
+                // is skipped; only `ensure_static_new` (from
+                // `ensure_common_attributes`) still runs.  Upstream re-derives
+                // `w_type.w_doc = newtext_or_none(typedef.doc)` here; pyre's
+                // builtin doc observable is the namespace `__doc__` entry,
+                // which already holds `definition.doc` (rawdict) or the
+                // ensure-common None — the same value — so no store is needed.
+                // Divergence: upstream's dict additionally keeps the override
+                // declaration's doc via `dict_w.setdefault('__doc__', w_doc)`
+                // for instance-level lookup; a single storage cannot carry
+                // both values, and pyre keeps the type-level one.
+                crate::typedef::ensure_static_new(gc_roots::shadow_stack_get(ns_slot), w_type);
+            }
         }
         Ok(w_type)
     }
@@ -454,6 +478,52 @@ mod tests {
                 crate::function::fget_func_objclass(function).unwrap(),
                 w_type
             );
+        }
+    }
+
+    #[test]
+    fn derived_declaration_skips_the_qualname_pass_and_reads_override_flags() {
+        crate::typedef::init_typeobjects();
+        let code = crate::compile::compile_source("42", crate::compile::Mode::Eval).unwrap();
+        let _roots = gc_roots::push_roots();
+        let code_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(crate::w_code_new(Box::into_raw(Box::new(code)).cast()));
+        let globals = w_module_dict_new();
+        let function = crate::function::function_new_with_fixed_code(
+            gc_roots::shadow_stack_get(code_slot).cast(),
+            "original".into(),
+            globals,
+        );
+        unsafe {
+            let base_def = TypeDef::from_rawdict("FlagBase", vec![], IndexMap::new(), &INSTANCE_TYPE)
+                as *mut TypeDef;
+            (*base_def).set_acceptable_as_base_class(true);
+            (*base_def).text_signature = Some("(x, /)".into());
+            let space = ObjSpace::new();
+            let base = space.gettypeobject(base_def).unwrap();
+            assert!(!base.is_null());
+            let derived_def = TypeDef::from_rawdict(
+                "FlagDerived",
+                vec![base_def],
+                IndexMap::from([("method".into(), TypeDefValue::root(function))]),
+                &INSTANCE_TYPE,
+            ) as *mut TypeDef;
+            (*derived_def).applevel_subclasses_base = base_def;
+            let w_type = space.gettypeobject(derived_def).unwrap();
+            // `typedef is not overridetypedef`: the qualname/objclass pass is
+            // skipped, so the function keeps its own name and objclass.
+            let function =
+                w_dict_getitem_str(w_type_get_dict_ptr(w_type).cast(), "method").unwrap();
+            assert_eq!(
+                crate::function::function_get_qualname(function)
+                    .as_str()
+                    .unwrap(),
+                "original"
+            );
+            // `acceptable_as_base_class` and `text_signature` read the
+            // override declaration (`layout.typedef` / `setup_builtin_type`).
+            assert!(w_type_get_acceptable_as_base_class(w_type));
+            assert_eq!(w_type_get_text_signature(w_type), Some("(x, /)"));
         }
     }
 

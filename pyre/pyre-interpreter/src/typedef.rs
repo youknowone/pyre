@@ -2700,9 +2700,11 @@ pub(crate) unsafe fn stamp_builtin_owner(func: PyObjectRef, type_name: &str) {
 ///
 /// # Safety
 /// `ns` must be a valid, live `W_DictObject`; `type_obj` a valid type.
-pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
+/// `typeobject.py ensure_static_new` — stamp the type onto its `__new__`
+/// carrier. Runs for every built type (`ensure_common_attributes`), including
+/// derived declarations whose function-metadata pass is skipped.
+pub(crate) unsafe fn ensure_static_new(ns: PyObjectRef, type_obj: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
-    let save_point = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
     let type_obj = pyre_object::gc_roots::pin_root(type_obj);
     if let Some(w_new) = pyre_object::w_dict_getitem_str(ns, "__new__") {
@@ -2723,6 +2725,14 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
             }
         }
     }
+}
+
+pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    let type_obj = pyre_object::gc_roots::pin_root(type_obj);
+    unsafe { ensure_static_new(ns, type_obj) };
     // TypeCache.build's post-initialization function metadata pass. Getsets
     // have already been copied for the allocated owner before initialization.
     let keys: Vec<String> = pyre_object::w_dict_items(ns)
