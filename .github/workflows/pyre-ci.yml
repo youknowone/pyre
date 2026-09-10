@@ -18,6 +18,7 @@ on:
       # lives here, so a change to it alone must still trigger this workflow.
       - "scripts/llbc_extract.py"
       - ".github/workflows/pyre-ci.yml"
+      - ".pre-commit-config.yaml"
   pull_request:
     branches: [ "main", "py3.[0-9]+" ]
     paths:
@@ -33,6 +34,7 @@ on:
       - "scripts/codspeed-environment.py"
       - "scripts/llbc_extract.py"
       - ".github/workflows/pyre-ci.yml"
+      - ".pre-commit-config.yaml"
   workflow_dispatch:
 
 concurrency:
@@ -48,18 +50,33 @@ permissions:
   contents: read
 
 jobs:
-  cargo-fmt:
-    name: cargo fmt --check
+  pre-commit:
+    name: pre-commit
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
         persist-credentials: false
+        # The citation check below needs the merge ref's first parent.
+        fetch-depth: 2
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+      with:
+        python-version: 3.x
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       with:
         components: rustfmt
-    - name: Run cargo fmt --check
-      run: cargo fmt --all -- --check
+    # `cargo fmt --check` lives in `.pre-commit-config.yaml`, not as a
+    # second job. This job is the cheap same-workflow gate every prepare
+    # job `needs`, so a hook failure holds LLBC/tests without a duplicate
+    # rustfmt workflow.
+    - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+    # The `no-line-number-citations` hook reads the staged diff, which is
+    # empty under the action's `--all-files`. A `pull_request` event checks
+    # out `refs/pull/N/merge`, whose first parent is the base tip, so
+    # `HEAD^1..HEAD` is this PR's own contribution.
+    - name: upstream citations name a symbol, not a line number
+      if: github.event_name == 'pull_request'
+      run: python3 scripts/check-new-line-citations.py --base HEAD^1 --annotate
     - name: Check majit ownership boundary
       run: python3 scripts/check-majit-boundary.py
     - name: Check synthetic fixture headers
@@ -93,17 +110,11 @@ jobs:
     name: prepare Charon/LLBC (ubuntu-24.04)
     runs-on: ubuntu-24.04
     # Every expensive job in this workflow hangs off one of the three prepare
-    # jobs, so naming `cargo fmt --check` here is what holds a whole run behind
-    # a 33 s check. Waiting costs no runner-seconds of its own -- a queued job
-    # occupies no runner -- only the wall time fmt spends queued, which on a
-    # saturated pool is already the larger half of every job's latency.
-    #
-    # Measured over the 95 finished runs of 2026-08-24: `cargo fmt --check` was
-    # the first job to go red in 5 of the 20 failures, and those five runs spent
-    # 97751 runner-seconds after it had already failed, against 1545805 for the
-    # day. `cpyext ABI` is the other job cheap enough to gate on and is left
-    # ungated: it went red in none of the 95.
-    needs: cargo-fmt
+    # jobs, so naming `pre-commit` here is what holds a whole run behind a
+    # cheap check. Waiting costs no runner-seconds of its own -- a queued job
+    # occupies no runner -- only the wall time the gate spends queued, which
+    # on a saturated pool is already the larger half of every job's latency.
+    needs: pre-commit
     env: &charon-llbc-env
       # Redirect the shared charon/ullbc build dir INTO the workspace so
       # actions/cache can reach it. Locally PYRE_SHARED_BUILD is unset and
@@ -312,13 +323,14 @@ jobs:
   prepare-charon-llbc-macos:
     name: prepare Charon/LLBC (macos-latest)
     runs-on: macos-latest
-    # `cargo-fmt` is the only Linux job the two platforms wait for, and the
+    # `pre-commit` is the only Linux job the two platforms wait for, and the
     # reason is latency. Job end times on run 32793420243, relative to the
     # first job's start: `cargo fmt --check` +47 s, `cargo test (ubuntu)`
     # +7977 s, `pyre/check.py dynasm (ubuntu)` +13327 s. Hanging the platform
     # prepare on either of the latter two defers everything behind it: that
     # run's macOS/Windows legs started at +13330 s and it finished at
-    # +18269 s, against roughly +5000 s for the same work started after fmt.
+    # +18269 s, against roughly +5000 s for the same work started after the
+    # cheap gate.
     #
     # A Linux `check.py` gate was tried (PR #1440) and removed. It cost more
     # than the round trip: over the 380 finished runs of 2026-08-21..25, 83
@@ -329,7 +341,7 @@ jobs:
     # two platforms to `main` is worse again: 7 runs in that window went red
     # only on macOS or Windows, and under that rule they would have landed
     # first.
-    needs: cargo-fmt
+    needs: pre-commit
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
@@ -338,8 +350,8 @@ jobs:
     # On windows-latest install-charon.py builds Charon from source
     # (no Windows release asset is published); see scripts/install-charon.py.
     runs-on: windows-latest
-    # See prepare-charon-llbc-macos for why `cargo-fmt` is the only wait.
-    needs: cargo-fmt
+    # See prepare-charon-llbc-macos for why `pre-commit` is the only wait.
+    needs: pre-commit
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29

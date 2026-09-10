@@ -317,6 +317,45 @@ unsafe fn long_payload_of(obj: pyre_object::PyObjectRef) -> i64 {
     unsafe { *((obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET) as *const i64) }
 }
 
+/// `longobject.py _make_descr_cmp`'s `isinstance(self, W_LongObject)` plus
+/// the `self.num` field read.  Always records `GuardClass(LONG)` — the
+/// tracing heapcache's `is_class_known` flag is not `isinstance`, and
+/// `W_IntObject.intval` sits at the same offset as `W_LongObject.value`.
+fn walker_guard_long_and_read_payload<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    boxed: OpRef,
+    expected_class: pyre_object::PyObjectRef,
+) -> Result<Option<OpRef>, DispatchError> {
+    let Some(obj) = walker_concrete_ref_object(ctx, boxed) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_long(obj) } {
+        return Ok(None);
+    }
+    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && !unsafe { pyre_object::tagged_int::is_tagged_int(obj) }
+    {
+        let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, boxed, false);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
+    }
+    let type_const = ctx.trace_ctx.const_int(long_type_addr);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[boxed, type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(boxed, long_type_addr);
+    walker_guard_exact_w_class(ctx, op_pc, boxed, expected_class)?;
+    let payload = unsafe { long_payload_of(obj) };
+    let field =
+        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, boxed, crate::descr::long_value_descr());
+    ctx.trace_ctx.set_opref_concrete(
+        field,
+        majit_ir::Value::Ref(majit_ir::GcRef(payload as usize)),
+    );
+    Ok(Some(field))
+}
+
 /// Record the `getfield_gc_r` that reads a long operand's `value` payload.
 /// A box the same trace built with [`crate::helpers::emit_box_long_inline`]
 /// answers this out of the heap cache, so the read costs nothing and the box
@@ -8197,23 +8236,16 @@ pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
     }
     let concrete_truth = unsafe { pyre_object::w_bool_get_value(boxed_result_obj) as i64 };
 
-    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
+    let Some(long_pl) = walker_guard_long_and_read_payload(ctx, op_pc, long, long_class)? else {
+        return Ok(None);
+    };
+    let long_payload = match ctx.trace_ctx.concrete_of_opref(long_pl) {
+        Some(majit_ir::Value::Ref(r)) => r.0 as i64,
+        _ => return Ok(None),
+    };
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
     let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
     walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
-    let off = pyre_object::longobject::LONG_VALUE_OFFSET;
-    let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
-    let long_pl = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[long],
-        crate::descr::long_value_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        long_pl,
-        majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
-    );
     let helper_ptr = helper as *const ();
     let truth = ctx.trace_ctx.call_typed_with_effect_pure(
         OpCode::CallI,

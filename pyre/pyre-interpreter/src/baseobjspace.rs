@@ -19378,32 +19378,7 @@ fn throw_yield_from(
 /// Run a delegated iterator's close operation.  A generator close is kept
 /// in the same resume path so nested delegation unwinds one frame at a time.
 fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
-    unsafe {
-        if pyre_object::generator::is_generator_or_coroutine(w_yf) {
-            let exit = PyError::new(PyErrorKind::GeneratorExit, String::new());
-            return match generator_send_ex(w_yf, w_none(), Some(exit), None, true) {
-                Ok(_) => Err(PyError::runtime_error(format!(
-                    "{} ignored GeneratorExit",
-                    generator_kind(w_yf)
-                ))),
-                Err(err)
-                    if err.matches_stop_iteration() || err.kind == PyErrorKind::GeneratorExit =>
-                {
-                    Ok(w_none())
-                }
-                Err(err) => Err(err),
-            };
-        }
-    }
-    let close = match getattr_str(w_yf, "close") {
-        Ok(method) => method,
-        Err(err) if err.kind == PyErrorKind::AttributeError => return Ok(w_none()),
-        Err(mut err) => {
-            err.write_unraisable(w_none(), Wtf8::new("generator/coroutine.close()"), w_none());
-            return Ok(w_none());
-        }
-    };
-    crate::call::call_function_impl_result(close, &[])
+    gen_close_iter(w_yf, true)
 }
 
 /// Put the stopped delegate's return value through the `SEND` completion
@@ -19708,6 +19683,19 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
             );
         }
     };
+    // generator.py `throw`: a GeneratorExit into a delegating generator
+    // closes the yield-from iterator first (`_gen_close_iter`).
+    if err.kind == PyErrorKind::GeneratorExit && !generator_get_delegate(gen_obj).is_null() {
+        if let Err(e) = generator_close_iter(gen_obj) {
+            return generator_send_ex(
+                gen_obj,
+                w_none(),
+                Some(e),
+                Some(([w_type, w_val, w_tb], argc)),
+                false,
+            );
+        }
+    }
     generator_send_ex(
         gen_obj,
         w_none(),
@@ -19715,6 +19703,61 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
         Some(([w_type, w_val, w_tb], argc)),
         false,
     )
+}
+
+/// generator.py `get_delegate` — `frame.w_yielding_from`.
+fn generator_get_delegate(gen_obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let frame_ptr =
+            pyre_object::generator::w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+        if frame_ptr.is_null() {
+            PY_NULL
+        } else {
+            (*frame_ptr).w_yielding_from
+        }
+    }
+}
+
+/// generator.py `set_delegate`.
+fn generator_set_delegate(gen_obj: PyObjectRef, w_delegate: PyObjectRef) {
+    unsafe {
+        let frame_ptr =
+            pyre_object::generator::w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+        debug_assert!(!frame_ptr.is_null());
+        (*frame_ptr).w_yielding_from = w_delegate;
+    }
+}
+
+/// generator.py `gen_close_iter` — close a yield-from subiterator.
+fn gen_close_iter(w_yf: PyObjectRef, prompt_finalizers: bool) -> PyResult {
+    unsafe {
+        if pyre_object::generator::is_generator_or_coroutine(w_yf) {
+            return generator_close_impl(w_yf, prompt_finalizers);
+        }
+    }
+    let close = match getattr_str(w_yf, "close") {
+        Ok(method) => method,
+        Err(err) if err.kind == PyErrorKind::AttributeError => return Ok(w_none()),
+        Err(mut err) => {
+            err.write_unraisable(w_none(), Wtf8::new("generator/coroutine.close()"), w_none());
+            return Ok(w_none());
+        }
+    };
+    crate::call::call_function_impl_result(close, &[])
+}
+
+/// generator.py `_gen_close_iter`.
+fn generator_close_iter(gen_obj: PyObjectRef) -> PyResult {
+    unsafe {
+        use pyre_object::generator::*;
+        debug_assert!(!w_generator_is_running(gen_obj));
+        let w_yf = generator_get_delegate(gen_obj);
+        generator_set_delegate(gen_obj, PY_NULL);
+        w_generator_set_running(gen_obj, true);
+        let result = gen_close_iter(w_yf, true);
+        w_generator_set_running(gen_obj, false);
+        result
+    }
 }
 
 /// PyPy: GeneratorIterator.descr_close().
@@ -19743,7 +19786,17 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             return Ok(w_none());
         }
     }
-    let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
+    // generator.py `descr_close`: close the yield-from delegate first, then
+    // send GeneratorExit (or the error that close raised) into this frame.
+    // Doing the delegate close here, not only inside JIT resume, keeps
+    // `os.fwalk().close()` from depending on whether the portal compiled.
+    let err = if generator_get_delegate(gen_obj).is_null() {
+        PyError::new(PyErrorKind::GeneratorExit, String::new())
+    } else {
+        generator_close_iter(gen_obj)
+            .err()
+            .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
+    };
     let sent = generator_send_ex(gen_obj, w_none(), Some(err), None, true);
     // Taken unconditionally, so a census no arm below spends cannot be read by
     // a later close.  `generator_send_ex` records one whenever it closes,

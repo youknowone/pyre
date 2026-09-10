@@ -1,4 +1,5 @@
 use pyre_object::PyObjectRef;
+use pyre_object::quasiimmut::QuasiImmutField;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -464,11 +465,32 @@ pub enum PendingLoopExit {
     ExitFrameWithException(crate::PyError),
 }
 
+/// Clone of [`QuasiImmutField`] that starts empty.  A copied execution
+/// context must not keep the source's compiled-loop watchers.
+struct WTracefuncWatchers(QuasiImmutField);
+
+impl Default for WTracefuncWatchers {
+    fn default() -> Self {
+        Self(QuasiImmutField::new())
+    }
+}
+
+impl Clone for WTracefuncWatchers {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutionContext {
     pub space: PyObjectRef,
     pub topframeref: *mut PyFrame,
     pub w_tracefunc: PyObjectRef,
+    /// Hidden `mutate_w_tracefunc` for
+    /// `executioncontext.py _immutable_fields_ = ['w_tracefunc?']`.
+    /// [`Clone`] yields an empty field so a copied EC does not inherit the
+    /// source's loop watchers.
+    w_tracefunc_watchers: WTracefuncWatchers,
     pub is_tracing: i32,
     pub compiler: PyObjectRef,
     /// pypy/interpreter/executioncontext.py:320 — function pointer to
@@ -609,6 +631,19 @@ pub const EC_TOPFRAMEREF_OFFSET: usize = std::mem::offset_of!(ExecutionContext, 
 /// code instead of running on past the events it now owes.
 pub const EC_W_TRACEFUNC_OFFSET: usize = std::mem::offset_of!(ExecutionContext, w_tracefunc);
 
+/// `quasiimmut.py get_current_qmut_instance` for the EC `w_tracefunc?` slot.
+///
+/// # Safety
+/// `ec` must be null or a live `ExecutionContext`.
+pub unsafe fn ec_current_w_tracefunc_qmut(
+    ec: *const ExecutionContext,
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
+    if ec.is_null() {
+        return None;
+    }
+    Some(unsafe { (*ec).current_w_tracefunc_qmut() })
+}
+
 /// Byte offset of `py_recursion_depth` within `ExecutionContext`, for the
 /// JIT's GETFIELD_GC_I/SETFIELD_GC lowering of the activation seam that
 /// `pyframe.py` (`execute_frame.insert_stack_check_here`) puts at the same
@@ -642,6 +677,7 @@ impl ExecutionContext {
             space: pyre_object::PY_NULL,
             topframeref: std::ptr::null_mut(),
             w_tracefunc: pyre_object::PY_NULL,
+            w_tracefunc_watchers: WTracefuncWatchers::default(),
             is_tracing: 0,
             compiler: pyre_object::PY_NULL,
             profilefunc: None,
@@ -1429,10 +1465,19 @@ impl ExecutionContext {
     }
 
     pub fn settrace(&mut self, w_func: PyObjectRef) {
-        self.w_tracefunc = w_func;
-        if w_func.is_null() || w_func == pyre_object::w_none() {
-            self.w_tracefunc = pyre_object::PY_NULL;
+        let w_func = if w_func.is_null() || w_func == pyre_object::w_none() {
+            pyre_object::PY_NULL
         } else {
+            w_func
+        };
+        // `executioncontext.py _immutable_fields_ = ['w_tracefunc?']`:
+        // notify watchers before the store, as
+        // `function_notify_quasi_immut` does for `code?`.
+        if self.w_tracefunc_watchers.0.is_installed() {
+            self.w_tracefunc_watchers.0.invalidate();
+        }
+        self.w_tracefunc = w_func;
+        if !w_func.is_null() {
             self.force_all_frames(false);
             // executioncontext.py settrace — increase the JIT's
             // trace_limit when a tracefunc is installed; tracing
@@ -1443,6 +1488,11 @@ impl ExecutionContext {
 
     pub fn gettrace(&self) -> PyObjectRef {
         self.w_tracefunc
+    }
+
+    /// `quasiimmut.py get_current_qmut_instance` for `w_tracefunc?`.
+    pub fn current_w_tracefunc_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
+        self.w_tracefunc_watchers.0.get_current_qmut_instance()
     }
 
     /// `executioncontext.py setprofile`.

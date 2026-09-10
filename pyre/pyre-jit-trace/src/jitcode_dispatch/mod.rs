@@ -10127,12 +10127,19 @@ fn walker_pin_function_code<Sym: WalkSym>(
     op_pc: usize,
     callable: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
+    walker_pin_function_quasi_field(ctx, op_pc, callable, crate::descr::function_code_descr())
+}
+
+/// `function.py:34 _immutable_fields_ = ['code?', 'w_func_globals?', ...]`
+/// marker on one `?` slot of a baked callee.
+fn walker_pin_function_quasi_field<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    callable: pyre_object::PyObjectRef,
+    descr: majit_ir::DescrRef,
+) -> Result<(), DispatchError> {
     let callable_const = ctx.trace_ctx.const_ref(callable as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        callable_const,
-        crate::descr::function_code_descr(),
-    );
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, descr);
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -10414,20 +10421,18 @@ fn walker_pin_instance_w_class<Sym: WalkSym>(
     expected_typeobj: pyre_object::PyObjectRef,
 ) -> Result<OpRef, DispatchError> {
     let descr = crate::descr::w_class_descr();
-    let field_index = descr.index();
     let actual = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
     let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
     if walker_ref_box_is(ctx, actual, expected_typeobj) {
         return Ok(expected);
     }
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[actual, expected])?;
-    // `pyjitpl.py` `MIFrame.implement_guard_value`'s second half: the guard
-    // has proved the read equals the constant, so later GETFIELDs of this
-    // slot must return that constant, not the GETFIELD box whose concrete
-    // snapshot merely happened to match at record time.
+    // `pyjitpl.py` `implement_guard_value`: generate_guard then replace_box.
+    // heapcache.replace_box marks the GETFIELD FrontendOp replaced-with-const;
+    // the next `opimpl_getfield_gc_r` returns that Const via
+    // `maybe_replace_with_const`.  It does not write the Const back with
+    // `getfield_now_known`.
     ctx.trace_ctx.heap_cache_mut().replace_box(actual, expected);
-    ctx.trace_ctx
-        .heapcache_getfield_now_known(obj, field_index, expected);
     Ok(expected)
 }
 
@@ -11734,8 +11739,11 @@ pub(crate) fn ec_hook_installed() -> bool {
 /// read starts from the portal's own `ec` red (`interp_jit.py reds =
 /// ['frame', 'ec']`) rather than a frame field; only a bridge whose red has
 /// not been seeded needs `walker_ensure_execution_context` to recover it from
-/// the frame.  The read is registered with the heapcache, so a run of merge
-/// points with no intervening call collapses to one loop-invariant read.
+/// the frame.  The slot is `w_tracefunc?`, so the pin is a `QUASIIMMUT_FIELD`
+/// marker plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
+/// The `GuardIsnull` is the `promote(None)` half.  The read is registered
+/// with the heapcache, so a run of merge points with no intervening call
+/// collapses to one loop-invariant read.
 ///
 /// A trace recorded while the slot is ALREADY non-NULL records nothing: there
 /// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
@@ -11769,6 +11777,12 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     {
         return Ok(());
     }
+    // `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`
+    // on a `w_tracefunc?` slot.  The marker plus `GUARD_NOT_INVALIDATED`
+    // is what `?` costs; `settrace` invalidates the watchers.  The
+    // `GuardIsnull` is the `promote(None)` half this portal records.
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
     let read = ctx
         .trace_ctx
         .record_op_with_descr(OpCode::GetfieldGcR, &[ec_box], descr);
