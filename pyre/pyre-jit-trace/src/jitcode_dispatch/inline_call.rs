@@ -1174,10 +1174,10 @@ fn effect_free_residual_fnaddr(fnaddr: i64) -> bool {
 /// effectful where the walk would not, never the reverse.
 ///
 /// Two of those the caller spares, because the odometer spares them too: a
-/// residual the walk would not count ([`effect_free_residual_fnaddr`], or a
-/// calldescr reporting an elidable / loop-invariant / not-in-trace call) and a
-/// store into an object this same body allocated.  Calling either effectful
-/// here refuses a descent for an effect that never happens.
+/// residual the walk would not count ([`effect_free_residual_fnaddr`], or
+/// [`residual_call_is_effect_free`]) and a store into an object this same body
+/// allocated.  Calling either effectful here refuses a descent for an effect
+/// that never happens.
 fn descent_op_applies_effect(opname: &str) -> bool {
     opname.starts_with("residual_call")
         || opname.starts_with("setfield_gc")
@@ -1704,10 +1704,6 @@ pub(crate) fn summarize_body_blockers_with(
         let mut known_array_len_r = point.known_array_len_r;
         let mut fresh_r = point.fresh_r;
 
-        // Set by a `residual_call` the walk's odometer would not count: one
-        // whose funcbox names a helper a rewind may re-run, or whose calldescr
-        // reports an effect the trace does not have to undo.
-        let mut effect_free_residual = false;
         if d.opname.starts_with("residual_call") {
             // Every `residual_call_*` argcode string opens with the `i` funcbox
             // operand, so it is the byte right after the opcode.

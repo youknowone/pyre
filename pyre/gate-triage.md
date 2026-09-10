@@ -340,7 +340,7 @@ production run; `nofuel` is how those two fields are read. `wasm_ops` is the
 fuel subtraction and reports -1 under it.
 
 `PYRE_FBW_DESCENT_SCAN_OFF` disables the descent's un-lowered-helper scan
-(`descent_static_decline_enabled`), so a builtin body holding a symbolic-fnaddr
+(`descent_unlowered_helper_scan_enabled`), so a builtin body holding a symbolic-fnaddr
 residual call is attempted rather than refused before the descent starts.  The
 attempted rollback is currently observable in `test_pickle` and `test_hashlib`,
 so the scan remains the correctness default.  Same shape and same reason as
