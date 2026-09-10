@@ -415,16 +415,43 @@ where
     fn _get(&self, i: usize) -> Operand {
         match self._cache.get(i).cloned().flatten() {
             Some(res) => res,
-            None => panic!(
-                "TraceIterator._get cache miss at {i} (cache_len={}, pos={}, start={}, end={}, index={}, start_index={}, fresh={})",
-                self._cache.len(),
-                self.pos,
-                self.start,
-                self.end,
-                self._index,
-                self.start_index,
-                self._fresh,
-            ),
+            None => {
+                let cur = self.trace.get(self.pos.saturating_sub(1)).map(|op| {
+                    let op: &majit_ir::Op = std::borrow::Borrow::borrow(op);
+                    let hits: Vec<String> = op
+                        .args_slice()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(ai, a)| {
+                            let r = a.to_opref();
+                            (!r.is_none() && !r.is_constant() && r.raw() as usize == i)
+                                .then(|| format!("arg{ai}={r:?}"))
+                        })
+                        .collect();
+                    format!("{:?} pos={:?} hits={hits:?}", op.opcode, op.pos().get())
+                });
+                let producers: Vec<String> = self.trace[self.start..self.end]
+                    .iter()
+                    .map(std::borrow::Borrow::borrow)
+                    .filter(|op| {
+                        let p = op.pos().get();
+                        !p.is_none() && !p.is_constant() && p.raw() as usize == i
+                    })
+                    .map(|op| format!("{:?} pos={:?}", op.opcode, op.pos().get()))
+                    .collect();
+                panic!(
+                    "TraceIterator._get cache miss at {i} (cache_len={}, pos={}, start={}, end={}, index={}, start_index={}, fresh={}, cur={}, producers_at_{i}={:?})",
+                    self._cache.len(),
+                    self.pos,
+                    self.start,
+                    self.end,
+                    self._index,
+                    self.start_index,
+                    self._fresh,
+                    cur.as_deref().unwrap_or("<none>"),
+                    producers,
+                );
+            }
         }
     }
 

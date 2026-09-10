@@ -2250,6 +2250,17 @@ impl MIFrame {
         // snapshot below so JUMP args never carry OpRef::NONE in the ec
         // slot on adapter / bridge-from-guard paths.
         let recovered_ec = self.ensure_execution_context(ctx);
+        // A void `sym.frame` (typically `DebugMergePoint` occupying the
+        // next `op_count` slot) cannot be a JUMP red. Recover the
+        // virtualizable identity (`virtualizable_boxes[-1]`), which is
+        // seeded once from the portal frame.
+        if self.sym().frame.ty() == Some(Type::Void) {
+            if let Some(identity) = ctx.standard_virtualizable_box() {
+                if identity.ty() != Some(Type::Void) {
+                    self.sym_mut().frame = identity;
+                }
+            }
+        }
         // The stack depth reads from `PyFrame.valuestackdepth`
         // (via `concrete_valuestackdepth()`) rather than the symbolic
         // mirror.  `close_loop_args_at` runs at the orgpc anchor where

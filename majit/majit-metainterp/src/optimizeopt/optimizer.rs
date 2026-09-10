@@ -3422,8 +3422,10 @@ impl Optimizer {
                             .unwrap_or_else(|| ctx.materialize_operand_at(arg))
                     })
                     .collect();
-                let preview_virtual_state =
-                    crate::optimizeopt::virtualstate::export_state(&post_force_args, &ctx);
+                let preview_virtual_state = crate::optimizeopt::virtualstate::export_state_operands(
+                    &preview_end_arg_boxes,
+                    &ctx,
+                );
                 let vs_args = &post_force_args;
                 // virtualstate.py:687-689 / unroll.py:154-158: a virtual-state
                 // mismatch here raises `VirtualStatesCantMatch` and the outer

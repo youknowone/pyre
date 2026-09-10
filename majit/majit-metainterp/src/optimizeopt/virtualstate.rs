@@ -2566,8 +2566,8 @@ pub(crate) fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
     // `Rc<VirtualStateInfoNode>` cache shared across the whole export, including
     // recursive nested-field calls AND top-level jump args.
     //
-    // virtualstate.py:713 `box = get_box_replacement(box)` is performed
-    // inside `export_single_value`, so we don't pre-resolve here.
+    // virtualstate.py `create_state` does `box = get_box_replacement(box)`
+    // inside the per-value walk, so we don't pre-resolve here.
     let mut cache = ExportCache::new();
     let state: Vec<Rc<VirtualStateInfoNode>> = oprefs
         .iter()
@@ -2576,6 +2576,20 @@ pub(crate) fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
     // virtualstate.py VirtualState.__init__ assigns positions via
     // _enum so subsequent walks dedup shared Rc'd subtrees via
     // `state.position > self.position`.
+    VirtualState::from_shared_rcs(state)
+}
+
+/// Same walk as [`export_state`], keyed by the already-resolved boxes.
+/// RPython `get_virtual_state(end_args)` holds Box objects, not positions.
+pub(crate) fn export_state_operands(
+    operands: &[majit_ir::operand::Operand],
+    ctx: &OptContext,
+) -> VirtualState {
+    let mut cache = ExportCache::new();
+    let state: Vec<Rc<VirtualStateInfoNode>> = operands
+        .iter()
+        .map(|operand| export_single_operand(operand, ctx, &mut cache))
+        .collect();
     VirtualState::from_shared_rcs(state)
 }
 

@@ -5809,7 +5809,18 @@ impl OptContext {
             return opref;
         }
         match self.get_box_replacement_operand_opt(opref) {
-            Some(o) => o.to_opref(),
+            Some(o) => {
+                let resolved = o.to_opref();
+                // A bound ResOp whose `pos` was never stamped has
+                // `to_opref() == None`. Returning that sentinel loses the
+                // box: `export_state` can no longer resolve it.
+                // `get_box_replacement` returns the box, not None.
+                if resolved.is_none() && !o.is_none() {
+                    opref
+                } else {
+                    resolved
+                }
+            }
             None => opref,
         }
     }
