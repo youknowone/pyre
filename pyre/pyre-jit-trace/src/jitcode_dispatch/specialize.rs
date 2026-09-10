@@ -9296,11 +9296,13 @@ pub(crate) fn binary_op_tag_for_helper_index(
 }
 
 /// The machine-int body of `int_add` / `int_sub` / `int_mul` / bitwise
-/// (`descroperation.rs`): unbox, `int_*_ovf` or `int_and`/`or`/`xor`,
-/// rebox.  Used when a helper walk cannot stamp its resume word
-/// (`GuardResumeCoordinateUnavailable`) so the call would otherwise
-/// become `CallMayForce`.  Does not walk `binary_value_from_tag` —
-/// that re-enters the same `add` inline and recurses.
+/// and of `int_floordiv` / `int_mod` (`descroperation.rs`): unbox,
+/// `int_*_ovf` or `int_and`/`or`/`xor` or the `OS_INT_PY_DIV` /
+/// `OS_INT_PY_MOD` elidable, rebox.  Used when a helper walk cannot
+/// stamp its resume word (`GuardResumeCoordinateUnavailable`) so the
+/// call would otherwise become `CallMayForce`.  Does not walk
+/// `binary_value_from_tag` — that re-enters the same `add` inline and
+/// recurses.
 pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9328,13 +9330,26 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     let la = unsafe { pyre_object::w_int_get_value(lhs_obj) };
     let rb = unsafe { pyre_object::w_int_get_value(rhs_obj) };
     use pyre_interpreter::bytecode::BinaryOperator as B;
-    let opcode = match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
+    let op = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag);
+    let is_py_div = matches!(
+        op,
+        Some(B::FloorDivide | B::InplaceFloorDivide | B::Remainder | B::InplaceRemainder)
+    );
+    // A live zero divisor is `try_walker_specialize_binary_op_int_zero_div`.
+    // Emitting `ll_int_py_div` here would dest-write a wrap value.
+    if is_py_div && rb == 0 {
+        return Ok(None);
+    }
+    let opcode = match op {
         Some(B::Add | B::InplaceAdd) => OpCode::IntAddOvf,
         Some(B::Subtract | B::InplaceSubtract) => OpCode::IntSubOvf,
         Some(B::Multiply | B::InplaceMultiply) => OpCode::IntMulOvf,
         Some(B::And | B::InplaceAnd) => OpCode::IntAnd,
         Some(B::Or | B::InplaceOr) => OpCode::IntOr,
         Some(B::Xor | B::InplaceXor) => OpCode::IntXor,
+        Some(B::FloorDivide | B::InplaceFloorDivide | B::Remainder | B::InplaceRemainder) => {
+            OpCode::CallI
+        }
         _ => return Ok(None),
     };
     // bool shares int's `intval` but carries `BOOL_TYPE`.  Unboxing both
@@ -9346,7 +9361,15 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(lhs_obj))?;
     let rhs_raw = walker_unbox_int_typed(ctx, op_pc, r_args[1], rhs_type, rhs_descr)?;
     walker_guard_exact_w_class(ctx, op_pc, r_args[1], walker_numeric_builtin_class(rhs_obj))?;
-    let (raw, concrete) = if matches!(
+    let (raw, concrete) = if is_py_div {
+        // Same `OS_INT_PY_DIV` / `OS_INT_PY_MOD` elidable the descent records.
+        // A declined helper walk used to residualize `binary_value_from_tag`
+        // as `CallMayForce` of freshly boxed ints; the compiled bridge then
+        // returned the divisor (`100 // -1` → `-1`) for `recur(1, 0)`.
+        walker_emit_int_div_domain_guards(ctx, op_pc, lhs_raw, rhs_raw, la, rb)?;
+        let is_div = matches!(op, Some(B::FloorDivide | B::InplaceFloorDivide));
+        walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, is_div)
+    } else if matches!(
         opcode,
         OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
     ) {
