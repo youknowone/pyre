@@ -1137,7 +1137,10 @@ impl PtrInfo {
                 if (v.descr.is_none() || index >= cur_len) && (cur_len == 0 || new_len > cur_len) {
                     v.descr = Some(descr);
                 }
-                reserve_assoc(&mut v.fields, new_len);
+                // `(u32, FieldEntry)` is 24 B; reserving `new_len` for a
+                // 6-field NodeRec was 144 B. Header-band keys are not
+                // positions, so this list stays sparse and grows on
+                // setfield (`info.py` `_fields[index] = op`).
             }
             PtrInfo::Struct(v) => {
                 let cur_len = v
@@ -1148,7 +1151,7 @@ impl PtrInfo {
                 if cur_len == 0 || (index >= cur_len && new_len > cur_len) {
                     v.descr = descr;
                 }
-                reserve_assoc(&mut v.fields, new_len);
+                // Same 144 B spare as Instance: do not reserve `new_len`.
             }
             PtrInfo::Virtual(v) => {
                 let cur_len = v
@@ -1180,12 +1183,11 @@ impl PtrInfo {
     pub fn setfield(&mut self, field_idx: u32, value: Operand) {
         match self {
             PtrInfo::Instance(v) => {
-                let n = descr_field_len(v.descr.as_ref());
-                push_assoc(&mut v.fields, field_idx, FieldEntry::Value(value), n);
+                // Do not reserve the descr field count: 6 × 24 B was 144 B.
+                push_assoc(&mut v.fields, field_idx, FieldEntry::Value(value), 1);
             }
             PtrInfo::Struct(v) => {
-                let n = descr_field_len(Some(&v.descr));
-                push_assoc(&mut v.fields, field_idx, FieldEntry::Value(value), n);
+                push_assoc(&mut v.fields, field_idx, FieldEntry::Value(value), 1);
             }
             PtrInfo::Virtual(v) => {
                 let n = descr_field_len(Some(&v.descr));
@@ -1549,24 +1551,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setfield_reserves_once_instead_of_growing_to_four() {
+    fn setfield_does_not_reserve_a_six_field_144b_list() {
         let mut info = PtrInfo::instance(None, None);
         let value = Operand::from_opref(OpRef::ConstInt(1));
         info.setfield(0, value.clone());
-        let cap = info.fields_capacity();
         assert!(
-            cap >= 4,
-            "info.py init_fields sizes _fields in one go; first setfield \
-             should not leave a 1-slot Vec that grows to 96 B at 4 entries, \
-             cap={cap}"
+            info.fields_capacity() < 6,
+            "a 6-slot (u32, FieldEntry) reserve is 144 B; first setfield \
+             must not pre-size the NodeRec descr, cap={}",
+            info.fields_capacity()
         );
         for i in 1..4 {
             info.setfield(i, value.clone());
         }
-        assert_eq!(
-            info.fields_capacity(),
-            cap,
-            "later setfields must not grow the reserved list"
+        assert!(
+            info.fields_capacity() < 6,
+            "four sparse setfields must stay off the 144 B class, cap={}",
+            info.fields_capacity()
         );
     }
 }
