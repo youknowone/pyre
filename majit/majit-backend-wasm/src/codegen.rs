@@ -5711,6 +5711,20 @@ fn build_function(
         sink.local_set(value_types.local(raw));
     }
 
+    // Every entry path, including a keyed LABEL resume, must install this
+    // module's map. A loop-closing bridge compiled before a merge still
+    // carries its old prefix map; the keyed resume branches past the
+    // key-0 publish below, so do it here before `br_table`.
+    let publish_ptr = if ca.compute_home_gcmap {
+        let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
+        let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
+        Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
+            as usize as i64
+    } else {
+        ca.home_gcmap_ptr
+    };
+    emit_publish_home_gcmap(&mut sink, publish_ptr);
+
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
     // preamble runs once on entry, the LABEL is the loop-back target, and
     // JUMP branches back to it. Emit the `loop` at the LABEL selected by the
@@ -5886,17 +5900,6 @@ fn build_function(
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
         }
     }
-    // assembler.py writes `jf_gcmap` at safepoints once the slots are live.
-    // CA alloc left the map null so leftover item words were not traced.
-    let publish_ptr = if ca.compute_home_gcmap {
-        let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
-        let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
-        Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
-            as usize as i64
-    } else {
-        ca.home_gcmap_ptr
-    };
-    emit_publish_home_gcmap(&mut sink, publish_ptr);
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
     if let Some((probe, type_idx)) = inline_trip {

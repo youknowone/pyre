@@ -3216,7 +3216,7 @@ impl WasmBackend {
         let (new_cells_base, new_cells_owner) = codegen::alloc_bridge_cells(merged_guard_count);
         inputs.bridge_cells_base = new_cells_base;
         inputs.ca.compute_home_gcmap = true;
-        inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes;
+        inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes;
         let (wasm_bytes, guard_exits, merged_ref_homes) = codegen::build_wasm_module(&inputs)?;
         let code_size = wasm_bytes.len();
@@ -3296,7 +3296,13 @@ impl WasmBackend {
         compiled.bridge_cells_base.set(new_cells_base);
         compiled.module_bytes.set(code_size as u32);
         compiled.num_guard_cells.set(guard_exits.len());
-        let _ = merged_ref_homes;
+        let widened = merged_ref_homes.max(compiled.num_ref_homes.get());
+        compiled.num_ref_homes.set(widened);
+        compiled.home_gcmap_ptr.set(leak_home_gcmap(
+            compiled.frame,
+            widened,
+            compiled.used_label_homes,
+        ));
         {
             let mut metas = compiled.chained_trace_meta.borrow_mut();
             let mut offset = own_guard_count;
@@ -4387,10 +4393,10 @@ impl majit_backend::Backend for WasmBackend {
             fail_descrs: std::cell::RefCell::new(fail_descrs),
             num_inputs: inputargs.len(),
             max_output_slots,
-            num_ref_homes,
+            num_ref_homes: std::cell::Cell::new(num_ref_homes),
             used_label_homes,
             frame,
-            home_gcmap_ptr,
+            home_gcmap_ptr: std::cell::Cell::new(home_gcmap_ptr),
             bridge_cells_base: std::cell::Cell::new(bridge_cells_base),
             module_bytes: std::cell::Cell::new(code_size as u32),
             num_guard_cells: std::cell::Cell::new(guard_exits.len()),
@@ -5165,7 +5171,7 @@ impl majit_backend::Backend for WasmBackend {
         // fresh-entry publish, so this map must cover the source loop's
         // already-initialized homes.
         let source_used_homes = compiled_wasm_loop(original_token)
-            .map(|loop_| (loop_.num_ref_homes, loop_.used_label_homes))
+            .map(|loop_| (loop_.num_ref_homes.get(), loop_.used_label_homes))
             .unwrap_or((0, 0));
         let ca_params = if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
             codegen::CaParams {
@@ -5699,7 +5705,7 @@ impl majit_backend::Backend for WasmBackend {
                 // owned for the compiled loop's lifetime, because this frame
                 // may remain reachable through a virtualizable token after
                 // the immediate outputs have been read.
-                unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr as *const u8 };
+                unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
 
                 let items_base = jf as usize + FIRST_ITEM_OFFSET;
                 let fsb = codegen::FRAME_SLOT_BASE as usize;
@@ -5768,7 +5774,7 @@ impl majit_backend::Backend for WasmBackend {
             let mut backing = vec![0i64; alloc_size.div_ceil(8)];
             let jf = backing.as_mut_ptr() as *mut majit_backend::jitframe::JitFrame;
             unsafe { majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth) };
-            unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr as *const u8 };
+            unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
             let items = (jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET) as *mut i64;
             for (i, arg) in args.iter().enumerate() {
                 let v = match arg {

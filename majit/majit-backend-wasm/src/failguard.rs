@@ -1103,7 +1103,7 @@ pub struct CompiledWasmLoop {
     /// Number of Ref-typed values given a home slot in the frame's Ref-home
     /// region (`codegen::HOME_SLOT_BASE`). `execute_token` sizes the host
     /// frame to include this region and registers each home slot as a GC root.
-    pub num_ref_homes: usize,
+    pub num_ref_homes: Cell<usize>,
     /// LABEL-capture homes this loop actually initialized. Frozen geometry
     /// may reserve more; a later bridge's published map must still cover
     /// these so a keyed tail-call cannot drop them.
@@ -1114,7 +1114,8 @@ pub struct CompiledWasmLoop {
     /// Per-loop `jf_gcmap` for the Ref-home region.  Like RPython's assembler
     /// gcmap allocation, this remains valid after `execute_token` returns: a
     /// virtualizable token can keep that JITFRAME alive and force it later.
-    pub home_gcmap_ptr: usize,
+    /// `Cell` so `reemit_loop` can replace it when a merge widens RefHomes.
+    pub home_gcmap_ptr: Cell<usize>,
     /// Base address (shared linear memory) of this loop's per-guard bridge-slot
     /// cell array — one i32 per `fail_index`, `0` = no bridge. The trace's
     /// epilogue reads `cells[fail_index]` and `compile_bridge` writes a bridge's
