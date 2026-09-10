@@ -437,7 +437,10 @@ impl InputArg {
             tp: self.tp,
             index: self.index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
-            value: std::cell::Cell::new(None),
+            // `_forwarded` is per-identity and must reset. The concrete
+            // bits belong to this inputarg *position* and stay with every
+            // remint so stack-resident reds can refuse a ConstPtr fold.
+            value: std::cell::Cell::new(self.value.get()),
         }
     }
 }

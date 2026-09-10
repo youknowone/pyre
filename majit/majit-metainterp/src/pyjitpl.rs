@@ -815,9 +815,59 @@ impl Drop for CompileSnapshotRootsGuard {
     }
 }
 
+/// A stack-resident red (Grain's `Vm` / frame) recorded as `ConstPtr`
+/// must number as TAGBOX. `make_constant_box` already refuses that fold
+/// in the optimizer; the tracer can still snapshot the concrete address
+/// as `SnapshotTagged::Const`. Resume then TAGCONSTs it and the next
+/// `Vm::new` has no failarg to rebind. Map the address back to the
+/// InputArg that already carries those bits.
+fn snapshot_inputarg_for_stack_ptr(
+    inputargs: &[majit_ir::InputArgRc],
+    addr: usize,
+) -> Option<majit_ir::OpRef> {
+    if addr <= 0x1000 {
+        return None;
+    }
+    let probe = 0usize;
+    if (std::ptr::addr_of!(probe) as usize).abs_diff(addr) >= 16 * 1024 * 1024 {
+        return None;
+    }
+    inputargs.iter().find_map(|ia| {
+        (ia.tp == majit_ir::Type::Ref
+            && matches!(ia.get_value(), Some(majit_ir::Value::Ref(g)) if g.0 == addr))
+        .then_some(majit_ir::OpRef::input_arg_typed(
+            ia.index,
+            majit_ir::Type::Ref,
+        ))
+    })
+}
+
+fn snapshot_tagged_to_box(
+    tagged: &crate::recorder::SnapshotTagged,
+    inputargs: &[majit_ir::InputArgRc],
+) -> SnapshotBox {
+    match tagged {
+        crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
+            let tp = opref.ty().unwrap_or(*fallback_tp);
+            SnapshotBox::typed(*opref, tp)
+        }
+        crate::recorder::SnapshotTagged::Const(val, tp) => {
+            if *tp == majit_ir::Type::Ref
+                && let Some(ia) = snapshot_inputarg_for_stack_ptr(inputargs, *val as usize)
+            {
+                return SnapshotBox::typed(ia, *tp);
+            }
+            let value = heap_value_for(*tp, *val);
+            let opref = majit_ir::OpRef::const_inline_from_value(&value);
+            SnapshotBox::typed(opref, *tp)
+        }
+    }
+}
+
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
+    inputargs: &[majit_ir::InputArgRc],
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -847,36 +897,7 @@ fn snapshot_map_from_trace_snapshots(
     // Box's OpRef. SnapshotTagged carries no `Virtual` variant (see the
     // `SnapshotTagged` docstring in `recorder.rs`) so this match is
     // exhaustive over the two recorder-side cases.
-    let tagged_to_box = |t: &crate::recorder::SnapshotTagged| -> SnapshotBox {
-        match t {
-            crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
-                // history.py:182/220/261/307 + resoperation.py:719/727/739/
-                // 564-638: `box.type` lives on the Box. Pyre's typed
-                // OpRef variants carry it intrinsically; the explicit
-                // `fallback_tp` is the lockstep authority for the
-                // narrow `OpRef::None` / Void-tagged corner case where
-                // `opref.ty()` returns `None`.
-                let tp = opref.ty().unwrap_or(*fallback_tp);
-                SnapshotBox::typed(*opref, tp)
-            }
-            crate::recorder::SnapshotTagged::Const(val, tp) => {
-                // history.py/268/314 `Const{Int,Float,Ptr}.value` is
-                // inline on the Box itself; mint the inline-Const OpRef
-                // directly so the value travels on the OpRef into resume
-                // numbering. The former pool-indexed Const path required
-                // `OptContext::const_pool` seeding from `constants`, now
-                // retired (see
-                // `merge_backend_constants_from_ctx`'s `const_pool.is_empty()`
-                // assert) — without seeding, the encoder's
-                // `OptBoxEnv::get_const` fallthrough resolved a Ref-typed
-                // null slot as `(0, Type::Int)`, encoding a vable_array
-                // NULL pointer as TAGINT(0) instead of NULLREF.
-                let value = heap_value_for(*tp, *val);
-                let opref = majit_ir::OpRef::const_inline_from_value(&value);
-                SnapshotBox::typed(opref, *tp)
-            }
-        }
-    };
+    let tagged_to_box = |t: &crate::recorder::SnapshotTagged| snapshot_tagged_to_box(t, inputargs);
     for snap in trace_snapshots {
         let boxes: crate::optimizeopt::SnapshotBoxList = snap
             .frames
@@ -919,7 +940,8 @@ fn snapshot_maps_from_ctx(
     if ctx.recorder.has_byte_buffer() {
         return snapshot_map_from_byte_recorder(&ctx.recorder, constants);
     }
-    snapshot_map_from_trace_snapshots(ctx.snapshots(), constants)
+    let inputargs = ctx.recorder.inputargs().to_vec();
+    snapshot_map_from_trace_snapshots(ctx.snapshots(), constants, &inputargs)
 }
 
 fn snapshot_map_from_byte_recorder(
@@ -940,18 +962,9 @@ fn snapshot_map_from_byte_recorder(
     let mut vable_map = Vec::with_capacity(n);
     let mut vref_map = Vec::with_capacity(n);
     let mut frame_pcs_map = Vec::with_capacity(n);
+    let inputargs = recorder.inputargs();
     let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
-        match t {
-            crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
-                let tp = opref.ty().unwrap_or(fallback_tp);
-                SnapshotBox::typed(opref, tp)
-            }
-            crate::recorder::SnapshotTagged::Const(val, tp) => {
-                let value = heap_value_for(tp, val);
-                let opref = majit_ir::OpRef::const_inline_from_value(&value);
-                SnapshotBox::typed(opref, tp)
-            }
-        }
+        snapshot_tagged_to_box(&t, inputargs)
     };
     recorder.for_each_captured_snapshot_arrays(|vable_t, vref_t, frames_t, py_pcs| {
         let n_boxes: usize = frames_t.iter().map(|(_, _, tagged)| tagged.len()).sum();
@@ -7741,7 +7754,11 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = snapshot_map_from_trace_snapshots(
+            &trace_snapshots,
+            &mut constants,
+            preamble_data.base.inputargs(),
+        );
         // history.py/261/307 — `Const{Int,Float,Ptr}.type` is an
         // intrinsic attribute on the Box itself, so no raw-u32 type
         // side-table propagation is needed; callers recover the type
@@ -9686,7 +9703,7 @@ impl<M: Clone> MetaInterp<M> {
             mut retrace_snapshot_vable_boxes,
             mut retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants);
+        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants, &trace.inputargs);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut retrace_snapshot_boxes,
             &mut retrace_snapshot_vable_boxes,
@@ -10673,7 +10690,7 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants, &trace.inputargs);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
             &mut snapshot_vable_map,
@@ -11174,7 +11191,7 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants, &trace.inputargs);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
             &mut snapshot_vable_map,
