@@ -312,7 +312,7 @@ pub const SSL3_RT_HEADER: i32 = 256;
 pub const SSL3_MT_CHANGE_CIPHER_SPEC: i32 = 0x0101;
 
 bitflags::bitflags! {
-    /// `SSL_OP_*` bits the `_ssl` module publishes.  Both `DEFAULT_OPTIONS` and
+    /// `SSL_OP_*` bits the `_ssl` module publishes.  Both `SslOp::DEFAULT` and
     /// [`enabled_versions`] decode this space, so the two must not name the same
     /// bit differently.
     #[repr(transparent)]
@@ -338,8 +338,6 @@ bitflags::bitflags! {
             | Self::ENABLE_MIDDLEBOX_COMPAT.bits();
     }
 }
-
-pub const DEFAULT_OPTIONS: u64 = SslOp::DEFAULT.bits();
 
 bitflags::bitflags! {
     /// `X509_V_FLAG_*` bits carried by `SSLContext.verify_flags`.
@@ -398,7 +396,7 @@ impl Context {
             check_hostname: client,
             verify_mode: if client { CERT_REQUIRED } else { CERT_NONE },
             verify_flags: 32768,
-            options: DEFAULT_OPTIONS,
+            options: SslOp::DEFAULT.bits(),
             minimum_version: match protocol {
                 PROTOCOL_TLSV1_2 => 0x303,
                 PROTOCOL_TLSV1_3 => 0x304,

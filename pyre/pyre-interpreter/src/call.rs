@@ -1237,7 +1237,9 @@ pub fn builtin_code_call_positional(
         // parameter also has HOPELESS fast arity; bypassing the binder let
         // excess positionals reach the typed wrapper, which consumes its
         // declared prefix and silently ignores the rest.
-        if unsafe { crate::builtin_code_get_fast_natural_arity(current_code) } == crate::HOPELESS {
+        if unsafe { crate::builtin_code_get_fast_natural_arity(current_code) }
+            == crate::BuiltinCodeFlags::HOPELESS.bits()
+        {
             // `descr_check` before the binder: binding reports a surplus
             // positional or an unknown keyword, and upstream reaches neither
             // until the receiver has answered for itself.

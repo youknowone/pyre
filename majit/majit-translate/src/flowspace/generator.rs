@@ -616,7 +616,7 @@ mod tests {
             co_nlocals: 1,
             co_argcount: 1,
             co_stacksize: 0,
-            co_flags: super::super::objspace::CO_NEWLOCALS,
+            co_flags: super::super::objspace::CoFlags::NEWLOCALS.bits(),
             co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
             co_varnames: vec!["x".to_string()],
             co_freevars: Vec::new(),

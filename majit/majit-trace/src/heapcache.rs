@@ -95,19 +95,6 @@ bitflags::bitflags! {
     }
 }
 
-/// heapcache.py: HF_LIKELY_VIRTUAL
-pub const HF_LIKELY_VIRTUAL: u8 = HeapFlags::LIKELY_VIRTUAL.bits();
-/// heapcache.py: HF_KNOWN_CLASS
-pub const HF_KNOWN_CLASS: u8 = HeapFlags::KNOWN_CLASS.bits();
-/// heapcache.py: HF_KNOWN_NULLITY
-pub const HF_KNOWN_NULLITY: u8 = HeapFlags::KNOWN_NULLITY.bits();
-/// heapcache.py: HF_SEEN_ALLOCATION
-pub const HF_SEEN_ALLOCATION: u8 = HeapFlags::SEEN_ALLOCATION.bits();
-/// heapcache.py: HF_IS_UNESCAPED
-pub const HF_IS_UNESCAPED: u8 = HeapFlags::IS_UNESCAPED.bits();
-/// heapcache.py: HF_NONSTD_VABLE
-pub const HF_NONSTD_VABLE: u8 = HeapFlags::NONSTD_VABLE.bits();
-
 /// heapcache.py helper aliases.
 const HF_VERSION_INC: u32 = 0x40;
 pub const HF_VERSION_MAX: u32 = 0xffff_ffff - HF_VERSION_INC;
@@ -563,9 +550,9 @@ impl HeapCache {
         }
         let mut flags = self.head_version;
         if Self::versioned_or(old_flags, self.likely_virtual_version)
-            && (old_flags & u32::from(HF_LIKELY_VIRTUAL)) != 0
+            && (old_flags & u32::from(HeapFlags::LIKELY_VIRTUAL.bits())) != 0
         {
-            flags |= u32::from(HF_LIKELY_VIRTUAL);
+            flags |= u32::from(HeapFlags::LIKELY_VIRTUAL.bits());
         }
         self.set_flags_for_ref(opref, flags);
         // RPython: ref_frontend_op._heapc_deps = None
@@ -573,33 +560,33 @@ impl HeapCache {
     }
 
     /// RPython: _check_flag(box, flag)
-    pub fn _check_flag(&self, opref: OpRef, flag: u8) -> bool {
+    pub fn _check_flag(&self, opref: OpRef, flag: HeapFlags) -> bool {
         if !self.test_head_version(opref) {
             return false;
         }
-        (self.flags_for_ref(opref) & u32::from(flag)) != 0
+        (self.flags_for_ref(opref) & u32::from(flag.bits())) != 0
     }
 
     /// RPython: _set_flag(box, flag)
-    pub fn _set_flag(&mut self, opref: OpRef, flag: u8) {
+    pub fn _set_flag(&mut self, opref: OpRef, flag: HeapFlags) {
         if opref.is_constant() {
             return;
         }
         self.update_version(opref);
-        let flags = self.flags_for_ref(opref) | u32::from(flag);
+        let flags = self.flags_for_ref(opref) | u32::from(flag.bits());
         self.set_flags_for_ref(opref, flags);
         // Keep mirrors: boolean flags used by this Rust implementation.
         let i = opref.raw() as usize;
         match flag {
-            HF_SEEN_ALLOCATION => {
+            HeapFlags::SEEN_ALLOCATION => {
                 self.seen_allocation.insert(i);
             }
-            HF_KNOWN_CLASS => {
+            HeapFlags::KNOWN_CLASS => {
                 if i >= self.known_class.len() {
                     self.known_class.resize(i + 1, None);
                 }
             }
-            HF_KNOWN_NULLITY => {
+            HeapFlags::KNOWN_NULLITY => {
                 if i >= self.known_nullity.len() {
                     self.known_nullity.resize(i + 1, 0);
                 }
@@ -607,10 +594,10 @@ impl HeapCache {
                     self.known_nullity[i] = 1;
                 }
             }
-            HF_IS_UNESCAPED => {
+            HeapFlags::IS_UNESCAPED => {
                 self.is_unescaped.insert(i);
             }
-            HF_LIKELY_VIRTUAL => {
+            HeapFlags::LIKELY_VIRTUAL => {
                 self.likely_virtual.insert(i);
             }
             // HF_NONSTD_VABLE has no mirror — heapc_flags is the source of truth.
@@ -618,7 +605,7 @@ impl HeapCache {
         }
     }
 
-    fn _remove_flag(&mut self, opref: OpRef, flag: u8) {
+    fn _remove_flag(&mut self, opref: OpRef, flag: HeapFlags) {
         if opref.is_constant() {
             return;
         }
@@ -626,25 +613,25 @@ impl HeapCache {
         if flags == 0 {
             return;
         }
-        let updated = flags & !u32::from(flag);
+        let updated = flags & !u32::from(flag.bits());
         self.set_flags_for_ref(opref, updated);
         let i = opref.raw() as usize;
         match flag {
-            HF_IS_UNESCAPED => {
+            HeapFlags::IS_UNESCAPED => {
                 self.is_unescaped.remove(i);
             }
-            HF_LIKELY_VIRTUAL => {
+            HeapFlags::LIKELY_VIRTUAL => {
                 self.likely_virtual.remove(i);
             }
-            HF_SEEN_ALLOCATION => {
+            HeapFlags::SEEN_ALLOCATION => {
                 self.seen_allocation.remove(i);
             }
-            HF_KNOWN_NULLITY => {
+            HeapFlags::KNOWN_NULLITY => {
                 if i < self.known_nullity.len() {
                     self.known_nullity[i] = 0;
                 }
             }
-            HF_KNOWN_CLASS if i < self.known_class.len() => {
+            HeapFlags::KNOWN_CLASS if i < self.known_class.len() => {
                 self.known_class[i] = None;
             }
             _ => {}
@@ -738,8 +725,8 @@ impl HeapCache {
         // _remove_flag updates heapc_flags AND mirrors HF_IS_UNESCAPED /
         // HF_LIKELY_VIRTUAL Vec<bool> back out, so the version-gated
         // _check_flag query stays consistent.
-        self._remove_flag(opref, HF_LIKELY_VIRTUAL);
-        self._remove_flag(opref, HF_IS_UNESCAPED);
+        self._remove_flag(opref, HeapFlags::LIKELY_VIRTUAL);
+        self._remove_flag(opref, HeapFlags::IS_UNESCAPED);
         let i = opref.raw() as usize;
         let deps = self.heapc_deps.get_mut(i).and_then(Option::take);
         if let Some(deps) = deps
@@ -975,10 +962,10 @@ impl HeapCache {
         // RPython add_flags writes the bitwise OR of all four flags into the
         // versioned heapc_flags. We route through _set_flag so the Vec<bool>
         // mirrors stay in sync with heapc_flags.
-        self._set_flag(opref, HF_LIKELY_VIRTUAL);
-        self._set_flag(opref, HF_SEEN_ALLOCATION);
-        self._set_flag(opref, HF_IS_UNESCAPED);
-        self._set_flag(opref, HF_KNOWN_NULLITY);
+        self._set_flag(opref, HeapFlags::LIKELY_VIRTUAL);
+        self._set_flag(opref, HeapFlags::SEEN_ALLOCATION);
+        self._set_flag(opref, HeapFlags::IS_UNESCAPED);
+        self._set_flag(opref, HeapFlags::KNOWN_NULLITY);
     }
 
     /// heapcache.py new_array
@@ -1006,13 +993,13 @@ impl HeapCache {
         //     add_flags(box, flags)
         //     self.arraylen_now_known(box, lengthbox)
         self.update_version(opref);
-        self._set_flag(opref, HF_SEEN_ALLOCATION);
+        self._set_flag(opref, HeapFlags::SEEN_ALLOCATION);
         // RPython adds HF_KNOWN_NULLITY directly via add_flags. Route through
         // nullity_now_known so the Vec<u8> value mirror also captures non-null.
         self.nullity_now_known(opref, true);
         if length_is_const {
-            self._set_flag(opref, HF_LIKELY_VIRTUAL);
-            self._set_flag(opref, HF_IS_UNESCAPED);
+            self._set_flag(opref, HeapFlags::LIKELY_VIRTUAL);
+            self._set_flag(opref, HeapFlags::IS_UNESCAPED);
         }
         // heapcache.py: self.arraylen_now_known(box, lengthbox)
         self.arraylen_now_known(opref, lengthbox);
@@ -1025,7 +1012,8 @@ impl HeapCache {
     ///      return self._check_flag(box, HF_NONSTD_VABLE) or self._check_flag(box, HF_SEEN_ALLOCATION)
     /// ```
     pub fn is_known_nonstandard_virtualizable(&self, opref: OpRef) -> bool {
-        self._check_flag(opref, HF_NONSTD_VABLE) || self._check_flag(opref, HF_SEEN_ALLOCATION)
+        self._check_flag(opref, HeapFlags::NONSTD_VABLE)
+            || self._check_flag(opref, HeapFlags::SEEN_ALLOCATION)
     }
 
     /// heapcache.py:488-491
@@ -1040,7 +1028,7 @@ impl HeapCache {
         if opref.is_constant() {
             return;
         }
-        self._set_flag(opref, HF_NONSTD_VABLE);
+        self._set_flag(opref, HeapFlags::NONSTD_VABLE);
     }
 
     /// heapcache.py `replace_box(oldbox, newbox)`.
@@ -1090,7 +1078,7 @@ impl HeapCache {
             self.known_class[i] = Some(class);
         }
         // RPython _set_flag(box, HF_KNOWN_CLASS | HF_KNOWN_NULLITY).
-        self._set_flag(opref, HF_KNOWN_CLASS);
+        self._set_flag(opref, HeapFlags::KNOWN_CLASS);
         // RPython also writes HF_KNOWN_NULLITY in the same _set_flag call;
         // route through nullity_now_known so the Vec<u8> value mirror also
         // captures non-null.
@@ -1109,7 +1097,7 @@ impl HeapCache {
         if opref.is_constant() {
             return false;
         }
-        self._check_flag(opref, HF_KNOWN_CLASS)
+        self._check_flag(opref, HeapFlags::KNOWN_CLASS)
     }
 
     /// Get the known class of an object, if available.
@@ -1120,7 +1108,7 @@ impl HeapCache {
         if opref.is_constant() {
             return None;
         }
-        if !self._check_flag(opref, HF_KNOWN_CLASS) {
+        if !self._check_flag(opref, HeapFlags::KNOWN_CLASS) {
             return None;
         }
         // A stored class of 0 means the allocation's vtable address was unavailable at build
@@ -1186,7 +1174,7 @@ impl HeapCache {
     /// heapcache.py is_unescaped.
     ///   `return self._check_flag(box, HF_IS_UNESCAPED)`
     pub fn is_unescaped(&self, opref: OpRef) -> bool {
-        self._check_flag(opref, HF_IS_UNESCAPED)
+        self._check_flag(opref, HeapFlags::IS_UNESCAPED)
     }
 
     /// heapcache.py `CacheEntry._seen_alloc(box)`:
@@ -1197,7 +1185,7 @@ impl HeapCache {
     ///  return self.heapcache._check_flag(ref_box, HF_SEEN_ALLOCATION)
     /// ```
     pub fn saw_allocation(&self, opref: OpRef) -> bool {
-        self._check_flag(opref, HF_SEEN_ALLOCATION)
+        self._check_flag(opref, HeapFlags::SEEN_ALLOCATION)
     }
 
     /// Notify the cache about an operation, potentially invalidating entries.
@@ -1949,7 +1937,7 @@ impl HeapCache {
         }
         self.known_nullity[i] = if is_nonnull { 1 } else { 2 };
         // RPython _set_flag(box, HF_KNOWN_NULLITY).
-        self._set_flag(opref, HF_KNOWN_NULLITY);
+        self._set_flag(opref, HeapFlags::KNOWN_NULLITY);
     }
 
     /// Check if a value's nullity is known.
@@ -1972,7 +1960,7 @@ impl HeapCache {
         // heapcache.py: return self._check_flag(box, HF_KNOWN_NULLITY).
         // Version-gated so a stale `known_nullity` Vec entry from before
         // the last reset_keep_likely_virtuals does not leak through.
-        if !self._check_flag(opref, HF_KNOWN_NULLITY) {
+        if !self._check_flag(opref, HeapFlags::KNOWN_NULLITY) {
             return None;
         }
         self.known_nullity
@@ -2054,7 +2042,7 @@ impl HeapCache {
             return false;
         }
         let f = self.flags_for_ref(opref);
-        (f as u8) & HF_LIKELY_VIRTUAL != 0
+        (f as u8) & HeapFlags::LIKELY_VIRTUAL.bits() != 0
     }
 
     // ── Loop-invariant call result caching ──

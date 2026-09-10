@@ -297,7 +297,7 @@ crate::py_module! {
                 crate::make_module_builtin_function_with_arity_and_maybe_sig(
                     "crc32",
                     crc32,
-                    crate::HOPELESS,
+                    crate::BuiltinCodeFlags::HOPELESS.bits(),
                     Some(sig_all_posonly("crc32", &["data", "crc"])),
                 ),
             ),
@@ -313,7 +313,7 @@ crate::py_module! {
                 crate::make_module_builtin_function_with_arity_and_maybe_sig(
                     "crc_hqx",
                     crc_hqx,
-                    crate::HOPELESS,
+                    crate::BuiltinCodeFlags::HOPELESS.bits(),
                     Some(sig_all_posonly("crc_hqx", &["data", "crc"])),
                 ),
             ),

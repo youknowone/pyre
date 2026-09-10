@@ -29,7 +29,7 @@ use super::pygraph::PyGraph;
 /// RPython `CO_NEWLOCALS` compile flag (0x0002). Used to verify that a
 /// code object allocates its own `f_locals` dict rather than sharing
 /// the caller's — RPython functions must always set this.
-pub const CO_NEWLOCALS: u32 = super::bytecode::CO_NEWLOCALS;
+pub use super::bytecode::CoFlags;
 
 /// RPython `objspace.py` — `_assert_rpythonic(func)`.
 ///
@@ -91,7 +91,7 @@ fn _assert_rpythonic(func: &GraphFunc) -> Result<(), FlowContextError> {
     }
 
     // upstream line 33-35: `if not (func.__code__.co_flags & CO_NEWLOCALS)`.
-    if code.co_flags & CO_NEWLOCALS == 0 {
+    if code.co_flags & CoFlags::NEWLOCALS.bits() == 0 {
         return Err(FlowContextError::Flowing(
             super::flowcontext::FlowingError::new(
                 "The code object for a RPython function should have \
@@ -145,7 +145,7 @@ pub fn build_flow(func: GraphFunc) -> Result<FunctionGraph, FlowContextError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::bytecode::CO_GENERATOR;
+    use super::super::bytecode::CoFlags;
     use super::super::model::{ConstValue, Constant};
     use super::*;
 
@@ -172,7 +172,7 @@ mod tests {
         // attach a dummy HostCode with CO_NEWLOCALS set so co_cellvars
         // is the check that fires first.
         let mut code = make_empty_host_code();
-        code.co_flags = CO_NEWLOCALS;
+        code.co_flags = CoFlags::NEWLOCALS.bits();
         code.co_cellvars.push("x".to_string());
         func.code = Some(Box::new(code));
 
@@ -189,7 +189,7 @@ mod tests {
     fn assert_rpythonic_rejects_not_rpython_marker() {
         let mut func = GraphFunc::new("marked", empty_globals());
         let mut code = make_empty_host_code();
-        code.co_flags = CO_NEWLOCALS;
+        code.co_flags = CoFlags::NEWLOCALS.bits();
         func.code = Some(Box::new(code));
         func.not_rpython = true;
 
@@ -206,7 +206,7 @@ mod tests {
     fn assert_rpythonic_rejects_not_rpython_docstring() {
         let mut func = GraphFunc::new("doc", empty_globals());
         let mut code = make_empty_host_code();
-        code.co_flags = CO_NEWLOCALS;
+        code.co_flags = CoFlags::NEWLOCALS.bits();
         code.consts.push(ConstantData::Str {
             value: "NOT_RPYTHON: skip me".to_string().into(),
         });
@@ -241,7 +241,7 @@ mod tests {
     fn build_flow_bootstraps_generator_entry_graph() {
         let mut func = GraphFunc::new("gen", empty_globals());
         let mut code = make_empty_host_code();
-        code.co_flags = CO_NEWLOCALS | CO_GENERATOR;
+        code.co_flags = CoFlags::NEWLOCALS.bits() | CoFlags::GENERATOR.bits();
         func.code = Some(Box::new(code));
 
         let graph = build_flow(func).expect("generator bootstrap graph");
