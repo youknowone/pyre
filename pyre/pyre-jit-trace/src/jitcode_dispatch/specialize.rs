@@ -253,11 +253,10 @@ pub(crate) fn try_walker_specialize_unary_not<Sym: WalkSym>(
     if dst_bank != 'r' {
         return Ok(None);
     }
-    let Some(truth) = try_walker_specialize_truth_int(ctx, op_pc, operand)?
-        .map_or_else(
-            || try_walker_specialize_truth_bool(ctx, op_pc, operand),
-            |t| Ok(Some(t)),
-        )?
+    let Some(truth) = try_walker_specialize_truth_int(ctx, op_pc, operand)?.map_or_else(
+        || try_walker_specialize_truth_bool(ctx, op_pc, operand),
+        |t| Ok(Some(t)),
+    )?
     else {
         return Ok(None);
     };

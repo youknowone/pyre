@@ -11997,8 +11997,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         Ok(inlined) => inlined,
         Err(err) => {
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx
-                .restore_virtualref_boxes(pre_fold_virtualrefs);
+            ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
             ctx.trace_ctx.heap_cache_mut().reset();
             decline!(format_args!(
                 "callee inline of {}.{dunder} aborted: {err:?}",
