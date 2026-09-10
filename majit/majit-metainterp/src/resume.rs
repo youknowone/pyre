@@ -3492,6 +3492,7 @@ pub struct ResumeDataLoopMemo {
     /// mint a fresh writer `Vec` and livebox hole list on every bridge.
     writer_scratch: Vec<i32>,
     livebox_opt_scratch: Vec<Option<majit_ir::OpRef>>,
+    ordered_livebox_scratch: Vec<majit_ir::OpRef>,
 }
 
 impl ResumeDataLoopMemo {
@@ -3507,6 +3508,16 @@ impl ResumeDataLoopMemo {
             nvreused: 0,
             writer_scratch: Vec::new(),
             livebox_opt_scratch: Vec::new(),
+            ordered_livebox_scratch: Vec::new(),
+        }
+    }
+
+    /// Return the `finish` livebox list so the next guard reuses its
+    /// allocation. The caller must be done reading the boxes.
+    pub fn recycle_ordered_liveboxes(&mut self, mut liveboxes: Vec<majit_ir::OpRef>) {
+        liveboxes.clear();
+        if liveboxes.capacity() > self.ordered_livebox_scratch.capacity() {
+            self.ordered_livebox_scratch = liveboxes;
         }
     }
 
@@ -4713,22 +4724,21 @@ impl ResumeDataLoopMemo {
         // `make_constant` flip without paired numbering) is racing the
         // numbering snapshot, which would break rd_numb / liveboxes
         // alignment downstream.
-        let ordered_liveboxes: Vec<majit_ir::OpRef> = liveboxes
-            .iter()
-            .map(|opt| {
-                opt.map(|opref| {
-                    let walked = env.get_box_replacement_not_const(opref);
-                    debug_assert!(
-                        !walked.is_constant(),
-                        "resume.py:412-417 invariant: liveboxes entry walked to \
-                         constant-namespace OpRef post-numbering ({opref:?} → {walked:?}); \
-                         _number_boxes should have classified this as TAGCONST inline"
-                    );
-                    walked
-                })
-                .unwrap_or(majit_ir::OpRef::NONE)
+        let mut ordered_liveboxes = std::mem::take(&mut self.ordered_livebox_scratch);
+        ordered_liveboxes.clear();
+        ordered_liveboxes.extend(liveboxes.iter().map(|opt| {
+            opt.map(|opref| {
+                let walked = env.get_box_replacement_not_const(opref);
+                debug_assert!(
+                    !walked.is_constant(),
+                    "resume.py:412-417 invariant: liveboxes entry walked to \
+                     constant-namespace OpRef post-numbering ({opref:?} → {walked:?}); \
+                     _number_boxes should have classified this as TAGCONST inline"
+                );
+                walked
             })
-            .collect();
+            .unwrap_or(majit_ir::OpRef::NONE)
+        }));
         liveboxes.clear();
         self.livebox_opt_scratch = liveboxes;
 

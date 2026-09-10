@@ -1904,10 +1904,10 @@ impl BlackholeInterpreter {
             let opcode = code[self.position];
             // The remaining `shift` epilogue at pc 210 is `-live-`,
             // `goto/L`, `goto_if_not`, `int_copy`, getfield/setfield of
-            // `marked`/`empty`, and `int_return` around one native
-            // INLINE_CALL. RPython's translated `dispatch_loop` inlines
-            // those `_get_method` bodies; the function-pointer table is
-            // the untranslated form. Do not restart `fnaddr` from this
+            // `marked`/`empty`, `int_return`, and one native INLINE_CALL.
+            // RPython's translated `dispatch_loop` inlines those
+            // `_get_method` bodies; the function-pointer table is the
+            // untranslated form. Do not restart `fnaddr` from this
             // mid-node PC.
             if !trace {
                 match opcode {
@@ -1991,6 +1991,37 @@ impl BlackholeInterpreter {
                         self.return_type = BhReturnType::Int;
                         self.position = p + 1;
                         return BhRunOutcome::LeaveFrame;
+                    }
+                    jitcode::insns::BC_INLINE_CALL => {
+                        let p = self.position + 1;
+                        match handler_inline_call_nested_ext(self, code, p) {
+                            Ok(new_pos) => {
+                                self.position = new_pos;
+                                continue;
+                            }
+                            Err(DispatchError::LeaveFrame) => {
+                                return BhRunOutcome::LeaveFrame;
+                            }
+                            Err(DispatchError::ContinueRunningNormally(args)) => {
+                                return BhRunOutcome::ContinueRunningNormally(args);
+                            }
+                            Err(DispatchError::RaiseException {
+                                exc,
+                                resume_position,
+                                ..
+                            }) => {
+                                // dispatch_step writes resume_position
+                                // before re-raising so catch_exception
+                                // sees the post-op cursor.
+                                self.position = resume_position;
+                                if self.handle_exception_in_frame(exc) {
+                                    continue;
+                                }
+                                self.got_exception = true;
+                                self.exception_last_value = exc;
+                                return BhRunOutcome::Exception;
+                            }
+                        }
                     }
                     _ => {}
                 }
