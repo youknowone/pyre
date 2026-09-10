@@ -4827,6 +4827,9 @@ impl MiniMarkGC {
     /// rounding (nursery geometry, arena minimum, inspector alignment), so the
     /// rounding stays at the call sites.
     fn try_size_for_typeid(&self, obj_addr: usize, type_id: u32) -> Option<usize> {
+        if (type_id as usize) >= self.types.len() {
+            return None;
+        }
         let type_info = self.types.get(type_id);
         if type_info.item_size == 0 {
             return Some(type_info.size);
@@ -6686,8 +6689,10 @@ impl MiniMarkGC {
     ///
     /// A precise map publishes the payload start. A slot that landed
     /// `N` words inside a nursery object still has to drag that object
-    /// out; snapping to the enclosing start is the walk-site counterpart
-    /// of `nursery_start_decodes`.
+    /// out. A live start that decodes is used as-is: walking backward
+    /// from every nursery root would treat a payload `FORWARDED_MARKER`
+    /// as an enclosing header and rewrite the slot to the wrong object.
+    /// Snap only when this address itself does not decode.
     fn nursery_root_object_addr(&self, addr: usize) -> usize {
         if self.nursery_start_decodes(addr) {
             return addr;
@@ -6713,8 +6718,19 @@ impl MiniMarkGC {
             }
             if unsafe { (*header_of(candidate)).is_forwarded() } {
                 let fwd = unsafe { GcHeader::forwarding_address(header_of(candidate)) };
-                let Some(size) =
-                    self.try_size_for_typeid(fwd, unsafe { (*header_of(fwd)).type_id() })
+                // A payload word can equal FORWARDED_MARKER. The word after
+                // it is then not a live object start; refuse an unaligned
+                // or non-heap forwarding address before reading its header.
+                if !fwd.is_multiple_of(GcHeader::ALIGN)
+                    || !(self.oldgen.contains(fwd) || self.is_in_nursery(fwd))
+                {
+                    continue;
+                }
+                let fwd_hdr = unsafe { header_of(fwd) };
+                if unsafe { (*fwd_hdr).is_forwarded() } {
+                    continue;
+                }
+                let Some(size) = self.try_size_for_typeid(fwd, unsafe { (*fwd_hdr).type_id() })
                 else {
                     continue;
                 };
@@ -14944,6 +14960,9 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::simple(32));
         let obj = gc.alloc_with_type(tid, 32);
         unsafe {
+            *(obj.0 as *mut u64) = 0x42;
+            // header_of(obj+16) reads this word; a non-type_id value
+            // is the test_re shape (`pycode` pointer, not tid 0).
             *((obj.0 + 8) as *mut u64) = 0x42;
         }
 
@@ -14956,13 +14975,31 @@ cache size\t: 8192 kB\n";
             "exact root must promote the object"
         );
 
+        // +16 so `header_of` reads the word we set to 0x42, which does
+        // not decode as a type_id. A zero word would look like type 0
+        // and is left as a start (`nursery_start_decodes`).
         let mut interior = GcRef(obj.0 + 16);
         gc.drag_out_root(&mut interior);
         assert_eq!(
             exact.0, interior.0,
             "interior root must snap to the same forwarded object"
         );
-        assert_eq!(unsafe { *((exact.0 + 8) as *const u64) }, 0x42);
+        assert_eq!(unsafe { *(exact.0 as *const u64) }, 0x42);
+    }
+
+    #[test]
+    fn test_enclosing_snap_ignores_forwarded_marker_payload_words() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(48));
+        let obj = gc.alloc_with_type(tid, 48);
+        unsafe {
+            *(obj.0 as *mut u64) = crate::header::FORWARDED_MARKER;
+            *((obj.0 + 8) as *mut usize) = 0xffff_ffff_ffff_ffce;
+        }
+        let mut exact = obj;
+        gc.drag_out_root(&mut exact);
+        let mut interior = GcRef(obj.0 + 24);
+        gc.drag_out_root(&mut interior);
     }
 
     /// incminimark.py:3068-3079 dead-target branch. A WEAKREF whose
