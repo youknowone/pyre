@@ -5714,10 +5714,30 @@ fn build_function(
     // Every entry path, including a keyed LABEL resume, must install this
     // module's map. A loop-closing bridge compiled before a merge still
     // carries its old prefix map; the keyed resume branches past the
-    // key-0 publish below, so do it here before `br_table`.
+    // key-0 clear below, so null any newly marked homes first.
     let publish_ptr = if ca.compute_home_gcmap {
         let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
         let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
+        // A first compile has min=0; those homes were cleared on the original
+        // key-0 entry. Only a merge that grew the map past a previous floor
+        // leaves newly marked slots uninitialized on a keyed resume.
+        if ca.home_gcmap_min_ordinary > 0 && used_ordinary > ca.home_gcmap_min_ordinary {
+            emit_null_home_slots(
+                &mut sink,
+                frame,
+                ca.home_gcmap_min_ordinary as u64..used_ordinary as u64,
+                |_| true,
+            );
+        }
+        let label_base = frame.ordinary_home_slots() as u64;
+        if ca.home_gcmap_min_labels > 0 && used_labels > ca.home_gcmap_min_labels {
+            emit_null_home_slots(
+                &mut sink,
+                frame,
+                label_base + ca.home_gcmap_min_labels as u64..label_base + used_labels as u64,
+                |_| true,
+            );
+        }
         Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
             as usize as i64
     } else {
