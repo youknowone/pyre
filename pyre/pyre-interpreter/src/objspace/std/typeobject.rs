@@ -227,20 +227,13 @@ mod tests {
                     (*tp).name
                 );
             }
-            let definition = TypeDef::from_rawdict(
-                "NotASequence",
-                vec![],
-                IndexMap::new(),
-                &INSTANCE_TYPE,
-            );
+            let definition =
+                TypeDef::from_rawdict("NotASequence", vec![], IndexMap::new(), &INSTANCE_TYPE);
             let w_type = ObjSpace::new().gettypeobject(definition).unwrap();
             assert!(!crate::baseobjspace::flag_sequence_bug_compat(w_type));
-            let flagged = TypeDef::from_rawdict(
-                "CompatSequence",
-                vec![],
-                IndexMap::new(),
-                &INSTANCE_TYPE,
-            ) as *mut TypeDef;
+            let flagged =
+                TypeDef::from_rawdict("CompatSequence", vec![], IndexMap::new(), &INSTANCE_TYPE)
+                    as *mut TypeDef;
             (*flagged).flag_sequence_bug_compat = true;
             let flagged = ObjSpace::new().gettypeobject(flagged).unwrap();
             assert!(crate::baseobjspace::flag_sequence_bug_compat(flagged));
