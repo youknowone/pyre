@@ -1814,21 +1814,18 @@ impl<'a> GraphFlattener<'a> {
 
     fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
         let exits = block.borrow().exits.clone();
-        // `raise/r` is not a canraise op (`graph_op_can_raise` omits it),
-        // so the block has no trailing `-live-`.  A later merge that
-        // appends a normal exit then takes the multi-exit early-return
-        // and drops `catch_exception`, so blackhole `raise/r` exits the
-        // frame instead of the same-frame except.  Always lower a
-        // raise-terminated block through the adjacent catch, using the
-        // seeded exception exit.  Do not go through `raising_op()` —
-        // that is `None` when `canraise()` is false.
+        // `raise/r` is not a canraise op (`graph_op_can_raise` omits it).
+        // A later merge that appends a normal exit, or vable stores after
+        // the raise, used to take the multi-exit early-return and drop
+        // `catch_exception`.  Any block that recorded `raise` is
+        // raise-terminated: emit the adjacent catch and the seeded
+        // exception exit.  Do not go through `raising_op()` — that is
+        // `None` when `canraise()` is false.
         if block
             .borrow()
             .operations
             .iter()
-            .rev()
-            .find(|op| op.opname != OPNAME_LIVE)
-            .is_some_and(|op| op.opname == "raise")
+            .any(|op| op.opname == "raise")
         {
             let link = exits
                 .iter()
@@ -2375,6 +2372,13 @@ impl<'a> GraphFlattener<'a> {
                 );
             }
             self.serialize_op(op);
+            // `Raise.nomoreblocks`: nothing after `raise` executes.
+            // Walker vable-mirror stores that landed on this block would
+            // sit between `raise/r` and `catch_exception`, so blackhole
+            // `handle_exception_in_frame` would miss the handler.
+            if op.opname == "raise" {
+                break;
+            }
         }
         self.insert_exits(&block, handling_ovf);
     }

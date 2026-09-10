@@ -9249,7 +9249,9 @@ pub(crate) fn binary_op_tag_for_helper_index(
     sub_index: usize,
     int_concretes: &[ConcreteValue],
 ) -> Option<i64> {
-    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)?.name.as_str();
+    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)?
+        .name
+        .as_str();
     if name.contains("binary_value_from_tag") {
         return match int_concretes.first() {
             Some(ConcreteValue::Int(tag)) => Some(*tag),
@@ -9534,11 +9536,8 @@ pub(crate) fn try_emit_exact_float_binop<Sym: WalkSym>(
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
     }
     let raw_result = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
-    let bits = majit_metainterp::eval_binop_f(
-        op_code,
-        lhs_f64.to_bits() as i64,
-        rhs_f64.to_bits() as i64,
-    );
+    let bits =
+        majit_metainterp::eval_binop_f(op_code, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);
     let result_val = f64::from_bits(bits as u64);
     ctx.trace_ctx
         .set_opref_concrete(raw_result, majit_ir::Value::Float(result_val));

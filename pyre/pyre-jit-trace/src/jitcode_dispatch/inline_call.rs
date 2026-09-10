@@ -12702,10 +12702,8 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             // do not re-enter `binary_value_from_tag`, which inlines
             // `add` and recurses.
             if ref_args.len() == 2
-                && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(
-                    sub_index,
-                    int_arg_concretes,
-                )
+                && let Some(op_tag) =
+                    super::specialize::binary_op_tag_for_helper_index(sub_index, int_arg_concretes)
                 && let Some((dst_bank, dst, _)) = call_opcode_result_dst(code, pc)
                 && dst_bank == 'r'
             {
@@ -12733,9 +12731,7 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                     pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
                     Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
                 ) && let Some(outcome) = spec_gate(SpecFold::Subscr, || {
-                    super::specialize::try_emit_list_int_getitem(
-                        ctx, pc, ref_args, dst, dst_bank,
-                    )
+                    super::specialize::try_emit_list_int_getitem(ctx, pc, ref_args, dst, dst_bank)
                 })? {
                     return Ok(outcome);
                 }
@@ -13949,9 +13945,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::BinaryOpDescent, || {
-            super::specialize::try_emit_exact_int_binop(
-                ctx, op.pc, op_tag, &args, dst, dst_bank,
-            )
+            super::specialize::try_emit_exact_int_binop(ctx, op.pc, op_tag, &args, dst, dst_bank)
         })? {
             write_boxed(ctx, boxed)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -13959,12 +13953,21 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::BinaryOpFloat, || {
-            super::specialize::try_emit_exact_float_binop(
-                ctx, op.pc, op_tag, &args, dst, dst_bank,
-            )
+            super::specialize::try_emit_exact_float_binop(ctx, op.pc, op_tag, &args, dst, dst_bank)
         })? {
             write_boxed(ctx, boxed)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // Named `add`/`mul` helpers are the same BINARY family as
+        // `binary_value_from_tag`.  A Python forward dunder must be
+        // admitted here too, or `p + i` residualizes the whole helper.
+        if let Ok(setup) = inline_fnaddr_call_setup(ctx, op.pc, descr_index, &[], &args, &[])
+            && let Some(call_descr) = setup.descr.as_call_descr()
+            && let Some(inlined) = try_walker_inline_user_binop(
+                ctx, op, code, op_tag, &args, call_descr, dst, dst_bank,
+            )?
+        {
+            return Ok(inlined);
         }
     }
 
@@ -14257,6 +14260,23 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
             write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // Residual BINARY_OP used to admit a Python forward dunder here.
+        // Flatten now lowers BINARY to `inline_call` of
+        // `binary_value_from_tag`, so the residual gate never sees
+        // `p + i`.  Re-run the same admission before residualizing the
+        // helper — `synth/binop_dunder_leaf_inline` and the defaulted
+        // `_pydecimal` shape (`binop_dunder_defaulted_param`).
+        // The inline_call descr is a JitCode descr, not a CallDescr;
+        // borrow the helper's own `calldescr` the fnaddr residual uses.
+        if let Ok(setup) =
+            inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
+            && let Some(call_descr) = setup.descr.as_call_descr()
+            && let Some(inlined) = try_walker_inline_user_binop(
+                ctx, op, code, op_tag, &ref_args, call_descr, dst, dst_bank,
+            )?
+        {
+            return Ok(inlined);
         }
     }
 

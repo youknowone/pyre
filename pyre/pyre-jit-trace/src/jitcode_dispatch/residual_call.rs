@@ -4048,56 +4048,56 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
                 // Keep the last portal store rather than clobber it with 0.
             } else {
-            let last_instr = ctx.trace_ctx.const_int(py_pc as i64);
-            // Scope the box half to the residual just as
-            // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
-            // leaves both halves equal (`pyjitpl.py:1188-1199`), and
-            // `check_synchronized_virtualizable` asserts that invariant
-            // (`pyjitpl.py:3463-3468`).
-            if let Some(idx) = info.static_field_index_by_name("last_instr")
-                && let Some((prev_op, prev_val)) = ctx.trace_ctx.virtualizable_entry_at(idx)
-            {
-                saved_last_instr_shadow = Some((prev_op, prev_val));
-            }
-            crate::trace_opcode::mirror_vable_static_to_boxes(
-                ctx.trace_ctx,
-                "last_instr",
-                last_instr,
-                majit_ir::Value::Int(py_pc as i64),
-            );
-            // Record the runtime heap half of the same `_opimpl_setfield_vable`
-            // shape.  The mirror above synchronizes the tracing-time shadow
-            // and live frame; this store keeps compiled execution paired too.
-            //
-            // Upstream needs neither at a residual call: its frame readers are
-            // traced in and read `last_instr` off the virtual frame.  pyre
-            // residualizes them and reads the heap, and the frame-chain walk no
-            // longer forces (`ExecutionContext::force_frame`), so without this
-            // store nothing keeps the field current in compiled code: left at
-            // the last resume point, `_warnings::setup_context` keys its
-            // registry on the wrong line and re-issues a warning the
-            // interpreted run already deduplicated.
-            if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
-                && let Some(idx) = info.static_field_index_by_name("last_instr")
-            {
-                // Record under the PARENT-STRUCT field descr, the resolution
-                // `vable_setfield` applies through `vable_static_record_descr`;
-                // `vable_setfield_descr` is a raw pass-through and does not.
-                // The vinfo's own `static_field_descrs[i]` numbers the field by
-                // the vinfo `[token, statics, arrays]` order, which diverges
-                // from PyFrame's struct declaration order, so the store pairs
-                // against the wrong slot.  `virtualizable.py:71` builds the
-                // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so
-                // upstream's vinfo descr and the descr an ordinary
-                // `setfield_gc` carries are one object and the question cannot
-                // arise there.  Here it decides whether this publish and
-                // `emit_traceback_node`'s store — same frame, same offset —
-                // supersede each other or survive as two independent
-                // locations flushed in an arbitrary order.
-                let descr = info.static_field_struct_descr(idx);
-                ctx.trace_ctx
-                    .vable_setfield_descr(vable_ref, last_instr, descr);
-            }
+                let last_instr = ctx.trace_ctx.const_int(py_pc as i64);
+                // Scope the box half to the residual just as
+                // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
+                // leaves both halves equal (`pyjitpl.py:1188-1199`), and
+                // `check_synchronized_virtualizable` asserts that invariant
+                // (`pyjitpl.py:3463-3468`).
+                if let Some(idx) = info.static_field_index_by_name("last_instr")
+                    && let Some((prev_op, prev_val)) = ctx.trace_ctx.virtualizable_entry_at(idx)
+                {
+                    saved_last_instr_shadow = Some((prev_op, prev_val));
+                }
+                crate::trace_opcode::mirror_vable_static_to_boxes(
+                    ctx.trace_ctx,
+                    "last_instr",
+                    last_instr,
+                    majit_ir::Value::Int(py_pc as i64),
+                );
+                // Record the runtime heap half of the same `_opimpl_setfield_vable`
+                // shape.  The mirror above synchronizes the tracing-time shadow
+                // and live frame; this store keeps compiled execution paired too.
+                //
+                // Upstream needs neither at a residual call: its frame readers are
+                // traced in and read `last_instr` off the virtual frame.  pyre
+                // residualizes them and reads the heap, and the frame-chain walk no
+                // longer forces (`ExecutionContext::force_frame`), so without this
+                // store nothing keeps the field current in compiled code: left at
+                // the last resume point, `_warnings::setup_context` keys its
+                // registry on the wrong line and re-issues a warning the
+                // interpreted run already deduplicated.
+                if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
+                    && let Some(idx) = info.static_field_index_by_name("last_instr")
+                {
+                    // Record under the PARENT-STRUCT field descr, the resolution
+                    // `vable_setfield` applies through `vable_static_record_descr`;
+                    // `vable_setfield_descr` is a raw pass-through and does not.
+                    // The vinfo's own `static_field_descrs[i]` numbers the field by
+                    // the vinfo `[token, statics, arrays]` order, which diverges
+                    // from PyFrame's struct declaration order, so the store pairs
+                    // against the wrong slot.  `virtualizable.py:71` builds the
+                    // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so
+                    // upstream's vinfo descr and the descr an ordinary
+                    // `setfield_gc` carries are one object and the question cannot
+                    // arise there.  Here it decides whether this publish and
+                    // `emit_traceback_node`'s store — same frame, same offset —
+                    // supersede each other or survive as two independent
+                    // locations flushed in an arbitrary order.
+                    let descr = info.static_field_struct_descr(idx);
+                    ctx.trace_ctx
+                        .vable_setfield_descr(vable_ref, last_instr, descr);
+                }
             }
         }
         unsafe {
@@ -9181,10 +9181,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         && pyre_interpreter::jit_trace_fnaddrs()
             .iter()
             .any(|(n, a)| *a == func_addr && n.ends_with("compare_value_from_tag"));
-    let is_binary_op = foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp
-        || opcode_binary_fnaddr;
-    let is_compare_op = foldable_runtime_helper == majit_ir::RuntimeHelperKind::CompareOp
-        || opcode_compare_fnaddr;
+    let is_binary_op =
+        foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp || opcode_binary_fnaddr;
+    let is_compare_op =
+        foldable_runtime_helper == majit_ir::RuntimeHelperKind::CompareOp || opcode_compare_fnaddr;
     if is_binary_op || is_compare_op {
         if let Some(&tag_opref) = i_args.first() {
             if let Some(majit_ir::Value::Int(op_tag)) = ctx.trace_ctx.box_value(tag_opref) {
