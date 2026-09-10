@@ -780,7 +780,7 @@ impl Operand {
 
     /// Live `Rc<RefCell<IntBound>>` handle. Mirror of
     /// Live `Rc<RefCell<IntBound>>` handle.
-    pub fn int_bound_handle(&self) -> Option<Rc<RefCell<IntBound>>> {
+    pub fn int_bound_handle(&self) -> Option<crate::intbound::IntBoundRc> {
         self.read_forwarding_host(None, |h| h.int_bound_handle())
     }
 

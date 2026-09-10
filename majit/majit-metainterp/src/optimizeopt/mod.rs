@@ -599,48 +599,44 @@ impl std::ops::Deref for PtrInfoHandleRef<'_> {
 ///     `ConstInt` (`optimizer.py from_constant`).  Two
 ///     `Const` handles never compare equal under `ptr_eq` even when
 ///     they wrap the same value.
-///   - `Live(Rc<RefCell<IntBound>>)` — the actual `_forwarded` cell.
-///     `Rc::ptr_eq` ≡ Python `is`.  In-place mutation via
+///   - `Live(IntBoundRc)` — the actual `_forwarded` cell.
+///     `IntBoundRc::ptr_eq` ≡ Python `is`.  In-place mutation via
 ///     `handle.borrow_mut()` propagates to every other live handle
 ///     cloned from the same cell.
 pub enum IntBoundHandle {
     /// Freshly synthesized `IntBound::from_constant(_)` object
-    /// (optimizer.py:102-103 return path). Wrapped in `Rc<RefCell<>>`
-    /// so callers retain Python `from_constant(...)` reference
-    /// semantics — the object is mutable, and clones of *this same
-    /// handle* share the cell. Two independent `getintbound_handle`
-    /// calls on the same ConstInt mint distinct Rcs (PyPy: two
-    /// `from_constant(7)` calls return two distinct objects), so
-    /// mutations do not propagate across calls.
-    Const(std::rc::Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>),
+    /// (`optimizer.py` `from_constant` return path). Each call mints
+    /// a distinct slab cell (two `from_constant(7)` calls return two
+    /// distinct objects), so mutations do not propagate across calls.
+    Const(majit_ir::intbound::IntBoundRc),
     /// Live `_forwarded` cell — mutations propagate to every handle
-    /// cloned from the same Rc and through `box._forwarded`.
-    Live(std::rc::Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>),
+    /// cloned from the same slab slot and through `box._forwarded`.
+    Live(majit_ir::intbound::IntBoundRc),
 }
 
 impl IntBoundHandle {
     /// Wrap a freshly synthesized `IntBound::from_constant(_)`
-    /// (`optimizer.py:102-103` return path). Mints a fresh `Rc` so
-    /// each call produces a distinct object (Python `is` semantics).
+    /// (`optimizer.py` `from_constant` return path). Mints a fresh
+    /// slab cell so each call produces a distinct object.
     pub fn const_(b: crate::optimizeopt::intutils::IntBound) -> Self {
-        IntBoundHandle::Const(std::rc::Rc::new(std::cell::RefCell::new(b)))
+        IntBoundHandle::Const(majit_ir::intbound::IntBoundRc::new(b))
     }
 
-    /// Wrap a live `_forwarded` cell handle (`optimizer.py:111-112`
-    /// return path).
-    pub fn live(
-        rc: std::rc::Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>,
-    ) -> Self {
+    /// Wrap a live `_forwarded` cell handle (`optimizer.py`
+    /// `getintbound` return path).
+    pub fn live(rc: majit_ir::intbound::IntBoundRc) -> Self {
         IntBoundHandle::Live(rc)
     }
 
     /// Identity comparison. Two handles are `ptr_eq` iff they hold
-    /// the same `Rc` — Python `is` parity. Const/Live cross-arm pairs
-    /// are never equal because they live in disjoint cell namespaces.
+    /// the same slab slot — Python `is` parity. Const/Live cross-arm
+    /// pairs are never equal because they live in disjoint namespaces.
     pub fn ptr_eq(&self, other: &IntBoundHandle) -> bool {
         match (self, other) {
             (IntBoundHandle::Const(a), IntBoundHandle::Const(b))
-            | (IntBoundHandle::Live(a), IntBoundHandle::Live(b)) => std::rc::Rc::ptr_eq(a, b),
+            | (IntBoundHandle::Live(a), IntBoundHandle::Live(b)) => {
+                majit_ir::intbound::IntBoundRc::ptr_eq(a, b)
+            }
             _ => false,
         }
     }
@@ -666,8 +662,7 @@ impl IntBoundHandle {
         }
     }
 
-    /// Convert to an owned `IntBound` snapshot. Clones for both arms
-    /// since both wrap `Rc<RefCell<_>>`.
+    /// Convert to an owned `IntBound` snapshot.
     pub fn into_int_bound(self) -> crate::optimizeopt::intutils::IntBound {
         match self {
             IntBoundHandle::Const(rc) | IntBoundHandle::Live(rc) => rc.borrow().clone(),
@@ -6129,7 +6124,7 @@ impl OptContext {
         }
         match &resolved.get_forwarded() {
             majit_ir::forwarding::Forwarded::Info(OpInfo::IntBound(rc)) => {
-                return IntBoundHandle::live(std::rc::Rc::clone(rc));
+                return IntBoundHandle::live(rc.clone());
             }
             majit_ir::forwarding::Forwarded::None => {}
             _ => {

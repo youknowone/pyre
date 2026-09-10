@@ -1870,7 +1870,9 @@ const BOTH_FWD_TAG: usize = 6;
 const SLOT_TAG_MAX: usize = BOTH_FWD_TAG;
 
 struct BothPayload {
-    descr: Option<DescrRef>,
+    /// Always present in this arm (`write_parts` `(Some, Some, false)`).
+    /// Not `Option` — that made the box 56 B on the regex and/or leaf.
+    descr: DescrRef,
     extra: OpKindExtra,
 }
 
@@ -2183,7 +2185,7 @@ fn take_word(w: usize) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32)
         (None, Some(extra), 0, 0)
     } else if is_both_inline(w) {
         let both = unsafe { Box::from_raw(tagged_ptr(w) as *mut BothPayload) };
-        (both.descr, Some(Box::new(both.extra)), 0, 0)
+        (Some(both.descr), Some(Box::new(both.extra)), 0, 0)
     } else if is_thin_fwd_box(w) {
         let p = free_thin_fwd(box_payload(w) as *mut ThinFwd);
         let (lo, hi) = thin_to_lo_hi(p.thin);
@@ -2526,7 +2528,7 @@ impl DescrSlot {
             }
             (Some(d), Some(e), false) => {
                 let ptr = Box::into_raw(Box::new(BothPayload {
-                    descr: Some(d),
+                    descr: d,
                     extra: *e,
                 })) as usize;
                 debug_assert_eq!(self.word(), 0);
@@ -2671,7 +2673,7 @@ impl DescrSlot {
                     BOTH_TAG => {
                         let both = Box::from_raw((*p).lo as *mut BothPayload);
                         (*p).lo = Box::into_raw(Box::new(BothFwd {
-                            descr: both.descr,
+                            descr: Some(both.descr),
                             extra: both.extra,
                             forwarded: packed,
                         })) as usize;
@@ -2746,7 +2748,7 @@ impl DescrSlot {
             unsafe {
                 *self.word.get() = 0;
             }
-            self.write_parts(both.descr, Some(Box::new(both.extra)), packed);
+            self.write_parts(Some(both.descr), Some(Box::new(both.extra)), packed);
             return;
         }
         let stamp = if w != 0 {
@@ -2815,7 +2817,7 @@ unsafe fn decode_descr_extra(
             (None, Some(Box::from_raw(lo as *mut OpKindExtra)), 0)
         } else if hi == BOTH_TAG {
             let both = Box::from_raw(lo as *mut BothPayload);
-            (both.descr, Some(Box::new(both.extra)), 0)
+            (Some(both.descr), Some(Box::new(both.extra)), 0)
         } else if hi == FWD_TAG {
             (None, None, lo as u64)
         } else if hi == DESCR_FWD_TAG {
@@ -2840,7 +2842,7 @@ unsafe fn peek_descr(lo: usize, hi: usize) -> Option<DescrRef> {
         } else if hi == EXTRA_TAG || hi == FWD_TAG || hi == EXTRA_FWD_TAG {
             None
         } else if hi == BOTH_TAG {
-            (*(lo as *const BothPayload)).descr.clone()
+            Some((*(lo as *const BothPayload)).descr.clone())
         } else if hi == DESCR_FWD_TAG {
             Some((*(lo as *const DescrFwd)).descr.clone())
         } else if hi == BOTH_FWD_TAG {

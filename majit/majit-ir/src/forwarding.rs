@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 #[cfg(feature = "test-support")]
 use crate::OpRef;
-use crate::intbound::IntBound;
+use crate::intbound::{IntBound, IntBoundRc};
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::Op;
@@ -301,8 +301,8 @@ pub trait ForwardingHost {
         }
     }
 
-    /// Live `Rc<RefCell<IntBound>>` handle.
-    fn int_bound_handle(&self) -> Option<Rc<std::cell::RefCell<IntBound>>> {
+    /// Live [`IntBoundRc`] handle.
+    fn int_bound_handle(&self) -> Option<IntBoundRc> {
         match self.get_forwarded() {
             Forwarded::Info(OpInfo::IntBound(rc)) => Some(rc),
             _ => None,
@@ -412,10 +412,55 @@ impl<T> std::ops::DerefMut for BorrowGuardMut<T> {
 pub type PtrInfoBorrow = BorrowGuard<PtrInfo>;
 /// Owning exclusive borrow guard for `ptr_info_mut()`.
 pub type PtrInfoBorrowMut = BorrowGuardMut<PtrInfo>;
-/// Owning shared borrow guard for `int_bound()`.
-pub type IntBoundBorrow = BorrowGuard<IntBound>;
-/// Owning exclusive borrow guard for `int_bound_mut()`.
-pub type IntBoundBorrowMut = BorrowGuardMut<IntBound>;
+
+/// Owning shared borrow of a slab `IntBound`. Same drop-order
+/// invariant as [`BorrowGuard`]: `_rc` outlives `inner`.
+pub struct IntBoundBorrow {
+    inner: std::cell::Ref<'static, IntBound>,
+    _rc: IntBoundRc,
+}
+
+impl IntBoundBorrow {
+    pub(crate) fn new(rc: IntBoundRc) -> Self {
+        let r: std::cell::Ref<'_, IntBound> = rc.borrow();
+        let r: std::cell::Ref<'static, IntBound> = unsafe { std::mem::transmute(r) };
+        Self { inner: r, _rc: rc }
+    }
+}
+
+impl std::ops::Deref for IntBoundBorrow {
+    type Target = IntBound;
+    fn deref(&self) -> &IntBound {
+        &self.inner
+    }
+}
+
+/// Owning exclusive borrow of a slab `IntBound`.
+pub struct IntBoundBorrowMut {
+    inner: std::cell::RefMut<'static, IntBound>,
+    _rc: IntBoundRc,
+}
+
+impl IntBoundBorrowMut {
+    pub(crate) fn new(rc: IntBoundRc) -> Self {
+        let r: std::cell::RefMut<'_, IntBound> = rc.borrow_mut();
+        let r: std::cell::RefMut<'static, IntBound> = unsafe { std::mem::transmute(r) };
+        Self { inner: r, _rc: rc }
+    }
+}
+
+impl std::ops::Deref for IntBoundBorrowMut {
+    type Target = IntBound;
+    fn deref(&self) -> &IntBound {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for IntBoundBorrowMut {
+    fn deref_mut(&mut self) -> &mut IntBound {
+        &mut self.inner
+    }
+}
 
 /// Packed `_forwarded` word. Low 3 bits are the tag; an 8-aligned Rc
 /// pointer uses tag 0 (`None` is the zero word). SmallConst keeps the
@@ -520,7 +565,7 @@ fn pack_info(info: OpInfo) -> u64 {
             p | FW_INFO_PTR
         }
         OpInfo::IntBound(rc) => {
-            let p = Rc::into_raw(rc) as u64;
+            let p = IntBoundRc::into_raw(rc) as u64;
             debug_assert_eq!(p & FW_TAG, 0);
             p | FW_INFO_BOUND
         }
@@ -573,8 +618,8 @@ pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
             out
         }
         FW_INFO_BOUND => {
-            let rc = unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<IntBound>) };
-            let out = Forwarded::Info(OpInfo::IntBound(Rc::clone(&rc)));
+            let rc = unsafe { IntBoundRc::from_raw(fwd_ptr(w) as *const ()) };
+            let out = Forwarded::Info(OpInfo::IntBound(rc.clone()));
             std::mem::forget(rc);
             out
         }
@@ -599,7 +644,7 @@ pub(crate) fn drop_packed_forwarded(w: u64) {
         }
         FW_CONST => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const Cell<Value>) }),
         FW_INFO_PTR => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<PtrInfo>) }),
-        FW_INFO_BOUND => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<IntBound>) }),
+        FW_INFO_BOUND => drop(unsafe { IntBoundRc::from_raw(fwd_ptr(w) as *const ()) }),
         FW_INFO_OTHER => drop(unsafe { Box::from_raw(fwd_ptr(w) as *mut OpInfo) }),
         _ => {}
     }

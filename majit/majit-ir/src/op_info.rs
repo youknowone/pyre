@@ -9,7 +9,7 @@
 //! `PtrInfo` provide shared-identity semantics matching PyPy's
 //! `_forwarded` slot — see `info.py:865-894 get*ptrinfo` "return fw".
 
-use crate::intbound::IntBound;
+use crate::intbound::{IntBound, IntBoundRc};
 use crate::ptr_info::PtrInfo;
 
 /// info.py `FloatConstInfo`.
@@ -56,7 +56,9 @@ pub enum OpInfo {
     EmptyInfo(EmptyInfo),
     /// Known integer bounds. info.py:1264 IntBound.
     /// `IntBound::from_constant(v)` is the canonical Int constant carrier.
-    IntBound(std::rc::Rc<std::cell::RefCell<IntBound>>),
+    /// Chunked [`IntBoundRc`] so first mint leaves the 56-byte
+    /// `RcBox<RefCell<IntBound>>` class.
+    IntBound(IntBoundRc),
     /// Pointer info (non-null, known class, virtual, etc.).
     /// `PtrInfo::Constant(GcRef)` is the Ref constant carrier
     /// (info.py ConstPtrInfo).
@@ -90,7 +92,7 @@ impl OpInfo {
 
     /// Helper for constructing `OpInfo::IntBound` from owned `IntBound`.
     pub fn int_bound(b: IntBound) -> Self {
-        OpInfo::IntBound(std::rc::Rc::new(std::cell::RefCell::new(b)))
+        OpInfo::IntBound(IntBoundRc::new(b))
     }
 
     pub fn is_constant(&self) -> bool {
@@ -110,10 +112,10 @@ impl OpInfo {
         }
     }
 
-    /// Returns the live `Rc` handle to the `IntBound` for the `IntBound`
+    /// Returns the live slab handle to the `IntBound` for the `IntBound`
     /// variant. Mirrors RPython object identity: callers that retain the
     /// handle observe in-place mutations through other holders.
-    pub fn get_int_bound(&self) -> Option<&std::rc::Rc<std::cell::RefCell<IntBound>>> {
+    pub fn get_int_bound(&self) -> Option<&IntBoundRc> {
         match self {
             OpInfo::IntBound(b) => Some(b),
             _ => None,
