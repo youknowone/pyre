@@ -7404,24 +7404,47 @@ impl CodeWriter {
                     None
                 };
                 if let Some(catch_label) = catch_label_opt {
-                    // Raise inside a try/except range: the `raise` op
-                    // closes the block as its last operation and the sole
-                    // exit is the exception edge to the catch landing.
-                    // The standard flattener serializes `raise <value>`
-                    // from the block body and emits the byte-adjacent
-                    // `catch_exception` dispatch from the graph shape
-                    // alone (single-exit canraise arm); the raised value
-                    // reaches the handler through the runtime exception
-                    // state (`route_to_catch` → `last_exc_value`), the
-                    // same delivery every canraise catch uses.
-                    record_graph_op(
+                    // Raise inside a try/except range.  FOR_ITER's
+                    // mismatch arm already proved the working shape:
+                    // a dedicated block whose only op is `raise` and
+                    // whose only exit is the catch landing.  Recording
+                    // `raise` on the current block left normalize /
+                    // vable-mirror ops in the same block, and
+                    // `insert_exits` then took the multi-exit
+                    // no-trailing-`-live-` early return that drops
+                    // `catch_exception`.  Blackhole
+                    // `handle_exception_in_frame` needs that opcode
+                    // immediately after `raise/r`.
+                    let site = catch_sites
+                        .iter()
+                        .find(|s| s.landing_label == catch_label)
+                        .expect("catch_sites entry for catch_label")
+                        .clone();
+                    let raise_block =
+                        SpamBlockRef::new(graph.new_block(Vec::new()), Some(current_state.clone()));
+                    all_walker_blocks.push(raise_block.clone());
+                    let inputargs: Vec<super::flow::FlowValue> = current_state.getvariables();
+                    raise_block.block().borrow_mut().inputargs = inputargs.clone();
+                    append_exit(
                         &current_block.block(),
+                        super::flow::Link::new(inputargs, Some(raise_block.block()), None)
+                            .into_ref(),
+                    );
+                    record_graph_op(
+                        &raise_block.block(),
                         "raise",
                         vec![evalue_fv.into()],
                         None,
                         offset,
                     );
-                    emit_catch_exception!(catch_label);
+                    attach_catch_exception_edge(
+                        code,
+                        &mut graph,
+                        &raise_block.block(),
+                        &site.landing,
+                        &current_state,
+                        &site,
+                    );
                 } else {
                     // `flowcontext.py Raise.nomoreblocks` shape:
                     //   link = Link([w_exc.w_type, w_exc.w_value],
@@ -10111,6 +10134,21 @@ impl CodeWriter {
                                 let normalized_exc_fv = normalized_var
                                     .map(super::flow::FlowValue::from)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                // The normalize residual is itself can-raise.
+                                // Close that call with its own catch + split
+                                // before recording `raise`, so blackhole
+                                // `handle_exception_in_frame` sees
+                                // `catch_exception` immediately after the
+                                // residual `-live-` rather than the `raise/r`.
+                                if let Some(catch_label) =
+                                    catch_for_pc.get(py_pc).copied().flatten()
+                                {
+                                    emit_catch_exception_and_split!(
+                                        catch_label,
+                                        py_pc,
+                                        [normalized_exc_fv.clone()]
+                                    );
+                                }
                                 // RAISE_VARARGS argc>=1: explicit
                                 // `raise X` source form. When inside
                                 // a try/except range, `catch_for_pc`
@@ -10118,6 +10156,7 @@ impl CodeWriter {
                                 // `catch_exception/L` adjacent to
                                 // `raise/r`.
                                 emit_raise!(exc_reg, normalized_exc_fv, py_pc as i64, true);
+                                exception_edge_handled = true;
                             } else {
                                 // Bare `raise` (argc==0): re-raise the active
                                 // handler exception (`raise_varargs(0)` →
@@ -16793,6 +16832,60 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op.key, "last_exception/>i" | "last_exc_value/>r")),
             "the match residual drains the exception slot, so its arms must not re-read it"
+        );
+    }
+
+    #[test]
+    fn explicit_raise_inside_try_emits_adjacent_catch() {
+        let code = first_nested_function_code(
+            "def f(i):\n    try:\n        if i == 0:\n            raise ValueError(\"v\")\n        return 1\n    except ValueError:\n        return 2\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("explicit raise inside try must produce a jitcode");
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let raise_positions: Vec<_> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(index, op)| (op.key == "raise/r").then_some(index))
+            .collect();
+        assert!(
+            !raise_positions.is_empty(),
+            "explicit raise must lower to raise/r; ops={:?}",
+            ops.iter().map(|op| op.key).collect::<Vec<_>>()
+        );
+        let adjacent = raise_positions.iter().copied().any(|raise_index| {
+            let mut idx = raise_index + 1;
+            if ops.get(idx).is_some_and(|op| op.key == "live/") {
+                idx += 1;
+            }
+            ops.get(idx).is_some_and(|op| op.key == "catch_exception/L")
+        });
+        assert!(
+            adjacent,
+            "at least one raise/r must be followed by catch_exception/L \
+             (optional live/); raise sites: {:?}; nearby: {:?}",
+            raise_positions
+                .iter()
+                .map(|&i| {
+                    let end = (i + 4).min(ops.len());
+                    (i, ops[i..end].iter().map(|op| op.key).collect::<Vec<_>>())
+                })
+                .collect::<Vec<_>>(),
+            ops.iter().map(|op| op.key).collect::<Vec<_>>()
         );
     }
 
