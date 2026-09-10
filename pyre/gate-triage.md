@@ -127,7 +127,10 @@ Kept as-is; listed for completeness.
   `PYRE_GC_INTERP`, `PYRE_JIT`, `PYRE_NO_JIT`, `PYRE_STDLIB`,
   `PYRE_CHECK_PYPY3`, `PYRE_CHECK_PYTHON3`, `PYRE_SANDBOX_NO_SECCOMP`,
   `PYRE_SHARED_BUILD`, `PYRE_SYNTH_PYPY`, `PYRE_SYNTH_PYRE`, `PYRE_SYNTH_PYTHON`.
-- **Test harness (1)**: `MAJIT_MIR_STRESS_LLBC`.
+- **Test harness (2)**: `MAJIT_MIR_STRESS_LLBC`,
+  `PYRE_TYPEOBJECT_DEADLOCK_CHILD`. The latter is the child-process
+  handshake for `init_typeobjects_does_not_deadlock_against_a_gil_holder`,
+  not a product switch.
 
 ## §6 — The 66 gates the audits never listed (2026-08-07)
 

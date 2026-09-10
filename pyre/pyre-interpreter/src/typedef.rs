@@ -13480,17 +13480,12 @@ fn init_type_type(ns: PyObjectRef) {
         "__dict__",
         |args| {
             let cls = args[1];
-            unsafe {
-                let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(cls);
-                if ns_ptr.is_null() {
-                    return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
-                }
-                // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
-                // returns a read-only live view over the type's canonical
-                // regular dict object.
-                let canonical = ns_ptr as PyObjectRef;
-                Ok(pyre_object::w_dict_proxy_new(canonical))
+            // typeobject.py type_get_dict: mappingproxy(w_cls.getdict(space)).
+            let w_dict = crate::baseobjspace::getdict(cls)?;
+            if w_dict.is_null() {
+                return Ok(pyre_object::w_none());
             }
+            Ok(pyre_object::w_dict_proxy_new(w_dict))
         },
         2,
     );

@@ -468,12 +468,14 @@ impl AppExecCache {
 pub enum SpaceCacheClass {
     GatewayCache,
     TypeCache,
+    ClassDictStrategy,
 }
 
 #[derive(Clone)]
 pub enum SpaceCacheInstance {
     GatewayCache(std::sync::Arc<crate::gateway::GatewayCache>),
     TypeCache(std::sync::Arc<crate::objspace::std::typeobject::TypeCache>),
+    ClassDictStrategy(std::sync::Arc<crate::objspace::std::classdict::ClassDictStrategy>),
 }
 
 impl SpaceCallable<std::sync::Weak<ObjSpace>> for SpaceCacheClass {
@@ -495,6 +497,9 @@ impl SpaceCallable<std::sync::Weak<ObjSpace>> for SpaceCacheClass {
             )),
             Self::GatewayCache => SpaceCacheInstance::GatewayCache(std::sync::Arc::new(
                 crate::gateway::GatewayCache::new(space.clone()),
+            )),
+            Self::ClassDictStrategy => SpaceCacheInstance::ClassDictStrategy(std::sync::Arc::new(
+                crate::objspace::std::classdict::ClassDictStrategy::new(space.clone()),
             )),
         })
     }
@@ -529,6 +534,7 @@ impl ObjSpace {
         self.fromcache.visit_values_mut(|cache| match cache {
             SpaceCacheInstance::GatewayCache(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::TypeCache(cache) => cache.walk_roots(forward),
+            SpaceCacheInstance::ClassDictStrategy(cache) => cache.walk_roots(forward),
         });
     }
 
@@ -5313,18 +5319,13 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 /// it to call `_obj_getdict`. pyre dispatches at runtime via the type's
 /// hasdict flag because Rust has no per-class virtual table.
 pub fn getdict(obj: PyObjectRef) -> PyResult {
-    // typeobject.py W_TypeObject.getdict exposes the live class
-    // namespace through a ClassDictStrategy dictionary, whose app-level
-    // surface is readonly.  Use pyre's live mapping-proxy wrapper even when
-    // this hook is reached through an inherited generic __dict__ descriptor.
+    // typeobject.py W_TypeObject.getdict:
+    //   strategy = space.fromcache(ClassDictStrategy)
+    //   storage = strategy.erase(self)
+    //   return W_DictObject(space, strategy, storage)
+    // The app-level `type.__dict__` descriptor wraps this in a mappingproxy.
     if unsafe { is_type(obj) } {
-        let dict_ptr = unsafe { pyre_object::w_type_get_dict_ptr(obj) };
-        let canonical = if dict_ptr.is_null() {
-            pyre_object::w_dict_new()
-        } else {
-            dict_ptr as PyObjectRef
-        };
-        return Ok(pyre_object::w_dict_proxy_new(canonical));
+        return Ok(crate::objspace::std::classdict::class_dict_for_type(obj));
     }
     // module.py Module.getdict returns its native namespace mapping.
     // The __dict__ attribute is readonly, but the returned mapping itself is
@@ -8569,21 +8570,18 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                         }
                     }
                 }
-                // No metatype descriptor overrides `__dict__`; a real type
-                // always exposes its canonical namespace, so a null pointer is
-                // an unfinished bootstrap layout rather than a user-visible
-                // mapping — surface it instead of a throwaway writable proxy.
-                let dict_ptr = w_type_get_dict_ptr(obj);
+                // typeobject.py type_get_dict: mappingproxy(getdict()).
+                let w_dict = getdict(obj)?;
                 debug_assert!(
-                    !dict_ptr.is_null(),
-                    "type object is missing its canonical __dict__"
+                    !w_dict.is_null(),
+                    "type object is missing its ClassDictStrategy dict"
                 );
-                if dict_ptr.is_null() {
+                if w_dict.is_null() {
                     return Err(PyError::runtime_error(
                         "type object has no canonical __dict__",
                     ));
                 }
-                return Ok(pyre_object::w_dict_proxy_new(dict_ptr as PyObjectRef));
+                return Ok(pyre_object::w_dict_proxy_new(w_dict));
             }
             // typeobject.py — `space.lookup(self, name)` searches the
             // complete metaclass MRO, and any data descriptor found there is

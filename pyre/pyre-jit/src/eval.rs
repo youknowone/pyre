@@ -719,11 +719,14 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     // of its own; `walk_gc_refs` below forwards the interior PyObjectRef
     // slots, matching the mapdict / set-items leaf-storage pattern. Only the
     // storage-box strategies own their `dstorage`: a MapDictStrategy
-    // `dstorage` is instead the backing instance (a GC edge that its own
-    // `walk_gc_refs` forwards), and the off-GC side-table storage
+    // `dstorage` is the backing instance and a ClassDictStrategy
+    // `dstorage` is the type (GC edges that `walk_gc_refs` forwards),
+    // and the off-GC side-table storage
     // (`w_dict_new_unmanaged_side_table_value`) is not collector-owned —
     // both are skipped (Map by kind, the side table by `try_gc_owns_object`).
-    if strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map {
+    if strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map
+        && strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Class
+    {
         if !dict.dstorage.is_null() && pyre_object::gc_hook::try_gc_owns_object(dict.dstorage) {
             let dstorage_slot = std::ptr::addr_of_mut!(dict.dstorage);
             f(dstorage_slot as *mut majit_ir::GcRef);
