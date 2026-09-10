@@ -6373,7 +6373,7 @@ fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
 fn remap_snapshot_boxes(
     boxes: &[SnapshotBox],
     ref_map: &indexmap::IndexMap<OpRef, OpRef>,
-) -> Vec<SnapshotBox> {
+) -> crate::optimizeopt::SnapshotBoxList {
     boxes
         .iter()
         .map(|boxref| boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref)))

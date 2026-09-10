@@ -292,11 +292,9 @@ pub struct Snapshot {
 /// RPython carries `box.type` on the Box object itself. Pyre's typed
 /// `OpRef` enum (resoperation.py:719/727/739 InputArg{Int,Float,Ref},
 /// resoperation.py:564-638 *Op mixin variants) carries the same type
-/// tag intrinsically, so SnapshotBox copies it from the OpRef variant
-/// at construction time. The explicit `tp` field stays around so the
-/// SnapshotBox API can answer `box.type` without re-decoding the
-/// variant on every read.
-#[derive(Debug, Clone)]
+/// tag intrinsically. There is no parallel type word: a second field
+/// made a two-box snapshot 48 B.
+#[derive(Debug, Clone, Copy)]
 pub struct SnapshotBox {
     /// The trace-position ref this snapshot slot references. A
     /// `Const{Ptr}` slot carries its gcref inline (history.py
@@ -304,19 +302,15 @@ pub struct SnapshotBox {
     /// (`walk_compile_snapshot_refs`) forwards it in place through a
     /// collected `*mut OpRef` slot address.
     pub opref: majit_ir::OpRef,
-    pub tp: Option<majit_ir::Type>,
 }
 
 impl SnapshotBox {
     pub fn untyped(opref: majit_ir::OpRef) -> Self {
-        SnapshotBox { opref, tp: None }
+        SnapshotBox { opref }
     }
 
-    pub fn typed(opref: majit_ir::OpRef, tp: majit_ir::Type) -> Self {
-        SnapshotBox {
-            opref,
-            tp: Some(tp),
-        }
+    pub fn typed(opref: majit_ir::OpRef, _tp: majit_ir::Type) -> Self {
+        SnapshotBox { opref }
     }
 
     /// The trace-position `OpRef` view of this slot.
@@ -324,10 +318,14 @@ impl SnapshotBox {
         self.opref
     }
 
+    /// history.py `Box.type` — the OpRef variant tag.
+    pub fn tp(&self) -> Option<majit_ir::Type> {
+        self.opref.ty()
+    }
+
     pub fn map_opref(&self, f: impl FnOnce(majit_ir::OpRef) -> majit_ir::OpRef) -> Self {
         SnapshotBox {
             opref: f(self.opref),
-            tp: self.tp,
         }
     }
 }
@@ -335,6 +333,18 @@ impl SnapshotBox {
 impl From<majit_ir::OpRef> for SnapshotBox {
     fn from(opref: majit_ir::OpRef) -> Self {
         SnapshotBox::untyped(opref)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_box_size {
+    #[test]
+    fn snapshot_box_is_one_opref() {
+        assert_eq!(
+            std::mem::size_of::<super::SnapshotBox>(),
+            std::mem::size_of::<majit_ir::OpRef>(),
+            "SnapshotBox must stay one OpRef; box.type lives on the variant"
+        );
     }
 }
 
@@ -4183,10 +4193,7 @@ impl ResumeDataLoopMemo {
             // to a Ref virtual after optimization; keeping the stale fallback
             // would number that virtual as a TAGBOX and the subsequent
             // optimizer.py:681 fail-arg force would materialize it.
-            let box_type = opref
-                .ty()
-                .or(snapshot_box.tp)
-                .unwrap_or_else(|| env.get_type(opref));
+            let box_type = opref.ty().unwrap_or_else(|| env.get_type(opref));
             let is_virtual = match box_type {
                 majit_ir::Type::Ref => env.is_virtual_ref(opref),
                 majit_ir::Type::Int => env.is_virtual_raw(opref),

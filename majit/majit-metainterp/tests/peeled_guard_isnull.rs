@@ -72,7 +72,10 @@ fn peeled_integer_loop_drops_the_loop_invariant_null_guard() {
     let mut optimizer = UnrollOptimizer::new();
     optimizer.trace_inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Int, Type::Ref]);
     optimizer.trace_inputarg_boxes = vec![acc, index, null];
-    optimizer.snapshot_boxes = vec![Some(Vec::new()), Some(Vec::new())];
+    optimizer.snapshot_boxes = vec![
+        Some(majit_metainterp::optimizeopt::SnapshotBoxList::new()),
+        Some(majit_metainterp::optimizeopt::SnapshotBoxList::new()),
+    ];
     let mut constants: ConstMap<Value> = ConstMap::default();
     let (optimized, _) =
         optimizer.optimize_trace_with_constants_and_inputs(&ops, &mut constants, 3);

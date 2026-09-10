@@ -115,9 +115,293 @@ impl IntoIterator for ExtraQueue {
     }
 }
 
-pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
+/// Compile-time snapshot box list. RPython keeps the live boxes themselves;
+/// this adapter copies OpRefs into a side table. Two or three boxes are
+/// 32–48 B, so those lengths mint from a reserved 48 B slot instead of
+/// the malloc class.
+const SNAP_LIST_SLAB_BYTES: usize = 48;
+const SNAP_LIST_SLAB: usize = SNAP_LIST_SLAB_BYTES / std::mem::size_of::<SnapshotBox>();
+const SNAP_LIST_SLAB_BIT: u32 = 1 << 31;
+const SNAP_LIST_CHUNK: usize = 2048;
+
+const _: () = assert!(
+    std::mem::size_of::<SnapshotBox>() > 0
+        && std::mem::size_of::<SnapshotBox>() <= SNAP_LIST_SLAB_BYTES
+);
+
+struct SnapListHeap {
+    chunks: Vec<(*mut SnapshotBox, usize)>,
+    free: Vec<*mut SnapshotBox>,
+}
+
+unsafe impl Send for SnapListHeap {}
+unsafe impl Sync for SnapListHeap {}
+
+static SNAP_LIST_HEAP: std::sync::Mutex<SnapListHeap> = std::sync::Mutex::new(SnapListHeap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn alloc_snap_list_slab() -> *mut SnapshotBox {
+    let mut heap = SNAP_LIST_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut() {
+        if *used < SNAP_LIST_CHUNK {
+            let p = unsafe { (*base).add(*used * SNAP_LIST_SLAB) };
+            *used += 1;
+            return p;
+        }
+    }
+    let layout = std::alloc::Layout::from_size_align(
+        SNAP_LIST_CHUNK * SNAP_LIST_SLAB_BYTES,
+        std::mem::align_of::<SnapshotBox>(),
+    )
+    .expect("48-byte snapshot-list chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
+    assert!(!base.is_null(), "48-byte snapshot-list chunk alloc failed");
+    heap.chunks.push((base, 1));
+    base
+}
+
+fn free_snap_list_slab(p: *mut SnapshotBox) {
+    SNAP_LIST_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+pub struct SnapshotBoxList {
+    ptr: std::ptr::NonNull<SnapshotBox>,
+    len: u32,
+    cap: u32,
+}
+
+unsafe impl Send for SnapshotBoxList {}
+unsafe impl Sync for SnapshotBoxList {}
+
+impl SnapshotBoxList {
+    pub fn new() -> Self {
+        Self {
+            ptr: std::ptr::NonNull::dangling(),
+            len: 0,
+            cap: 0,
+        }
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        if n == 0 {
+            return Self::new();
+        }
+        if n <= SNAP_LIST_SLAB {
+            return Self {
+                ptr: unsafe { std::ptr::NonNull::new_unchecked(alloc_snap_list_slab()) },
+                len: 0,
+                cap: SNAP_LIST_SLAB as u32 | SNAP_LIST_SLAB_BIT,
+            };
+        }
+        let layout = std::alloc::Layout::array::<SnapshotBox>(n).expect("snapshot box list");
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
+        assert!(!ptr.is_null(), "snapshot box list alloc failed");
+        Self {
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(ptr) },
+            len: 0,
+            cap: n as u32,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        (self.cap & !SNAP_LIST_SLAB_BIT) as usize
+    }
+
+    fn is_slab(&self) -> bool {
+        self.cap & SNAP_LIST_SLAB_BIT != 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[SnapshotBox] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [SnapshotBox] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }
+    }
+
+    pub fn push(&mut self, item: SnapshotBox) {
+        let len = self.len as usize;
+        if len == self.capacity() {
+            self.grow();
+        }
+        unsafe {
+            self.ptr.as_ptr().add(len).write(item);
+        }
+        self.len += 1;
+    }
+
+    fn grow(&mut self) {
+        let old_len = self.len as usize;
+        let old_cap = self.capacity();
+        let new_cap = (old_cap.max(1) * 2).max(old_len + 1);
+        let layout = std::alloc::Layout::array::<SnapshotBox>(new_cap).expect("snapshot box grow");
+        let new_ptr = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
+        assert!(!new_ptr.is_null(), "snapshot box grow failed");
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr, old_len);
+        }
+        self.dealloc_storage(old_len);
+        self.ptr = unsafe { std::ptr::NonNull::new_unchecked(new_ptr) };
+        self.cap = new_cap as u32;
+    }
+
+    fn dealloc_storage(&mut self, len: usize) {
+        if self.capacity() == 0 {
+            return;
+        }
+        if self.is_slab() {
+            free_snap_list_slab(self.ptr.as_ptr());
+        } else {
+            let layout = std::alloc::Layout::array::<SnapshotBox>(self.capacity())
+                .expect("snapshot box dealloc");
+            unsafe {
+                std::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
+            }
+        }
+        let _ = len;
+    }
+}
+
+impl Default for SnapshotBoxList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for SnapshotBoxList {
+    fn clone(&self) -> Self {
+        let mut out = Self::with_capacity(self.len as usize);
+        for item in self.as_slice() {
+            out.push(*item);
+        }
+        out
+    }
+}
+
+impl Drop for SnapshotBoxList {
+    fn drop(&mut self) {
+        unsafe {
+            for i in 0..self.len as usize {
+                self.ptr.as_ptr().add(i).drop_in_place();
+            }
+        }
+        self.dealloc_storage(self.len as usize);
+    }
+}
+
+impl std::ops::Deref for SnapshotBoxList {
+    type Target = [SnapshotBox];
+
+    fn deref(&self) -> &[SnapshotBox] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for SnapshotBoxList {
+    fn deref_mut(&mut self) -> &mut [SnapshotBox] {
+        self.as_mut_slice()
+    }
+}
+
+impl Extend<SnapshotBox> for SnapshotBoxList {
+    fn extend<T: IntoIterator<Item = SnapshotBox>>(&mut self, iter: T) {
+        let iter = iter.into_iter();
+        if let Some(extra) = iter
+            .size_hint()
+            .0
+            .checked_sub(self.capacity() - self.len as usize)
+        {
+            if extra > 0 && !self.is_slab() {
+                let want = self.len as usize + extra;
+                if want > self.capacity() {
+                    let layout = std::alloc::Layout::array::<SnapshotBox>(want)
+                        .expect("snapshot box extend");
+                    let new_ptr = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
+                    assert!(!new_ptr.is_null(), "snapshot box extend failed");
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.ptr.as_ptr(),
+                            new_ptr,
+                            self.len as usize,
+                        );
+                    }
+                    self.dealloc_storage(self.len as usize);
+                    self.ptr = unsafe { std::ptr::NonNull::new_unchecked(new_ptr) };
+                    self.cap = want as u32;
+                }
+            }
+        }
+        for item in iter {
+            self.push(item);
+        }
+    }
+}
+
+impl FromIterator<SnapshotBox> for SnapshotBoxList {
+    fn from_iter<T: IntoIterator<Item = SnapshotBox>>(iter: T) -> Self {
+        let iter = iter.into_iter();
+        let mut list = Self::with_capacity(iter.size_hint().0);
+        list.extend(iter);
+        list
+    }
+}
+
+impl From<Vec<SnapshotBox>> for SnapshotBoxList {
+    fn from(v: Vec<SnapshotBox>) -> Self {
+        v.into_iter().collect()
+    }
+}
+
+impl<'a> IntoIterator for &'a SnapshotBoxList {
+    type Item = &'a SnapshotBox;
+    type IntoIter = std::slice::Iter<'a, SnapshotBox>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut SnapshotBoxList {
+    type Item = &'a mut SnapshotBox;
+    type IntoIter = std::slice::IterMut<'a, SnapshotBox>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut_slice().iter_mut()
+    }
+}
+
+pub type SnapshotBoxes = Vec<Option<SnapshotBoxList>>;
 pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;
 pub type SnapshotFramePcs = Vec<Option<Vec<(i32, i32, i32)>>>;
+
+#[cfg(test)]
+mod snapshot_box_list_size {
+    #[test]
+    fn option_snapshot_box_list_niches() {
+        assert_eq!(
+            std::mem::size_of::<Option<super::SnapshotBoxList>>(),
+            16,
+            "Option<SnapshotBoxList> must niche so a 2-slot map leaves 48 B"
+        );
+    }
+}
 type OpRefFxIndexMap<V> = indexmap::IndexMap<OpRef, V, FxBuildHasher>;
 
 pub(crate) fn snapshot_get<T>(store: &[Option<T>], pos: i32) -> Option<&T> {
@@ -6814,13 +7098,13 @@ impl OptContext {
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
         // _number_virtuals then builds rd_virtuals from PtrInfo.
         let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position())
-            .map(Vec::as_slice)
+            .map(|v| v.as_slice())
             .unwrap_or_default();
         let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position())
-            .map(Vec::as_slice)
+            .map(|v| v.as_slice())
             .unwrap_or_default();
         let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position())
-            .map(Vec::as_slice)
+            .map(|v| v.as_slice())
             .unwrap_or_default();
         let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position())
             .map(Vec::as_slice)
@@ -6848,7 +7132,7 @@ impl OptContext {
                 .chain(vref_oprefs.iter());
             for cell in cells {
                 let encoded = cell.opref.ty();
-                match cell.tp {
+                match cell.tp() {
                     None => untyped += 1,
                     Some(tp) if Some(tp) == encoded => agree += 1,
                     Some(tp) => {

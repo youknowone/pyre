@@ -4535,11 +4535,15 @@ mod tests {
         // `minimum_virtualizable_size`) asserts it. Identity first
         // (`opencoder.py:718-726`), then this config's one static field and
         // its one array item.
-        opt.snapshot_vable_boxes = vec![Some(vec![
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(0, Type::Ref), Type::Ref),
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(1, Type::Int), Type::Int),
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(2, Type::Int), Type::Int),
-        ])];
+        opt.snapshot_vable_boxes = vec![Some(
+            [
+                crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(0, Type::Ref), Type::Ref),
+                crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(1, Type::Int), Type::Int),
+                crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(2, Type::Int), Type::Int),
+            ]
+            .into_iter()
+            .collect(),
+        )];
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
         let jump = result
             .iter()

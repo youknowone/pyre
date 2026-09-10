@@ -881,18 +881,20 @@ fn snapshot_map_from_trace_snapshots(
         }
     };
     for snap in trace_snapshots {
-        let boxes: Vec<SnapshotBox> = snap
+        let boxes: crate::optimizeopt::SnapshotBoxList = snap
             .frames
             .iter()
             .flat_map(|f| f.boxes.iter())
             .map(&tagged_to_box)
             .collect();
         let frame_sizes: Vec<usize> = snap.frames.iter().map(|f| f.boxes.len()).collect();
-        let vable_boxes: Vec<SnapshotBox> = snap.vable_boxes.iter().map(&tagged_to_box).collect();
+        let vable_boxes: crate::optimizeopt::SnapshotBoxList =
+            snap.vable_boxes.iter().map(&tagged_to_box).collect();
         // opencoder.py create_top_snapshot writes BOTH vable_array
         // AND vref_array. resume.py _number_boxes consumes
         // vref_array as a separate section after vable_array.
-        let vref_boxes: Vec<SnapshotBox> = snap.vref_boxes.iter().map(&tagged_to_box).collect();
+        let vref_boxes: crate::optimizeopt::SnapshotBoxList =
+            snap.vref_boxes.iter().map(&tagged_to_box).collect();
         let frame_pcs: Vec<(i32, i32, i32)> = snap
             .frames
             .iter()
@@ -955,7 +957,8 @@ fn snapshot_map_from_byte_recorder(
         }
     };
     recorder.for_each_captured_snapshot_arrays(|vable_t, vref_t, frames_t, py_pcs| {
-        let mut boxes = Vec::new();
+        let n_boxes: usize = frames_t.iter().map(|(_, _, tagged)| tagged.len()).sum();
+        let mut boxes = crate::optimizeopt::SnapshotBoxList::with_capacity(n_boxes);
         let mut frame_sizes = Vec::with_capacity(frames_t.len());
         let mut frame_pcs = Vec::with_capacity(frames_t.len());
         for (fi, (jc, pc, tagged)) in frames_t.into_iter().enumerate() {
@@ -971,11 +974,11 @@ fn snapshot_map_from_byte_recorder(
                     .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique))),
             );
         }
-        let vable_boxes: Vec<SnapshotBox> = vable_t
+        let vable_boxes: crate::optimizeopt::SnapshotBoxList = vable_t
             .into_iter()
             .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
             .collect();
-        let vref_boxes: Vec<SnapshotBox> = vref_t
+        let vref_boxes: crate::optimizeopt::SnapshotBoxList = vref_t
             .into_iter()
             .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
             .collect();
@@ -7712,7 +7715,7 @@ impl<M: Clone> MetaInterp<M> {
         // through `OpRef::ty()` / `Const::get_type()`.
         // Phase 1's copy of the snapshot banks. The originals stay owned here
         // because the `InvalidLoop` arm below moves them into the unroll-free
-        // optimizer, so this is a second set, one `Vec<SnapshotBox>` per
+        // optimizer, so this is a second set, one snapshot-box list per
         // recorded guard. A trace that records guards in the thousands makes
         // that the largest single allocation of the compile, and the arm that
         // never peels never reads it.
@@ -25112,7 +25115,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut snapshot_boxes = Vec::new();
+        let mut snapshot_boxes: SnapshotBoxes = Vec::new();
         snapshot_insert(
             &mut snapshot_boxes,
             0,
@@ -25120,13 +25123,14 @@ mod tests {
                 OpRef::input_arg_int(0).into(),
                 OpRef::ref_op(2).into(),
                 OpRef::int_op(3).into(),
-            ],
+            ]
+            .into(),
         );
-        let mut snapshot_vable_boxes = Vec::new();
+        let mut snapshot_vable_boxes: SnapshotBoxes = Vec::new();
         snapshot_insert(
             &mut snapshot_vable_boxes,
             0,
-            vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()],
+            vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()].into(),
         );
         let pending_bridge_rd = PendingBridgeRd {
             storage: crate::resume::ResumeStorage::new(vec![1, 2, 3], vec![], vec![], vec![]),

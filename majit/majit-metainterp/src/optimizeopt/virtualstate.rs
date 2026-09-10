@@ -570,8 +570,10 @@ impl VirtualState {
         Self::reset_positions(&self.state);
         // Borrow split: clone the top-level Rcs into a temporary list so
         // the per-node `enum_into` can take `&mut self`. Rc::clone is
-        // refcount-only.
-        let top: Vec<Rc<VirtualStateInfoNode>> = self.state.clone();
+        // refcount-only. RPython `VirtualState.__init__` walks `state`
+        // directly; keep the clone on the stack for the usual few inputs.
+        let top: smallvec::SmallVec<[Rc<VirtualStateInfoNode>; 8]> =
+            self.state.iter().cloned().collect();
         for node in &top {
             node.enum_into(self);
         }
@@ -580,8 +582,12 @@ impl VirtualState {
     /// Walk all reachable nodes and reset position cells to -1 so the
     /// next `enum_top_level` traversal mirrors a fresh RPython
     /// VirtualState.__init__ over fresh subclass instances.
+    ///
+    /// RPython `__init__` has no visited set (fresh instances). The set
+    /// here only breaks shared-Rc DAGs; a linear SmallVec stays off the
+    /// 48 B IndexMap-bucket class on the regex graphs.
     fn reset_positions(state: &[Rc<VirtualStateInfoNode>]) {
-        let mut visited: indexmap::IndexSet<usize> = indexmap::IndexSet::new();
+        let mut visited: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
         for node in state {
             Self::reset_positions_walk(node, &mut visited);
         }
@@ -589,13 +595,13 @@ impl VirtualState {
 
     fn reset_positions_walk(
         node: &Rc<VirtualStateInfoNode>,
-        visited: &mut indexmap::IndexSet<usize>,
+        visited: &mut smallvec::SmallVec<[usize; 8]>,
     ) {
         let key = Rc::as_ptr(node) as usize;
-        if visited.contains(&key) {
+        if visited.iter().any(|&k| k == key) {
             return;
         }
-        visited.insert(key);
+        visited.push(key);
         node.position.set(-1);
         node.position_in_notvirtuals.set(-1);
         match &node.info {
