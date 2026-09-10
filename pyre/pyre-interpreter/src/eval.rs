@@ -2239,6 +2239,10 @@ pub fn handle_exception_with_context(
         // has to land on the frame the materialisation left live.
         let frame = unsafe { &mut *frame_anchor.live() };
         frame.push(exc_obj);
+        // The exception is now on this frame's handler.  Drop the backend
+        // `_store_exception` cells so a later compiled `GUARD_NO_EXCEPTION`
+        // does not re-deliver the value this except already consumed.
+        crate::runtime_ops::jit_clear_published_exception();
         // The decoded `target` is a byte offset; pyre's `next_instr` is a
         // code-unit index, so divide by 2.
         *next_instr = (target_bytes / 2) as usize;
