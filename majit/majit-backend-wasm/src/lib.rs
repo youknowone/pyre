@@ -621,6 +621,7 @@ pub fn last_compile_err_len() -> u32 {
 /// `i` is out of range.
 pub fn last_compile_err_byte(i: u32) -> u32 {
     LAST_COMPILE_ERR_SNAP.with(|snap| snap.borrow().get(i as usize).copied().unwrap_or(0) as u32)
+
 }
 
 /// Number of JIT trace entries made from the guest.

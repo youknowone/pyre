@@ -2841,6 +2841,181 @@ fn label_ref_phi_without_a_producer_declines() {
 }
 
 #[test]
+fn compute_home_gcmap_simple_loop_is_valid() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let const_1 = OpRef::const_int(1);
+    let const_100 = OpRef::const_int(100);
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(1), OpRef::input_arg_int(0)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), const_100],
+            OpRef::int_op(4),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(4)],
+            &[OpRef::int_op(3), OpRef::int_op(2)],
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(2))]),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.compute_home_gcmap = true;
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("compute_home_gcmap loop should build");
+    validate_wasm(&bytes);
+}
+
+/// A peeled loop's start LABEL can still name an import_state source
+/// (`InputArgRef(128)` on attr_delete) after every real use was rewritten
+/// to the folded constant. That argument is the phi destination, not a
+/// read of a never-written local. A later producer past 128 used to make
+/// `unbound_pool_const_seeds` decline the whole module (`value[128]`).
+#[test]
+fn label_arg_import_hole_is_not_an_unbound_read() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let const_1 = OpRef::const_int(1);
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_ref(128))],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(200),
+        ),
+        Op::new(
+            OpCode::Jump,
+            &[rb(OpRef::int_op(200)), rb(OpRef::input_arg_int(1))],
+        ),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.compute_home_gcmap = true;
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs)
+        .expect("stale LABEL import hole must not decline the module");
+    validate_wasm(&bytes);
+}
+
+/// A real read of an unbound hole (not a LABEL phi name) is still declined.
+#[test]
+fn unbound_non_label_read_of_import_hole_is_declined() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(0), OpRef::input_arg_ref(128)],
+        OpRef::int_op(200),
+    )];
+    let err = match codegen::build_wasm_module(&codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(16, 8, 0),
+        ca: codegen::CaParams::default(),
+    }) {
+        Err(err) => err,
+        Ok(_) => panic!("a real read of the hole must still decline"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("value[128]"),
+        "expected unbound 128 decline, got {msg}"
+    );
+}
+
+#[test]
 fn test_float_ops() {
     let inputargs = vec![
         InputArg::from_type(Type::Float, 0),
