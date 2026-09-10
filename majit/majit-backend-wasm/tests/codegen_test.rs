@@ -718,6 +718,87 @@ fn same_as_does_not_alias_a_mutable_label_local() {
 }
 
 #[test]
+fn same_as_before_label_defines_a_fresh_label_arg() {
+    // Peeled header: preamble produces v1, SameAs copies it into the
+    // LABEL-arg box, fall-through then reads that box. Without the
+    // SameAs the backend declines (see the next test).
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        make_op(OpCode::SameAsI, &[OpRef::int_op(1)], OpRef::int_op(100)),
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(100))]),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(100), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
+    ];
+
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+}
+
+#[test]
+fn unbound_label_arg_without_a_producer_declines() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(100))]),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(100), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
+    ];
+
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let error = match codegen::build_wasm_module(&inputs) {
+        Ok(_) => panic!("a LABEL arg with no producer must decline"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("read with no producing op and no"),
+        "unexpected decline: {error}"
+    );
+}
+
+#[test]
 fn unbound_pool_float_operand_declares_an_f64_local() {
     let folded_float = OpRef::float_op(7);
     let ops = vec![Op::new(OpCode::Finish, &[rb(folded_float)])];
