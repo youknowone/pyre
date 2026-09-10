@@ -621,7 +621,6 @@ pub fn last_compile_err_len() -> u32 {
 /// `i` is out of range.
 pub fn last_compile_err_byte(i: u32) -> u32 {
     LAST_COMPILE_ERR_SNAP.with(|snap| snap.borrow().get(i as usize).copied().unwrap_or(0) as u32)
-
 }
 
 /// Number of JIT trace entries made from the guest.
@@ -3305,6 +3304,11 @@ impl WasmBackend {
         }
         if owner_extent_grew {
             compiled.bridge_slots.borrow_mut().clear();
+            let owner_tid = compiled.trace_id;
+            compiled
+                .bridge_descr_ranges
+                .borrow_mut()
+                .retain(|&(tid, _, _, _)| tid != owner_tid);
         }
         if let Some(owner) = new_cells_owner {
             compiled._bridge_owned_cells.borrow_mut().push(owner);

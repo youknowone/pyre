@@ -476,13 +476,11 @@ pub extern "C" fn pyre_jit_last_compile_err_byte(i: u32) -> u32 {
     majit_backend_wasm::last_compile_err_byte(i)
 }
 
-
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_jit_last_compile_err_len() -> u32 {
     majit_backend_wasm::last_compile_err_len()
 }
-
 
 /// Packed `(kind, needed, available)` geometry for an inline-module trial that
 /// did not fit its owner's frozen frame. The host formats this diagnostic only.
