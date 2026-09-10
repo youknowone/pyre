@@ -2762,9 +2762,12 @@ impl WasmBackend {
 
     fn register_gc_table(token: &JitCellToken, table: Arc<majit_gc::GcTable>) {
         if let Some(clt) = token.compiled_loop_token() {
-            let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = table.clone();
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
+        // `gcreftracer.py` `llop.gc_writebarrier(tr)`: the table enters
+        // this MiniMark's remembered set for one minor.
+        let _ = with_wasm_active_gc_mut(|gc| gc.remember_gc_table(&table));
     }
 
     /// Validate that every constant OpRef appearing as an arg is resolvable.

@@ -7458,8 +7458,11 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     // `typedef::type` falls back to the kind registry when `w_class` is
     // still the generic BaseException stub (`w_exception_new` internals).
     // The match walked that registry class; pin the kind field so a
-    // different ExcKind cannot reuse this fold. A GuardValue on `w_class`
-    // would pin the stub and fail at runtime.
+    // different ExcKind cannot reuse this fold. A GuardValue on the
+    // registry class would pin a pointer the slot does not hold and fail
+    // at runtime. Pin the stub itself as well: a user subclass of the
+    // same kind (`class MyError(ValueError)`) shares `ob_type` and
+    // `ExcKind` but not `w_class`.
     let pin_kind_instead_of_w_class = !std::ptr::eq(unsafe { (*exc).w_class }, exc_class);
     // `eval::check_exc_match_against` = `exception_match(type(exc), match)`
     // (eval.rs), walking the exception class MRO and accepting a tuple of
@@ -7527,6 +7530,7 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
             ctx.trace_ctx
                 .heap_cache_mut()
                 .replace_box(kind_op, expected);
+            walker_guard_exact_w_class(ctx, op_pc, exc_op, unsafe { (*exc).w_class })?;
         } else {
             let w_class_op =
                 walker_record_getfield_gc_r_uncached(ctx, exc_op, crate::descr::w_class_descr());

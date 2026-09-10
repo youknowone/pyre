@@ -4491,6 +4491,65 @@ thread_local! {
     /// When an OpRef collides (in both constants map and op-result set),
     /// the variable takes precedence over the constant.
     static OP_RESULT_VARS: std::cell::RefCell<Option<indexmap::IndexSet<u32>>> = const { std::cell::RefCell::new(None) };
+    /// `assembler.py` `genop_load_from_gc_table` base for this compile.
+    static GC_TABLE_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Vars that are `LoadFromGcTable` results (or SameAs of one), keyed by
+    /// OpRef raw. rewrite.py clears `gcrefs_recently_loaded` at LABEL, so a
+    /// later failarg must rematerialize the load rather than reuse a
+    /// preamble SSA value that is not a LABEL arg.
+    static GC_TABLE_VAR_INDEX: std::cell::RefCell<indexmap::IndexMap<u32, u32>> =
+        std::cell::RefCell::new(indexmap::IndexMap::new());
+}
+
+/// RAII guard that restores `GC_TABLE_BASE` / `GC_TABLE_VAR_INDEX` on Drop
+/// so nested compiles (bridge compilation re-entry) keep their own table
+/// base and rematerialize map. Same reason as `OprefVarMapGuard`.
+struct GcTableCompileGuard {
+    saved_base: usize,
+    saved_index: indexmap::IndexMap<u32, u32>,
+}
+
+impl GcTableCompileGuard {
+    fn enter(new_base: usize) -> Self {
+        let saved_base = GC_TABLE_BASE.with(|cell| cell.replace(new_base));
+        let saved_index = GC_TABLE_VAR_INDEX.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        Self {
+            saved_base,
+            saved_index,
+        }
+    }
+}
+
+impl Drop for GcTableCompileGuard {
+    fn drop(&mut self) {
+        GC_TABLE_BASE.with(|cell| cell.set(self.saved_base));
+        GC_TABLE_VAR_INDEX.with(|cell| *cell.borrow_mut() = std::mem::take(&mut self.saved_index));
+    }
+}
+
+fn record_gc_table_var(var_idx: u32, table_index: u32) {
+    GC_TABLE_VAR_INDEX.with(|cell| {
+        cell.borrow_mut().insert(var_idx, table_index);
+    });
+}
+
+fn gc_table_index_for_var(var_idx: u32) -> Option<u32> {
+    GC_TABLE_VAR_INDEX.with(|cell| cell.borrow().get(&var_idx).copied())
+}
+
+fn emit_load_gc_table_slot(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    table_index: u32,
+) -> CValue {
+    let base = GC_TABLE_BASE.with(std::cell::Cell::get);
+    let base_v = builder.ins().iconst(cl_types::I64, base as i64);
+    let index_v = builder.ins().iconst(cl_types::I64, table_index as i64);
+    let byte_ofs = builder.ins().ishl_imm_u(index_v, 3);
+    let slot_addr = builder.ins().iadd(base_v, byte_ofs);
+    builder
+        .ins()
+        .load(ptr_type, MemFlagsData::trusted(), slot_addr, 0)
 }
 
 fn opref_is_op_result_var(opref: OpRef) -> bool {
@@ -5733,6 +5792,16 @@ fn resolve_failarg_opref(
     // a fail-arg reference constant whose object can move must be reloaded
     // through GC-forwarded resume data, not frozen as an immediate.
     guard_constptr_immediate(opref);
+    // rewrite.py clears `gcrefs_recently_loaded` at LABEL. A failarg that
+    // is a table load (or SameAs of one) defined in the preamble is not a
+    // LABEL arg, so rematerialize `genop_load_from_gc_table` here instead
+    // of `use_var` of a preamble SSA value the back-edge does not carry.
+    if !opref.is_none()
+        && !opref.is_constant()
+        && let Some(table_index) = gc_table_index_for_var(opref.raw())
+    {
+        return emit_load_gc_table_slot(builder, cl_types::I64, table_index);
+    }
     // Inline-Const fast path: history.py/268/314 — Const Box value
     // is inline. Stale-ref reload only applies to op-result variables
     // (regalloc-assigned slots), never to constants.
@@ -9599,6 +9668,7 @@ impl CraneliftBackend {
         // Empty list ⇒ no table, base stays 0.
         let gc_table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
         let gc_table_base = gc_table.as_ref().map_or(0usize, |t| t.base_addr());
+        let _gc_table_guard = GcTableCompileGuard::enter(gc_table_base);
         // RPython parity: regalloc asserts that every Box used as an
         // argument or in fail_args is bound to a register or stack
         // location before code emission begins. The pyre/Cranelift
@@ -11298,7 +11368,14 @@ impl CraneliftBackend {
                 // ── Identity / cast ──
                 OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF | OpCode::CastOpaquePtr => {
                     let a = if op.num_args() > 0 {
-                        resolve_opref(&mut builder, &constants, op.arg(0).to_opref())
+                        let src = op.arg(0).to_opref();
+                        if !src.is_none()
+                            && !src.is_constant()
+                            && let Some(table_index) = gc_table_index_for_var(src.raw())
+                        {
+                            record_gc_table_var(vi, table_index);
+                        }
+                        resolve_opref(&mut builder, &constants, src)
                     } else if let Some(&c) = constants.get(&vi) {
                         builder.ins().iconst(cl_types::I64, c)
                     } else {
@@ -15716,13 +15793,11 @@ impl CraneliftBackend {
                 // each load observes the relocated object. Cranelift folds
                 // `base + (const_index << 3)` to a single address.
                 OpCode::LoadFromGcTable => {
-                    let index = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                    let base = builder.ins().iconst(cl_types::I64, gc_table_base as i64);
-                    let byte_ofs = builder.ins().ishl_imm_u(index, 3);
-                    let slot_addr = builder.ins().iadd(base, byte_ofs);
-                    let value = builder
-                        .ins()
-                        .load(ptr_type, MemFlagsData::trusted(), slot_addr, 0);
+                    let table_index = lookup_const_i64(&constants, op.arg(0).to_opref())
+                        .expect("LoadFromGcTable index is ConstInt")
+                        as u32;
+                    record_gc_table_var(vi, table_index);
+                    let value = emit_load_gc_table_slot(&mut builder, ptr_type, table_index);
                     builder.def_var(var(vi), value);
                 }
 
@@ -16120,9 +16195,12 @@ impl CraneliftBackend {
         table: Arc<majit_gc::GcTable>,
     ) {
         if let Some(clt) = token.compiled_loop_token() {
-            let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = table.clone();
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
         }
+        // `gcreftracer.py` `llop.gc_writebarrier(tr)`: the table enters
+        // this MiniMark's remembered set for one minor.
+        let _ = with_cranelift_gc(|gc| gc.remember_gc_table(&table));
     }
 }
 
@@ -20332,16 +20410,10 @@ mod tests {
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xB12D_6001);
     }
 
-    /// gcreftracer.py gcrefs_trace: re-emission must read the forwarded
-    /// reference constant, just as the already compiled owner does.
-    ///
-    /// Parallel MiniMarks share `PENDING_MINOR_TABLES` and the published
-    /// nursery window, so a sibling collection can leave this table's
-    /// slot unmoved. Run serially:
-    /// `cargo test -p majit-backend-cranelift merged_owner_preserves -- --ignored --test-threads=1`
+    /// gcreftracer.py gcrefs_trace: a later `assemble_bridge` must read the
+    /// forwarded reference constant, just as the already compiled owner does.
     #[test]
-    #[ignore = "needs an exclusive MiniMark; sibling collections steal the pending-table list"]
-    fn merged_owner_preserves_reference_constant_after_collection() {
+    fn owner_preserves_reference_constant_after_collection() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
