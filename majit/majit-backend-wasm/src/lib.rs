@@ -3354,11 +3354,11 @@ impl WasmBackend {
         if let Some(mut target) = call_assembler_target(token.number) {
             target.func_handle = old_handle;
             target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
-            target.has_guard_not_forced_2 = inputs
-                .ops
-                .iter()
-                .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2)
-                as u32;
+            // Never clear a flag an out-of-line bridge already published:
+            // re-emission can omit that bridge's ops while the attached
+            // module still finishes through it.
+            target.has_guard_not_forced_2 |=
+                module_has_guard_not_forced_2(&inputs.ops, &inputs.inlined_bridges);
             ca_dispatch_publish(
                 token.number,
                 old_handle,
@@ -3625,6 +3625,14 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
         }
     }
     (saw_ca && !resolved.is_empty()).then_some(resolved)
+}
+
+fn module_has_guard_not_forced_2(ops: &[Op], inlined_bridges: &[codegen::InlinedBridge]) -> u32 {
+    let is_gnf2 = |op: &Op| op.opcode == majit_ir::OpCode::GuardNotForced2;
+    (ops.iter().any(is_gnf2)
+        || inlined_bridges
+            .iter()
+            .any(|bridge| bridge.ops.iter().any(is_gnf2))) as u32
 }
 
 fn bridge_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
@@ -4442,9 +4450,7 @@ impl majit_backend::Backend for WasmBackend {
         // its finish index. Publish those mutable pieces before exposing the
         // immutable geometry metadata: previously compiled CALL_ASSEMBLER
         // modules load this stable entry at runtime.
-        let has_guard_not_forced_2 =
-            ops.iter()
-                .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2) as u32;
+        let has_guard_not_forced_2 = module_has_guard_not_forced_2(ops, &[]);
         ca_dispatch_publish(
             token.number,
             compiled.eager_func_handle(),
@@ -5467,6 +5473,33 @@ impl majit_backend::Backend for WasmBackend {
                 match self.reemit_loop(original_token) {
                     Ok(()) => diag_bump(31),
                     Err(_) => diag_bump(30),
+                }
+            }
+        }
+
+        // An out-of-line bridge runs in the source loop's CA frame. If that
+        // bridge retains `_finish_gcmap`, callers of the source token must
+        // take the write-barrier pop even when the original loop ops did not
+        // contain `GUARD_NOT_FORCED_2`.
+        if ops
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2)
+        {
+            if let Some(mut target) = call_assembler_target(original_token.number) {
+                if target.has_guard_not_forced_2 == 0 {
+                    target.has_guard_not_forced_2 = 1;
+                    ca_dispatch_publish(
+                        original_token.number,
+                        target.func_handle,
+                        target.compiled_ptr as u32,
+                        target.callee_frame_bytes,
+                        target.dispatch_key_ofs as u32,
+                        target.callee_gcmap_ptr,
+                        target.home_slot_base,
+                        target.home_slots,
+                        1,
+                    );
+                    publish_call_assembler_target(original_token.number, target);
                 }
             }
         }
