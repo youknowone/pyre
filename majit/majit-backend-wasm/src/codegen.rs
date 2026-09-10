@@ -8481,6 +8481,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
                 let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
                 emit_reload_frame_if_necessary(
@@ -8488,6 +8490,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
                 );
                 emit_reload_refs_from_homes(
                     &mut sink,
@@ -8758,6 +8761,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -8798,6 +8802,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8806,6 +8812,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -8860,6 +8867,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
                 let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
                 emit_reload_frame_if_necessary(
@@ -8867,6 +8876,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
                 );
                 emit_reload_refs_from_homes(
                     &mut sink,
@@ -8919,6 +8929,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -8975,6 +8986,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8983,6 +8996,7 @@ fn build_function(
                         residual_type_base,
                         ca.ca_reload_fn_ptr,
                         ca.jf_top_addr,
+                        wb,
                     );
                     emit_reload_refs_from_homes(
                         &mut sink,
@@ -9239,6 +9253,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
                 sink.local_get(ca_cfp_local);
                 sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
@@ -12289,7 +12305,14 @@ fn emit_memory_error_check(
 ) {
     emit_resolve(sink, constants, value_types, value);
     sink.i64_eqz();
-    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+    emit_memory_error_on_truthy(
+        sink,
+        residual_type_base,
+        ca_reload_fn_ptr,
+        jf_top_addr,
+        wb,
+        gc_maps,
+    );
 }
 
 fn emit_memory_error_if_i32_zero(
@@ -12297,9 +12320,18 @@ fn emit_memory_error_if_i32_zero(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    wb: &WriteBarrierHelpers,
+    gc_maps: &FrameGcMaps,
 ) {
     sink.i32_eqz();
-    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+    emit_memory_error_on_truthy(
+        sink,
+        residual_type_base,
+        ca_reload_fn_ptr,
+        jf_top_addr,
+        wb,
+        gc_maps,
+    );
 }
 
 fn emit_memory_error_on_truthy(
@@ -12307,6 +12339,8 @@ fn emit_memory_error_on_truthy(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    wb: &WriteBarrierHelpers,
+    gc_maps: &FrameGcMaps,
 ) {
     sink.if_(BlockType::Empty);
     if crate::failguard::exit_frame_with_exception_attached() {
