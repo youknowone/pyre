@@ -226,6 +226,13 @@ WASM_TIMEOUT_SCALE = 4.0
 # of whichever run it failed in -- which is exactly how foriter_make_function_body
 # stayed out of the first version of this paragraph, and 3.5 looked reachable.
 WASM_MAX_DYNASM_RATIO = 4.0
+# How much of a fixture's native `max-pypy-ratio` wasm may spend against
+# dynasm. Native backends keep the header as written; wasm's guest compilation
+# and residual tax make the same number harsh, so the dynasm comparison uses
+# this scale instead of a second per-fixture header. A derived ceiling below
+# `WASM_MAX_DYNASM_RATIO` does not tighten the default. An explicit
+# `max-wasm-ratio` still wins.
+WASM_PYPY_RATIO_SCALE = 1.5
 # The headroom every `max-wasm-ratio` allowance is fitted with, and the same
 # margin the summary requires before it will call one outgrown -- a fixture
 # reading just under the ceiling is not one that can lose its allowance.
@@ -1805,8 +1812,10 @@ def synth_perf_gate(path):
     Keeping the gate beside the workload makes a changed loop count or known
     slow path reviewable with the test that needs the allowance.
 
-    The limit is read against the native backends only; `run_synthetic_bench`
-    exempts wasm.
+    The limit is read against the native backends as written. wasm spends
+    `WASM_PYPY_RATIO_SCALE` times that budget against dynasm — see
+    [`wasm_dynasm_ratio_ceiling`] — unless the fixture also states
+    `max-wasm-ratio`.
 
     A fixture states its ceiling and nothing else: the floor that goes with it
     is `perf_gate_floor`'s business, so a leftover `min-pypy-ratio` header is
@@ -1832,11 +1841,11 @@ def wasm_ratio_gate(path):
     """Read an optional per-fixture ceiling on wasm's ratio to dynasm:
         # pyre-check: max-wasm-ratio=6
 
-    Absence means `WASM_MAX_DYNASM_RATIO`, not "no ceiling" -- the opposite of
-    `synth_perf_gate` and `synth_rss_gate`, whose absence exempts a fixture
-    entirely. A directive here is therefore an allowance carved out of a gate
-    that already applies, so a run names every fixture that used one: an
-    allowance that is quietly the reason a suite is green is worse than no gate.
+    Absence is no longer "use `WASM_MAX_DYNASM_RATIO` and stop". The ceiling
+    then comes from [`wasm_dynasm_ratio_ceiling`]: a `max-pypy-ratio` scaled
+    by `WASM_PYPY_RATIO_SCALE`, or the 4x default. A directive here is still
+    an allowance carved out of that derived gate, so a run names every
+    fixture that used one.
 
     Read for every bench rather than synthetic ones alone, because the fixtures
     that need an allowance are not all synthetic.
@@ -1871,6 +1880,28 @@ def wasm_ratio_gate(path):
     if found is None:
         return None
     return _positive_float(*found, path, "wasm ratio gate")
+
+
+def wasm_dynasm_ratio_ceiling(path):
+    """Wasm's execution-only ceiling against dynasm, and what produced it.
+
+    Returns `(ceiling, kind)` where `kind` is `max-wasm-ratio`,
+    `max-pypy-ratio`, or `default`.
+
+    An explicit `max-wasm-ratio` wins. Otherwise a fixture that declared
+    `max-pypy-ratio` may spend `WASM_PYPY_RATIO_SCALE` times that budget
+    against dynasm, but never less than `WASM_MAX_DYNASM_RATIO`. Fixtures
+    with neither header keep the 4x default.
+    """
+    explicit = wasm_ratio_gate(path)
+    if explicit is not None:
+        return explicit, "max-wasm-ratio"
+    pypy_ratio = synth_perf_gate(path)
+    if pypy_ratio is not None:
+        derived = pypy_ratio * WASM_PYPY_RATIO_SCALE
+        if derived > WASM_MAX_DYNASM_RATIO:
+            return derived, "max-pypy-ratio"
+    return WASM_MAX_DYNASM_RATIO, "default"
 
 
 def perf_gate_floor(ceiling):
@@ -2472,6 +2503,10 @@ def check_synthetic_headers(pattern):
     broken = _expected_reader_selftest()
     for case, detail in broken:
         print(f"{red('ERROR')}: the `# Expected` reader mis-reads {case}: {detail}")
+    ceiling_broken = _wasm_ceiling_selftest()
+    for case, detail in ceiling_broken:
+        print(f"{red('ERROR')}: wasm_dynasm_ratio_ceiling mis-reads {case}: {detail}")
+    broken.extend(ceiling_broken)
     empty = [(path, line) for path in paths
              for claim, line in _expected_claims(path) if not claim.strip()]
     for path, line in empty:
@@ -2505,6 +2540,54 @@ EXPECTED_READER_CASES = (
     ("an expectation with nothing in it", "# Expected:\n", "5\n", True),
     ("a name the fixture never bound", "# Expected: os.sep\n", "/\n", True),
 )
+
+
+# `(label, header, ceiling, kind)` — `--check-headers` proves the derived
+# wasm/dynasm ceiling still follows `max-pypy-ratio` × scale, the 4x floor,
+# and an explicit `max-wasm-ratio` winning.
+WASM_CEILING_CASES = (
+    ("no headers", "", WASM_MAX_DYNASM_RATIO, "default"),
+    (
+        "pypy only below the default",
+        "# pyre-check: max-pypy-ratio=1.8\n",
+        WASM_MAX_DYNASM_RATIO,
+        "default",
+    ),
+    (
+        "pypy only above the default",
+        "# pyre-check: max-pypy-ratio=4.2\n",
+        4.2 * WASM_PYPY_RATIO_SCALE,
+        "max-pypy-ratio",
+    ),
+    (
+        "explicit wasm wins",
+        "# pyre-check: max-pypy-ratio=4.2\n# pyre-check: max-wasm-ratio=6.1\n",
+        6.1,
+        "max-wasm-ratio",
+    ),
+    (
+        "explicit wasm alone",
+        "# pyre-check: max-wasm-ratio=5.5\n",
+        5.5,
+        "max-wasm-ratio",
+    ),
+)
+
+
+def _wasm_ceiling_selftest():
+    """The cases `wasm_dynasm_ratio_ceiling` reads wrongly, as `(label, detail)`."""
+    broken = []
+    with tempfile.TemporaryDirectory() as directory:
+        fixture = Path(directory) / "fixture.py"
+        for label, header, want_ceiling, want_kind in WASM_CEILING_CASES:
+            fixture.write_text(header, encoding="utf-8")
+            ceiling, kind = wasm_dynasm_ratio_ceiling(str(fixture))
+            if kind != want_kind or not math.isclose(ceiling, want_ceiling):
+                broken.append((
+                    label,
+                    f"got {ceiling:g}x [{kind}], want {want_ceiling:g}x [{want_kind}]",
+                ))
+    return broken
 
 
 def _expected_reader_selftest():
@@ -3300,10 +3383,11 @@ class Check:
         # prints the same green as a satisfied one.
         self.wasm_ratio_ungated = []
         self.pypy_ratio_ungated = []
-        # (bench name, ceiling, measured ratio or None) for fixtures whose
-        # header raised the ratio above WASM_MAX_DYNASM_RATIO, for the same
-        # reason as the line above: a gate widened for a fixture and a gate the
-        # fixture satisfied both print green. The measured ratio rides along
+        # (bench name, ceiling, measured ratio or None, kind) for fixtures
+        # whose wasm/dynasm ceiling rose above WASM_MAX_DYNASM_RATIO, for the
+        # same reason as the line above: a gate widened for a fixture and a
+        # gate the fixture satisfied both print green. `kind` is
+        # `max-wasm-ratio` or `max-pypy-ratio`. The measured ratio rides along
         # because an allowance the backend has since outgrown is invisible
         # otherwise -- one sat at 4.8x over a fixture measuring 2.9x, and
         # finding that took parsing 434 comparison rows out of a job log.
@@ -4554,10 +4638,9 @@ class Check:
                 )
             )
 
-        # wasm carries no tuned per-fixture ratio, so it gates against dynasm's
-        # execution-only time from this same invocation instead. Placed after
-        # the other ratio gates so a fixture that is slow against several
-        # baselines still reports each one.
+        # wasm gates against dynasm's execution-only time from this same
+        # invocation. Placed after the other ratio gates so a fixture that is
+        # slow against several baselines still reports each one.
         if backend == "wasm":
             dynasm_elapsed = self.bench_elapsed.get(("dynasm", name))
             dynasm_exec = (
@@ -4571,14 +4654,16 @@ class Check:
             # would only reject one already pinned to EXEC_TIME_FLOOR_S, which
             # leaves the band up to FLOOR_GATE_MIN_BASELINE_S dividing by
             # something the same size as its own error.
-            ceiling = wasm_ratio_gate(script) or WASM_MAX_DYNASM_RATIO
-            allowed = ceiling > WASM_MAX_DYNASM_RATIO
+            ceiling, wasm_ceiling_kind = wasm_dynasm_ratio_ceiling(script)
+            allowed = wasm_ceiling_kind != "default"
             if dynasm_exec in (None, "-") or (
                 float(dynasm_exec) < FLOOR_GATE_MIN_BASELINE_S
             ):
                 self.wasm_ratio_ungated.append(name)
                 if allowed:
-                    self.wasm_ratio_allowed.append((name, ceiling, None))
+                    self.wasm_ratio_allowed.append((
+                        name, ceiling, None, wasm_ceiling_kind,
+                    ))
             else:
                 # This ceiling is meant to come back down as the backend closes
                 # the gap, so it has to mean the number it states: a standing
@@ -4606,6 +4691,7 @@ class Check:
                         name, ceiling,
                         float(self._exec_time(backend, checked_elapsed))
                         / float(self._exec_time("dynasm", checked_baseline)),
+                        wasm_ceiling_kind,
                     ))
                 if not passed:
                     detail = self._gate_fail_detail(
@@ -5117,11 +5203,11 @@ class Check:
                 print(dim("skip"))
                 self._append_comparison(backend, name, t_cpython, t_pypy, "skip")
                 continue
-            # wasm carries no perf-ratio gate, matching `run_bench` (which has no
-            # `wasm_vs_*` parameter at all): it legitimately runs a few× slower
-            # than the native backends a fixture's ratio is tuned for, so one
-            # ratio cannot gate both — see WASM_TIMEOUT_SCALE. Its per-bench
-            # timeout stays the hang guard.
+            # wasm is not gated against pypy with the native number: the
+            # guest's compilation tax makes that ceiling harsh. It keeps the
+            # dynasm comparison, scaled from this header by
+            # `wasm_dynasm_ratio_ceiling`. Its per-bench timeout stays the
+            # hang guard.
             vs_pypy = None if backend == "wasm" else max_pypy_ratio
             self._run_backend_bench(
                 backend, name, path, timeout,
@@ -5275,15 +5361,16 @@ class Check:
         if self.wasm_ratio_allowed:
             rows = sorted(set(self.wasm_ratio_allowed))
             names = ", ".join(
-                f"{name} {ceiling:g}x "
+                f"{name} {ceiling:g}x [{kind}] "
                 + (f"(measured {measured:.1f}x)" if measured is not None
                    else "(gate declined this run)")
-                for name, ceiling, measured in rows
+                for name, ceiling, measured, kind in rows
             )
             print(
                 dim(
-                    f"wasm/dynasm ratio raised above {WASM_MAX_DYNASM_RATIO:g}x by "
-                    f"`# pyre-check: max-wasm-ratio` for: {names}"
+                    f"wasm/dynasm ratio raised above {WASM_MAX_DYNASM_RATIO:g}x "
+                    f"({WASM_PYPY_RATIO_SCALE:g}× max-pypy-ratio, or an "
+                    f"explicit max-wasm-ratio) for: {names}"
                 )
             )
             # `* WASM_RATIO_FIT_HEADROOM` and not a bare comparison: without
@@ -5291,10 +5378,13 @@ class Check:
             # as outgrown on the strength of 0.07x. The caveat is there because
             # a run only measures its own host and an allowance may be fitted
             # to another -- math_folds_hot's 13x is a darwin-arm64 reading of
-            # 11.3x, which no ubuntu run can see.
+            # 11.3x, which no ubuntu run can see. Only an explicit
+            # `max-wasm-ratio` is a header that can be deleted; a derived
+            # lift lives on the native pypy budget.
             outgrown = [
-                n for n, _, m in rows
-                if m is not None
+                n for n, _, m, kind in rows
+                if kind == "max-wasm-ratio"
+                and m is not None
                 and m * WASM_RATIO_FIT_HEADROOM <= WASM_MAX_DYNASM_RATIO
             ]
             if outgrown:
