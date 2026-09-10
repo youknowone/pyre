@@ -1876,26 +1876,17 @@ impl BlackholeInterpreter {
     /// and return the post-operand position; we then store it back into
     /// `self.position`.
     fn dispatch_step(&mut self, opcode: u8, code: &[u8]) -> Result<(), DispatchError> {
-        let placeholder_addr = unwired_handler_placeholder as *const () as usize;
-        let table_handler = self
+        let handler = self
             .dispatch_table
             .get(opcode as usize)
             .copied()
-            .filter(|h| (*h as *const () as usize) != placeholder_addr);
-        let Some(handler) = table_handler else {
+            .unwrap_or(unwired_handler_placeholder);
+        if handler as *const () as usize == unwired_handler_placeholder as *const () as usize {
             // RPython parity (`blackhole.py setup_insns`
             // resolving every key via `_get_method`): a missing handler
             // is `AttributeError` at builder-construction time.  pyre
             // hits this branch only when a builder has not registered
             // every BC_* it intends to emit.
-            // The jitcode NAME is not an identity — `__new__` names one jitcode
-            // per class — and a byte that is unwired here is just as likely to
-            // be an operand the frame was resumed in the middle of as an opname
-            // the builder forgot.  Report the index and whether the position is
-            // a recorded instruction boundary so the two read apart.  `entry`
-            // separates the two further: equal to `pos` means the frame was
-            // `setposition`ed straight onto this byte and dispatched with no
-            // prior step, so nothing walked it forward from a valid boundary.
             //
             // Grain never installs MiniMark. A walk that inlined a helper
             // (`malformed`) and aborted leaves the blackhole on that helper
@@ -1916,7 +1907,7 @@ impl BlackholeInterpreter {
                 self.jitcode.try_index(),
                 self.jitcode.is_valid_startpoint(self.last_opcode_position),
             );
-        };
+        }
         match handler(self, code, self.position) {
             Ok(new_pos) => {
                 self.position = new_pos;
@@ -8336,6 +8327,67 @@ fn handler_unreachable(
 // These call `cpu.bh_getfield_gc_i(struct_ptr, descr)` etc.
 // The 'd' argcode is a 2-byte descriptor index into `bh.descrs`.
 // In pyre, descrs[index] resolves to a field offset (usize).
+//
+// The default `Backend` impl is a raw load/store at that offset
+// (`llmodel.py read_int_at_mem`). Going through `bh.cpu()` is two
+// virtual calls per field on a path the regex leaf interprets for
+// the rest of `shift`. Same bytes, no vtable.
+
+#[inline(always)]
+fn bh_load_int_field(struct_ptr: i64, descr: &BhDescr) -> i64 {
+    let (offset, size, sign) = descr.unpack_fielddescr_size();
+    let addr = (struct_ptr as usize).wrapping_add(offset);
+    // SAFETY: `struct_ptr` is the GC object the resume reader seeded;
+    // `offset`/`size` come from the field descriptor.
+    unsafe {
+        match (size, sign) {
+            (1, true) => (addr as *const i8).read_unaligned() as i64,
+            (1, false) => (addr as *const u8).read_unaligned() as i64,
+            (2, true) => (addr as *const i16).read_unaligned() as i64,
+            (2, false) => (addr as *const u16).read_unaligned() as i64,
+            (4, true) => (addr as *const i32).read_unaligned() as i64,
+            (4, false) => (addr as *const u32).read_unaligned() as i64,
+            (8, _) => (addr as *const i64).read_unaligned(),
+            other => panic!("bh_load_int_field: unsupported (size, signed) = {other:?}"),
+        }
+    }
+}
+
+#[inline(always)]
+fn bh_store_int_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
+    let (offset, size, _sign) = descr.unpack_fielddescr_size();
+    unsafe { majit_backend::llmodel::write_int_at_mem(struct_ptr as usize, offset, size, value) }
+}
+
+#[inline(always)]
+fn bh_load_ref_field(struct_ptr: i64, descr: &BhDescr) -> i64 {
+    let offset = descr.as_offset();
+    let addr = (struct_ptr as usize).wrapping_add(offset);
+    unsafe { (addr as *const usize).read_unaligned() as i64 }
+}
+
+#[inline(always)]
+fn bh_store_ref_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
+    let offset = descr.as_offset();
+    majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
+    unsafe {
+        majit_backend::llmodel::write_ref_at_mem(struct_ptr as usize, offset, value as usize);
+    }
+    majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+}
+
+#[inline(always)]
+fn bh_load_float_field(struct_ptr: i64, descr: &BhDescr) -> f64 {
+    let offset = descr.as_offset();
+    let addr = (struct_ptr as usize).wrapping_add(offset);
+    unsafe { (addr as *const f64).read_unaligned() }
+}
+
+#[inline(always)]
+fn bh_store_float_field(struct_ptr: i64, value: f64, descr: &BhDescr) {
+    let offset = descr.as_offset();
+    unsafe { majit_backend::llmodel::write_float_at_mem(struct_ptr as usize, offset, value) }
+}
 
 // CPU-dependent field and array operations
 /// RPython `blackhole.py:150-157`: read a 2-byte descriptor index from
@@ -8581,9 +8633,7 @@ fn handler_getfield_gc_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    let result = cpu.bh_getfield_gc_i(struct_ptr, descr);
-    bh.registers_i[code[pos] as usize] = result;
+    bh.registers_i[code[pos] as usize] = bh_load_int_field(struct_ptr, descr);
     Ok(pos + 1)
 }
 fn handler_getfield_gc_r(
@@ -8593,9 +8643,7 @@ fn handler_getfield_gc_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
-    bh.registers_r[code[pos] as usize] = result.0 as i64;
+    bh.registers_r[code[pos] as usize] = bh_load_ref_field(struct_ptr, descr);
     Ok(pos + 1)
 }
 fn handler_getfield_gc_f(
@@ -8605,9 +8653,7 @@ fn handler_getfield_gc_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
-    bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
+    bh.registers_f[code[pos] as usize] = bh_load_float_field(struct_ptr, descr).to_bits() as i64;
     Ok(pos + 1)
 }
 // bhimpl_setfield_gc_i: @arguments("cpu", "r", "i", "d")
@@ -8619,8 +8665,7 @@ fn handler_setfield_gc_i(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
+    bh_store_int_field(struct_ptr, value, descr);
     Ok(pos)
 }
 // `setfield_gc_i/rcd` — USE_C_FORM short value (`assembler.py`):
@@ -8635,8 +8680,7 @@ fn handler_setfield_gc_i_c(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = code[position + 1] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
+    bh_store_int_field(struct_ptr, value, descr);
     Ok(pos)
 }
 fn handler_setfield_gc_r(
@@ -8647,8 +8691,7 @@ fn handler_setfield_gc_r(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
+    bh_store_ref_field(struct_ptr, value, descr);
     Ok(pos)
 }
 fn handler_setfield_gc_f(
@@ -8659,8 +8702,7 @@ fn handler_setfield_gc_f(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_f(struct_ptr, value, descr);
+    bh_store_float_field(struct_ptr, value, descr);
     Ok(pos)
 }
 
