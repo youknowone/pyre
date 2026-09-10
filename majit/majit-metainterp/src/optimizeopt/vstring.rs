@@ -1050,7 +1050,7 @@ impl OptString {
         // position (no producer / inputarg yet) has no resolvable Operand, so
         // fall back to its canonical materialized stand-in rather than the
         // total resolver's position-only panic.
-        let args: Vec<Operand> = op
+        let args: smallvec::SmallVec<[Operand; 4]> = op
             .getarglist()
             .iter()
             .map(|a| match ctx.resolve_operand_operand_opt(a) {
