@@ -1814,6 +1814,37 @@ impl<'a> GraphFlattener<'a> {
 
     fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
         let exits = block.borrow().exits.clone();
+        // `raise/r` is not a canraise op (`graph_op_can_raise` omits it),
+        // so the block has no trailing `-live-`.  A later merge that
+        // appends a normal exit then takes the multi-exit early-return
+        // and drops `catch_exception`, so blackhole `raise/r` exits the
+        // frame instead of the same-frame except.  Always lower a
+        // raise-terminated block through the adjacent catch, using the
+        // seeded exception exit.  Do not go through `raising_op()` —
+        // that is `None` when `canraise()` is false.
+        if block
+            .borrow()
+            .operations
+            .iter()
+            .rev()
+            .find(|op| op.opname != OPNAME_LIVE)
+            .is_some_and(|op| op.opname == "raise")
+        {
+            let link = exits
+                .iter()
+                .find(|link| {
+                    let link = link.borrow();
+                    link.last_exception.is_some() && link.last_exc_value.is_some()
+                })
+                .or_else(|| exits.first())
+                .expect("raise-terminated block has an exit");
+            let catch_label = self.tlabel_for_link(link);
+            self.emitline(Insn::op("catch_exception", vec![catch_label]));
+            let handler_label = self.label_for_link(link);
+            self.emitline(handler_label);
+            self.make_exception_link(link, handling_ovf);
+            return;
+        }
         if exits.len() == 1 {
             // `flatten.py assert link.exitcase in (None, False, True)`
             // — single-exit links carry either the default fall-through

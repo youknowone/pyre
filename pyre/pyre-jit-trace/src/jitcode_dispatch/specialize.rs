@@ -9388,6 +9388,8 @@ pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     }
     let sid = if unsafe { pyre_object::w_list_uses_int_storage(list_obj) } {
         1i64
+    } else if unsafe { pyre_object::w_list_uses_float_storage(list_obj) } {
+        2i64
     } else if unsafe { pyre_object::w_list_uses_object_storage(list_obj) } {
         0i64
     } else {
@@ -9422,40 +9424,129 @@ pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
     ctx.trace_ctx
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
-    let len_descr = if sid == 0 {
-        crate::descr::list_length_descr()
-    } else {
-        crate::descr::list_int_items_len_descr()
+    let len_descr = match sid {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        2 => crate::descr::list_float_items_len_descr(),
+        _ => return Ok(None),
     };
     let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
     walker_emit_index_bounds_guards(ctx, op_pc, raw_index, index, lenbox, concrete_len)?;
-    let (boxed, boxed_concrete) = if sid == 0 {
-        let items_block = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            list_op,
-            crate::descr::list_items_descr(),
-        );
-        (
-            crate::state::trace_items_block_getitem_value(ctx.trace_ctx, items_block, raw_index),
-            majit_ir::Value::Ref(majit_ir::GcRef(elem_obj as usize)),
-        )
-    } else {
-        let block = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            list_op,
-            crate::descr::list_int_items_block_descr(),
-        );
-        let raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, block, raw_index);
-        let elem = unsafe { pyre_object::w_int_get_value(elem_obj) };
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Int(elem));
-        (
-            walker_box_int(ctx, op_pc, raw, elem)?,
-            box_int_concrete(elem, elem_obj as i64),
-        )
+    let (boxed, boxed_concrete) = match sid {
+        0 => {
+            let items_block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::list_items_descr(),
+            );
+            (
+                crate::state::trace_items_block_getitem_value(
+                    ctx.trace_ctx,
+                    items_block,
+                    raw_index,
+                ),
+                majit_ir::Value::Ref(majit_ir::GcRef(elem_obj as usize)),
+            )
+        }
+        1 => {
+            let block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::list_int_items_block_descr(),
+            );
+            let raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, block, raw_index);
+            let elem = unsafe { pyre_object::w_int_get_value(elem_obj) };
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Int(elem));
+            (
+                walker_box_int(ctx, op_pc, raw, elem)?,
+                box_int_concrete(elem, elem_obj as i64),
+            )
+        }
+        2 => {
+            let block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::list_float_items_block_descr(),
+            );
+            let raw =
+                crate::state::trace_float_block_getitem_value(ctx.trace_ctx, block, raw_index);
+            let elem = unsafe { pyre_object::w_float_get_value(elem_obj) };
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Float(elem));
+            (
+                crate::state::wrapfloat(ctx.trace_ctx, raw),
+                majit_ir::Value::Ref(majit_ir::GcRef(elem_obj as usize)),
+            )
+        }
+        _ => return Ok(None),
     };
     ctx.trace_ctx.set_opref_concrete(boxed, boxed_concrete);
     let _ = dst;
+    Ok(Some(DispatchOutcome::SubReturn {
+        result: Some(boxed),
+    }))
+}
+
+/// Exact builtin float/int operands at a declined helper CALL: the same
+/// `FloatAdd`/`FloatSub`/`FloatMul`/`FloatTrueDiv` + `wrapfloat` body
+/// `try_walker_specialize_binary_op_float` records, without a residual
+/// `call_descr`.  `float_loop` / `spectral_norm` / `nbody` otherwise stay
+/// `CallMayForce`.
+pub(crate) fn try_emit_exact_float_binop<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(bin_op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    use pyre_interpreter::bytecode::BinaryOperator;
+    let op_code = match bin_op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => OpCode::FloatAdd,
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => OpCode::FloatSub,
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => OpCode::FloatMul,
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => OpCode::FloatTrueDiv,
+        _ => return Ok(None),
+    };
+    let Some((lhs, rhs, lhs_obj, rhs_obj, lhs_is_int, rhs_is_int, lhs_f64, rhs_f64)) =
+        walker_float_specialization_input_operands(ctx, r_args)
+    else {
+        return Ok(None);
+    };
+    if matches!(op_code, OpCode::FloatTrueDiv) && rhs_f64 == 0.0 {
+        return Ok(None);
+    }
+    let lhs_raw = walker_coerce_dispatching_operand_to_float(
+        ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64, false,
+    )?;
+    let rhs_raw = walker_coerce_dispatching_operand_to_float(
+        ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64, false,
+    )?;
+    if matches!(op_code, OpCode::FloatTrueDiv) {
+        let rhs_zero = walker_float_eq_const(ctx, rhs_raw, 0.0, 0);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
+    }
+    let raw_result = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+    let bits = majit_metainterp::eval_binop_f(
+        op_code,
+        lhs_f64.to_bits() as i64,
+        rhs_f64.to_bits() as i64,
+    );
+    let result_val = f64::from_bits(bits as u64);
+    ctx.trace_ctx
+        .set_opref_concrete(raw_result, majit_ir::Value::Float(result_val));
+    let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw_result);
+    let boxed_ptr = pyre_object::w_float_new(result_val) as usize;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr)));
+    let _ = (dst, dst_bank);
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
     }))
@@ -9466,6 +9557,7 @@ fn binary_op_tag_for_helper_name(name: &str) -> Option<i64> {
     let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
     let leaf = leaf.strip_suffix("_impl").unwrap_or(leaf);
     let leaf = leaf.strip_prefix("shortcut_").unwrap_or(leaf);
+    let leaf = leaf.strip_prefix("descr_").unwrap_or(leaf);
     let leaf = leaf.strip_prefix("int_").unwrap_or(leaf);
     let leaf = leaf.strip_prefix("long_").unwrap_or(leaf);
     let op = match leaf {

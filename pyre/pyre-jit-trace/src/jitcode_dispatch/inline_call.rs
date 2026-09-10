@@ -12722,6 +12722,13 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 })? {
                     return Ok(outcome);
                 }
+                if let Some(outcome) = spec_gate(SpecFold::BinaryOpFloat, || {
+                    super::specialize::try_emit_exact_float_binop(
+                        ctx, pc, op_tag, ref_args, dst, dst_bank,
+                    )
+                })? {
+                    return Ok(outcome);
+                }
                 if matches!(
                     pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
                     Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
@@ -13918,19 +13925,45 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
             .is_some_and(|jc| jc.code.as_ptr() == sub_body.code.as_ptr())
         && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(sub_index, &[])
-        && matches!(
-            pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
-            Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
-        )
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-        if let Some(DispatchOutcome::SubReturn {
+        let write_boxed = |ctx: &mut WalkContext<'_, '_, Sym>, boxed: OpRef| {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
+            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)
+        };
+        if matches!(
+            pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+            Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
+        ) && let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::Subscr, || {
             super::specialize::try_emit_list_int_getitem(ctx, op.pc, &args, dst, dst_bank)
         })? {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            write_boxed(ctx, boxed)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // Named `add`/`mul`/… helpers arrive as `dR>r`, not
+        // `binary_value_from_tag`.  Emit before walking so a declined
+        // `w_float_new` body cannot leave a residual `CallF` with a
+        // symbolic funcptr in the caller trace (`float_loop` SIGBUS).
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::BinaryOpDescent, || {
+            super::specialize::try_emit_exact_int_binop(
+                ctx, op.pc, op_tag, &args, dst, dst_bank,
+            )
+        })? {
+            write_boxed(ctx, boxed)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::BinaryOpFloat, || {
+            super::specialize::try_emit_exact_float_binop(
+                ctx, op.pc, op_tag, &args, dst, dst_bank,
+            )
+        })? {
+            write_boxed(ctx, boxed)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
@@ -14198,6 +14231,32 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             )
         })? {
             return Ok((outcome, op.next_pc));
+        }
+        // Orthodox descent admits only exact int/bool.  Float (and a
+        // declined int walk) must not fall through to a successful
+        // `binary_value_from_tag` walk that residualizes `descr_add` as
+        // `CallMayForce` — that is the 19x `float_loop` hole.
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::BinaryOpDescent, || {
+            super::specialize::try_emit_exact_int_binop(
+                ctx, op.pc, op_tag, &ref_args, dst, dst_bank,
+            )
+        })? {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
+            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::BinaryOpFloat, || {
+            super::specialize::try_emit_exact_float_binop(
+                ctx, op.pc, op_tag, &ref_args, dst, dst_bank,
+            )
+        })? {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
+            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
 
