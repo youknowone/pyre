@@ -14,9 +14,11 @@ use indexmap::{IndexMap, IndexSet};
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
 use majit_ir::Type;
 use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
+use majit_ir::forwarding::Forwarded;
 use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
 use majit_ir::{Const, ConstMap, GcRef, Value};
+use std::collections::HashSet;
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
@@ -53,6 +55,7 @@ fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
 /// itself is then `None`, so follow the replacement first.
 fn rewrite_operand(
     operand: Operand,
+    defined: &HashSet<u32>,
     gcrefs: &mut Vec<GcRef>,
     gcrefs_map: &mut IndexMap<usize, u32>,
     recently_loaded: &mut IndexMap<u32, Operand>,
@@ -61,15 +64,32 @@ fn rewrite_operand(
 ) -> Operand {
     // rewrite.py `get_box_replacement(arg)` — `not_const=False`.
     let replaced = operand.get_box_replacement(false);
-    intern_constptr_operand(
+    if let Some(load) = intern_constptr_operand(
         replaced.clone(),
         gcrefs,
         gcrefs_map,
         recently_loaded,
         next_pos,
         out,
-    )
-    .unwrap_or(replaced)
+    ) {
+        return load;
+    }
+    // Off-stream producer: flattening left a `RefOp(pos)` / InputArg whose
+    // `_resref` still names the object (`history.py *FrontendOp`). rewrite.py
+    // never sees that shape — RPython Box identity keeps the Const on the
+    // box itself after get_box_replacement.
+    if let Some(gcref) = leftover_folded_ref(&operand, defined) {
+        return intern_constptr_operand(
+            Operand::const_from_value(Value::Ref(gcref)),
+            gcrefs,
+            gcrefs_map,
+            recently_loaded,
+            next_pos,
+            out,
+        )
+        .unwrap_or(replaced);
+    }
+    replaced
 }
 
 /// rewrite.py `_gcref_index` — put a non-null ConstPtr in the output
@@ -133,6 +153,28 @@ fn intern_constptr_operand(
     })
 }
 
+/// A folded producer that is no longer in the compiled stream still
+/// carries the object on `_resref` / `_forwarded` (`history.py
+/// *FrontendOp`). Flattening that operand to `RefOp(pos)` without a
+/// pool entry or a `LoadFromGcTable` leaves wasm reading an unbound local.
+fn leftover_folded_ref(arg: &Operand, defined: &HashSet<u32>) -> Option<GcRef> {
+    let opref = arg.to_opref();
+    if opref != OpRef::NONE && !opref.is_constant() && defined.contains(&opref.raw()) {
+        return None;
+    }
+    let value = match arg.get_value() {
+        Some(value) => value,
+        None => match arg.get_forwarded() {
+            Forwarded::Const(c) => c.get(),
+            _ => return None,
+        },
+    };
+    match value {
+        Value::Ref(gcref) if !gcref.is_null() => Some(gcref),
+        _ => None,
+    }
+}
+
 pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRef>) {
     // rewrite.py:352-354 `gcrefs_output_list` / `gcrefs_map` /
     // `gcrefs_recently_loaded`.
@@ -140,6 +182,13 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
     let mut gcrefs_map: IndexMap<usize, u32> = IndexMap::default();
     let mut recently_loaded: IndexMap<u32, Operand> = IndexMap::default();
     let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    let defined: HashSet<u32> = ops
+        .iter()
+        .filter_map(|op| {
+            let pos = op.pos.get();
+            (pos != OpRef::NONE && !pos.is_constant()).then_some(pos.raw())
+        })
+        .collect();
 
     for op in ops {
         // rewrite.py:1005 — the per-basic-block CSE cache is dropped at
@@ -157,6 +206,7 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
                     i,
                     rewrite_operand(
                         op.arg(i),
+                        &defined,
                         &mut gcrefs,
                         &mut gcrefs_map,
                         &mut recently_loaded,
