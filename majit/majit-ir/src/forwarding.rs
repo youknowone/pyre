@@ -442,21 +442,30 @@ fn fwd_ptr(w: u64) -> u64 {
     w & FWD_PTR_MASK & !FW_TAG
 }
 
+/// SmallConst identity lives in bits 35-63. Bits 56-61 may carry a
+/// small stamp, so a packed stamp keeps the id in bits 35-55 (21 bits).
+const SMALL_CONST_ID_STAMP_BITS: u64 = 21;
+
 #[inline]
 pub(crate) fn fwd_stamp(w: u64) -> u32 {
-    if w & FW_TAG == FW_INFO_BOUND {
-        ((w >> FWD_STAMP_SHIFT) & FWD_STAMP_MASK) as u32
-    } else {
-        0
+    match w & FW_TAG {
+        FW_INFO_BOUND | FW_SMALL_CONST => ((w >> FWD_STAMP_SHIFT) & FWD_STAMP_MASK) as u32,
+        _ => 0,
     }
 }
 
 #[inline]
 pub(crate) fn try_pack_fwd_stamp(packed: u64, stamp: u32) -> Option<u64> {
-    if packed & FW_TAG == FW_INFO_BOUND && stamp < 64 {
-        Some((packed & FWD_PTR_MASK) | ((stamp as u64) << FWD_STAMP_SHIFT))
-    } else {
-        None
+    if stamp >= 64 {
+        return None;
+    }
+    match packed & FW_TAG {
+        FW_INFO_BOUND => Some((packed & FWD_PTR_MASK) | ((stamp as u64) << FWD_STAMP_SHIFT)),
+        FW_SMALL_CONST if packed >> 35 < (1 << SMALL_CONST_ID_STAMP_BITS) => {
+            let body = packed & ((1u64 << FWD_STAMP_SHIFT) - 1);
+            Some(body | ((stamp as u64) << FWD_STAMP_SHIFT))
+        }
+        _ => None,
     }
 }
 
@@ -466,6 +475,7 @@ pub(crate) fn strip_fwd_stamp(w: u64) -> u64 {
         FW_OP | FW_INPUTARG | FW_CONST | FW_INFO_PTR | FW_INFO_BOUND | FW_INFO_OTHER => {
             w & FWD_PTR_MASK
         }
+        FW_SMALL_CONST => w & ((1u64 << FWD_STAMP_SHIFT) - 1),
         _ => w,
     }
 }
@@ -547,7 +557,12 @@ pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
         }
         FW_SMALL_CONST => {
             let val = ((w >> 3) as u32) as u64;
-            let id = w >> 35;
+            let stamp = (w >> FWD_STAMP_SHIFT) & FWD_STAMP_MASK;
+            let id = if stamp == 0 {
+                w >> 35
+            } else {
+                (w >> 35) & ((1 << SMALL_CONST_ID_STAMP_BITS) - 1)
+            };
             Forwarded::SmallConst((id << 32) | val)
         }
         FW_SMALL_WIDE => Forwarded::SmallWide(w >> 3),
