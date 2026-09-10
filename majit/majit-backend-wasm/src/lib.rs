@@ -781,8 +781,9 @@ fn guard_fail_args_advanced(
 
 use failguard::{
     CallAssemblerTarget, ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr,
-    WasmFrameData, ca_dispatch_mark_gnf2, ca_dispatch_publish, ca_dispatch_redirect,
-    ca_dispatch_slot, call_assembler_target, global_fail_descr, label_target,
+    WasmFrameData, ca_dispatch_mark_gnf2, ca_dispatch_mark_gnf2_for_compiled_ptr,
+    ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot, call_assembler_target,
+    global_fail_descr, label_target, mark_call_assembler_targets_gnf2_for_compiled_ptr,
     publish_call_assembler_target, publish_label_target, register_fail_descrs, reserve_fail_descrs,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
@@ -5430,6 +5431,15 @@ impl majit_backend::Backend for WasmBackend {
             .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2)
         {
             ca_dispatch_mark_gnf2(original_token.number);
+            let compiled_ptr = original_token
+                .compiled
+                .get()
+                .and_then(|compiled| compiled.downcast_ref::<CompiledWasmLoop>())
+                .map(|loop_| loop_ as *const CompiledWasmLoop as u32);
+            if let Some(compiled_ptr) = compiled_ptr.filter(|&ptr| ptr != 0) {
+                ca_dispatch_mark_gnf2_for_compiled_ptr(compiled_ptr);
+                mark_call_assembler_targets_gnf2_for_compiled_ptr(compiled_ptr);
+            }
             if let Some(mut target) = call_assembler_target(original_token.number) {
                 if target.has_guard_not_forced_2 == 0 {
                     target.has_guard_not_forced_2 = 1;
@@ -6247,6 +6257,35 @@ mod tests {
         }
         drop(table);
         failguard::ca_dispatch_remove(token_number);
+    }
+
+    #[test]
+    fn mark_gnf2_raises_redirected_alias_cells() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let old_number = 9_900_030;
+        let new_number = 9_900_031;
+        ca_dispatch_publish(old_number, 1, 22, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(new_number, 2, 99, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_redirect(old_number, 2, 99, 33, 44, 55, 0, 0, 0);
+        failguard::ca_dispatch_mark_gnf2(new_number);
+
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        for number in [old_number, new_number] {
+            let entry = table
+                .as_ref()
+                .and_then(|table| table.get(&number))
+                .expect("dispatch entry");
+            assert_eq!(
+                entry
+                    .has_guard_not_forced_2
+                    .load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "token {number} must see GNF2 after the replacement loop is marked"
+            );
+        }
+        drop(table);
+        failguard::ca_dispatch_remove(old_number);
+        failguard::ca_dispatch_remove(new_number);
     }
 
     #[test]

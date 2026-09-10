@@ -662,10 +662,66 @@ pub fn ca_dispatch_slot(number: u64) -> u32 {
 /// this before arming a newly compiled `GUARD_NOT_FORCED_2` bridge so
 /// an in-flight CALL_ASSEMBLER footer sees the flag before the callee
 /// can finish through that bridge.
+///
+/// When `number` already has a snapshot, every cell whose current
+/// target invokes the same compiled loop is raised too. Redirected
+/// aliases keep their own cell; callers baked that address, so marking
+/// only the replacement token would leave those footers reading zero.
 pub fn ca_dispatch_mark_gnf2(number: u64) {
     let table = WASM_CA_DISPATCH.lock();
-    if let Some(entry) = table.as_ref().and_then(|table| table.get(&number)) {
+    let Some(table) = table.as_ref() else {
+        return;
+    };
+    let compiled_ptr = table.get(&number).and_then(|entry| {
+        entry
+            .targets
+            .lock()
+            .unwrap()
+            .last()
+            .map(|target| target.compiled_ptr)
+    });
+    if let Some(compiled_ptr) = compiled_ptr.filter(|&ptr| ptr != 0) {
+        mark_gnf2_entries_for_compiled_ptr(table, compiled_ptr);
+    } else if let Some(entry) = table.get(&number) {
         entry.has_guard_not_forced_2.store(1, Ordering::Release);
+    }
+}
+
+/// Raise the monotonic GNF2 flag on every dispatch cell whose current
+/// snapshot invokes `compiled_ptr`.
+pub fn ca_dispatch_mark_gnf2_for_compiled_ptr(compiled_ptr: u32) {
+    let table = WASM_CA_DISPATCH.lock();
+    if let Some(table) = table.as_ref() {
+        mark_gnf2_entries_for_compiled_ptr(table, compiled_ptr);
+    }
+}
+
+fn mark_gnf2_entries_for_compiled_ptr(
+    table: &std::collections::HashMap<u64, Box<WasmCaDispatchEntry>>,
+    compiled_ptr: u32,
+) {
+    for entry in table.values() {
+        let aliases = entry
+            .targets
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|target| target.compiled_ptr == compiled_ptr);
+        if aliases {
+            entry.has_guard_not_forced_2.store(1, Ordering::Release);
+        }
+    }
+}
+
+/// Stamp `has_guard_not_forced_2` on every CALL_ASSEMBLER metadata
+/// alias that currently names `compiled_ptr`.
+pub fn mark_call_assembler_targets_gnf2_for_compiled_ptr(compiled_ptr: u32) {
+    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().as_mut() {
+        for target in targets.values_mut() {
+            if target.compiled_ptr as u32 == compiled_ptr {
+                target.has_guard_not_forced_2 = 1;
+            }
+        }
     }
 }
 
