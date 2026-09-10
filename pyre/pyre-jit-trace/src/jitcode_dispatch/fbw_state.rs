@@ -4004,6 +4004,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 let defer_truth_or_method_self = match ei.runtime_helper {
                     majit_ir::RuntimeHelperKind::LoadMethodSelf => method_form_deferred_helpers,
                     majit_ir::RuntimeHelperKind::Truth => true,
+                    majit_ir::RuntimeHelperKind::UnaryNot => true,
                     _ => false,
                 };
                 let defer_helper = defer_truth_or_method_self

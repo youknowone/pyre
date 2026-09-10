@@ -11993,7 +11993,19 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
         ));
     }
-    let Some(inlined) = descent? else {
+    let Some(inlined) = (match descent {
+        Ok(inlined) => inlined,
+        Err(err) => {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx
+                .restore_virtualref_boxes(pre_fold_virtualrefs);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            decline!(format_args!(
+                "callee inline of {}.{dunder} aborted: {err:?}",
+                unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+            ));
+        }
+    }) else {
         decline!(format_args!(
             "callee inline of {}.{dunder} declined",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
@@ -13915,6 +13927,25 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         })?;
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
+
+    if dst_bank == 'r'
+        && args.len() == 1
+        && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
+            jc.code.as_ptr() == sub_body.code.as_ptr()
+                && (jc.name == "neg" || jc.name.ends_with("::neg"))
+        })
+    {
+        let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::UnaryNeg, || {
+            super::specialize::try_emit_exact_int_uneg(ctx, op.pc, &args, dst, dst_bank)
+        })? {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
+            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
 
     if dst_bank == 'r'
         && args.len() == 2

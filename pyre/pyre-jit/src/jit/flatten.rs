@@ -6959,7 +6959,7 @@ where
         ctx.unary_not_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::RuntimeHelperKind::None,
+        majit_ir::RuntimeHelperKind::UnaryNot,
         dst_reg,
     ))
 }

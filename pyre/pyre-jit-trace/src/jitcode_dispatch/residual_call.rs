@@ -7052,6 +7052,33 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && r_args.len() == 1
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNot
+        && spec_gate(SpecFold::UnaryNot, || {
+            try_walker_specialize_unary_not(ctx, op.pc, r_args[0], dst, dst_bank)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && r_args.len() == 1
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
+    {
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::UnaryNeg, || {
+            try_emit_exact_int_uneg(ctx, op.pc, &r_args, dst, dst_bank)
+        })? {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+
     // #62: specialize STORE_SUBSCR `list[int] = value` (int / float storage,
     // in-bounds, type-matching) to the walker-native `setarrayitem_raw` form,
     // eliding the `CALL_MAY_FORCE` that would force the virtualizable every
@@ -9225,9 +9252,26 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         })? {
                             return Ok((outcome, op.next_pc));
                         }
-                        // Descend the helper whole ahead of the hand folds, so
-                        // their `consulted` counts read whether the descent
-                        // took the site.
+                        // Same cut as flatten `inline_call` of
+                        // `binary_value_from_tag`: emit the machine-int body
+                        // before walking `add`.  A user `__add__` that does
+                        // `return self.x + o` residualizes this BINARY; the
+                        // descent then walks `descr_add` and dies on an
+                        // unallocated float register (`RegisterOutOfRange`
+                        // bank `f`).
+                        if let Some(DispatchOutcome::SubReturn {
+                            result: Some(boxed),
+                        }) = spec_gate(SpecFold::BinaryOpDescent, || {
+                            try_emit_exact_int_binop(
+                                ctx, op.pc, op_tag, &r_args, dst, dst_bank,
+                            )
+                        })? {
+                            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
+                            return Ok((DispatchOutcome::Continue, op.next_pc));
+                        }
+                        // Descend the helper whole ahead of the remaining hand
+                        // folds, so their `consulted` counts read whether the
+                        // descent took the site.
                         if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
                             try_walker_orthodox_binary_op(
                                 ctx, op.pc, op_tag, tag_opref, &r_args, dst, dst_bank,
