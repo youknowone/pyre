@@ -1,16 +1,10 @@
 # pyre-check: max-pypy-ratio=2.4
-# pyre-check: max-wasm-ratio=6.1
 #
 # Ceiling 6 derived floor. After `get_instantiate` became a word load of
 # the immutable OBJECT_VTABLE slot, ubuntu dynasm reads 0.5x and
 # cranelift 0.6x (run 34382609753). 2.4 puts the derived floor at 0.4x
 # under those and still covers the slower 1.4x cranelift host span from
 # before the slot folded.
-#
-# The walker stops unrolling `step` two frames past `FBW_MAX_INLINE_RECURSION`,
-# so each loop iteration is a residual recursive call. wasm compiles one
-# module per residual trace; ubuntu-24.04 measured 5.0x on main and 5.3x
-# here, so 6.1x is the higher reading plus WASM_RATIO_FIT_HEADROOM (15%).
 #
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #
