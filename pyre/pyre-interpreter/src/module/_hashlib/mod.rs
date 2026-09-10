@@ -392,7 +392,10 @@ fn check_digest_name(name_obj: PyObjectRef) -> Result<(), crate::PyError> {
 fn unsupported_digestmod(msg: &str) -> crate::PyError {
     let mut err = crate::PyError::value_error(msg.to_string());
     if let Some(cls) = crate::builtins::lookup_exc_class("_hashlib.UnsupportedDigestmodError") {
-        let args = [cls, w_str_new(msg)];
+        let _roots = gc_roots::push_roots();
+        let msg_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_str_new_managed(msg));
+        let args = [cls, gc_roots::shadow_stack_get(msg_slot)];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }

@@ -871,8 +871,8 @@ fn fget(w_self: PyObjectRef, attrchar: char) -> Result<PyObjectRef, PyError> {
     let ct = ctype_arg(w_self)?;
     match attrchar {
         // `W_CType._fget('k')` — a class attribute in PyPy.
-        'k' => Ok(pyre_object::w_str_new(kind_name(ct))),
-        'c' => Ok(pyre_object::w_str_new(ct.name)),
+        'k' => Ok(pyre_object::w_str_new_managed(kind_name(ct))),
+        'c' => Ok(pyre_object::w_str_new_managed(ct.name)),
         // `W_CTypePointer._fget('i')` and `W_CTypeArray._fget('i')`.  A
         // function type has none: `W_CTypeFunc` reaches `W_CType._fget`.
         'i' if ct.is_ptr_or_array() => Ok(ct.ctitem),

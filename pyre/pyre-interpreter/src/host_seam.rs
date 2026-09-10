@@ -215,12 +215,13 @@ pub type SeamResult<T> = Result<T, SeamError>;
 /// the `""` the fd call sites pass). Both real and trampoline-backed opens
 /// use this conversion so they expose the same Python exception shape.
 pub fn seam_os_err(e: SeamError, context: &str) -> crate::PyError {
-    let w_filename = if context.is_empty() {
-        pyre_object::PY_NULL
-    } else {
-        pyre_object::w_str_new(context)
-    };
-    seam_os_err_with_filename(e, w_filename)
+    if context.is_empty() {
+        return seam_os_err_with_filename(e, pyre_object::PY_NULL);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let filename_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(context));
+    seam_os_err_with_filename(e, pyre_object::gc_roots::shadow_stack_get(filename_slot))
 }
 
 /// `wrap_oserror2(space, e, w_path)` in `interp_posix.py`: retain the exact

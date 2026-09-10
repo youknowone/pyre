@@ -2168,7 +2168,7 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     )?;
     for names in [&code.varnames, &code.freevars, &code.cellvars, &code.names] {
         for name in names.iter() {
-            add_obj(&mut result, w_str_new(name))?;
+            add_obj(&mut result, w_str_new_managed(name))?;
         }
     }
     for (index, constant) in crate::pyframe::code_constants(code).iter().enumerate() {

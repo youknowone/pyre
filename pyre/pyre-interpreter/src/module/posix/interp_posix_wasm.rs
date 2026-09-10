@@ -218,30 +218,38 @@ fn seam_error(e: &std::io::Error, w_path: PyObjectRef) -> crate::PyError {
 /// block-device fields nor the Windows ones, leaving the float times, the
 /// sub-second remainders and the full nanosecond timestamps.
 fn make_stat_result(mode: i64, size: i64) -> PyObjectRef {
-    let seq = vec![
-        pyre_object::w_int_new(mode),
-        pyre_object::w_int_new(0), // st_ino
-        pyre_object::w_int_new(0), // st_dev
-        pyre_object::w_int_new(1), // st_nlink
-        pyre_object::w_int_new(0), // st_uid
-        pyre_object::w_int_new(0), // st_gid
-        pyre_object::w_int_new(size),
-        pyre_object::w_int_new(0), // _integer_atime
-        pyre_object::w_int_new(0), // _integer_mtime
-        pyre_object::w_int_new(0), // _integer_ctime
-    ];
-    let extras = vec![
-        ("st_atime", pyre_object::w_float_new(0.0)),
-        ("st_mtime", pyre_object::w_float_new(0.0)),
-        ("st_ctime", pyre_object::w_float_new(0.0)),
-        ("nsec_atime", pyre_object::w_int_new(0)),
-        ("nsec_mtime", pyre_object::w_int_new(0)),
-        ("nsec_ctime", pyre_object::w_int_new(0)),
-        ("st_atime_ns", pyre_object::w_int_new(0)),
-        ("st_mtime_ns", pyre_object::w_int_new(0)),
-        ("st_ctime_ns", pyre_object::w_int_new(0)),
-    ];
-    crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut extra_slots: Vec<(&str, usize)> = Vec::new();
+    let mut put_extra = |name: &'static str, value: PyObjectRef| {
+        extra_slots.push((name, pyre_object::gc_roots::shadow_stack_len()));
+        let _ = pyre_object::gc_roots::pin_root(value);
+    };
+    put_extra("st_atime", pyre_object::w_float_new(0.0));
+    put_extra("st_mtime", pyre_object::w_float_new(0.0));
+    put_extra("st_ctime", pyre_object::w_float_new(0.0));
+    put_extra("nsec_atime", pyre_object::w_int_new(0));
+    put_extra("nsec_mtime", pyre_object::w_int_new(0));
+    put_extra("nsec_ctime", pyre_object::w_int_new(0));
+    put_extra("st_atime_ns", pyre_object::w_int_new(0));
+    put_extra("st_mtime_ns", pyre_object::w_int_new(0));
+    put_extra("st_ctime_ns", pyre_object::w_int_new(0));
+    drop(put_extra);
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_int_new(mode));
+    fields.push(pyre_object::w_int_new(0)); // st_ino
+    fields.push(pyre_object::w_int_new(0)); // st_dev
+    fields.push(pyre_object::w_int_new(1)); // st_nlink
+    fields.push(pyre_object::w_int_new(0)); // st_uid
+    fields.push(pyre_object::w_int_new(0)); // st_gid
+    fields.push(pyre_object::w_int_new(size));
+    fields.push(pyre_object::w_int_new(0)); // _integer_atime
+    fields.push(pyre_object::w_int_new(0)); // _integer_mtime
+    fields.push(pyre_object::w_int_new(0)); // _integer_ctime
+    let extras: Vec<_> = extra_slots
+        .into_iter()
+        .map(|(name, slot)| (name, pyre_object::gc_roots::shadow_stack_get(slot)))
+        .collect();
+    crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), fields.take(), extras)
 }
 
 /// `os.terminal_size` structseq — `(columns, lines)`.

@@ -1266,16 +1266,15 @@ impl<'a> MiniXmlParser<'a> {
 
     fn intern_string(&self, value: &str) -> PyObjectRef {
         // Nothing holds the new string until the map takes it, and everything
-        // below can collect, so it gets one liveness pin at its mint; a `str`
-        // does not move, so the local stays current.
+        // below can collect, so it gets one liveness pin at its mint.
         let value_roots = pyre_object::gc_roots::push_roots();
-        let w_value = w_str_new(value);
-        let w_value = value_roots.pin_root(w_value);
+        let value_slot = value_roots.base();
+        let _ = value_roots.pin_root(w_str_new_managed(value));
         let Ok(intern) = crate::baseobjspace::getattr_str(self.parser, "intern") else {
-            return w_value;
+            return value_roots.get(value_slot);
         };
         if unsafe { is_none(intern) } {
-            return w_value;
+            return value_roots.get(value_slot);
         }
         // The intern map is a caller-supplied `dict`, whose header moves.  A
         // borrowed-str probe compares against whatever a colliding bucket
@@ -1289,8 +1288,8 @@ impl<'a> MiniXmlParser<'a> {
             if let Some(existing) = w_dict_getitem_str(roots.get(intern_slot), value) {
                 existing
             } else {
-                w_dict_setitem_str(roots.get(intern_slot), value, w_value);
-                w_value
+                w_dict_setitem_str(roots.get(intern_slot), value, value_roots.get(value_slot));
+                value_roots.get(value_slot)
             }
         }
     }
@@ -2049,7 +2048,7 @@ fn error_string(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(ERROR_TABLE
         .iter()
         .find(|(_, c)| *c == code)
-        .map(|(msg, _)| w_str_new(msg))
+        .map(|(msg, _)| w_str_new_managed(msg))
         .unwrap_or_else(w_none))
 }
 

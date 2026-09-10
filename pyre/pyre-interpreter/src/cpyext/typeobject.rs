@@ -3189,7 +3189,9 @@ fn read_member(
             T_PYSSIZET => pyre_object::w_int_new(*(address as *const isize) as i64),
             T_FLOAT => pyre_object::w_float_new(*(address as *const f32) as f64),
             T_DOUBLE => pyre_object::w_float_new(*(address as *const f64)),
-            T_CHAR => pyre_object::w_str_new(&(*(address as *const u8) as char).to_string()),
+            T_CHAR => {
+                pyre_object::w_str_new_managed(&(*(address as *const u8) as char).to_string())
+            }
             T_STRING => {
                 let text = *(address as *const *const c_char);
                 text_or_none(text)
@@ -6847,7 +6849,7 @@ pub unsafe extern "C" fn PyType_GetFullyQualifiedName(tp: *mut CPyTypeObject) ->
         Some("builtins") | Some("__main__") | None => qualified,
         Some(module) => format!("{module}.{qualified}"),
     };
-    pyobject::make_ref(pyre_object::w_str_new(&name))
+    pyobject::make_ref(pyre_object::w_str_new_managed(&name))
 }
 
 /// The metaclass a type built from a spec is an instance of —

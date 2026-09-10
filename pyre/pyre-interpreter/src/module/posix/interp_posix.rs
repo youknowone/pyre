@@ -5028,74 +5028,85 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // The 10 sequence slots are the integer fields (integer-seconds
         // times at 7..10, named `_integer_*`); the float times, `st_*_ns`,
         // and the platform block/device extras are named-only fields.
-        let seq = vec![
-            pyre_object::w_int_new(st_mode),
-            w_ino(st_ino),
-            pyre_object::w_int_new(st_dev),
-            pyre_object::w_int_new(st_nlink),
-            pyre_object::w_int_new(st_uid),
-            pyre_object::w_int_new(st_gid),
-            pyre_object::w_int_new(st_size),
-            pyre_object::w_int_new(st_atime),
-            pyre_object::w_int_new(st_mtime),
-            pyre_object::w_int_new(st_ctime),
-        ];
         // `_ll_get_st_atime` — float times keep sub-second precision:
         // `float(seconds) + 1e-9 * nanosecond_fraction`, where the
         // fraction is recovered from the full-nanosecond field.
         let st_atime_f = st_atime as f64 + 1e-9 * (st_atime_ns - whole_ns(st_atime, 0)) as f64;
         let st_mtime_f = st_mtime as f64 + 1e-9 * (st_mtime_ns - whole_ns(st_mtime, 0)) as f64;
         let st_ctime_f = st_ctime as f64 + 1e-9 * (st_ctime_ns - whole_ns(st_ctime, 0)) as f64;
-        #[allow(unused_mut)]
-        let mut extras = vec![
-            ("st_atime", pyre_object::w_float_new(st_atime_f)),
-            ("st_mtime", pyre_object::w_float_new(st_mtime_f)),
-            ("st_ctime", pyre_object::w_float_new(st_ctime_f)),
-            ("st_atime_ns", w_time_ns(st_atime_ns)),
-            ("st_mtime_ns", w_time_ns(st_mtime_ns)),
-            ("st_ctime_ns", w_time_ns(st_ctime_ns)),
-            // `build_stat_result` (interp_posix.py): the
-            // sub-second remainder of each full-nanosecond timestamp,
-            // `value % 1_000_000_000` (non-negative for pre-1970 times).
-            (
-                "nsec_atime",
-                pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000) as i64),
-            ),
-            (
-                "nsec_mtime",
-                pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000) as i64),
-            ),
-            (
-                "nsec_ctime",
-                pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000) as i64),
-            ),
-        ];
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut extra_slots: Vec<(&str, usize)> = Vec::new();
+        let mut put_extra = |name: &'static str, value: pyre_object::PyObjectRef| {
+            extra_slots.push((name, pyre_object::gc_roots::shadow_stack_len()));
+            let _ = pyre_object::gc_roots::pin_root(value);
+        };
+        put_extra("st_atime", pyre_object::w_float_new(st_atime_f));
+        put_extra("st_mtime", pyre_object::w_float_new(st_mtime_f));
+        put_extra("st_ctime", pyre_object::w_float_new(st_ctime_f));
+        put_extra("st_atime_ns", w_time_ns(st_atime_ns));
+        put_extra("st_mtime_ns", w_time_ns(st_mtime_ns));
+        put_extra("st_ctime_ns", w_time_ns(st_ctime_ns));
+        // `build_stat_result` (interp_posix.py): the
+        // sub-second remainder of each full-nanosecond timestamp,
+        // `value % 1_000_000_000` (non-negative for pre-1970 times).
+        put_extra(
+            "nsec_atime",
+            pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000) as i64),
+        );
+        put_extra(
+            "nsec_mtime",
+            pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000) as i64),
+        );
+        put_extra(
+            "nsec_ctime",
+            pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000) as i64),
+        );
         #[cfg(unix)]
         {
-            extras.push(("st_blksize", pyre_object::w_int_new(st_blksize)));
-            extras.push(("st_blocks", pyre_object::w_int_new(st_blocks)));
-            extras.push(("st_rdev", pyre_object::w_int_new(st_rdev)));
+            put_extra("st_blksize", pyre_object::w_int_new(st_blksize));
+            put_extra("st_blocks", pyre_object::w_int_new(st_blocks));
+            put_extra("st_rdev", pyre_object::w_int_new(st_rdev));
         }
         #[cfg(target_os = "macos")]
-        extras.push(("st_flags", pyre_object::w_int_new(st_flags as i64)));
+        put_extra("st_flags", pyre_object::w_int_new(st_flags as i64));
         #[cfg(not(target_os = "macos"))]
         let _ = st_flags;
         #[cfg(windows)]
         {
             let birthtime_f =
                 f.birthtime as f64 + 1e-9 * (f.birthtime_ns - whole_ns(f.birthtime, 0)) as f64;
-            extras.push((
+            put_extra(
                 "st_file_attributes",
                 pyre_object::w_int_new(f.file_attributes as i64),
-            ));
-            extras.push((
+            );
+            put_extra(
                 "st_reparse_tag",
                 pyre_object::w_int_new(f.reparse_tag as i64),
-            ));
-            extras.push(("st_birthtime", pyre_object::w_float_new(birthtime_f)));
-            extras.push(("st_birthtime_ns", w_time_ns(f.birthtime_ns)));
+            );
+            put_extra("st_birthtime", pyre_object::w_float_new(birthtime_f));
+            put_extra("st_birthtime_ns", w_time_ns(f.birthtime_ns));
         }
-        crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
+        drop(put_extra);
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_int_new(st_mode));
+        fields.push(w_ino(st_ino));
+        fields.push(pyre_object::w_int_new(st_dev));
+        fields.push(pyre_object::w_int_new(st_nlink));
+        fields.push(pyre_object::w_int_new(st_uid));
+        fields.push(pyre_object::w_int_new(st_gid));
+        fields.push(pyre_object::w_int_new(st_size));
+        fields.push(pyre_object::w_int_new(st_atime));
+        fields.push(pyre_object::w_int_new(st_mtime));
+        fields.push(pyre_object::w_int_new(st_ctime));
+        let extras: Vec<_> = extra_slots
+            .into_iter()
+            .map(|(name, slot)| (name, pyre_object::gc_roots::shadow_stack_get(slot)))
+            .collect();
+        crate::_structseq::new_instance_with_extra(
+            super::stat_result_seq_type(),
+            fields.take(),
+            extras,
+        )
     }
     /// Build a `stat_result` from the sandbox wire `StatBuf` (sandbox build
     /// only, hence unix-only): the controller delivers the 10 protocol fields
@@ -5110,48 +5121,59 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let st_atime_ns = whole_ns(st.atime, st.atime_nsec);
         let st_mtime_ns = whole_ns(st.mtime, st.mtime_nsec);
         let st_ctime_ns = whole_ns(st.ctime, st.ctime_nsec);
-        let seq = vec![
-            pyre_object::w_int_new(st.mode as i64),
-            pyre_object::w_int_new(st.ino as i64),
-            pyre_object::w_int_new(st.dev as i64),
-            pyre_object::w_int_new(st.nlink as i64),
-            pyre_object::w_int_new(st.uid as i64),
-            pyre_object::w_int_new(st.gid as i64),
-            pyre_object::w_int_new(st.size as i64),
-            pyre_object::w_int_new(st_atime),
-            pyre_object::w_int_new(st_mtime),
-            pyre_object::w_int_new(st_ctime),
-        ];
         let st_atime_f = st_atime as f64 + 1e-9 * (st_atime_ns - whole_ns(st_atime, 0)) as f64;
         let st_mtime_f = st_mtime as f64 + 1e-9 * (st_mtime_ns - whole_ns(st_mtime, 0)) as f64;
         let st_ctime_f = st_ctime as f64 + 1e-9 * (st_ctime_ns - whole_ns(st_ctime, 0)) as f64;
-        #[allow(unused_mut)]
-        let mut extras = vec![
-            ("st_atime", pyre_object::w_float_new(st_atime_f)),
-            ("st_mtime", pyre_object::w_float_new(st_mtime_f)),
-            ("st_ctime", pyre_object::w_float_new(st_ctime_f)),
-            ("st_atime_ns", w_time_ns(st_atime_ns)),
-            ("st_mtime_ns", w_time_ns(st_mtime_ns)),
-            ("st_ctime_ns", w_time_ns(st_ctime_ns)),
-            (
-                "nsec_atime",
-                pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000) as i64),
-            ),
-            (
-                "nsec_mtime",
-                pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000) as i64),
-            ),
-            (
-                "nsec_ctime",
-                pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000) as i64),
-            ),
-            ("st_blksize", pyre_object::w_int_new(st.blksize as i64)),
-            ("st_blocks", pyre_object::w_int_new(st.blocks as i64)),
-            ("st_rdev", pyre_object::w_int_new(st.rdev as i64)),
-        ];
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut extra_slots: Vec<(&str, usize)> = Vec::new();
+        let mut put_extra = |name: &'static str, value: pyre_object::PyObjectRef| {
+            extra_slots.push((name, pyre_object::gc_roots::shadow_stack_len()));
+            let _ = pyre_object::gc_roots::pin_root(value);
+        };
+        put_extra("st_atime", pyre_object::w_float_new(st_atime_f));
+        put_extra("st_mtime", pyre_object::w_float_new(st_mtime_f));
+        put_extra("st_ctime", pyre_object::w_float_new(st_ctime_f));
+        put_extra("st_atime_ns", w_time_ns(st_atime_ns));
+        put_extra("st_mtime_ns", w_time_ns(st_mtime_ns));
+        put_extra("st_ctime_ns", w_time_ns(st_ctime_ns));
+        put_extra(
+            "nsec_atime",
+            pyre_object::w_int_new(st_atime_ns.rem_euclid(1_000_000_000) as i64),
+        );
+        put_extra(
+            "nsec_mtime",
+            pyre_object::w_int_new(st_mtime_ns.rem_euclid(1_000_000_000) as i64),
+        );
+        put_extra(
+            "nsec_ctime",
+            pyre_object::w_int_new(st_ctime_ns.rem_euclid(1_000_000_000) as i64),
+        );
+        put_extra("st_blksize", pyre_object::w_int_new(st.blksize as i64));
+        put_extra("st_blocks", pyre_object::w_int_new(st.blocks as i64));
+        put_extra("st_rdev", pyre_object::w_int_new(st.rdev as i64));
         #[cfg(target_os = "macos")]
-        extras.push(("st_flags", pyre_object::w_int_new(st.st_flags as i64)));
-        crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
+        put_extra("st_flags", pyre_object::w_int_new(st.st_flags as i64));
+        drop(put_extra);
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_int_new(st.mode as i64));
+        fields.push(pyre_object::w_int_new(st.ino as i64));
+        fields.push(pyre_object::w_int_new(st.dev as i64));
+        fields.push(pyre_object::w_int_new(st.nlink as i64));
+        fields.push(pyre_object::w_int_new(st.uid as i64));
+        fields.push(pyre_object::w_int_new(st.gid as i64));
+        fields.push(pyre_object::w_int_new(st.size as i64));
+        fields.push(pyre_object::w_int_new(st_atime));
+        fields.push(pyre_object::w_int_new(st_mtime));
+        fields.push(pyre_object::w_int_new(st_ctime));
+        let extras: Vec<_> = extra_slots
+            .into_iter()
+            .map(|(name, slot)| (name, pyre_object::gc_roots::shadow_stack_get(slot)))
+            .collect();
+        crate::_structseq::new_instance_with_extra(
+            super::stat_result_seq_type(),
+            fields.take(),
+            extras,
+        )
     }
     /// `os.stat(path, *, dir_fd=None, follow_symlinks=True)` /
     /// `os.lstat(path, *, dir_fd=None)` — `follow_symlinks` is keyword-only,
@@ -9133,20 +9155,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         fn statvfs_to_obj(
             info: rustpython_host_env::posix::StatVfsInfo,
         ) -> pyre_object::PyObjectRef {
-            let seq = vec![
-                pyre_object::w_int_new(info.f_bsize as i64),
-                pyre_object::w_int_new(info.f_frsize as i64),
-                pyre_object::w_int_new(info.f_blocks as i64),
-                pyre_object::w_int_new(info.f_bfree as i64),
-                pyre_object::w_int_new(info.f_bavail as i64),
-                pyre_object::w_int_new(info.f_files as i64),
-                pyre_object::w_int_new(info.f_ffree as i64),
-                pyre_object::w_int_new(info.f_favail as i64),
-                pyre_object::w_int_new(info.f_flag as i64),
-                pyre_object::w_int_new(info.f_namemax as i64),
-            ];
-            let extras = vec![("f_fsid", pyre_object::w_int_new(info.f_fsid as i64))];
-            crate::_structseq::new_instance_with_extra(statvfs_result_seq_type(), seq, extras)
+            let _roots = pyre_object::gc_roots::push_roots();
+            let fsid_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(info.f_fsid as i64));
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_int_new(info.f_bsize as i64));
+            fields.push(pyre_object::w_int_new(info.f_frsize as i64));
+            fields.push(pyre_object::w_int_new(info.f_blocks as i64));
+            fields.push(pyre_object::w_int_new(info.f_bfree as i64));
+            fields.push(pyre_object::w_int_new(info.f_bavail as i64));
+            fields.push(pyre_object::w_int_new(info.f_files as i64));
+            fields.push(pyre_object::w_int_new(info.f_ffree as i64));
+            fields.push(pyre_object::w_int_new(info.f_favail as i64));
+            fields.push(pyre_object::w_int_new(info.f_flag as i64));
+            fields.push(pyre_object::w_int_new(info.f_namemax as i64));
+            crate::_structseq::new_instance_with_extra(
+                statvfs_result_seq_type(),
+                fields.take(),
+                vec![(
+                    "f_fsid",
+                    pyre_object::gc_roots::shadow_stack_get(fsid_slot),
+                )],
+            )
         }
         #[cfg(not(target_os = "redox"))]
         crate::module_ns_store(

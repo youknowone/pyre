@@ -1308,7 +1308,7 @@ pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult
     {
         let mut args = pyre_object::gc_roots::RootedItems::new();
         args.push(w_self);
-        args.push(pyre_object::w_str_new(unsafe {
+        args.push(pyre_object::w_str_new_managed(unsafe {
             crate::function_get_name(obj)
         }));
         let args = pyre_object::w_tuple_new(args.take());
@@ -1337,7 +1337,7 @@ pub unsafe fn descr_fixed_code_reduce(obj: PyObjectRef) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(owner);
-    let name = pyre_object::w_str_new(unsafe { function_get_name(obj) });
+    let name = pyre_object::w_str_new_managed(unsafe { function_get_name(obj) });
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(name);
     let getattr = crate::baseobjspace::builtin_callable("getattr");
@@ -1598,7 +1598,7 @@ pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let obj = pyre_object::gc_roots::pin_root(obj);
-        let w_qualname = pyre_object::w_str_new(function_get_name(obj));
+        let w_qualname = pyre_object::w_str_new_managed(function_get_name(obj));
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_write_barrier(obj);
         function_notify_quasi_immut(obj, QuasiImmutSlot::WQualname);
@@ -1663,7 +1663,7 @@ pub unsafe fn function_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let obj = pyre_object::gc_roots::pin_root(obj);
-        let w_name = pyre_object::w_str_new(function_get_name(obj));
+        let w_name = pyre_object::w_str_new_managed(function_get_name(obj));
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_set_name_obj(obj, w_name);
         w_name

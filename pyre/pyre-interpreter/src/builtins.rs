@@ -1739,9 +1739,9 @@ fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
-        Ok(w_str_new(pyre_object::memoryview::w_memoryview_format_str(
-            mv,
-        )))
+        Ok(w_str_new_managed(
+            pyre_object::memoryview::w_memoryview_format_str(mv),
+        ))
     }
 }
 

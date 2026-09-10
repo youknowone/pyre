@@ -732,7 +732,7 @@ impl PyError {
         name: &str,
     ) -> Self {
         let mut err = Self::new(PyErrorKind::AttributeError, msg);
-        err.w_name_context = pyre_object::w_str_new(name);
+        err.w_name_context = pyre_object::w_str_new_managed(name);
         err.w_obj_context = w_obj;
         err
     }
@@ -798,7 +798,7 @@ impl PyError {
         };
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_obj);
-        let w_name = pyre_object::w_str_new(name);
+        let w_name = pyre_object::w_str_new_managed(name);
         if let Some(slot) = exc_slot {
             self.exc_object = pyre_object::gc_roots::shadow_stack_get(slot);
         }
@@ -1042,7 +1042,7 @@ impl PyError {
     /// materialised (Python 3.10+).
     pub fn name_error_with_name(msg: impl Into<Wtf8Buf>, name: &str) -> Self {
         let mut err = Self::new(PyErrorKind::NameError, msg);
-        err.w_name_context = pyre_object::w_str_new(name);
+        err.w_name_context = pyre_object::w_str_new_managed(name);
         err
     }
 
@@ -1060,7 +1060,7 @@ impl PyError {
     /// `name` rides the shared `w_n` slot (ImportError / NameError /
     /// AttributeError), stamped by `to_exc_object`.
     pub fn module_not_found_with_name(msg: impl Into<Wtf8Buf>, name: &str) -> Self {
-        Self::module_not_found_with_name_obj(msg, pyre_object::w_str_new(name))
+        Self::module_not_found_with_name_obj(msg, pyre_object::w_str_new_managed(name))
     }
 
     /// `module_not_found_with_name` for a name with no `&str` spelling, so the

@@ -44,7 +44,7 @@ fn key_of(pointer: *const c_char) -> Option<PyObjectRef> {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return None;
     }
-    Some(pyre_object::w_str_new(
+    Some(pyre_object::w_str_new_managed(
         &unsafe { CStr::from_ptr(pointer) }.to_string_lossy(),
     ))
 }

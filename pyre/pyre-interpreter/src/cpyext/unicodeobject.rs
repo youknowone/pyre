@@ -65,7 +65,7 @@ pub(super) fn utf8_text(bytes: &[u8]) -> Result<&str, crate::PyError> {
 
 fn from_utf8_bytes(bytes: &[u8]) -> *mut CPyObject {
     match utf8_text(bytes) {
-        Ok(text) => pyobject::make_ref(pyre_object::w_str_new(text)),
+        Ok(text) => pyobject::make_ref(pyre_object::w_str_new_managed(text)),
         Err(error) => {
             super::pyerrors::set_pending_error(error);
             std::ptr::null_mut()
@@ -973,7 +973,7 @@ pub unsafe extern "C" fn PyUnicode_DecodeLocaleAndSize(
         return std::ptr::null_mut();
     };
     let error = match std::str::from_utf8(bytes) {
-        Ok(text) => return pyobject::make_ref(pyre_object::w_str_new(text)),
+        Ok(text) => return pyobject::make_ref(pyre_object::w_str_new_managed(text)),
         Err(error) => error,
     };
     if escaping {

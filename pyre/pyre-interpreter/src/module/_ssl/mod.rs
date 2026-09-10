@@ -162,20 +162,41 @@ fn split_library_reason(message: &str) -> Option<(&str, &str)> {
 
 fn set_library_reason(exception: PyObjectRef, message: &str) {
     if let Some((library, reason)) = split_library_reason(message) {
-        let _ = crate::baseobjspace::setattr_str(exception, "library", w_str_new(library));
-        let _ = crate::baseobjspace::setattr_str(exception, "reason", w_str_new(reason));
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(exception);
+        let library_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(library));
+        let _ = crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            "library",
+            pyre_object::gc_roots::shadow_stack_get(library_slot),
+        );
+        let reason_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(reason));
+        let _ = crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            "reason",
+            pyre_object::gc_roots::shadow_stack_get(reason_slot),
+        );
     }
 }
 
 fn ssl_error(message: impl Into<String>) -> crate::PyError {
     let message = message.into();
     let mut err = crate::PyError::os_error(message.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class("ssl.SSLError")
-        && let Ok(exc) =
-            crate::builtins::exc_exception_new(&[cls, w_int_new(0), w_str_new(&message)])
-    {
-        set_library_reason(exc, &message);
-        err.exc_object = exc;
+    if let Some(cls) = crate::builtins::lookup_exc_class("ssl.SSLError") {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let message_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
+        if let Ok(exc) = crate::builtins::exc_exception_new(&[
+            cls,
+            w_int_new(0),
+            pyre_object::gc_roots::shadow_stack_get(message_slot),
+        ]) {
+            set_library_reason(exc, &message);
+            err.exc_object = exc;
+        }
     }
     err
 }
@@ -235,33 +256,46 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
     } else {
         code
     };
-    if let Some(class) = crate::builtins::lookup_exc_class(class_name)
-        && let Ok(exception) = crate::builtins::exc_os_error_new(&[
+    if let Some(class) = crate::builtins::lookup_exc_class(class_name) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let message_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
+        if let Ok(exception) = crate::builtins::exc_os_error_new(&[
             class,
             w_int_new(public_errno as i64),
-            w_str_new(&message),
-        ])
-    {
-        set_library_reason(exception, &message);
-        if let Some(verify_code) = verify_code {
-            let _ = crate::baseobjspace::setattr_str(
-                exception,
-                "verify_code",
-                w_int_new(verify_code as i64),
-            );
-            let _ = crate::baseobjspace::setattr_str(
-                exception,
-                "verify_message",
-                w_str_new(pyre_native::ssl::certificate_verify_message(verify_code)),
-            );
-            let _ = crate::baseobjspace::setattr_str(exception, "library", w_str_new("SSL"));
-            let _ = crate::baseobjspace::setattr_str(
-                exception,
-                "reason",
-                w_str_new("CERTIFICATE_VERIFY_FAILED"),
-            );
+            pyre_object::gc_roots::shadow_stack_get(message_slot),
+        ]) {
+            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(exception);
+            set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
+            if let Some(verify_code) = verify_code {
+                let _ = crate::baseobjspace::setattr_str(
+                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                    "verify_code",
+                    w_int_new(verify_code as i64),
+                );
+                let verify_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(
+                    pyre_native::ssl::certificate_verify_message(verify_code),
+                ));
+                let _ = crate::baseobjspace::setattr_str(
+                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                    "verify_message",
+                    pyre_object::gc_roots::shadow_stack_get(verify_slot),
+                );
+                let _ = crate::baseobjspace::setattr_str(
+                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                    "library",
+                    w_str_new("SSL"),
+                );
+                let _ = crate::baseobjspace::setattr_str(
+                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                    "reason",
+                    w_str_new("CERTIFICATE_VERIFY_FAILED"),
+                );
+            }
+            error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         }
-        error.exc_object = exception;
     }
     error
 }
@@ -330,6 +364,18 @@ fn dict_from_pairs(items: &[(&str, PyObjectRef)]) -> PyObjectRef {
     dict
 }
 
+fn dict_put(dict_slot: usize, key: &str, value: PyObjectRef) {
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value);
+    unsafe {
+        w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            key,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        );
+    }
+}
+
 fn decoded_name(cert: *const pyre_native::ssl::DecodedCertificate, subject: bool) -> PyObjectRef {
     let rdn_count = unsafe { pyre_native::ssl::certificate_name_rdn_count(cert, subject) };
     // Every tuple here is freshly allocated and the next allocation can collect,
@@ -352,8 +398,8 @@ fn decoded_name(cert: *const pyre_native::ssl::DecodedCertificate, subject: bool
                 };
                 let attribute_tuple = {
                     let mut pair = pyre_object::gc_roots::RootedItems::new();
-                    pair.push(w_str_new(&key));
-                    pair.push(w_str_new(&value));
+                    pair.push(w_str_new_managed(&key));
+                    pair.push(w_str_new_managed(&value));
                     w_tuple_new(pair.take())
                 };
                 attributes.push(attribute_tuple);
@@ -391,8 +437,8 @@ fn decoded_directory_name(
                 };
                 let attribute_tuple = {
                     let mut pair = pyre_object::gc_roots::RootedItems::new();
-                    pair.push(w_str_new(&key));
-                    pair.push(w_str_new(&value));
+                    pair.push(w_str_new_managed(&key));
+                    pair.push(w_str_new_managed(&value));
                     w_tuple_new(pair.take())
                 };
                 attributes.push(attribute_tuple);
@@ -412,39 +458,44 @@ fn decoded_urls(
     if count == 0 {
         return None;
     }
-    Some(w_tuple_new(
-        (0..count)
-            .map(|index| {
-                w_str_new(&unsafe { pyre_native::ssl::certificate_url(cert, kind, index) })
-            })
-            .collect(),
-    ))
+    let mut urls = pyre_object::gc_roots::RootedItems::new();
+    for index in 0..count {
+        urls.push(w_str_new_managed(&unsafe {
+            pyre_native::ssl::certificate_url(cert, kind, index)
+        }));
+    }
+    Some(w_tuple_new(urls.take()))
 }
 
 fn decoded_certificate_dict(cert: *mut pyre_native::ssl::DecodedCertificate) -> PyObjectRef {
-    let dict = dict_from_pairs(&[
-        ("issuer", decoded_name(cert, false)),
-        (
-            "notAfter",
-            w_str_new(&unsafe { pyre_native::ssl::certificate_not_after(cert) }),
-        ),
-        (
-            "notBefore",
-            w_str_new(&unsafe { pyre_native::ssl::certificate_not_before(cert) }),
-        ),
-        (
-            "serialNumber",
-            w_str_new(&unsafe { pyre_native::ssl::certificate_serial_number(cert) }),
-        ),
-        ("subject", decoded_name(cert, true)),
-        (
-            "version",
-            w_int_new(unsafe { pyre_native::ssl::certificate_version(cert) } as i64),
-        ),
-    ]);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_dict_new());
+    dict_put(dict_slot, "issuer", decoded_name(cert, false));
+    dict_put(
+        dict_slot,
+        "notAfter",
+        w_str_new_managed(&unsafe { pyre_native::ssl::certificate_not_after(cert) }),
+    );
+    dict_put(
+        dict_slot,
+        "notBefore",
+        w_str_new_managed(&unsafe { pyre_native::ssl::certificate_not_before(cert) }),
+    );
+    dict_put(
+        dict_slot,
+        "serialNumber",
+        w_str_new_managed(&unsafe { pyre_native::ssl::certificate_serial_number(cert) }),
+    );
+    dict_put(dict_slot, "subject", decoded_name(cert, true));
+    dict_put(
+        dict_slot,
+        "version",
+        w_int_new(unsafe { pyre_native::ssl::certificate_version(cert) } as i64),
+    );
     for (name, kind) in [("OCSP", 0), ("caIssuers", 1), ("crlDistributionPoints", 2)] {
         if let Some(urls) = decoded_urls(cert, kind) {
-            unsafe { w_dict_setitem_str(dict, name, urls) };
+            dict_put(dict_slot, name, urls);
         }
     }
     let san_count = unsafe { pyre_native::ssl::certificate_san_count(cert) };
@@ -460,17 +511,19 @@ fn decoded_certificate_dict(cert: *mut pyre_native::ssl::DecodedCertificate) -> 
                 let value = if kind == "DirName" {
                     decoded_directory_name(cert, index)
                 } else {
-                    w_str_new(&unsafe { pyre_native::ssl::certificate_san_value(cert, index) })
+                    w_str_new_managed(&unsafe {
+                        pyre_native::ssl::certificate_san_value(cert, index)
+                    })
                 };
                 pair.push(value);
                 w_tuple_new(pair.take())
             };
             names.push(entry);
         }
-        unsafe { w_dict_setitem_str(dict, "subjectAltName", w_tuple_new(names.take())) };
+        dict_put(dict_slot, "subjectAltName", w_tuple_new(names.take()));
     }
     unsafe { pyre_native::ssl::certificate_free(cert) };
-    dict
+    pyre_object::gc_roots::shadow_stack_get(dict_slot)
 }
 
 fn parse_server_hostname(
@@ -500,7 +553,7 @@ fn parse_server_hostname(
             "server_hostname must contain ASCII only",
         ));
     }
-    Ok((Some(hostname.clone()), w_str_new(&hostname)))
+    Ok((Some(hostname.clone()), w_str_new_managed(&hostname)))
 }
 
 fn allocate_ssl_socket(
@@ -1129,25 +1182,52 @@ mod context_methods {
                 let name = pyre_native::ssl::cipher_name(index);
                 let bits = pyre_native::ssl::cipher_bits(index);
                 let description = pyre_native::ssl::cipher_description(index);
-                ciphers.push(dict_from_pairs(&[
-                    ("id", w_int_new(pyre_native::ssl::cipher_id(index))),
-                    ("name", w_str_new(name)),
-                    (
+                let cipher = {
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(w_dict_new());
+                    dict_put(
+                        dict_slot,
+                        "id",
+                        w_int_new(pyre_native::ssl::cipher_id(index)),
+                    );
+                    dict_put(dict_slot, "name", w_str_new_managed(name));
+                    dict_put(
+                        dict_slot,
                         "protocol",
-                        w_str_new(pyre_native::ssl::cipher_protocol(index)),
-                    ),
-                    ("description", w_str_new(&description)),
-                    ("strength_bits", w_int_new(bits as i64)),
-                    ("alg_bits", w_int_new(bits as i64)),
-                    ("aead", w_bool_from(pyre_native::ssl::cipher_aead(index))),
-                    (
+                        w_str_new_managed(pyre_native::ssl::cipher_protocol(index)),
+                    );
+                    dict_put(dict_slot, "description", w_str_new_managed(&description));
+                    dict_put(dict_slot, "strength_bits", w_int_new(bits as i64));
+                    dict_put(dict_slot, "alg_bits", w_int_new(bits as i64));
+                    dict_put(
+                        dict_slot,
+                        "aead",
+                        w_bool_from(pyre_native::ssl::cipher_aead(index)),
+                    );
+                    dict_put(
+                        dict_slot,
                         "symmetric",
-                        w_str_new(pyre_native::ssl::cipher_symmetric(index)),
-                    ),
-                    ("digest", w_str_new(pyre_native::ssl::cipher_digest(index))),
-                    ("kea", w_str_new(pyre_native::ssl::cipher_kea(index))),
-                    ("auth", w_str_new(pyre_native::ssl::cipher_auth(index))),
-                ]));
+                        w_str_new_managed(pyre_native::ssl::cipher_symmetric(index)),
+                    );
+                    dict_put(
+                        dict_slot,
+                        "digest",
+                        w_str_new_managed(pyre_native::ssl::cipher_digest(index)),
+                    );
+                    dict_put(
+                        dict_slot,
+                        "kea",
+                        w_str_new_managed(pyre_native::ssl::cipher_kea(index)),
+                    );
+                    dict_put(
+                        dict_slot,
+                        "auth",
+                        w_str_new_managed(pyre_native::ssl::cipher_auth(index)),
+                    );
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot)
+                };
+                ciphers.push(cipher);
             }
             w_list_new(ciphers.take())
         }
@@ -1580,15 +1660,20 @@ mod ssl_socket_methods {
             return Ok(());
         }
         for event in events {
+            let _event_roots = pyre_object::gc_roots::push_roots();
+            let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(owner);
+            let data_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&event.data));
             crate::call::call_function_impl_result(
                 context.msg_callback,
                 &[
-                    owner,
+                    pyre_object::gc_roots::shadow_stack_get(owner_slot),
                     w_str_new(if event.write { "write" } else { "read" }),
                     w_int_new(event.version as i64),
                     w_int_new(event.content_type as i64),
                     w_int_new(event.message_type as i64),
-                    w_bytes_from_bytes(&event.data),
+                    pyre_object::gc_roots::shadow_stack_get(data_slot),
                 ],
             )?;
         }
@@ -2005,14 +2090,24 @@ mod ssl_socket_methods {
                     "[SSL: PARSE_TLSEXT] SNI callback owner is no longer available".to_string(),
                 ));
             }
-            let server_name = unsafe {
+            let _sni_roots = pyre_object::gc_roots::push_roots();
+            let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(owner);
+            let name_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(unsafe {
                 pyre_native::ssl::connection_server_name(backend)
-                    .map(|name| w_str_new(&name))
+                    .map(|name| w_str_new_managed(&name))
                     .unwrap_or_else(w_none)
-            };
+            });
+            let context_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(initial_context);
             let result = match crate::call::call_function_impl_result(
                 callback,
-                &[owner, server_name, initial_context],
+                &[
+                    pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
+                    pyre_object::gc_roots::shadow_stack_get(context_slot),
+                ],
             ) {
                 Ok(result) => result,
                 Err(mut error) => {
@@ -2382,7 +2477,7 @@ mod ssl_socket_methods {
                 return w_none();
             }
             unsafe { pyre_native::ssl::connection_alpn(self.backend) }
-                .map(|value| w_str_new(&String::from_utf8_lossy(&value)))
+                .map(|value| w_str_new_managed(&String::from_utf8_lossy(&value)))
                 .unwrap_or_else(w_none)
         }
 
@@ -2391,7 +2486,7 @@ mod ssl_socket_methods {
                 return w_none();
             }
             unsafe { pyre_native::ssl::connection_version(self.backend) }
-                .map(w_str_new)
+                .map(w_str_new_managed)
                 .unwrap_or_else(w_none)
         }
 
@@ -2695,7 +2790,7 @@ mod certificate_methods {
                 pem.push_str("-----END CERTIFICATE-----\n");
                 // Peer/path certificates carry no OpenSSL auxiliary trust
                 // data, so PEM_write_bio_X509_AUX has the same output as PEM.
-                return Ok(w_str_new(&pem));
+                return Ok(w_str_new_managed(&pem));
             }
             Err(crate::PyError::value_error("Unsupported format"))
         }
@@ -2910,7 +3005,7 @@ mod cert_store {
                     CertificateUses::Oids(oids) => {
                         let mut strings = RootedItems::new();
                         for oid in oids {
-                            strings.push(pyre_object::w_str_new(&oid));
+                            strings.push(pyre_object::w_str_new_managed(&oid));
                         }
                         pyre_object::w_frozenset_from_items(&strings.take())
                     }
@@ -2945,8 +3040,8 @@ mod cert_store {
 #[cfg(all(windows, not(feature = "host_env")))]
 mod cert_store {
     use pyre_object::{
-        PyObjectRef, w_bool_from, w_bytes_from_bytes, w_frozenset_from_items, w_int_new,
-        w_list_new, w_str_new, w_tuple_new,
+        PyObjectRef, gc_roots::RootedItems, w_bool_from, w_bytes_from_bytes,
+        w_frozenset_from_items, w_int_new, w_list_new, w_str_new, w_str_new_managed, w_tuple_new,
     };
     use windows_sys::Win32::Foundation::CRYPT_E_NOT_FOUND;
     use windows_sys::Win32::Security::Cryptography::{
@@ -3011,15 +3106,15 @@ mod cert_store {
             return key_usage_not_found();
         }
         let usage = &*usage;
-        let mut oids = Vec::with_capacity(usage.cUsageIdentifier as usize);
+        let mut oids = RootedItems::new();
         for i in 0..usage.cUsageIdentifier as usize {
             let oid = *usage.rgpszUsageIdentifier.add(i);
             if !oid.is_null() {
                 let oid = std::ffi::CStr::from_ptr(oid.cast());
-                oids.push(w_str_new(&oid.to_string_lossy()));
+                oids.push(w_str_new_managed(&oid.to_string_lossy()));
             }
         }
-        Ok(Some(w_frozenset_from_items(&oids)))
+        Ok(Some(w_frozenset_from_items(&oids.take())))
     }
 
     /// Walk one kind of store content: `next` is `CertEnumCertificatesInStore`
