@@ -495,7 +495,10 @@ impl BoxEnv for SimpleBoxEnv {
             return opref;
         }
         let mut opref = opref;
-        while let Some(next) = self.replacements.get(&opref.raw()).copied() {
+        while !opref.is_constant() {
+            let Some(next) = self.replacements.get(&opref.raw()).copied() else {
+                break;
+            };
             if next == opref {
                 return opref;
             }
@@ -547,7 +550,8 @@ impl BoxEnv for SimpleBoxEnv {
         opref
     }
 
-    fn is_const(&self, opref: majit_ir::OpRef) -> bool {
+    fn is_const(&self, box_: &majit_ir::operand::Operand) -> bool {
+        let opref = box_.to_opref();
         // history.py/268/314 inline-Const variants are constants by tag.
         if opref.is_constant() {
             return true;
@@ -557,7 +561,8 @@ impl BoxEnv for SimpleBoxEnv {
         }
         self.constants.contains_key(&opref.raw())
     }
-    fn get_const(&self, opref: majit_ir::OpRef) -> (i64, majit_ir::Type) {
+    fn get_const(&self, box_: &majit_ir::operand::Operand) -> (i64, majit_ir::Type) {
+        let opref = box_.to_opref();
         // history.py ConstInt.value / :268 ConstFloat.value / :314 ConstPtr.value
         // inline on the Box; read directly without side-table.
         if let (Some(bits), Some(tp)) = (opref.inline_const_bits(), opref.ty()) {
@@ -579,13 +584,15 @@ impl BoxEnv for SimpleBoxEnv {
             .copied()
             .unwrap_or(majit_ir::Type::Int)
     }
-    fn is_virtual_ref(&self, opref: majit_ir::OpRef) -> bool {
+    fn is_virtual_ref(&self, box_: &majit_ir::operand::Operand) -> bool {
+        let opref = box_.to_opref();
         if opref.inline_const_bits().is_some() {
             return false;
         }
         self.virtuals.contains(&opref.raw())
     }
-    fn is_virtual_raw(&self, opref: majit_ir::OpRef) -> bool {
+    fn is_virtual_raw(&self, box_: &majit_ir::operand::Operand) -> bool {
+        let opref = box_.to_opref();
         if opref.inline_const_bits().is_some() {
             return false;
         }
@@ -3966,19 +3973,15 @@ impl ResumeDataLoopMemo {
         liveboxes_from_env: &LiveboxMap,
         new_liveboxes: &mut LiveboxMap,
     ) {
-        if opref.is_none() {
+        if opref.is_none() || opref.is_constant() {
             return;
         }
         // resume.py — constants are handled by _gettagged
         // (TAGCONST/TAGINT) and don't need livebox slots.
-        if env.is_const(opref) {
+        let b = env.get_box_replacement_operand(opref);
+        if env.is_const(&b) {
             return;
         }
-        // #160/S11: key by the canonical box (Rc::ptr_eq = PyPy `box is`).
-        // `opref` is already replacement-walked by the caller, so re-walking
-        // through get_box_replacement_operand is idempotent and yields the one
-        // memoized Rc per logical box.
-        let b = env.get_box_replacement_operand(opref);
         if liveboxes_from_env.contains_key(&b) || new_liveboxes.contains_key(&b) {
             return;
         }
@@ -4247,13 +4250,14 @@ impl ResumeDataLoopMemo {
             return Ok(UNINITIALIZED_TAG);
         }
         // resume.py: isinstance(box, Const) → getconst
-        if env.is_const(opref) {
-            let (val, tp) = env.get_const(opref);
+        if let Some(bits) = opref.inline_const_bits() {
+            return self.getconst(bits, opref.ty().unwrap());
+        }
+        let b = env.get_box_replacement_operand(opref);
+        if env.is_const(&b) {
+            let (val, tp) = env.get_const(&b);
             return self.getconst(val, tp);
         }
-        // #160/S11: key the livebox / cached maps by the canonical box
-        // (Rc::ptr_eq). `opref` is already replacement-walked by the caller.
-        let b = env.get_box_replacement_operand(opref);
         // resume.py: liveboxes_from_env → existing tag
         if let Some(tagged) = liveboxes_from_env.get(&b) {
             return Ok(tagged);
@@ -4292,23 +4296,26 @@ impl ResumeDataLoopMemo {
                 numb_state.append_short(NULLREF);
                 continue;
             }
-            // resume.py: box = box.get_box_replacement()
-            let opref = env.get_box_replacement(raw_opref);
+            // resume.py ResumeDataLoopMemo._number_boxes retains the resolved
+            // box for both classification and the liveboxes identity lookup.
+            // Inline constants need no producer object or identity-map entry.
+            if let Some(bits) = raw_opref.inline_const_bits() {
+                numb_state.append_short(self.getconst(bits, raw_opref.ty().unwrap())?);
+                continue;
+            }
+            let b = env.get_box_replacement_operand(raw_opref);
+            let opref = b.to_opref();
             if opref.is_none() {
                 numb_state.append_short(NULLREF);
                 continue;
             }
             // resume.py: isinstance(box, Const) → getconst
-            if env.is_const(opref) {
-                let (val, tp) = env.get_const(opref);
+            if env.is_const(&b) {
+                let (val, tp) = env.get_const(&b);
                 let tagged = self.getconst(val, tp)?;
                 numb_state.append_short(tagged);
                 continue;
             }
-            // #160/S11: key liveboxes by the canonical box (Rc::ptr_eq =
-            // PyPy `box is`). `opref` is replacement-walked above and non-const
-            // here (Const short-circuited via the is_const branch).
-            let b = env.get_box_replacement_operand(opref);
             // resume.py:206-208: liveboxes
             if let Some(tagged) = numb_state.liveboxes.get(&b) {
                 numb_state.append_short(tagged);
@@ -4329,8 +4336,8 @@ impl ResumeDataLoopMemo {
             // optimizer.py:681 fail-arg force would materialize it.
             let box_type = opref.ty().unwrap_or_else(|| env.get_type(opref));
             let is_virtual = match box_type {
-                majit_ir::Type::Ref => env.is_virtual_ref(opref),
-                majit_ir::Type::Int => env.is_virtual_raw(opref),
+                majit_ir::Type::Ref => env.is_virtual_ref(&b),
+                majit_ir::Type::Int => env.is_virtual_raw(&b),
                 _ => false,
             };
             let tagged = if is_virtual {
@@ -4663,10 +4670,11 @@ impl ResumeDataLoopMemo {
                     // field is a virtual, register_virtual_fields
                     // overwrites the UNASSIGNED stamp with the env-
                     // pre-numbered tag (or UNASSIGNEDVIRTUAL).
-                    let resolved = env.get_box_replacement(field_opref);
+                    let resolved_box = env.get_box_replacement_operand(field_opref);
+                    let resolved = resolved_box.to_opref();
                     if !resolved.is_none()
                         && !virtual_fields.contains_key(&resolved)
-                        && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
+                        && (env.is_virtual_ref(&resolved_box) || env.is_virtual_raw(&resolved_box))
                     {
                         self.register_virtual_box(
                             resolved,
@@ -4710,10 +4718,11 @@ impl ResumeDataLoopMemo {
             self.register_virtual_box(fieldbox, env, &numb_state.liveboxes, &mut new_liveboxes);
             for &field_opref in &vf.field_oprefs {
                 self.register_box(field_opref, env, &numb_state.liveboxes, &mut new_liveboxes);
-                let resolved = env.get_box_replacement(field_opref);
+                let resolved_box = env.get_box_replacement_operand(field_opref);
+                let resolved = resolved_box.to_opref();
                 if !resolved.is_none()
                     && !virtual_fields.contains_key(&resolved)
-                    && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
+                    && (env.is_virtual_ref(&resolved_box) || env.is_virtual_raw(&resolved_box))
                 {
                     self.register_virtual_box(
                         resolved,
@@ -4739,10 +4748,11 @@ impl ResumeDataLoopMemo {
             if let Some(vf) = env.get_virtual_fields(opref_id) {
                 for &field_opref in &vf.field_oprefs {
                     self.register_box(field_opref, env, &numb_state.liveboxes, &mut new_liveboxes);
-                    let resolved = env.get_box_replacement(field_opref);
+                    let resolved_box = env.get_box_replacement_operand(field_opref);
+                    let resolved = resolved_box.to_opref();
                     if !resolved.is_none()
                         && !virtual_fields.contains_key(&resolved)
-                        && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
+                        && (env.is_virtual_ref(&resolved_box) || env.is_virtual_raw(&resolved_box))
                     {
                         self.register_virtual_box(
                             resolved,
@@ -5206,6 +5216,63 @@ mod tests {
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
     #[test]
+    fn numbering_keeps_the_resolved_box_for_identity_lookup() {
+        struct Env {
+            inner: SimpleBoxEnv,
+            resolutions: std::cell::Cell<usize>,
+        }
+        impl BoxEnv for Env {
+            fn get_box_replacement(&self, _: majit_ir::OpRef) -> majit_ir::OpRef {
+                panic!("numbering must retain its resolved box, not resolve its position again")
+            }
+            fn get_box_replacement_operand(
+                &self,
+                opref: majit_ir::OpRef,
+            ) -> majit_ir::operand::Operand {
+                self.resolutions.set(self.resolutions.get() + 1);
+                self.inner.get_box_replacement_operand(opref)
+            }
+            fn is_const(&self, box_: &majit_ir::operand::Operand) -> bool {
+                self.inner.is_const(box_)
+            }
+            fn get_const(&self, box_: &majit_ir::operand::Operand) -> (i64, majit_ir::Type) {
+                self.inner.get_const(box_)
+            }
+            fn get_type(&self, opref: majit_ir::OpRef) -> majit_ir::Type {
+                self.inner.get_type(opref)
+            }
+            fn is_virtual_ref(&self, box_: &majit_ir::operand::Operand) -> bool {
+                self.inner.is_virtual_ref(box_)
+            }
+            fn is_virtual_raw(&self, box_: &majit_ir::operand::Operand) -> bool {
+                self.inner.is_virtual_raw(box_)
+            }
+        }
+        let mut env = Env {
+            inner: SimpleBoxEnv::new(),
+            resolutions: std::cell::Cell::new(0),
+        };
+        env.inner.replacements.insert(1, majit_ir::OpRef::int_op(0));
+        env.inner
+            .replacements
+            .insert(2, majit_ir::OpRef::const_int(7));
+        let boxes = [
+            majit_ir::OpRef::int_op(1),
+            majit_ir::OpRef::int_op(1),
+            majit_ir::OpRef::int_op(2),
+            majit_ir::OpRef::const_int(9),
+        ]
+        .map(SnapshotBox::untyped);
+        let mut state = NumberingState::new(4);
+        ResumeDataLoopMemo::new()
+            ._number_boxes(&boxes, &mut state, &env)
+            .unwrap();
+        assert_eq!(state.num_boxes, 1);
+        assert_eq!(state.liveboxes.iter().count(), 1);
+        assert_eq!(env.resolutions.get(), 3);
+    }
+
+    #[test]
     fn livebox_map_preserves_box_identity_and_insertion_order() {
         let mut liveboxes = LiveboxMap::new();
         // Two distinct logical boxes — an InputArg and a ResOp result, each
@@ -5540,11 +5607,13 @@ mod tests {
                 self.get_box_replacement(opref)
             }
 
-            fn is_const(&self, opref: majit_ir::OpRef) -> bool {
+            fn is_const(&self, box_: &majit_ir::operand::Operand) -> bool {
+                let opref = box_.to_opref();
                 self.constants.contains_key(&opref.raw())
             }
 
-            fn get_const(&self, opref: majit_ir::OpRef) -> (i64, majit_ir::Type) {
+            fn get_const(&self, box_: &majit_ir::operand::Operand) -> (i64, majit_ir::Type) {
+                let opref = box_.to_opref();
                 self.constants
                     .get(&opref.raw())
                     .copied()
@@ -5558,11 +5627,12 @@ mod tests {
                     .unwrap_or(majit_ir::Type::Int)
             }
 
-            fn is_virtual_ref(&self, opref: majit_ir::OpRef) -> bool {
+            fn is_virtual_ref(&self, box_: &majit_ir::operand::Operand) -> bool {
+                let opref = box_.to_opref();
                 self.virtuals.contains(&opref.raw())
             }
 
-            fn is_virtual_raw(&self, _opref: majit_ir::OpRef) -> bool {
+            fn is_virtual_raw(&self, _box: &majit_ir::operand::Operand) -> bool {
                 false
             }
 

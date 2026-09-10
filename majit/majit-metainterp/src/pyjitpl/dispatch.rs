@@ -7718,7 +7718,8 @@ where
                 );
                 let has_float = bytecode == jitcode::insns::BC_RESIDUAL_CALL_IRF_V;
 
-                let (target, args_i, args_r, args_f, calldescr) = {
+                let call_jitcode = self.frames.current_mut().jitcode.clone();
+                let (target, args_i, args_r, args_f, calldescr, trace_descr) = {
                     let frame = self.frames.current_mut();
                     let funcptr_reg = frame.next_reg() as u16;
                     let mut args_i: Vec<JitCallArg> = Vec::new();
@@ -7741,13 +7742,17 @@ where
                         }
                     }
                     let calldescr_idx = frame.next_u16();
-                    let calldescr = frame
-                        .jitcode
+                    let calldescr = call_jitcode
                         .descr_at(calldescr_idx as usize)
                         .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_*_V descr is not BhDescr")
-                        .as_calldescr()
-                        .clone();
+                        .as_calldescr();
+                    let trace_descr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
+                        .cloned()
+                        .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
                     let target = frame
                         .jitcode
                         .exec
@@ -7765,7 +7770,7 @@ where
                             let func = func as *const ();
                             JitCallTarget::new(func, func)
                         });
-                    (target, args_i, args_r, args_f, calldescr)
+                    (target, args_i, args_r, args_f, calldescr, trace_descr)
                 };
 
                 let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) = self
@@ -7982,20 +7987,19 @@ where
                     //    `pyjitpl.py do_residual_call` declines at the top of
                     //    this branch, so the calldescr reaching here is the
                     //    original one.
-                    let effect_info = calldescr.extra_info.clone();
                     if is_release_gil {
                         ctx.call_release_gil_void_typed_with_effect(
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                         );
                     } else if is_forces {
                         ctx.call_may_force_void_typed_with_effect(
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                         );
                     } else if is_loopinvariant {
                         // pyjitpl.py:2087-2110 with tp == 'v':
@@ -8006,10 +8010,15 @@ where
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                         );
                     } else {
-                        ctx.call_void_typed_with_effect(trace_ptr, &args, &arg_types, effect_info);
+                        ctx.record_call_with_descr(
+                            majit_ir::OpCode::CallN,
+                            trace_ptr,
+                            &args,
+                            trace_descr,
+                        );
                     }
                     // 4. for forces: `vable_after_residual_call` +
                     //    `generate_guard(GUARD_NOT_FORCED)` (`pyjitpl.py`).
@@ -8070,7 +8079,8 @@ where
                 );
                 let has_float = bytecode == jitcode::insns::BC_RESIDUAL_CALL_IRF_I;
 
-                let (target, args_i, args_r, args_f, calldescr, dst) = {
+                let call_jitcode = self.frames.current_mut().jitcode.clone();
+                let (target, args_i, args_r, args_f, calldescr, trace_descr, dst) = {
                     let frame = self.frames.current_mut();
                     let funcptr_reg = frame.next_reg() as u16;
                     let mut args_i: Vec<JitCallArg> = Vec::new();
@@ -8094,13 +8104,17 @@ where
                     }
                     let calldescr_idx = frame.next_u16();
                     let dst = frame.next_reg() as usize;
-                    let calldescr = frame
-                        .jitcode
+                    let calldescr = call_jitcode
                         .descr_at(calldescr_idx as usize)
                         .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_*_I descr is not BhDescr")
-                        .as_calldescr()
-                        .clone();
+                        .as_calldescr();
+                    let trace_descr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
+                        .cloned()
+                        .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
                     let target = frame
                         .jitcode
                         .exec
@@ -8118,7 +8132,7 @@ where
                             let func = func as *const ();
                             JitCallTarget::new(func, func)
                         });
-                    (target, args_i, args_r, args_f, calldescr, dst)
+                    (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
                 };
 
                 let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) = self
@@ -8289,7 +8303,6 @@ where
                     if is_forces {
                         ctx.vrefs_after_residual_call();
                     }
-                    let effect_info = calldescr.extra_info.clone();
                     // pyjitpl.py do_residual_call plain branch:
                     //     pure = effectinfo.check_is_elidable()
                     //     return self.execute_varargs(rop.CALL_I,
@@ -8311,31 +8324,29 @@ where
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                         )
                     } else if is_forces {
                         ctx.call_may_force_int_typed_with_effect(
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                         )
                     } else if is_loopinvariant {
                         ctx.call_loopinvariant_int_typed_with_effect(
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                             concrete,
                         )
                     } else {
-                        ctx.call_typed_with_effect(
+                        ctx.record_call_with_descr(
                             majit_ir::OpCode::CallI,
                             trace_ptr,
                             &args,
-                            &arg_types,
-                            majit_ir::Type::Int,
-                            effect_info,
+                            trace_descr.clone(),
                         )
                     };
                     // pyjitpl.py execute_varargs:
@@ -8358,11 +8369,7 @@ where
                                 traced,
                                 &call_args,
                                 &concrete_values,
-                                crate::call_descr::make_call_descr_with_effect(
-                                    &arg_types,
-                                    majit_ir::Type::Int,
-                                    effectinfo.clone(),
-                                ),
+                                trace_descr,
                                 patch_pos,
                                 majit_ir::OpCode::CallI,
                                 majit_ir::Value::Int(concrete),
@@ -8422,7 +8429,8 @@ where
                 );
                 let has_float = bytecode == jitcode::insns::BC_RESIDUAL_CALL_IRF_R;
 
-                let (target, args_i, args_r, args_f, calldescr, dst) = {
+                let call_jitcode = self.frames.current_mut().jitcode.clone();
+                let (target, args_i, args_r, args_f, calldescr, trace_descr, dst) = {
                     let frame = self.frames.current_mut();
                     let funcptr_reg = frame.next_reg() as u16;
                     let mut args_i: Vec<JitCallArg> = Vec::new();
@@ -8446,13 +8454,17 @@ where
                     }
                     let calldescr_idx = frame.next_u16();
                     let dst = frame.next_reg() as usize;
-                    let calldescr = frame
-                        .jitcode
+                    let calldescr = call_jitcode
                         .descr_at(calldescr_idx as usize)
                         .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_*_R descr is not BhDescr")
-                        .as_calldescr()
-                        .clone();
+                        .as_calldescr();
+                    let trace_descr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
+                        .cloned()
+                        .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
                     let target = frame
                         .jitcode
                         .exec
@@ -8470,7 +8482,7 @@ where
                             let func = func as *const ();
                             JitCallTarget::new(func, func)
                         });
-                    (target, args_i, args_r, args_f, calldescr, dst)
+                    (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
                 };
 
                 let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) = self
@@ -8628,7 +8640,6 @@ where
                     if is_forces {
                         ctx.vrefs_after_residual_call();
                     }
-                    let effect_info = calldescr.extra_info.clone();
                     // pyjitpl.py do_residual_call plain branch —
                     // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
                     let plain_branch = !is_forces && !is_loopinvariant;
@@ -8643,24 +8654,22 @@ where
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                         )
                     } else if is_loopinvariant {
                         ctx.call_loopinvariant_ref_typed_with_effect(
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                             concrete,
                         )
                     } else {
-                        ctx.call_typed_with_effect(
+                        ctx.record_call_with_descr(
                             majit_ir::OpCode::CallR,
                             trace_ptr,
                             &args,
-                            &arg_types,
-                            majit_ir::Type::Ref,
-                            effect_info,
+                            trace_descr.clone(),
                         )
                     };
                     // pyjitpl.py:1946 gate (see int sibling for full cite).
@@ -8676,11 +8685,7 @@ where
                                 traced,
                                 &call_args,
                                 &concrete_values,
-                                crate::call_descr::make_call_descr_with_effect(
-                                    &arg_types,
-                                    majit_ir::Type::Ref,
-                                    effectinfo.clone(),
-                                ),
+                                trace_descr,
                                 patch_pos,
                                 majit_ir::OpCode::CallR,
                                 majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
@@ -8730,7 +8735,8 @@ where
             // (count, regs) pairs even when one is empty, so the
             // recorder reads them unconditionally.
             jitcode::insns::BC_RESIDUAL_CALL_IRF_F => {
-                let (target, args_i, args_r, args_f, calldescr, dst) = {
+                let call_jitcode = self.frames.current_mut().jitcode.clone();
+                let (target, args_i, args_r, args_f, calldescr, trace_descr, dst) = {
                     let frame = self.frames.current_mut();
                     let funcptr_reg = frame.next_reg() as u16;
                     let mut args_i: Vec<JitCallArg> = Vec::new();
@@ -8750,13 +8756,17 @@ where
                     }
                     let calldescr_idx = frame.next_u16();
                     let dst = frame.next_reg() as usize;
-                    let calldescr = frame
-                        .jitcode
+                    let calldescr = call_jitcode
                         .descr_at(calldescr_idx as usize)
                         .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
                         .expect("BC_RESIDUAL_CALL_IRF_F descr is not BhDescr")
-                        .as_calldescr()
-                        .clone();
+                        .as_calldescr();
+                    let trace_descr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
+                        .cloned()
+                        .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
                     let target = frame
                         .jitcode
                         .exec
@@ -8774,7 +8784,7 @@ where
                             let func = func as *const ();
                             JitCallTarget::new(func, func)
                         });
-                    (target, args_i, args_r, args_f, calldescr, dst)
+                    (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
                 };
 
                 let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) = self
@@ -8914,7 +8924,6 @@ where
                     if is_forces {
                         ctx.vrefs_after_residual_call();
                     }
-                    let effect_info = calldescr.extra_info.clone();
                     // pyjitpl.py do_residual_call plain branch —
                     // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
                     let plain_branch = !is_release_gil && !is_forces && !is_loopinvariant;
@@ -8929,31 +8938,29 @@ where
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                         )
                     } else if is_forces {
                         ctx.call_may_force_float_typed_with_effect(
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                         )
                     } else if is_loopinvariant {
                         ctx.call_loopinvariant_float_typed_with_effect(
                             trace_ptr,
                             &args,
                             &arg_types,
-                            effect_info,
+                            effectinfo.clone(),
                             concrete.to_bits() as i64,
                         )
                     } else {
-                        ctx.call_typed_with_effect(
+                        ctx.record_call_with_descr(
                             majit_ir::OpCode::CallF,
                             trace_ptr,
                             &args,
-                            &arg_types,
-                            majit_ir::Type::Float,
-                            effect_info,
+                            trace_descr.clone(),
                         )
                     };
                     // pyjitpl.py:1946 gate (see int sibling for full cite).
@@ -8969,11 +8976,7 @@ where
                                 traced,
                                 &call_args,
                                 &concrete_values,
-                                crate::call_descr::make_call_descr_with_effect(
-                                    &arg_types,
-                                    majit_ir::Type::Float,
-                                    effectinfo.clone(),
-                                ),
+                                trace_descr,
                                 patch_pos,
                                 majit_ir::OpCode::CallF,
                                 majit_ir::Value::Float(concrete),
@@ -15129,6 +15132,21 @@ mod tests {
             recorder.ops().iter().any(|op| op.opcode == OpCode::CallN),
             "cannot-raise residual call still records the call"
         );
+        let pool_descr = jitcode
+            .exec
+            .descrs
+            .iter()
+            .filter_map(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
+            .find(|descr| descr.as_call_descr().is_some())
+            .expect("call descriptor belongs to the JitCode pool");
+        let recorded = recorder
+            .ops()
+            .iter()
+            .find(|op| op.opcode == OpCode::CallN)
+            .unwrap()
+            .getdescr()
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(pool_descr, &recorded));
         assert!(
             !recorder
                 .ops()
