@@ -9322,9 +9322,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         if let Some(DispatchOutcome::SubReturn {
                             result: Some(boxed),
                         }) = spec_gate(SpecFold::BinaryOpDescent, || {
-                            try_emit_exact_int_binop(
-                                ctx, op.pc, op_tag, &r_args, dst, dst_bank,
-                            )
+                            try_emit_exact_int_binop(ctx, op.pc, op_tag, &r_args, dst, dst_bank)
                         })? {
                             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
                             return Ok((DispatchOutcome::Continue, op.next_pc));
