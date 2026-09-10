@@ -47,15 +47,14 @@
 //! else, and only then collects.
 use parking_lot::Mutex;
 use std::cell::{Cell, UnsafeCell};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use majit_backend::{Backend, DeadFrame, JitCellToken};
 use majit_backend_dynasm::runner::DynasmBackend;
 use majit_ir::forwarding::bound_operand_from_opref as rb;
 use majit_ir::{
-    CallDescr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, OopSpecIndex, Op, OpCode, OpRef,
-    Type, Value,
+    CallDescr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, OopSpecIndex, Op, OpCode, OpRc,
+    OpRef, Type, Value,
 };
 
 /// The owner-root slots and the published nursery state are shared beyond one
@@ -350,9 +349,9 @@ impl Fixture {
         finish.set_fail_arg_types(vec![Type::Ref, Type::Ref]);
         finish.setfailargs(vec![rb(r0), rb(r1)].into());
 
-        let ops: Vec<Rc<Op>> = vec![force_token, call, guard, finish]
+        let ops: Vec<OpRc> = vec![force_token, call, guard, finish]
             .into_iter()
-            .map(Rc::new)
+            .map(OpRc::new)
             .collect();
         let token = JitCellToken::new(token_number);
         backend

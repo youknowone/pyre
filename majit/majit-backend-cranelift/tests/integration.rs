@@ -10,7 +10,7 @@ use majit_backend::{
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::test_support::{RecordedTrace, Trace};
 use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
+    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value,
 };
 
 /// Materialize owned input arguments for backend APIs that do not traffic in
@@ -2306,8 +2306,7 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
         ),
     ];
     assign_positions(&mut callee_ops, 0);
-    let callee_ops_rc: Vec<std::rc::Rc<Op>> =
-        callee_ops.into_iter().map(std::rc::Rc::new).collect();
+    let callee_ops_rc: Vec<OpRc> = callee_ops.into_iter().map(OpRc::new).collect();
 
     let mut backend = CraneliftBackend::new();
 

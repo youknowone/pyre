@@ -6163,7 +6163,7 @@ mod tests {
         finish.setfailargs(Vec::new().into());
 
         backend
-            .compile_loop(&[], &[std::rc::Rc::new(finish)], &token)
+            .compile_loop(&[], &[OpRc::new(finish)], &token)
             .expect("compile straight-line wasm trace");
         let compiled = token
             .compiled
@@ -6398,7 +6398,7 @@ mod tests {
                 op.pos().set(majit_ir::OpRef::int_op(position));
                 previous = op.pos().get();
                 values.push(previous);
-                ops.push(std::rc::Rc::new(op));
+                ops.push(OpRc::new(op));
             }
             if value_count > 1 {
                 let guard = Op::new(
@@ -6408,12 +6408,12 @@ mod tests {
                 guard.pos().set(majit_ir::OpRef::void_op(value_count + 1));
                 guard.setfailargs(values.iter().copied().map(rb).collect::<Vec<_>>().into());
                 guard.set_fail_arg_types(vec![majit_ir::Type::Int; values.len()]);
-                ops.push(std::rc::Rc::new(guard));
+                ops.push(OpRc::new(guard));
             }
             let finish = Op::new(majit_ir::OpCode::Finish, &[rb(previous)]);
             finish.pos().set(majit_ir::OpRef::void_op(value_count + 2));
             finish.set_fail_arg_types(vec![majit_ir::Type::Int]);
-            ops.push(std::rc::Rc::new(finish));
+            ops.push(OpRc::new(finish));
             backend
                 .compile_loop(&inputargs, &ops, token)
                 .expect("compile wasm redirect target");
