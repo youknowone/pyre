@@ -200,7 +200,7 @@ pub trait Optimization {
     /// Transfer imported PreambleOp entries from OptContext to this pass.
     /// RPython calls `opt.optimizer.optpure` directly during produce_op.
     /// In majit, the Optimization trait mediates this transfer.
-    fn install_preamble_pure_ops(&mut self, _ctx: &OptContext) {}
+    fn install_preamble_pure_ops(&mut self, _ctx: &mut OptContext) {}
 
     /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
     fn export_arg_int_bounds(
@@ -2954,7 +2954,7 @@ impl Optimizer {
         // to the OptPure pass here (matching RPython's produce_op timing).
         if !ctx.imported_short_pure_ops.is_empty() {
             for pass in &mut self.passes {
-                pass.install_preamble_pure_ops(&ctx);
+                pass.install_preamble_pure_ops(&mut ctx);
             }
         }
 

@@ -60,12 +60,12 @@ fn pure_lookup_keeps_forwarding_and_commutative_matching() {
         OpCode::IntAdd,
         &[Operand::const_from_value(Value::Int(5)), alias],
     );
-    assert_eq!(pure.get_pure_result(&query, &ctx), Some(result));
+    assert_eq!(pure.get_pure_result(&query, &mut ctx), Some(result));
     let different = Op::new(
         OpCode::IntAdd,
         &[Operand::const_from_value(Value::Int(6)), x],
     );
-    assert_eq!(pure.get_pure_result(&different, &ctx), None);
+    assert_eq!(pure.get_pure_result(&different, &mut ctx), None);
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn unchecked_arithmetic_reuses_checked_arithmetic() {
             &mut ctx,
         );
         let query = Op::new(plain, &[x, Operand::const_from_value(Value::Int(5))]);
-        assert_eq!(pure.get_pure_result(&query, &ctx), Some(OpRef::int_op(2)));
+        assert_eq!(pure.get_pure_result(&query, &mut ctx), Some(OpRef::int_op(2)));
     }
 }
 
