@@ -8,6 +8,7 @@ use crate::PyError;
 use crate::baseobjspace::{ObjSpace, SpaceCacheClass, SpaceCacheInstance};
 use pyre_object::dictmultiobject::{DictStrategy, DictStrategyRef, StrategyKind};
 use pyre_object::*;
+use rustpython_wtf8::Wtf8;
 
 /// `classdict.py ClassDictStrategy`.
 pub struct ClassDictStrategy {
@@ -103,24 +104,32 @@ unsafe fn unerase(w_dict: PyObjectRef) -> PyObjectRef {
 impl ClassDictMethods {
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if pyre_object::is_str(w_key) {
-            return self.getitem_str(w_dict, unsafe { pyre_object::w_str_get_value(w_key) });
+            return self.getitem_wtf8(w_dict, pyre_object::w_str_get_wtf8(w_key));
         }
-        None
+        // [3.14-spec] type() may leave a non-string key in the type
+        // namespace. ClassDictStrategy.getitem returns None for non-text
+        // keys; the live dict_w still has to answer a key it already stored.
+        let ns = type_namespace(unerase(w_dict));
+        if ns.is_null() {
+            return None;
+        }
+        let w_value = pyre_object::w_dict_lookup(ns, w_key)?;
+        Some(pyre_object::celldict::unwrap_cell(w_value))
     }
 
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+        self.getitem_wtf8(w_dict, Wtf8::new(key))
+    }
+
+    unsafe fn getitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8) -> Option<PyObjectRef> {
         let w_type = unerase(w_dict);
-        let w_value = crate::type_dict_lookup(w_type, key)?;
+        let w_value = crate::type_dict_lookup_wtf8(w_type, key)?;
         Some(pyre_object::celldict::unwrap_cell(w_value))
     }
 
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
-            self.setitem_str(
-                w_dict,
-                unsafe { pyre_object::w_str_get_value(w_key) },
-                w_value,
-            );
+            self.setitem_wtf8(w_dict, pyre_object::w_str_get_wtf8(w_key), w_value);
             return;
         }
         crate::call::set_call_error(PyError::type_error(
@@ -129,7 +138,11 @@ impl ClassDictMethods {
     }
 
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        if let Err(err) = type_setdictvalue(unerase(w_dict), key, w_value) {
+        self.setitem_wtf8(w_dict, Wtf8::new(key), w_value)
+    }
+
+    unsafe fn setitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8, w_value: PyObjectRef) {
+        if let Err(err) = type_setdictvalue_wtf8(unerase(w_dict), key, w_value) {
             crate::call::set_call_error(err);
         }
     }
@@ -138,9 +151,7 @@ impl ClassDictMethods {
         if !pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
             return false;
         }
-        match type_deldictvalue(unerase(w_dict), unsafe {
-            pyre_object::w_str_get_value(w_key)
-        }) {
+        match type_deldictvalue_wtf8(unerase(w_dict), pyre_object::w_str_get_wtf8(w_key)) {
             Ok(removed) => removed,
             Err(err) => {
                 crate::call::set_call_error(err);
@@ -228,34 +239,34 @@ fn type_namespace(w_type: PyObjectRef) -> PyObjectRef {
 }
 
 /// `W_TypeObject.setdictvalue`.
-unsafe fn type_setdictvalue(
+unsafe fn type_setdictvalue_wtf8(
     w_type: PyObjectRef,
-    name: &str,
+    name: &Wtf8,
     w_value: PyObjectRef,
 ) -> Result<(), PyError> {
     if !pyre_object::w_type_is_heaptype(w_type) {
         return Err(PyError::type_error(format!(
             "cannot set '{}' attribute of immutable type '{}'",
-            name,
+            name.as_str().unwrap_or("\\ud800"),
             pyre_object::w_type_get_name(w_type),
         )));
     }
-    crate::baseobjspace::mutated(w_type, Some(name));
-    crate::type_dict_store(w_type, name, w_value);
+    crate::baseobjspace::mutated(w_type, name.as_str().ok());
+    crate::type_dict_store_wtf8(w_type, name, w_value);
     Ok(())
 }
 
 /// `W_TypeObject.deldictvalue`.
-unsafe fn type_deldictvalue(w_type: PyObjectRef, name: &str) -> Result<bool, PyError> {
+unsafe fn type_deldictvalue_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Result<bool, PyError> {
     if !pyre_object::w_type_is_heaptype(w_type) {
         return Err(PyError::type_error(format!(
             "cannot delete attributes on immutable type object '{}'",
             pyre_object::w_type_get_name(w_type),
         )));
     }
-    let removed = crate::type_dict_delete(w_type, name);
+    let removed = crate::type_dict_delete_wtf8(w_type, name);
     if removed {
-        crate::baseobjspace::mutated(w_type, Some(name));
+        crate::baseobjspace::mutated(w_type, name.as_str().ok());
     }
     Ok(removed)
 }
@@ -343,6 +354,37 @@ mod tests {
                 Some(crate::type_dict_lookup(w_type, "attr").unwrap())
             );
             assert_ne!(pyre_object::w_type_get_version_tag(w_type), before);
+        }
+    }
+
+    #[test]
+    fn class_dict_getitem_reads_surrogate_and_non_string_keys() {
+        crate::typedef::init_typeobjects();
+        unsafe {
+            let definition =
+                TypeDef::from_rawdict("SurrogateOwner", vec![], IndexMap::new(), &INSTANCE_TYPE);
+            let w_type = ObjSpace::new().gettypeobject(definition).unwrap();
+            pyre_object::w_type_set_heaptype(w_type, true);
+            let w_dict = class_dict_for_type(w_type);
+            let mut name = rustpython_wtf8::Wtf8Buf::new();
+            name.push(rustpython_wtf8::CodePoint::from_u32(0xDCFF).unwrap());
+            let w_name = pyre_object::w_str_from_wtf8(name);
+            CLASS_DICT_SLOT.setitem(w_dict, w_name, pyre_object::w_int_new(1));
+            assert!(crate::call::take_call_error().is_none());
+            assert_eq!(
+                CLASS_DICT_SLOT
+                    .getitem(w_dict, w_name)
+                    .map(|value| pyre_object::w_int_get_value(value)),
+                Some(1)
+            );
+            let ns = type_namespace(w_type);
+            pyre_object::w_dict_store(ns, pyre_object::w_int_new(1), pyre_object::w_int_new(2));
+            assert_eq!(
+                CLASS_DICT_SLOT
+                    .getitem(w_dict, pyre_object::w_int_new(1))
+                    .map(|value| pyre_object::w_int_get_value(value)),
+                Some(2)
+            );
         }
     }
 }
