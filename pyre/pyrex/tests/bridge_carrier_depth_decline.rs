@@ -155,11 +155,11 @@ fn the_answer_is_the_same_at_every_carrier_depth_cap() {
 #[test]
 fn a_recursive_carrier_bypasses_the_generic_depth_decline() {
     // Non-vacuity: `the_answer_is_the_same_at_every_carrier_depth_cap` would
-    // also pass if the program stopped reaching the drain at all.  The lowered
-    // generic cap must not decline this recursive carrier, and a successful
-    // multi-frame adoption proves the drain still handled it. `census_dump`
-    // reprints the whole map on every record, so the count is the value after
-    // the colon, never the number of occurrences.
+    // also pass if the generic cap silently stopped applying to this program.
+    // The lowered cap must not record `OverMultiframeDepth`, and the escape
+    // arm plus the interpreter accumulator still prove the recursive body ran.
+    // `census_dump` reprints the whole map on every record, so the count is
+    // the value after the colon, never the number of occurrences.
     let out = run(&[
         ("PYRE_FBW_MULTIFRAME_DEPTH", "1"),
         ("PYRE_FBW_DEBUG_ABORT", "1"),
@@ -181,14 +181,11 @@ fn a_recursive_carrier_bypasses_the_generic_depth_decline() {
         "a recursive carrier was rejected by pyre's generic depth cap\n{}",
         report("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out)
     );
-    let adopted = text
-        .lines()
-        .any(|l| l.starts_with("[fbw-blackhole] adopted multi-frame terminal"));
-    assert!(
-        adopted,
-        "the drain handled no recursive multi-frame carrier\n{}",
-        report("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out)
-    );
+    // `_getframe().f_lineno` now reads the compiled last_instr store, so this
+    // fixture no longer forces a multi-frame blackhole terminal.  The depth-cap
+    // bypass is the `OverMultiframeDepth: 0` count above; the answer and the
+    // escape arm still prove the recursive body ran.
+    assert_answers("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out);
     // The rollback the arm exists to avoid: an abort that ran effects and found
     // no image to adopt.
     let dirty = text
