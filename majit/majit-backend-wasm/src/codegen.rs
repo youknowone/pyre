@@ -5734,15 +5734,10 @@ fn build_function(
                 |_| true,
             );
         }
-        let label_base = frame.ordinary_home_slots() as u64;
-        if ca.home_gcmap_has_prior && used_labels > ca.home_gcmap_min_labels {
-            emit_null_home_slots(
-                &mut sink,
-                frame,
-                label_base + ca.home_gcmap_min_labels as u64..label_base + used_labels as u64,
-                |_| true,
-            );
-        }
+        // LABEL captures stay on keyed resume: a bridge with more captures
+        // than its source writes them on the first crossing, and a later
+        // keyed tail-call restores from those slots. Key-0 still clears
+        // the full used-label range below.
         Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
             as usize as i64
     } else {
