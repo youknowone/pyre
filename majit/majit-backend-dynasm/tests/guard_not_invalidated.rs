@@ -15,10 +15,8 @@
 //! has a bridge attached to it".  The list is emptied by the walk, so a second
 //! call has nothing to write.
 
-use std::rc::Rc;
-
 use majit_backend::{Backend, JitCellToken, make_resume_guard_descr_typed};
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use majit_backend_dynasm::runner::DynasmBackend;
 use majit_ir::forwarding::bound_operand_from_opref as rb;
@@ -47,7 +45,7 @@ fn compile_guarded_add(backend: &mut DynasmBackend, token: &JitCellToken) -> maj
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
-    let ops_rc: Vec<Rc<Op>> = vec![Rc::new(guard_op), Rc::new(add_op), Rc::new(finish_op)];
+    let ops_rc: Vec<OpRc> = vec![OpRc::new(guard_op), OpRc::new(add_op), OpRc::new(finish_op)];
     let result = backend.compile_loop(&inputargs, &ops_rc, token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
     guard_descr
@@ -140,11 +138,11 @@ fn every_recorded_position_in_a_trace_is_written() {
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
-    let ops_rc: Vec<Rc<Op>> = vec![
-        Rc::new(first),
-        Rc::new(add_op),
-        Rc::new(second),
-        Rc::new(finish_op),
+    let ops_rc: Vec<OpRc> = vec![
+        OpRc::new(first),
+        OpRc::new(add_op),
+        OpRc::new(second),
+        OpRc::new(finish_op),
     ];
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());

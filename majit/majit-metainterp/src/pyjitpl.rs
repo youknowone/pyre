@@ -1530,7 +1530,7 @@ fn densify_root_loop_inputargs(
                 .iter()
                 .map(&remap)
                 .collect::<smallvec::SmallVec<[_; 3]>>();
-            let cloned = std::rc::Rc::new(op.copy_and_change(op.opcode, Some(&args), None));
+            let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
             if let Some(failargs) = op.guard_fail_args() {
                 cloned.setfailargs(failargs.iter().map(&remap).collect());
             }
@@ -7900,7 +7900,7 @@ impl<M: Clone> MetaInterp<M> {
                         let trace_ops_snapshot_rc: Vec<majit_ir::OpRc> = trace_ops_snapshot
                             .unwrap_or_else(|| std::mem::take(&mut trace_ops))
                             .into_iter()
-                            .map(std::rc::Rc::new)
+                            .map(OpRc::new)
                             .collect();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7994,7 +7994,7 @@ impl<M: Clone> MetaInterp<M> {
                     user_code,
                 )
                 .into_iter()
-                .map(std::rc::Rc::new)
+                .map(OpRc::new)
                 .collect()
             } else {
                 optimized_ops
@@ -8086,7 +8086,7 @@ impl<M: Clone> MetaInterp<M> {
                     .collect::<Vec<_>>(),
             );
             label_op.pos().set(majit_ir::OpRef::NONE);
-            optimized_ops.insert(0, std::rc::Rc::new(label_op));
+            optimized_ops.insert(0, OpRc::new(label_op));
         }
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
             root_inputargs,
@@ -8330,7 +8330,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 label_op.pos().set(majit_ir::OpRef::NONE);
                 label_op.setdescr(target_token.as_jump_target_descr());
-                compiled_ops.insert(0, std::rc::Rc::new(label_op));
+                compiled_ops.insert(0, OpRc::new(label_op));
             }
             vec![target_token]
         } else if unroll_opt.target_tokens.is_empty() {
@@ -11274,7 +11274,7 @@ impl<M: Clone> MetaInterp<M> {
         );
         label_op.pos().set(majit_ir::OpRef::NONE);
         label_op.setdescr(target_token.as_jump_target_descr());
-        compiled_ops.insert(0, std::rc::Rc::new(label_op));
+        compiled_ops.insert(0, OpRc::new(label_op));
 
         // compile.py send_loop_to_backend virtualizable hook —
         // simple-loop compile path must also reload virtualizable fields on
@@ -24707,7 +24707,7 @@ mod tests {
             10,
         );
         meta.partial_trace = Some(PartialTrace {
-            ops: vec![std::rc::Rc::new(op)],
+            ops: vec![OpRc::new(op)],
             inputargs: Vec::new(),
         });
 
@@ -24737,7 +24737,7 @@ mod tests {
             Operand::from_opref(OpRef::const_int(123)),
         ]);
         meta.partial_trace = Some(PartialTrace {
-            ops: vec![std::rc::Rc::new(guard)],
+            ops: vec![OpRc::new(guard)],
             inputargs: Vec::new(),
         });
 
@@ -25029,7 +25029,7 @@ mod tests {
             ),
         ];
 
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let err =
             normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
         assert_eq!(err, (0, 3));
@@ -25048,7 +25048,7 @@ mod tests {
             OpRef::NONE.raw(),
         )];
 
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let err =
             normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
         assert_eq!(err, (0, 2));
@@ -25064,7 +25064,7 @@ mod tests {
             OpRef::input_arg_int(596),
             OpRef::input_arg_ref(614),
         ];
-        let guard = std::rc::Rc::new(mk_op(
+        let guard = OpRc::new(mk_op(
             OpCode::GuardClass,
             &[renamed[0], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
             OpRef::NONE.raw(),
@@ -25280,7 +25280,7 @@ mod tests {
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+                ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
                 terminal_exit_layouts: indexmap::IndexMap::new(),
@@ -25351,7 +25351,7 @@ mod tests {
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+                ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
                 terminal_exit_layouts: indexmap::IndexMap::new(),
@@ -26110,7 +26110,7 @@ mod tests {
         meta.backend.set_next_trace_id(trace_id);
         meta.backend
             .set_next_frame_value_count_fn(meta.active_frame_value_count_fn());
-        let ops_rc: Vec<majit_ir::OpRc> = ops.iter().cloned().map(std::rc::Rc::new).collect();
+        let ops_rc: Vec<majit_ir::OpRc> = ops.iter().cloned().map(OpRc::new).collect();
         meta.backend
             .compile_loop(inputargs, &ops_rc, &token)
             .expect("loop should compile");
@@ -26151,7 +26151,7 @@ mod tests {
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+                ops: ops.into_iter().map(OpRc::new).collect(),
                 constants: constants_typed,
                 exit_layouts,
                 terminal_exit_layouts,
@@ -28691,7 +28691,7 @@ mod closing_jump_fixes_label_slots_tests {
 
     fn op(opcode: OpCode, args: &[OpRef]) -> majit_ir::OpRc {
         let args: Vec<Operand> = args.iter().map(|a| Operand::bound_from_opref(*a)).collect();
-        std::rc::Rc::new(Op::new(opcode, &args))
+        OpRc::new(Op::new(opcode, &args))
     }
 
     /// An `OpRef` naming a producer, i.e. what a LABEL declares each of its

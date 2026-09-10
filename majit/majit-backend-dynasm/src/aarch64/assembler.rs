@@ -7513,7 +7513,6 @@ fn flush_icache(addr: *const u8, len: usize) {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -7522,7 +7521,7 @@ mod tests {
     use majit_ir::forwarding::bound_operand_from_opref;
     use majit_ir::operand::Operand;
     use majit_ir::{
-        GcRef, InputArg, Op, OpCode, OpRef, Type, Value, make_array_descr_signed,
+        GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_array_descr_signed,
         make_loop_target_descr,
     };
 
@@ -7537,7 +7536,7 @@ mod tests {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
 
-        let malloc = Rc::new(Op::new(
+        let malloc = OpRc::new(Op::new(
             OpCode::CallMallocNursery,
             &[Operand::from_opref(OpRef::const_int(32))],
         ));
@@ -7550,7 +7549,7 @@ mod tests {
 
         let token = JitCellToken::new(517);
         backend
-            .compile_loop(&[], &[malloc, Rc::new(finish)], &token)
+            .compile_loop(&[], &[malloc, OpRc::new(finish)], &token)
             .expect("compile register-resident nursery result trace");
 
         let compiled = token
@@ -7566,8 +7565,8 @@ mod tests {
         );
     }
 
-    fn eval_breaker_poll_ops(word_addr: usize, first_pos: u32) -> (Rc<Op>, Rc<Op>, Rc<Op>) {
-        let word = Rc::new(Op::with_descr(
+    fn eval_breaker_poll_ops(word_addr: usize, first_pos: u32) -> (OpRc, OpRc, OpRc) {
+        let word = OpRc::new(Op::with_descr(
             OpCode::RawLoadI,
             &[
                 Operand::from_opref(OpRef::const_int(word_addr as i64)),
@@ -7576,9 +7575,9 @@ mod tests {
             make_array_descr_signed(0, 8, Type::Int, true),
         ));
         word.pos().set(OpRef::int_op(first_pos));
-        let armed = Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
+        let armed = OpRc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
         armed.pos().set(OpRef::int_op(first_pos + 1));
-        let guard = Rc::new(Op::new(
+        let guard = OpRc::new(Op::new(
             OpCode::GuardFalse,
             &[Operand::from_bound_op(&armed)],
         ));
@@ -7603,7 +7602,7 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
-        let ops = vec![word, armed, guard, Rc::new(finish)];
+        let ops = vec![word, armed, guard, OpRc::new(finish)];
         backend
             .compile_loop(&[], &ops, &token)
             .expect("compile eval-breaker poll IR");
@@ -7672,7 +7671,7 @@ mod tests {
         backend
             .compile_loop(
                 &[],
-                &[Rc::new(label), word, armed, guard, Rc::new(finish)],
+                &[OpRc::new(label), word, armed, guard, OpRc::new(finish)],
                 &target_token,
             )
             .expect("compile cross-trace bitmask target");
@@ -7686,7 +7685,7 @@ mod tests {
         jump.setdescr(target_descr);
         let source_token = JitCellToken::new(521);
         backend
-            .compile_loop(&[], &[Rc::new(jump)], &source_token)
+            .compile_loop(&[], &[OpRc::new(jump)], &source_token)
             .expect("compile external JUMP source");
 
         let frame = backend.execute_token(&target_token, &[]);
@@ -7735,7 +7734,7 @@ mod tests {
             backend
                 .compile_loop(
                     &[],
-                    &[Rc::new(label), word, armed, guard, Rc::new(jump)],
+                    &[OpRc::new(label), word, armed, guard, OpRc::new(jump)],
                     &token,
                 )
                 .expect("compile polling loop on worker");
@@ -7866,7 +7865,7 @@ mod tests {
 
         let token = JitCellToken::new(trace_id);
         backend
-            .compile_loop(&inputargs, &[Rc::new(barrier), Rc::new(finish)], &token)
+            .compile_loop(&inputargs, &[OpRc::new(barrier), OpRc::new(finish)], &token)
             .expect("compile COND_CALL_GC_WB_ARRAY trace");
         let frame = backend.execute_token(&token, &values);
         assert!(

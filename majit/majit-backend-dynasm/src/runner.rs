@@ -4224,7 +4224,7 @@ mod tests {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let op = Op::new(opcode, &bx);
         op.pos().set(OpRef::op_typed(pos, opcode.result_type()));
-        std::rc::Rc::new(op)
+        OpRc::new(op)
     }
 
     fn make_plain_call_descr(arg_types: Vec<Type>, result_type: Type) -> DescrRef {

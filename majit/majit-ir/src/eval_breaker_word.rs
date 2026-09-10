@@ -395,10 +395,9 @@ mod tests {
     use super::*;
     use crate::resoperation::{Op, OpCode};
     use crate::value::Const;
-    use std::rc::Rc;
 
     fn bind(op: Op) -> crate::operand::Operand {
-        crate::operand::Operand::from_bound_op(&Rc::new(op))
+        crate::operand::Operand::from_bound_op(&crate::resoperation::OpRc::new(op))
     }
 
     /// Both memory-error tests read the process-global bit and assert on its

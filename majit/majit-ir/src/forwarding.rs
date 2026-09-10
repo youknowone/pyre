@@ -47,7 +47,7 @@ pub enum Forwarded {
     /// a target held by none of them died mid-optimization: the walker then
     /// stopped one hop early and handed its caller an operand that was still
     /// forwarding.
-    Op(Rc<Op>),
+    Op(crate::resoperation::OpRc),
 
     /// `resoperation.py AbstractInputArg` forwarding — direct
     /// `InputArgRc` reference. Same chain-walk and same ownership as `Op`.
@@ -234,7 +234,7 @@ pub trait ForwardingHost {
             !self.is_same_op(target),
             "set_forwarded_op on the same Op creates a one-node chain cycle"
         );
-        self.store_forwarded(Forwarded::Op(Rc::clone(target)));
+        self.store_forwarded(Forwarded::Op(target.clone()));
     }
 
     /// `compile.py` / `unroll.py` InputArg→InputArg redirect.
@@ -326,7 +326,7 @@ impl ForwardingHost for Op {
         self.forwarded().set(value);
     }
     fn is_same_op(&self, op: &crate::resoperation::OpRc) -> bool {
-        std::ptr::eq(self, Rc::as_ptr(op))
+        std::ptr::eq(self, crate::resoperation::OpRc::as_ptr(op))
     }
 }
 
@@ -484,7 +484,7 @@ pub(crate) fn pack_forwarded(v: Forwarded) -> u64 {
     match v {
         Forwarded::None => 0,
         Forwarded::Op(rc) => {
-            let p = Rc::into_raw(rc) as u64;
+            let p = crate::resoperation::OpRc::into_raw(rc) as u64;
             debug_assert_eq!(p & FW_TAG, 0);
             p
         }
@@ -538,8 +538,8 @@ pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
     }
     match w & FW_TAG {
         FW_OP => {
-            let rc = unsafe { Rc::from_raw(fwd_ptr(w) as *const Op) };
-            let out = Forwarded::Op(Rc::clone(&rc));
+            let rc = unsafe { crate::resoperation::OpRc::from_raw(fwd_ptr(w) as *const Op) };
+            let out = Forwarded::Op(rc.clone());
             std::mem::forget(rc);
             out
         }
@@ -593,7 +593,7 @@ pub(crate) fn drop_packed_forwarded(w: u64) {
         return;
     }
     match w & FW_TAG {
-        FW_OP => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const Op) }),
+        FW_OP => drop(unsafe { crate::resoperation::OpRc::from_raw(fwd_ptr(w) as *const Op) }),
         FW_INPUTARG => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const InputArg) }),
         FW_CONST => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const Cell<Value>) }),
         FW_INFO_PTR => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<PtrInfo>) }),
@@ -636,7 +636,7 @@ pub(crate) mod test_support {
             Type::Ref => OpCode::SameAsR,
             Type::Void => OpCode::Jump,
         };
-        let op = std::rc::Rc::new(Op::new(opcode, &[]));
+        let op = crate::resoperation::OpRc::new(Op::new(opcode, &[]));
         op.pos().set(OpRef::op_typed(position, tp));
         Operand::from_bound_op(&op)
     }

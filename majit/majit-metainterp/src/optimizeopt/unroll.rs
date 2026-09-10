@@ -19,7 +19,7 @@
 /// don't collide with the original ops.
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, IndexMapExt, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, IndexMapExt, Op, OpCode, OpRc, OpRef, Type, Value};
 
 use crate::history::TargetToken;
 use crate::optimizeopt::{
@@ -738,7 +738,7 @@ impl UnrollOptimizer {
             // registered in the optimizer's producer stores.
             let jump = (*result[idx]).clone();
             jump.setdescr(preamble_target.as_jump_target_descr());
-            result[idx] = std::rc::Rc::new(jump);
+            result[idx] = OpRc::new(jump);
         }
         result
     }
@@ -1116,7 +1116,7 @@ impl UnrollOptimizer {
                     // here for non-peeled traces that return directly.
                     let mut ops = p1_ops;
                     if let Some(terminal) = opt_p1.terminal_op.take() {
-                        ops.push(std::rc::Rc::new(terminal));
+                        ops.push(OpRc::new(terminal));
                     }
                     // `compile.py` `jitcell_token.target_tokens = [target_token]`
                     // / `:290` `jitcell_token.target_tokens = [start_descr]` —
@@ -5261,14 +5261,8 @@ fn assemble_peeled_trace(
     loop_label_descr: Option<DescrRef>,
 ) -> Vec<majit_ir::OpRc> {
     let mut ctx = assemble_test_context(p1_ops, p2_ops, body_num_inputs);
-    let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
-        .iter()
-        .map(|op| std::rc::Rc::new(op.clone()))
-        .collect();
-    let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
-        .iter()
-        .map(|op| std::rc::Rc::new(op.clone()))
-        .collect();
+    let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops.iter().map(|op| OpRc::new(op.clone())).collect();
+    let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops.iter().map(|op| OpRc::new(op.clone())).collect();
     assemble_peeled_trace_with_jump_args(
         &p1_ops_rc,
         &p2_ops_rc,
@@ -5319,7 +5313,7 @@ fn emit_alias_same_as_for_imports(
             std::slice::from_ref(&alias.same_as_source),
         );
         op.pos().set(alias.result);
-        result.push(std::rc::Rc::new(op));
+        result.push(OpRc::new(op));
     }
 }
 
@@ -5449,7 +5443,7 @@ fn assemble_peeled_trace_with_jump_args(
         let mut start_label = Op::new(OpCode::Label, &start_label_args_box_operand);
         start_label.pos().set(OpRef::NONE);
         start_label.setdescr(start_label_descr);
-        result.push(std::rc::Rc::new(start_label));
+        result.push(OpRc::new(start_label));
     }
 
     // Preamble: everything except Jump
@@ -5457,7 +5451,7 @@ fn assemble_peeled_trace_with_jump_args(
         if op.opcode == OpCode::Jump {
             break;
         }
-        result.push(std::rc::Rc::new((**op).clone()));
+        result.push(OpRc::new((**op).clone()));
     }
 
     // max_pos must account for ALL p1_ops positions, including SameAs
@@ -5706,8 +5700,8 @@ fn assemble_peeled_trace_with_jump_args(
     if let Some(ref d) = loop_label_descr {
         label_op.setdescr(d.clone());
     }
-    result.extend(fallthrough_aliases.into_iter().map(std::rc::Rc::new));
-    result.push(std::rc::Rc::new(label_op));
+    result.extend(fallthrough_aliases.into_iter().map(OpRc::new));
+    result.push(OpRc::new(label_op));
 
     // Body: 2-pass remap (inputarg refs -> label args, body results -> fresh boxes)
     let max_label_arg_pos = full_label_args
@@ -6119,7 +6113,7 @@ fn assemble_peeled_trace_with_jump_args(
         // sharing-path guard. Both phases of the unroll optimizer
         // therefore emit body guards with unique descrs already; no
         // post-process re-stamping is needed.
-        let new_rc = std::rc::Rc::new(new_op);
+        let new_rc = OpRc::new(new_op);
         if new_rc.result_type() != Type::Void && !new_rc.pos().get().is_none() {
             emitted_at.insert(new_rc.pos().get(), new_rc.clone());
         }
@@ -6195,7 +6189,7 @@ fn replace_terminal_jump(body_ops: &[majit_ir::OpRc], jump_op: Op) -> Vec<majit_
         .rposition(|op| op.opcode == OpCode::Jump)
         .unwrap_or(body_ops.len());
     result.extend_from_slice(&body_ops[..split_idx]);
-    result.push(std::rc::Rc::new(jump_op));
+    result.push(OpRc::new(jump_op));
     result
 }
 
@@ -6675,7 +6669,7 @@ mod tests {
         ];
         let preamble_target = TargetToken::new_preamble(7);
 
-        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(std::rc::Rc::new).collect();
+        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(OpRc::new).collect();
         let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target);
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
@@ -6722,7 +6716,7 @@ mod tests {
         let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
         jump.setdescr(TargetToken::new_preamble(7).as_jump_target_descr());
 
-        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(std::rc::Rc::new).collect();
+        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(OpRc::new).collect();
         let result = replace_terminal_jump(&body_ops, jump);
 
         assert_eq!(result.len(), 2);
@@ -6812,7 +6806,7 @@ mod tests {
             VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(old))]),
             exported_infos,
             vec![PreambleOp {
-                op: std::rc::Rc::new(Op::new(OpCode::SameAsR, &[Operand::from_opref(old_ref)])),
+                op: OpRc::new(Op::new(OpCode::SameAsR, &[Operand::from_opref(old_ref)])),
                 source_op: None,
                 res: Operand::bound_from_opref(old_ref),
                 kind: PreambleOpKind::Pure,
@@ -6825,7 +6819,7 @@ mod tests {
             // `exported_short_boxes`. An inline ConstPtr receiver here has to
             // be forwarded by the same visitor.
             vec![PreambleOp {
-                op: std::rc::Rc::new(Op::with_descr(
+                op: OpRc::new(Op::with_descr(
                     OpCode::GetfieldGcI,
                     &[Operand::from_opref(old_ref)],
                     majit_ir::descr::make_field_descr_full(0, 0, 8, Type::Int, true),
@@ -6847,14 +6841,8 @@ mod tests {
             ProducedShortOp {
                 kind: PreambleOpKind::Pure,
                 res: Operand::from_opref(old_ref),
-                preamble_op: std::rc::Rc::new(Op::new(
-                    OpCode::SameAsR,
-                    &[Operand::from_opref(old_ref)],
-                )),
-                source_op: std::rc::Rc::new(Op::new(
-                    OpCode::SameAsR,
-                    &[Operand::from_opref(old_ref)],
-                )),
+                preamble_op: OpRc::new(Op::new(OpCode::SameAsR, &[Operand::from_opref(old_ref)])),
+                source_op: OpRc::new(Op::new(OpCode::SameAsR, &[Operand::from_opref(old_ref)])),
                 invented_name: false,
                 same_as_source: Some(Operand::from_opref(old_ref)),
                 label_arg_idx: None,
@@ -7684,7 +7672,7 @@ mod tests {
                 ],
             );
             op.pos().set(masked);
-            std::rc::Rc::new(op)
+            OpRc::new(op)
         };
         let dep_op = {
             let mut op = Op::new(
@@ -7695,7 +7683,7 @@ mod tests {
                 ],
             );
             op.pos().set(dependent);
-            std::rc::Rc::new(op)
+            OpRc::new(op)
         };
         let mask_box = ctx.materialize_operand_at(masked);
         let dep_box = ctx.materialize_operand_at(dependent);
@@ -7830,7 +7818,7 @@ mod tests {
                         field_descr.clone(),
                     );
                     op.pos().set(OpRef::int_op(11));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 source_op: Some({
                     let mut op = Op::with_descr(
@@ -7839,7 +7827,7 @@ mod tests {
                         field_descr.clone(),
                     );
                     op.pos().set(OpRef::int_op(11));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 }),
                 res: rooted_resop_operand(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
@@ -7949,7 +7937,7 @@ mod tests {
                         field_descr.clone(),
                     );
                     op.pos().set(OpRef::int_op(11));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 source_op: Some({
                     let mut op = Op::with_descr(
@@ -7958,7 +7946,7 @@ mod tests {
                         field_descr.clone(),
                     );
                     op.pos().set(OpRef::int_op(11));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 }),
                 res: Operand::from_opref(OpRef::const_int(7)),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
@@ -8047,7 +8035,7 @@ mod tests {
                         field_descr.clone(),
                     );
                     op.pos().set(OpRef::int_op(11));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 source_op: None,
                 res: rooted_resop_operand(Type::Int, 11),
@@ -8128,7 +8116,7 @@ mod tests {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
                     op.pos().set(OpRef::int_op(11));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 source_op: None,
                 res: rooted_resop_operand(Type::Int, 11),
@@ -8204,7 +8192,7 @@ mod tests {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[Operand::from_opref(func)]);
                     op.pos().set(source);
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 source_op: None,
                 res: source_box.clone(),
@@ -8271,7 +8259,7 @@ mod tests {
                         ],
                     );
                     op.pos().set(OpRef::int_op(20));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 source_op: None,
                 res: rooted_resop_operand(Type::Int, 20),
@@ -8362,7 +8350,7 @@ mod tests {
                         majit_ir::descr::make_field_descr_full(56, 0, 8, Type::Ref, false),
                     );
                     op.pos().set(OpRef::ref_op(19));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 source_op: None,
                 res: rooted_resop_operand(Type::Ref, 19),
@@ -8454,7 +8442,7 @@ mod tests {
                 op: {
                     let mut op = Op::new(OpCode::IntAdd, &[si0.clone(), si1.clone()]);
                     op.pos().set(OpRef::int_op(30));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 source_op: None,
                 res: rooted_resop_operand(Type::Int, 30),
@@ -8976,14 +8964,10 @@ mod tests {
             majit_ir::ConstMap::from_iter([(OpRef::void_op(857).raw(), majit_ir::Value::Int(2))]);
 
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
-        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
-            .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
-            .collect();
-        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
-            .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
-            .collect();
+        let p1_ops_rc: Vec<majit_ir::OpRc> =
+            p1_ops.iter().map(|op| OpRc::new(op.clone())).collect();
+        let p2_ops_rc: Vec<majit_ir::OpRc> =
+            p2_ops.iter().map(|op| OpRc::new(op.clone())).collect();
         let combined = assemble_peeled_trace_with_jump_args(
             &p1_ops_rc,
             &p2_ops_rc,
@@ -9608,9 +9592,9 @@ mod tests {
             ),
         ];
 
-        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(std::rc::Rc::new).collect();
+        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(OpRc::new).collect();
         let redirected_tail: Vec<majit_ir::OpRc> =
-            redirected_tail.into_iter().map(std::rc::Rc::new).collect();
+            redirected_tail.into_iter().map(OpRc::new).collect();
         let spliced = splice_redirected_tail(&body_ops, &redirected_tail);
         assert_eq!(spliced.len(), 3);
         assert_eq!(spliced[0].opcode, OpCode::IntAdd);

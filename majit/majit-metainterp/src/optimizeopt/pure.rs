@@ -6,7 +6,7 @@ use majit_ir::operand::Operand;
 ///
 /// When the same pure operation is seen again with the same arguments,
 /// the cached result is returned instead of recomputing.
-use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
+use majit_ir::{GcRef, Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -1382,7 +1382,7 @@ mod tests {
             &short_inputargs,
             &short_inputargs,
             &[crate::optimizeopt::shortpreamble::PreambleOp {
-                op: std::rc::Rc::new(preamble_op),
+                op: OpRc::new(preamble_op),
                 source_op: None,
                 res,
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
@@ -1409,7 +1409,7 @@ mod tests {
                 .unwrap_or_else(|| {
                     let mut same_as = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_box));
                     same_as.pos().set(source);
-                    std::rc::Rc::new(same_as)
+                    OpRc::new(same_as)
                 });
             let pop = crate::optimizeopt::info::PreambleOp {
                 op: ctx.materialize_operand_at(source),
@@ -1515,8 +1515,8 @@ mod tests {
                 })
                 .collect();
             let op = match &spec.descr {
-                Some(d) => std::rc::Rc::new(Op::with_descr(spec.opcode, &arg_ops, d.clone())),
-                None => std::rc::Rc::new(Op::new(spec.opcode, &arg_ops)),
+                Some(d) => OpRc::new(Op::with_descr(spec.opcode, &arg_ops, d.clone())),
+                None => OpRc::new(Op::new(spec.opcode, &arg_ops)),
             };
             op.pos().set(OpRef::op_typed(
                 num_inputs + i as u32,
@@ -1556,7 +1556,7 @@ mod tests {
             let flat: Vec<Op> = producers.iter().map(|o| (**o).clone()).collect();
             let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&flat);
             opt.snapshot_boxes = snapshots;
-            seeded.into_iter().map(std::rc::Rc::new).collect()
+            seeded.into_iter().map(OpRc::new).collect()
         } else {
             producers.clone()
         };
@@ -1919,14 +1919,14 @@ mod tests {
         let op0 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
         let mut op0 = op0;
         op0.pos().set(OpRef::int_op(2));
-        let result0 = pass.propagate_forward(&op0, &std::rc::Rc::new(op0.clone()), &mut ctx);
+        let result0 = pass.propagate_forward(&op0, &OpRc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
         let op1 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
         let mut op1 = op1;
         op1.pos().set(OpRef::int_op(3));
-        let result1 = pass.propagate_forward(&op1, &std::rc::Rc::new(op1.clone()), &mut ctx);
+        let result1 = pass.propagate_forward(&op1, &OpRc::new(op1.clone()), &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
     }
 
@@ -2724,7 +2724,7 @@ mod tests {
         // collapsed `from_bound_op(op_rc)` resolves to the same box the test
         // reads back via `get_box_replacement_operand_opt(pos)` (mirrors production
         // input-op binding).
-        let op_rc = std::rc::Rc::new(op.clone());
+        let op_rc = OpRc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let result = pass.propagate_forward(&op, &op_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
@@ -2745,7 +2745,7 @@ mod tests {
         let a1 = ctx.materialize_operand_at(OpRef::int_op(1));
         let mut op = Op::new(OpCode::IntAdd, &[a0.clone(), a1.clone()]);
         op.pos().set(OpRef::int_op(2));
-        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
+        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
@@ -2796,7 +2796,7 @@ mod tests {
                 majit_ir::OopSpecIndex::None,
             ),
         ));
-        let result = pass.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
+        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
         // The demote routes the CALL through the remaining passes (Replace),
         // mirroring RPython's `self.emit(newop)`, so OptHeap still processes it.
         match result {
@@ -2861,15 +2861,14 @@ mod tests {
             );
         }
         // OptRewrite demotes CallLoopinvariantI → CallI
-        let rewrite_result =
-            rewrite.propagate_forward(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
+        let rewrite_result = rewrite.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
         let demoted = match rewrite_result {
             OptimizationResult::Emit(emitted) => emitted,
             other => panic!("expected OptRewrite to emit demoted call, got {other:?}"),
         };
         assert_eq!(demoted.opcode, OpCode::CallI);
         // OptPure sees the demoted CallI
-        let result = pass.propagate_forward(&demoted, &std::rc::Rc::new(demoted.clone()), &mut ctx);
+        let result = pass.propagate_forward(&demoted, &OpRc::new(demoted.clone()), &mut ctx);
         match result {
             OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
             OptimizationResult::PassOn => {} // PassOn is also acceptable

@@ -8,12 +8,11 @@ use parking_lot::Mutex;
 ///   guard_true(i2)  [fail_args: i1]
 ///   jump(i1)        → label
 ///   finish(i1)      [on guard failure]
-use std::rc::Rc;
 use std::sync::LazyLock;
 
 use majit_backend::{Backend, JitCellToken, STATUS_TYPE_MASK, make_resume_guard_descr_typed};
 use majit_ir::{
-    GcRef, InputArg, Op, OpCode, OpRef, Type, Value, make_array_descr, make_loop_target_descr,
+    GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_array_descr, make_loop_target_descr,
 };
 
 use majit_backend_dynasm::runner::DynasmBackend;
@@ -37,7 +36,7 @@ fn test_just_finish() {
     finish_op.setfailargs(vec![].into());
 
     let ops = vec![finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -69,9 +68,9 @@ fn guard_not_forced_2_arms_returned_force_token_and_preserves_failargs() {
     finish.set_fail_arg_types(vec![Type::Ref]);
     finish.setfailargs(vec![rb(OpRef::ref_op(1))].into());
 
-    let ops: Vec<Rc<Op>> = vec![force_token, guard, finish]
+    let ops: Vec<OpRc> = vec![force_token, guard, finish]
         .into_iter()
-        .map(Rc::new)
+        .map(OpRc::new)
         .collect();
     backend
         .compile_loop(&inputargs, &ops, &token)
@@ -107,7 +106,7 @@ fn test_simple_int_add() {
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let ops = vec![add_op, finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
     // Compile
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
@@ -145,7 +144,7 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let ops = vec![add_op, finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -178,7 +177,7 @@ fn test_float_add() {
     finish_op.setfailargs(vec![rb(OpRef::float_op(1))].into());
 
     let ops = vec![add_op, finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -232,7 +231,7 @@ fn test_setarrayitem_raw_float_roundtrip() {
     finish_op.setfailargs(vec![rb(OpRef::float_op(3))].into());
 
     let ops = vec![set_op, get_op, finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -277,7 +276,7 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
     finish_op.setfailargs(vec![rb(OpRef::float_op(4))].into());
 
     let ops = vec![set_op, get_op, finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -336,7 +335,7 @@ fn test_guard_and_loop() {
     jump_op.setdescr(loop_descr);
 
     let ops = vec![label_op, add_op, lt_op, guard_op, jump_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -380,7 +379,7 @@ fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
     jump_op.pos().set(OpRef::void_op(2));
     jump_op.setdescr(loop_descr);
 
-    let ops_rc: Vec<Rc<Op>> = vec![Rc::new(label_op), Rc::new(guard_op), Rc::new(jump_op)];
+    let ops_rc: Vec<OpRc> = vec![OpRc::new(label_op), OpRc::new(guard_op), OpRc::new(jump_op)];
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -474,7 +473,7 @@ fn test_float_loop_carried_across_jump() {
     let ops = vec![
         label_op, lt_op, guard_op, cast_op, mul_op, add_op, inc_op, jump_op,
     ];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -541,7 +540,7 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
     finish_op.setfailargs(vec![].into());
 
     let ops = vec![guard_gc_type, guard_is_object, guard_subclass, finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -581,9 +580,9 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         finish_op.set_fail_arg_types(vec![]);
         finish_op.setfailargs(vec![].into());
 
-        let ops_rc: Vec<Rc<Op>> = vec![guard_gc_type, finish_op]
+        let ops_rc: Vec<OpRc> = vec![guard_gc_type, finish_op]
             .into_iter()
-            .map(Rc::new)
+            .map(OpRc::new)
             .collect();
         let result = backend.compile_loop(&inputargs, &ops_rc, &token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -619,9 +618,9 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         finish_op.set_fail_arg_types(vec![]);
         finish_op.setfailargs(vec![].into());
 
-        let ops_rc: Vec<Rc<Op>> = vec![guard_is_object, finish_op]
+        let ops_rc: Vec<OpRc> = vec![guard_is_object, finish_op]
             .into_iter()
-            .map(Rc::new)
+            .map(OpRc::new)
             .collect();
         let result = backend.compile_loop(&inputargs, &ops_rc, &token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -664,9 +663,9 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         finish_op.set_fail_arg_types(vec![]);
         finish_op.setfailargs(vec![].into());
 
-        let ops_rc: Vec<Rc<Op>> = vec![guard_subclass, finish_op]
+        let ops_rc: Vec<OpRc> = vec![guard_subclass, finish_op]
             .into_iter()
-            .map(Rc::new)
+            .map(OpRc::new)
             .collect();
         let result = backend.compile_loop(&inputargs, &ops_rc, &token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
@@ -704,7 +703,7 @@ fn test_exception_guards_use_dynasm_emit() {
     finish_op.setfailargs(vec![rb(OpRef::ref_op(0))].into());
 
     let ops = vec![guard_exception, finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -742,7 +741,7 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
     finish_op.setfailargs(vec![].into());
 
     let ops = vec![guard_no_exception, finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -773,7 +772,7 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
     finish_op.set_fail_arg_types(vec![]);
     finish_op.setfailargs(vec![].into());
     let ops = vec![guard_always_fails, finish_op];
-    let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
     let result = always_backend.compile_loop(&[], &ops_rc, &always_token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
     let frame = always_backend.execute_token(&always_token, &[]);
@@ -805,7 +804,7 @@ fn test_int_binop_wide_immediate_is_not_truncated() {
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
-    let ops_rc: Vec<Rc<Op>> = vec![Rc::new(and_op), Rc::new(finish_op)];
+    let ops_rc: Vec<OpRc> = vec![OpRc::new(and_op), OpRc::new(finish_op)];
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -838,7 +837,7 @@ fn test_int_add_wide_immediate_is_not_truncated() {
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
-    let ops_rc: Vec<Rc<Op>> = vec![Rc::new(add_op), Rc::new(finish_op)];
+    let ops_rc: Vec<OpRc> = vec![OpRc::new(add_op), OpRc::new(finish_op)];
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 

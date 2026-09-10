@@ -2068,7 +2068,7 @@ mod tests {
         rec.materialize_into_ops();
         let first = rec.ops()[0].clone();
         let (_, ops) = rec.into_parts();
-        assert!(std::rc::Rc::ptr_eq(&first, &ops[0]));
+        assert!(OpRc::ptr_eq(&first, &ops[0]));
     }
 
     #[test]

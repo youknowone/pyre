@@ -33,7 +33,7 @@
 /// into a `ShortPreamble` that is stored alongside the compiled loop.
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
-use majit_ir::{GcRef, Op, OpCode, OpRef};
+use majit_ir::{GcRef, Op, OpCode, OpRc, OpRef};
 
 use crate::optimizeopt::virtualstate::VirtualState;
 
@@ -442,7 +442,7 @@ impl PreambleOp {
             // shortpreamble.py/85/170 `ProducedShortOp(self, ...)` —
             // short_op.res is the original result box; resolve canonical.
             res: ctx.materialize_operand_at(self.op.pos().get()),
-            preamble_op: std::rc::Rc::new(preamble_op),
+            preamble_op: OpRc::new(preamble_op),
             source_op: self.source_op.clone().unwrap_or_else(|| self.op.clone()),
             invented_name: self.invented_name,
             same_as_source: self.same_as_source.clone(),
@@ -672,7 +672,7 @@ impl ShortBoxes {
             self.const_short_boxes.push(PreambleOp {
                 source_op: None,
                 res: ctx.materialize_operand_at(op.pos().get()),
-                op: std::rc::Rc::new(op),
+                op: OpRc::new(op),
                 kind: PreambleOpKind::Heap,
                 label_arg_idx,
                 invented_name: false,
@@ -789,7 +789,7 @@ impl ShortBoxes {
             PotentialShortOp::Preamble(PreambleOp {
                 source_op: None,
                 res: arg_res,
-                op: std::rc::Rc::new(same_as),
+                op: OpRc::new(same_as),
                 kind: PreambleOpKind::InputArg,
                 label_arg_idx: Some(live_slot),
                 invented_name: false,
@@ -985,7 +985,7 @@ impl ShortBoxes {
             // shortpreamble.py: ProducedShortOp(short_op, preamble_op)
             short_boxes.push(ProducedShortOp {
                 res: ctx.materialize_operand_at(getfield_op.pos().get()),
-                preamble_op: std::rc::Rc::new(new_op),
+                preamble_op: OpRc::new(new_op),
                 source_op: short_op.source_op.unwrap_or_else(|| short_op.op.clone()),
                 kind: PreambleOpKind::Heap,
                 invented_name: false,
@@ -1093,7 +1093,7 @@ impl ShortBoxes {
         let pop = PotentialShortOp::Preamble(PreambleOp {
             source_op: None,
             res: key.clone(),
-            op: std::rc::Rc::new(op),
+            op: OpRc::new(op),
             kind,
             label_arg_idx,
             invented_name: false,
@@ -1159,7 +1159,7 @@ impl CollectedExtendedShortPreambleBuilder {
         self.guards.push(PreambleOp {
             source_op: None,
             res: majit_ir::operand::Operand::bound_from_opref(op.pos().get()),
-            op: std::rc::Rc::new(op),
+            op: OpRc::new(op),
             kind: PreambleOpKind::Guard,
             label_arg_idx,
             invented_name: false,
@@ -1173,7 +1173,7 @@ impl CollectedExtendedShortPreambleBuilder {
         self.pure_ops.push(PreambleOp {
             source_op: None,
             res: majit_ir::operand::Operand::bound_from_opref(op.pos().get()),
-            op: std::rc::Rc::new(op),
+            op: OpRc::new(op),
             kind: PreambleOpKind::Pure,
             label_arg_idx,
             invented_name: false,
@@ -1187,7 +1187,7 @@ impl CollectedExtendedShortPreambleBuilder {
         self.heap_ops.push(PreambleOp {
             source_op: None,
             res: majit_ir::operand::Operand::bound_from_opref(op.pos().get()),
-            op: std::rc::Rc::new(op),
+            op: OpRc::new(op),
             kind: PreambleOpKind::Heap,
             label_arg_idx,
             invented_name: false,
@@ -1201,7 +1201,7 @@ impl CollectedExtendedShortPreambleBuilder {
         self.loopinvariant_ops.push(PreambleOp {
             source_op: None,
             res: majit_ir::operand::Operand::bound_from_opref(op.pos().get()),
-            op: std::rc::Rc::new(op),
+            op: OpRc::new(op),
             kind: PreambleOpKind::LoopInvariant,
             label_arg_idx,
             invented_name: false,
@@ -1779,7 +1779,7 @@ impl ProducedShortOp {
                 );
                 p.preamble_op
             })
-            .unwrap_or_else(|| std::rc::Rc::new(getfield_op.clone()));
+            .unwrap_or_else(|| OpRc::new(getfield_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
             // PreambleOp.op carries the Box itself (shortpreamble.py).
             // shortpreamble.py `PreambleOp(self.res, ...)`: for a const
@@ -1928,7 +1928,7 @@ impl ProducedShortOp {
                 );
                 p.preamble_op
             })
-            .unwrap_or_else(|| std::rc::Rc::new(getarrayitem_op.clone()));
+            .unwrap_or_else(|| OpRc::new(getarrayitem_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
             // PreambleOp.op carries the Box itself (shortpreamble.py).
             // Same const-entry rule as `produce_heap_field`.
@@ -2134,7 +2134,7 @@ impl AbstractShortPreambleBuilderState {
         self.short.push(preamble_op.clone());
         if preamble_op.opcode.is_ovf() {
             self.short
-                .push(std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[])));
+                .push(OpRc::new(Op::new(OpCode::GuardNoOverflow, &[])));
         }
         preamble_op
     }
@@ -2190,19 +2190,18 @@ impl AbstractShortPreambleBuilderState {
                 self.short.push(dep.clone());
                 if dep.opcode.is_ovf() {
                     self.short
-                        .push(std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[])));
+                        .push(OpRc::new(Op::new(OpCode::GuardNoOverflow, &[])));
                 }
             }
         }
         // shortpreamble.py:389,396: info.make_guards(arg, self.short, optimizer)
-        self.short
-            .extend(arg_guards.iter().cloned().map(std::rc::Rc::new));
+        self.short.extend(arg_guards.iter().cloned().map(OpRc::new));
         // shortpreamble.py:398: self.short.append(preamble_op)
         self.short_results.insert(canonical_result);
         self.short.push(preamble_op.clone());
         if preamble_op.opcode.is_ovf() {
             self.short
-                .push(std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[])));
+                .push(OpRc::new(Op::new(OpCode::GuardNoOverflow, &[])));
         }
         // shortpreamble.py:401-402: `info = preamble_op.get_forwarded();
         // preamble_op.set_forwarded(None)` — consume the own marker so a
@@ -2210,7 +2209,7 @@ impl AbstractShortPreambleBuilderState {
         *preamble_op.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::None;
         // shortpreamble.py:405-406: info.make_guards(preamble_op, self.short, optimizer)
         self.short
-            .extend(result_guards.iter().cloned().map(std::rc::Rc::new));
+            .extend(result_guards.iter().cloned().map(OpRc::new));
         (**preamble_op).clone()
     }
 }
@@ -2409,7 +2408,7 @@ impl ShortPreambleBuilder {
             .find(|(_, p)| p.preamble_op.pos().get() == source)
         {
             debug_assert!(
-                std::rc::Rc::ptr_eq(&produced.preamble_op, preamble_op),
+                OpRc::ptr_eq(&produced.preamble_op, preamble_op),
                 "use_box pop replay diverged from builder entry at {source:?}"
             );
         }
@@ -3219,7 +3218,7 @@ impl ExtendedShortPreambleBuilder {
         #[cfg(debug_assertions)]
         if let Some(produced) = self.produced_short_boxes.get(&source) {
             debug_assert!(
-                std::rc::Rc::ptr_eq(&produced.preamble_op, preamble_op),
+                OpRc::ptr_eq(&produced.preamble_op, preamble_op),
                 "ext use_box pop replay diverged from builder entry at {source:?}"
             );
         }
@@ -3282,7 +3281,7 @@ impl ExtendedShortPreambleBuilder {
         // short[..len-1] excludes the JUMP sentinel
         let ops: Vec<majit_ir::OpRc> = self.short[..self.short_ops_len()]
             .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
+            .map(|op| OpRc::new(op.clone()))
             .collect();
         let mut short_preamble = build_short_preamble_struct_from_ops(
             &self.short_inputargs,
@@ -3519,7 +3518,7 @@ pub(crate) fn produced_short_boxes_from_exported_boxes(
                     // boundary; it already holds the live producer / const
                     // operand (#173 roots the producer, never position-only).
                     res: entry.res.clone(),
-                    preamble_op: std::rc::Rc::new(preamble_op),
+                    preamble_op: OpRc::new(preamble_op),
                     source_op: entry.source_op.clone().unwrap_or_else(|| entry.op.clone()),
                     invented_name: entry.invented_name,
                     same_as_source: entry.same_as_source.clone(),
@@ -3875,7 +3874,7 @@ mod tests {
                 op: {
                     let mut op = Op::new(OpCode::IntAdd, &[rop(Type::Int, 10), rop(Type::Int, 11)]);
                     op.pos().set(OpRef::int_op(7));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 res: rooted_resop_operand(Type::Int, 7),
                 kind: PreambleOpKind::Pure,
@@ -3888,7 +3887,7 @@ mod tests {
                 op: {
                     let mut op = Op::new(OpCode::IntSub, &[rop(Type::Int, 7), rop(Type::Int, 11)]);
                     op.pos().set(OpRef::int_op(8));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 res: rooted_resop_operand(Type::Int, 8),
                 kind: PreambleOpKind::Pure,
@@ -3922,7 +3921,7 @@ mod tests {
         let exported = vec![
             PreambleOp {
                 source_op: None,
-                op: std::rc::Rc::new(ovf),
+                op: OpRc::new(ovf),
                 res: rooted_resop_operand(Type::Int, 20),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
@@ -3931,7 +3930,7 @@ mod tests {
             },
             PreambleOp {
                 source_op: None,
-                op: std::rc::Rc::new(guard),
+                op: OpRc::new(guard),
                 res: majit_ir::operand::Operand::None,
                 kind: PreambleOpKind::Guard,
                 label_arg_idx: None,
@@ -3960,13 +3959,13 @@ mod tests {
         let producer7 = {
             let mut op = Op::new(OpCode::IntAdd, &[in0.clone(), in1.clone()]);
             op.pos().set(OpRef::int_op(7));
-            std::rc::Rc::new(op)
+            OpRc::new(op)
         };
         let res7 = Operand::from_bound_op(&producer7);
         let producer8 = {
             let mut op = Op::new(OpCode::IntMul, &[res7.clone(), in1.clone()]);
             op.pos().set(OpRef::int_op(8));
-            std::rc::Rc::new(op)
+            OpRc::new(op)
         };
         let res8 = Operand::from_bound_op(&producer8);
         let produced = vec![
@@ -4601,7 +4600,7 @@ mod tests {
         let pop = crate::optimizeopt::info::PreambleOp {
             op: rooted_resop_operand(Type::Int, 14),
             invented_name: true,
-            preamble_op: std::rc::Rc::new(replay_op),
+            preamble_op: OpRc::new(replay_op),
             // Imported invented-name pop carries the original it aliases;
             // the else arm reads it to emit `same_as(source)`.
             same_as_source: Some(rooted_resop_operand(Type::Int, 14)),
@@ -4641,7 +4640,7 @@ mod tests {
         let pop = crate::optimizeopt::info::PreambleOp {
             op: rooted_resop_operand(Type::Int, 14),
             invented_name: true,
-            preamble_op: std::rc::Rc::new(replay_op),
+            preamble_op: OpRc::new(replay_op),
             // Imported invented-name pop carries the original it aliases;
             // the else arm reads it to emit `same_as(source)`.
             same_as_source: Some(rooted_resop_operand(Type::Int, 14)),

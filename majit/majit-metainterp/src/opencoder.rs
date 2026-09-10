@@ -564,7 +564,7 @@ where
         } else {
             res.pos().set(src.pos().get());
         }
-        let res = std::rc::Rc::new(res);
+        let res = OpRc::new(res);
         // opencoder.py `self._cache[self._index] = res` — cache
         // the fresh op OBJECT itself so later references resolve to the
         // same identity.
@@ -976,7 +976,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // opencoder.py `self._cache[self._index] = res` — the
         // fresh op IS the cached box object, so a later TAGBOX arg binds
         // to this exact `Rc` (`from_bound_op` → `Operand::Op`).
-        let op: majit_ir::OpRc = std::rc::Rc::new(op);
+        let op: majit_ir::OpRc = OpRc::new(op);
         // opencoder.py:429-431 — cache non-void result at `_index`, bump.
         if opcode.result_type() != Type::Void {
             let slot = self._index as usize;
@@ -3180,7 +3180,7 @@ mod tests {
 
         // Phase 1 / legacy layout: start_fresh = 0 → inputargs allocated
         // as InputArgInt(0..2), op results follow as BoxInt(2..).
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         assert_eq!(inputarg_oprefs(&iter), vec![iarg(0), iarg(1)]);
         assert_eq!(cache_opref(&iter, 0), Some(iarg(0)));
@@ -3226,7 +3226,7 @@ mod tests {
         // `History.set_inputargs([box0, box2])` filtered that dead box.
         // `TraceIterator.__init__` must seed `_cache` by each surviving
         // box's recorded position, not by its compact vector index.
-        let ops = vec![std::rc::Rc::new(op_at(
+        let ops = vec![OpRc::new(op_at(
             3,
             majit_ir::OpCode::IntAdd,
             &[iarg(0), iarg(2)],
@@ -3265,7 +3265,7 @@ mod tests {
 
         // Phase 1: start_fresh = 0 reproduces the legacy positional layout
         // (inputargs at [0, num_inputargs), op results at [num_inputargs, …)).
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         let mut p1_ops = Vec::new();
         while let Some(op) = p1.next() {
@@ -3315,7 +3315,7 @@ mod tests {
         let const_ref = OpRef::const_int(5);
         let ops = vec![op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), const_ref])];
         let inputarg_types = vec![majit_ir::Type::Int; 1];
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         let r = iter.next().unwrap();
         assert_eq!(r.pos().get(), iop(1));
@@ -3341,7 +3341,7 @@ mod tests {
         // _index (raw trace position) and _fresh (fresh OpRef counter)
         // surfaces as an out-of-bounds panic or stale cache slot.
         let inputarg_types = vec![majit_ir::Type::Int; 1];
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100);
         let r1 = iter.next().unwrap();
         // After writing raw pos 1, _index should be 2 (next slot).
@@ -3373,7 +3373,7 @@ mod tests {
             guard,
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 1];
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10);
         let r1 = iter.next().unwrap();
         assert_eq!(r1.pos().get(), iop(11));
@@ -3401,7 +3401,7 @@ mod tests {
             majit_ir::Type::Int,
             majit_ir::Type::Int,
         ];
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100);
 
         assert_eq!(

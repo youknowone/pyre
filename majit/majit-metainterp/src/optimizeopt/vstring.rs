@@ -1,7 +1,7 @@
 #![allow(non_upper_case_globals)]
 
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
+use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -1781,7 +1781,7 @@ mod tests {
             for i in 0..resolved_op.num_args() {
                 resolved_op.setarg(i, ctx.resolve_operand_operand(&resolved_op.arg(i)));
             }
-            let resolved_rc = std::rc::Rc::new(resolved_op.clone());
+            let resolved_rc = OpRc::new(resolved_op.clone());
             ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
             match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -2236,7 +2236,7 @@ mod tests {
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         let mut getitem = Op::new(OpCode::Strgetitem, &[rop(11), iop(302)]);
         getitem.pos().set(pos);
-        let op_rc = std::rc::Rc::new(getitem.clone());
+        let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
 
         let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut ctx);
@@ -2295,7 +2295,7 @@ mod tests {
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         let mut getitem = Op::new(OpCode::Strgetitem, &[rop(13), iop(302)]);
         getitem.pos().set(pos);
-        let op_rc = std::rc::Rc::new(getitem.clone());
+        let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
 
         let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut ctx);
@@ -2674,7 +2674,7 @@ mod tests {
         ctx.make_constant_box(&b, Value::Int(2));
 
         // Process NEWSTR → creates virtual Plain
-        let left_op_rc = std::rc::Rc::new(left_op.clone());
+        let left_op_rc = OpRc::new(left_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&left_op_rc));
         let _ = pass.propagate_forward(&left_op, &left_op_rc, &mut ctx);
         assert!(pass.is_virtual(&ctx.get_box_replacement_operand(left), &ctx));

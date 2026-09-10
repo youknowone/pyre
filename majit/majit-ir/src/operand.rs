@@ -168,7 +168,7 @@ impl Operand {
 
     #[allow(non_snake_case)]
     pub fn Op(op: OpRc) -> Operand {
-        let p = Rc::into_raw(op) as u64;
+        let p = OpRc::into_raw(op) as u64;
         debug_assert_eq!(p & OP_TAG, 0);
         Operand { packed: p }
     }
@@ -215,8 +215,8 @@ impl Operand {
         }
         match self.packed & OP_TAG {
             OP_OP => {
-                let rc = unsafe { Rc::from_raw(self.packed as *const crate::resoperation::Op) };
-                let out = Opnd::Op(Rc::clone(&rc));
+                let rc = unsafe { OpRc::from_raw(self.packed as *const crate::resoperation::Op) };
+                let out = Opnd::Op(rc.clone());
                 std::mem::forget(rc);
                 out
             }
@@ -267,9 +267,7 @@ impl Clone for Operand {
         }
         match self.packed & OP_TAG {
             OP_OP => unsafe {
-                Rc::<crate::resoperation::Op>::increment_strong_count(
-                    self.packed as *const crate::resoperation::Op,
-                );
+                OpRc::increment_strong_count(self.packed as *const crate::resoperation::Op);
             },
             OP_INPUTARG => unsafe {
                 Rc::<crate::value::InputArg>::increment_strong_count(
@@ -296,7 +294,7 @@ impl Drop for Operand {
         }
         match self.packed & OP_TAG {
             OP_OP => {
-                drop(unsafe { Rc::from_raw(self.packed as *const crate::resoperation::Op) });
+                drop(unsafe { OpRc::from_raw(self.packed as *const crate::resoperation::Op) });
             }
             OP_INPUTARG => {
                 drop(unsafe {
@@ -346,7 +344,7 @@ impl Operand {
     /// (`resoperation.py:250`) — no `box_cache` memoization, the `Rc`
     /// itself IS the stable identity.
     pub fn from_bound_op(op: &OpRc) -> Operand {
-        Operand::Op(Rc::clone(op))
+        Operand::Op(op.clone())
     }
 
     /// Wrap a bound input arg as `Operand::InputArg` (`Rc::clone`). Successor
@@ -429,7 +427,7 @@ impl Operand {
                     Type::Ref => OpCode::SameAsR,
                     Type::Void => OpCode::Jump,
                 };
-                let op: OpRc = Rc::new(Op::new(opcode, &[]));
+                let op: OpRc = OpRc::new(Op::new(opcode, &[]));
                 op.pos().set(r);
                 Operand::from_bound_op(&op)
             }
@@ -639,8 +637,8 @@ impl Operand {
         }
         let ptr = self.packed as *const crate::resoperation::Op;
         unsafe {
-            Rc::increment_strong_count(ptr);
-            Some(Rc::from_raw(ptr))
+            OpRc::increment_strong_count(ptr);
+            Some(OpRc::from_raw(ptr))
         }
     }
 
@@ -860,7 +858,7 @@ mod tests {
     use crate::value::{Const, InputArg, Type, Value};
 
     fn op_at(pos: u32, tp: Type) -> OpRc {
-        let op = Rc::new(Op::new(OpCode::SameAsI, &[]));
+        let op = OpRc::new(Op::new(OpCode::SameAsI, &[]));
         op.pos().set(OpRef::op_typed(pos, tp));
         op
     }
@@ -1037,12 +1035,12 @@ mod tests {
         assert!(matches!(a.get_forwarded(), Forwarded::None));
         a.set_forwarded_op(&b);
         match a.get_forwarded() {
-            Forwarded::Op(target) => assert!(Rc::ptr_eq(&target, &b)),
+            Forwarded::Op(target) => assert!(OpRc::ptr_eq(&target, &b)),
             other => panic!("expected Forwarded::Op, got {other:?}"),
         }
         // The walker follows a -> b to the terminal.
         match a.get_box_replacement(false).bound_op() {
-            Some(op) => assert!(Rc::ptr_eq(&op, &b)),
+            Some(op) => assert!(OpRc::ptr_eq(&op, &b)),
             None => panic!(
                 "expected Operand::Op(b), got {:?}",
                 a.get_box_replacement(false)
@@ -1076,12 +1074,12 @@ mod tests {
             let c = op_at(2, Type::Int);
             b.set_forwarded_op(&c);
             a.set_forwarded_op(&b);
-            (Rc::as_ptr(&b), Rc::as_ptr(&c))
+            (OpRc::as_ptr(&b), OpRc::as_ptr(&c))
         };
 
         match a.get_box_replacement(false).bound_op() {
             Some(op) => assert!(
-                std::ptr::eq(Rc::as_ptr(&op), c_ptr),
+                std::ptr::eq(OpRc::as_ptr(&op), c_ptr),
                 "the walk stopped short of the chain terminal",
             ),
             None => panic!(
@@ -1115,7 +1113,7 @@ mod tests {
     fn bound_op_and_bound_inputarg_arms() {
         let op = op_at(2, Type::Int);
         let o_op = Operand::from_bound_op(&op);
-        assert!(o_op.bound_op().is_some_and(|o| Rc::ptr_eq(&o, &op)));
+        assert!(o_op.bound_op().is_some_and(|o| OpRc::ptr_eq(&o, &op)));
         assert!(o_op.bound_inputarg().is_none());
 
         let ia = Rc::new(InputArg::from_type(Type::Ref, 1));

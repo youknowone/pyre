@@ -14,7 +14,7 @@ use crate::optimizeopt::{
 /// Chains multiple optimization passes and drives operations through them.
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, Op, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef, Type};
 use std::sync::Arc;
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
@@ -1158,7 +1158,7 @@ impl Optimizer {
             // SAME_AS_*.type parity); the immediate push below makes
             // op_at(fresh) the authoritative type source. No
             // `value_types` write needed (5).
-            let op_rc = std::rc::Rc::new(op);
+            let op_rc = OpRc::new(op);
             ctx.emitted_operations
                 .insert(majit_ir::operand::Operand::from_bound_op(&op_rc));
             ctx.push_new_operation(op_rc);
@@ -1863,7 +1863,7 @@ impl Optimizer {
         op: &Op,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        let op_rc = std::rc::Rc::new(op.clone());
+        let op_rc = OpRc::new(op.clone());
         // Register the producer for op_rc.pos before dispatch so a pass that
         // folds it via make_equal_to(from_bound_op(op_rc), ..) writes the
         // forwarding onto a host find_producer_op can reach (the normal trace
@@ -1881,7 +1881,7 @@ impl Optimizer {
         op: &Op,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        let op_rc = std::rc::Rc::new(op.clone());
+        let op_rc = OpRc::new(op.clone());
         ctx.register_extra_producer(&op_rc);
         self.propagate_from_pass(after_pass_idx + 1, &op_rc, ctx)
     }
@@ -2382,8 +2382,7 @@ impl Optimizer {
         // are not the canonical producers, so `input_ops` is seeded as empty
         // here (`input_ops_from_ops = false`); the canonical stores
         // (`bind_input_resops` / emit) carry identity instead.
-        let ops_rc: Vec<majit_ir::OpRc> =
-            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+        let ops_rc: Vec<majit_ir::OpRc> = ops.iter().map(|op| OpRc::new(op.clone())).collect();
         // This `&[Op]` convenience overload backs unit-test fixtures and the
         // legacy `propagate_all_forward` / `optimize_trace_with_constants`
         // helpers, not the production JIT path (which uses the `_oprc` /
@@ -3148,7 +3147,7 @@ impl Optimizer {
                 self.terminal_op
                     .clone()
                     .filter(|op| op.opcode == OpCode::Jump)
-                    .map(std::rc::Rc::new)
+                    .map(OpRc::new)
             });
         let mut loop_info = BasicLoopInfo::new(
             self.trace_inputargs.clone(),
@@ -3497,7 +3496,7 @@ impl Optimizer {
                 {
                     let mut seen: Vec<*const majit_ir::Op> = Vec::with_capacity(produced.len());
                     for (_, p) in &produced {
-                        let ptr = std::rc::Rc::as_ptr(&p.preamble_op);
+                        let ptr = OpRc::as_ptr(&p.preamble_op);
                         debug_assert!(
                             !seen.contains(&ptr),
                             "exported short boxes share a replay OpRc at {:?}",
@@ -4109,11 +4108,11 @@ impl Optimizer {
                 .unwrap_or(ops.len());
             let extra_same_as_len = loop_info.extra_same_as.len();
             for (offset, op) in loop_info.extra_same_as.into_iter().enumerate() {
-                ops.insert(term_idx + offset, std::rc::Rc::new(op));
+                ops.insert(term_idx + offset, OpRc::new(op));
             }
             let before_label_idx = term_idx + extra_same_as_len;
             for (offset, op) in loop_info.extra_before_label.into_iter().enumerate() {
-                ops.insert(before_label_idx + offset, std::rc::Rc::new(op));
+                ops.insert(before_label_idx + offset, OpRc::new(op));
             }
         }
         // resume.py:411-417 parity: store_final_boxes_in_guard
@@ -4888,9 +4887,9 @@ impl Optimizer {
                     // same ResOperation. Reuse that Rc instead of cls().
                     let emit_rc = if op.opcode == op_rc.opcode {
                         OptContext::stamp_emitted_op(&op, op_rc);
-                        std::rc::Rc::clone(op_rc)
+                        op_rc.clone()
                     } else {
-                        std::rc::Rc::new(op.clone())
+                        OpRc::new(op.clone())
                     };
                     self.emit_operation_inner(emit_rc, ctx, false)?;
                     // optimizer.py:585-589: invoke postprocess callbacks
@@ -4942,7 +4941,7 @@ impl Optimizer {
                     );
                     // 5: Restart's new op carries `Op.type_` from
                     // construction; no side-table refresh needed.
-                    let restart_op_rc = std::rc::Rc::new(op);
+                    let restart_op_rc = OpRc::new(op);
                     // replace_op_with parity: the rewrite supersedes the
                     // original as the producer at its position so the
                     // re-dispatch reads/writes one canonical `_forwarded` host
@@ -4998,7 +4997,7 @@ impl Optimizer {
         // recorder input op verbatim (args re-resolved), so emit may append
         // that same Rc — no second ResOperation().
         if !replaced {
-            self.emit_operation_inner(std::rc::Rc::clone(op_rc), ctx, true)?;
+            self.emit_operation_inner(op_rc.clone(), ctx, true)?;
         } else {
             self.emit_operation((*current_op).clone(), ctx, false)?;
         }
@@ -5027,7 +5026,7 @@ impl Optimizer {
         ctx: &mut OptContext,
         reuse: bool,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        self.emit_operation_inner(std::rc::Rc::new(op), ctx, reuse)
+        self.emit_operation_inner(OpRc::new(op), ctx, reuse)
     }
 
     fn emit_operation_inner(
@@ -5162,7 +5161,7 @@ impl Optimizer {
                              replacement guard has no descr",
                     );
                     crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
-                    ctx.replace_new_operation(target_pos, std::rc::Rc::clone(&op));
+                    ctx.replace_new_operation(target_pos, op.clone());
                     ctx.in_final_emission = saved_in_final_emission;
                     return Ok(());
                 }
@@ -5170,7 +5169,7 @@ impl Optimizer {
 
             // optimizer.py: op = self.emit_guard_operation(op, pendingfields)
             if let Some(newop) = self.emit_guard_operation(&op, ctx) {
-                op = std::rc::Rc::new(newop);
+                op = OpRc::new(newop);
             }
             // emit_guard_operation may defer an `InvalidLoop` (e.g. a pending
             // SETARRAYITEM index that is not a non-negative constant).
@@ -5719,7 +5718,7 @@ impl Optimizer {
             debug_assert!(false, "virtualize.py:89 assert i >= 0");
             return;
         };
-        ctx.new_operations.insert(i, std::rc::Rc::new(guard_op));
+        ctx.new_operations.insert(i, OpRc::new(guard_op));
         // `new_operations_index` maps position -> op with last-occurrence-wins
         // semantics, which an insert in the middle cannot maintain
         // incrementally.
@@ -6418,9 +6417,9 @@ mod tests {
         let rhs = rooted_resop_operand(Type::Int, 1);
         ctx.emit_extra_at(
             0,
-            std::rc::Rc::new(Op::new(OpCode::IntAdd, &[lhs.clone(), rhs.clone()])),
+            OpRc::new(Op::new(OpCode::IntAdd, &[lhs.clone(), rhs.clone()])),
         );
-        ctx.emit_extra_at(0, std::rc::Rc::new(Op::new(OpCode::IntSub, &[lhs, rhs])));
+        ctx.emit_extra_at(0, OpRc::new(Op::new(OpCode::IntSub, &[lhs, rhs])));
 
         let result = opt.drain_extra_operations_from(0, &mut ctx);
 
@@ -7366,7 +7365,7 @@ mod tests {
             OpRef::input_arg_int(1),
             OpRef::input_arg_ref(2),
         ];
-        opt.phase1_emit_ops.push(std::rc::Rc::new(majit_ir::Op::new(
+        opt.phase1_emit_ops.push(OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::SameAsI,
             &[rooted_resop_operand(Type::Int, 50)],
         )));
@@ -7717,7 +7716,7 @@ mod tests {
             &[OpRef::int_op(0)],
             &[OpRef::int_op(0)],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
-                op: std::rc::Rc::new(preamble_op.clone()),
+                op: OpRc::new(preamble_op.clone()),
                 source_op: None,
                 res: rooted_resop_operand(Type::Int, 14),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
@@ -7737,7 +7736,7 @@ mod tests {
                         &[rooted_resop_operand(Type::Int, 14)],
                     );
                     op.pos().set(OpRef::op_typed(14, op.result_type()));
-                    std::rc::Rc::new(op)
+                    OpRc::new(op)
                 },
                 same_as_source: None,
             },

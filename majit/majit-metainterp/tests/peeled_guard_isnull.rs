@@ -11,7 +11,7 @@
 //! without it.
 
 use majit_ir::operand::Operand;
-use majit_ir::{ConstMap, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{ConstMap, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 use majit_metainterp::optimizeopt::unroll::UnrollOptimizer;
 
 fn positioned(opcode: OpCode, args: &[Operand], raw: u32) -> Op {
@@ -35,7 +35,7 @@ fn peeled_integer_loop_drops_the_loop_invariant_null_guard() {
 
     let is_null = positioned(OpCode::GuardIsnull, std::slice::from_ref(&null_arg), 3);
     is_null.set_rd_resume_position(0);
-    let less_than = std::rc::Rc::new(positioned(
+    let less_than = OpRc::new(positioned(
         OpCode::IntLt,
         &[
             index_arg.clone(),
@@ -45,8 +45,8 @@ fn peeled_integer_loop_drops_the_loop_invariant_null_guard() {
     ));
     let in_range = positioned(OpCode::GuardTrue, &[Operand::from_bound_op(&less_than)], 5);
     in_range.set_rd_resume_position(1);
-    let next_acc = std::rc::Rc::new(positioned(OpCode::IntAdd, &[acc_arg, index_arg.clone()], 6));
-    let next_index = std::rc::Rc::new(positioned(
+    let next_acc = OpRc::new(positioned(OpCode::IntAdd, &[acc_arg, index_arg.clone()], 6));
+    let next_index = OpRc::new(positioned(
         OpCode::IntAdd,
         &[index_arg, Operand::const_from_value(Value::Int(1))],
         7,

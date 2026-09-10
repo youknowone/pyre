@@ -27,7 +27,7 @@ use majit_backend::{
 use majit_ir::operand::Operand;
 use majit_ir::{
     AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op, OpCode,
-    OpRef, RdVirtualInfo, Type, Value,
+    OpRc, OpRef, RdVirtualInfo, Type, Value,
 };
 
 use crate::blackhole::ExceptionState;
@@ -1988,7 +1988,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             }
         }
 
-        let emitted = std::rc::Rc::new(emitted);
+        let emitted = OpRc::new(emitted);
         if let Some(source) = forwarded_source {
             set_local_forwarded(forwarding, source, Operand::from_bound_op(&emitted));
         }
@@ -2084,7 +2084,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         let mut op = Op::new(opcode, std::slice::from_ref(&vable_box));
         op.pos().set(new_opref);
         op.setdescr(descr);
-        let op = std::rc::Rc::new(op);
+        let op = OpRc::new(op);
         set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&op));
         extra_ops.push(op);
         i += 1;
@@ -2115,7 +2115,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         let mut arr_load = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&vable_box));
         arr_load.pos().set(array_opref);
         arr_load.setdescr(array_field_descr.clone());
-        let arr_load = std::rc::Rc::new(arr_load);
+        let arr_load = OpRc::new(arr_load);
         let array_box = Operand::from_bound_op(&arr_load);
         extra_ops.push(arr_load);
 
@@ -2200,7 +2200,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                     Type::Int,
                     ArrayFlag::Unsigned,
                 ));
-                let ptr_load = std::rc::Rc::new(ptr_load);
+                let ptr_load = OpRc::new(ptr_load);
                 let ptr_box = Operand::from_bound_op(&ptr_load);
                 extra_ops.push(ptr_load);
 
@@ -2233,7 +2233,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             );
             elem_op.pos().set(new_opref);
             elem_op.setdescr(item_descr.clone());
-            let elem_op = std::rc::Rc::new(elem_op);
+            let elem_op = OpRc::new(elem_op);
             set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&elem_op));
             extra_ops.push(elem_op);
             i += 1;
@@ -2597,7 +2597,7 @@ pub fn compile_tmp_callback(
     let call_opcode = OpCode::call_for_type(jitdriver_sd.result_type);
     // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
     // descr=jd.portal_calldescr)`.
-    let call_op = std::rc::Rc::new(Op::with_descr(call_opcode, &callargs_box, portal_calldescr));
+    let call_op = OpRc::new(Op::with_descr(call_opcode, &callargs_box, portal_calldescr));
     //
     // `compile.py` `if call_op.type != 'v': finishargs = [call_op]
     // else: finishargs = []`.
@@ -2624,11 +2624,7 @@ pub fn compile_tmp_callback(
     // `compile.py` `operations[1].setfailargs([])` — no fail args.
     guard_op.setfailargs(smallvec![]);
     let finish_op = Op::with_descr(OpCode::Finish, &finishargs_box, portal_finishtoken);
-    let operations: Vec<majit_ir::OpRc> = vec![
-        call_op,
-        std::rc::Rc::new(guard_op),
-        std::rc::Rc::new(finish_op),
-    ];
+    let operations: Vec<majit_ir::OpRc> = vec![call_op, OpRc::new(guard_op), OpRc::new(finish_op)];
     //
     // `compile.py:1145` `operations = get_deep_immutable_oplist(operations)` —
     // pyre has no immutable-list transformation.
@@ -2906,10 +2902,10 @@ mod tests {
         let op0: majit_ir::OpRc = {
             let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, 1)]);
             op.pos().set(OpRef::ref_op(10));
-            std::rc::Rc::new(op)
+            OpRc::new(op)
         };
         let op0_result = majit_ir::operand::Operand::from_bound_op(&op0);
-        let op1: majit_ir::OpRc = std::rc::Rc::new(Op::new(
+        let op1: majit_ir::OpRc = OpRc::new(Op::new(
             OpCode::Label,
             &[rooted_inputarg_operand(Type::Ref, 0), op0_result.clone()],
         ));
@@ -2922,7 +2918,7 @@ mod tests {
                 Type::Int,
                 ArrayFlag::Signed,
             ));
-            std::rc::Rc::new(op)
+            OpRc::new(op)
         };
         let mut ops: Vec<majit_ir::OpRc> = vec![op0, op1, op2];
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
@@ -3005,7 +3001,7 @@ mod tests {
         ];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
-        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
             &mut inputargs,
@@ -3086,7 +3082,7 @@ mod tests {
             InputArg::new_int(3),
         ];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,

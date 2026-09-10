@@ -45,7 +45,7 @@ use crate::resume::SnapshotBox;
 use indexmap::{IndexMap, IndexSet};
 use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 /// `optimizer.py` extra-operations list. Almost always 0–2 ops (one
@@ -547,7 +547,7 @@ impl ImportedShortPureOp {
             pop: crate::optimizeopt::info::PreambleOp {
                 op: pop_op,
                 invented_name,
-                preamble_op: std::rc::Rc::new(replay),
+                preamble_op: OpRc::new(replay),
                 same_as_source,
             },
         }
@@ -2233,7 +2233,7 @@ impl OptContext {
             majit_ir::Type::Ref => OpCode::SameAsR,
             majit_ir::Type::Void => OpCode::Jump,
         };
-        let synthetic = std::rc::Rc::new(Op::new(opcode, &[]));
+        let synthetic = OpRc::new(Op::new(opcode, &[]));
         synthetic.pos().set(opref);
         self.resop_refs.insert(opref, synthetic.clone());
         self.live_synthetics_push(synthetic.clone());
@@ -2295,7 +2295,7 @@ impl OptContext {
         // `ptr_eq` guard skips the self-clone — and its `RefCell` double-borrow
         // — when `op` is already the registered stand-in.
         if let Some(superseded) = self.live_synthetics_swap_remove_pos(pos)
-            && !std::rc::Rc::ptr_eq(&superseded, op)
+            && !OpRc::ptr_eq(&superseded, op)
         {
             let carried = superseded.forwarded().borrow().clone();
             *op.forwarded().borrow_mut() = carried;
@@ -3266,7 +3266,7 @@ impl OptContext {
                 return op_pos;
             }
         }
-        let op_rc = std::rc::Rc::new(op);
+        let op_rc = OpRc::new(op);
         // Catch up any operand placeholder that `materialize_operand_at` created for
         // `op_pos` ahead of this emit (forward-reference path).
         // `resoperation.py:233 _forwarded` lives on the operation
@@ -3291,7 +3291,7 @@ impl OptContext {
             // orphaned stand-in while the OpRef path resolves `op_rc`, so a
             // later fold (e.g. GUARD_TRUE constant-folding the operand) lands
             // on a different host and `resolve_operand_operand`'s witness diverges.
-            if !std::rc::Rc::ptr_eq(&synth, &op_rc) {
+            if !OpRc::ptr_eq(&synth, &op_rc) {
                 use majit_ir::forwarding::ForwardingHost;
                 synth.set_forwarded_op(&op_rc);
             }
@@ -3358,7 +3358,7 @@ impl OptContext {
     pub fn emit_extra(&mut self, after_pass_idx: usize, op: Op) -> OpRef {
         // emit_extra enters the chain at the pass AFTER the caller; the first
         // re-processing pass is `after_pass_idx + 1`.
-        self.emit_extra_at(after_pass_idx + 1, std::rc::Rc::new(op))
+        self.emit_extra_at(after_pass_idx + 1, OpRc::new(op))
     }
 
     /// `emit_extra` when the caller already holds the ResOperation object
@@ -3402,7 +3402,7 @@ impl OptContext {
         if self.in_final_emission {
             self.emit(op)
         } else {
-            self.emit_extra_at(0, std::rc::Rc::new(op))
+            self.emit_extra_at(0, OpRc::new(op))
         }
     }
 
@@ -3434,7 +3434,7 @@ impl OptContext {
                     crate::optimizeopt::shortpreamble::ProducedShortOp {
                         kind: entry.kind.clone(),
                         res,
-                        preamble_op: std::rc::Rc::new((*entry.op).clone()),
+                        preamble_op: OpRc::new((*entry.op).clone()),
                         source_op: entry.source_op.clone().unwrap_or_else(|| entry.op.clone()),
                         invented_name: entry.invented_name,
                         same_as_source: entry.same_as_source.clone(),
@@ -3673,7 +3673,7 @@ impl OptContext {
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         res,
-                        preamble_op: std::rc::Rc::new(op),
+                        preamble_op: OpRc::new(op),
                         source_op: produced_op.source_op.clone(),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
@@ -3734,7 +3734,7 @@ impl OptContext {
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
-                                preamble_op: std::rc::Rc::new(op),
+                                preamble_op: OpRc::new(op),
                                 source_op: produced_op.source_op.clone(),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -3776,7 +3776,7 @@ impl OptContext {
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
-                                preamble_op: std::rc::Rc::new(op),
+                                preamble_op: OpRc::new(op),
                                 source_op: produced_op.source_op.clone(),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -3816,7 +3816,7 @@ impl OptContext {
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         res,
-                        preamble_op: std::rc::Rc::new(op),
+                        preamble_op: OpRc::new(op),
                         source_op: produced_op.source_op.clone(),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
@@ -4869,10 +4869,7 @@ impl OptContext {
             // tripping `set_forwarded_op`'s self-cycle assert. Honour
             // the upstream `is` semantics by comparing the bound `Op`
             // identities first.
-            if op
-                .bound_op()
-                .is_some_and(|o| std::rc::Rc::ptr_eq(&o, &target_op))
-            {
+            if op.bound_op().is_some_and(|o| OpRc::ptr_eq(&o, &target_op)) {
                 return;
             }
             op.set_forwarded_op(&target_op);
@@ -5460,7 +5457,7 @@ impl OptContext {
         // Skip when `canon` wraps the same bound `Op` as `arg` under a distinct
         // host — linking would be a one-node self-cycle.
         if let (Some(ao), Some(co)) = (arg.bound_op(), canon.bound_op())
-            && std::rc::Rc::ptr_eq(&ao, &co)
+            && OpRc::ptr_eq(&ao, &co)
         {
             return;
         }
@@ -9317,7 +9314,7 @@ mod input_ops_index_tests {
     fn op_at(pos: OpRef) -> majit_ir::OpRc {
         let op = Op::new(OpCode::SameAsI, &[]);
         op.pos().set(pos);
-        Rc::new(op)
+        OpRc::new(op)
     }
 
     /// `input_ops_index` is a derived O(1) acceleration of
@@ -9343,11 +9340,11 @@ mod input_ops_index_tests {
             .find_producer_op(pos)
             .expect("a producer must be found at the seeded position");
         assert!(
-            Rc::ptr_eq(&producer, &last),
+            OpRc::ptr_eq(&producer, &last),
             "the last occurrence at a shared position must win"
         );
         assert!(
-            !Rc::ptr_eq(&producer, &first),
+            !OpRc::ptr_eq(&producer, &first),
             "the earlier occurrence must be shadowed by the later one"
         );
     }
@@ -9437,7 +9434,7 @@ mod boxref_forwarding_tests {
         assert!(
             resolved
                 .bound_op()
-                .is_some_and(|op| std::rc::Rc::ptr_eq(&op, &producer_b)),
+                .is_some_and(|op| OpRc::ptr_eq(&op, &producer_b)),
             "consumer must resolve to the emitted producer, not the orphaned stand-in"
         );
     }
@@ -9995,13 +9992,13 @@ mod boxref_forwarding_tests {
     #[test]
     fn drained_operations_invalidate_recorded_guard_positions() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        let guard = std::rc::Rc::new(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&b)));
+        let guard = OpRc::new(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&b)));
         ctx.push_new_operation(guard);
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 0 });
         assert!(ctx.get_last_guard(&b).is_some());
 
         let _old_operations = ctx.take_new_operations();
-        ctx.push_new_operation(std::rc::Rc::new(Op::new(OpCode::IntAdd, &[])));
+        ctx.push_new_operation(OpRc::new(Op::new(OpCode::IntAdd, &[])));
 
         assert!(ctx.get_last_guard(&b).is_none());
         assert!(ctx.last_guard_pos(&b).is_none());
@@ -11395,7 +11392,7 @@ mod imported_short_preamble_fallback_tests {
         let pop = crate::optimizeopt::info::PreambleOp {
             op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(41)),
             invented_name: false,
-            preamble_op: std::rc::Rc::new(replay_op),
+            preamble_op: OpRc::new(replay_op),
             same_as_source: None,
         };
 

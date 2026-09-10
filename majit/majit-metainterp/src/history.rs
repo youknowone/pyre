@@ -293,13 +293,13 @@ pub(crate) mod test_support {
             Type::Ref => OpCode::SameAsR,
             Type::Void => OpCode::Jump,
         };
-        let op = std::rc::Rc::new(Op::new(opcode, &[]));
+        let op = OpRc::new(Op::new(opcode, &[]));
         op.pos().set(OpRef::op_typed(position, tp));
         (Operand::from_bound_op(&op), op)
     }
 
     thread_local! {
-        static PRODUCER_ROOTS: std::cell::RefCell<Vec<std::rc::Rc<dyn std::any::Any>>> =
+        static PRODUCER_ROOTS: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
@@ -310,7 +310,7 @@ pub(crate) mod test_support {
     /// still finds the live producer instead of a dangling `Weak`.
     pub(crate) fn rooted_resop_operand(tp: Type, position: u32) -> Operand {
         let (operand, op) = bound_resop_operand(tp, position);
-        let rooted: std::rc::Rc<dyn std::any::Any> = op;
+        let rooted: Box<dyn std::any::Any> = Box::new(op);
         PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
         operand
     }
@@ -320,7 +320,7 @@ pub(crate) mod test_support {
     /// re-resolution stays bound.
     pub(crate) fn rooted_inputarg_operand(tp: Type, index: u32) -> Operand {
         let (operand, ia) = bound_inputarg_operand(tp, index);
-        let rooted: std::rc::Rc<dyn std::any::Any> = ia;
+        let rooted: Box<dyn std::any::Any> = Box::new(ia);
         PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
         operand
     }
@@ -367,7 +367,7 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn op(&mut self, opcode: OpCode, args: &[Operand]) -> Operand {
-            let op = std::rc::Rc::new(Op::new(opcode, args));
+            let op = OpRc::new(Op::new(opcode, args));
             op.pos()
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;
@@ -382,7 +382,7 @@ pub(crate) mod test_support {
             args: &[Operand],
             descr: majit_ir::DescrRef,
         ) -> Operand {
-            let op = std::rc::Rc::new(Op::with_descr(opcode, args, descr));
+            let op = OpRc::new(Op::with_descr(opcode, args, descr));
             op.pos()
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;
@@ -502,7 +502,7 @@ impl TreeLoop {
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
         TreeLoop {
             inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
-            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+            ops: ops.into_iter().map(OpRc::new).collect(),
             snapshots: Vec::new(),
         }
     }
@@ -515,7 +515,7 @@ impl TreeLoop {
     ) -> Self {
         TreeLoop {
             inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
-            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+            ops: ops.into_iter().map(OpRc::new).collect(),
             snapshots,
         }
     }
@@ -1167,7 +1167,7 @@ impl TreeLoop {
             }
             // Prefix ops don't need fail_args (they're not guards).
             new_op.clearfailargs();
-            new_ops.push(std::rc::Rc::new(new_op));
+            new_ops.push(OpRc::new(new_op));
         }
 
         // Phase 6: Remap post-cut ops.
@@ -1201,7 +1201,7 @@ impl TreeLoop {
                     "cut-trace op carried fail_args: {cut_opcode:?}"
                 );
             }
-            new_ops.push(std::rc::Rc::new(new_op));
+            new_ops.push(OpRc::new(new_op));
         }
 
         // opencoder.py parity: carry snapshots through cut_trace_from.
@@ -1724,7 +1724,7 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
         let mut trace2 = trace.clone();
 
-        trace2.ops.push(std::rc::Rc::new(Op::new(
+        trace2.ops.push(OpRc::new(Op::new(
             OpCode::IntSub,
             &[iarg_box(0), iarg_box(0)],
         )));

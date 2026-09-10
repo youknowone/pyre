@@ -17,7 +17,6 @@ use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
 use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
 use majit_ir::{Const, ConstMap, GcRef, Value};
-use std::rc::Rc;
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
@@ -120,7 +119,7 @@ fn intern_constptr_operand(
     Some(match recently_loaded.get(&index) {
         Some(load) => load.clone(),
         None => {
-            let load_op = std::rc::Rc::new(mk_op(
+            let load_op = OpRc::new(mk_op(
                 OpCode::LoadFromGcTable,
                 &[Operand::const_from_value(Value::Int(index as i64))],
             ));
@@ -808,7 +807,7 @@ impl RewriteState {
             pos
         };
         op.pos().set(pos);
-        self.push_emitted(Rc::new(op), pos)
+        self.push_emitted(OpRc::new(op), pos)
     }
 
     /// Emit a result-producing op, preserving the provided position when the
@@ -827,7 +826,7 @@ impl RewriteState {
             preferred_pos
         };
         op.pos().set(pos);
-        self.push_emitted(Rc::new(op), pos)
+        self.push_emitted(OpRc::new(op), pos)
     }
 
     fn push_emitted(&mut self, rc: OpRc, pos: OpRef) -> Operand {
@@ -845,7 +844,7 @@ impl RewriteState {
     fn emit_op(&mut self, op: &OpRc) -> Operand {
         let keep = op.opcode == OpCode::JitDebug;
         let mut replaced = false;
-        let mut out = Rc::clone(op);
+        let mut out = op.clone();
         for i in 0..out.num_args() {
             let orig = out.arg(i);
             let mut arg = self.resolve(orig.clone());
@@ -3390,7 +3389,7 @@ impl GcRewriter for GcRewriterImpl {
             // rewrite.py — if `remove_tested_failarg` rewrote this
             // op on a previous iteration, use the stashed replacement.
             let owned = st.changed_ops.swap_remove(&i);
-            let op_rc: OpRc = owned.map(Rc::new).unwrap_or_else(|| Rc::clone(orig_op));
+            let op_rc: OpRc = owned.map(OpRc::new).unwrap_or_else(|| orig_op.clone());
             let op: &Op = &op_rc;
             st.current_i = i;
 
@@ -3536,7 +3535,7 @@ impl GcRewriter for GcRewriterImpl {
                     let same_pos = st.emit_result(same, OpRef::NONE);
                     let newop =
                         op.copy_and_change(OpCode::GuardValue, Some(&[same_pos, one]), None);
-                    st.emit_op(&Rc::new(newop));
+                    st.emit_op(&OpRc::new(newop));
                 }
 
                 // ── Guards: emit_pending_zeros was already called at the
@@ -4675,21 +4674,21 @@ mod tests {
         let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(2))]);
         guard.store_final_boxes(vec![ro(OpRef::int_op(0))]);
         let boxed: Vec<OpRc> = vec![
-            Rc::new(Op::new(
+            OpRc::new(Op::new(
                 OpCode::IntAdd,
                 &[ro(OpRef::int_op(0)), ro(OpRef::int_op(1))],
             )),
-            Rc::new(guard),
-            Rc::new(Op::new(OpCode::Jump, &[])),
+            OpRc::new(guard),
+            OpRc::new(Op::new(OpCode::Jump, &[])),
         ];
-        let recorded = Rc::clone(&boxed[1]);
+        let recorded = boxed[1].clone();
         let result = GcRewriter::rewrite_for_gc(&rw, &boxed);
         let out = result
             .iter()
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard survives rewrite");
         assert!(
-            Rc::ptr_eq(out, &recorded),
+            OpRc::ptr_eq(out, &recorded),
             "emit_op must not mint a second ResOperation when failargs are unchanged"
         );
     }
@@ -6539,9 +6538,8 @@ mod tests {
 
     #[test]
     fn remove_bridge_exception_strips_unused_prefix() {
-        use std::rc::Rc;
-        let class = Rc::new(Op::new(OpCode::SaveExcClass, &[]));
-        let value = Rc::new(Op::new(OpCode::SaveException, &[]));
+        let class = OpRc::new(Op::new(OpCode::SaveExcClass, &[]));
+        let value = OpRc::new(Op::new(OpCode::SaveException, &[]));
         let restore = Op::new(
             OpCode::RestoreException,
             &[
@@ -6564,9 +6562,8 @@ mod tests {
 
     #[test]
     fn remove_bridge_exception_keeps_prefix_when_value_reused() {
-        use std::rc::Rc;
-        let class = Rc::new(Op::new(OpCode::SaveExcClass, &[]));
-        let value = Rc::new(Op::new(OpCode::SaveException, &[]));
+        let class = OpRc::new(Op::new(OpCode::SaveExcClass, &[]));
+        let value = OpRc::new(Op::new(OpCode::SaveException, &[]));
         let restore = Op::new(
             OpCode::RestoreException,
             &[

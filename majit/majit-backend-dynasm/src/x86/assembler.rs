@@ -103,7 +103,7 @@ mod tests {
 
     use majit_backend::{Backend, JitCellToken};
     use majit_ir::operand::Operand;
-    use majit_ir::{Op, OpCode, OpRef, Type, make_array_descr_signed};
+    use majit_ir::{Op, OpCode, OpRc, OpRef, Type, make_array_descr_signed};
 
     use crate::runner::DynasmBackend;
 
@@ -118,7 +118,7 @@ mod tests {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
 
-        let malloc = Rc::new(Op::new(
+        let malloc = OpRc::new(Op::new(
             OpCode::CallMallocNursery,
             &[Operand::from_opref(OpRef::const_int(32))],
         ));
@@ -131,7 +131,7 @@ mod tests {
 
         let token = JitCellToken::new(517);
         backend
-            .compile_loop(&[], &[malloc, Rc::new(finish)], &token)
+            .compile_loop(&[], &[malloc, OpRc::new(finish)], &token)
             .expect("compile register-resident nursery result trace");
 
         let compiled = token
@@ -155,7 +155,7 @@ mod tests {
         backend.attach_default_test_descrs();
         let mut token = JitCellToken::new(trace_id);
 
-        let word = Rc::new(Op::with_descr(
+        let word = OpRc::new(Op::with_descr(
             OpCode::RawLoadI,
             &[
                 Operand::from_opref(OpRef::const_int(word_addr as i64)),
@@ -164,7 +164,7 @@ mod tests {
             make_array_descr_signed(0, 8, Type::Int, true),
         ));
         word.pos().set(OpRef::int_op(0));
-        let armed = Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
+        let armed = OpRc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
         armed.pos().set(OpRef::int_op(1));
         let guard = Op::new(OpCode::GuardFalse, &[Operand::from_bound_op(&armed)]);
         guard.pos().set(OpRef::void_op(2));
@@ -178,7 +178,7 @@ mod tests {
         backend
             .compile_loop(
                 &[],
-                &[word, armed, Rc::new(guard), Rc::new(finish)],
+                &[word, armed, OpRc::new(guard), OpRc::new(finish)],
                 &mut token,
             )
             .expect("compile eval-breaker poll IR");

@@ -16,11 +16,9 @@
 //! jitframe slot index coincide, so every reader agrees no matter which of the
 //! two it is actually indexing by — the comparison would pass with the
 //! `rd_locs` decode removed entirely, and would be no control at all.
-use std::rc::Rc;
-
 use majit_backend::{Backend, JitCellToken};
 use majit_ir::forwarding::bound_operand_from_opref as rb;
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value, make_loop_target_descr};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_loop_target_descr};
 
 use majit_backend_dynasm::runner::DynasmBackend;
 
@@ -144,7 +142,7 @@ fn finish_one_int() -> Case {
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
-    let ops: Vec<Rc<Op>> = vec![add_op, finish_op].into_iter().map(Rc::new).collect();
+    let ops: Vec<OpRc> = vec![add_op, finish_op].into_iter().map(OpRc::new).collect();
     backend
         .compile_loop(&inputargs, &ops, &token)
         .expect("compile_loop");
@@ -191,9 +189,9 @@ fn guard_one_int() -> Case {
     jump_op.pos().set(OpRef::void_op(4));
     jump_op.setdescr(loop_descr);
 
-    let ops: Vec<Rc<Op>> = vec![label_op, add_op, lt_op, guard_op, jump_op]
+    let ops: Vec<OpRc> = vec![label_op, add_op, lt_op, guard_op, jump_op]
         .into_iter()
-        .map(Rc::new)
+        .map(OpRc::new)
         .collect();
     backend
         .compile_loop(&inputargs, &ops, &token)
@@ -276,11 +274,11 @@ fn guard_float_and_int() -> Case {
     jump_op.pos().set(OpRef::void_op(8));
     jump_op.setdescr(loop_descr);
 
-    let ops: Vec<Rc<Op>> = vec![
+    let ops: Vec<OpRc> = vec![
         label_op, lt_op, guard_op, cast_op, mul_op, add_op, inc_op, jump_op,
     ]
     .into_iter()
-    .map(Rc::new)
+    .map(OpRc::new)
     .collect();
     backend
         .compile_loop(&inputargs, &ops, &token)
@@ -337,9 +335,9 @@ fn guard_with_hole() -> Case {
     jump_op.pos().set(OpRef::void_op(5));
     jump_op.setdescr(loop_descr);
 
-    let ops: Vec<Rc<Op>> = vec![label_op, add_op, dbl_op, lt_op, guard_op, jump_op]
+    let ops: Vec<OpRc> = vec![label_op, add_op, dbl_op, lt_op, guard_op, jump_op]
         .into_iter()
-        .map(Rc::new)
+        .map(OpRc::new)
         .collect();
     backend
         .compile_loop(&inputargs, &ops, &token)

@@ -1243,10 +1243,163 @@ pub trait BoxEnv {
 /// the same `Rc<Op>` and reads/writes `forwarded`/`descr`/...  through
 /// the interior-mutable slots.
 ///
-/// This alias is the shared-identity handle for trace `Op` storage.
-/// Most sites traffic in `OpRc`; the remaining `Vec<Op>` sites keep the
-/// legacy clone-on-copy shape until they are migrated.
-pub type OpRc = std::rc::Rc<Op>;
+/// Shared-identity handle for trace `Op` storage.
+///
+/// `cls()` / `emit_op` mint through [`OpRc::new`]. The handle is a
+/// one-word refcount (no `Weak`) in reserved chunks so first mint
+/// leaves the 48-byte `RcBox<Op>` class. Clone is a count bump; the
+/// last drop returns the slot to the chunk free list.
+pub struct OpRc {
+    ptr: std::ptr::NonNull<OpInner>,
+}
+
+#[repr(C)]
+struct OpInner {
+    strong: std::cell::Cell<usize>,
+    value: Op,
+}
+
+const OP_INNER_CHUNK: usize = 1024;
+
+struct OpInnerHeap {
+    chunks: Vec<(*mut OpInner, usize)>,
+    free: Vec<std::ptr::NonNull<OpInner>>,
+}
+
+unsafe impl Send for OpInnerHeap {}
+unsafe impl Sync for OpInnerHeap {}
+
+static OP_INNER_HEAP: std::sync::Mutex<OpInnerHeap> = std::sync::Mutex::new(OpInnerHeap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn alloc_op_inner() -> std::ptr::NonNull<OpInner> {
+    let mut heap = OP_INNER_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < OP_INNER_CHUNK
+    {
+        let p = unsafe { std::ptr::NonNull::new_unchecked((*base).add(*used)) };
+        *used += 1;
+        return p;
+    }
+    let layout = std::alloc::Layout::array::<OpInner>(OP_INNER_CHUNK).expect("OpInner chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut OpInner };
+    assert!(!base.is_null(), "OpInner chunk alloc failed");
+    heap.chunks.push((base, 1));
+    unsafe { std::ptr::NonNull::new_unchecked(base) }
+}
+
+fn free_op_inner(p: std::ptr::NonNull<OpInner>) {
+    OP_INNER_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+impl OpRc {
+    pub fn new(op: Op) -> Self {
+        let ptr = alloc_op_inner();
+        unsafe {
+            ptr.as_ptr().write(OpInner {
+                strong: std::cell::Cell::new(1),
+                value: op,
+            });
+        }
+        OpRc { ptr }
+    }
+
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr == other.ptr
+    }
+
+    pub fn as_ptr(this: &Self) -> *const Op {
+        unsafe { std::ptr::addr_of!((*this.ptr.as_ptr()).value) }
+    }
+
+    pub fn strong_count(this: &Self) -> usize {
+        unsafe { this.ptr.as_ref().strong.get() }
+    }
+
+    pub fn into_raw(this: Self) -> *const Op {
+        let p = Self::as_ptr(&this);
+        std::mem::forget(this);
+        p
+    }
+
+    pub unsafe fn from_raw(value: *const Op) -> Self {
+        let offset = std::mem::offset_of!(OpInner, value);
+        let inner = (value as usize).wrapping_sub(offset) as *mut OpInner;
+        OpRc {
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(inner) },
+        }
+    }
+
+    pub unsafe fn increment_strong_count(value: *const Op) {
+        let rc = unsafe { Self::from_raw(value) };
+        let extra = rc.clone();
+        std::mem::forget(rc);
+        std::mem::forget(extra);
+    }
+}
+
+impl Clone for OpRc {
+    fn clone(&self) -> Self {
+        let inner = unsafe { self.ptr.as_ref() };
+        inner.strong.set(inner.strong.get() + 1);
+        OpRc { ptr: self.ptr }
+    }
+}
+
+impl Drop for OpRc {
+    fn drop(&mut self) {
+        let inner = unsafe { self.ptr.as_ref() };
+        let n = inner.strong.get() - 1;
+        if n == 0 {
+            unsafe {
+                std::ptr::drop_in_place(&mut (*self.ptr.as_ptr()).value);
+            }
+            free_op_inner(self.ptr);
+        } else {
+            inner.strong.set(n);
+        }
+    }
+}
+
+impl std::ops::Deref for OpRc {
+    type Target = Op;
+    fn deref(&self) -> &Op {
+        unsafe { &self.ptr.as_ref().value }
+    }
+}
+
+impl AsRef<Op> for OpRc {
+    fn as_ref(&self) -> &Op {
+        self
+    }
+}
+
+impl std::borrow::Borrow<Op> for OpRc {
+    fn borrow(&self) -> &Op {
+        self
+    }
+}
+
+impl std::fmt::Debug for OpRc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl From<Op> for OpRc {
+    fn from(op: Op) -> Self {
+        OpRc::new(op)
+    }
+}
 
 /// A single IR operation.
 ///
@@ -5470,7 +5623,12 @@ mod tests {
             let rc_box = op + 2 * std::mem::size_of::<usize>();
             assert!(
                 op <= 32,
-                "Op grew to {op} bytes (RcBox ~{rc_box}); keep Rc<Op> out of the 64-byte class"
+                "Op grew to {op} bytes (RcBox ~{rc_box}); keep the Op payload at 32 B"
+            );
+            let inner = std::mem::size_of::<OpInner>();
+            assert!(
+                inner <= 40,
+                "OpInner grew to {inner} B; OpRc::new must stay out of the 48-byte class"
             );
             let extra = std::mem::size_of::<GuardExtra>();
             assert!(

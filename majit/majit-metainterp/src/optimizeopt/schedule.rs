@@ -583,7 +583,7 @@ impl VecScheduleState {
     /// position binds directly to this `Rc` (`Operand::from_bound_op`) rather
     /// than minting a position-only `Operand::Box`.
     pub fn append_to_oplist(&mut self, op: Op) {
-        self.oplist.push(std::rc::Rc::new(op));
+        self.oplist.push(OpRc::new(op));
     }
 
     /// schedule.py: remember_args_in_vector — after creating a new
@@ -1167,7 +1167,7 @@ pub fn expand(
         let vecop = state.create_vec_op(expand_opcode, &[arg], datatype, bytesize, signed, numops);
         let vecop_pos = vecop.pos().get();
         if is_invariant {
-            state.invariant_oplist.push(std::rc::Rc::new(vecop));
+            state.invariant_oplist.push(OpRc::new(vecop));
             state.invariant_vector_vars.insert(vecop_pos);
         } else {
             state.append_to_oplist(vecop);
@@ -1212,7 +1212,7 @@ pub fn expand(
         state.create_vec_op(vec_create_opcode, &[], datatype, bytesize, signed, numops);
     let mut current_vec = vec_create.pos().get();
     if is_invariant {
-        state.invariant_oplist.push(std::rc::Rc::new(vec_create));
+        state.invariant_oplist.push(OpRc::new(vec_create));
     } else {
         state.append_to_oplist(vec_create);
     }
@@ -1238,7 +1238,7 @@ pub fn expand(
         current_vec = pack_op.pos().get();
         state.costmodel.record_vector_pack(is_float, 0, 1);
         if is_invariant {
-            state.invariant_oplist.push(std::rc::Rc::new(pack_op));
+            state.invariant_oplist.push(OpRc::new(pack_op));
         } else {
             state.append_to_oplist(pack_op);
         }

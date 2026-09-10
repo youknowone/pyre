@@ -8,7 +8,7 @@ pub use crate::optimizeopt::rawbuffer::{
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
     field_descrs.get(field_idx as usize).cloned()
@@ -2485,7 +2485,7 @@ mod tests {
         let pop = PreambleOp {
             op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(88)),
             invented_name: false,
-            preamble_op: std::rc::Rc::new(replay),
+            preamble_op: OpRc::new(replay),
             same_as_source: None,
         };
         info.set_preamble_item(1, pop.clone());
@@ -2518,7 +2518,7 @@ mod tests {
         let pop = PreambleOp {
             op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(88)),
             invented_name: false,
-            preamble_op: std::rc::Rc::new(replay),
+            preamble_op: OpRc::new(replay),
             same_as_source: None,
         };
         info.set_preamble_field(3, pop);

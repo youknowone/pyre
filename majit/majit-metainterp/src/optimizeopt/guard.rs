@@ -11,7 +11,7 @@
 //! (`intbounds.rs`), folding via box-attached `getptrinfo`/`getintbound` +
 //! `make_constant` — `rewrite.py` `optimize_GUARD_*`.
 use indexmap::IndexMap;
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{Op, OpCode, OpRc, OpRef};
 
 use crate::optimizeopt::OptContext;
 use crate::optimizeopt::dependency::IndexVar;
@@ -821,11 +821,11 @@ mod tests {
 
         // Producer ops carry their result positions (base 100) so they do not
         // collide with the inputarg slots `[0, num_inputs)`.
-        let guard_true = std::rc::Rc::new(Op::new(OpCode::GuardTrue, std::slice::from_ref(&i1)));
-        let sub = std::rc::Rc::new(Op::new(OpCode::IntSubOvf, &[i0.clone(), i2.clone()]));
-        let guard_ovf1 = std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
-        let mul = std::rc::Rc::new(Op::new(OpCode::IntMulOvf, &[i2.clone(), i1.clone()]));
-        let guard_ovf2 = std::rc::Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
+        let guard_true = OpRc::new(Op::new(OpCode::GuardTrue, std::slice::from_ref(&i1)));
+        let sub = OpRc::new(Op::new(OpCode::IntSubOvf, &[i0.clone(), i2.clone()]));
+        let guard_ovf1 = OpRc::new(Op::new(OpCode::GuardNoOverflow, &[]));
+        let mul = OpRc::new(Op::new(OpCode::IntMulOvf, &[i2.clone(), i1.clone()]));
+        let guard_ovf2 = OpRc::new(Op::new(OpCode::GuardNoOverflow, &[]));
 
         // Sequential positions from base 100 + a fresh ResumeGuardDescr on
         // every guard. Set positions before binding the producer result boxes
@@ -839,7 +839,7 @@ mod tests {
 
         let sub_box = Operand::from_bound_op(&sub);
         let mul_box = Operand::from_bound_op(&mul);
-        let jump = std::rc::Rc::new(Op::new(
+        let jump = OpRc::new(Op::new(
             OpCode::Jump,
             &[sub_box.clone(), sub_box.clone(), mul_box],
         ));
@@ -903,11 +903,11 @@ mod tests {
         let i0 = rooted_inputarg_operand(Type::Int, 0);
         let i1 = rooted_inputarg_operand(Type::Int, 1);
         // v = (i0 > i1): intbounds bounds the comparison result to [0,1].
-        let int_gt = std::rc::Rc::new(Op::new(OpCode::IntGt, &[i0, i1]));
+        let int_gt = OpRc::new(Op::new(OpCode::IntGt, &[i0, i1]));
         int_gt.pos().set(OpRef::int_op(100));
         let v = Operand::from_bound_op(&int_gt);
         // guard_value(v, 1)
-        let guard_value = std::rc::Rc::new(Op::new(
+        let guard_value = OpRc::new(Op::new(
             OpCode::GuardValue,
             &[v, Operand::const_from_value(Value::Int(1))],
         ));

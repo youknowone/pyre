@@ -5,7 +5,7 @@ use majit_ir::operand::Operand;
 /// Translated from rpython/jit/metainterp/optimizeopt/rewrite.py.
 /// Rewrites operations into equivalent, cheaper operations.
 /// This includes constant folding for pure ops and algebraic identities.
-use majit_ir::{Op, OpCode, OpRef, Value};
+use majit_ir::{Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
@@ -1028,7 +1028,7 @@ impl OptRewrite {
                             Some(Some(new_descr)),
                         );
                         // rewrite.py:343: self.optimizer.replace_guard(op, info)
-                        ctx.replace_new_operation(old_idx, std::rc::Rc::new(replacement));
+                        ctx.replace_new_operation(old_idx, OpRc::new(replacement));
                         // rewrite.py:345-346: info.reset_last_guard_pos()
                         if let Some(b) = obj_box.as_ref() {
                             ctx.with_ptr_info_mut(b, |info_mut| info_mut.reset_last_guard_pos());
@@ -1127,7 +1127,7 @@ impl OptRewrite {
                     Some(&[old_guard.arg(0), op.arg(1)]),
                     Some(Some(new_descr)),
                 );
-                ctx.replace_new_operation(old_idx, std::rc::Rc::new(combined));
+                ctx.replace_new_operation(old_idx, OpRc::new(combined));
                 // rewrite.py postprocess_GUARD_CLASS parity
                 // (invoked inline here because the replacement path
                 // rewrites `new_operations[old_idx]` directly instead
@@ -2430,7 +2430,7 @@ impl Optimization for OptRewrite {
                             LoopInvariantEntry::Preamble(PreambleOp {
                                 op: source_op,
                                 invented_name: false,
-                                preamble_op: std::rc::Rc::new(replay),
+                                preamble_op: OpRc::new(replay),
                                 // Non-invented loop-invariant producer: the
                                 // SameAs arm is never taken, so no source.
                                 same_as_source: None,
@@ -2733,7 +2733,7 @@ mod tests {
                 .iter()
                 .map(|&p| Operand::from_bound_op(&ops[p as usize]))
                 .collect();
-            let op = std::rc::Rc::new(Op::new(spec.opcode, &arg_ops));
+            let op = OpRc::new(Op::new(spec.opcode, &arg_ops));
             op.pos()
                 .set(OpRef::op_typed(pos as u32, spec.opcode.result_type()));
             ops.push(op);
@@ -2794,7 +2794,7 @@ mod tests {
         let mut passes = test_pass_chain();
         let mut op = (*ops[target]).clone();
         resolve_op_args_in_ctx(&mut op, &mut ctx);
-        let op_rc = std::rc::Rc::new(op.clone());
+        let op_rc = OpRc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let mut result = OptimizationResult::PassOn;
         for pass in passes.iter_mut() {
@@ -2857,7 +2857,7 @@ mod tests {
         let mut pass = OptRewrite::new();
         let mut op = (*ops[target]).clone();
         resolve_op_args_in_ctx(&mut op, &mut ctx);
-        let op_rc = std::rc::Rc::new(op.clone());
+        let op_rc = OpRc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let result = pass.propagate_forward(&op, &op_rc, &mut ctx);
         (result, ctx)
@@ -2917,7 +2917,7 @@ mod tests {
             let mut resolved = (**op).clone();
             resolve_op_args_in_ctx(&mut resolved, &mut ctx);
 
-            let __pf_rc = std::rc::Rc::new(resolved.clone());
+            let __pf_rc = OpRc::new(resolved.clone());
             ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
             let mut result = OptimizationResult::PassOn;
             for pass in passes.iter_mut() {
@@ -3006,7 +3006,7 @@ mod tests {
         for op in &ops[num_inputs..] {
             let mut resolved = (**op).clone();
             resolve_op_args_in_ctx(&mut resolved, &mut ctx);
-            let op_rc = std::rc::Rc::new(resolved.clone());
+            let op_rc = OpRc::new(resolved.clone());
             ctx.bind_input_resops(std::slice::from_ref(&op_rc));
             let mut result = OptimizationResult::PassOn;
             for pass in passes.iter_mut() {
@@ -3341,7 +3341,7 @@ mod tests {
             majit_ir::EffectInfo::new(majit_ir::ExtraEffect::ElidableCanRaise, oopspecindex),
         )));
         resolve_op_args_in_ctx(&mut call, &mut ctx);
-        let op_rc = std::rc::Rc::new(call.clone());
+        let op_rc = OpRc::new(call.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&call, &op_rc, &mut ctx);
@@ -3616,7 +3616,7 @@ mod tests {
         arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
         let mut guard = Op::new(OpCode::GuardIsnull, std::slice::from_ref(&arg));
         guard.pos().set(OpRef::void_op(0));
-        let guard_rc = std::rc::Rc::new(guard.clone());
+        let guard_rc = OpRc::new(guard.clone());
         let mut pass = OptRewrite::new();
 
         let result = pass.propagate_forward(&guard, &guard_rc, &mut ctx);
@@ -3635,7 +3635,7 @@ mod tests {
             &[arg, Operand::const_from_value(majit_ir::Value::Ref(value))],
         );
         guard.pos().set(OpRef::void_op(0));
-        let guard_rc = std::rc::Rc::new(guard.clone());
+        let guard_rc = OpRc::new(guard.clone());
         let mut pass = OptRewrite::new();
 
         let result = pass.propagate_forward(&guard, &guard_rc, &mut ctx);
@@ -3693,7 +3693,7 @@ mod tests {
             for i in 0..resolved.num_args() {
                 resolved.setarg(i, ctx.resolve_operand_operand(&resolved.arg(i)));
             }
-            let __pf_rc = std::rc::Rc::new(resolved.clone());
+            let __pf_rc = OpRc::new(resolved.clone());
             ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
             let mut result = OptimizationResult::PassOn;
             // The production loop absorbs SameAs* before the passes
@@ -3762,7 +3762,7 @@ mod tests {
                 for i in 0..resolved.num_args() {
                     resolved.setarg(i, ctx.resolve_operand_operand(&resolved.arg(i)));
                 }
-                let __pf_rc = std::rc::Rc::new(resolved.clone());
+                let __pf_rc = OpRc::new(resolved.clone());
                 ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
                 let mut result = OptimizationResult::PassOn;
                 // SameAsI input fixtures bypass the passes, as in the
@@ -3961,7 +3961,7 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         // Process op1 first (pass it through)
-        let __pf_rc = std::rc::Rc::new((*ops[1]).clone());
+        let __pf_rc = OpRc::new((*ops[1]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result1 = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
@@ -3970,7 +3970,7 @@ mod tests {
         // Process op2: should detect double negation
         let mut resolved2 = (*ops[2]).clone();
         resolve_op_args_in_ctx(&mut resolved2, &mut ctx);
-        let __pf_rc = std::rc::Rc::new(resolved2.clone());
+        let __pf_rc = OpRc::new(resolved2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result2 = pass.propagate_forward(&resolved2, &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
@@ -4270,13 +4270,13 @@ mod tests {
         // Process CondCallN -> removed
         let mut resolved2 = (*ops[2]).clone();
         resolve_op_args_in_ctx(&mut resolved2, &mut ctx);
-        let __pf_rc = std::rc::Rc::new(resolved2.clone());
+        let __pf_rc = OpRc::new(resolved2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result2 = pass.propagate_forward(&resolved2, &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
 
         // Process GuardNoException -> should also be removed
-        let __pf_rc = std::rc::Rc::new((*ops[3]).clone());
+        let __pf_rc = OpRc::new((*ops[3]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result3 = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
         assert!(matches!(result3, OptimizationResult::Remove));
@@ -4295,14 +4295,14 @@ mod tests {
 
         let mut pass = OptRewrite::new();
         // Process CallN -> PassOn (not handled by OptRewrite)
-        let __pf_rc = std::rc::Rc::new((*ops[1]).clone());
+        let __pf_rc = OpRc::new((*ops[1]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result1 = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit((*ops[1]).clone());
 
         // Process GuardNoException -> should NOT be removed
-        let __pf_rc = std::rc::Rc::new((*ops[2]).clone());
+        let __pf_rc = OpRc::new((*ops[2]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
         let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
         assert!(matches!(result2, OptimizationResult::PassOn));
@@ -4336,7 +4336,7 @@ mod tests {
         let (_i1, i1_rc) = bound_inputarg_operand(majit_ir::Type::Int, 1);
         // A live producer for v (IntGt result) at int_op(2), held in
         // `int_gt` for the body of the test.
-        let int_gt = std::rc::Rc::new(Op::new(
+        let int_gt = OpRc::new(Op::new(
             OpCode::IntGt,
             &[
                 Operand::from_bound_inputarg(&i0_rc),
