@@ -170,6 +170,13 @@ pub struct MIFrame {
     pub parent_snapshot: i64,
     /// pyjitpl.py `self.unroll_iterations = 1`.
     pub unroll_iterations: usize,
+    /// Merge-point Ref reds and the InputArg they were seeded with.
+    ///
+    /// The reserved colour can be overwritten in the walker register
+    /// file (a later store reuses the slot). Snapshots must still name
+    /// the original InputArg so resume dumps a live box, not
+    /// `ConstPtr` of this eval's stack address.
+    pub portal_red_refs: Vec<(u16, OpRef)>,
 }
 
 impl MIFrame {
@@ -219,7 +226,15 @@ impl MIFrame {
             pushed_box: None,
             parent_snapshot: -1,
             unroll_iterations: 1,
+            portal_red_refs: Vec::new(),
         }
+    }
+
+    fn portal_red_ref_at(&self, idx: usize) -> Option<OpRef> {
+        let idx = u16::try_from(idx).ok()?;
+        self.portal_red_refs
+            .iter()
+            .find_map(|&(reg, opref)| (reg == idx).then_some(opref))
     }
 
     /// `history.py AbstractValue.getref_base()` for one entry of
@@ -328,6 +343,7 @@ impl MIFrame {
         self.pushed_box = None;
         self.parent_snapshot = -1;
         self.unroll_iterations = 1;
+        self.portal_red_refs.clear();
         if let Some(ctx) = ctx {
             self.copy_constants(ctx);
         }
@@ -910,11 +926,19 @@ impl MIFrame {
                     // pyjitpl.py:186-187 CONST_NULL clearing.
                     OpBox::ConstPtr(0)
                 } else if idx < num_regs_r {
-                    let opref = self.ref_regs[idx]
-                        .expect("get_list_of_active_boxes: ref register uninitialized");
-                    let value = self.ref_values[idx]
-                        .expect("get_list_of_active_boxes: ref value uninitialized");
-                    register_to_box_ref(opref, value, unique_to_box)
+                    if let Some(portal) = self.portal_red_ref_at(idx) {
+                        register_to_box_ref(
+                            portal,
+                            self.ref_values[idx].unwrap_or(0),
+                            unique_to_box,
+                        )
+                    } else {
+                        let opref = self.ref_regs[idx]
+                            .expect("get_list_of_active_boxes: ref register uninitialized");
+                        let value = self.ref_values[idx]
+                            .expect("get_list_of_active_boxes: ref value uninitialized");
+                        register_to_box_ref(opref, value, unique_to_box)
+                    }
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_r, ...,
                     // ConstPtrJitCode)` — constants_r store raw GC
@@ -1152,21 +1176,26 @@ impl MIFrame {
                 let tagged = if Some(idx) == clear_ref_idx {
                     SnapshotTagged::Const(0, Type::Ref)
                 } else if idx < num_regs_r {
-                    let opref = self.ref_regs[idx]
-                        .expect("get_list_of_active_snapshot_boxes: ref register uninitialized");
-                    let value = self.ref_values[idx]
-                        .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
-                    if opref.is_constant() {
-                        // history.py `ConstPtr.value` — take the forwarded
-                        // gcref from the inline `OpRef::ConstPtr`, not the
-                        // unforwarded `ref_values` mirror (stale after a move).
-                        let bits = match opref {
-                            OpRef::ConstPtr(gcref) => gcref.0 as i64,
-                            _ => value,
-                        };
-                        SnapshotTagged::Const(bits, Type::Ref)
+                    if let Some(portal) = self.portal_red_ref_at(idx) {
+                        SnapshotTagged::Box(portal, Type::Ref)
                     } else {
-                        SnapshotTagged::Box(opref, Type::Ref)
+                        let opref = self.ref_regs[idx].expect(
+                            "get_list_of_active_snapshot_boxes: ref register uninitialized",
+                        );
+                        let value = self.ref_values[idx]
+                            .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
+                        if opref.is_constant() {
+                            // history.py `ConstPtr.value` — take the forwarded
+                            // gcref from the inline `OpRef::ConstPtr`, not the
+                            // unforwarded `ref_values` mirror (stale after a move).
+                            let bits = match opref {
+                                OpRef::ConstPtr(gcref) => gcref.0 as i64,
+                                _ => value,
+                            };
+                            SnapshotTagged::Const(bits, Type::Ref)
+                        } else {
+                            SnapshotTagged::Box(opref, Type::Ref)
+                        }
                     }
                 } else {
                     SnapshotTagged::Const(

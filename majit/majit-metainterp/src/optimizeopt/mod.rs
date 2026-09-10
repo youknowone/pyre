@@ -1466,7 +1466,20 @@ fn const_value_as_word(value: Value) -> (i64, majit_ir::Type) {
 
 impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     fn get_box_replacement(&self, opref: OpRef) -> OpRef {
-        self.ctx.get_replacement_opref(opref)
+        let walked = self.ctx.get_replacement_opref(opref);
+        // `_number_boxes` does `box = get_box_replacement(box)` then
+        // `isinstance(box, Const)`. A stack-resident InputArg folded
+        // to ConstPtr would TAGCONST and drop out of the dump. Stay
+        // on the InputArg so the next `Vm::new` still has a livebox.
+        if opref.is_input_arg()
+            && walked.is_constant()
+            && walked
+                .inline_const_bits()
+                .is_some_and(|bits| OptContext::ref_addr_is_stack_resident(bits as usize))
+        {
+            return opref;
+        }
+        walked
     }
 
     fn get_box_replacement_operand(&self, opref: OpRef) -> Operand {
@@ -1511,13 +1524,27 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         let Some(replacement) = self.ctx.get_box_replacement_operand_opt(opref) else {
             return false;
         };
-        if replacement.const_value().is_some() {
-            return true;
+        if let Some(value) = replacement.const_value() {
+            // A stack-resident red forwarded to ConstPtr must stay a
+            // TAGBOX. `isinstance(box, Const)` is true of a real Const
+            // snapshot slot (`opref.is_constant()` above); an InputArg
+            // whose replacement is this-eval's stack address is not.
+            return match value {
+                majit_ir::Value::Ref(gcref) => !OptContext::ref_addr_is_stack_resident(gcref.0),
+                _ => true,
+            };
         }
-        matches!(
-            self.ctx.peek_ptr_info(&replacement),
-            Some(crate::optimizeopt::info::PtrInfo::Constant(_))
-        )
+        match self.ctx.peek_ptr_info(&replacement) {
+            Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) => {
+                // resume.py uses getptrinfo only for `is_virtual`. A
+                // stack-resident red that the tracer snapshotted as
+                // ConstPtr is remapped to its InputArg; numbering that
+                // InputArg as TAGCONST would drop it from the failargs
+                // again. Heap ConstPtrInfo stays Const (PyPy identity).
+                !OptContext::ref_addr_is_stack_resident(gcref.0)
+            }
+            _ => false,
+        }
     }
 
     fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
@@ -6969,6 +6996,81 @@ impl OptContext {
         resolved
     }
 
+    /// Recover a declared Ref inputarg that the IR fail_args still
+    /// name but snapshot numbering dropped as TAGCONST.
+    ///
+    /// Grain's `Vm` / frame live on the stack and change every
+    /// `Vm::new`. The tracer can snapshot them as `ConstPtr(this
+    /// eval)`, so `_number_boxes` never puts the InputArg in
+    /// liveboxes and `rebind_bridge_reds` bakes that address. If the
+    /// optimizer kept the InputArg (or folded it only to a
+    /// stack-resident ConstPtr), put it back as a failarg. Heap
+    /// InputArgs that numbered as TAGCONST stay Const.
+    fn should_recover_stack_red_failarg(&self, resolved: &Operand) -> bool {
+        if !resolved.is_inputarg() || resolved.type_() != Type::Ref {
+            return false;
+        }
+        let opref = resolved.to_opref();
+        if !self.inputargs.iter().any(|ia| *ia == opref) {
+            return false;
+        }
+        if let Some(Value::Ref(gcref)) = resolved.get_value() {
+            return Self::ref_addr_is_stack_resident(gcref.0);
+        }
+        if let Some(PtrInfo::Constant(gcref)) = self.peek_ptr_info(resolved) {
+            return Self::ref_addr_is_stack_resident(gcref.0);
+        }
+        let walked = self.get_replacement_opref(opref);
+        if walked.is_constant() {
+            return walked
+                .inline_const_bits()
+                .is_some_and(|bits| Self::ref_addr_is_stack_resident(bits as usize));
+        }
+        // Still an InputArg: the optimizer refused the fold, the
+        // snapshot just never carried the box.
+        true
+    }
+
+    fn recover_stack_reds_into_liveboxes(
+        &self,
+        op: &Op,
+        liveboxes: &mut Vec<OpRef>,
+        livebox_types: &mut crate::resume::LiveboxTypeMap,
+    ) {
+        let Some(fail_args) = op.guard_fail_args() else {
+            return;
+        };
+        let extra: Vec<OpRef> = fail_args
+            .iter()
+            .filter_map(|fa| {
+                let resolved = self
+                    .get_box_replacement_not_const_operand(fa)
+                    .unwrap_or_else(|| fa.clone());
+                let keep = self.should_recover_stack_red_failarg(&resolved);
+                if std::env::var_os("MAJIT_ISCONST_DEBUG").is_some()
+                    && (resolved.is_inputarg() || fa.is_inputarg())
+                    && resolved.type_() == Type::Ref
+                {
+                    eprintln!(
+                        "[recover-red] fa={:?} resolved={:?} keep={keep} in_inputs={} walked={:?}",
+                        fa.to_opref(),
+                        resolved.to_opref(),
+                        self.inputargs.iter().any(|ia| *ia == resolved.to_opref()),
+                        self.get_replacement_opref(resolved.to_opref()),
+                    );
+                }
+                keep.then(|| resolved.to_opref())
+            })
+            .collect();
+        for opref in extra {
+            if liveboxes.iter().any(|existing| *existing == opref) {
+                continue;
+            }
+            liveboxes.push(opref);
+            livebox_types.insert(opref, Type::Ref);
+        }
+    }
+
     /// RPython optimizer.py store_final_boxes_in_guard inline.
     /// Called from emit() for every guard during optimization. Produces
     /// rd_numb via memo.number() using the CURRENT optimizer state
@@ -7280,12 +7382,14 @@ impl OptContext {
 
         // resume.py, 520-558: pending_setfields are passed to finish()
         // which handles register_box, visitor_walk_recursive, and tagging.
-        let Ok((rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)) =
+        let Ok((rd_numb, rd_consts, rd_virtuals, mut liveboxes, mut livebox_types)) =
             memo.finish(numb_state, &env, &mut pending_setfields, knowledge.as_ref())
         else {
             self.signal_invalid_loop("resume numbering: TagOverflow");
             return;
         };
+        drop((memo, env));
+        self.recover_stack_reds_into_liveboxes(op, &mut liveboxes, &mut livebox_types);
 
         if crate::callee_rca_enabled() {
             let vable_items = if rd_numb.len() >= 3 {
@@ -9975,6 +10079,50 @@ mod boxref_forwarding_tests {
         assert!(
             b1.get_box_replacement(false).is_constant(),
             "heap InputArg stays foldable (PyPy GC identity)"
+        );
+    }
+
+    #[test]
+    fn recovers_unfolded_ref_inputarg_missing_from_liveboxes() {
+        use majit_ir::GcRef;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
+        let (b0, _ia0) = bound_inputarg_operand(Type::Ref, 0);
+        ctx.seed_boxes_canonical(&[b0.clone()]);
+        ctx.inputargs = vec![OpRef::input_arg_typed(0, Type::Ref)];
+        assert!(
+            ctx.should_recover_stack_red_failarg(&b0),
+            "a declared Ref inputarg that is still a box must be recovered"
+        );
+        let heap = GcRef(0x0000_0001_0000_0000);
+        let (b1, ia1) = bound_inputarg_operand(Type::Ref, 1);
+        ia1.set_value(Value::Ref(heap));
+        ctx.seed_boxes_canonical(&[b1.clone()]);
+        ctx.make_constant_box(&b1, Value::Ref(heap));
+        ctx.inputargs = vec![
+            OpRef::input_arg_typed(0, Type::Ref),
+            OpRef::input_arg_typed(1, Type::Ref),
+        ];
+        assert!(
+            !ctx.should_recover_stack_red_failarg(&b1),
+            "a heap InputArg folded to ConstPtr must stay TAGCONST"
+        );
+    }
+
+    #[test]
+    fn recover_does_not_invent_a_failarg_absent_from_the_guard() {
+        use majit_ir::resoperation::{Op, OpCode};
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
+        let (b0, _ia0) = bound_inputarg_operand(Type::Ref, 0);
+        ctx.seed_boxes_canonical(&[b0.clone()]);
+        ctx.inputargs = vec![OpRef::input_arg_typed(0, Type::Ref)];
+        let guard = Op::new(OpCode::GuardTrue, &[]);
+        let mut liveboxes = Vec::new();
+        let mut livebox_types = crate::resume::LiveboxTypeMap::default();
+        ctx.recover_stack_reds_into_liveboxes(&guard, &mut liveboxes, &mut livebox_types);
+        assert!(
+            liveboxes.is_empty(),
+            "rd_numb is built from the snapshot; extra liveboxes without a \
+             numbering slot desynchronize resume"
         );
     }
 
