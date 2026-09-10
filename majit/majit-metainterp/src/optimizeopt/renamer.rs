@@ -6,7 +6,7 @@
 use std::rc::Rc;
 
 use majit_ir::resoperation::{Op, OpCode, OpRc};
-use majit_ir::{InputArg, OpRef, Type};
+use majit_ir::{InputArg, InputArgRc, OpRef, Type};
 
 use indexmap::IndexMap;
 use majit_ir::operand::Operand;
@@ -90,7 +90,7 @@ impl Renamer {
         let pos = r.raw();
         match r {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                let ia = Rc::new(InputArg::from_type(ty, pos));
+                let ia = InputArgRc::new(InputArg::from_type(ty, pos));
                 let b = Operand::from_bound_inputarg(&ia);
                 self.producer_roots.push(Box::new(ia));
                 b

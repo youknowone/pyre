@@ -132,7 +132,8 @@ use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::{
-    Const, FailDescr, GcRef, IndexMapExt, InputArg, Op, OpCode, OpRc, OpRef, Type, Value,
+    Const, FailDescr, GcRef, IndexMapExt, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type,
+    Value,
 };
 
 use crate::blackhole::ExceptionState;
@@ -1510,7 +1511,7 @@ fn densify_root_loop_inputargs(
                     opref
                 )
             });
-            let dense = std::rc::Rc::new(InputArg::from_type(tp, position as u32));
+            let dense = InputArgRc::new(InputArg::from_type(tp, position as u32));
             replacements.insert(opref, dense.clone());
             InputArg::from_type(tp, position as u32)
         })
@@ -14949,7 +14950,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_trace_data = TreeLoop::from_oprc(
             bridge_inputargs
                 .iter()
-                .map(|arg| std::rc::Rc::new(arg.fresh_value_copy()))
+                .map(|arg| InputArgRc::new(arg.fresh_value_copy()))
                 .collect(),
             prepared_ops,
             Vec::new(),

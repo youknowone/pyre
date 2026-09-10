@@ -516,19 +516,19 @@ impl InputArg {
     }
 
     pub fn new_int_rc(index: u32) -> InputArgRc {
-        std::rc::Rc::new(Self::new_int(index))
+        InputArgRc::new(Self::new_int(index))
     }
 
     pub fn new_ref_rc(index: u32) -> InputArgRc {
-        std::rc::Rc::new(Self::new_ref(index))
+        InputArgRc::new(Self::new_ref(index))
     }
 
     pub fn new_float_rc(index: u32) -> InputArgRc {
-        std::rc::Rc::new(Self::new_float(index))
+        InputArgRc::new(Self::new_float(index))
     }
 
     pub fn from_type_rc(tp: Type, index: u32) -> InputArgRc {
-        std::rc::Rc::new(Self::from_type(tp, index))
+        InputArgRc::new(Self::from_type(tp, index))
     }
 
     /// Returns the OpRef referencing this input arg's slot.
@@ -548,10 +548,163 @@ impl InputArg {
 /// PyPy's `inputargs` list holds Python objects that are reachable
 /// unchanged from `TreeLoop.inputargs`, the optimizer's exported state,
 /// the short preamble, resume metadata, and the backend's regalloc
-/// surface. Pyre matches that shape by wrapping every `InputArg` in
-/// `Rc` so all consumers traffic in the same identity and observe the
-/// same `_forwarded` slot via `inputarg.forwarded`.
-pub type InputArgRc = std::rc::Rc<InputArg>;
+/// surface. The handle is a one-word refcount (no `Weak`) in reserved
+/// chunks so `from_type_rc` leaves the 48-byte `RcBox<InputArg>` class.
+pub struct InputArgRc {
+    ptr: std::ptr::NonNull<InputArgInner>,
+}
+
+#[repr(C)]
+struct InputArgInner {
+    strong: std::cell::Cell<usize>,
+    value: InputArg,
+}
+
+const INPUTARG_INNER_CHUNK: usize = 1024;
+
+struct InputArgInnerHeap {
+    chunks: Vec<(*mut InputArgInner, usize)>,
+    free: Vec<std::ptr::NonNull<InputArgInner>>,
+}
+
+unsafe impl Send for InputArgInnerHeap {}
+unsafe impl Sync for InputArgInnerHeap {}
+
+static INPUTARG_INNER_HEAP: std::sync::Mutex<InputArgInnerHeap> =
+    std::sync::Mutex::new(InputArgInnerHeap {
+        chunks: Vec::new(),
+        free: Vec::new(),
+    });
+
+fn alloc_inputarg_inner() -> std::ptr::NonNull<InputArgInner> {
+    let mut heap = INPUTARG_INNER_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < INPUTARG_INNER_CHUNK
+    {
+        let p = unsafe { std::ptr::NonNull::new_unchecked((*base).add(*used)) };
+        *used += 1;
+        return p;
+    }
+    let layout = std::alloc::Layout::array::<InputArgInner>(INPUTARG_INNER_CHUNK)
+        .expect("InputArgInner chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut InputArgInner };
+    assert!(!base.is_null(), "InputArgInner chunk alloc failed");
+    heap.chunks.push((base, 1));
+    unsafe { std::ptr::NonNull::new_unchecked(base) }
+}
+
+fn free_inputarg_inner(p: std::ptr::NonNull<InputArgInner>) {
+    INPUTARG_INNER_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+impl InputArgRc {
+    pub fn new(ia: InputArg) -> Self {
+        let ptr = alloc_inputarg_inner();
+        unsafe {
+            ptr.as_ptr().write(InputArgInner {
+                strong: std::cell::Cell::new(1),
+                value: ia,
+            });
+        }
+        InputArgRc { ptr }
+    }
+
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr == other.ptr
+    }
+
+    pub fn as_ptr(this: &Self) -> *const InputArg {
+        unsafe { std::ptr::addr_of!((*this.ptr.as_ptr()).value) }
+    }
+
+    pub fn strong_count(this: &Self) -> usize {
+        unsafe { this.ptr.as_ref().strong.get() }
+    }
+
+    pub fn into_raw(this: Self) -> *const InputArg {
+        let p = Self::as_ptr(&this);
+        std::mem::forget(this);
+        p
+    }
+
+    pub unsafe fn from_raw(value: *const InputArg) -> Self {
+        let offset = std::mem::offset_of!(InputArgInner, value);
+        let inner = (value as usize).wrapping_sub(offset) as *mut InputArgInner;
+        InputArgRc {
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(inner) },
+        }
+    }
+
+    pub unsafe fn increment_strong_count(value: *const InputArg) {
+        let rc = unsafe { Self::from_raw(value) };
+        let extra = rc.clone();
+        std::mem::forget(rc);
+        std::mem::forget(extra);
+    }
+}
+
+impl Clone for InputArgRc {
+    fn clone(&self) -> Self {
+        let inner = unsafe { self.ptr.as_ref() };
+        inner.strong.set(inner.strong.get() + 1);
+        InputArgRc { ptr: self.ptr }
+    }
+}
+
+impl Drop for InputArgRc {
+    fn drop(&mut self) {
+        let inner = unsafe { self.ptr.as_ref() };
+        let n = inner.strong.get() - 1;
+        if n == 0 {
+            unsafe {
+                std::ptr::drop_in_place(&mut (*self.ptr.as_ptr()).value);
+            }
+            free_inputarg_inner(self.ptr);
+        } else {
+            inner.strong.set(n);
+        }
+    }
+}
+
+impl std::ops::Deref for InputArgRc {
+    type Target = InputArg;
+    fn deref(&self) -> &InputArg {
+        unsafe { &self.ptr.as_ref().value }
+    }
+}
+
+impl AsRef<InputArg> for InputArgRc {
+    fn as_ref(&self) -> &InputArg {
+        self
+    }
+}
+
+impl std::borrow::Borrow<InputArg> for InputArgRc {
+    fn borrow(&self) -> &InputArg {
+        self
+    }
+}
+
+impl std::fmt::Debug for InputArgRc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl From<InputArg> for InputArgRc {
+    fn from(ia: InputArg) -> Self {
+        InputArgRc::new(ia)
+    }
+}
 
 /// Limit on the number of fail arguments per guard.
 ///
@@ -1581,12 +1734,15 @@ mod tests {
 
     #[test]
     fn inputarg_rc_leaves_the_64_byte_class() {
-        // Rc header is two usizes (16). Payload must stay at 48 or below
-        // so Rc<InputArg> is not a 64-byte allocation.
         assert!(
-            std::mem::size_of::<InputArg>() < 48,
-            "InputArg is {} bytes; RcBox would stay in the 64-byte class",
+            std::mem::size_of::<InputArg>() <= 32,
+            "InputArg is {} bytes; keep the payload at 32 B",
             std::mem::size_of::<InputArg>()
+        );
+        assert!(
+            std::mem::size_of::<InputArgInner>() <= 40,
+            "InputArgInner is {} B; from_type_rc must stay out of the 48-byte class",
+            std::mem::size_of::<InputArgInner>()
         );
     }
 

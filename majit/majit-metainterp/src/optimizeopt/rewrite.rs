@@ -3611,7 +3611,8 @@ mod tests {
     #[test]
     fn guard_isnull_uses_the_inputargs_own_forwarding_chain() {
         let mut ctx = OptContext::with_inputarg_types(4, &[majit_ir::Type::Ref]);
-        let input = std::rc::Rc::new(majit_ir::InputArg::from_type(majit_ir::Type::Ref, 0));
+        let input =
+            majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(majit_ir::Type::Ref, 0));
         let arg = Operand::from_bound_inputarg(&input);
         arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
         let mut guard = Op::new(OpCode::GuardIsnull, std::slice::from_ref(&arg));
@@ -3626,7 +3627,8 @@ mod tests {
     #[test]
     fn guard_value_uses_the_inputargs_own_forwarding_chain() {
         let mut ctx = OptContext::with_inputarg_types(4, &[majit_ir::Type::Ref]);
-        let input = std::rc::Rc::new(majit_ir::InputArg::from_type(majit_ir::Type::Ref, 0));
+        let input =
+            majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(majit_ir::Type::Ref, 0));
         let arg = Operand::from_bound_inputarg(&input);
         let value = majit_ir::GcRef(42);
         arg.set_forwarded_const(majit_ir::Const::Ref(value));

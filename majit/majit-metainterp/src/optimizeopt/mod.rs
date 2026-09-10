@@ -2003,7 +2003,7 @@ impl OptContext {
             .map(|(i, &tp)| {
                 (
                     i as u32,
-                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, i as u32)),
+                    majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(tp, i as u32)),
                 )
             })
             .collect();
@@ -2079,7 +2079,7 @@ impl OptContext {
             _ => {
                 self.inputarg_refs.insert(
                     pos,
-                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos)),
+                    majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(tp, pos)),
                 );
             }
         }
@@ -4880,7 +4880,7 @@ impl OptContext {
             // identities.
             if op
                 .bound_inputarg()
-                .is_some_and(|i| std::rc::Rc::ptr_eq(&i, &target_ia))
+                .is_some_and(|i| majit_ir::InputArgRc::ptr_eq(&i, &target_ia))
             {
                 return;
             }
@@ -9383,7 +9383,7 @@ mod boxref_forwarding_tests {
         ctx.make_equal_to(&b0, &b1);
         assert!(matches!(b0.get_forwarded(), BoxForwarded::InputArg(_)));
         let walked = b0.get_box_replacement(false);
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &walked
                 .bound_inputarg()
                 .expect("walked terminal carries bound InputArg"),
@@ -9471,7 +9471,7 @@ mod boxref_forwarding_tests {
         // transient operand sharing `ia_holder[1]`'s identity.
         assert!(matches!(b0.get_forwarded(), BoxForwarded::InputArg(_)));
         let walked = b0.get_box_replacement(false);
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &walked
                 .bound_inputarg()
                 .expect("walked terminal carries bound InputArg"),
@@ -9826,7 +9826,7 @@ mod boxref_forwarding_tests {
             .expect("canonical store resolves the slot");
         // No forwarding: the resolver materialises a fresh terminal operand
         // bound to the same `InputArgRc` as the seeded slot.
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &got.bound_inputarg()
                 .expect("resolved terminal carries bound InputArg"),
             &ia_holder[0],
@@ -9847,7 +9847,7 @@ mod boxref_forwarding_tests {
         let got = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_typed(0, Type::Int))
             .expect("bound box resolves");
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &got.bound_inputarg()
                 .expect("walked terminal carries bound InputArg"),
             &ia_holder[1],
@@ -9891,7 +9891,7 @@ mod boxref_forwarding_tests {
             .expect("canonical store resolves the slot");
         // Walker terminates at the slot (its `_forwarded` is Info, not a
         // chain step); the resolved operand shares b0's bound InputArg.
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &got.bound_inputarg()
                 .expect("resolved terminal carries bound InputArg"),
             &ia_holder[0],
@@ -11516,7 +11516,7 @@ mod opt_box_env_tests {
         // identity lives on the bound `InputArgRc`.
         let second = ctx.materialize_operand_at(arg);
         assert!(
-            std::rc::Rc::ptr_eq(
+            majit_ir::InputArgRc::ptr_eq(
                 &ia,
                 &second.bound_inputarg().expect("second bound to InputArg"),
             ),

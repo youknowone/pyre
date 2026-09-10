@@ -53,7 +53,7 @@ pub enum Forwarded {
     /// `InputArgRc` reference. Same chain-walk and same ownership as `Op`.
     /// RPython uses this for inputarg→inputarg redirects in bridge import
     /// and retrace remap (compile.py / unroll.py).
-    InputArg(Rc<InputArg>),
+    InputArg(crate::value::InputArgRc),
 
     /// `history.py ConstInt` / `ConstFloat` / `ConstPtr` object assigned to
     /// `_forwarded`. Forwarding terminates here; chain walkers clone this
@@ -244,7 +244,7 @@ pub trait ForwardingHost {
             "set_forwarded_inputarg on the same InputArg creates a one-node \
              chain cycle"
         );
-        self.store_forwarded(Forwarded::InputArg(Rc::clone(target)));
+        self.store_forwarded(Forwarded::InputArg(target.clone()));
     }
 
     /// `optimizer.py make_constant(box, constbox)` — terminate the chain
@@ -338,7 +338,7 @@ impl ForwardingHost for InputArg {
         self.forwarded.set(value);
     }
     fn is_same_inputarg(&self, ia: &crate::value::InputArgRc) -> bool {
-        std::ptr::eq(self, Rc::as_ptr(ia))
+        std::ptr::eq(self, crate::value::InputArgRc::as_ptr(ia))
     }
 }
 
@@ -489,7 +489,7 @@ pub(crate) fn pack_forwarded(v: Forwarded) -> u64 {
             p
         }
         Forwarded::InputArg(rc) => {
-            let p = Rc::into_raw(rc) as u64;
+            let p = crate::value::InputArgRc::into_raw(rc) as u64;
             debug_assert_eq!(p & FW_TAG, 0);
             p | FW_INPUTARG
         }
@@ -544,8 +544,8 @@ pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
             out
         }
         FW_INPUTARG => {
-            let rc = unsafe { Rc::from_raw(fwd_ptr(w) as *const InputArg) };
-            let out = Forwarded::InputArg(Rc::clone(&rc));
+            let rc = unsafe { crate::value::InputArgRc::from_raw(fwd_ptr(w) as *const InputArg) };
+            let out = Forwarded::InputArg(rc.clone());
             std::mem::forget(rc);
             out
         }
@@ -594,7 +594,9 @@ pub(crate) fn drop_packed_forwarded(w: u64) {
     }
     match w & FW_TAG {
         FW_OP => drop(unsafe { crate::resoperation::OpRc::from_raw(fwd_ptr(w) as *const Op) }),
-        FW_INPUTARG => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const InputArg) }),
+        FW_INPUTARG => {
+            drop(unsafe { crate::value::InputArgRc::from_raw(fwd_ptr(w) as *const InputArg) })
+        }
         FW_CONST => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const Cell<Value>) }),
         FW_INFO_PTR => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<PtrInfo>) }),
         FW_INFO_BOUND => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<IntBound>) }),

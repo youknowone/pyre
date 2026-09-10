@@ -175,7 +175,7 @@ impl Operand {
 
     #[allow(non_snake_case)]
     pub fn InputArg(ia: InputArgRc) -> Operand {
-        let p = Rc::into_raw(ia) as u64;
+        let p = InputArgRc::into_raw(ia) as u64;
         debug_assert_eq!(p & OP_TAG, 0);
         Operand {
             packed: p | OP_INPUTARG,
@@ -222,9 +222,9 @@ impl Operand {
             }
             OP_INPUTARG => {
                 let rc = unsafe {
-                    Rc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
+                    InputArgRc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
                 };
-                let out = Opnd::InputArg(Rc::clone(&rc));
+                let out = Opnd::InputArg(rc.clone());
                 std::mem::forget(rc);
                 out
             }
@@ -270,7 +270,7 @@ impl Clone for Operand {
                 OpRc::increment_strong_count(self.packed as *const crate::resoperation::Op);
             },
             OP_INPUTARG => unsafe {
-                Rc::<crate::value::InputArg>::increment_strong_count(
+                InputArgRc::increment_strong_count(
                     (self.packed & !OP_TAG) as *const crate::value::InputArg,
                 );
             },
@@ -298,7 +298,7 @@ impl Drop for Operand {
             }
             OP_INPUTARG => {
                 drop(unsafe {
-                    Rc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
+                    InputArgRc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
                 });
             }
             OP_CONST => {
@@ -350,7 +350,7 @@ impl Operand {
     /// Wrap a bound input arg as `Operand::InputArg` (`Rc::clone`). Successor
     /// (`resoperation.py:699`).
     pub fn from_bound_inputarg(ia: &InputArgRc) -> Operand {
-        Operand::InputArg(Rc::clone(ia))
+        Operand::InputArg(ia.clone())
     }
 
     /// A constant operand — mints a fresh const box (`history.py:227`
@@ -417,7 +417,7 @@ impl Operand {
         let ty = r.ty().unwrap_or(Type::Void);
         match r {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                let ia: InputArgRc = Rc::new(InputArg::from_type(ty, r.raw()));
+                let ia: InputArgRc = InputArgRc::new(InputArg::from_type(ty, r.raw()));
                 Operand::from_bound_inputarg(&ia)
             }
             _ => {
@@ -650,8 +650,8 @@ impl Operand {
         }
         let ptr = (self.packed & !OP_TAG) as *const crate::value::InputArg;
         unsafe {
-            Rc::increment_strong_count(ptr);
-            Some(Rc::from_raw(ptr))
+            InputArgRc::increment_strong_count(ptr);
+            Some(InputArgRc::from_raw(ptr))
         }
     }
 
@@ -871,7 +871,7 @@ mod tests {
             OpRef::op_typed(3, Type::Int)
         );
 
-        let ia = Rc::new(InputArg::from_type(Type::Ref, 2));
+        let ia = InputArgRc::new(InputArg::from_type(Type::Ref, 2));
         assert_eq!(
             Operand::from_bound_inputarg(&ia).to_opref(),
             OpRef::input_arg_typed(2, Type::Ref),
@@ -893,7 +893,7 @@ mod tests {
         assert_eq!(o_op.type_(), Type::Int);
         assert_eq!(o_op.const_value(), None);
 
-        let ia = Rc::new(InputArg::from_type(Type::Float, 1));
+        let ia = InputArgRc::new(InputArg::from_type(Type::Float, 1));
         let o_ia = Operand::from_bound_inputarg(&ia);
         assert!(o_ia.is_inputarg());
         assert_eq!(o_ia.position(), Some(1));
@@ -935,9 +935,9 @@ mod tests {
     /// `0.0 != -0.0`, `NaN == NaN`), and cross-kind always-false.
     #[test]
     fn same_box_inputarg_float_and_cross_kind() {
-        let ia = Rc::new(InputArg::from_type(Type::Int, 0));
+        let ia = InputArgRc::new(InputArg::from_type(Type::Int, 0));
         assert!(Operand::from_bound_inputarg(&ia).same_box(&Operand::from_bound_inputarg(&ia)));
-        let ia_other = Rc::new(InputArg::from_type(Type::Int, 0));
+        let ia_other = InputArgRc::new(InputArg::from_type(Type::Int, 0));
         assert!(
             !Operand::from_bound_inputarg(&ia).same_box(&Operand::from_bound_inputarg(&ia_other))
         );
@@ -1094,12 +1094,12 @@ mod tests {
         // same way in bridge import and retrace remap.
         let d = Operand::from_bound_op(&op_at(3, Type::Int));
         let e_ptr = {
-            let e = Rc::new(InputArg::from_type(Type::Int, 9));
+            let e = InputArgRc::new(InputArg::from_type(Type::Int, 9));
             d.set_forwarded_inputarg(&e);
-            Rc::as_ptr(&e)
+            InputArgRc::as_ptr(&e)
         };
         match d.get_box_replacement(false).bound_inputarg() {
-            Some(ia) => assert!(std::ptr::eq(Rc::as_ptr(&ia), e_ptr)),
+            Some(ia) => assert!(std::ptr::eq(InputArgRc::as_ptr(&ia), e_ptr)),
             None => panic!(
                 "the InputArg walk returned {:?}",
                 d.get_box_replacement(false)
@@ -1116,9 +1116,12 @@ mod tests {
         assert!(o_op.bound_op().is_some_and(|o| OpRc::ptr_eq(&o, &op)));
         assert!(o_op.bound_inputarg().is_none());
 
-        let ia = Rc::new(InputArg::from_type(Type::Ref, 1));
+        let ia = InputArgRc::new(InputArg::from_type(Type::Ref, 1));
         let o_ia = Operand::from_bound_inputarg(&ia);
-        assert!(o_ia.bound_inputarg().is_some_and(|i| Rc::ptr_eq(&i, &ia)));
+        assert!(
+            o_ia.bound_inputarg()
+                .is_some_and(|i| InputArgRc::ptr_eq(&i, &ia))
+        );
         assert!(o_ia.bound_op().is_none());
 
         let o_c = Operand::const_(Const::Int(3));

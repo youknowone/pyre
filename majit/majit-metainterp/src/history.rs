@@ -5,7 +5,7 @@
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
-use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -280,7 +280,7 @@ pub(crate) mod test_support {
     /// producer handle, so forwarding asserts read the same canonical
     /// `InputArg` host the operand routes writes to.
     pub(crate) fn bound_inputarg_operand(tp: Type, index: u32) -> (Operand, InputArgRc) {
-        let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
+        let ia = InputArgRc::new(InputArg::from_type(tp, index));
         (Operand::from_bound_inputarg(&ia), ia)
     }
 
@@ -501,7 +501,7 @@ impl TreeLoop {
     /// `TreeLoop.operations` semantic).
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
         TreeLoop {
-            inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
+            inputargs: inputargs.into_iter().map(InputArgRc::new).collect(),
             ops: ops.into_iter().map(OpRc::new).collect(),
             snapshots: Vec::new(),
         }
@@ -514,7 +514,7 @@ impl TreeLoop {
         snapshots: Vec<crate::recorder::Snapshot>,
     ) -> Self {
         TreeLoop {
-            inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
+            inputargs: inputargs.into_iter().map(InputArgRc::new).collect(),
             ops: ops.into_iter().map(OpRc::new).collect(),
             snapshots,
         }
@@ -1073,7 +1073,7 @@ impl TreeLoop {
         let new_inputargs: Vec<majit_ir::InputArgRc> = new_ia_types
             .iter()
             .enumerate()
-            .map(|(i, &tp)| std::rc::Rc::new(InputArg::from_type(tp, i as u32)))
+            .map(|(i, &tp)| InputArgRc::new(InputArg::from_type(tp, i as u32)))
             .collect();
 
         // Bind a remapped operand to its producer in the NEW namespace:

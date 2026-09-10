@@ -3554,7 +3554,7 @@ impl OptUnroll {
                      unroll close; ensure_inputarg_bindings must seed every canonical \
                      inputarg so this fresh allocation is only a type-mismatch repair",
                 );
-                std::rc::Rc::new(majit_ir::InputArg::from_type(want_ty, idx as u32))
+                majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(want_ty, idx as u32))
             })
             .collect();
         state.partial_trace_operations = optimizer.phase1_emit_ops.clone();

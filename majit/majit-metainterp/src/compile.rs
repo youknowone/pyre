@@ -2006,7 +2006,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
 
     let expanded_inputargs: Vec<majit_ir::InputArgRc> = inputargs
         .iter()
-        .map(|ia| std::rc::Rc::new(ia.fresh_value_copy()))
+        .map(|ia| majit_ir::InputArgRc::new(ia.fresh_value_copy()))
         .collect();
 
     // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
