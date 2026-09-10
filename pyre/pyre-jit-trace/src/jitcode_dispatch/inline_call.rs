@@ -12712,6 +12712,16 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 })? {
                     return Ok(outcome);
                 }
+                if matches!(
+                    pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+                    Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
+                ) && let Some(outcome) = spec_gate(SpecFold::Subscr, || {
+                    super::specialize::try_emit_list_int_getitem(
+                        ctx, pc, ref_args, dst, dst_bank,
+                    )
+                })? {
+                    return Ok(outcome);
+                }
             } else if fbw_debug_abort_enabled() {
                 let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
                     .map(|jc| jc.name.as_str())
@@ -13777,6 +13787,12 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         fbw_mode: FbwWalkMode {
             inline_subwalk: true,
             transparent_helper_subwalk: true,
+            // A helper has no Python PC. Residual last_instr publication
+            // reads this field when `current_inline_concrete_frame()==0`.
+            inline_caller_py_pc: ctx
+                .fbw_mode
+                .inline_caller_py_pc
+                .or_else(|| (ctx.vstack_cur_pypc != 0).then_some(ctx.vstack_cur_pypc)),
             ..ctx.fbw_mode
         },
         session: ctx.session,
@@ -13886,6 +13902,26 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         })?;
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
+
+    if dst_bank == 'r'
+        && args.len() == 2
+        && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(sub_index, &[])
+        && matches!(
+            pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+            Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
+        )
+    {
+        let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::Subscr, || {
+            super::specialize::try_emit_list_int_getitem(ctx, op.pc, &args, dst, dst_bank)
+        })? {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
+            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
 
     let callee_result = run_inline_call_subwalk(
         ctx,
@@ -14073,6 +14109,27 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // R-list immediately after the I-list.
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
+
+    if dst_bank == 'r'
+        && int_args.len() == 1
+        && ref_args.len() == 2
+        && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
+        && matches!(
+            pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+            Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
+        )
+    {
+        let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::Subscr, || {
+            super::specialize::try_emit_list_int_getitem(ctx, op.pc, &ref_args, dst, dst_bank)
+        })? {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
+            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
 
     // RPython `rclass.py`/`rbuiltin.py` allocation lowering: entering the
     // canonical `w_int_new` helper with one signed argument records the

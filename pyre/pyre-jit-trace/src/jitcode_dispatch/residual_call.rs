@@ -4035,7 +4035,20 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // on.  [`LiveLastInstrGuard`] makes the matching retarget for the
         // concrete store, publishing onto the callee's own frame instead.
         if current_inline_concrete_frame() == 0 {
-            let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
+            // A transparent helper is not a Python frame: its
+            // `vstack_cur_pypc` stays 0.  Publish the CALL-site opcode
+            // instead of writing last_instr=0 over the portal coordinate.
+            let py_pc = if ctx.fbw_mode.transparent_helper_subwalk {
+                ctx.fbw_mode
+                    .inline_caller_py_pc
+                    .unwrap_or(ctx.vstack_cur_pypc)
+            } else {
+                ctx.vstack_cur_pypc
+            };
+            if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
+                // Keep the last portal store rather than clobber it with 0.
+            } else {
+            let last_instr = ctx.trace_ctx.const_int(py_pc as i64);
             // Scope the box half to the residual just as
             // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
             // leaves both halves equal (`pyjitpl.py:1188-1199`), and
@@ -4050,7 +4063,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 ctx.trace_ctx,
                 "last_instr",
                 last_instr,
-                majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
+                majit_ir::Value::Int(py_pc as i64),
             );
             // Record the runtime heap half of the same `_opimpl_setfield_vable`
             // shape.  The mirror above synchronizes the tracing-time shadow
@@ -4084,6 +4097,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 let descr = info.static_field_struct_descr(idx);
                 ctx.trace_ctx
                     .vable_setfield_descr(vable_ref, last_instr, descr);
+            }
             }
         }
         unsafe {
