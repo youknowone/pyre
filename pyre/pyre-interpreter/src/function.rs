@@ -391,22 +391,25 @@ pub type StaticMethod = pyre_object::function::StaticMethod;
 pub type ClassMethod = pyre_object::function::ClassMethod;
 
 struct FrameLocalsRoot {
-    slot: *mut *mut u8,
+    frame: *mut crate::pyframe::PyFrame,
     registered: bool,
 }
 
 impl FrameLocalsRoot {
+    /// Look-inside: the 2-word `{frame, registered}` return cannot be a
+    /// residual. The interior slot address stays inside the word-ABI
+    /// [`crate::pyframe::register_frame_locals_slot`] residual.
     fn new(frame: &mut crate::pyframe::PyFrame) -> Self {
-        let slot = &mut frame.locals_cells_stack_w as *mut _ as *mut *mut u8;
-        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
-        Self { slot, registered }
+        let frame = frame as *mut crate::pyframe::PyFrame;
+        let registered = unsafe { crate::pyframe::register_frame_locals_slot(frame) };
+        Self { frame, registered }
     }
 }
 
 impl Drop for FrameLocalsRoot {
     fn drop(&mut self) {
         if self.registered {
-            pyre_object::gc_hook::try_gc_remove_root(self.slot);
+            crate::pyframe::unregister_frame_locals_slot(self.frame);
         }
     }
 }

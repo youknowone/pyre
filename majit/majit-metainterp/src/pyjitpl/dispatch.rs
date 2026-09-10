@@ -1244,6 +1244,12 @@ fn refuse_walk_local_ref_args(
     if !small_ref && !bridge_store && !pointer_index {
         return None;
     }
+    // `FrameAnchor::live` residualizes `&self` as the depth word in a Ref
+    // register (`frame_anchor_live_method_jit_abi`). A live slot index is
+    // also `<= 0x1000`; running the helper is what the residual exists for.
+    if crate::allow_small_ref_residual(func) {
+        return None;
+    }
     ctx.symbolic_residual_abort = true;
     if crate::is_bridge_walking() || ctx.is_bridge_trace {
         ctx.deterministic_bridge_abort = true;
@@ -3241,11 +3247,8 @@ where
                         } else {
                             "<non-string panic payload>"
                         };
-                        eprintln!(
-                            "[jit] trace_jitcode panic while tracing pc={}: {}",
-                            self.frames.current_mut().pc,
-                            message
-                        );
+                        let pc = self.frames.frames.last().map(|f| f.pc).unwrap_or(0);
+                        eprintln!("[jit] trace_jitcode panic while tracing pc={pc}: {message}");
                     }
                     // The unwind left `code_cursor` inside the panicking
                     // instruction, so the frames name no resumable position.
@@ -3255,13 +3258,26 @@ where
                 }
             };
             if !matches!(action, TraceAction::Continue) {
-                if crate::tldbg_enabled() {
+                if crate::majit_log_enabled() || crate::tldbg_enabled() {
+                    let (cursor, last_op, name) = self
+                        .frames
+                        .frames
+                        .last()
+                        .map(|fr| {
+                            (
+                                fr.code_cursor,
+                                fr.jitcode
+                                    .code
+                                    .get(fr.last_opcode_position)
+                                    .copied()
+                                    .unwrap_or(0xff),
+                                fr.jitcode.name(),
+                            )
+                        })
+                        .unwrap_or((0, 0xff, "<empty>"));
                     eprintln!(
-                        "@@@TLDBG run_to_end end action={:?} step_count={} num_recorded_ops={} trace_limit={}",
-                        action,
-                        step_count,
+                        "[interpret] run_to_end action={action:?} steps={step_count} ops={} cursor={cursor} last_op=0x{last_op:02x} jitcode={name}",
                         ctx.num_recorded_ops(),
-                        ctx.trace_limit()
                     );
                 }
                 match action {
@@ -3463,19 +3479,15 @@ where
             let mut portal_frame = self.frames.take_frame(portal, green_pc, None, Some(ctx));
             portal_frame.code_cursor = green_pc;
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
-            // pyjitpl.py newframe -> enter_portal_frame(jd_no, unique_id)
-            // for an inlined portal (greenkey present). `unique_id` has no
-            // warmstate source here; use `green_pc` as a stable per-entry id.
-            // Pairs with the deferred LEAVE_PORTAL_FRAME recorded by the
-            // recursive-portal merge-point cut (opimpl_jit_merge_point
-            // else-branch).
+            // pyjitpl.py newframe -> enter_portal_frame(jd_no, unique_id).
+            // rvmprof.get_unique_id is 0 when the code class is unregistered.
             let jd_box = ctx.const_int(jd_index as i64);
-            let uid_box = ctx.const_int(green_pc as i64);
+            let uid_box = ctx.const_int(0);
             ctx.record_op(OpCode::EnterPortalFrame, &[jd_box, uid_box]);
             // pyjitpl.py `newframe`: ENTER_PORTAL_FRAME and the
             // `portal_trace_positions` append sit on adjacent lines.
-            // The machine cannot reach MetaInterp, so the log half
-            // lives on TraceCtx and `find_biggest_function` reads both.
+            // The machine forwards the log half through
+            // `portal_trace_push_fn` into MetaInterp.
             if runtime.is_main_portal(jd_index) {
                 ctx.push_portal_trace_event(
                     jd_index,
@@ -3938,6 +3950,13 @@ where
             // `unwind_to_exception_handler` above.)
             jitcode::insns::BC_LIVE => {
                 let _liveness_offset = self.frames.current_mut().next_u16();
+            }
+            // pyjitpl.py opimpl_unreachable: raise AssertionError("unreachable").
+            // A landing here is a wrong-path generation/dispatch defect; abort
+            // the attempt so the interpreter can resume instead of panicking
+            // mid-opcode (which left a stack underflow on the Python frame).
+            jitcode::insns::BC_UNREACHABLE => {
+                return TraceAction::Abort;
             }
             // -- State field access (register/tape machines) --
             // Argcodes: `d` = u16 descr (`assembler.py:197-207`),
@@ -4590,11 +4609,12 @@ where
                 // which carries the field's byte width; a sub-word integer field
                 // (`Char`/`Bool`/`INT` narrower than a word) must be read at that
                 // width, not as a full word — otherwise adjacent bytes leak into
-                // the value. Ref fields are always word-sized pointers.
+                // the value. Ref fields are always word-sized pointers
+                // (`llmodel.py bh_getfield_gc_r` / `read_ref_at_mem`).
                 let loaded = if struct_ptr == 0 {
                     0
                 } else if is_ref {
-                    unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
+                    unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) as i64 }
                 } else {
                     let addr = (struct_ptr as usize).wrapping_add(offset);
                     unsafe {
@@ -4700,15 +4720,36 @@ where
                     // an entry seeded without a live concrete and skips
                     // the check.  A null struct fabricated `loaded` rather
                     // than reading, so it has nothing to compare either.
+                    //
+                    // RPython runs `executor.execute(cpu, metainterp,
+                    // opnum, fielddescr, box)` for this compare
+                    // (`_opimpl_getfield_gc_any_pureornot`). That is
+                    // `bh_getfield_gc_{i,r}`, a word-sized ref load —
+                    // not a raw i64 read that on a 32-bit target
+                    // swallows the next field.
                     let expected = match ctx.box_value(cached) {
                         Some(Value::Int(n)) => Some(n),
                         Some(Value::Ref(r)) => Some(r.0 as i64),
                         _ => None,
                     };
+                    let executed = if is_ref {
+                        ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Ref)
+                            .and_then(|v| match v {
+                                Value::Ref(r) => Some(r.0 as i64),
+                                _ => None,
+                            })
+                    } else {
+                        ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Int)
+                            .and_then(|v| match v {
+                                Value::Int(n) => Some(n),
+                                _ => None,
+                            })
+                    };
+                    let compare = executed.unwrap_or(loaded);
                     assert!(
-                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
+                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != compare),
                         "_opimpl_getfield_gc_any_pureornot sanity check ({}): \
-                             loaded {loaded} != cached {expected:?} \
+                             loaded {compare} != cached {expected:?} \
                              (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
                         if is_ref { "ref" } else { "int" },
                     );
@@ -8371,13 +8412,26 @@ where
                     // results this way (`jitcode_dispatch/residual_call.rs`).
                     ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
                     self.set_int_reg(dst, Some(traced), Some(concrete));
-                    if is_forces
-                        && matches!(
+                    if is_forces {
+                        if crate::majit_log_enabled() {
+                            let frame = self.frames.current_mut();
+                            eprintln!(
+                                "[interpret] residual may_force jitcode={} last_op={} cursor={} \
+                                 extraeffect={:?} can_raise={} next={:?}",
+                                frame.jitcode.name(),
+                                frame.last_opcode_position,
+                                frame.code_cursor,
+                                effectinfo.extraeffect,
+                                effectinfo.check_can_raise(false),
+                                frame.jitcode.code.get(frame.code_cursor),
+                            );
+                        }
+                        if matches!(
                             self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
+                        ) {
+                            return TraceAction::Abort;
+                        }
                     }
                     // pyjitpl.py `exc = exc and not isinstance(op, Const)`:
                     // a pure call that const-folded clears `exc`, so
@@ -9985,6 +10039,12 @@ where
         let Some(sub_jitcode) = sub_jitcode else {
             // The callee is in neither pool; abort the trace instead of
             // crashing the process.
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[interpret] inline_call descrs[{sub_idx}] missing (pool={})",
+                    crate::jitcode::global_build_descr_pool().is_some(),
+                );
+            }
             return TraceAction::Abort;
         };
         let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));

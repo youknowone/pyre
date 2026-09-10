@@ -321,6 +321,20 @@ pub fn portal_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
+/// `newframe` takes the metainterp wrapper around the same portal body.
+pub fn portal_metainterp_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    static PORTAL_META: OnceLock<Option<Arc<majit_metainterp::jitcode::JitCode>>> = OnceLock::new();
+    PORTAL_META
+        .get_or_init(|| {
+            portal_jitcode().map(|canonical| {
+                Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
+                    (*canonical).clone(),
+                ))
+            })
+        })
+        .clone()
+}
+
 /// Resolve the portal `JitCode` for the configured driver whose portal
 /// graph has canonical key `key` (e.g. a secondary driver's
 /// `baseobjspace::unpackiterable_portal`). Per-driver analogue of
@@ -1957,9 +1971,34 @@ fn runtime_descr_cells() -> &'static [OnceLock<majit_metainterp::RuntimeBhDescr>
         .0
 }
 
+/// Serialized `BhCallDescr.extra_info` is an inert `MOST_GENERAL`
+/// placeholder (`prepass.rs` after `translated_effect_info_id` is
+/// assigned). The real EffectInfo lives in the interned table — the
+/// same join `descr_ref_at` / `rehydrated_call_descr_ref` already
+/// performs for the FBW walker. Restore it so `JitCode::descr_at` →
+/// `as_calldescr().extra_info` (the interpret residual path) sees the
+/// extraeffect the assembler used when deciding whether to emit `-live-`.
+fn restore_translated_call_extra_info(bh: &mut BhDescr) {
+    let calldescr = match bh {
+        BhDescr::Call { calldescr } | BhDescr::JitCode { calldescr, .. } => calldescr,
+        _ => return,
+    };
+    let Some(id) = calldescr.translated_effect_info_id else {
+        return;
+    };
+    let cell = majit_ir::effectinfo::translated_effect_info(id).unwrap_or_else(|| {
+        panic!("translated EffectInfo {id} was not published before its CallDescr")
+    });
+    calldescr.extra_info = cell.get().clone();
+}
+
 fn load_runtime_descr(index: usize) -> majit_metainterp::RuntimeBhDescr {
     use majit_metainterp::RuntimeBhDescr;
-    let bh = load_descr_uncached(index);
+    // Same ordering as `descr_ref_at`: freeze EffectInfo identities
+    // before a CallDescr can ask for one.
+    rehydrate_build_descr_raw_sets();
+    let mut bh = load_descr_uncached(index);
+    restore_translated_call_extra_info(&mut bh);
     match bh {
         BhDescr::JitCode { jitcode_index, .. } => match get_jitcode_by_index(jitcode_index) {
             Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
@@ -2682,6 +2721,46 @@ mod tests {
                 ._write_descrs_interiorfields
                 .as_ref()
                 .is_some_and(Vec::is_empty)
+        );
+    }
+
+    /// The wire `BhCallDescr.extra_info` is `MOST_GENERAL`; interpret
+    /// reads that field after `descr_at`. The loader must join the
+    /// interned EffectInfo so extraeffect matches the assembler.
+    #[test]
+    fn load_runtime_descr_joins_translated_effect_info() {
+        rehydrate_build_descr_raw_sets();
+        let mut joined = 0usize;
+        let mut restored_non_random = 0usize;
+        for i in 0..descr_count() {
+            let descr = load_runtime_descr(i);
+            let Some(bh) = descr.as_bh_descr() else {
+                continue;
+            };
+            let calldescr = match bh {
+                BhDescr::Call { calldescr } | BhDescr::JitCode { calldescr, .. } => calldescr,
+                _ => continue,
+            };
+            let Some(id) = calldescr.translated_effect_info_id else {
+                continue;
+            };
+            let expected = majit_ir::effectinfo::translated_effect_info(id)
+                .unwrap_or_else(|| panic!("missing interned EffectInfo {id} for descr {i}"));
+            assert_eq!(
+                calldescr.extra_info.extraeffect,
+                expected.get().extraeffect,
+                "descr {i} extraeffect did not join translated EffectInfo {id}",
+            );
+            joined += 1;
+            if calldescr.extra_info.extraeffect != majit_ir::descr::ExtraEffect::RandomEffects {
+                restored_non_random += 1;
+            }
+        }
+        assert!(joined > 0, "fixture must contain translated CallDescrs");
+        assert!(
+            restored_non_random > 0,
+            "fixture must restore at least one non-RandomEffects extraeffect; \
+             otherwise interpret would still treat every residual as may_force"
         );
     }
 
@@ -3702,17 +3781,11 @@ mod tests {
         let bt_jc = portal_jitcode().expect("configured portal must resolve to a jitcode");
         assert!(!bt_jc.code.is_empty());
         // `warmspot.py split_graph_and_record_jitdriver` registers the copy
-        // cut at `jit_merge_point` (`eval::eval_loop_jit_portal`). The unsplit
-        // key remains when `PYRE_PORTAL_SPLIT=0`.
+        // cut at `jit_merge_point`.
         let eval_driver = COMPILED_JIT_DRIVERS
             .iter()
-            .find(|driver| {
-                matches!(
-                    driver.portal.canonical_key().as_str(),
-                    "eval::eval_loop_jit" | "eval::eval_loop_jit_portal"
-                )
-            })
-            .expect("compiled drivers must contain the main eval portal");
+            .find(|driver| driver.portal.canonical_key() == "eval::eval_loop_jit_portal")
+            .expect("compiled drivers must contain the split eval portal");
         assert_eq!(eval_driver.main_jitcode_index, bt_jc.index());
         assert_eq!(
             bt_jc.num_regs_and_consts_i(),

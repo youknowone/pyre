@@ -593,16 +593,18 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     /// on call sites that need true immutability to make a copy.
     fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError>;
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError>;
-    /// `getconstant_w(index) -> co_consts_w[index]` (`pyopcode.py`).
-    /// The default realizes from the compiler constant; `PyFrame` overrides it
-    /// to return the object owned by `self.pycode.co_consts_w[index]`.
+    /// `pyopcode.py getconstant_w(index) -> self.getcode().co_consts_w[index]`.
+    ///
+    /// No default: a fallback that indexed `enclosing.constants` (the
+    /// compiler `Constants(Box<[ConstantData]>)` wrapper) was walked as
+    /// `getfield_gc_r Constants.__pos_0` and treated a `ConstIdx` integer
+    /// as a GCREF. `PyFrame` is the only implementor and reads the
+    /// runtime `co_consts_w` slot via `w_code_const`.
     fn constant_at(
         &mut self,
         index: crate::bytecode::oparg::ConstIdx,
         enclosing: &CodeObject,
-    ) -> Result<Self::Value, PyError> {
-        load_const_value(self, &enclosing.constants[index])
-    }
+    ) -> Result<Self::Value, PyError>;
     fn none_constant(&mut self) -> Result<Self::Value, PyError>;
     fn ellipsis_constant(&mut self) -> Result<Self::Value, PyError>;
     fn slice_constant(

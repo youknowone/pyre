@@ -8070,13 +8070,9 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     let (portal_call_depth, current_call_id, is_being_profiled, already_recorded) = {
         let mut session = ctx.session.borrow_mut();
         let is_being_profiled = session.is_being_profiled;
-        let mut depth = 0usize;
-        let mut call_id = 0u64;
         let mut active_frame_index = None;
         for (index, frame) in session.framestack.iter().enumerate() {
             if frame.w_code != 0 {
-                depth += 1;
-                call_id = frame.call_id;
                 active_frame_index = Some(index);
             }
         }
@@ -8086,6 +8082,18 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
         };
         let already_recorded = *slot == Some(py_pc);
         *slot = Some(py_pc);
+        let depth = ctx
+            .trace_ctx
+            .portal_call_depth_fn
+            .as_ref()
+            .map(|f| f() as usize)
+            .unwrap_or(0);
+        let call_id = ctx
+            .trace_ctx
+            .current_call_id_fn
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or(0);
         (depth, call_id, is_being_profiled, already_recorded)
     };
     if already_recorded {
@@ -13532,18 +13540,18 @@ fn handle<Sym: WalkSym>(
             // The FBW walker keeps portal frames on `WalkSession::framestack`;
             // canonical helper levels have `w_code == 0` and do not contribute
             // to either depth or call identity.
-            let (portal_call_depth, current_call_id) = {
-                let session = ctx.session.borrow();
-                let mut depth = 0usize;
-                let mut call_id = 0u64;
-                for frame in session.framestack.iter() {
-                    if frame.w_code != 0 {
-                        depth += 1;
-                        call_id = frame.call_id;
-                    }
-                }
-                (depth, call_id)
-            };
+            let portal_call_depth = ctx
+                .trace_ctx
+                .portal_call_depth_fn
+                .as_ref()
+                .map(|f| f() as usize)
+                .unwrap_or(0);
+            let current_call_id = ctx
+                .trace_ctx
+                .current_call_id_fn
+                .as_ref()
+                .map(|f| f())
+                .unwrap_or(0);
             let mut debug_args = Vec::with_capacity(3 + gi.len() + gr.len() + gf.len());
             debug_args.push(ctx.trace_ctx.const_int(jdindex as i64));
             debug_args.push(ctx.trace_ctx.const_int(portal_call_depth as i64));
@@ -14161,9 +14169,11 @@ fn handle<Sym: WalkSym>(
             // pyjitpl.py: a matching merge point (same green key
             // + red-bank shape) closes the loop; first visit registers and
             // continues to unroll.
+            let live_typed =
+                crate::driver::make_green_key_typed(code_ptr, next_instr, is_being_profiled);
             if ctx
                 .trace_ctx
-                .has_merge_point_with_shape_assert(key, live_args.len())
+                .has_merge_point_same_greenkey(key, Some(&live_typed), live_args.len())
             {
                 // The matched merge point need not be the one tracing started
                 // from: `reached_loop_header` scans every registered merge

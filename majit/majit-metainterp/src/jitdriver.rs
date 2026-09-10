@@ -3062,7 +3062,12 @@ impl<S: JitState> JitDriver<S> {
             // aborted opcodes' tails against the real heap, so the `None`
             // source-pc handoff would run them twice.
             crate::jitexc::JitException::BailToInterpreter => {
-                writeback(state, usize::MAX);
+                // The terminal image is the nested jitcode's register
+                // file (e.g. `new` with 5 ints), not the portal
+                // virtualizable (`PyFrame` has 6 scalars). Writing it
+                // back panics in `virt_restore_scalars_raw` and would
+                // smash the live frame residuals already updated.
+                // Leave `state` as the heap left it.
                 self.meta.single_pass_finish = true;
                 Some(usize::MAX)
             }
@@ -5044,23 +5049,53 @@ impl<S: JitState> JitDriver<S> {
                         // sym's state-field image so the `jit_merge_point!` hook can
                         // finish the half-executed opcodes in the blackhole and take
                         // the resume position from the merge point they reach.
-                        let staged = self.meta.trace_ctx().and_then(|ctx| {
-                            let framestack = ctx.aborted_framestack.take()?;
-                            Some((
-                                framestack,
+                        let aborted = self
+                            .meta
+                            .tracing
+                            .as_mut()
+                            .and_then(|ctx| ctx.aborted_framestack.take());
+                        let virt_and_ptr = self.meta.trace_ctx().map(|ctx| {
+                            (
                                 ctx.collect_virtualizable_element_values(),
                                 ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
-                            ))
+                            )
                         });
-                        if let (
-                            Some((framestack, virt_array_values, virtualizable_ptr)),
-                            Some(sym),
-                        ) = (staged, self.sym.as_ref())
-                        {
+                        // Standalone walks publish into `aborted_framestack`.
+                        // `MetaInterp::interpret` keeps the same stack on the
+                        // MetaInterp (`pyjitpl.py` `_interpret`).
+                        let staged = aborted
+                            .or_else(|| {
+                                (!self.meta.framestack.is_empty()).then(|| {
+                                    std::mem::replace(
+                                        &mut self.meta.framestack,
+                                        crate::pyjitpl::MIFrameStack::empty(),
+                                    )
+                                })
+                            })
+                            .map(|framestack| {
+                                let (virt_array_values, virtualizable_ptr) =
+                                    virt_and_ptr.unwrap_or((None, 0));
+                                (framestack, virt_array_values, virtualizable_ptr)
+                            });
+                        // `blackhole.py convert_and_run_from_pyjitpl` only
+                        // needs the metainterp framestack. The sym image is
+                        // extra state-field seed for generated machines;
+                        // the Python portal has none, so missing `self.sym`
+                        // must not drop the conversion.
+                        if let Some((framestack, virt_array_values, virtualizable_ptr)) = staged {
+                            let (scalar_values, ref_scalar_values) =
+                                if let Some(sym) = self.sym.as_ref() {
+                                    (
+                                        S::collect_scalar_state_field_values(sym),
+                                        S::collect_ref_scalar_state_field_values(sym),
+                                    )
+                                } else {
+                                    (Vec::new(), Vec::new())
+                                };
                             self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
                                 framestack,
-                                scalar_values: S::collect_scalar_state_field_values(sym),
-                                ref_scalar_values: S::collect_ref_scalar_state_field_values(sym),
+                                scalar_values,
+                                ref_scalar_values,
                                 virt_array_values,
                                 virtualizable_ptr,
                                 // `blackhole.py:1811-1814` reads

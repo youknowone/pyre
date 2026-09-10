@@ -1538,6 +1538,7 @@ use std::sync::OnceLock;
 static CRITICALCODE_START_FN: OnceLock<fn()> = OnceLock::new();
 static CRITICALCODE_STOP_FN: OnceLock<fn()> = OnceLock::new();
 static STACK_ALMOST_FULL_FN: OnceLock<fn() -> bool> = OnceLock::new();
+static ALLOW_SMALL_REF_RESIDUAL_FN: OnceLock<fn(usize) -> bool> = OnceLock::new();
 
 /// Register the `_stack_criticalcode_start` / `_stack_criticalcode_stop`
 /// hooks the interpreter implements. Called once at JIT install time.
@@ -1553,6 +1554,23 @@ pub fn register_criticalcode_hooks(start: fn(), stop: fn()) {
 /// `rpython/rlib/rstack.py:76-77`.
 pub fn register_stack_almost_full_hook(f: fn() -> bool) {
     let _ = STACK_ALMOST_FULL_FN.set(f);
+}
+
+/// Residuals whose `Ref` argument is a small integer word (a shadow-stack
+/// depth), not a heap pointer. `refuse_walk_local_ref_args` would otherwise
+/// abort every `FrameAnchor::live` whose depth is `<= 0x1000`.
+pub fn register_allow_small_ref_residual(f: fn(usize) -> bool) {
+    let _ = ALLOW_SMALL_REF_RESIDUAL_FN.set(f);
+}
+
+/// Whether the host marked `addr` as a small-word residual. Unregistered
+/// means no — the walk-local refuse stays in force.
+#[must_use]
+pub fn allow_small_ref_residual(addr: usize) -> bool {
+    ALLOW_SMALL_REF_RESIDUAL_FN
+        .get()
+        .copied()
+        .is_some_and(|f| f(addr))
 }
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via

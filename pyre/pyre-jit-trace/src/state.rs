@@ -1820,67 +1820,119 @@ fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
 /// at trace time.
 pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     ensure_finish_setup();
+    // Interpret snapshots stamp the helper's build-time `JitCode::index`.
+    // The matching runtime slot is reserved as a skeleton until a portal
+    // or `ensure_build_time_jitcode_at` installs the frozen body
+    // (`reserve_build_time_index_space`). Compile then looks the index
+    // up in `METAINTERP_SD.jitcodes` — a still-empty skeleton has no
+    // `-live-` bytes, so materialize the body first.
+    if let Ok(idx) = usize::try_from(jitcode_index) {
+        let skeleton = METAINTERP_SD.with(|r| {
+            r.borrow()
+                .jitcodes
+                .get(idx)
+                .is_some_and(|jc| jc.payload.is_skeleton())
+        });
+        if skeleton {
+            let _ = ensure_build_time_jitcode_at(idx);
+        }
+    }
     METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
         let idx = jitcode_index as usize;
-        let jc = match sd.jitcodes.get(idx) {
-            Some(jc) => jc,
-            // `record_guard_with_snapshot` (`history.rs`) mints the
-            // interpreter-side vable promotes' resume frame with no
-            // coordinate of its own, marked
-            // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps
-            // it with the real position
-            // (`walker_capture_inline_nonstandard_vable_guard`). Arriving
-            // here still carrying the mark means that re-stamp was missed and
-            // the guard was compiled against a resume coordinate that names
-            // no frame. The frame holds no boxes, so `0` is the arithmetically
-            // right answer and the decode would survive it — but the guard it
-            // belongs to cannot resume, so say so instead of continuing.
-            None if jitcode_index == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 => {
-                panic!(
-                    "frame_value_count_at: guard resume frame is still \
-                     unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
-                     pc={pc}) — the `record_guard_with_snapshot` placeholder \
-                     reached the decoder without the walker's real position"
-                )
+        let runtime = {
+            let sd = r.borrow();
+            match sd.jitcodes.get(idx) {
+                Some(jc) => {
+                    // Snapshot publication stores only a decodable JitCode `-live-`
+                    // coordinate. An unrepresentable coordinate must have declined
+                    // during capture, before it could reach this frame-boundary
+                    // decoder.
+                    let count = decode_live_var_count(
+                        &jc.payload.jitcode,
+                        pc,
+                        sd.op_live,
+                        &sd.liveness_info,
+                    );
+                    Some((
+                        count,
+                        jc.payload.metadata.n_py_instrs as usize,
+                        sd.liveness_info.len(),
+                    ))
+                }
+                // `record_guard_with_snapshot` (`history.rs`) mints the
+                // interpreter-side vable promotes' resume frame with no
+                // coordinate of its own, marked
+                // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps
+                // it with the real position
+                // (`walker_capture_inline_nonstandard_vable_guard`). Arriving
+                // here still carrying the mark means that re-stamp was missed
+                // and the guard was compiled against a resume coordinate that
+                // names no frame. The frame holds no boxes, so `0` is the
+                // arithmetically right answer and the decode would survive it
+                // — but the guard it belongs to cannot resume, so say so
+                // instead of continuing.
+                None if jitcode_index
+                    == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 =>
+                {
+                    panic!(
+                        "frame_value_count_at: guard resume frame is still \
+                         unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
+                         pc={pc}) — the `record_guard_with_snapshot` placeholder \
+                         reached the decoder without the walker's real position"
+                    )
+                }
+                None => None,
             }
-            None => return 0,
         };
-        let payload = &jc.payload;
-        // Snapshot publication stores only a decodable JitCode `-live-`
-        // coordinate. An unrepresentable coordinate must have declined during
-        // capture, before it could reach this frame-boundary decoder.
-        let resolved_jit_pc: Option<usize> = if pc >= 0
-            && payload
-                .jitcode
-                .can_decode_live_vars(pc as usize, sd.op_live)
-        {
-            Some(pc as usize)
-        } else {
-            None
+        let Some((count, n_py_instrs, live_len)) = runtime else {
+            return 0;
         };
-        if let Some(jit_pc) = resolved_jit_pc {
-            let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
-            let all_liveness: &[u8] = &sd.liveness_info;
-            if off + 2 < all_liveness.len() {
-                let length_i = all_liveness[off] as usize;
-                let length_r = all_liveness[off + 1] as usize;
-                let length_f = all_liveness[off + 2] as usize;
-                return length_i + length_r + length_f;
-            }
+        if let Some(count) = count {
+            return count;
+        }
+        // `MetaInterp::interpret` inlines extracted helper JitCodes whose
+        // `JitCode::index` is the build-time `all_jitcodes` slot. The
+        // runtime store at that number can be a different body; try the
+        // table the helper was assembled into.
+        if let Some(count) = decode_build_time_live_var_count(jitcode_index, pc) {
+            return count;
         }
         // A published non-decodable coordinate violates the capture contract.
         // This remains a fail-loud internal invariant, not a fallback path.
         panic!(
             "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
-             (n_py_instrs={}, all_liveness.len={}). Phase X-0/X-1 removed \
-             all known triggers — further hits are bugs.",
-            jitcode_index,
-            pc,
-            payload.metadata.n_py_instrs as usize,
-            sd.liveness_info.len(),
+             (n_py_instrs={n_py_instrs}, all_liveness.len={live_len}). Phase \
+             X-0/X-1 removed all known triggers — further hits are bugs.",
+            jitcode_index, pc,
         );
     })
+}
+
+fn decode_live_var_count(
+    jitcode: &majit_translate::jitcode::JitCode,
+    pc: i32,
+    op_live: u8,
+    all_liveness: &[u8],
+) -> Option<usize> {
+    if pc < 0 || !jitcode.can_decode_live_vars(pc as usize, op_live) {
+        return None;
+    }
+    let off = jitcode.get_live_vars_info(pc as usize, op_live);
+    if off + 2 >= all_liveness.len() {
+        return None;
+    }
+    let length_i = all_liveness[off] as usize;
+    let length_r = all_liveness[off + 1] as usize;
+    let length_f = all_liveness[off + 2] as usize;
+    Some(length_i + length_r + length_f)
+}
+
+fn decode_build_time_live_var_count(jitcode_index: i32, pc: i32) -> Option<usize> {
+    let op_live = crate::jitcode_runtime::insns_opname_to_byte()
+        .get("live/")
+        .copied()?;
+    let jitcode = crate::jitcode_runtime::get_jitcode_by_index(jitcode_index as usize)?;
+    decode_live_var_count(&jitcode, pc, op_live, &liveness_info_snapshot())
 }
 
 /// [`frame_value_count_at`] for a driver whose frames are numbered in the
@@ -4083,52 +4135,34 @@ pub(crate) fn note_root_trace_too_long(
 /// including an abort that retires the log before the close.
 pub(crate) fn note_inline_subwalk_start(
     green_key: majit_metainterp::PortalGreenKey,
-    pos: majit_metainterp::recorder::TracePosition,
+    _pos: majit_metainterp::recorder::TracePosition,
 ) -> Option<usize> {
     let (driver, _) = crate::driver::try_driver_pair()?;
-    // Every Python callee re-enters the Python driver's declared portal.
-    // eval.rs registers that driver in slot 0; portal_jitcode resolves its
-    // actual mainjitcode from CompiledJitDriver, including a split portal.
-    // Read that JitCode's owner as pyjitpl.py `MetaInterp.newframe` does,
-    // rather than choosing the first recursive driver in the process.
-    let jitcode = crate::jitcode_runtime::portal_jitcode()?;
+    let canonical = crate::jitcode_runtime::portal_jitcode()?;
     let meta = driver.meta_interp_mut();
-    if !meta.is_main_jitcode(&jitcode) {
+    if !meta.is_main_jitcode(&canonical) {
         return None;
     }
-    let jd_no = jitcode.jitdriver_sd()?;
-    // pyjitpl.py `newframe`: ENTER_PORTAL_FRAME sits on the same greenkey
-    // path as the log append. The walker never builds an MIFrame, so this
-    // is the counterpart of that record.
-    let unique_id = meta.unique_id_for_greenkey(jd_no, &green_key);
-    meta.enter_portal_frame(jd_no, unique_id);
-    meta.push_portal_trace_position(jd_no, Some(green_key), pos);
-    // Counted HERE, not where the entry is appended: an abort retires the log
-    // mid-sub-walk, so counting appends would read `push` far above `pop` for a
-    // reason that says nothing about the pairing.  Counting the decisions makes
-    // `ptp_push != ptp_pop` mean exactly one thing — a sub-walk exit that
-    // skipped its close.
+    let jd_no = canonical.jitdriver_sd()?;
+    // pyjitpl.py `newframe(portal_code, greenkey)` — one owner for
+    // portal_call_depth, call_ids, ENTER_PORTAL_FRAME, and the log.
+    let jitcode = crate::jitcode_runtime::portal_metainterp_jitcode()?;
+    meta.newframe(jitcode, Some(green_key));
     majit_metainterp::mc_diag_bump(58);
     Some(jd_no)
 }
 
 /// pyjitpl.py:2470-2472 — close the entry [`note_inline_subwalk_start`] opened.
 pub(crate) fn note_inline_subwalk_end(
-    jd_no: usize,
-    pos: majit_metainterp::recorder::TracePosition,
+    _jd_no: usize,
+    _pos: majit_metainterp::recorder::TracePosition,
 ) {
-    // Like note_inline_subwalk_start, count the activation decision even
-    // when the abort has retired the log. These are not append counters.
     let Some((driver, _)) = crate::driver::try_driver_pair() else {
         return;
     };
     majit_metainterp::mc_diag_bump(59);
-    let meta = driver.meta_interp_mut();
-    // pyjitpl.py `popframe(leave_portal_frame=True)`: the walker close is
-    // a normal return, so LEAVE is recorded even when the abort has
-    // already retired the log.
-    meta.leave_portal_frame(jd_no);
-    meta.push_portal_trace_position(jd_no, None, pos);
+    // pyjitpl.py `popframe(leave_portal_frame=True)`.
+    driver.meta_interp_mut().popframe(true);
 }
 
 /// Stage `reason` as the abort the walker is returning, so the single

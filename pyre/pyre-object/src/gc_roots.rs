@@ -499,26 +499,30 @@ impl RootScope {
     }
 
     /// Scope-local [`shadow_stack_get`] using the cached cell.
-    #[majit_macros::dont_look_inside_cannot_raise]
+    #[inline]
     pub fn get(&self, index: usize) -> PyObjectRef {
-        // SAFETY: same cell; `slot` bounds-checks `index`.
-        unsafe { *(*self.stack_slot).slot(index) }
+        get_at(self.stack_slot, index)
+    }
+
+    /// Write one root without normalizing. Pair with [`normalize`] after
+    /// the whole run is on the stack.
+    #[inline]
+    pub fn publish_one(&self, root: PyObjectRef) -> usize {
+        publish_one_at(self.stack_slot, root)
     }
 
     /// Scope-local [`publish_roots`] using the cached cell.
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn publish(&self, roots: &[PyObjectRef]) -> usize {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        // SAFETY: this thread's cell, alive for the bracket; `incr_stack`
-        // returns the slot it just claimed.
-        unsafe {
-            let stack = &*self.stack_slot;
-            let base = stack.len();
-            for &root in roots {
-                *stack.incr_stack() = root;
+        match roots {
+            [] => unsafe { (*self.stack_slot).len() },
+            [first, rest @ ..] => {
+                let base = self.publish_one(*first);
+                for &root in rest {
+                    let _ = self.publish_one(root);
+                }
+                base
             }
-            base
         }
     }
 
@@ -533,13 +537,9 @@ impl RootScope {
     }
 
     /// Scope-local [`normalize_roots`] using the cached cell.
-    #[majit_macros::dont_look_inside_cannot_raise]
+    #[inline]
     pub fn normalize(&self, base: usize, len: usize) {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        // SAFETY: `publish` claimed every index in this range, and
-        // `stack_slot` is this thread's live root-stack cell.
-        let _ = normalize_published_run(unsafe { &*self.stack_slot }, base, len);
+        normalize_at(self.stack_slot, base, len);
     }
 
     /// [`normalize`](Self::normalize), reporting whether any slot in the run
@@ -584,6 +584,48 @@ impl Drop for RootScope {
         // the steady-state case for an empty bracket.
         shadow_stack_cell_truncate(self.stack_slot, self.save_point);
     }
+}
+
+/// Word-ABI residual for the compiler's `RootScope::drop_in_place`.
+/// The glue is a one-word `*mut RootScope`; without this binding the
+/// residual stays a symbolic hash and interpret/blackhole abort.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub unsafe fn root_scope_drop_in_place(slot: *mut RootScope) {
+    if !slot.is_null() {
+        unsafe { std::ptr::drop_in_place(slot) };
+    }
+}
+
+/// Word-ABI residual for [`RootScope::publish_one`]. `RootScope` is a
+/// two-word ADT; a residual `&RootScope` collapses it to one word and
+/// leaves `stack_slot` null. The cell pointer is one word.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn publish_one_at(stack_slot: *const RootStack, root: PyObjectRef) -> usize {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    // SAFETY: caller hands the live thread cell a `RootScope` still owns.
+    unsafe {
+        let stack = &*stack_slot;
+        let index = stack.len();
+        *stack.incr_stack() = root;
+        index
+    }
+}
+
+/// Word-ABI residual for [`RootScope::get`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn get_at(stack_slot: *const RootStack, index: usize) -> PyObjectRef {
+    // SAFETY: same cell; `slot` bounds-checks `index`.
+    unsafe { *(*stack_slot).slot(index) }
+}
+
+/// Word-ABI residual for [`RootScope::normalize`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn normalize_at(stack_slot: *const RootStack, base: usize, len: usize) {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    // SAFETY: `publish_one_at` claimed every index in this range.
+    let _ = normalize_published_run(unsafe { &*stack_slot }, base, len);
 }
 
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to

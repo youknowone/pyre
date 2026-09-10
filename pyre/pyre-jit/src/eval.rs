@@ -6608,10 +6608,11 @@ pub fn get_printable_location(
 pub fn get_unique_id(
     _next_instr: usize,
     _is_being_profiled: bool,
-    w_pycode: pyre_object::PyObjectRef,
+    _w_pycode: pyre_object::PyObjectRef,
 ) -> usize {
-    // A stable process-local unique-id equivalent using the code pointer.
-    unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) as usize }
+    // rvmprof.get_unique_id returns 0 unless register_code_object_class
+    // ran for the code class. Pyre does not register PyCode there.
+    0
 }
 
 /// warmstate.py `get_unique_id(greenkey)` for the Python portal.
@@ -11518,6 +11519,45 @@ fn execute_assembler(
     }
 }
 
+/// pyjitpl.py `initialize_original_boxes` for the Python portal.
+///
+/// Greens are Const; reds are InputArg. `setup_call` then packs them
+/// by kind into the portal MIFrame banks (`pyjitpl.py MIFrame.setup_call`).
+fn portal_original_boxes(
+    meta: &mut majit_metainterp::MetaInterp<crate::jit::state::PyreMeta>,
+    frame: &PyFrame,
+    next_instr: usize,
+    portal: &majit_metainterp::jitcode::JitCode,
+) -> Vec<(majit_metainterp::JitArgKind, majit_ir::OpRef, i64)> {
+    use majit_ir::OpRef;
+    use majit_metainterp::JitArgKind;
+
+    let ctx = meta
+        .trace_ctx()
+        .expect("portal_original_boxes requires an active trace");
+    let next_instr = next_instr as i64;
+    let is_being_profiled = i64::from(frame.get_is_being_profiled());
+    let pycode = frame.pycode as usize as i64;
+    let live_frame = frame as *const PyFrame as usize as i64;
+    let ec = pyre_interpreter::call::getexecutioncontext() as usize as i64;
+    let next_instr_op = ctx.const_int(next_instr);
+    let profiled_op = ctx.const_int(is_being_profiled);
+    let pycode_op = ctx.const_ref(pycode);
+    let frame_op = OpRef::input_arg_typed(0, Type::Ref);
+    let ec_op = OpRef::input_arg_typed(1, Type::Ref);
+    match portal.calldescr().arg_classes.as_str() {
+        "r" => vec![(JitArgKind::Ref, frame_op, live_frame)],
+        "iirrr" => vec![
+            (JitArgKind::Int, next_instr_op, next_instr),
+            (JitArgKind::Int, profiled_op, is_being_profiled),
+            (JitArgKind::Ref, pycode_op, pycode),
+            (JitArgKind::Ref, frame_op, live_frame),
+            (JitArgKind::Ref, ec_op, ec),
+        ],
+        other => panic!("portal start expected arg_classes \"r\" or \"iirrr\", got {other:?}"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompileOnceStart {
     BackEdge,
@@ -11547,6 +11587,12 @@ fn compile_and_run_once(
         CompileOnceStart::FunctionEntry => 19,
     });
 
+    // LLBC-extracted portal jitcodes resolve `d`/`j` argcodes through
+    // the process-global build-time descr table (RPython
+    // `Assembler.descrs`). jd1 and the metatrace probe already install
+    // it; `_compile_and_run_once` must too or the first
+    // `inline_call_*` aborts with an empty pool.
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     // warmspot/codewriter ordering: the portal and all drained JitCodes are
     // installed before the marker-driven metainterpreter starts.  Resolve the
     // per-green static entry here; `trace_bytecode` consumes the same sidecar
@@ -11580,47 +11626,102 @@ fn compile_and_run_once(
         return None;
     }
 
+    // pyjitpl.py initialize_state_from_start: newframe(mainjitcode)
+    // then setup_call(original_boxes). Virtualizable boxes were already
+    // seeded by setup_tracing.
+    if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
+        let meta = driver.meta_interp_mut();
+        let boxes = portal_original_boxes(meta, frame_root.frame(), target_pc, &portal);
+        meta.seed_root_portal_frame(portal, &boxes);
+    }
+
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     let mut propagated_exception = None;
+    // Residuals mutate the live PyFrame. If interpret aborts and the
+    // blackhole cannot finish the opcode (`BailToInterpreter`), restore
+    // this snapshot so the interpreter can replay the opcode. RPython
+    // never needs the snapshot: `convert_and_run_from_pyjitpl` always
+    // raises. pyre still has unbound residuals the blackhole declines.
+    let abort_snapshot = frame_root.frame().snapshot_for_tracing();
+    // pyjitpl.py `_compile_and_run_once`: `interpret()` on the seeded
+    // portal framestack.
     let outcome = driver.jit_merge_point_keyed(
         green_key,
         target_pc,
         &mut jit_state,
         env,
         || {},
-        |meta, sym| {
-            let concrete_frame = frame_root.frame().snapshot_for_tracing();
-            let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
-            let (action, executed_frame) = trace_bytecode(
-                meta,
-                sym,
-                code,
-                target_pc,
-                concrete_frame,
-                live_frame_addr,
-                true,
-            );
-            let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
-            let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
-            if walk_end_flushed {
-                frame_root
-                    .frame()
-                    .restore_resume_state_from(&executed_frame);
-            } else if let Some(restart_pc) = walk_end_restart_pc {
-                // A marker inside a super-instruction closes the loop at
-                // `loop_header_pc + 1`, and the walk already advanced
-                // `valuestackdepth` through the super-instruction. Set both the
-                // resume pc and its operand depth so the handed-back frame is
-                // self-consistent, mirroring the flush leg above and the
-                // blackhole legs (`apply_blackhole_crn_handoff`).
-                let frame = frame_root.frame();
-                frame.set_last_instr_from_next_instr(restart_pc);
-                correct_resume_vsd(frame, restart_pc);
+        |meta, _sym| {
+            let mut portal_sym = PortalMetatraceSym {
+                header_pc: target_pc,
+            };
+            if majit_metainterp::majit_log_enabled() {
+                let (name, cursor, first) = if meta.framestack.is_empty() {
+                    ("<empty>".to_owned(), 0, 0u8)
+                } else {
+                    let frame = meta.framestack.current_mut();
+                    let first = frame
+                        .jitcode
+                        .code
+                        .get(frame.code_cursor)
+                        .copied()
+                        .unwrap_or(0);
+                    (frame.jitcode.name().to_owned(), frame.code_cursor, first)
+                };
+                eprintln!(
+                    "[interpret] enter depth={} jitcode={} cursor={} first=0x{first:02x} ops={}",
+                    meta.framestack.len(),
+                    name,
+                    cursor,
+                    meta.trace_ctx().map(|c| c.num_recorded_ops()).unwrap_or(0),
+                );
+            }
+            let action = meta.interpret(&mut portal_sym, target_pc);
+            if majit_metainterp::majit_log_enabled() {
+                let (name, cursor) = if meta.framestack.is_empty() {
+                    ("<empty>".to_owned(), 0)
+                } else {
+                    let frame = meta.framestack.current_mut();
+                    (frame.jitcode.name().to_owned(), frame.code_cursor)
+                };
+                eprintln!(
+                    "[interpret] leave action={action:?} depth={} jitcode={} cursor={} ops={}",
+                    meta.framestack.len(),
+                    name,
+                    cursor,
+                    meta.trace_ctx().map(|c| c.num_recorded_ops()).unwrap_or(0),
+                );
             }
             propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
             action
         },
     );
+    // pyjitpl.py:2910-2911 `except SwitchToBlackhole`:
+    // `run_blackhole_interp_to_cancel_tracing` →
+    // `convert_and_run_from_pyjitpl`. Residuals already mutated the
+    // live PyFrame; finishing the remaining jitcode in the blackhole
+    // is what makes `ContinueRunningNormally` safe. Returning to the
+    // interpreter at the same `last_instr` replays the opcode.
+    if let Some(bh_pc) = driver.run_pending_abort_blackhole(&mut jit_state, env) {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!("[interpret] abort blackhole resume_pc={bh_pc}");
+        }
+        if bh_pc != usize::MAX {
+            frame_root.frame().set_last_instr_from_next_instr(bh_pc);
+            correct_resume_vsd(frame_root.frame(), bh_pc);
+        } else {
+            // Blackhole declined a residual and bailed. The opcode is
+            // half-applied; rewind so replay is sound.
+            frame_root
+                .frame()
+                .restore_resume_state_from(&abort_snapshot);
+        }
+    } else if outcome.is_none() && !driver.has_compiled_loop(green_key) {
+        // Abort arm did not stage a blackhole. Rewind so replay is sound.
+        frame_root
+            .frame()
+            .restore_resume_state_from(&abort_snapshot);
+    }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
     if tracing_finished
@@ -11701,7 +11802,10 @@ fn compile_and_run_once(
             }
             None => {}
         }
-        return Some(LoopResult::ContinueRunningNormally);
+        // Fall through so a `Jump` can commit
+        // `continue_running_normally_values` (`raise_continue_running_normally`)
+        // before the interpreter resumes. Returning CRN here used to drop
+        // loop-carried reds (`total`, cell shadows) recorded during the peel.
     }
 
     if let Some(outcome) = outcome {
@@ -11710,8 +11814,14 @@ fn compile_and_run_once(
             JitAction::ContinueRunningNormally => {
                 return Some(LoopResult::ContinueRunningNormally);
             }
-            JitAction::Continue => {}
+            JitAction::Continue => {
+                if tracing_finished {
+                    return Some(LoopResult::ContinueRunningNormally);
+                }
+            }
         }
+    } else if tracing_finished {
+        return Some(LoopResult::ContinueRunningNormally);
     }
     None
 }

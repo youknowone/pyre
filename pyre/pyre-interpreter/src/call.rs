@@ -36,16 +36,18 @@ pub(crate) fn frame_into_generator_for_function(
 }
 
 struct FrameLocalsRoot {
-    slot: *mut *mut u8,
+    frame: *mut PyFrame,
     registered: bool,
 }
 
 impl FrameLocalsRoot {
+    /// Look-inside: the 2-word `{frame, registered}` return cannot be a
+    /// residual. The interior slot address stays inside the word-ABI
+    /// [`crate::pyframe::register_frame_locals_slot`] residual.
     fn new(frame: &PyFrame) -> Self {
         let frame = frame as *const PyFrame as *mut PyFrame;
-        let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) } as *mut *mut u8;
-        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
-        Self { slot, registered }
+        let registered = unsafe { crate::pyframe::register_frame_locals_slot(frame) };
+        Self { frame, registered }
     }
 
     fn new_mut(frame: &mut PyFrame) -> Self {
@@ -56,7 +58,7 @@ impl FrameLocalsRoot {
 impl Drop for FrameLocalsRoot {
     fn drop(&mut self) {
         if self.registered {
-            pyre_object::gc_hook::try_gc_remove_root(self.slot);
+            crate::pyframe::unregister_frame_locals_slot(self.frame);
         }
     }
 }

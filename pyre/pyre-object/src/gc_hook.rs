@@ -697,7 +697,14 @@ pub extern "C" fn try_gc_owns_object(addr: *mut u8) -> bool {
 /// cell therefore bought nothing but an opaque call: every root pin and every
 /// root reload pays it, and behind it sits a two-word range compare that
 /// wants to be inlined into the caller.
+///
+/// `dont_look_inside`: inlining pulls `header_of` / forwarding into the
+/// caller's jitcode, and that body residualizes `Option<[u8; 4]>::branch`
+/// (`opt?`) which `front::option_try` will not rewrite in a `Result`-returning
+/// graph. The walk then aborts on a walk-local Option tag. Keep the nursery
+/// compare in this residual, the same way `try_gc_add_root` stays opaque.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn try_gc_current_object_address(addr: *mut u8) -> *mut u8 {
     majit_gc::gc_current_object_address(addr as usize) as *mut u8
 }

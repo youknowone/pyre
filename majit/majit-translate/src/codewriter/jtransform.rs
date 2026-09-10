@@ -2702,6 +2702,17 @@ impl<'a> Transformer<'a> {
                 && self.get_value_kind_var(rhs) == 'r'
                 && !self.config.str_concat_helper.is_empty() =>
             {
+                // `rstr.py rtype_add` → `ll_strconcat`: both operands and
+                // the result are `Ptr(STR)`. Stamp the result so assembler
+                // coloring stays `'r'` (`residual_call_r_r`), matching
+                // `jtransform.py` `getkind(op.result.concretetype)`.
+                // `can_raise_memoryerror["stroruni.concat"]` selects
+                // `EF_ELIDABLE_OR_MEMORYERROR`, not `EF_ELIDABLE_CAN_RAISE`.
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::GcRef,
+                );
                 let target = CallTarget::function_path([self.config.str_concat_helper.as_str()]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 let mut ops = vec![funcptr_op];
@@ -2712,7 +2723,10 @@ impl<'a> Transformer<'a> {
                         descriptor: CallDescriptor::from_signature(
                             &[majit_ir::value::Type::Ref, majit_ir::value::Type::Ref],
                             majit_ir::value::Type::Ref,
-                            EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::StrConcat),
+                            EffectInfo::new(
+                                ExtraEffect::ElidableOrMemoryError,
+                                OopSpecIndex::StrConcat,
+                            ),
                         ),
                         args_i: vec![],
                         args_r: vec![lhs.clone(), rhs.clone()],
