@@ -1037,9 +1037,9 @@ fn bind_local(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn format_message(args: &[PyObjectRef]) -> crate::PyResult {
-    Ok(pyre_object::w_str_new(&host_overlapped::format_message(
-        u32_w(arg(args, 0, "FormatMessage")?)?,
-    )))
+    Ok(pyre_object::w_str_new_managed(
+        &host_overlapped::format_message(u32_w(arg(args, 0, "FormatMessage")?)?),
+    ))
 }
 
 fn wsa_connect(args: &[PyObjectRef]) -> crate::PyResult {

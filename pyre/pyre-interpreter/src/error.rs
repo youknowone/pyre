@@ -4047,7 +4047,7 @@ pub(crate) fn emit_report_to_sys_stderr(buf: &[u8]) {
     // put there.
     let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
         Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
-        None => pyre_object::w_str_new(&String::from_utf8_lossy(buf)),
+        None => pyre_object::w_str_new_managed(&String::from_utf8_lossy(buf)),
     };
     // Read the stream back after that allocation, not before it.
     let result = crate::baseobjspace::call_method(

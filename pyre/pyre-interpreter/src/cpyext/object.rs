@@ -655,7 +655,7 @@ pub unsafe extern "C" fn PyObject_DelItemString(
     let roots = pyre_object::gc_roots::push_roots();
     let object_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(object);
-    let w_key = pyre_object::w_str_new(&key);
+    let w_key = pyre_object::w_str_new_managed(&key);
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_key);
     let outcome = crate::baseobjspace::delitem(

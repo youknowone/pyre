@@ -1875,12 +1875,12 @@ fn call_thread_target(
     };
     if unsafe { crate::is_function(target) } {
         let mut mixed = args;
-        let mut names = Vec::with_capacity(entries.len());
+        let mut names = pyre_object::gc_roots::RootedItems::new();
         for (name, value) in entries {
             mixed.push(value);
-            names.push(w_str_new(&name));
+            names.push(w_str_new_managed(&name));
         }
-        let kwarg_names = w_tuple_new(names);
+        let kwarg_names = w_tuple_new(names.take());
         let resolved = crate::call::resolve_kwargs(target, &mixed, kwarg_names)?;
         crate::call::call_user_function_plain_with_ctx(ec, target, &resolved)
     } else {
@@ -2428,7 +2428,7 @@ fn thread_excepthook_file(
         };
         thread_excepthook_write(file_slot, w_str_from_wtf8(rendered))?;
     } else {
-        thread_excepthook_write(file_slot, w_str_new(&current_ident().to_string()))?;
+        thread_excepthook_write(file_slot, w_str_new_managed(&current_ident().to_string()))?;
     }
     thread_excepthook_write(file_slot, w_str_new(":\n"))?;
 

@@ -118,7 +118,7 @@ fn locale_error(message: &str) -> crate::PyError {
     let cls = crate::builtins::lookup_exc_class("locale.Error")
         .or_else(|| crate::builtins::lookup_exc_class("Exception"))
         .expect("Exception must be installed");
-    let args = vec![cls, pyre_object::w_str_new(message)];
+    let args = vec![cls, pyre_object::w_str_new_managed(message)];
     let exc = crate::builtins::exc_exception_new(&args)
         .expect("exc_exception_new is infallible for str args");
     let mut err = crate::PyError::value_error(message);
@@ -547,7 +547,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 let out = rustpython_host_env::locale::setlocale(cat, c_locale.as_deref());
                 match out {
-                    Some(bytes) => Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&bytes))),
+                    Some(bytes) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(&bytes))),
                     None => Err(locale_error("unsupported locale setting")),
                 }
             }
@@ -700,7 +700,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // a plain utf-8 decode (lossy), matching `setlocale`;
                     // unlike `localeconv`/`nl_langinfo` it does not apply
                     // surrogateescape.
-                    Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&out)))
+                    Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(&out)))
                 }
                 #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
                 {
@@ -720,7 +720,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         "getencoding",
         crate::make_builtin_function_with_arity(
             "getencoding",
-            |_| Ok(pyre_object::w_str_new(&locale_encoding())),
+            |_| Ok(pyre_object::w_str_new_managed(&locale_encoding())),
             0,
         ),
     );

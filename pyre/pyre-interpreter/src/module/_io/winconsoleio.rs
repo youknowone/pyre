@@ -322,7 +322,7 @@ impl W_WindowsConsoleIO {
 
     #[getter]
     fn mode(&self) -> PyObjectRef {
-        w_str_new(self.mode_string())
+        w_str_new_managed(self.mode_string())
     }
 
     fn fileno(&self) -> Result<i64, crate::PyError> {

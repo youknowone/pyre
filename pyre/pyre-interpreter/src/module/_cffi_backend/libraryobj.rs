@@ -62,7 +62,7 @@ pub fn load_library(w_filename: PyObjectRef, flags: i64) -> Result<PyObjectRef, 
     let name_slot = roots.base();
     let _ = roots.pin_root(pyre_object::PY_NULL);
     let (name, handle, autoclose) = super::misc::dlopen_w(w_filename, flags)?;
-    roots.set(name_slot, pyre_object::w_str_new(&name));
+    roots.set(name_slot, pyre_object::w_str_new_managed(&name));
     let obj = W_Library::allocate_stable(W_Library {
         handle: handle as i64,
         autoclose: i64::from(autoclose),

@@ -95,7 +95,7 @@ pub unsafe extern "C" fn PyContextVar_New(
         let _ = roots.pin_root(default);
         // The name is minted last, so nothing above it is a pre-move address.
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_str_new(&text));
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(&text));
         let class = pyre_object::gc_roots::shadow_stack_get(class_slot);
         let arguments = [pyre_object::gc_roots::shadow_stack_get(name_slot)];
         if default_value.is_null() {

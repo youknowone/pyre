@@ -1097,25 +1097,28 @@ impl Arguments {
             input_argcount += take;
         }
 
-        // `w_kw_defs`, the `**kwargs` dict, the keyword values, the positional
-        // defaults and the words already copied into `scope_w` are all read
-        // after the allocations below — the vararg tuple, the dict itself, the
-        // keyword collection, the kwonly-default lookups — and a `list` or
-        // `dict` among them moves under any of those.  A by-value parameter
-        // copy is no more a slot the collector updates than the caller's scope
-        // buffer or `Arguments`' own vectors are, so each word is pinned here,
-        // ahead of the first allocation, and read back where it is used.
+        // `w_kw_defs`, the `**kwargs` dict, the keyword values, the leftover
+        // positionals that become `*args`, the positional defaults and the
+        // words already copied into `scope_w` are all read after the
+        // allocations below — the vararg tuple, the dict itself, the keyword
+        // collection, the kwonly-default lookups — and a `list` or `dict`
+        // among them moves under any of those.  A by-value parameter copy is
+        // no more a slot the collector updates than the caller's scope buffer
+        // or `Arguments`' own vectors are, so each word is pinned here, ahead
+        // of the first allocation, and read back where it is used.
         let _roots = pyre_object::gc_roots::push_roots();
         let keywords_w = self.keywords_w.as_deref().unwrap_or(&[]);
         let names_w = self.keyword_names_w.as_deref().unwrap_or(&[]);
-        let mut live = Vec::with_capacity(1 + keywords_w.len() + names_w.len());
+        let mut live = Vec::with_capacity(1 + keywords_w.len() + names_w.len() + args_w.len());
         live.push(w_kw_defs);
         live.extend_from_slice(keywords_w);
         live.extend_from_slice(names_w);
+        live.extend_from_slice(args_w);
         let kw_defs_slot = pyre_object::gc_roots::pin_roots(&live);
         let w_kw_defs = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot);
         let keywords_base = kw_defs_slot + 1;
         let names_base = keywords_base + keywords_w.len();
+        let args_base = names_base + names_w.len();
         // The defaults arrive as a caller-owned slice — `Function`'s `defs_w`
         // reaches here through a borrow, and a gateway builds its own array —
         // so the collector rewrites neither, while the run is read out one
@@ -1137,11 +1140,10 @@ impl Arguments {
             // argument.py — `assert args_left >= 0` always holds in
             // pyre (usize subtraction would have panicked above).
             let starargs_w: Vec<PyObjectRef> = if num_args > args_left {
-                if args_left == 0 {
-                    args_w.to_vec()
-                } else {
-                    args_w[args_left..].to_vec()
-                }
+                let extra_base = args_base + args_left;
+                (0..(num_args - args_left))
+                    .map(|i| pyre_object::gc_roots::shadow_stack_get(extra_base + i))
+                    .collect()
             } else {
                 Vec::new()
             };

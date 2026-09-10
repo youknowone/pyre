@@ -93,7 +93,7 @@ pub(crate) fn ffi_error(message: impl Into<String>) -> PyError {
     let mut error = PyError::runtime_error(message.clone());
     if let Ok(w_exc) = crate::builtins::exc_exception_new(&[
         newtype::ffi_error(),
-        pyre_object::w_str_new(&message),
+        pyre_object::w_str_new_managed(&message),
     ]) {
         error.exc_object = w_exc;
     }
@@ -795,7 +795,7 @@ fn ffi_getctype(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         result.push(')');
     }
     result.push_str(&ct.name()[at..]);
-    Ok(pyre_object::w_str_new(&result))
+    Ok(pyre_object::w_str_new_managed(&result))
 }
 
 fn ffi_memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
@@ -974,7 +974,7 @@ fn ffi_list_types(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         let typename = unsafe { *ctx.typenames.offset(i) };
         let name = unsafe { CStr::from_ptr(typename.name) }.to_string_lossy();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_str_new(&name));
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(&name));
         unsafe {
             pyre_object::listobject::w_list_append(roots.get(typedefs_slot), roots.get(name_slot))
         };
@@ -986,7 +986,7 @@ fn ffi_list_types(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             continue;
         }
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_str_new(&name));
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(&name));
         let target = if su.flags & parse_c_type::F_UNION != 0 {
             unions_slot
         } else {

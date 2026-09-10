@@ -2305,10 +2305,14 @@ fn jit_blackhole_resume_from_guard(
 /// `decode_ref` keys the same index), so the type gate is exact.
 struct ResumeDeadframeRoots {
     slots: Vec<*mut *mut u8>,
+    frame_roots: Vec<pyre_interpreter::pyframe::FrameLocalsRoot>,
 }
 
 impl ResumeDeadframeRoots {
-    fn register_pyframe_locals_slot(value: i64, slots: &mut Vec<*mut *mut u8>) {
+    fn register_pyframe_locals_slot(
+        value: i64,
+        frame_roots: &mut Vec<pyre_interpreter::pyframe::FrameLocalsRoot>,
+    ) {
         let ptr = value as *mut u8;
         if ptr.is_null()
             || !pyre_object::gc_hook::try_gc_owns_object(ptr)
@@ -2324,15 +2328,14 @@ impl ResumeDeadframeRoots {
         if type_id != pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID {
             return;
         }
-        let frame = current as *mut PyFrame;
-        let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) as *mut *mut u8 };
-        if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
-            slots.push(slot);
-        }
+        frame_roots.push(pyre_interpreter::pyframe::FrameLocalsRoot::new(
+            current as *mut PyFrame,
+        ));
     }
 
     fn register(deadframe: &mut [i64], deadframe_types: Option<&[majit_ir::Type]>) -> Self {
         let mut slots = Vec::new();
+        let mut frame_roots = Vec::new();
         if let Some(types) = deadframe_types {
             for (idx, ty) in types.iter().enumerate() {
                 if !matches!(ty, majit_ir::Type::Ref) {
@@ -2349,10 +2352,10 @@ impl ResumeDeadframeRoots {
                 if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
                     slots.push(slot);
                 }
-                Self::register_pyframe_locals_slot(*cell, &mut slots);
+                Self::register_pyframe_locals_slot(*cell, &mut frame_roots);
             }
         }
-        Self { slots }
+        Self { slots, frame_roots }
     }
 }
 
@@ -2361,6 +2364,7 @@ impl Drop for ResumeDeadframeRoots {
         for &slot in &self.slots {
             pyre_object::gc_hook::try_gc_remove_root(slot);
         }
+        self.frame_roots.clear();
     }
 }
 

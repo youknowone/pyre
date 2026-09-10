@@ -89,7 +89,7 @@ pub fn make_includes_from(
             .to_string_lossy()
             .into_owned();
         let part_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_str_new(&include_name));
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(&include_name));
         let _ = roots.pin_root(pyre_object::w_str_new("ffi"));
         let _ = roots.pin_root(pyre_object::w_str_new("lib"));
         let _ = roots.pin_root(pyre_object::w_tuple_new(vec![
@@ -420,7 +420,7 @@ fn dir1(w_lib: PyObjectRef, ignore_global_vars: bool) -> Result<PyObjectRef, PyE
         }
         let name = unsafe { CStr::from_ptr(g.name) }.to_string_lossy();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_str_new(&name));
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(&name));
         unsafe {
             pyre_object::listobject::w_list_append(roots.get(result_slot), roots.get(name_slot))
         };
@@ -441,7 +441,11 @@ fn full_dict_copy(w_lib: PyObjectRef) -> Result<PyObjectRef, PyError> {
         let name = unsafe { CStr::from_ptr(g.name) }
             .to_string_lossy()
             .into_owned();
-        let value = get_attr(roots.get(lib_slot), pyre_object::w_str_new(&name), false)?;
+        let value = get_attr(
+            roots.get(lib_slot),
+            pyre_object::w_str_new_managed(&name),
+            false,
+        )?;
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(value);
         unsafe {

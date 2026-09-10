@@ -27,7 +27,7 @@ fn struct_error(msg: impl Into<String>) -> crate::PyError {
     let cls = crate::builtins::lookup_exc_class("struct.error")
         .or_else(|| crate::builtins::lookup_exc_class("Exception"))
         .expect("Exception must be installed before _struct is used");
-    let exc = crate::builtins::exc_exception_new(&[cls, w_str_new(&msg)])
+    let exc = crate::builtins::exc_exception_new(&[cls, w_str_new_managed(&msg)])
         .expect("exc_exception_new is infallible for str args");
     let mut err = crate::PyError::new(crate::PyErrorKind::ValueError, msg);
     err.exc_object = exc;
@@ -1157,7 +1157,7 @@ impl W_Struct {
     fn __init__(&mut self, w_format: PyObjectRef) -> Result<(), crate::PyError> {
         let format = format_to_string(w_format)?;
         self.size = parse_format(&format)?.calcsize()?;
-        self.format = w_str_new(&format);
+        self.format = w_str_new_managed(&format);
         pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
         Ok(())
     }

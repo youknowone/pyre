@@ -376,7 +376,7 @@ pub unsafe extern "C" fn PyErr_SetString(w_type: *mut CPyObject, message: *const
     let text = if message.is_null() {
         PY_NULL
     } else {
-        pyre_object::w_str_new(&unsafe { CStr::from_ptr(message) }.to_string_lossy())
+        pyre_object::w_str_new_managed(&unsafe { CStr::from_ptr(message) }.to_string_lossy())
     };
     set_normalized(class, text);
 }
@@ -1277,7 +1277,7 @@ pub(super) fn ensure_linked() {
 
         let mut arguments = vec![
             pyre_object::w_int_new(code as i64),
-            pyre_object::w_str_new(&message),
+            pyre_object::w_str_new_managed(&message),
         ];
         let filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
         if !filename.is_null() {

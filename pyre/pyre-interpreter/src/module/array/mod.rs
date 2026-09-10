@@ -2068,7 +2068,11 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             20 => "utf-32-le",
             _ => "utf-32-be",
         };
-        let decoded = call_method(args[3], "decode", &[pyre_object::w_str_new(encoding)])?;
+        let decoded = call_method(
+            args[3],
+            "decode",
+            &[pyre_object::w_str_new_managed(encoding)],
+        )?;
         array_fromunicode(obj, decoded)?;
         return Ok(obj);
     }
@@ -2085,7 +2089,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
         typecode
     };
     let output_typecode_text = (output_typecode as char).to_string();
-    let obj = array_descr_new(&[w_cls, pyre_object::w_str_new(&output_typecode_text)])?;
+    let obj = array_descr_new(&[w_cls, pyre_object::w_str_new_managed(&output_typecode_text)])?;
     for chunk in bytes.chunks_exact(source_size) {
         let w_item = if matches!(mformat, 14 | 15) {
             let raw: [u8; 4] = chunk.try_into().unwrap();

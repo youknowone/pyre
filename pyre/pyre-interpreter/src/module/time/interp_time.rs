@@ -1395,11 +1395,12 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
     crate::module_ns_store(ns, "timezone", w_int_new(timezone));
     crate::module_ns_store(ns, "altzone", w_int_new(altzone));
     crate::module_ns_store(ns, "daylight", w_int_new(daylight));
-    crate::module_ns_store(
-        ns,
-        "tzname",
-        w_tuple_new(vec![w_str_new(&standard_name), w_str_new(&daylight_name)]),
-    );
+    crate::module_ns_store(ns, "tzname", {
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_str_new_managed(&standard_name));
+        fields.push(w_str_new_managed(&daylight_name));
+        w_tuple_new(fields.take())
+    });
 }
 
 /// `interp_time.py tzset` — ask libc to reread `TZ`, then refresh
@@ -1488,14 +1489,12 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
     crate::module_ns_store(ns, "timezone", w_int_new(timezone));
     crate::module_ns_store(ns, "altzone", w_int_new(timezone - 3600));
     crate::module_ns_store(ns, "daylight", w_int_new(i64::from(observes_dst)));
-    crate::module_ns_store(
-        ns,
-        "tzname",
-        w_tuple_new(vec![
-            w_str_new(&info.standard_name),
-            w_str_new(&info.daylight_name),
-        ]),
-    );
+    crate::module_ns_store(ns, "tzname", {
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_str_new_managed(&info.standard_name));
+        fields.push(w_str_new_managed(&info.daylight_name));
+        w_tuple_new(fields.take())
+    });
 }
 
 #[cfg(windows)]
@@ -1568,22 +1567,30 @@ pub(crate) fn struct_time_type() -> PyObjectRef {
 
 /// Build a `time.struct_time` from our portable `c_tm`.
 fn _tm_to_tuple(tm: &c_tm) -> PyObjectRef {
-    let seq = vec![
-        w_int_new((tm.tm_year + 1900) as i64),
-        w_int_new((tm.tm_mon + 1) as i64),
-        w_int_new(tm.tm_mday as i64),
-        w_int_new(tm.tm_hour as i64),
-        w_int_new(tm.tm_min as i64),
-        w_int_new(tm.tm_sec as i64),
-        w_int_new(((tm.tm_wday + 6) % 7) as i64), // Monday=0
-        w_int_new((tm.tm_yday + 1) as i64),
-        w_int_new(tm.tm_isdst as i64),
-    ];
-    let extras = vec![
-        ("tm_zone", pyre_object::w_str_new(&tm.tm_zone)),
-        ("tm_gmtoff", w_int_new(tm.tm_gmtoff)),
-    ];
-    crate::_structseq::new_instance_with_extra(struct_time_type(), seq, extras)
+    let items = {
+        let mut seq = pyre_object::gc_roots::RootedItems::new();
+        seq.push(w_int_new((tm.tm_year + 1900) as i64));
+        seq.push(w_int_new((tm.tm_mon + 1) as i64));
+        seq.push(w_int_new(tm.tm_mday as i64));
+        seq.push(w_int_new(tm.tm_hour as i64));
+        seq.push(w_int_new(tm.tm_min as i64));
+        seq.push(w_int_new(tm.tm_sec as i64));
+        seq.push(w_int_new(((tm.tm_wday + 6) % 7) as i64)); // Monday=0
+        seq.push(w_int_new((tm.tm_yday + 1) as i64));
+        seq.push(w_int_new(tm.tm_isdst as i64));
+        seq.take()
+    };
+    let extras = {
+        let mut extra_items = pyre_object::gc_roots::RootedItems::new();
+        extra_items.push(pyre_object::w_str_new_managed(&tm.tm_zone));
+        extra_items.push(w_int_new(tm.tm_gmtoff));
+        extra_items.take()
+    };
+    crate::_structseq::new_instance_with_extra(
+        struct_time_type(),
+        items,
+        vec![("tm_zone", extras[0]), ("tm_gmtoff", extras[1])],
+    )
 }
 
 /// `interp_time.py _get_inttime` — extract integral epoch seconds

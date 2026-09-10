@@ -2640,7 +2640,7 @@ fn text_or_none(pointer: *const c_char) -> PyObjectRef {
     if pointer.is_null() {
         return pyre_object::w_none();
     }
-    pyre_object::w_str_new(&unsafe { std::ffi::CStr::from_ptr(pointer) }.to_string_lossy())
+    pyre_object::w_str_new_managed(&unsafe { std::ffi::CStr::from_ptr(pointer) }.to_string_lossy())
 }
 
 /// Build one descriptor carrier: the definition address plus the names every

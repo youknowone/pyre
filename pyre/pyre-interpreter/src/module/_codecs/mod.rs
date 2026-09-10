@@ -733,7 +733,7 @@ fn lookup_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
 
         ensure_encodings_imported(state)?;
-        let w_v = w_str_new(&normalized_encoding);
+        let w_v = w_str_new_managed(&normalized_encoding);
         let n = unsafe { pyre_object::w_list_len(state.codec_search_path) };
         for i in 0..n {
             let Some(w_search) =
@@ -964,7 +964,7 @@ fn forget_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let normalized_encoding = normalize(crate::baseobjspace::str_utf8_w(w_encoding)?);
     with_codec_state(|state| {
         let w_cache = state.codec_search_cache;
-        let w_key = w_str_new(&normalized_encoding);
+        let w_key = w_str_new_managed(&normalized_encoding);
         if unsafe { pyre_object::dictmultiobject::w_dict_lookup(w_cache, w_key).is_some() } {
             let _ = crate::baseobjspace::delitem(w_cache, w_key);
         }

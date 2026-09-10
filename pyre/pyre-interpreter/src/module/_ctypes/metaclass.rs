@@ -1390,9 +1390,9 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
                     let n = field.iter().position(|&b| b == 0).unwrap_or(field.len());
                     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&field[..n]))
                 }
-                Some("u") => Ok(pyre_object::w_str_new(&host_ctypes::wstring_from_bytes(
-                    field,
-                ))),
+                Some("u") => Ok(pyre_object::w_str_new_managed(
+                    &host_ctypes::wstring_from_bytes(field),
+                )),
                 _ => Ok(cdata::make_indexed_subview(proto, obj, offset, size, index)),
             }
         }
@@ -1593,7 +1593,7 @@ fn cfield_repr(args: &[PyObjectRef]) -> PyResult {
         cf_usize(cfield, "offset"),
         cf_usize(cfield, "size"),
     );
-    Ok(pyre_object::w_str_new(&s))
+    Ok(pyre_object::w_str_new_managed(&s))
 }
 
 fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
@@ -2162,7 +2162,7 @@ fn array_get_slice(obj: PyObjectRef, meta: &ArrayMeta, slice: PyObjectRef) -> Py
                 value.push_str(&s);
             }
         }
-        return Ok(pyre_object::w_str_new(&value));
+        return Ok(pyre_object::w_str_new_managed(&value));
     }
     // Each element is freshly boxed and the next index allocates again, so they
     // are pinned as they arrive.
@@ -2317,9 +2317,9 @@ fn install_wchar_array_getsets(cls: PyObjectRef) {
 }
 
 fn wchar_array_get_value(args: &[PyObjectRef]) -> PyResult {
-    Ok(pyre_object::w_str_new(&host_ctypes::wstring_from_bytes(
-        cdata::cdata_bytes(args[1]).unwrap_or(&[]),
-    )))
+    Ok(pyre_object::w_str_new_managed(
+        &host_ctypes::wstring_from_bytes(cdata::cdata_bytes(args[1]).unwrap_or(&[])),
+    ))
 }
 
 fn wchar_array_set_value(args: &[PyObjectRef]) -> PyResult {

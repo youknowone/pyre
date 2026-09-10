@@ -877,9 +877,9 @@ impl W_TextIOWrapper {
         // before a collection is one the collection never traced.
         self.w_buffer = buffer;
         self.publish_refs();
-        self.w_encoding = w_str_new(encoding);
+        self.w_encoding = w_str_new_managed(encoding);
         self.publish_refs();
-        self.w_errors = w_str_new(errors);
+        self.w_errors = w_str_new_managed(errors);
         self.publish_refs();
         self.w_newline = newline;
         self.publish_refs();
@@ -918,7 +918,7 @@ impl W_TextIOWrapper {
         // a payload whose stdio methods are installed in the instance dict.
         let _ = type_object();
         let obj = Self::allocate_stable(Self {
-            w_stdio_name: w_str_new(name),
+            w_stdio_name: w_str_new_managed(name),
             ..Self::default()
         });
         let _roots = pyre_object::gc_roots::push_roots();
@@ -964,7 +964,7 @@ impl W_TextIOWrapper {
         }
         payload.state = STATE_OK;
         payload.publish_refs();
-        crate::baseobjspace::setdictvalue_native(obj, "name", w_str_new(name));
+        crate::baseobjspace::setdictvalue_native(obj, "name", w_str_new_managed(name));
         obj
     }
 
@@ -1798,10 +1798,13 @@ impl W_TextIOWrapper {
             self.set_newline(value.as_deref());
         }
         if let Some(value) = new_encoding.as_ref() {
-            self.w_encoding = w_str_new(value);
-            self.w_errors = w_str_new(new_errors.as_deref().unwrap_or("strict"));
+            self.w_encoding = w_str_new_managed(value);
+            self.publish_refs();
+            self.w_errors = w_str_new_managed(new_errors.as_deref().unwrap_or("strict"));
+            self.publish_refs();
         } else if let Some(value) = new_errors.as_ref() {
-            self.w_errors = w_str_new(value);
+            self.w_errors = w_str_new_managed(value);
+            self.publish_refs();
         }
         if let Some(codec) = new_codec {
             self.set_encoder_decoder(codec)?;

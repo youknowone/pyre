@@ -238,7 +238,7 @@ pub(super) fn error(hresult: i32, iid: usize, this: usize) -> crate::PyError {
     let details_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(details);
     let text = match host_ctypes::format_error_message(Some(hresult as u32)) {
-        Some(message) => pyre_object::w_str_new(&message),
+        Some(message) => pyre_object::w_str_new_managed(&message),
         None => pyre_object::w_none(),
     };
     let text_slot = pyre_object::gc_roots::shadow_stack_len();

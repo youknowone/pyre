@@ -186,7 +186,7 @@ pub fn getcname(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(args[0])?;
     let replace_with = crate::baseobjspace::text_w(args[1])?;
     let (name, _) = ct.insert_name(&replace_with, 0);
-    Ok(pyre_object::w_str_new(&name))
+    Ok(pyre_object::w_str_new_managed(&name))
 }
 
 /// `func.py string`.

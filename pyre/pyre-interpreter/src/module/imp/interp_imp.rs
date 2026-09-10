@@ -874,7 +874,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let _ = pyre_object::gc_roots::pin_root(w_globals);
                 // The name string is allocated before the store so the mapping
                 // it writes into is read after that allocation, not before it.
-                let w_name = pyre_object::w_str_new(&name);
+                let w_name = pyre_object::w_str_new_managed(&name);
                 unsafe {
                     pyre_object::w_dict_setitem_str(
                         pyre_object::gc_roots::shadow_stack_get(globals_slot),

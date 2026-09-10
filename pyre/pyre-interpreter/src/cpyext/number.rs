@@ -451,7 +451,7 @@ pub unsafe extern "C" fn PyNumber_ToBase(object: *mut CPyObject, base: c_int) ->
     };
     result(
         crate::builtins::format_index_radix(object, base as u32, prefix)
-            .map(|written| pyre_object::w_str_new(&written)),
+            .map(|written| pyre_object::w_str_new_managed(&written)),
     )
 }
 

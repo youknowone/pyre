@@ -1050,7 +1050,7 @@ fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
                     ("EXT_SUFFIX", so_ext.clone()),
                 ] {
                     let w_key = pyre_object::w_str_new(name);
-                    let w_value = pyre_object::w_str_new(&value);
+                    let w_value = pyre_object::w_str_new_managed(&value);
                     pyre_object::w_dict_store(roots.get(vars_slot), w_key, w_value);
                 }
             }

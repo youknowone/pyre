@@ -143,7 +143,7 @@ fn ffi_error(message: impl Into<String>) -> PyError {
     let mut error = PyError::new(PyErrorKind::RuntimeError, message.clone());
     if let Ok(w_exc) = crate::builtins::exc_exception_new(&[
         newtype::ffi_error(),
-        pyre_object::w_str_new(&message),
+        pyre_object::w_str_new_managed(&message),
     ]) {
         error.exc_object = w_exc;
     }
@@ -782,7 +782,7 @@ pub fn do_realize_lazy_struct(w_ctype: PyObjectRef) -> Result<(), PyError> {
                 &format!("wrong size for field '{field_name}'"),
             )?;
         }
-        let _ = roots.pin_root(pyre_object::w_str_new(&field_name));
+        let _ = roots.pin_root(pyre_object::w_str_new_managed(&field_name));
         let _ = roots.pin_root(pyre_object::w_int_new(fbitsize));
         let _ = roots.pin_root(pyre_object::w_int_new(field_offset));
         let tuple_slot = part_slot + 4;
