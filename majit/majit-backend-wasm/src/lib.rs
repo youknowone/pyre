@@ -3216,6 +3216,7 @@ impl WasmBackend {
         let (new_cells_base, new_cells_owner) = codegen::alloc_bridge_cells(merged_guard_count);
         inputs.bridge_cells_base = new_cells_base;
         inputs.ca.compute_home_gcmap = true;
+        inputs.ca.home_gcmap_has_prior = true;
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes;
         let (wasm_bytes, guard_exits, merged_ref_homes) = codegen::build_wasm_module(&inputs)?;
@@ -5191,6 +5192,7 @@ impl majit_backend::Backend for WasmBackend {
                 inline: ca_inline_params(ca_max_frame_bytes(targets)),
                 jf_top_addr: jf_top_addr(),
                 compute_home_gcmap: true,
+                home_gcmap_has_prior: true,
                 home_gcmap_min_ordinary: source_used_homes.0,
                 home_gcmap_min_labels: source_used_homes.1,
                 ..codegen::CaParams::default()
@@ -5200,6 +5202,7 @@ impl majit_backend::Backend for WasmBackend {
                 ca_reload_fn_ptr: body_reload_fn_ptr(),
                 jf_top_addr: jf_top_addr(),
                 compute_home_gcmap: true,
+                home_gcmap_has_prior: true,
                 home_gcmap_min_ordinary: source_used_homes.0,
                 home_gcmap_min_labels: source_used_homes.1,
                 ..codegen::CaParams::default()

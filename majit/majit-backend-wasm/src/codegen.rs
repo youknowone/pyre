@@ -3810,6 +3810,11 @@ pub struct CaParams {
     pub compute_home_gcmap: bool,
     pub home_gcmap_min_ordinary: usize,
     pub home_gcmap_min_labels: usize,
+    /// True when `home_gcmap_min_*` is a previous publication's floor
+    /// (re-emission or a bridge that must cover the source loop). False
+    /// on a first compile, where min=0 must not wipe live homes on keyed
+    /// resume. Distinguishes a 0→N merge from an initial compile.
+    pub home_gcmap_has_prior: bool,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -5718,10 +5723,10 @@ fn build_function(
     let publish_ptr = if ca.compute_home_gcmap {
         let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
         let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
-        // A first compile has min=0; those homes were cleared on the original
-        // key-0 entry. Only a merge that grew the map past a previous floor
-        // leaves newly marked slots uninitialized on a keyed resume.
-        if ca.home_gcmap_min_ordinary > 0 && used_ordinary > ca.home_gcmap_min_ordinary {
+        // A first compile has no prior map. A re-emission or bridge may
+        // grow past a previous floor of zero, so `min > 0` is not the
+        // signal — `has_prior` is.
+        if ca.home_gcmap_has_prior && used_ordinary > ca.home_gcmap_min_ordinary {
             emit_null_home_slots(
                 &mut sink,
                 frame,
@@ -5730,7 +5735,7 @@ fn build_function(
             );
         }
         let label_base = frame.ordinary_home_slots() as u64;
-        if ca.home_gcmap_min_labels > 0 && used_labels > ca.home_gcmap_min_labels {
+        if ca.home_gcmap_has_prior && used_labels > ca.home_gcmap_min_labels {
             emit_null_home_slots(
                 &mut sink,
                 frame,
