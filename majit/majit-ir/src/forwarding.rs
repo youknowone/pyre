@@ -430,6 +430,45 @@ const FW_SMALL_WIDE: u64 = 4;
 const FW_INFO_PTR: u64 = 5;
 const FW_INFO_BOUND: u64 = 6;
 const FW_INFO_OTHER: u64 = 7;
+/// Heap pointers are 48-bit. Bits 56-61 of an `IntBound` word may carry
+/// a small `_resint` stamp so optimizer restamp does not mint ThinStamp
+/// around forwarded-only.
+const FWD_PTR_MASK: u64 = (1 << 48) - 1;
+const FWD_STAMP_SHIFT: u64 = 56;
+const FWD_STAMP_MASK: u64 = 0x3f;
+
+#[inline]
+fn fwd_ptr(w: u64) -> u64 {
+    w & FWD_PTR_MASK & !FW_TAG
+}
+
+#[inline]
+pub(crate) fn fwd_stamp(w: u64) -> u32 {
+    if w & FW_TAG == FW_INFO_BOUND {
+        ((w >> FWD_STAMP_SHIFT) & FWD_STAMP_MASK) as u32
+    } else {
+        0
+    }
+}
+
+#[inline]
+pub(crate) fn try_pack_fwd_stamp(packed: u64, stamp: u32) -> Option<u64> {
+    if packed & FW_TAG == FW_INFO_BOUND && stamp < 64 {
+        Some((packed & FWD_PTR_MASK) | ((stamp as u64) << FWD_STAMP_SHIFT))
+    } else {
+        None
+    }
+}
+
+#[inline]
+pub(crate) fn strip_fwd_stamp(w: u64) -> u64 {
+    match w & FW_TAG {
+        FW_OP | FW_INPUTARG | FW_CONST | FW_INFO_PTR | FW_INFO_BOUND | FW_INFO_OTHER => {
+            w & FWD_PTR_MASK
+        }
+        _ => w,
+    }
+}
 
 pub(crate) fn pack_forwarded(v: Forwarded) -> u64 {
     match v {
@@ -489,19 +528,19 @@ pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
     }
     match w & FW_TAG {
         FW_OP => {
-            let rc = unsafe { Rc::from_raw(w as *const Op) };
+            let rc = unsafe { Rc::from_raw(fwd_ptr(w) as *const Op) };
             let out = Forwarded::Op(Rc::clone(&rc));
             std::mem::forget(rc);
             out
         }
         FW_INPUTARG => {
-            let rc = unsafe { Rc::from_raw((w & !FW_TAG) as *const InputArg) };
+            let rc = unsafe { Rc::from_raw(fwd_ptr(w) as *const InputArg) };
             let out = Forwarded::InputArg(Rc::clone(&rc));
             std::mem::forget(rc);
             out
         }
         FW_CONST => {
-            let rc = unsafe { Rc::from_raw((w & !FW_TAG) as *const Cell<Value>) };
+            let rc = unsafe { Rc::from_raw(fwd_ptr(w) as *const Cell<Value>) };
             let out = Forwarded::Const(Rc::clone(&rc));
             std::mem::forget(rc);
             out
@@ -513,19 +552,19 @@ pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
         }
         FW_SMALL_WIDE => Forwarded::SmallWide(w >> 3),
         FW_INFO_PTR => {
-            let rc = unsafe { Rc::from_raw((w & !FW_TAG) as *const RefCell<PtrInfo>) };
+            let rc = unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<PtrInfo>) };
             let out = Forwarded::Info(OpInfo::Ptr(Rc::clone(&rc)));
             std::mem::forget(rc);
             out
         }
         FW_INFO_BOUND => {
-            let rc = unsafe { Rc::from_raw((w & !FW_TAG) as *const RefCell<IntBound>) };
+            let rc = unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<IntBound>) };
             let out = Forwarded::Info(OpInfo::IntBound(Rc::clone(&rc)));
             std::mem::forget(rc);
             out
         }
         FW_INFO_OTHER => {
-            let boxed = unsafe { Box::from_raw((w & !FW_TAG) as *mut OpInfo) };
+            let boxed = unsafe { Box::from_raw(fwd_ptr(w) as *mut OpInfo) };
             let out = Forwarded::Info((*boxed).clone());
             std::mem::forget(boxed);
             out
@@ -539,12 +578,12 @@ pub(crate) fn drop_packed_forwarded(w: u64) {
         return;
     }
     match w & FW_TAG {
-        FW_OP => drop(unsafe { Rc::from_raw(w as *const Op) }),
-        FW_INPUTARG => drop(unsafe { Rc::from_raw((w & !FW_TAG) as *const InputArg) }),
-        FW_CONST => drop(unsafe { Rc::from_raw((w & !FW_TAG) as *const Cell<Value>) }),
-        FW_INFO_PTR => drop(unsafe { Rc::from_raw((w & !FW_TAG) as *const RefCell<PtrInfo>) }),
-        FW_INFO_BOUND => drop(unsafe { Rc::from_raw((w & !FW_TAG) as *const RefCell<IntBound>) }),
-        FW_INFO_OTHER => drop(unsafe { Box::from_raw((w & !FW_TAG) as *mut OpInfo) }),
+        FW_OP => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const Op) }),
+        FW_INPUTARG => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const InputArg) }),
+        FW_CONST => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const Cell<Value>) }),
+        FW_INFO_PTR => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<PtrInfo>) }),
+        FW_INFO_BOUND => drop(unsafe { Rc::from_raw(fwd_ptr(w) as *const RefCell<IntBound>) }),
+        FW_INFO_OTHER => drop(unsafe { Box::from_raw(fwd_ptr(w) as *mut OpInfo) }),
         _ => {}
     }
 }

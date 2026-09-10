@@ -1011,8 +1011,9 @@ fn fail_cell_capacity(ra_ops: &[RegAllocOp], ops: &[OpRc]) -> usize {
     let mut n = 0;
     for ra in ra_ops {
         match ra {
-            RegAllocOp::PerformGuard { .. } => n += 1,
+            RegAllocOp::PerformGuard { .. } | RegAllocOp::PerformGuard1 { .. } => n += 1,
             RegAllocOp::Perform { op_index, .. }
+            | RegAllocOp::Perform1 { op_index, .. }
             | RegAllocOp::PerformDiscard { op_index, .. }
             | RegAllocOp::PerformDiscardGcStore { op_index, .. } => {
                 if ops[*op_index].opcode == OpCode::Finish {
@@ -2821,6 +2822,25 @@ impl<'a> Assembler386<'a> {
                     );
                     self.pending_malloc_nursery_gcmap = None;
                 }
+                RegAllocOp::Perform1 {
+                    op_index,
+                    loc,
+                    result_loc,
+                    gcmap,
+                } => {
+                    let op = &ops[*op_index];
+                    let locs = [*loc];
+                    self.pending_malloc_nursery_gcmap = *gcmap;
+                    self.regalloc_perform(
+                        op,
+                        *op_index,
+                        &locs,
+                        result_loc.as_ref(),
+                        fail_index,
+                        ops,
+                    );
+                    self.pending_malloc_nursery_gcmap = None;
+                }
                 RegAllocOp::PerformGuard {
                     op_index,
                     arglocs,
@@ -2857,6 +2877,24 @@ impl<'a> Assembler386<'a> {
                         op,
                         *op_index,
                         arglocs,
+                        result_loc.as_ref(),
+                        faillocs,
+                        fail_index,
+                    );
+                    fail_index += 1;
+                }
+                RegAllocOp::PerformGuard1 {
+                    op_index,
+                    loc,
+                    result_loc,
+                    faillocs,
+                } => {
+                    let op = &ops[*op_index];
+                    let locs = [*loc];
+                    self.regalloc_perform_guard(
+                        op,
+                        *op_index,
+                        &locs,
                         result_loc.as_ref(),
                         faillocs,
                         fail_index,

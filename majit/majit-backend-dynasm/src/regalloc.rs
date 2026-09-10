@@ -1664,10 +1664,24 @@ pub enum RegAllocOp {
         result_loc: Option<Loc>,
         gcmap: Option<usize>,
     },
+    /// One-loc `perform` without a 16 B `Vec`.
+    Perform1 {
+        op_index: usize,
+        loc: Loc,
+        result_loc: Option<Loc>,
+        gcmap: Option<usize>,
+    },
     /// regalloc_perform_guard(op_index, arglocs, result_loc, faillocs)
     PerformGuard {
         op_index: usize,
         arglocs: Vec<Loc>,
+        result_loc: Option<Loc>,
+        faillocs: Vec<Option<Loc>>,
+    },
+    /// One-loc `perform_guard` without a 16 B `Vec`.
+    PerformGuard1 {
+        op_index: usize,
+        loc: Loc,
         result_loc: Option<Loc>,
         faillocs: Vec<Option<Loc>>,
     },
@@ -2221,34 +2235,47 @@ impl<'a> RegAlloc<'a> {
     pub(crate) fn perform(
         &mut self,
         op_index: usize,
-        arglocs: Vec<Loc>,
+        arglocs: impl AsRef<[Loc]>,
         result_loc: Option<Loc>,
         output: &mut Vec<RegAllocOp>,
     ) {
+        self.push_perform(op_index, arglocs.as_ref(), result_loc, None, output);
+    }
+
+    fn push_perform(
+        &mut self,
+        op_index: usize,
+        arglocs: &[Loc],
+        result_loc: Option<Loc>,
+        gcmap: Option<usize>,
+        output: &mut Vec<RegAllocOp>,
+    ) {
         self.flush_moves(output);
-        output.push(RegAllocOp::Perform {
-            op_index,
-            arglocs,
-            result_loc,
-            gcmap: None,
-        });
+        match *arglocs {
+            [loc] => output.push(RegAllocOp::Perform1 {
+                op_index,
+                loc,
+                result_loc,
+                gcmap,
+            }),
+            _ => output.push(RegAllocOp::Perform {
+                op_index,
+                arglocs: arglocs.to_vec(),
+                result_loc,
+                gcmap,
+            }),
+        }
     }
 
     fn perform_with_gcmap_ptr(
         &mut self,
         op_index: usize,
-        arglocs: Vec<Loc>,
+        arglocs: impl AsRef<[Loc]>,
         result_loc: Option<Loc>,
         gcmap: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        self.flush_moves(output);
-        output.push(RegAllocOp::Perform {
-            op_index,
-            arglocs,
-            result_loc,
-            gcmap: Some(gcmap),
-        });
+        self.push_perform(op_index, arglocs.as_ref(), result_loc, Some(gcmap), output);
     }
 
     /// Variant of `perform` that captures the current regalloc state as a
@@ -2259,11 +2286,10 @@ impl<'a> RegAlloc<'a> {
     fn perform_with_gcmap(
         &mut self,
         op_index: usize,
-        arglocs: Vec<Loc>,
+        arglocs: impl AsRef<[Loc]>,
         result_loc: Option<Loc>,
         output: &mut Vec<RegAllocOp>,
     ) {
-        self.flush_moves(output);
         // aarch64/regalloc.py prepare_op_call_malloc_nursery:
         //   `gcmap = self.get_gcmap([r.x0, r.x1])`
         // The malloc-nursery clobber regs are the result register plus a
@@ -2273,12 +2299,7 @@ impl<'a> RegAlloc<'a> {
         // bitmap prevents the collector from reading garbage out of
         // jitframe slots 0/1 during `do_collect_nursery`.
         let gcmap = self.get_gcmap(&MALLOC_NURSERY_CLOBBER, false) as usize;
-        output.push(RegAllocOp::Perform {
-            op_index,
-            arglocs,
-            result_loc,
-            gcmap: Some(gcmap),
-        });
+        self.push_perform(op_index, arglocs.as_ref(), result_loc, Some(gcmap), output);
     }
 
     /// x86/regalloc.py perform_guard
@@ -2286,36 +2307,50 @@ impl<'a> RegAlloc<'a> {
         &mut self,
         op: &Op,
         op_index: usize,
-        arglocs: Vec<Loc>,
+        arglocs: impl AsRef<[Loc]>,
         result_loc: Option<Loc>,
         output: &mut Vec<RegAllocOp>,
     ) {
         self.flush_moves(output);
         let faillocs = self.locs_for_fail(op);
-        output.push(RegAllocOp::PerformGuard {
-            op_index,
-            arglocs,
-            result_loc,
-            faillocs,
-        });
+        self.push_perform_guard(op_index, arglocs.as_ref(), result_loc, faillocs, output);
     }
 
     fn perform_guard_j2(
         &mut self,
         fail_args: &[OpRef],
         op_index: usize,
-        arglocs: Vec<Loc>,
+        arglocs: impl AsRef<[Loc]>,
         result_loc: Option<Loc>,
         output: &mut Vec<RegAllocOp>,
     ) {
         self.flush_moves(output);
         let faillocs = self.locs_for_fail_args(fail_args);
-        output.push(RegAllocOp::PerformGuard {
-            op_index,
-            arglocs,
-            result_loc,
-            faillocs,
-        });
+        self.push_perform_guard(op_index, arglocs.as_ref(), result_loc, faillocs, output);
+    }
+
+    fn push_perform_guard(
+        &mut self,
+        op_index: usize,
+        arglocs: &[Loc],
+        result_loc: Option<Loc>,
+        faillocs: Vec<Option<Loc>>,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        match *arglocs {
+            [loc] => output.push(RegAllocOp::PerformGuard1 {
+                op_index,
+                loc,
+                result_loc,
+                faillocs,
+            }),
+            _ => output.push(RegAllocOp::PerformGuard {
+                op_index,
+                arglocs: arglocs.to_vec(),
+                result_loc,
+                faillocs,
+            }),
+        }
     }
 
     /// aarch64/regalloc.py get_gcmap.
@@ -3704,7 +3739,7 @@ impl<'a> RegAlloc<'a> {
             &self.constants,
             &mut self.pending_moves,
         );
-        self.perform(i, vec![loc], Some(loc), output);
+        self.perform(i, [loc], Some(loc), output);
     }
 
     /// x86/regalloc.py consider_uint_mul_high
@@ -3751,7 +3786,7 @@ impl<'a> RegAlloc<'a> {
                 &mut self.longevity,
                 &mut self.fm,
             );
-            self.perform(i, vec![l1], Some(Loc::Reg(EDX)), output);
+            self.perform(i, [l1], Some(Loc::Reg(EDX)), output);
         }
     }
 
@@ -3881,7 +3916,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let loc = self.make_sure_var_in_reg(arg, self.tp(arg), &[], None, false);
-        self.perform_guard_j2(fail_args, i, vec![loc], None, output);
+        self.perform_guard_j2(fail_args, i, [loc], None, output);
     }
 
     fn consider_guard_value_j2(
@@ -3938,7 +3973,7 @@ impl<'a> RegAlloc<'a> {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            self.perform_guard_j2(fail_args, i, vec![x], None, output);
+            self.perform_guard_j2(fail_args, i, [x], None, output);
         }
     }
 
@@ -4066,7 +4101,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_guard_cc(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let arg = op.arg(0).to_opref();
         let loc = self.make_sure_var_in_reg(arg, self.tp(arg), &[], None, false);
-        self.perform_guard(op, i, vec![loc], None, output);
+        self.perform_guard(op, i, [loc], None, output);
     }
 
     /// x86/regalloc.py consider_guard_value
@@ -4191,7 +4226,7 @@ impl<'a> RegAlloc<'a> {
         let arg0 = op.arg(0).to_opref();
         let tp = self.tp(arg0);
         let loc = self.make_sure_var_in_reg(arg0, tp, &[], None, false);
-        self.perform(i, vec![loc], None, output);
+        self.perform(i, [loc], None, output);
     }
 
     fn consider_check_memory_error_j2(
@@ -4201,33 +4236,33 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let Some(&arg) = args.first() else {
-            return self.perform(i, vec![], None, output);
+            return self.perform(i, [], None, output);
         };
         let tp = self.tp(arg);
         let loc = self.make_sure_var_in_reg(arg, tp, &[], None, false);
-        self.perform(i, vec![loc], None, output);
+        self.perform(i, [loc], None, output);
     }
 
     /// x86/regalloc.py consider_finish
     fn consider_finish(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let locs = if op.num_args() != 0 {
+        if op.num_args() != 0 {
             let arg0 = op.arg(0).to_opref();
             let tp = self.tp(arg0);
-            vec![self.make_sure_var_in_reg(arg0, tp, &[], None, false)]
+            let loc = self.make_sure_var_in_reg(arg0, tp, &[], None, false);
+            self.perform(i, [loc], None, output);
         } else {
-            vec![]
-        };
-        self.perform(i, locs, None, output);
+            self.perform(i, [], None, output);
+        }
     }
 
     fn consider_finish_j2(&mut self, args: &[OpRef], i: usize, output: &mut Vec<RegAllocOp>) {
-        let locs = if let Some(&arg) = args.first() {
+        if let Some(&arg) = args.first() {
             let tp = self.tp(arg);
-            vec![self.make_sure_var_in_reg(arg, tp, &[], None, false)]
+            let loc = self.make_sure_var_in_reg(arg, tp, &[], None, false);
+            self.perform(i, [loc], None, output);
         } else {
-            vec![]
-        };
-        self.perform(i, locs, None, output);
+            self.perform(i, [], None, output);
+        }
     }
 
     /// x86/regalloc.py same_as / identity operations
@@ -4252,7 +4287,7 @@ impl<'a> RegAlloc<'a> {
         self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
         // aarch64/regalloc.py:887
         let resloc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
-        self.perform(i, vec![argloc], Some(resloc), output);
+        self.perform(i, [argloc], Some(resloc), output);
     }
 
     fn consider_same_as_j2(
@@ -4276,7 +4311,7 @@ impl<'a> RegAlloc<'a> {
         self.rm.free_temp_vars(&mut self.longevity, &mut self.fm);
         self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
         let resloc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
-        self.perform(i, vec![argloc], Some(resloc), output);
+        self.perform(i, [argloc], Some(resloc), output);
     }
 
     /// x86/regalloc.py _consider_float_op
@@ -4346,7 +4381,7 @@ impl<'a> RegAlloc<'a> {
             &self.constants,
             &mut self.pending_moves,
         );
-        self.perform(i, vec![loc], Some(loc), output);
+        self.perform(i, [loc], Some(loc), output);
     }
 
     fn consider_float_unary_j2(
@@ -4367,7 +4402,7 @@ impl<'a> RegAlloc<'a> {
             &self.constants,
             &mut self.pending_moves,
         );
-        self.perform(i, vec![loc], Some(loc), output);
+        self.perform(i, [loc], Some(loc), output);
     }
 
     /// x86/regalloc.py _consider_float_cmp
@@ -4411,7 +4446,7 @@ impl<'a> RegAlloc<'a> {
         let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Int, &[], None, false);
         let result_loc =
             Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Float, &[], None, false));
-        self.perform(i, vec![loc0], Some(result_loc), output);
+        self.perform(i, [loc0], Some(result_loc), output);
     }
 
     fn consider_cast_int_to_float_j2(
@@ -4423,7 +4458,7 @@ impl<'a> RegAlloc<'a> {
     ) {
         let loc0 = self.make_sure_var_in_reg(arg, Type::Int, &[], None, false);
         let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Float, &[], None, false));
-        self.perform(i, vec![loc0], Some(result_loc), output);
+        self.perform(i, [loc0], Some(result_loc), output);
     }
 
     /// x86/regalloc.py cast_float_to_int
@@ -4431,7 +4466,7 @@ impl<'a> RegAlloc<'a> {
         let loc0 = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Float, &[], None, false);
         let result_loc =
             Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Int, &[], None, false));
-        self.perform(i, vec![loc0], Some(result_loc), output);
+        self.perform(i, [loc0], Some(result_loc), output);
     }
 
     fn consider_cast_float_to_int_j2(
@@ -4443,7 +4478,7 @@ impl<'a> RegAlloc<'a> {
     ) {
         let loc0 = self.make_sure_var_in_reg(arg, Type::Float, &[], None, false);
         let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
-        self.perform(i, vec![loc0], Some(result_loc), output);
+        self.perform(i, [loc0], Some(result_loc), output);
     }
 
     /// Memory load: getfield pattern (1 arg → result)
@@ -4451,7 +4486,7 @@ impl<'a> RegAlloc<'a> {
         let base_loc = self.make_sure_var_in_reg(op.arg(0).to_opref(), Type::Ref, &[], None, false);
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos().get(), tp, &[], None, false));
-        self.perform(i, vec![base_loc], Some(result_loc), output);
+        self.perform(i, [base_loc], Some(result_loc), output);
     }
 
     fn consider_getfield_j2(
@@ -4465,7 +4500,7 @@ impl<'a> RegAlloc<'a> {
         let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &[], None, false);
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
-        self.perform(i, vec![base_loc], Some(result_loc), output);
+        self.perform(i, [base_loc], Some(result_loc), output);
     }
 
     /// Memory load: getarrayitem pattern (2 args → result)
@@ -5602,8 +5637,12 @@ impl<'a> RegAlloc<'a> {
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         // aarch64/regalloc.py:968: sizeloc = size_box.getint()
         let size_val = self.const_value(op.arg(0).to_opref());
-        let arglocs = vec![Loc::immed(size_val)];
-        self.perform_with_gcmap(i, arglocs, Some(Loc::Reg(result_reg)), output);
+        self.perform_with_gcmap(
+            i,
+            [Loc::immed(size_val)],
+            Some(Loc::Reg(result_reg)),
+            output,
+        );
     }
 
     fn consider_call_malloc_nursery_j2(
@@ -5654,7 +5693,7 @@ impl<'a> RegAlloc<'a> {
         let size_val = args.first().map(|&arg| self.const_value(arg)).unwrap_or(0);
         self.perform_with_gcmap(
             i,
-            vec![Loc::immed(size_val)],
+            [Loc::immed(size_val)],
             Some(Loc::Reg(result_reg)),
             output,
         );
@@ -5718,7 +5757,7 @@ impl<'a> RegAlloc<'a> {
         );
         self.rm
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
-        self.perform_with_gcmap(i, vec![sizeloc], Some(Loc::Reg(result_reg)), output);
+        self.perform_with_gcmap(i, [sizeloc], Some(Loc::Reg(result_reg)), output);
     }
 
     fn consider_call_malloc_nursery_varsize_frame_j2(
@@ -5771,7 +5810,7 @@ impl<'a> RegAlloc<'a> {
         );
         self.rm
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
-        self.perform_with_gcmap(i, vec![sizeloc], Some(Loc::Reg(result_reg)), output);
+        self.perform_with_gcmap(i, [sizeloc], Some(Loc::Reg(result_reg)), output);
     }
 
     /// aarch64/regalloc.py prepare_op_call_malloc_nursery_varsize parity.
@@ -6587,15 +6626,14 @@ mod tests {
         ra.prepare_loop();
         let ra_ops = ra.walk_operations();
 
-        let guard_faillocs = ra_ops.iter().find_map(|ra_op| {
-            if let RegAllocOp::PerformGuard {
+        let guard_faillocs = ra_ops.iter().find_map(|ra_op| match ra_op {
+            RegAllocOp::PerformGuard {
                 op_index, faillocs, ..
-            } = ra_op
-                && *op_index == 2
-            {
-                return Some(faillocs);
             }
-            None
+            | RegAllocOp::PerformGuard1 {
+                op_index, faillocs, ..
+            } if *op_index == 2 => Some(faillocs),
+            _ => None,
         });
 
         let Some(faillocs) = guard_faillocs else {
@@ -6681,29 +6719,29 @@ mod tests {
         };
 
         let ra_ops = ra.walk_operations();
-        let dispatched = ra_ops.iter().find_map(|ra_op| {
-            if let RegAllocOp::Perform {
+        let dispatched = ra_ops.iter().find_map(|ra_op| match ra_op {
+            RegAllocOp::Perform {
                 op_index,
                 arglocs,
                 result_loc,
                 ..
-            } = ra_op
-                && *op_index == 0
-            {
-                return Some((arglocs, result_loc));
-            }
-            None
+            } if *op_index == 0 => Some((arglocs.len(), result_loc.is_none())),
+            RegAllocOp::Perform1 {
+                op_index,
+                result_loc,
+                ..
+            } if *op_index == 0 => Some((1, result_loc.is_none())),
+            _ => None,
         });
 
-        let Some((arglocs, result_loc)) = dispatched else {
+        let Some((nlocs, result_is_none)) = dispatched else {
             panic!("j2 LIR dispatch did not produce a Perform op");
         };
         assert_eq!(
-            arglocs.len(),
-            1,
+            nlocs, 1,
             "walk_operations should dispatch from j2 LIR, not raw GcStore opcode"
         );
-        assert!(result_loc.is_none());
+        assert!(result_is_none);
     }
 
     #[test]
@@ -7003,7 +7041,12 @@ mod tests {
 
         match output
             .iter()
-            .find(|op| matches!(op, RegAllocOp::PerformGuard { .. }))
+            .find(|op| {
+                matches!(
+                    op,
+                    RegAllocOp::PerformGuard { .. } | RegAllocOp::PerformGuard1 { .. }
+                )
+            })
             .expect("expected PerformGuard")
         {
             RegAllocOp::PerformGuard {
@@ -7019,6 +7062,17 @@ mod tests {
                         .iter()
                         .any(|l| matches!(l, Loc::Immed(_) | Loc::ImmedFloat(_))),
                     "GuardNotForced2 must not carry a frame-depth immediate argloc, got {arglocs:?}"
+                );
+            }
+            RegAllocOp::PerformGuard1 { loc, faillocs, .. } => {
+                assert_eq!(faillocs.len(), 1);
+                assert!(
+                    matches!(faillocs[0], Some(Loc::Frame(_))),
+                    "GuardNotForced2 must spill every failarg into the jitframe, got {faillocs:?}"
+                );
+                assert!(
+                    !matches!(loc, Loc::Immed(_) | Loc::ImmedFloat(_)),
+                    "GuardNotForced2 must not carry a frame-depth immediate argloc, got {loc:?}"
                 );
             }
             other => panic!("expected PerformGuard, got {other:?}"),

@@ -1851,7 +1851,8 @@ fn take_word(w: usize) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32)
         (Some(descr_arc_from_bits(lo, hi)), None, 0, thin_stamp(w))
     } else {
         let (d, e, f) = unsafe { decode_descr_extra(w, FWD_TAG) };
-        (d, e, f, 0)
+        let stamp = crate::forwarding::fwd_stamp(f);
+        (d, e, crate::forwarding::strip_fwd_stamp(f), stamp)
     }
 }
 
@@ -1981,7 +1982,7 @@ impl DescrSlot {
         } else if is_thin_descr(w) {
             thin_stamp(w)
         } else {
-            0
+            crate::forwarding::fwd_stamp(w as u64)
         }
     }
 
@@ -2037,6 +2038,10 @@ impl DescrSlot {
                 unsafe {
                     *self.word.get() = 0;
                 }
+            } else if crate::forwarding::fwd_stamp(w as u64) != 0 {
+                unsafe {
+                    *self.word.get() = crate::forwarding::strip_fwd_stamp(w as u64) as usize;
+                }
             }
             return;
         }
@@ -2051,6 +2056,12 @@ impl DescrSlot {
         {
             unsafe {
                 *self.word.get() = thin;
+            }
+            return;
+        }
+        if let Some(packed) = crate::forwarding::try_pack_fwd_stamp(w as u64, stamp) {
+            unsafe {
+                *self.word.get() = packed as usize;
             }
             return;
         }
@@ -2331,12 +2342,21 @@ impl DescrSlot {
             self.write_parts(both.descr, Some(Box::new(both.extra)), packed);
             return;
         }
+        let stamp = if w != 0 {
+            crate::forwarding::fwd_stamp(w as u64)
+        } else {
+            0
+        };
         if w != 0 {
             crate::forwarding::drop_packed_forwarded(w as u64);
         }
         debug_assert_eq!(packed & SLOT_BOX_BIT as u64, 0);
+        let packed = crate::forwarding::try_pack_fwd_stamp(packed, stamp).unwrap_or(packed);
         unsafe {
             *self.word.get() = packed as usize;
+        }
+        if stamp != 0 && crate::forwarding::fwd_stamp(packed) == 0 {
+            self.set_stamp_word(stamp);
         }
     }
 
@@ -5343,6 +5363,26 @@ mod tests {
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(42)));
         op.set_value(crate::value::Value::Int(-7));
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(-7)));
+    }
+
+    #[test]
+    fn small_stamp_on_intbound_forwarded_stays_in_the_word() {
+        let op = Op::new(OpCode::IntAdd, &[]);
+        op.set_value(crate::value::Value::Int(1));
+        op.forwarded().set(crate::forwarding::Forwarded::Info(
+            crate::op_info::OpInfo::int_bound(crate::intbound::IntBound::from_constant(7)),
+        ));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(1)));
+        assert!(matches!(
+            op.forwarded().borrow(),
+            crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
+        ));
+        op.set_value(crate::value::Value::Int(0));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(0)));
+        assert!(matches!(
+            op.forwarded().borrow(),
+            crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
+        ));
     }
 
     #[test]

@@ -259,7 +259,7 @@ impl<'a> RegAlloc<'a> {
         let arg_loc = self.make_sure_var_in_reg(arg, Type::Int, &[], None, false);
         self.possibly_free_var(arg, Type::Int);
         let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
-        self.perform(i, vec![arg_loc], Some(Loc::Reg(res)), output);
+        self.perform(i, [arg_loc], Some(Loc::Reg(res)), output);
     }
 
     /// aarch64 `int_is_true` / `int_is_zero`: shares the 3-op `prepare_unary`
@@ -287,7 +287,7 @@ impl<'a> RegAlloc<'a> {
         self.possibly_free_var(arg, Type::Int);
         let ops_ref: &[majit_ir::OpRc] = self.operations;
         let res = self.force_allocate_reg_or_cc(dst, ops_ref, i);
-        self.perform(i, vec![arg_loc], Some(res), output);
+        self.perform(i, [arg_loc], Some(res), output);
     }
 
     /// aarch64/regalloc.py `prepare_op_uint_mul_high = prepare_op_int_mul`.
