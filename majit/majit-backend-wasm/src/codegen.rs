@@ -5398,8 +5398,7 @@ fn build_function(
     // is a preamble `LoadFromGcTable` (or SameAs of one) is not a LABEL
     // arg, so the guard must rematerialize the load — cranelift
     // `resolve_failarg_opref` / `GC_TABLE_VAR_INDEX`.
-    let gc_table_slots =
-        gc_table_failarg_slots(ops, constants, gc_table_base, gc_table_bases);
+    let gc_table_slots = gc_table_failarg_slots(ops, constants, gc_table_base, gc_table_bases);
     let inline_guards: Vec<InlineGuard<'_>> = inlined_bridges
         .iter()
         .enumerate()
@@ -11025,13 +11024,7 @@ fn emit_guard_param_tail_call(
             emit_resolve_f64(sink, constants, value_types, arg);
             sink.i64_reinterpret_f64();
         } else {
-            emit_resolve_failarg(
-                sink,
-                constants,
-                value_types,
-                arg,
-                dispatch.gc_table_slots,
-            );
+            emit_resolve_failarg(sink, constants, value_types, arg, dispatch.gc_table_slots);
         }
     }
     sink.local_get(dispatch.bridge_slot_local);
