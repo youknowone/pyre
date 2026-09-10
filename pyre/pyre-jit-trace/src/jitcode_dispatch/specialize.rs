@@ -239,6 +239,41 @@ pub(crate) fn try_walker_specialize_truth_bool<Sym: WalkSym>(
     Ok(Some(truth))
 }
 
+/// `space.not_` on a concrete exact int or bool: `int_is_true` + negate +
+/// `newbool`.  The truth alternates in `acc + (not i & 1)`, so this must not
+/// plant a polarity `GuardTrue`/`GuardFalse` — that would fail every other
+/// iteration and compile a bridge storm.  The box residual is `CannotRaise`.
+pub(crate) fn try_walker_specialize_unary_not<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(truth) = try_walker_specialize_truth_int(ctx, op_pc, operand)?
+        .map_or_else(
+            || try_walker_specialize_truth_bool(ctx, op_pc, operand),
+            |t| Ok(Some(t)),
+        )?
+    else {
+        return Ok(None);
+    };
+    let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(truth) else {
+        return Ok(None);
+    };
+    let boxed = crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, true);
+    let result_obj = pyre_object::w_bool_from(n == 0);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
 /// The `W_LongObject.value` payload of a concrete long, read the way the folds
 /// that pass a payload to an `rbigint` helper need it.
 ///
@@ -9303,9 +9338,15 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         Some(B::Xor | B::InplaceXor) => OpCode::IntXor,
         _ => return Ok(None),
     };
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let lhs_raw = walker_unbox_int(ctx, op_pc, r_args[0], int_type_addr)?;
-    let rhs_raw = walker_unbox_int(ctx, op_pc, r_args[1], int_type_addr)?;
+    // bool shares int's `intval` but carries `BOOL_TYPE`.  Unboxing both
+    // operands through `&INT_TYPE` plants a `GUARD_CLASS INT` that fails on
+    // every `acc + flag` / `flag * 2` and retraces the loop.
+    let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
+    let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
+    let lhs_raw = walker_unbox_int_typed(ctx, op_pc, r_args[0], lhs_type, lhs_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(lhs_obj))?;
+    let rhs_raw = walker_unbox_int_typed(ctx, op_pc, r_args[1], rhs_type, rhs_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[1], walker_numeric_builtin_class(rhs_obj))?;
     let (raw, concrete) = if matches!(
         opcode,
         OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
@@ -9337,6 +9378,49 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     };
     let boxed_ptr = pyre_object::w_int_new(concrete) as i64;
     let boxed = walker_box_int(ctx, op_pc, raw, concrete)?;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(concrete, boxed_ptr));
+    let _ = (dst, dst_bank);
+    Ok(Some(DispatchOutcome::SubReturn {
+        result: Some(boxed),
+    }))
+}
+
+/// `space.neg` on a concrete exact int or bool: unbox through the operand's
+/// own vtable and emit `IntSubOvf(0, value)`.  `-True` is int `-1`, so the
+/// result is always boxed as int.  `INT_MIN` declines — its negation is the
+/// `2**63` long.
+pub(crate) fn try_emit_exact_int_uneg<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if r_args.len() != 1 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    unsafe {
+        if !pyre_object::is_int(obj) || !pyre_object::is_exact_builtin_instance(obj) {
+            return Ok(None);
+        }
+    }
+    let val = unsafe { pyre_object::w_int_get_value(obj) };
+    let Some(concrete) = val.checked_neg() else {
+        return Ok(None);
+    };
+    let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(obj);
+    let raw = walker_unbox_int_typed(ctx, op_pc, r_args[0], type_addr, descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(obj))?;
+    let zero = ctx.trace_ctx.const_int(0);
+    let Some(neg) = record_int_ovf_guarded(ctx, op_pc, OpCode::IntSubOvf, zero, raw)? else {
+        return Ok(None);
+    };
+    let boxed_ptr = pyre_object::w_int_new(concrete) as i64;
+    let boxed = walker_box_int(ctx, op_pc, neg, concrete)?;
     ctx.trace_ctx
         .set_opref_concrete(boxed, box_int_concrete(concrete, boxed_ptr));
     let _ = (dst, dst_bank);
