@@ -1278,6 +1278,12 @@ fn refuse_walk_local_ref_args(
     if !small_ref && !bridge_store && !pointer_index {
         return None;
     }
+    // `FrameAnchor::live` residualizes `&self` as the depth word in a Ref
+    // register (`frame_anchor_live_method_jit_abi`). A live slot index is
+    // also `<= 0x1000`; running the helper is what the residual exists for.
+    if crate::allow_small_ref_residual(func) {
+        return None;
+    }
     ctx.symbolic_residual_abort = true;
     if crate::is_bridge_walking() || ctx.is_bridge_trace {
         ctx.deterministic_bridge_abort = true;
@@ -3370,10 +3376,9 @@ where
                         } else {
                             "<non-string panic payload>"
                         };
+                        let pc = self.frames.frames.last().map(|f| f.pc).unwrap_or(0);
                         eprintln!(
-                            "[jit] trace_jitcode panic while tracing pc={}: {}",
-                            self.frames.current_mut().pc,
-                            message
+                            "[jit] trace_jitcode panic while tracing pc={pc}: {message}"
                         );
                     }
                     // The unwind left `code_cursor` inside the panicking
