@@ -2623,11 +2623,21 @@ fn create_state_or_none(
     ctx: &OptContext,
     cache: &mut ExportCache,
 ) -> Option<Rc<VirtualStateInfoNode>> {
-    let opref = operand.to_opref();
-    if opref.is_none() {
+    // virtualstate.py `create_state_or_none`: `if box is None: return None`. The
+    // absent-slot sentinel is `Operand::None`, not `to_opref() == None`:
+    // a bound ResOp whose `pos` was never stamped still has `box.type`
+    // (`Op.type_`) and must be exported.
+    if operand.is_none() {
         None
     } else {
-        Some(export_single_value(opref, ctx, cache))
+        let opref = operand.to_opref();
+        if opref.is_none() {
+            // Bound ResOp whose `pos` was never stamped: keep the
+            // operand so `Op.type_` can still pick the not_virtual leaf.
+            Some(export_single_operand(operand, ctx, cache))
+        } else {
+            Some(export_single_value(opref, ctx, cache))
+        }
     }
 }
 
@@ -2661,18 +2671,27 @@ fn export_single_value(
     ctx: &OptContext,
     cache: &mut ExportCache,
 ) -> Rc<VirtualStateInfoNode> {
+    export_single_operand(&ctx.get_box_replacement_operand(opref), ctx, cache)
+}
+
+fn export_single_operand(
+    operand: &majit_ir::operand::Operand,
+    ctx: &OptContext,
+    cache: &mut ExportCache,
+) -> Rc<VirtualStateInfoNode> {
     // virtualstate.py:713-716 `box = get_box_replacement(box)` then keyed
     // lookup on `self.info`: resolve the forwarding chain BEFORE the cache
     // lookup so two field references forwarding to the same target collapse
     // onto the same VirtualStateInfo. Key the DAG cache by the resolved box's
     // identity (`Rc::ptr_eq`, const by value) — the bound producer's one
     // canonical `Rc`.
-    let box_ = ctx.get_box_replacement_operand(opref);
+    let box_ = operand.get_box_replacement(false);
+    let opref = box_.to_opref();
     // bind-at-alloc invariant (see ExportCache): every position reaching
     // export resolves to a bound box, so `box_` is a stable canonical `Rc`
     // rather than a fresh `from_opref` placeholder that would split the cache.
     debug_assert!(
-        ctx.get_box_replacement_operand_opt(opref).is_some(),
+        !box_.is_none() || opref.is_none(),
         "export_single_value: unbound position {opref:?} reached export — \
          bind-at-alloc invariant violated (every value reaching create_state \
          must be a bound box; virtualstate.py:711-720)"
@@ -2705,7 +2724,7 @@ fn export_single_value(
     let key = box_.clone();
     cache.in_progress.insert(key.clone());
 
-    let info = export_single_value_inner(box_.to_opref(), ctx, cache);
+    let info = export_single_value_inner(&box_, ctx, cache);
     // virtualstate.py NotVirtualStateInfoPtr.__init__: retain the
     // widened ArrayPtrInfo / StrPtrInfo length bound on the per-instance
     // pointer leaf. Virtual pointer infos have their own state variants and
@@ -2730,10 +2749,11 @@ fn export_single_value(
 }
 
 fn export_single_value_inner(
-    opref: OpRef,
+    box_: &majit_ir::operand::Operand,
     ctx: &OptContext,
     cache: &mut ExportCache,
 ) -> VirtualStateInfo {
+    let opref = box_.to_opref();
     // virtualstate.py `visit_not_virtual` dispatches via
     // `not_virtual(cpu, value.type, optimizer.getinfo(value))`; when
     // `info.is_constant()` is true the resulting state is LEVEL_CONSTANT
@@ -2742,25 +2762,24 @@ fn export_single_value_inner(
     // returns Some exactly when the chain terminates at a Const Box,
     // i.e. when PyPy's `info.is_constant()` is true. Mirror that:
     // export LEVEL_CONSTANT regardless of OpRef namespace.
-    if let Some(value) = ctx
-        .get_box_replacement_operand_opt(opref)
-        .and_then(|b| ctx.get_constant_box(&b))
-    {
+    if let Some(value) = ctx.get_constant_box(box_) {
         return VirtualStateInfo::Constant(value);
     }
 
     // operand-routing PtrInfo read (info.py op.get_forwarded()).
-    let opref_box = ctx.get_box_replacement_operand_opt(opref);
-    if let Some(info) = opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+    if let Some(info) = ctx.peek_ptr_info(box_) {
         let info_fielddescrs = info.all_fielddescrs_from_descr();
         match info {
             PtrInfo::Virtual(vinfo) => {
+                // virtualstate.py `create_state`: fieldboxes go through
+                // `create_state_or_none`. An unwritten slot is `None` and
+                // stays absent from the sparse field list.
                 let fields = vinfo
                     .fields
                     .iter()
-                    .map(|(field_idx, field_ref)| {
-                        let field_state = export_single_value(field_ref.to_opref(), ctx, cache);
-                        (*field_idx, field_state)
+                    .filter_map(|(field_idx, field_ref)| {
+                        create_state_or_none(field_ref, ctx, cache)
+                            .map(|field_state| (*field_idx, field_state))
                     })
                     .collect();
                 return VirtualStateInfo::Virtual {
@@ -2787,12 +2806,14 @@ fn export_single_value_inner(
                 };
             }
             PtrInfo::VirtualStruct(vinfo) => {
+                // virtualstate.py `create_state`: same `create_state_or_none`
+                // walk as Virtual / VArray. Unwritten slots stay absent.
                 let fields = vinfo
                     .fields
                     .iter()
-                    .map(|(field_idx, field_ref)| {
-                        let field_state = export_single_value(field_ref.to_opref(), ctx, cache);
-                        (*field_idx, field_state)
+                    .filter_map(|(field_idx, field_ref)| {
+                        create_state_or_none(field_ref, ctx, cache)
+                            .map(|field_state| (*field_idx, field_state))
                     })
                     .collect();
                 return VirtualStateInfo::VStruct {
@@ -2876,20 +2897,28 @@ fn export_single_value_inner(
     // is picked by `box.type` which is ALWAYS set on RPython Boxes.
     // pyre's OptContext::opref_type reconstructs it from value_types
     // (seeded from trace_inputargs) / producing-op result_type.
-    let tp = ctx.opref_type(opref).unwrap_or_else(|| {
-        // Two different failures reach this line: the absent-operand sentinel
-        // is unexpected outside `create_state_or_none`, while a named ref
-        // means value_types lacks an entry for a real box. Keep both loud.
-        let seen = if opref.is_none() {
-            "the absent-operand sentinel reached export_state"
-        } else {
-            "no type recorded for a ref that does exist"
-        };
-        panic!(
-            "not_virtual: opref_type({opref:?}) found no type — {seen}; \
+    let tp = ctx
+        .opref_type(opref)
+        .or_else(|| {
+            // A bound ResOp whose `pos` was never stamped has no OpRef
+            // variant tag; `Op.type_` is still `opclasses[opnum].type`.
+            let t = box_.type_();
+            (t != Type::Void).then_some(t)
+        })
+        .unwrap_or_else(|| {
+            // Two different failures reach this line: the absent-operand sentinel
+            // is unexpected outside `create_state_or_none`, while a named ref
+            // means value_types lacks an entry for a real box. Keep both loud.
+            let seen = if box_.is_none() {
+                "the absent-operand sentinel reached export_state"
+            } else {
+                "no type recorded for a ref that does exist"
+            };
+            panic!(
+                "not_virtual: opref_type({opref:?}) found no type — {seen}; \
              RPython box.type is always set (virtualstate.py:360)",
-        );
-    });
+            );
+        });
     // virtualstate.py NotVirtualStateInfoInt.__init__: an int leaf's
     // info is `getintbound(op)` (optimizer.py — always an IntBound for a
     // non-constant int), and the constructor widens it (`info.widen_update()`)
@@ -3384,6 +3413,39 @@ mod tests {
         let inputargs = state
             .make_inputargs(&[array_ref], &mut optimizer, &mut ctx, false)
             .expect("exported virtual array must enumerate its written slot");
+        assert_eq!(inputargs, vec![written_ref]);
+    }
+
+    #[test]
+    fn test_export_virtual_struct_skips_unwritten_slot() {
+        // virtualstate.py `create_state_or_none`: an unwritten
+        // struct fieldbox is None and must not reach not_virtual.
+        let mut ctx = OptContext::new(32);
+        let struct_ref = OpRef::ref_op(10);
+        let written_ref = OpRef::int_op(11);
+        let struct_box = ctx.materialize_operand_at(struct_ref);
+        let written_box = ctx.materialize_operand_at(written_ref);
+        ctx.set_ptr_info(
+            &struct_box,
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr: test_descr(21),
+                fields: vec![(0, Operand::None), (1, written_box)],
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let state = export_state(&[struct_ref], &ctx);
+        let VirtualStateInfo::VStruct { fields, .. } = &state.state[0].info else {
+            panic!("exported state is not a virtual struct");
+        };
+        assert_eq!(fields.len(), 1, "unwritten slot must stay absent");
+        assert_eq!(fields[0].0, 1);
+        assert_eq!(state.num_boxes(), 1);
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let inputargs = state
+            .make_inputargs(&[struct_ref], &mut optimizer, &mut ctx, false)
+            .expect("exported virtual struct must enumerate its written slot");
         assert_eq!(inputargs, vec![written_ref]);
     }
 

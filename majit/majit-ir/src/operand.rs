@@ -496,7 +496,7 @@ impl Operand {
     /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
     pub fn type_(&self) -> Type {
         match self.view() {
-            Opnd::Op(op) => op.pos().get().ty().unwrap_or(Type::Void),
+            Opnd::Op(op) => op.pos().get().ty().unwrap_or(op.type_),
             Opnd::InputArg(ia) => ia.tp,
             Opnd::SmallInt(_) => Type::Int,
             Opnd::SmallWide(id) => wide_value(id).get_type(),
