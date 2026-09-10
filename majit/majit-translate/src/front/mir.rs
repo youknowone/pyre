@@ -23583,7 +23583,19 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
         // leaves AtomicPtr out because the inner value is a pointer; the
         // field walk must still see a pointer spelling, or `is_known_struct`
         // treats `AtomicPtr<T>` as a by-value struct and drops `instantiate`.
-        return "*mut PyObject".to_string();
+        // Spell the actual pointee: `Function.mutate_slots` is an `AtomicPtr`
+        // over a raw (non-GC) struct, and an erased `*mut PyObject` would
+        // make the annotator's field projection answer `Instance(PyObject)`
+        // for it.
+        let pointee = tyref_node(ty, llbc)
+            .and_then(|node| strip_ty_wrappers(node, llbc))
+            .and_then(|node| node.get("Adt")?.get("generics")?.get("types")?.as_array()?.first().cloned())
+            .and_then(|arg| serde_json::from_value::<TyRef>(arg).ok())
+            .map(|arg| tyref_to_ast_string(&arg, llbc));
+        return match pointee {
+            Some(pointee) => format!("*mut {pointee}"),
+            None => "*mut PyObject".to_string(),
+        };
     }
     // `Option<E>` over a densely numbered fieldless E uses E's scalar tag
     // plus one reserved value for `None`.  Preserve that physical width in
@@ -32981,11 +32993,12 @@ mod tests {
             majit_ir::value::Type::Int
         );
 
-        // `AtomicPtr` is a pointer word. Spell it as one so fielddescrof
-        // does not treat the wrapper as a nested struct and drop it.
+        // `AtomicPtr<T>` is a pointer word. Spell it as a pointer to the
+        // actual `T` so fielddescrof does not treat the wrapper as a nested
+        // struct, and so a non-GC pointee is not erased to `PyObject`.
         let ptr_ty = adt_ty(2, serde_json::json!([{"Literal": {"UInt": "U8"}}]));
         let ptr_str = super::tyref_to_field_layout_string(&ptr_ty, &llbc);
-        assert_eq!(ptr_str, "*mut PyObject");
+        assert_eq!(ptr_str, "*mut u8");
         assert_eq!(
             crate::codewriter::call::get_type_flag(&ptr_str).1,
             majit_ir::value::Type::Ref
