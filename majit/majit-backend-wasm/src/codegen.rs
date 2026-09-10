@@ -2060,6 +2060,22 @@ fn emit_jitframe_write_barrier(
     residual_type_base: Option<u32>,
     wb: &WriteBarrierHelpers,
 ) {
+    if residual_type_base.is_none() && jit_call_idx.is_none() {
+        return;
+    }
+    // aarch64/assembler.py _reload_frame_if_necessary invokes
+    // _write_barrier_fastpath(is_frame=True): frames never use card marking.
+    // Off-GC frames reserve a zeroed header too (alloc_off_gc_jitframe), so
+    // their flag-byte read is valid and does not enter the guarded helper.
+    sink.local_get(0);
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+    sink.i32_const(wb.flag_byteofs);
+    sink.i32_add();
+    sink.i32_load8_u(memarg(0, 0));
+    sink.i32_const(i32::from(wb.if_flag));
+    sink.i32_and();
+    sink.if_(BlockType::Empty);
     if let Some(base) = residual_type_base {
         sink.local_get(0);
         sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
@@ -2068,6 +2084,7 @@ fn emit_jitframe_write_barrier(
         sink.i32_const(wb.fn_ptr as i32);
         sink.call_indirect(0, base + 1);
         sink.drop();
+        sink.end();
         return;
     }
     let Some(jit_call) = jit_call_idx else {
@@ -2086,6 +2103,7 @@ fn emit_jitframe_write_barrier(
     sink.i64_extend_i32_u();
     sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
     emit_jit_call(sink, jit_call);
+    sink.end();
 }
 
 /// Per-value def / last-use op positions over the trace, used to filter the

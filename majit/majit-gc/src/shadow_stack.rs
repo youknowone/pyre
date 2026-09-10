@@ -2011,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_extra_areas_keep_outer_roots_and_retire_by_owner() {
+    fn scoped_extra_areas_forward_and_retire_on_drop_or_unwind() {
         unsafe fn walk_cell(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
             let slot = unsafe { &*(data as *const Cell<GcRef>) };
             let mut value = slot.get();
@@ -2040,23 +2040,12 @@ mod tests {
         seen.clear();
         walk_my_extra_areas(|root| seen.push(root.0));
         assert_eq!(seen, [0x2080]);
-        drop(inner_guard);
-        walk_my_extra_areas(|_| panic!("retired root still visible"));
-        unregister_mutator();
-    }
-
-    #[test]
-    fn scoped_extra_area_unwinds_before_owner_storage_dies() {
-        unsafe fn no_roots(_: *const (), _: &mut dyn FnMut(&mut GcRef)) {}
-        let _lock = TEST_MUTEX.lock();
-        register_mutator();
-        let result = std::panic::catch_unwind(|| {
-            let _guard =
-                unsafe { MutatorExtraAreaGuard::new(no_roots, std::ptr::null(), "unwind") };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = inner_guard;
             panic!("test unwind");
-        });
+        }));
         assert!(result.is_err());
-        // Teardown asserts that no scoped area remains registered.
+        walk_my_extra_areas(|_| panic!("retired root still visible"));
         unregister_mutator();
     }
 
