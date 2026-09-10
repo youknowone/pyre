@@ -121,7 +121,154 @@ pub fn compile_source_with_opts(
     opts: CompileOpts,
 ) -> Result<CodeObject, CompileError> {
     crate::module::thread::ensure_runtime_thread();
-    rp_compile(&universal_newline(source), mode, filename, opts)
+    let source = universal_newline(source);
+    match rp_compile(&source, mode, filename, opts.clone()) {
+        Ok(code) => Ok(code),
+        Err(error) => retry_named_escape_parse(&source, error, |rewritten| {
+            rp_compile(rewritten, mode, filename, opts)
+        }),
+    }
+}
+
+fn compile_error_is_unexpected_unicode(error: &CompileError) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("unexpected unicode")
+}
+
+pub(crate) fn retry_named_escape_parse(
+    source: &str,
+    first: CompileError,
+    retry: impl FnOnce(&str) -> Result<CodeObject, CompileError>,
+) -> Result<CodeObject, CompileError> {
+    if !compile_error_is_unexpected_unicode(&first) {
+        return Err(first);
+    }
+    match rewrite_resolved_named_escapes(source) {
+        Some(rewritten) => retry(&rewritten),
+        None => Err(first),
+    }
+}
+
+/// Replace `\N{name}` in non-raw string literals with `\UXXXXXXXX` when
+/// `lookup_character` can resolve `name`.
+///
+/// Ruff's parser looks names up in `unicode_names2`, which has no formal
+/// aliases and no Tangut derived names. rustpython-unicode does. Substituting
+/// the scalar lets the parse succeed; the later `\N{}` walk then sees a
+/// `\U` escape and never asks Ruff for the name again.
+fn rewrite_resolved_named_escapes(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0;
+    let mut changed = false;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'#' {
+            let end = bytes[cursor..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |newline| cursor + newline + 1);
+            out.push_str(&source[cursor..end]);
+            cursor = end;
+            continue;
+        }
+        if !matches!(bytes[cursor], b'\'' | b'"') {
+            out.push(source[cursor..].chars().next().unwrap());
+            cursor += source[cursor..].chars().next().unwrap().len_utf8();
+            continue;
+        }
+        let quote_start = cursor;
+        let mut token_start = quote_start;
+        while token_start > 0 && bytes[token_start - 1].is_ascii_alphabetic() {
+            token_start -= 1;
+        }
+        if bytes
+            .get(token_start.wrapping_sub(1))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            out.push(source[cursor..].chars().next().unwrap());
+            cursor += 1;
+            continue;
+        }
+        let prefix = &bytes[token_start..quote_start];
+        if !prefix
+            .iter()
+            .all(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'f' | b'r' | b't' | b'u'))
+        {
+            out.push(source[cursor..].chars().next().unwrap());
+            cursor += 1;
+            continue;
+        }
+        let has = |wanted: u8| {
+            prefix
+                .iter()
+                .any(|byte| byte.to_ascii_lowercase() == wanted)
+        };
+        let raw = has(b'r');
+        let bytes_literal = has(b'b');
+        let quote = bytes[quote_start];
+        let triple = bytes[quote_start..].starts_with(&[quote, quote, quote]);
+        let quote_len = if triple { 3 } else { 1 };
+        let content_start = quote_start + quote_len;
+        let mut content_end = content_start;
+        while content_end < bytes.len() {
+            if triple && bytes[content_end..].starts_with(&[quote, quote, quote]) {
+                break;
+            }
+            if !triple && bytes[content_end] == quote {
+                break;
+            }
+            if bytes[content_end] == b'\\' {
+                content_end = (content_end + 2).min(bytes.len());
+            } else {
+                content_end += 1;
+            }
+        }
+        let token_end = (content_end + quote_len).min(bytes.len());
+        // Prefix letters were already copied while walking up to the quote.
+        out.push_str(&source[quote_start..content_start]);
+        if raw || bytes_literal {
+            out.push_str(&source[content_start..content_end]);
+        } else if rewrite_named_escapes_in_literal(&source[content_start..content_end], &mut out) {
+            changed = true;
+        }
+        out.push_str(&source[content_end..token_end]);
+        cursor = token_end;
+    }
+    changed.then_some(out)
+}
+
+fn rewrite_named_escapes_in_literal(contents: &str, out: &mut String) -> bool {
+    let bytes = contents.as_bytes();
+    let mut cursor = 0;
+    let mut changed = false;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'\\' {
+            let ch = contents[cursor..].chars().next().unwrap();
+            out.push(ch);
+            cursor += ch.len_utf8();
+            continue;
+        }
+        if bytes.get(cursor + 1) == Some(&b'N')
+            && bytes.get(cursor + 2) == Some(&b'{')
+            && let Some(rel) = bytes[cursor + 3..].iter().position(|byte| *byte == b'}')
+        {
+            let name_start = cursor + 3;
+            let name_end = name_start + rel;
+            if let Ok(name) = std::str::from_utf8(&bytes[name_start..name_end])
+                && let Some(ch) = rustpython_unicode::lookup_character(name)
+            {
+                out.push_str(&format!("\\U{:08X}", ch as u32));
+                cursor = name_end + 1;
+                changed = true;
+                continue;
+            }
+        }
+        out.push('\\');
+        cursor += 1;
+    }
+    changed
 }
 
 /// Scan the first two lines of `source` for a PEP 263 coding cookie
@@ -391,4 +538,27 @@ pub fn compile_eval(source: &str) -> Result<CodeObject, CompileError> {
 /// Compile a Python script (module).
 pub fn compile_exec(source: &str) -> Result<CodeObject, CompileError> {
     compile_source(source, Mode::Exec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compile_eval, rewrite_resolved_named_escapes};
+
+    #[test]
+    fn named_escape_rewrite_substitutes_tangut_and_aliases() {
+        let rewritten =
+            rewrite_resolved_named_escapes(r#"x = "\N{TANGUT IDEOGRAPH-17000}""#).unwrap();
+        assert!(rewritten.contains(r"\U00017000"), "{rewritten}");
+        let rewritten =
+            rewrite_resolved_named_escapes(r#"x = "\N{LATIN CAPITAL LETTER GHA}""#).unwrap();
+        assert!(rewritten.contains(r"\U000001A2"), "{rewritten}");
+        assert!(rewrite_resolved_named_escapes(r#"x = r"\N{TANGUT IDEOGRAPH-17000}""#).is_none());
+        assert!(rewrite_resolved_named_escapes(r#"x = "\N{SNOWMAN}""#).is_some());
+    }
+
+    #[test]
+    fn compile_resolves_tangut_named_escape() {
+        compile_eval(r#""\N{TANGUT IDEOGRAPH-17000}""#).unwrap();
+        compile_eval(r#""\N{LATIN CAPITAL LETTER GHA}""#).unwrap();
+    }
 }
