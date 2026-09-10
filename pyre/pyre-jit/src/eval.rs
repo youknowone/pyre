@@ -11593,7 +11593,10 @@ fn compile_and_run_once(
             }
             None => {}
         }
-        return Some(LoopResult::ContinueRunningNormally);
+        // Fall through so a `Jump` can commit
+        // `continue_running_normally_values` (`raise_continue_running_normally`)
+        // before the interpreter resumes. Returning CRN here used to drop
+        // loop-carried reds (`total`, cell shadows) recorded during the peel.
     }
 
     if let Some(outcome) = outcome {
@@ -11602,8 +11605,14 @@ fn compile_and_run_once(
             JitAction::ContinueRunningNormally => {
                 return Some(LoopResult::ContinueRunningNormally);
             }
-            JitAction::Continue => {}
+            JitAction::Continue => {
+                if tracing_finished {
+                    return Some(LoopResult::ContinueRunningNormally);
+                }
+            }
         }
+    } else if tracing_finished {
+        return Some(LoopResult::ContinueRunningNormally);
     }
     None
 }
