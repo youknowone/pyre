@@ -491,15 +491,8 @@ pub extern "C" fn PyThreadState_SetAsyncExc(ident: usize, w_type: PyObjectRef) -
     }
     // pypy/module/__pypy__/interp_signal.py `_raise_in_thread`:
     // `space.actionflag.rearm_ticker()` after updating the EC-owned slot.
-    // interp_signal.py `SignalActionFlag.rearm_ticker` writes the ticker
-    // cell to -1 so `action_dispatcher` runs; the eval-breaker bit is
-    // the compiled-loop mirror of that same arm.
     use crate::executioncontext::ActionFlagOps;
-    crate::executioncontext::SpaceActionFlag::new().reset_ticker(-1);
-    #[cfg(not(target_arch = "wasm32"))]
-    crate::module::signal::signalstate::rearm_ticker();
-    #[cfg(target_arch = "wasm32")]
-    majit_ir::eval_breaker_word::set_async();
+    crate::executioncontext::SpaceActionFlag::new().rearm_ticker();
     1
 }
 
