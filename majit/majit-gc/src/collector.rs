@@ -5206,14 +5206,11 @@ impl MiniMarkGC {
         );
         if self.is_nursery_object_start(gcref.0) {
             let slot_addr = gcref as *mut GcRef as usize;
-            // `is_nursery_object_start` is incminimark `is_in_nursery`: a
-            // range check, not a header check. A root slot that holds an
-            // interior address still has to name an object start — follow
-            // the enclosing header, which is what a precise map would have
-            // published. Do not change the range check itself.
-            let obj_addr = self.nursery_root_object_addr(gcref.0);
+            // incminimark.py `_trace_drag_out`: `is_in_nursery` is a range
+            // check, then copy `root.address[0]`. Interiors are a publisher
+            // defect, not a walk-site repair.
             *gcref =
-                self.copy_nursery_object(obj_addr, "minor_root_target", "minor_root", 0, slot_addr);
+                self.copy_nursery_object(gcref.0, "minor_root_target", "minor_root", 0, slot_addr);
         } else if self.is_young_rawmalloced(gcref.0) {
             // incminimark.py:2149-2159 `_trace_drag_out`: an object outside the
             // nursery needs nothing changed, *except* that a young rawmalloced
@@ -5268,10 +5265,12 @@ impl MiniMarkGC {
                         site,
                     );
                     if self.is_nursery_object_start(field_ref.0) {
-                        let child = self.nursery_root_object_addr(field_ref.0);
-                        if child != field_ref.0 || self.nursery_start_decodes(field_ref.0) {
+                        // `_trace_drag_out` copies the slot value. An
+                        // undecodable interior is deferred so the rest of
+                        // this custom trace can be reported with it.
+                        if self.nursery_start_decodes(field_ref.0) {
                             let new_ref = self.copy_nursery_object(
-                                child,
+                                field_ref.0,
                                 "minor_custom_trace_target",
                                 site,
                                 obj_addr,
@@ -6667,64 +6666,6 @@ impl MiniMarkGC {
     fn nursery_start_decodes(&self, obj_addr: usize) -> bool {
         let hdr = unsafe { *header_of(obj_addr) };
         hdr.is_forwarded() || (hdr.type_id() as usize) < self.types.len()
-    }
-
-    /// Object-start address a root slot should name.
-    ///
-    /// A precise map publishes the payload start. A slot that landed
-    /// `N` words inside a nursery object still has to drag that object
-    /// out. A live start that decodes is used as-is: walking backward
-    /// from every nursery root would treat a payload `FORWARDED_MARKER`
-    /// as an enclosing header and rewrite the slot to the wrong object.
-    /// Snap only when this address itself does not decode.
-    fn nursery_root_object_addr(&self, addr: usize) -> usize {
-        if self.nursery_start_decodes(addr) {
-            return addr;
-        }
-        self.enclosing_nursery_object_start(addr).unwrap_or(addr)
-    }
-
-    /// Payload start of a nursery object that already moved and whose
-    /// leftover header still covers `addr`.
-    ///
-    /// Only a forwarded header is a witness: a live object's payload
-    /// words can decode as a small type_id, and treating one as a start
-    /// would copy from the middle of the object. The `test_re` crash
-    /// walks the interior slot after another root has already forwarded
-    /// the real start (`nearest_header=forwarded back=3w`).
-    fn enclosing_nursery_object_start(&self, obj_addr: usize) -> Option<usize> {
-        let word = std::mem::size_of::<usize>();
-        let floor = self.nursery.start_ptr() as usize;
-        for back in 1..=64usize {
-            let candidate = obj_addr.checked_sub(back * word)?;
-            if candidate < floor + GcHeader::SIZE {
-                break;
-            }
-            if unsafe { (*header_of(candidate)).is_forwarded() } {
-                let fwd = unsafe { GcHeader::forwarding_address(header_of(candidate)) };
-                // A payload word can equal FORWARDED_MARKER. The word after
-                // it is then not a live object start; refuse an unaligned
-                // or non-heap forwarding address before reading its header.
-                if !fwd.is_multiple_of(GcHeader::ALIGN)
-                    || !(self.oldgen.contains(fwd) || self.is_in_nursery(fwd))
-                {
-                    continue;
-                }
-                let fwd_hdr = unsafe { header_of(fwd) };
-                if unsafe { (*fwd_hdr).is_forwarded() } {
-                    continue;
-                }
-                let Some(size) = self.try_size_for_typeid(fwd, unsafe { (*fwd_hdr).type_id() })
-                else {
-                    continue;
-                };
-                if candidate + size <= obj_addr {
-                    continue;
-                }
-                return Some(candidate);
-            }
-        }
-        None
     }
 
     /// Every slot a custom trace names, with the state of the value in it.
@@ -14932,57 +14873,22 @@ cache size\t: 8192 kB\n";
     // contract. The test disagreed with that contract and was removed
     // to keep majit-gc structurally aligned with RPython.
     //
-    // `drag_out_root` still has to name an object start when a publisher
-    // puts an interior address in a root slot (`test_re` on linux
-    // dynasm: `+16` into a forwarded nursery object). Snapping to the
-    // enclosing header is that walk-site repair; the range check itself
-    // stays a range check.
+    // `drag_out_root` copies `root.address[0]` (`_trace_drag_out`).
+    // An interior slot is a publisher defect and must panic, not snap.
 
     #[test]
-    fn test_minor_root_walk_snaps_interior_pointer_to_object_start() {
+    #[should_panic(expected = "invalid type_id")]
+    fn test_minor_root_walk_does_not_snap_interior_pointers() {
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(32));
         let obj = gc.alloc_with_type(tid, 32);
         unsafe {
             *(obj.0 as *mut u64) = 0x42;
-            // header_of(obj+16) reads this word; a non-type_id value
-            // is the test_re shape (`pycode` pointer, not tid 0).
             *((obj.0 + 8) as *mut u64) = 0x42;
         }
-
-        // Exact root first so the object is forwarded before the interior
-        // slot is walked — the `test_re` ordering (`nearest_header=forwarded`).
         let mut exact = obj;
         gc.drag_out_root(&mut exact);
-        assert!(
-            gc.oldgen.contains(exact.0),
-            "exact root must promote the object"
-        );
-
-        // +16 so `header_of` reads the word we set to 0x42, which does
-        // not decode as a type_id. A zero word would look like type 0
-        // and is left as a start (`nursery_start_decodes`).
         let mut interior = GcRef(obj.0 + 16);
-        gc.drag_out_root(&mut interior);
-        assert_eq!(
-            exact.0, interior.0,
-            "interior root must snap to the same forwarded object"
-        );
-        assert_eq!(unsafe { *(exact.0 as *const u64) }, 0x42);
-    }
-
-    #[test]
-    fn test_enclosing_snap_ignores_forwarded_marker_payload_words() {
-        let mut gc = test_gc(4096);
-        let tid = gc.register_type(TypeInfo::simple(48));
-        let obj = gc.alloc_with_type(tid, 48);
-        unsafe {
-            *(obj.0 as *mut u64) = crate::header::FORWARDED_MARKER;
-            *((obj.0 + 8) as *mut usize) = 0xffff_ffff_ffff_ffce;
-        }
-        let mut exact = obj;
-        gc.drag_out_root(&mut exact);
-        let mut interior = GcRef(obj.0 + 24);
         gc.drag_out_root(&mut interior);
     }
 
