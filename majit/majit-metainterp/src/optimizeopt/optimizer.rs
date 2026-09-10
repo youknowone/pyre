@@ -1503,7 +1503,7 @@ impl Optimizer {
             passes: Vec::new(),
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
-            call_pure_results: crate::optimizeopt::util::args_dict(),
+            call_pure_results: crate::optimizeopt::util::ArgsDict::default(),
             last_guard_op_idx: None,
             replaces_guard: indexmap::IndexMap::new(),
             pendingfields: Vec::new(),

@@ -370,7 +370,7 @@ impl OptPure {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: crate::optimizeopt::util::args_dict(),
+            call_pure_results: crate::optimizeopt::util::ArgsDict::default(),
             preamble_pure_ops: Vec::new(),
         }
     }
@@ -1887,7 +1887,7 @@ mod tests {
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
-            call_pure_results: crate::optimizeopt::util::args_dict(),
+            call_pure_results: crate::optimizeopt::util::ArgsDict::default(),
             preamble_pure_ops: Vec::new(),
         }));
         let result = opt

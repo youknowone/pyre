@@ -88,30 +88,50 @@ impl Hash for ArgsKey {
 /// Collection updates only the independently owned Const slots, never this
 /// map through a borrowed TraceCtx/Optimizer. No GC-time clear or rehash.
 #[derive(Clone, Default)]
-pub struct ArgsDict(Rc<RefCell<indexmap::IndexMap<ArgsKey, CachedConst>>>);
+pub struct ArgsDict(RefCell<Option<Rc<RefCell<indexmap::IndexMap<ArgsKey, CachedConst>>>>>);
 
 impl std::fmt::Debug for ArgsDict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArgsDict")
-            .field("len", &self.0.borrow().len())
+            .field(
+                "len",
+                &self
+                    .0
+                    .borrow()
+                    .as_ref()
+                    .map(|m| m.borrow().len())
+                    .unwrap_or(0),
+            )
             .finish()
     }
 }
 
 pub fn args_dict() -> ArgsDict {
-    ArgsDict::default()
+    ArgsDict(RefCell::new(Some(Rc::new(RefCell::new(
+        indexmap::IndexMap::new(),
+    )))))
 }
 
 impl ArgsDict {
     pub fn insert(&self, args: Vec<Value>, value: Value) {
         let key = ArgsKey::new(args);
         let value = CachedConst::new(value);
-        self.0.borrow_mut().insert(key, value);
+        let mut slot = self.0.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Rc::new(RefCell::new(indexmap::IndexMap::new())));
+        }
+        slot.as_ref()
+            .expect("args_dict insert")
+            .borrow_mut()
+            .insert(key, value);
     }
 
     pub fn get(&self, args: &[Value]) -> Option<Value> {
         let key = ArgsKey::new(args.iter().copied());
-        self.0.borrow().get(&key).map(CachedConst::value)
+        self.0
+            .borrow()
+            .as_ref()
+            .and_then(|m| m.borrow().get(&key).map(CachedConst::value))
     }
 }
 
