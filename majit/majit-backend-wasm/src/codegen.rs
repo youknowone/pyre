@@ -5394,6 +5394,12 @@ fn build_function(
     debug_assert_eq!(ca_target_local, ca_fi_local + 1);
     debug_assert_eq!(alloc_scratch_local, bridge_slot_local + base_i32_locals);
     debug_assert_eq!(alloc_size_local, alloc_scratch_local + 1);
+    // rewrite.py clears `gcrefs_recently_loaded` at LABEL. A failarg that
+    // is a preamble `LoadFromGcTable` (or SameAs of one) is not a LABEL
+    // arg, so the guard must rematerialize the load — cranelift
+    // `resolve_failarg_opref` / `GC_TABLE_VAR_INDEX`.
+    let gc_table_slots =
+        gc_table_failarg_slots(ops, constants, gc_table_base, gc_table_bases);
     let inline_guards: Vec<InlineGuard<'_>> = inlined_bridges
         .iter()
         .enumerate()
@@ -5425,6 +5431,7 @@ fn build_function(
         frame,
         counter_slot: counter_slot(inputargs, ops).map(|slot| slot as u64),
         spill_helpers: spill_helper_indices,
+        gc_table_slots: &gc_table_slots,
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -8321,10 +8328,7 @@ fn build_function(
                 if !OpRef::raw_is_constant(vi) {
                     let index = resolve_const_bits(constants, op.arg(0).to_opref());
                     let base = gc_table_bases.get(&vi).copied().unwrap_or(gc_table_base);
-                    let slot =
-                        base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
-                    sink.i32_const(slot as i32);
-                    sink.i64_load32_u(memarg(0, 2));
+                    emit_gc_table_load(&mut sink, base, index);
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -10279,6 +10283,66 @@ fn emit_label_capture_restore(
     }
 }
 
+fn emit_gc_table_load(sink: &mut PeepSink<'_, '_>, base: u32, index: i64) {
+    let slot = base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
+    sink.i32_const(slot as i32);
+    sink.i64_load32_u(memarg(0, 2));
+}
+
+/// Failarg counterpart of cranelift `resolve_failarg_opref`: rematerialize a
+/// preamble `LoadFromGcTable` (or SameAs of one) instead of spilling the
+/// local the back edge does not refresh.
+fn emit_resolve_failarg(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    opref: OpRef,
+    gc_table_slots: &HashMap<u32, (u32, i64)>,
+) {
+    if !opref.is_none()
+        && !opref.is_constant()
+        && let Some(&(base, index)) = gc_table_slots.get(&opref.raw())
+    {
+        emit_gc_table_load(sink, base, index);
+        return;
+    }
+    emit_resolve(sink, constants, value_types, opref);
+}
+
+fn gc_table_failarg_slots(
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    gc_table_base: u32,
+    gc_table_bases: &HashMap<u32, u32>,
+) -> HashMap<u32, (u32, i64)> {
+    let mut slots = HashMap::new();
+    for op in ops {
+        match op.opcode {
+            OpCode::LoadFromGcTable => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    let index = resolve_const_bits(constants, op.arg(0).to_opref());
+                    let base = gc_table_bases.get(&vi).copied().unwrap_or(gc_table_base);
+                    slots.insert(vi, (base, index));
+                }
+            }
+            OpCode::SameAsI | OpCode::SameAsR | OpCode::CastOpaquePtr => {
+                let vi = op.pos.get().raw();
+                let src = op.arg(0).to_opref();
+                if !OpRef::raw_is_constant(vi)
+                    && !src.is_none()
+                    && !src.is_constant()
+                    && let Some(&slot) = slots.get(&src.raw())
+                {
+                    slots.insert(vi, slot);
+                }
+            }
+            _ => {}
+        }
+    }
+    slots
+}
+
 fn emit_resolve(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -10638,6 +10702,10 @@ struct BridgeDispatch<'a> {
     /// arguments, for the counts `spill_helper_arities` admitted. An exit whose
     /// count is absent writes its own stores.
     spill_helpers: &'a indexmap::IndexMap<usize, u32>,
+    /// Preamble `LoadFromGcTable` results (and SameAs of them) that a
+    /// later guard may spill. Keyed by value id; the pair is the baked
+    /// table base and slot index.
+    gc_table_slots: &'a HashMap<u32, (u32, i64)>,
 }
 
 fn emit_guard_true(
@@ -10873,6 +10941,7 @@ fn emit_guard_exit(
             dispatch.frame,
             op,
             inline.inputargs,
+            dispatch.gc_table_slots,
         );
         sink.br(inline_region_br_depth(inline, &dispatch, enclosing_frames));
         return;
@@ -10886,6 +10955,7 @@ fn emit_guard_exit(
             op,
             dispatch.counter_slot,
             dispatch.spill_helpers,
+            dispatch.gc_table_slots,
         );
         if dispatch.enabled {
             emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
@@ -10902,6 +10972,7 @@ fn emit_guard_exit(
             op,
             dispatch.counter_slot,
             dispatch.spill_helpers,
+            dispatch.gc_table_slots,
         );
     }
     sink.br(block_exit_depth);
@@ -10954,7 +11025,13 @@ fn emit_guard_param_tail_call(
             emit_resolve_f64(sink, constants, value_types, arg);
             sink.i64_reinterpret_f64();
         } else {
-            emit_resolve(sink, constants, value_types, arg);
+            emit_resolve_failarg(
+                sink,
+                constants,
+                value_types,
+                arg,
+                dispatch.gc_table_slots,
+            );
         }
     }
     sink.local_get(dispatch.bridge_slot_local);
@@ -10973,6 +11050,7 @@ fn emit_guard_inline_bridge_move(
     frame: FrameGeometry,
     op: &Op,
     inputargs: &[InputArg],
+    gc_table_slots: &HashMap<u32, (u32, i64)>,
 ) {
     let fail_args: Vec<OpRef> = live_fail_args_of(op);
     assert_eq!(
@@ -10984,7 +11062,7 @@ fn emit_guard_inline_bridge_move(
         if value_types.ty(input.index) == ValType::F64 {
             emit_resolve_f64(sink, constants, value_types, *arg);
         } else {
-            emit_resolve(sink, constants, value_types, *arg);
+            emit_resolve_failarg(sink, constants, value_types, *arg, gc_table_slots);
         }
     }
     for input in inputargs.iter().rev() {
@@ -11128,6 +11206,7 @@ fn emit_guard_spill(
     op: &Op,
     counter_slot: Option<u64>,
     spill_helpers: &indexmap::IndexMap<usize, u32>,
+    gc_table_slots: &HashMap<u32, (u32, i64)>,
 ) {
     emit_guard_fail_args_spill(
         sink,
@@ -11136,6 +11215,7 @@ fn emit_guard_spill(
         op,
         counter_slot,
         spill_helpers,
+        gc_table_slots,
     );
     emit_guard_fail_index_store(sink, exit_index(op, guard_idx));
 }
@@ -11162,6 +11242,7 @@ fn emit_guard_fail_args_spill(
     op: &Op,
     counter_slot: Option<u64>,
     spill_helpers: &indexmap::IndexMap<usize, u32>,
+    gc_table_slots: &HashMap<u32, (u32, i64)>,
 ) {
     // Only through the last live position: `normal_frame_value_slots` sizes the
     // value area the same way, so writing past it would write past the frame.
@@ -11177,21 +11258,21 @@ fn emit_guard_fail_args_spill(
     if let Some(&helper) = spill_helpers.get(&fail_args.len()) {
         sink.local_get(0);
         for &arg_ref in &fail_args {
-            emit_resolve(sink, constants, value_types, arg_ref);
+            emit_resolve_failarg(sink, constants, value_types, arg_ref, gc_table_slots);
         }
         sink.call(helper);
     } else {
         for (i, &arg_ref) in fail_args.iter().enumerate() {
             let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
             sink.local_get(0);
-            emit_resolve(sink, constants, value_types, arg_ref);
+            emit_resolve_failarg(sink, constants, value_types, arg_ref, gc_table_slots);
             sink.i64_store(mem64(offset));
         }
     }
     if let Some((operand, slot)) = counter_value_spill(op, &fail_args).zip(counter_slot) {
         let offset = FRAME_SLOT_BASE + slot * SLOT_SIZE;
         sink.local_get(0);
-        emit_resolve(sink, constants, value_types, operand);
+        emit_resolve_failarg(sink, constants, value_types, operand, gc_table_slots);
         sink.i64_store(mem64(offset));
     }
 }
@@ -12069,6 +12150,7 @@ mod tests {
             frame: FrameGeometry::compact(1, 0, 0),
             counter_slot: None,
             spill_helpers: &spill_helpers,
+            gc_table_slots: &HashMap::new(),
         };
 
         assert_eq!(inline_region_br_depth(&inline, &dispatch, 0), 0);

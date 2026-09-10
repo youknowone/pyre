@@ -3588,6 +3588,113 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
     );
 }
 
+/// A preamble `LoadFromGcTable` used only as a later guard failarg is
+/// rematerialized at the spill. rewrite.py clears `gcrefs_recently_loaded`
+/// at LABEL, so the local is not a LABEL arg and is stale after the first
+/// collecting back edge — cranelift `resolve_failarg_opref`.
+#[test]
+fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::LoadFromGcTable,
+            &[OpRef::const_int(0)],
+            OpRef::ref_op(1),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(2)],
+            &[OpRef::ref_op(1), OpRef::int_op(2)],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]),
+    ];
+    let gc_table_base = 4096;
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(5, 3, 1),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+
+    let mut control_stack = Vec::new();
+    let mut gc_table_address_on_stack = false;
+    let mut loads_inside_loop = 0usize;
+    let mut loads_outside_loop = 0usize;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::Loop { .. } => {
+                        control_stack.push(true);
+                        gc_table_address_on_stack = false;
+                    }
+                    wasmparser::Operator::Block { .. } | wasmparser::Operator::If { .. } => {
+                        control_stack.push(false);
+                        gc_table_address_on_stack = false;
+                    }
+                    wasmparser::Operator::End => {
+                        control_stack.pop();
+                        gc_table_address_on_stack = false;
+                    }
+                    wasmparser::Operator::I32Const { value } if value == gc_table_base as i32 => {
+                        gc_table_address_on_stack = true;
+                    }
+                    wasmparser::Operator::I64Load32U { .. } if gc_table_address_on_stack => {
+                        if control_stack.contains(&true) {
+                            loads_inside_loop += 1;
+                        } else {
+                            loads_outside_loop += 1;
+                        }
+                        gc_table_address_on_stack = false;
+                    }
+                    _ => gc_table_address_on_stack = false,
+                }
+            }
+        }
+    }
+    assert_eq!(
+        loads_outside_loop, 1,
+        "the preamble LoadFromGcTable stays outside the loop"
+    );
+    assert_eq!(
+        loads_inside_loop, 1,
+        "the guard failarg must rematerialize the table load inside the loop"
+    );
+}
+
 #[test]
 fn test_peeled_label_captures_missing_ref_livein_in_frozen_frame() {
     let inputargs = vec![
