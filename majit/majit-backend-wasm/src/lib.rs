@@ -4019,8 +4019,9 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
         .map(|i| unsafe { *frame.add(1 + i) })
         .collect();
     let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
-    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
-        as *const majit_backend::jitframe::JitFrame;
+    // `boxed` may collect and forward a nursery callee. Reload the object
+    // base from the JF shadow stack before reading `jf_savedata`.
+    let jf = jitframe_object_base(frame_ptr).0 as *const majit_backend::jitframe::JitFrame;
     data.set_savedata_ref(GcRef(unsafe { (*jf).jf_savedata }));
     DeadFrame::Boxed(data)
 }
@@ -4037,6 +4038,18 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
 /// itself carries in local 0.
 fn forced_frame_items_base(force_token: GcRef) -> usize {
     force_token.0 + majit_backend::jitframe::FIRST_ITEM_OFFSET
+}
+
+/// JitFrame object base for a data-region `frame_ptr`. After a collecting
+/// `WasmFrameData::boxed`, prefer the forwarded address on the JF shadow
+/// stack; tests that never pushed a frame keep the incoming pointer.
+fn jitframe_object_base(frame_ptr: usize) -> GcRef {
+    let top = majit_gc::shadow_stack::jf_top_ptr();
+    if top.is_null() {
+        GcRef(frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+    } else {
+        top
+    }
 }
 
 fn force_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> i64 {
@@ -4068,13 +4081,11 @@ fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame 
         .collect();
     let mut data = WasmFrameData::boxed(raw_values, fail_descr, 0);
     unsafe {
-        // `attach_forced_jitframe` wants the JitFrame object base: it
-        // checks GC ownership and later casts this address to
-        // `*mut JitFrame` in `set_savedata_ref`. `frame_ptr` here is
-        // the items base `force` decoded from the token.
-        data.attach_forced_jitframe(GcRef(
-            frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET,
-        ));
+        // `boxed` may collect. Attach the forwarded object base, not the
+        // incoming items pointer. `attach_forced_jitframe` wants that
+        // object base: it checks GC ownership and later casts it to
+        // `*mut JitFrame` in `set_savedata_ref`.
+        data.attach_forced_jitframe(jitframe_object_base(frame_ptr));
     }
     DeadFrame::Boxed(data)
 }
@@ -6053,10 +6064,11 @@ impl majit_backend::Backend for WasmBackend {
             let sign = std::mem::size_of::<isize>();
             let depth = frame_size * 8 / sign;
             let alloc_size = majit_backend::jitframe::JitFrame::alloc_size(depth);
-            // An `i64` element type for the alignment a `JitFrame` needs and
-            // for the zero fill `JitFrame::init` requires.
-            let mut backing = vec![0i64; alloc_size.div_ceil(8)];
-            let jf = backing.as_mut_ptr() as *mut majit_backend::jitframe::JitFrame;
+            // Off-GC storage so a FINISH that returns the force token can
+            // hand the same block to `LibcJitFrameDeadFrame::owning`. A
+            // `Vec` on this stack would free the token's JitFrame.
+            let jf = majit_backend::jitframe::alloc_off_gc_jitframe(alloc_size);
+            assert!(!jf.is_null(), "wasm host-buffer JitFrame allocation failed");
             unsafe { majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth) };
             unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
             let items = (jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET) as *mut i64;
@@ -6081,9 +6093,10 @@ impl majit_backend::Backend for WasmBackend {
                 glue::execute(func_handle, items as usize as u32);
             }
             majit_gc::shadow_stack::pop_jf_to(saved);
-            majit_gc::shadow_stack::unregister_libc_jitframe(jf as usize);
             // Nothing reads the frame's interior through the gcmap any more,
-            // and the gcmap is about to go out of scope.
+            // and the gcmap is about to go out of scope. Keep the libc
+            // registration: `owning` walks this frame as a deadframe root
+            // and unregisters it on drop.
             unsafe { (*jf).jf_gcmap = std::ptr::null() };
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
@@ -6098,18 +6111,20 @@ impl majit_backend::Backend for WasmBackend {
             let raw_values: Vec<i64> = (0..num_outputs)
                 .map(|i| unsafe { *items.add(1 + i) })
                 .collect();
-            let savedata = GcRef(unsafe { (*jf).jf_savedata });
-            let savedata_root = if savedata.is_null() {
-                None
-            } else {
-                Some(majit_gc::shadow_stack::push(savedata))
+            // FINISH(force_token) parks this JitFrame pointer in raw_values.
+            // Own the off-GC block before `boxed` so a later `force` does
+            // not dereference a freed frame.
+            let owner = unsafe {
+                majit_backend::libc_deadframe::LibcJitFrameDeadFrame::owning(
+                    jf,
+                    jf,
+                    depth,
+                    fail_descr.clone(),
+                    None,
+                )
             };
-            drop(backing);
             let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
-            data.set_savedata_ref(savedata_root.map_or(GcRef(0), majit_gc::shadow_stack::get));
-            if let Some(root) = savedata_root {
-                majit_gc::shadow_stack::pop_to(root);
-            }
+            data.take_host_frame(owner);
             DeadFrame::Boxed(data)
         }
     }
