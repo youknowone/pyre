@@ -158,6 +158,11 @@ impl LiveboxMap {
         }
     }
 
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Slot of `b` in `entries`, through the index once there is one.
     #[inline(always)]
     fn position(&self, b: &majit_ir::operand::Operand) -> Option<usize> {
@@ -3906,6 +3911,15 @@ impl ResumeDataLoopMemo {
         env: &dyn majit_ir::BoxEnv,
     ) -> Result<(Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>, usize), TagOverflow> {
         // resume.py: new_liveboxes = [None] * memo.num_cached_boxes()
+        // then reverse + extend onto `liveboxes`. When this finish() saw no
+        // field-walk boxes and no virtuals, that list is all holes — extend
+        // them in place and skip the intermediate Vec the memo's cached-box
+        // count would otherwise allocate on every timed-section guard.
+        if new_liveboxes.is_empty() && virtual_fields.is_empty() {
+            let n = self.num_cached_boxes();
+            liveboxes.extend(std::iter::repeat_n(None, n));
+            return Ok((Vec::new(), n));
+        }
         let mut new_boxes_list: Vec<Option<majit_ir::OpRef>> = vec![None; self.num_cached_boxes()];
         let mut count = 0;
         // Iterate in insertion order (RPython dict iteration = insertion order).

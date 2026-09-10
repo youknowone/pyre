@@ -829,9 +829,18 @@ impl BlackholeInterpreter {
     /// Allocates registers sized to hold both working regs and constants,
     /// then copies constants into the upper portion of each register array.
     pub fn setposition(&mut self, jitcode: std::sync::Arc<JitCode>, position: usize) {
-        self.init_register_files_from_runtime_jitcode(&jitcode);
-        // RPython: descrs are shared on the builder (setup_descrs).
-        self.jitcode = jitcode;
+        // `copy_constants` is idempotent for one jitcode. A 4–7 frame
+        // `shift` resume reseats the same helper; skip the constant walk
+        // when the banks are already that jitcode's. Working regs are
+        // filled by `consume_one_section` from liveness.
+        let already = std::sync::Arc::ptr_eq(&self.jitcode, &jitcode)
+            && self.registers_i.len() >= jitcode.num_regs_and_consts_i()
+            && self.registers_r.len() >= jitcode.num_regs_and_consts_r()
+            && self.registers_f.len() >= jitcode.num_regs_and_consts_f();
+        if !already {
+            self.init_register_files_from_runtime_jitcode(&jitcode);
+            self.jitcode = jitcode;
+        }
         self.reset_position_state(position);
         if crate::bh_debug_enabled() {
             eprintln!(
@@ -1759,10 +1768,78 @@ impl BlackholeInterpreter {
                 current = frame.nextblackholeinterp.as_deref_mut();
             }
         }
-        let result = self.run_inner();
+        let result = self
+            .try_native_finish_at_node_entry()
+            .unwrap_or_else(|| self.run_inner());
         majit_gc::shadow_stack::pop_resume_ref_roots_to(vable_roots_depth);
         majit_gc::shadow_stack::pop_bh_regs_to(bh_depth);
         result
+    }
+
+    /// `bhimpl_inline_call_*` for a frame whose resume PC is still the
+    /// helper entry: the remaining body is the whole callee, so one
+    /// `fnaddr` call answers it.
+    fn try_native_finish_at_node_entry(&mut self) -> Option<BhRunOutcome> {
+        if !is_callable_fnaddr(self.jitcode.fnaddr) {
+            return None;
+        }
+        if !native_entry_args_intact(&self.jitcode, self.position) {
+            return None;
+        }
+        let body = self.jitcode.try_body()?;
+        let calldescr = body.calldescr.clone();
+        let fnaddr = self.jitcode.fnaddr;
+        let mut args_i = smallvec::SmallVec::<[i64; 4]>::new();
+        let mut args_r = smallvec::SmallVec::<[i64; 4]>::new();
+        let mut args_f = smallvec::SmallVec::<[i64; 2]>::new();
+        let (mut ni, mut nr, mut nf) = (0usize, 0usize, 0usize);
+        for ch in calldescr.arg_classes.bytes() {
+            match ch {
+                b'i' => {
+                    args_i.push(*self.registers_i.get(ni)?);
+                    ni += 1;
+                }
+                b'r' => {
+                    args_r.push(*self.registers_r.get(nr)?);
+                    nr += 1;
+                }
+                b'f' => {
+                    args_f.push(*self.registers_f.get(nf)?);
+                    nf += 1;
+                }
+                _ => return None,
+            }
+        }
+        BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(args_r.as_mut_slice());
+        }
+        let outcome = match calldescr.result_type {
+            'i' => {
+                let result =
+                    self.bhimpl_inline_call_irf_i(fnaddr, &args_i, &args_r, &args_f, &calldescr);
+                match check_residual_call_exception_after(self, self.position) {
+                    Ok(()) => {
+                        self.tmpreg_i = result;
+                        self.return_type = BhReturnType::Int;
+                        Some(BhRunOutcome::LeaveFrame)
+                    }
+                    Err(DispatchError::LeaveFrame) => Some(BhRunOutcome::LeaveFrame),
+                    Err(DispatchError::ContinueRunningNormally(args)) => {
+                        Some(BhRunOutcome::ContinueRunningNormally(args))
+                    }
+                    Err(DispatchError::RaiseException { exc, .. }) => {
+                        self.got_exception = true;
+                        self.exception_last_value = exc;
+                        Some(BhRunOutcome::Exception)
+                    }
+                }
+            }
+            _ => None,
+        };
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(args_root_depth);
+        outcome
     }
 
     fn run_inner(&mut self) -> BhRunOutcome {
@@ -12573,6 +12650,58 @@ pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
 #[inline]
 pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
     fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)
+}
+
+/// True when `position` is still a node-entry of this helper: no child
+/// `INLINE_CALL` and no `SETFIELD` have run, and the param slots (`r0`,
+/// `i0`, `i1`) have not been overwritten. Restarting `fnaddr` with those
+/// slots is then the same as interpreting the rest of this frame.
+///
+/// A mid-`shift` Sequence/Alternative PC (left child already stored)
+/// returns false — re-running the helper would reread `old_left` from
+/// the current-character marks.
+pub fn native_entry_args_intact(jitcode: &JitCode, position: usize) -> bool {
+    if position == 0 {
+        return true;
+    }
+    let Some(starts) = jitcode.startpoints.as_ref() else {
+        return false;
+    };
+    let code = jitcode.code.as_slice();
+    for &pc in starts {
+        if pc >= position {
+            continue;
+        }
+        let Some(&op) = code.get(pc) else {
+            continue;
+        };
+        match op {
+            jitcode::insns::BC_INLINE_CALL
+            | jitcode::insns::BC_SETFIELD_GC_I
+            | jitcode::insns::BC_SETFIELD_GC_R
+            | jitcode::insns::BC_SETFIELD_GC_F => return false,
+            jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_R => {
+                let dest = code.get(pc + 4).copied().unwrap_or(0xff);
+                if dest == 0 || (op == jitcode::insns::BC_GETFIELD_GC_I && dest == 1) {
+                    return false;
+                }
+            }
+            jitcode::insns::BC_MOVE_I | jitcode::insns::BC_MOVE_I_C => {
+                let dest = code.get(pc + 2).copied().unwrap_or(0xff);
+                if dest == 0 || dest == 1 {
+                    return false;
+                }
+            }
+            jitcode::insns::BC_INT_EQ => {
+                let dest = code.get(pc + 3).copied().unwrap_or(0xff);
+                if dest == 0 || dest == 1 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Refuse to call an unresolved `inline_call_*` target when its jitcode
