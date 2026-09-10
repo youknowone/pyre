@@ -960,6 +960,12 @@ pub enum RuntimeHelperKind {
     /// `guard_class INT` (`~x` always fits an int, so no overflow guard); a
     /// bool / subclass / non-int operand falls through to the generic residual.
     UnaryInvert,
+    /// `bh_unary_not_fn(value)` — the `UNARY_NOT` helper (`space.not_` →
+    /// `w_bool_from(!is_true(value))`).  The full-body walker folds a
+    /// provably-exact-int or exact-bool operand to `int_is_true` + negate +
+    /// `newbool`, eliding the `CALL_MAY_FORCE`.  A subclass / non-int operand
+    /// falls through so a user `__bool__` / `__len__` still runs.
+    UnaryNot,
     /// `bh_format_simple_fn(value)` — the FORMAT_SIMPLE helper
     /// (`runtime_ops::format_value` with the empty spec).  A user
     /// `__format__` runs Python here, so the generic residual is opaque for
