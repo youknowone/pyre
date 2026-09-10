@@ -1,9 +1,9 @@
-# An abandoned fwalk generator keeps its dirfds until GC. close() of a
-# different fwalk must not run that peer's finally -- otherwise
-# test_os.FwalkTests.test_fd_finalization sees extra closes
-# (AssertionError: 4 != 7) after test_walk_symlink leaves a generator
-# live. CPython drops the peer on the rebind; pypy3 leaves it until a
-# later collection and still does not finalize it from this close().
+# CPython-suite gap: test_os.FwalkTests.test_fd_finalization only fails
+# after test_walk_symlink abandons a live fwalk; the suite does not pin
+# that close() of one fwalk must not run a peer's finally.
+# parity-tests reason: prompt-finalization on gen.close() must not treat
+# an exhausted scandir's leftover finalizer registration as a reason to
+# collect the whole heap and close another generator's dirfds.
 import os
 import shutil
 import tempfile
