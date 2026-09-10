@@ -12345,7 +12345,7 @@ fn handler_getfield_vable_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
@@ -12357,7 +12357,7 @@ fn handler_getfield_vable_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
@@ -12369,7 +12369,7 @@ fn handler_getfield_vable_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
@@ -12383,7 +12383,7 @@ fn handler_setfield_vable_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_i[code[p + 1] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
@@ -12403,7 +12403,7 @@ fn handler_setfield_vable_i_imm(
     let lo = code[p + 1] as u32 | ((code[p + 2] as u32) << 8);
     let hi = code[p + 3] as u32 | ((code[p + 4] as u32) << 8);
     let value = (lo | (hi << 16)) as i64;
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 5);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
@@ -12416,7 +12416,7 @@ fn handler_setfield_vable_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_r[code[p + 1] as usize];
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
@@ -12429,7 +12429,7 @@ fn handler_setfield_vable_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 1] as usize] as u64);
-    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr)?;
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
@@ -12456,15 +12456,17 @@ fn handler_setfield_vable_f(
 /// release builds, since the alternative is silent unsafe deref of a
 /// null pointer.
 fn vable_clear_token_and_get_vinfo(
-    bh: &BlackholeInterpreter,
+    bh: &mut BlackholeInterpreter,
     vable: i64,
-) -> (&'static crate::virtualizable::VirtualizableInfo, i64) {
+) -> Result<(&'static crate::virtualizable::VirtualizableInfo, i64), DispatchError> {
     if bh.virtualizable_info.is_null() {
-        panic!(
-            "vable opcode requires `bh.virtualizable_info` to be set \
-             (RPython `BlackholeInterpreter.bhimpl_*field_vable_*` parity); \
-             a null pointer here is a contract bug, not a recoverable case"
-        );
+        // A helper body interpreted because its fnaddr is still symbolic
+        // can reach a vable opcode on a frame that never received the
+        // portal vinfo. Hand the continuation back to the interpreter
+        // rather than treat the missing handle as a process-fatal bug.
+        bh.aborted = true;
+        bh.abort_permanent_bail = true;
+        return Err(DispatchError::LeaveFrame);
     }
     let bh_vinfo = unsafe { &*bh.virtualizable_info };
     // blackhole.py `fielddescr.get_vinfo().clear_vable_token(struct)`.
@@ -12484,7 +12486,7 @@ fn vable_clear_token_and_get_vinfo(
         .unwrap_or(bh_vinfo);
     let vable =
         unsafe { crate::virtualizable::bh_clear_vable_token(clear_info, vable as *mut u8) } as i64;
-    (bh_vinfo, vable)
+    Ok((bh_vinfo, vable))
 }
 
 /// Decode the vable-array descr pair after the register operands and
@@ -12494,20 +12496,20 @@ fn vable_clear_token_and_get_vinfo(
 /// `bhimpl_arraylen_vable` all start
 /// `fielddescr.get_vinfo().clear_vable_token(vable)` then load the array
 /// through `cpu.bh_getfield_gc_r`.
-fn take_vable_array<'a>(
-    bh: &'a BlackholeInterpreter,
+fn take_vable_array(
+    bh: &mut BlackholeInterpreter,
     vable: i64,
     code: &[u8],
     descr_pos: usize,
-) -> (&'a crate::virtualizable::VableArrayInfo, usize, i64) {
-    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable);
+) -> Result<(&'static crate::virtualizable::VableArrayInfo, usize, i64), DispatchError> {
+    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable)?;
     let (_field_descr, array_idx, p) = read_descr_vable_array(bh, code, descr_pos);
     let (_array_descr, pos) = read_descr(bh, code, p);
     // Item access goes through `vable_read_array_item` /
     // `vable_write_array_item`, which follow `EmbeddedArray`'s container
     // pointer as well as a direct `Ptr(GcArray)`.
     let info = &vinfo.array_fields[array_idx];
-    (info, pos, vable)
+    Ok((info, pos, vable))
 }
 
 // Virtualizable array operations (`bhimpl_getarrayitem_vable_*`)
@@ -12518,7 +12520,7 @@ fn handler_getarrayitem_vable_i(
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2)?;
     bh.registers_i[code[p] as usize] =
         unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
     Ok(p + 1)
@@ -12531,7 +12533,7 @@ fn handler_getarrayitem_vable_r(
     let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2)?;
     let value =
         unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
     if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
@@ -12551,7 +12553,7 @@ fn handler_setarrayitem_vable_i(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3)?;
     unsafe {
         crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
     }
@@ -12566,7 +12568,7 @@ fn handler_setarrayitem_vable_r(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3)?;
     if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
         eprintln!(
             "[nbody-debug][bh-vable-set-r] position={} last_opcode_position={} index={} value={:#x}",
@@ -12584,7 +12586,7 @@ fn handler_arraylen_vable(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 1);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 1)?;
     bh.registers_i[code[p] as usize] =
         unsafe { crate::virtualizable::bhimpl_arraylen_vable(vable as *const u8, ainfo) as i64 };
     Ok(p + 1)
@@ -12606,7 +12608,7 @@ fn handler_arraybase_vable(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable);
+    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable)?;
     let (field_descr, p) = read_descr(bh, code, p + 1);
     let array_idx = field_descr.as_vable_array_index();
     let (_, p) = read_descr(bh, code, p);
@@ -13186,7 +13188,7 @@ fn handler_getarrayitem_vable_f(
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 2)?;
     bh.registers_f[code[p] as usize] =
         unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
     Ok(p + 1)
@@ -13200,7 +13202,7 @@ fn handler_setarrayitem_vable_f(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_f[code[p + 2] as usize];
-    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3);
+    let (ainfo, p, vable) = take_vable_array(bh, vable, code, p + 3)?;
     unsafe {
         crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
     }
@@ -13471,6 +13473,7 @@ fn reject_unresolved_inline_call(
         "inline jitcode[{jitcode_index}] fnaddr={fnaddr:#x}"
     ));
     bh.aborted = true;
+    bh.abort_permanent_bail = true;
     DispatchError::LeaveFrame
 }
 
