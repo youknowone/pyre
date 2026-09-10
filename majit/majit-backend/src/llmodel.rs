@@ -93,6 +93,84 @@ pub unsafe fn get_int_value_direct(ptr: *const JitFrame, slot: usize) -> isize {
     unsafe { *JitFrame::slot_ptr_const(ptr, slot) }
 }
 
+/// llmodel.py `get_int_value(deadframe, index)`.
+///
+/// `_decode_pos` then `get_int_value_direct`. Values stay in
+/// `jf_frame[]`; nothing is copied into a host list.
+#[inline]
+pub unsafe fn get_int_value(ptr: *const JitFrame, descr: &dyn FailDescr, index: usize) -> i64 {
+    let slot = decode_rd_loc_slot(descr, index).unwrap_or(index);
+    unsafe { get_int_value_direct(ptr, slot) as i64 }
+}
+
+/// Fail-arg source for `resume.py` TAGBOX decode.
+///
+/// RPython's decoder calls `cpu.get_int_value` / `get_ref_value` on the
+/// deadframe. Tests that already hold a dense fail-arg list keep the
+/// slice arm; compiled guard failure uses the jitframe.
+#[derive(Clone, Copy)]
+pub enum FailArgSource<'a> {
+    Slice(&'a [i64]),
+    JitFrame {
+        ptr: *const JitFrame,
+        descr: &'a dyn FailDescr,
+        n: usize,
+    },
+}
+
+impl<'a> FailArgSource<'a> {
+    pub fn from_jitframe(ptr: *const JitFrame, descr: &'a dyn FailDescr, n: usize) -> Self {
+        Self::JitFrame { ptr, descr, n }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Slice(s) => s.len(),
+            Self::JitFrame { n, .. } => *n,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> i64 {
+        match self {
+            Self::Slice(s) => s[index],
+            Self::JitFrame { ptr, descr, n } => {
+                debug_assert!(index < *n);
+                unsafe { get_int_value(*ptr, *descr, index) }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn first(&self) -> Option<i64> {
+        (self.len() > 0).then(|| self.get(0))
+    }
+}
+
+impl<'a> From<&'a [i64]> for FailArgSource<'a> {
+    fn from(s: &'a [i64]) -> Self {
+        Self::Slice(s)
+    }
+}
+
+impl<'a> From<&'a Vec<i64>> for FailArgSource<'a> {
+    fn from(s: &'a Vec<i64>) -> Self {
+        Self::Slice(s)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [i64; N]> for FailArgSource<'a> {
+    fn from(s: &'a [i64; N]) -> Self {
+        Self::Slice(s)
+    }
+}
+
 /// Symmetric setter for `get_int_value_direct`.
 ///
 /// llsupport/llmodel.py does not expose this: compiled code writes

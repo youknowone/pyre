@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use majit_backend::{
     ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
-    ExitVirtualLayout,
+    ExitVirtualLayout, FailArgSource,
 };
 use majit_ir::{Const, GcRef, OpRef, Type};
 
@@ -6407,8 +6407,8 @@ pub struct ResumeDataDirectReader<'a> {
     pub consts: &'a [majit_ir::Const],
 
     // ResumeDataDirectReader fields (resume.py)
-    /// resume.py:1366 deadframe — raw fail_args values
-    pub deadframe: &'a [i64],
+    /// resume.py `ResumeDataDirectReader.deadframe` — `cpu.get_int_value`
+    pub deadframe: FailArgSource<'a>,
     /// pyre flat-deadframe adaptation: original type of each deadframe slot.
     /// RPython's CPU exposes typed getters (get_ref_value/get_int_value/...);
     /// pyre passes a flat raw slice and needs slot kinds to emulate
@@ -7239,7 +7239,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         rd_numb: &'a [u8],
         rd_consts: &'a [majit_ir::Const],
         all_liveness: &'a [u8],
-        deadframe: &'a [i64],
+        deadframe: impl Into<FailArgSource<'a>>,
         deadframe_types: Option<&'a [majit_ir::Type]>,
         all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
         allocator: &'a dyn BlackholeAllocator,
@@ -7263,7 +7263,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             items_resume_section,
             count,
             consts: rd_consts,
-            deadframe,
+            deadframe: deadframe.into(),
             deadframe_types,
             resume_after_guard_not_forced,
             rd_virtuals: None,
@@ -7651,7 +7651,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             if idx < 0 {
                 idx += self.count;
             }
-            return self.deadframe[idx as usize];
+            return self.deadframe.get(idx as usize);
         }
         self.decode_ref(tagged)
     }
@@ -8214,7 +8214,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe[idx as usize]
+                self.deadframe.get(idx as usize)
             }
             _ => unreachable!("bad tag: {tag}"),
         }
@@ -8245,7 +8245,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                let value = self.deadframe[idx as usize];
+                let value = self.deadframe.get(idx as usize);
                 let slot_type = match self.deadframe_types {
                     // resume.py has no `deadframe_types`: `cpu.get_ref_value`
                     // reads a self-describing deadframe, so a ref slot always
@@ -8300,7 +8300,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe[idx as usize]
+                self.deadframe.get(idx as usize)
             }
             _ => {
                 // resume.py — only TAGCONST and TAGBOX valid for floats
@@ -8314,7 +8314,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// Virtual sources go through getvirtual_ptr (REF virtuals).
     pub fn decode_field_source(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => self.deadframe[*index],
+            ResumeValueSource::FailArg(index) => self.deadframe.get(*index),
             // resume.py:1568 ConstPtr.getref_base() — the Const carries its type.
             ResumeValueSource::Constant(c) => c.getref_base().as_usize() as i64,
             ResumeValueSource::Virtual(index) => self.getvirtual_ptr(*index),
@@ -8329,7 +8329,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// Virtual sources go through getvirtual_int (INT/raw virtuals).
     pub fn decode_field_source_int(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => self.deadframe[*index],
+            ResumeValueSource::FailArg(index) => self.deadframe.get(*index),
             // resume.py:1555 ConstInt.getint().
             ResumeValueSource::Constant(c) => c.getint(),
             ResumeValueSource::Virtual(index) => self.getvirtual_int(*index),
@@ -8346,7 +8346,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// VirtualInfo variant.
     pub fn decode_field_source_float(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => self.deadframe[*index],
+            ResumeValueSource::FailArg(index) => self.deadframe.get(*index),
             // resume.py:1583 ConstFloat.getfloatstorage().
             ResumeValueSource::Constant(c) => c.getfloatstorage(),
             ResumeValueSource::Virtual(_) => {
@@ -8667,7 +8667,7 @@ pub fn blackhole_from_resumedata<'a>(
     rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
-    deadframe: &'a [i64],
+    deadframe: impl Into<FailArgSource<'a>>,
     deadframe_types: Option<&'a [majit_ir::Type]>,
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,

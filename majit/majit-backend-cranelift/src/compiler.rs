@@ -2155,7 +2155,8 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// stub staged into `jf_guard_exc`, handed to the blackhole resume per
 /// `blackhole.py _prepare_resume_from_failure`.  `0` = no pending
 /// exception.
-type CallAssemblerBlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>;
+type CallAssemblerBlackholeFn =
+    fn(usize, *mut majit_backend::jitframe::JitFrame, i64) -> Option<i64>;
 static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<CallAssemblerBlackholeFn> = OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
@@ -2173,8 +2174,9 @@ pub fn register_call_assembler_blackhole(f: CallAssemblerBlackholeFn) {
 /// receives the descr directly; the C-ABI delivers the same shape via
 /// `descr_addr` (recovered to `Arc<dyn FailDescr>` by the receiver)
 /// instead of a surrogate `(green_key, trace_id, fail_index)` triple.
-static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(*const i64, usize, usize, i64, bool) -> bool> =
-    OnceLock::new();
+static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<
+    fn(*mut majit_backend::jitframe::JitFrame, usize, i64, bool) -> bool,
+> = OnceLock::new();
 
 /// On-demand resume callback: pyre-jit registers this to
 /// drive `ResumeDataDirectReader` from the failed descr's `rd_numb` /
@@ -2534,7 +2536,9 @@ pub fn prologue_probe_addr() -> Option<usize> {
     PROLOGUE_PROBE_ADDR.get().copied()
 }
 
-pub fn register_call_assembler_bridge(f: fn(*const i64, usize, usize, i64, bool) -> bool) {
+pub fn register_call_assembler_bridge(
+    f: fn(*mut majit_backend::jitframe::JitFrame, usize, i64, bool) -> bool,
+) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
 
@@ -2998,33 +3002,25 @@ fn call_assembler_finish_or_blackhole_deadframe(frame: DeadFrame) -> Option<i64>
     // and bake that cell's address.  The recovery inside the BH call
     // bumps the strong refcount before returning, so the local cell can
     // safely drop after BH completes.
-    let (is_finish, fail_descr_arc, fail_arg_types) = {
+    let (is_finish, fail_descr_arc, frame_ptr) = {
         let jf = frame.as_jitframe()?;
         let fail_descr = jf.fail_descr.to_arc();
         let fd = as_fd(&fail_descr);
         let is_finish = fd.is_finish();
-        let fail_arg_types = fd.fail_arg_types().to_vec();
-        (is_finish, fail_descr, fail_arg_types)
+        let frame_ptr = jf.jf_gcref().0 as *mut majit_backend::jitframe::JitFrame;
+        (is_finish, fail_descr, frame_ptr)
     };
     if is_finish {
         return finish_result_from_deadframe(&frame).ok();
     }
 
-    let raw_values = raw_values_from_deadframe_typed(&frame, &fail_arg_types).ok()?;
     let guard_exc = grab_exc_value_from_deadframe(&frame)
         .map(|g| g.0 as i64)
         .unwrap_or(0);
     let blackhole = CALL_ASSEMBLER_BLACKHOLE_FN.get()?;
     let cell = majit_ir::FailDescrCell::wrap(fail_descr_arc);
     let descr_addr = majit_ir::FailDescrCell::thin_ptr(&cell);
-    let result = blackhole(
-        descr_addr,
-        raw_values.as_ptr(),
-        raw_values.len(),
-        raw_values.as_ptr(),
-        raw_values.len(),
-        guard_exc,
-    );
+    let result = blackhole(descr_addr, frame_ptr, guard_exc);
     drop(cell);
     result
 }
@@ -3767,8 +3763,12 @@ fn call_assembler_guard_failure_inner(
     // compile bridge. The bridge is attached to fail_descr for fast
     // dispatch on subsequent guard failures.  Skipped on giveup (None).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
-        let raw_num = fail_descr.fail_arg_types().len();
-        if bridge_fn(outputs_ptr, raw_num, fail_descr_ptr as usize, 0, false) {
+        if bridge_fn(
+            frame_ptr as *mut majit_backend::jitframe::JitFrame,
+            fail_descr_ptr as usize,
+            0,
+            false,
+        ) {
             // compile.py:704-716 / dynasm parity: the hook traces and
             // attaches the bridge; the current occurrence still resumes
             // through blackhole instead of re-entering the new bridge.
@@ -3803,14 +3803,10 @@ fn call_assembler_guard_failure_inner(
     // (call_jit.rs), which previously drove the force_fn fallback
     // into garbage-frame territory.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let raw_num = fail_descr.fail_arg_types().len();
         let guard_exc = grab_exc_value_from_jf_ptr(frame_ptr as usize);
         if let Some(result) = bh_fn(
             fail_descr_ptr as usize,
-            outputs_ptr,
-            raw_num,
-            outputs_ptr,
-            raw_num,
+            frame_ptr as *mut majit_backend::jitframe::JitFrame,
             guard_exc,
         ) {
             // warmspot.py:988-996: DoneWithThisFrame{Int,Ref,Float} returns
@@ -3963,14 +3959,11 @@ fn call_assembler_shim_inner(
         let guard_exc = grab_exc_value_from_deadframe(&frame)
             .map(|g| g.0 as i64)
             .unwrap_or(0);
-        if let Some(result) = bh_fn(
-            descr_addr,
-            bh_outputs.as_ptr(),
-            num_outputs,
-            raw_outputs.as_ptr(),
-            raw_num,
-            guard_exc,
-        ) {
+        let frame_ptr = frame
+            .as_jitframe()
+            .map(|jf| jf.jf_gcref().0 as *mut majit_backend::jitframe::JitFrame)
+            .unwrap_or(std::ptr::null_mut());
+        if let Some(result) = bh_fn(descr_addr, frame_ptr, guard_exc) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
                 *outcome.add(1) = 0;

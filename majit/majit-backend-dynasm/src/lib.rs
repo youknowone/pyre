@@ -219,7 +219,9 @@ use std::sync::OnceLock;
 /// _prepare_resume_from_failure` hands it to the resumed frame so an
 /// exception guard unwinds into its handler instead of resuming the
 /// no-exception continuation.  `0` = no pending exception.
-pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>;
+/// `compile.py resume_in_blackhole(descr, deadframe)`:
+/// descr address plus the jitframe. Values stay in `jf_frame[]`.
+pub type BlackholeFn = fn(usize, *mut jitframe::JitFrame, i64) -> Option<i64>;
 
 /// Bridge compilation: raw values, descr identity, and optional GUARD_VALUE
 /// operand → compiled?
@@ -231,7 +233,8 @@ pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> O
 /// `descr.fail_index_per_trace()`) from that Arc, mirroring
 /// `pyjitpl.py handle_guard_failure(self, resumedescr,
 /// deadframe)`.  No surrogate triple crosses the C-ABI.
-pub type BridgeFn = fn(*const i64, usize, usize, i64, bool) -> bool;
+/// `pyjitpl.py handle_guard_failure(self, resumedescr, deadframe)`.
+pub type BridgeFn = fn(*mut jitframe::JitFrame, usize, i64, bool) -> bool;
 
 /// Force callee: (callee_frame_ptr) → result
 pub type ForceFn = extern "C" fn(i64) -> i64;
@@ -242,31 +245,6 @@ pub type UnboxIntFn = fn(i64) -> i64;
 static CA_BLACKHOLE_FN: OnceLock<BlackholeFn> = OnceLock::new();
 static CA_BRIDGE_FN: OnceLock<BridgeFn> = OnceLock::new();
 
-thread_local! {
-    /// Reused fail-arg buffer for `handle_fail_resume_guard`. The timed
-    /// `and`/`or` path deopts once per character; a fresh `Vec` each time
-    /// is a 96 B class the RPython C blackhole does not pay.
-    static FAIL_ARG_BUF: Cell<Vec<i64>> = const { Cell::new(Vec::new()) };
-}
-
-struct FailArgBuf(Vec<i64>);
-
-impl FailArgBuf {
-    fn take(n: usize) -> Self {
-        let mut buf = FAIL_ARG_BUF.take();
-        buf.clear();
-        buf.reserve(n);
-        Self(buf)
-    }
-}
-
-impl Drop for FailArgBuf {
-    fn drop(&mut self) {
-        let mut buf = std::mem::take(&mut self.0);
-        buf.clear();
-        FAIL_ARG_BUF.set(buf);
-    }
-}
 static CA_FORCE_FN: OnceLock<ForceFn> = OnceLock::new();
 static CA_UNBOX_INT_FN: OnceLock<UnboxIntFn> = OnceLock::new();
 
@@ -426,18 +404,6 @@ struct GcRootScope(*mut majit_ir::GcRef);
 impl Drop for GcRootScope {
     fn drop(&mut self) {
         majit_gc::gc_remove_root(self.0);
-    }
-}
-
-/// Restores the resume-root stack depth on every exit path.
-///
-/// Same hazard as [`GcRootScope`]: the registered slots point into the
-/// trampoline's `raw_values`, which an unwind frees.
-struct ResumeRefRootScope(usize);
-
-impl Drop for ResumeRefRootScope {
-    fn drop(&mut self) {
-        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.0);
     }
 }
 
@@ -705,18 +671,6 @@ fn handle_fail_resume_guard(
 ) -> i64 {
     let trace_id = descr.trace_id();
     let fail_index = descr.fail_index_per_trace();
-    let n_fail_args = descr.fail_arg_types().len();
-    let mut raw_values = FailArgBuf::take(n_fail_args);
-    for i in 0..n_fail_args {
-        // PyPy `llmodel.py _decode_pos` parity: read the slot
-        // from `descr.rd_locs[i]`.  Synthetic descrs without `rd_locs`
-        // fall back to identity slot indexing — same shape as the
-        // pre-Slice-MM table-miss path.
-        let slot = guard::decode_rd_loc_slot(descr, i).unwrap_or(i);
-        raw_values
-            .0
-            .push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
-    }
 
     let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
         .map(|slot| unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
@@ -775,76 +729,23 @@ fn handle_fail_resume_guard(
         GcRootScope(slot)
     });
 
-    // `raw_values` is a host copy of the jitframe slots, and only the jitframe
-    // itself is walked (`jitframe_trace`).  The bridge hook below traces and
-    // compiles, so it allocates: a moving collection forwards the frame's own
-    // slots and leaves this copy naming the addresses the objects have left,
-    // which the blackhole call further down then reads.  Register the copy's
-    // GC slots for the hook's duration so the collector writes the forwarded
-    // addresses back through them.
-    //
-    // `pyre-jit`'s other guard-failure path already does this around its own
-    // bridge decision (`DeadFrameRefRoots::enter`, `eval.rs handle_fail`); that
-    // type sits behind `majit-metainterp`, which this crate does not depend on,
-    // so the same shadow-stack primitives are used directly here.
-    //
-    // The scope ends before the blackhole call rather than wrapping it: the
-    // blackhole receiver registers the same buffer itself, and a slot left
-    // registered across the resumed run pins whatever the guard happened to
-    // leave in it (`blackhole.py:1782-1796` ends `deadframe`'s live range at
-    // `_prepare_resume_from_failure`, before `_run_forever`).
-    //
-    // The rooted set is `compute_gcmap`'s: every `Ref`-typed exit slot, force
-    // tokens included — one is the jitframe pointer, and the jitframe moves.
-    let resume_ref_roots = ResumeRefRootScope(majit_gc::shadow_stack::resume_ref_roots_depth());
-    let fail_arg_types = descr.fail_arg_types();
-    for slot in 0..raw_values.0.len() {
-        if matches!(fail_arg_types.get(slot), Some(majit_ir::Type::Ref)) {
-            // SAFETY: `slot` indexes `raw_values`, which outlives the pop below
-            // and is not resized while the roots are registered.
-            unsafe {
-                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
-                    raw_values.0.as_mut_ptr().add(slot),
-                    1,
-                ));
-            }
-        }
-    }
-
     // compile.py `_trace_and_compile_from_bridge`.
     // The hook compiles+attaches; it does NOT re-enter the bridge.
-    // Skipped on giveup (None).
+    // Skipped on giveup (None). Fail args stay in `jf_frame[]`
+    // (`llmodel.py get_int_value`); `jitframe_trace` walks them.
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
         bridge_fn(
-            raw_values.0.as_ptr(),
-            raw_values.0.len(),
+            frame_ptr,
             descr_raw,
             guard_value_operand.unwrap_or(0),
             guard_value_operand.is_some(),
         );
     }
-    drop(resume_ref_roots);
 
-    // compile.py:710-716 `resume_in_blackhole(descr, deadframe)`: the
-    // descr is the sole identity carrier; the receiver derives green_key /
-    // trace_id / fail_index from it via `fail_descr_arc_from_addr` and
-    // `descr_owning_jct`.  Read the exception pointer back from the rooted
-    // slot before handing it off, then drop the root — the blackhole receiver
-    // re-roots it through the resumed interpreter.
-    // The value is seeded as the resume exception (`blackhole.py:1647`
-    // `_prepare_resume_from_failure`, consumed at `blackhole.py`);
-    // re-reading `jf_guard_exc` here would observe the post-`grab_exc_value`
-    // null and drop the exception.
-    let bh_result = CA_BLACKHOLE_FN.get().and_then(|blackhole| {
-        blackhole(
-            descr_raw,
-            raw_values.0.as_ptr(),
-            raw_values.0.len(),
-            raw_values.0.as_ptr(),
-            raw_values.0.len(),
-            guard_exc_root.0 as i64,
-        )
-    });
+    // compile.py `resume_in_blackhole(descr, deadframe)`.
+    let bh_result = CA_BLACKHOLE_FN
+        .get()
+        .and_then(|blackhole| blackhole(descr_raw, frame_ptr, guard_exc_root.0 as i64));
     if let Some(bh_result) = bh_result {
         if majit_log_enabled() {
             eprintln!(

@@ -5635,7 +5635,7 @@ fn assemble_peeled_trace_with_jump_args(
                         same_as.pos().set(arg);
                         fallthrough_aliases.push(same_as);
                     }
-                    continue;
+                    return;
                 }
                 push_fallthrough_same_as(
                     &mut fallthrough_aliases,
@@ -5665,11 +5665,11 @@ fn assemble_peeled_trace_with_jump_args(
         if arg.is_none() {
             continue;
         }
-        if fallthrough_aliases.iter().any(|op| op.pos.get() == arg) {
+        if fallthrough_aliases.iter().any(|op| op.pos().get() == arg) {
             continue;
         }
         push_fallthrough_same_as(&mut fallthrough_aliases, &stream_defs, arg, constants, ctx);
-        if fallthrough_aliases.iter().any(|op| op.pos.get() == arg) {
+        if fallthrough_aliases.iter().any(|op| op.pos().get() == arg) {
             continue;
         }
         if let Some(const_op) = const_ref_replacement(ctx, arg) {

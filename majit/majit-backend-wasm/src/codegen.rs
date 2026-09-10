@@ -7912,7 +7912,7 @@ fn build_function(
             }
 
             OpCode::Newstr | OpCode::Newunicode => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let Some(base) = residual_type_base else {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: Newstr/Newunicode needs a residual alloc helper".into(),
@@ -7945,7 +7945,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -8180,7 +8180,7 @@ fn build_function(
                 // when the nursery cannot hold the request.
             }
             OpCode::CallMallocNurseryHeaderless => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
                 let bump_size = size_const.and_then(aligned_varsize_frame_bump);
                 let Some(base) = residual_type_base else {
@@ -8258,7 +8258,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -8281,12 +8281,12 @@ fn build_function(
                         frame,
                     );
                 }
-                remember_nursery_wb(&mut wb_applied, op.pos.get(), &same_as_forwardings);
+                remember_nursery_wb(&mut wb_applied, op.pos().get(), &same_as_forwardings);
             }
             OpCode::CallMallocNurseryVarsize => {
                 // The arity-5 array helper can return old-gen, so this arm
                 // does not seed `wb_applied` — same reason as `NewArray`.
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let Some(base) = residual_type_base else {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: CallMallocNurseryVarsize needs a residual alloc helper"
@@ -8320,7 +8320,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -8343,7 +8343,7 @@ fn build_function(
                 );
             }
             OpCode::CallMallocNurseryVarsizeFrame => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
                 let bump_size = size_const.and_then(aligned_varsize_frame_bump);
                 let payload =
@@ -8435,7 +8435,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -8549,7 +8549,7 @@ fn build_function(
                 }
             }
             OpCode::ThreadlocalrefGet => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let Some(base) = residual_type_base.filter(|_| alloc.threadlocal_fn_ptr != 0)
                     else {
@@ -10590,7 +10590,7 @@ fn gc_table_failarg_slots(
     for op in ops {
         match op.opcode {
             OpCode::LoadFromGcTable => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let index = resolve_const_bits(constants, op.arg(0).to_opref());
                     let base = gc_table_bases.get(&vi).copied().unwrap_or(gc_table_base);
@@ -10598,7 +10598,7 @@ fn gc_table_failarg_slots(
                 }
             }
             OpCode::SameAsI | OpCode::SameAsR | OpCode::CastOpaquePtr => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let src = op.arg(0).to_opref();
                 if !OpRef::raw_is_constant(vi)
                     && !src.is_none()
@@ -10777,7 +10777,7 @@ fn unbound_pool_const_seeds(
                     OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
                 )
             })
-            .map(|op| op.pos.get())
+            .map(|op| op.pos().get())
             .collect();
         let in_idx: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
         return Err(BackendError::Unsupported(format!(
