@@ -1932,6 +1932,9 @@ pub fn install_jit_call_bridge() {
             pyre_interpreter::stack_check::stack_almost_full()
         }
         majit_metainterp::register_stack_almost_full_hook(stack_almost_full_adapter);
+        majit_metainterp::register_allow_small_ref_residual(
+            pyre_interpreter::is_frame_anchor_word_residual,
+        );
         #[cfg(feature = "cranelift")]
         {
             majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);

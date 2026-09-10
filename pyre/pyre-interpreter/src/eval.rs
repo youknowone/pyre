@@ -2650,7 +2650,7 @@ impl SharedOpcodeHandler for PyFrame {
     fn push_anchored(anchor: &Self::Anchor, value: Self::Value) -> Result<(), PyError> {
         // A JIT-created frame lives in the nursery and the allocating step may
         // have relocated it; push onto the forwarded live frame.
-        unsafe { &mut *anchor.live() }.push(value);
+        unsafe { &mut *anchor.live() }.push_on_self(value);
         Ok(())
     }
 
@@ -5691,7 +5691,7 @@ impl OpcodeStepExecutor for PyFrame {
                 // baseobjspace.py:1256 self.pushvalue(w_result). The callee may
                 // have relocated this frame via a minor collection, so push
                 // onto the forwarded live frame, not the pre-call pointer.
-                unsafe { &mut *anchor.live() }.push(result);
+                unsafe { &mut *anchor.live() }.push_on_self(result);
                 return Ok(());
             }
         }
@@ -5717,7 +5717,7 @@ impl OpcodeStepExecutor for PyFrame {
         };
         // The callee may have relocated this frame via a minor collection;
         // push onto the forwarded live frame, not the pre-call pointer.
-        unsafe { &mut *anchor.live() }.push(result);
+        unsafe { &mut *anchor.live() }.push_on_self(result);
         Ok(())
     }
 
@@ -5746,7 +5746,7 @@ impl OpcodeStepExecutor for PyFrame {
             crate::call::call_function_ex(self, callable, self_or_null, args_obj, kwargs_or_null)?;
         // The callee may have relocated this frame via a minor collection;
         // push onto the forwarded live frame, not the pre-call pointer.
-        unsafe { &mut *anchor.live() }.push(result);
+        unsafe { &mut *anchor.live() }.push_on_self(result);
         Ok(())
     }
 
@@ -5776,7 +5776,7 @@ impl OpcodeStepExecutor for PyFrame {
         let result = crate::call::call_kw(self, callable, self_or_null, &args, kwarg_names)?;
         // The callee may have relocated this frame via a minor collection;
         // push onto the forwarded live frame, not the pre-call pointer.
-        unsafe { &mut *anchor.live() }.push(result);
+        unsafe { &mut *anchor.live() }.push_on_self(result);
         Ok(())
     }
 

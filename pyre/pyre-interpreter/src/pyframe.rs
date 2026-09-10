@@ -4404,10 +4404,23 @@ impl PyFrame {
         // Both writes below — the stack slot and the depth — have to land on
         // the live frame, so reload once and use it for both.
         let frame = self.live_mut();
-        frame.assert_stack_index(frame.valuestackdepth);
-        let idx = frame.valuestackdepth;
-        frame.set_locals_w(idx, value);
-        frame.valuestackdepth = idx + 1;
+        frame.push_on_self(value);
+    }
+
+    /// `pyframe.py pushvalue` — write the slot and the depth on `self`.
+    ///
+    /// [`push`] reloads through [`Self::live_mut`] first because it is the
+    /// post-allocation write and the caller's `&mut self` may name a
+    /// forwarded corpse. Callers that already hold the live frame —
+    /// [`crate::eval::FrameAnchor::live`] — write here so the tracer sees
+    /// the virtualizable stores instead of a `try_gc_current_object_address`
+    /// residual on the walk-local frame.
+    #[inline]
+    pub fn push_on_self(&mut self, value: PyObjectRef) {
+        self.assert_stack_index(self.valuestackdepth);
+        let idx = self.valuestackdepth;
+        self.set_locals_w(idx, value);
+        self.valuestackdepth = idx + 1;
     }
 
     /// Reads and writes through the caller's `&mut self`, without the

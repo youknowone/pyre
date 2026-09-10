@@ -771,6 +771,32 @@ const MAP_BUILD_HELPER_PATHS: &[(&str, &str)] = &[
 /// activate (still as a SAFE leave-symbolic decline) only if those accessors
 /// are later registered; an unregistered helper is already declined upstream
 /// by the funcptr-hash gate, so registering them is unnecessary for soundness.
+/// True when `addr` is a [`FrameAnchor`] slot op whose `Ref` argument is
+/// the one-word depth, not a heap pointer.
+///
+/// `front::mir` aliases `&FrameAnchor` to the depth word, so
+/// `FrameAnchor::live` residualizes as `classes=r` with that depth in a
+/// Ref register. `refuse_walk_local_ref_args` treats `addr <= 0x1000` as a
+/// walk-local `Dynamic`; a live shadow-stack depth is also that small and
+/// must still run (`frame_anchor_live_method_jit_abi`).
+pub fn is_frame_anchor_word_residual(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.ends_with("::FrameAnchor::live")
+                    || path.ends_with("::frame_anchor_live")
+                    || path.ends_with("::frame_anchor_release")
+                    || *path == "eval::FrameAnchor::live"
+            })
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
 pub fn is_pyframe_operand_stack_accessor(addr: usize) -> bool {
     use std::sync::OnceLock;
     static ACCESSOR_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
@@ -5049,7 +5075,8 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
+        is_abi_unsound_argument_residual, is_frame_anchor_word_residual, is_list_write_barrier,
+        is_pyframe_operand_stack_accessor,
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
         jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
@@ -5913,6 +5940,14 @@ mod tests {
         let nlocals = bindings["pyre_interpreter::pyframe::PyFrame::nlocals"];
         assert!(!is_pyframe_operand_stack_accessor(nlocals as usize));
         assert!(!is_pyframe_operand_stack_accessor(0));
+    }
+
+    #[test]
+    fn is_frame_anchor_word_residual_matches_live() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let live = bindings["eval::FrameAnchor::live"];
+        assert!(is_frame_anchor_word_residual(live as usize));
+        assert!(!is_frame_anchor_word_residual(0));
     }
 
     #[test]
