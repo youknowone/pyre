@@ -14,7 +14,7 @@
 ///
 /// arch.rs, codebuf.rs, guard.rs, regloc.rs are from llsupport/.
 // ── Shared modules (llsupport/ parity) ──
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 pub mod arch;
 pub mod callbuilder;
@@ -241,6 +241,32 @@ pub type UnboxIntFn = fn(i64) -> i64;
 
 static CA_BLACKHOLE_FN: OnceLock<BlackholeFn> = OnceLock::new();
 static CA_BRIDGE_FN: OnceLock<BridgeFn> = OnceLock::new();
+
+thread_local! {
+    /// Reused fail-arg buffer for `handle_fail_resume_guard`. The timed
+    /// `and`/`or` path deopts once per character; a fresh `Vec` each time
+    /// is a 96 B class the RPython C blackhole does not pay.
+    static FAIL_ARG_BUF: Cell<Vec<i64>> = const { Cell::new(Vec::new()) };
+}
+
+struct FailArgBuf(Vec<i64>);
+
+impl FailArgBuf {
+    fn take(n: usize) -> Self {
+        let mut buf = FAIL_ARG_BUF.take();
+        buf.clear();
+        buf.reserve(n);
+        Self(buf)
+    }
+}
+
+impl Drop for FailArgBuf {
+    fn drop(&mut self) {
+        let mut buf = std::mem::take(&mut self.0);
+        buf.clear();
+        FAIL_ARG_BUF.set(buf);
+    }
+}
 static CA_FORCE_FN: OnceLock<ForceFn> = OnceLock::new();
 static CA_UNBOX_INT_FN: OnceLock<UnboxIntFn> = OnceLock::new();
 
@@ -680,14 +706,16 @@ fn handle_fail_resume_guard(
     let trace_id = descr.trace_id();
     let fail_index = descr.fail_index_per_trace();
     let n_fail_args = descr.fail_arg_types().len();
-    let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
+    let mut raw_values = FailArgBuf::take(n_fail_args);
     for i in 0..n_fail_args {
         // PyPy `llmodel.py _decode_pos` parity: read the slot
         // from `descr.rd_locs[i]`.  Synthetic descrs without `rd_locs`
         // fall back to identity slot indexing — same shape as the
         // pre-Slice-MM table-miss path.
         let slot = guard::decode_rd_loc_slot(descr, i).unwrap_or(i);
-        raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
+        raw_values
+            .0
+            .push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
     }
 
     let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
@@ -770,13 +798,13 @@ fn handle_fail_resume_guard(
     // tokens included — one is the jitframe pointer, and the jitframe moves.
     let resume_ref_roots = ResumeRefRootScope(majit_gc::shadow_stack::resume_ref_roots_depth());
     let fail_arg_types = descr.fail_arg_types();
-    for slot in 0..raw_values.len() {
+    for slot in 0..raw_values.0.len() {
         if matches!(fail_arg_types.get(slot), Some(majit_ir::Type::Ref)) {
             // SAFETY: `slot` indexes `raw_values`, which outlives the pop below
             // and is not resized while the roots are registered.
             unsafe {
                 majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
-                    raw_values.as_mut_ptr().add(slot),
+                    raw_values.0.as_mut_ptr().add(slot),
                     1,
                 ));
             }
@@ -788,8 +816,8 @@ fn handle_fail_resume_guard(
     // Skipped on giveup (None).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
         bridge_fn(
-            raw_values.as_ptr(),
-            raw_values.len(),
+            raw_values.0.as_ptr(),
+            raw_values.0.len(),
             descr_raw,
             guard_value_operand.unwrap_or(0),
             guard_value_operand.is_some(),
@@ -810,10 +838,10 @@ fn handle_fail_resume_guard(
     let bh_result = CA_BLACKHOLE_FN.get().and_then(|blackhole| {
         blackhole(
             descr_raw,
-            raw_values.as_ptr(),
-            raw_values.len(),
-            raw_values.as_ptr(),
-            raw_values.len(),
+            raw_values.0.as_ptr(),
+            raw_values.0.len(),
+            raw_values.0.as_ptr(),
+            raw_values.0.len(),
             guard_exc_root.0 as i64,
         )
     });

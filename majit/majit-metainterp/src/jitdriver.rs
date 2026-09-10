@@ -98,7 +98,7 @@ pub struct SingleFrameBlackholeResult {
 /// so a resume pays one `Arc` clone rather than one `BhCallDescr` per driver.
 fn bh_jitdrivers_sd(
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
-) -> std::sync::Arc<[crate::blackhole::BhJitDriverSd]> {
+) -> &std::sync::Arc<[crate::blackhole::BhJitDriverSd]> {
     let table = metainterp_sd
         .bh_jitdrivers_sd
         .get_or_init(|| build_bh_jitdrivers_sd(metainterp_sd));
@@ -114,7 +114,7 @@ fn bh_jitdrivers_sd(
         "bh_jitdrivers_sd outlived a `jitdrivers_sd` write that did not run \
          `finish_setup_descrs_for_jitdrivers`"
     );
-    std::sync::Arc::clone(table)
+    table
 }
 
 /// `warmspot.py:449` `jd.result_type` projected to the blackhole dispatch char.
@@ -279,7 +279,7 @@ pub fn drive_single_frame_blackhole(
         virtualizable_ptr = packed_ref_roots[index];
     }
 
-    builder.setup_jitdrivers_sd(bh_jitdrivers_sd(metainterp_sd));
+    builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
 
     let mut bh = builder.acquire_interp();
     bh.copy_data_from_miframe(miframe);
@@ -441,7 +441,7 @@ pub fn drive_multi_frame_blackhole(
         last_exc_value = packed_ref_roots[index];
     }
 
-    builder.setup_jitdrivers_sd(bh_jitdrivers_sd(metainterp_sd));
+    builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
 
     let mut terminal = None;
     let outcome = crate::blackhole::convert_and_run_from_pyjitpl(
@@ -6759,7 +6759,9 @@ impl<S: JitState> JitDriver<S> {
                 // the previous resume left on it, so seed the table here
                 // instead of depending on that.
                 let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
-                bh_builder.setup_jitdrivers_sd(jitdrivers_sd);
+                if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
+                    bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
+                }
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
                 // The state-field macro's `&state` is host-stack storage, so
                 // its identity may be folded out of the failing frame. Ask

@@ -7637,10 +7637,17 @@ impl<'a> ResumeDataDirectReader<'a> {
         if self.virtualizable_identity_override.is_some()
             && self.virtualizable_identity_tagged == Some(tagged)
         {
-            self.virtualizable_ptr
-        } else {
-            self.decode_ref(tagged)
+            return self.virtualizable_ptr;
         }
+        // resume.py decode_ref `TAGBOX`: the payload is a deadframe index.
+        if (tagged as u16) & TAGMASK as u16 == TAGBOX as u16 {
+            let mut idx = (tagged >> 2) as i32;
+            if idx < 0 {
+                idx += self.count;
+            }
+            return self.deadframe[idx as usize];
+        }
+        self.decode_ref(tagged)
     }
 
     /// resume.py next_float
@@ -8747,7 +8754,7 @@ pub fn blackhole_from_resumedata<'a>(
                 resolved.pc
             );
         }
-        nextbh.setposition(resolved.jitcode.clone(), resolved.pc);
+        nextbh.setposition_ref(&resolved.jitcode, resolved.pc);
         if let Some(stack_base) = resolved.virtualizable_stack_base {
             nextbh.virtualizable_stack_base = stack_base;
         }
@@ -8768,7 +8775,9 @@ pub fn blackhole_from_resumedata<'a>(
         resumereader.consume_one_section(&mut nextbh, vinfo);
 
         // resume.py:1342
-        nextbh.handle_rvmprof_enter();
+        if nextbh.op_rvmprof_code != majit_translate::insns::BC_ABSENT {
+            nextbh.handle_rvmprof_enter();
+        }
 
         curbh = Some(nextbh);
     }

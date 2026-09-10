@@ -829,17 +829,22 @@ impl BlackholeInterpreter {
     /// Allocates registers sized to hold both working regs and constants,
     /// then copies constants into the upper portion of each register array.
     pub fn setposition(&mut self, jitcode: std::sync::Arc<JitCode>, position: usize) {
-        // `copy_constants` is idempotent for one jitcode. A 4–7 frame
-        // `shift` resume reseats the same helper; skip the constant walk
-        // when the banks are already that jitcode's. Working regs are
+        self.setposition_ref(&jitcode, position);
+    }
+
+    /// `setposition` without taking the `Arc`. A 4–7 frame `shift` resume
+    /// reseats the same helper; skip the clone and the constant walk when
+    /// the banks are already that jitcode's.
+    pub fn setposition_ref(&mut self, jitcode: &std::sync::Arc<JitCode>, position: usize) {
+        // `copy_constants` is idempotent for one jitcode. Working regs are
         // filled by `consume_one_section` from liveness.
-        let already = std::sync::Arc::ptr_eq(&self.jitcode, &jitcode)
+        let already = std::sync::Arc::ptr_eq(&self.jitcode, jitcode)
             && self.registers_i.len() >= jitcode.num_regs_and_consts_i()
             && self.registers_r.len() >= jitcode.num_regs_and_consts_r()
             && self.registers_f.len() >= jitcode.num_regs_and_consts_f();
         if !already {
-            self.init_register_files_from_runtime_jitcode(&jitcode);
-            self.jitcode = jitcode;
+            self.init_register_files_from_runtime_jitcode(jitcode);
+            self.jitcode = std::sync::Arc::clone(jitcode);
         }
         self.reset_position_state(position);
         if crate::bh_debug_enabled() {
@@ -1731,9 +1736,7 @@ impl BlackholeInterpreter {
         // never a `NodeRec`. Skip that walk when every frame is already
         // rooted and no heap virtualizable is present.
         if !self.chain_needs_run_rooting() {
-            return self
-                .try_native_finish_at_node_entry()
-                .unwrap_or_else(|| self.run_inner());
+            return self.run_after_rooting();
         }
         // Root this frame's register bank AND every pending caller frame
         // reachable through `nextblackholeinterp`.  RPython keeps the whole
@@ -1803,12 +1806,21 @@ impl BlackholeInterpreter {
                 current = frame.nextblackholeinterp.as_deref_mut();
             }
         }
-        let result = self
-            .try_native_finish_at_node_entry()
-            .unwrap_or_else(|| self.run_inner());
+        let result = self.run_after_rooting();
         majit_gc::shadow_stack::pop_resume_ref_roots_to(vable_roots_depth);
         majit_gc::shadow_stack::pop_bh_regs_to(bh_depth);
         result
+    }
+
+    /// Native-finish only at a node-entry PC. The regex leaf resumes at
+    /// mid-`shift` pc 210, so skip the `fnaddr` probe there.
+    fn run_after_rooting(&mut self) -> BhRunOutcome {
+        if native_entry_args_intact(&self.jitcode, self.position) {
+            if let Some(outcome) = self.try_native_finish_at_node_entry() {
+                return outcome;
+            }
+        }
+        self.run_inner()
     }
 
     /// `bhimpl_inline_call_*` for a frame whose resume PC is still the
@@ -1912,8 +1924,14 @@ impl BlackholeInterpreter {
         // DIFFERENT interpreter — `copy_data_from_miframe` and the resume
         // reader before `run`, and `handler_inline_call_nested_ext` on the
         // callee — so no handler re-seats the frame it is dispatching in.
-        let jitcode_arc = std::sync::Arc::clone(&self.jitcode);
-        let code: &[u8] = &jitcode_arc.code;
+        // Bind the code slice without an `Arc` clone: `self.jitcode` already
+        // owns the bytes for the whole loop.
+        let code: &[u8] = {
+            let slice = self.jitcode.code.as_slice();
+            // SAFETY: `self.jitcode` is not reseated while this loop runs
+            // (see above). The slice is only read.
+            unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) }
+        };
         // `blackhole.py` `dispatch_loop` keeps `position` as a loop local.
         // Write `self.position` only when leaving the inlined match (return,
         // INLINE_CALL, or the function-pointer fallback).
@@ -1932,7 +1950,6 @@ impl BlackholeInterpreter {
                 return BhRunOutcome::EndOfCode;
             }
             let pos_before = position;
-            self.last_opcode_position = pos_before;
             if check_startpoints && let Some(startpoints) = self.jitcode.startpoints.as_ref() {
                 assert!(
                     startpoints.contains(&pos_before),
@@ -2102,6 +2119,7 @@ impl BlackholeInterpreter {
                     jitcode::insns::BC_INLINE_CALL => {
                         let p = position + 1;
                         self.position = position;
+                        self.last_opcode_position = pos_before;
                         match handler_inline_call_nested_ext(self, code, p) {
                             Ok(new_pos) => {
                                 position = new_pos;
@@ -2136,6 +2154,7 @@ impl BlackholeInterpreter {
                 }
             }
             self.position = position;
+            self.last_opcode_position = pos_before;
             self.position += 1;
             if trace {
                 eprintln!(
@@ -3050,12 +3069,16 @@ impl BlackholeInterpBuilder {
         //   self.op_live = builder.op_live
         bh.op_live = self.op_live;
         // RPython blackhole.py: self.dispatch_loop = builder.dispatch_loop
-        bh.dispatch_table = std::sync::Arc::clone(&self.dispatch_table);
+        if !std::sync::Arc::ptr_eq(&bh.dispatch_table, &self.dispatch_table) {
+            bh.dispatch_table = std::sync::Arc::clone(&self.dispatch_table);
+        }
         // blackhole.py:250 `self.builder = builder` — upstream keeps the
         // back-reference and reads `self.builder.metainterp_sd.jitdrivers_sd`
         // on demand (:1079, :1096).  The pool owns the interpreters here, so
         // hand each one the builder's snapshot instead.
-        bh.jitdrivers_sd = std::sync::Arc::clone(&self.jitdrivers_sd);
+        if !std::sync::Arc::ptr_eq(&bh.jitdrivers_sd, &self.jitdrivers_sd) {
+            bh.jitdrivers_sd = std::sync::Arc::clone(&self.jitdrivers_sd);
+        }
         bh
     }
 
@@ -4530,6 +4553,36 @@ mod tests {
             assert!(bh.rooted);
             assert!(bh.virtualizable_info.is_null());
             assert!(!bh.chain_needs_run_rooting());
+        }
+
+        #[test]
+        fn acquire_interp_reuses_the_builder_dispatch_table() {
+            let mut builder = build_test_bh_builder();
+            let first = builder.acquire_interp();
+            let table = std::sync::Arc::clone(&first.dispatch_table);
+            builder.release_interp(first);
+            let reused = builder.acquire_interp();
+            assert!(
+                std::sync::Arc::ptr_eq(&reused.dispatch_table, &table),
+                "a pooled interp already holds this builder's dispatch table"
+            );
+        }
+
+        #[test]
+        fn setposition_ref_does_not_clone_an_already_seated_jitcode() {
+            let mut b = JitCodeBuilder::default();
+            b.int_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition_ref(&jitcode, 0);
+            let before = std::sync::Arc::strong_count(&jitcode);
+            bh.setposition_ref(&jitcode, 0);
+            assert_eq!(
+                std::sync::Arc::strong_count(&jitcode),
+                before,
+                "reseating the same helper must not clone the Arc"
+            );
         }
 
         /// `_setup_return_value_i` reads `code[position-1]`, the single
