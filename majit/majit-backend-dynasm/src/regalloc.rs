@@ -1672,18 +1672,24 @@ pub enum RegAllocOp {
         gcmap: Option<usize>,
     },
     /// regalloc_perform_guard(op_index, arglocs, result_loc, faillocs)
+    ///
+    /// `faillocs` live in [`RegAlloc::faillocs_arena`]; start/len are
+    /// the slice. A per-guard `Vec<Option<Loc>>` was 96 B on the regex
+    /// and/or leaf (`locs_for_fail_args`).
     PerformGuard {
         op_index: usize,
         arglocs: Vec<Loc>,
         result_loc: Option<Loc>,
-        faillocs: Vec<Option<Loc>>,
+        faillocs_start: u32,
+        faillocs_len: u32,
     },
     /// One-loc `perform_guard` without a 16 B `Vec`.
     PerformGuard1 {
         op_index: usize,
         loc: Loc,
         result_loc: Option<Loc>,
-        faillocs: Vec<Option<Loc>>,
+        faillocs_start: u32,
+        faillocs_len: u32,
     },
     /// regalloc_perform_discard(op_index, arglocs)
     PerformDiscard { op_index: usize, arglocs: Vec<Loc> },
@@ -1763,6 +1769,10 @@ pub struct RegAlloc<'a> {
     /// `aarch64/regalloc.py:990`); pyre's flat-OpRef encoding needs a
     /// counter to feed the unique raw payload reservation.
     temp_var_counter: u32,
+    /// Failarg locations for every guard in this walk. `locs_for_fail`
+    /// appends here so `PerformGuard` stores a (start, len) instead of
+    /// a 96 B `Vec` per guard.
+    faillocs_arena: Vec<Option<Loc>>,
 }
 
 impl<'a> RegAlloc<'a> {
@@ -1795,6 +1805,7 @@ impl<'a> RegAlloc<'a> {
             final_jump_op_position: -1,
             j2_ops: Vec::new(),
             temp_var_counter: 0,
+            faillocs_arena: Vec::new(),
         }
     }
 
@@ -2312,8 +2323,15 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         self.flush_moves(output);
-        let faillocs = self.locs_for_fail(op);
-        self.push_perform_guard(op_index, arglocs.as_ref(), result_loc, faillocs, output);
+        let (faillocs_start, faillocs_len) = self.locs_for_fail(op);
+        self.push_perform_guard(
+            op_index,
+            arglocs.as_ref(),
+            result_loc,
+            faillocs_start,
+            faillocs_len,
+            output,
+        );
     }
 
     fn perform_guard_j2(
@@ -2325,8 +2343,15 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         self.flush_moves(output);
-        let faillocs = self.locs_for_fail_args(fail_args);
-        self.push_perform_guard(op_index, arglocs.as_ref(), result_loc, faillocs, output);
+        let (faillocs_start, faillocs_len) = self.locs_for_fail_args(fail_args);
+        self.push_perform_guard(
+            op_index,
+            arglocs.as_ref(),
+            result_loc,
+            faillocs_start,
+            faillocs_len,
+            output,
+        );
     }
 
     fn push_perform_guard(
@@ -2334,7 +2359,8 @@ impl<'a> RegAlloc<'a> {
         op_index: usize,
         arglocs: &[Loc],
         result_loc: Option<Loc>,
-        faillocs: Vec<Option<Loc>>,
+        faillocs_start: u32,
+        faillocs_len: u32,
         output: &mut Vec<RegAllocOp>,
     ) {
         match *arglocs {
@@ -2342,13 +2368,15 @@ impl<'a> RegAlloc<'a> {
                 op_index,
                 loc,
                 result_loc,
-                faillocs,
+                faillocs_start,
+                faillocs_len,
             }),
             _ => output.push(RegAllocOp::PerformGuard {
                 op_index,
                 arglocs: arglocs.to_vec(),
                 result_loc,
-                faillocs,
+                faillocs_start,
+                faillocs_len,
             }),
         }
     }
@@ -2438,35 +2466,49 @@ impl<'a> RegAlloc<'a> {
         });
     }
 
-    /// x86/regalloc.py locs_for_fail
-    pub fn locs_for_fail(&mut self, guard_op: &Op) -> Vec<Option<Loc>> {
-        let fail_args = match guard_op.guard_fail_args() {
-            Some(fa) => fa,
-            None => return Vec::new(),
-        };
-        let fail_args: Vec<OpRef> = fail_args.iter().map(|a| a.to_opref()).collect();
-        self.locs_for_fail_args(&fail_args)
+    /// Slice of [`Self::faillocs_arena`] recorded for one guard.
+    pub fn faillocs(&self, start: u32, len: u32) -> &[Option<Loc>] {
+        let start = start as usize;
+        &self.faillocs_arena[start..start + len as usize]
     }
 
-    fn locs_for_fail_args(&mut self, fail_args: &[OpRef]) -> Vec<Option<Loc>> {
-        let mut locs = Vec::with_capacity(fail_args.len());
-        for &arg in fail_args {
-            if arg.is_none() {
-                locs.push(None);
-                continue;
-            }
-            // RPython: isinstance(arg, Const) → convert_to_imm(arg)
-            if arg.is_constant() {
-                locs.push(Some(self.rm.convert_to_imm(arg, &self.constants)));
-                continue;
-            }
-            let tp = self.tp(arg);
-            // x86/regalloc.py `RegAlloc.locs_for_fail` calls `self.loc(arg)`:
-            // a box reused from ResumeDataLoopMemo may be live only in this
-            // guard and therefore need its frame binding allocated here.
-            locs.push(Some(self.loc(arg, tp)));
+    /// x86/regalloc.py locs_for_fail
+    pub fn locs_for_fail(&mut self, guard_op: &Op) -> (u32, u32) {
+        let Some(fail_args) = guard_op.guard_fail_args() else {
+            return (self.faillocs_arena.len() as u32, 0);
+        };
+        let start = self.faillocs_arena.len();
+        for arg in fail_args.iter() {
+            self.push_failloc(arg.to_opref());
         }
-        locs
+        (start as u32, (self.faillocs_arena.len() - start) as u32)
+    }
+
+    fn locs_for_fail_args(&mut self, fail_args: &[OpRef]) -> (u32, u32) {
+        let start = self.faillocs_arena.len();
+        for &arg in fail_args {
+            self.push_failloc(arg);
+        }
+        (start as u32, (self.faillocs_arena.len() - start) as u32)
+    }
+
+    fn push_failloc(&mut self, arg: OpRef) {
+        if arg.is_none() {
+            self.faillocs_arena.push(None);
+            return;
+        }
+        // RPython: isinstance(arg, Const) → convert_to_imm(arg)
+        if arg.is_constant() {
+            self.faillocs_arena
+                .push(Some(self.rm.convert_to_imm(arg, &self.constants)));
+            return;
+        }
+        let tp = self.tp(arg);
+        // x86/regalloc.py `RegAlloc.locs_for_fail` calls `self.loc(arg)`:
+        // a box reused from ResumeDataLoopMemo may be live only in this
+        // guard and therefore need its frame binding allocated here.
+        let loc = self.loc(arg, tp);
+        self.faillocs_arena.push(Some(loc));
     }
 
     // ── Type resolution ──
@@ -2496,6 +2538,17 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py walk_operations — main dispatch loop.
     pub fn walk_operations(&mut self) -> Vec<RegAllocOp> {
+        self.faillocs_arena.clear();
+        // One reserve for the walk: a per-guard `Vec` was 96 B
+        // (`locs_for_fail_args`). Size to the failargs already on
+        // the ops so the walk does not grow mid-guard. `ops * 8`
+        // over-reserved a 71-op bridge by ~9 KiB.
+        let failarg_slots: usize = self
+            .operations
+            .iter()
+            .filter_map(|op| op.guard_fail_args().map(|fa| fa.len()))
+            .sum();
+        self.faillocs_arena.reserve(failarg_slots);
         let operations: &'a [OpRc] = self.operations;
         let inputargs: &'a [InputArg] = self.inputargs;
         // Take the lowering plan so dispatch can borrow each LirOp without cloning it.
@@ -6628,11 +6681,17 @@ mod tests {
 
         let guard_faillocs = ra_ops.iter().find_map(|ra_op| match ra_op {
             RegAllocOp::PerformGuard {
-                op_index, faillocs, ..
+                op_index,
+                faillocs_start,
+                faillocs_len,
+                ..
             }
             | RegAllocOp::PerformGuard1 {
-                op_index, faillocs, ..
-            } if *op_index == 2 => Some(faillocs),
+                op_index,
+                faillocs_start,
+                faillocs_len,
+                ..
+            } if *op_index == 2 => Some(ra.faillocs(*faillocs_start, *faillocs_len)),
             _ => None,
         });
 
@@ -6640,7 +6699,7 @@ mod tests {
             panic!("guard op was not lowered through RegAllocOp::PerformGuard");
         };
         assert!(
-            matches!(faillocs.as_slice(), [Some(Loc::Reg(_))]),
+            matches!(faillocs, [Some(Loc::Reg(_))]),
             "deopt-only failarg should be captured from a register: {:?}",
             faillocs
         );
@@ -7050,8 +7109,12 @@ mod tests {
             .expect("expected PerformGuard")
         {
             RegAllocOp::PerformGuard {
-                arglocs, faillocs, ..
+                arglocs,
+                faillocs_start,
+                faillocs_len,
+                ..
             } => {
+                let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
                 assert_eq!(faillocs.len(), 1);
                 assert!(
                     matches!(faillocs[0], Some(Loc::Frame(_))),
@@ -7064,7 +7127,13 @@ mod tests {
                     "GuardNotForced2 must not carry a frame-depth immediate argloc, got {arglocs:?}"
                 );
             }
-            RegAllocOp::PerformGuard1 { loc, faillocs, .. } => {
+            RegAllocOp::PerformGuard1 {
+                loc,
+                faillocs_start,
+                faillocs_len,
+                ..
+            } => {
+                let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
                 assert_eq!(faillocs.len(), 1);
                 assert!(
                     matches!(faillocs[0], Some(Loc::Frame(_))),

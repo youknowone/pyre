@@ -2286,8 +2286,10 @@ impl<'a> AssemblerARM64<'a> {
                     op_index,
                     arglocs,
                     result_loc,
-                    faillocs,
+                    faillocs_start,
+                    faillocs_len,
                 } => {
+                    let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
                     let op = &ops[*op_index];
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -2328,8 +2330,10 @@ impl<'a> AssemblerARM64<'a> {
                     op_index,
                     loc,
                     result_loc,
-                    faillocs,
+                    faillocs_start,
+                    faillocs_len,
                 } => {
+                    let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
                     let op = &ops[*op_index];
                     let locs = [*loc];
                     self.regalloc_perform_guard(
