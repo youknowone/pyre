@@ -6289,6 +6289,41 @@ mod tests {
     }
 
     #[test]
+    fn mark_gnf2_raises_cells_that_retain_a_historical_target() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let alias = 9_900_040;
+        let source = 9_900_041;
+        ca_dispatch_publish(alias, 1, 99, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(source, 2, 99, 33, 44, 55, 0, 0, 0);
+        // Second redirect replaces `.last()`; the S snapshot stays in
+        // `targets` for in-flight callers that already loaded it.
+        ca_dispatch_redirect(alias, 3, 77, 33, 44, 55, 0, 0, 0);
+        failguard::ca_dispatch_mark_gnf2(source);
+
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&alias))
+            .expect("alias dispatch entry");
+        {
+            let targets = entry.targets.lock().unwrap();
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].compiled_ptr, 99);
+            assert_eq!(targets[1].compiled_ptr, 77);
+        }
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a cell that still retains S must rise even after a later redirect"
+        );
+        drop(table);
+        failguard::ca_dispatch_remove(alias);
+        failguard::ca_dispatch_remove(source);
+    }
+
+    #[test]
     fn redirect_call_assembler_grows_tmp_callback_frame_info() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         fn compile_with_depth(backend: &mut WasmBackend, token: &JitCellToken, value_count: u32) {

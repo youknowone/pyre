@@ -663,10 +663,12 @@ pub fn ca_dispatch_slot(number: u64) -> u32 {
 /// an in-flight CALL_ASSEMBLER footer sees the flag before the callee
 /// can finish through that bridge.
 ///
-/// When `number` already has a snapshot, every cell whose current
-/// target invokes the same compiled loop is raised too. Redirected
-/// aliases keep their own cell; callers baked that address, so marking
-/// only the replacement token would leave those footers reading zero.
+/// When `number` already has a snapshot, every cell that still retains
+/// that compiled loop — current target or an older snapshot — is
+/// raised too. Redirected aliases keep their own cell, and in-flight
+/// callers may still hold a historical snapshot pointer, so marking
+/// only the replacement token or only `.last()` would leave those
+/// footers reading zero.
 pub fn ca_dispatch_mark_gnf2(number: u64) {
     let table = WASM_CA_DISPATCH.lock();
     let Some(table) = table.as_ref() else {
@@ -687,8 +689,8 @@ pub fn ca_dispatch_mark_gnf2(number: u64) {
     }
 }
 
-/// Raise the monotonic GNF2 flag on every dispatch cell whose current
-/// snapshot invokes `compiled_ptr`.
+/// Raise the monotonic GNF2 flag on every dispatch cell that still
+/// retains a snapshot invoking `compiled_ptr`.
 pub fn ca_dispatch_mark_gnf2_for_compiled_ptr(compiled_ptr: u32) {
     let table = WASM_CA_DISPATCH.lock();
     if let Some(table) = table.as_ref() {
@@ -705,8 +707,8 @@ fn mark_gnf2_entries_for_compiled_ptr(
             .targets
             .lock()
             .unwrap()
-            .last()
-            .is_some_and(|target| target.compiled_ptr == compiled_ptr);
+            .iter()
+            .any(|target| target.compiled_ptr == compiled_ptr);
         if aliases {
             entry.has_guard_not_forced_2.store(1, Ordering::Release);
         }
