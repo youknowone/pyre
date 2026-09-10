@@ -5313,6 +5313,24 @@ mod tests {
         fn split_head(path: &str) -> Option<(&str, &str)> {
             path.split_once("::")
         }
+        /// The word-ABI wrapper published next to the source path it
+        /// residualizes — `…::jit_bigint_mul` and `…::bigint_mul` share
+        /// one address because the registry binds both to the wrapper.
+        fn jit_wrapper_leaf(a: &str, b: &str) -> bool {
+            let Some((parent_a, leaf_a)) = a.rsplit_once("::") else {
+                return false;
+            };
+            let Some((parent_b, leaf_b)) = b.rsplit_once("::") else {
+                return false;
+            };
+            parent_a == parent_b
+                && (leaf_a
+                    .strip_prefix("jit_")
+                    .is_some_and(|rest| rest == leaf_b)
+                    || leaf_b
+                        .strip_prefix("jit_")
+                        .is_some_and(|rest| rest == leaf_a))
+        }
         // A crate-root re-export (`pyre_interpreter::acquire_buffered_lock`)
         // beside its defining path (`pyre_interpreter::module::_io::
         // acquire_buffered_lock`) is related by neither suffix while the crate
@@ -5326,7 +5344,7 @@ mod tests {
         // rule: `module::a::type_object` and `module::b::type_object` would
         // read as aliases while address-keyed patching between them stays
         // ambiguous. Those are related by no suffix here and are reported.
-        if extends(a, b) || drops_one_segment(a, b) {
+        if extends(a, b) || drops_one_segment(a, b) || jit_wrapper_leaf(a, b) {
             return true;
         }
         match (split_head(a), split_head(b)) {
@@ -5359,6 +5377,15 @@ mod tests {
         assert!(are_alias_spellings(
             "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_size",
             "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_size",
+        ));
+        // Word-ABI wrapper beside the MIR-front residual path it serves.
+        assert!(are_alias_spellings(
+            "pyre_interpreter::objspace::descroperation::jit_bigint_mul",
+            "pyre_interpreter::objspace::descroperation::bigint_mul",
+        ));
+        assert!(!are_alias_spellings(
+            "pyre_interpreter::objspace::descroperation::jit_bigint_mul",
+            "pyre_interpreter::objspace::descroperation::bigint_add",
         ));
         // Two crates cannot re-export one another's item, so identical module
         // paths under different crates are two functions, not two spellings.
