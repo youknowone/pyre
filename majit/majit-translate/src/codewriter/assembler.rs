@@ -2676,6 +2676,46 @@ impl Assembler {
             // the generic fallback would push zero operand bytes (because
             // `op_variable_refs(LoopHeader)` is empty), misaligning the
             // dispatch cursor.
+            // jtransform.py `_rewrite_op_cond_call` — `conditional_call_ir_v/iiIRd`.
+            // Condition and funcptr are int registers; force_ir always
+            // emits both I and R lists, then the calldescr.
+            OpKind::ConditionalCall {
+                condition,
+                funcptr,
+                descriptor,
+                args_i,
+                args_r,
+                args_f,
+            } => {
+                assert!(
+                    args_f.is_empty(),
+                    "conditional_call does not support float args"
+                );
+                let (reg, kc) = self.lookup_reg_with_kind_var(condition, regallocs);
+                assert_eq!(kc, 'i', "conditional_call condition is an int");
+                state.code.push(reg);
+                argcodes.push(kc);
+                let fnaddr = match callcontrol {
+                    Some(cc) => cc.fnaddr_for_target(funcptr),
+                    None => crate::call::symbolic_fnaddr_for_target(funcptr),
+                };
+                let func_byte = self.emit_const_i(fnaddr, state);
+                state.code.push(func_byte);
+                argcodes.push('i');
+                self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
+                argcodes.push('I');
+                self.emit_list_of_kind(args_r, RegKind::Ref, regallocs, state);
+                argcodes.push('R');
+                let calldescr = descriptor.to_bh_calldescr();
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let key = format!("conditional_call_ir_v/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+
             OpKind::LoopHeader { jitdriver_index } => {
                 let reg_byte = self.emit_const_i(*jitdriver_index as i64, state);
                 state.code.push(reg_byte);

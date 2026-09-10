@@ -980,6 +980,12 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// guarded positive-depth specialization admits only its completed immediate
 /// `f_locals` slice, so it cannot bake a stale inline `last_instr` into those
 /// other getters.
+/// `pypy/module/sys/vm.py getframe` — `@jit.look_inside_iff(lambda space, depth: jit.isconstant(depth))`.
+fn getframe_iff(depth: i64) -> bool {
+    majit_rlib::jit::isconstant(&depth)
+}
+
+#[majit_macros::look_inside_iff(getframe_iff)]
 pub fn getframe(depth: i64) -> crate::PyResult {
     let ec = current_execution_context();
     let mut current = if ec.is_null() {

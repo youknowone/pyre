@@ -9723,7 +9723,7 @@ impl CraneliftBackend {
 
         let mut sig = Signature::new(body_call_conv);
         sig.params.push(AbiParam::new(ptr_type)); // jf_ptr (read inputs, write outputs)
-        // x86/regalloc.py:1397 per-TargetToken `_ll_loop_code` parity: a JUMP
+        // x86/regalloc.py `_ll_loop_code` parity: a JUMP
         // re-enters the target at a SPECIFIC LABEL, not always the first.
         // PyPy exposes one code address per LABEL; cranelift has a single
         // function entry, so the target LABEL is selected by a `dispatch_key`
@@ -9731,7 +9731,7 @@ impl CraneliftBackend {
         // passes 0 for the preamble; an in-code closing-jump passes the target
         // descr's `label_block_id + 1`.
         sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-        // RPython _call_footer (assembler.py:1097): mov eax, ebp; ret
+        // RPython `_call_footer`: mov eax, ebp; ret
         sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
 
         let body_name = format!("trace_{}_body", self.func_counter);

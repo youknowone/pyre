@@ -214,7 +214,8 @@ impl IntArray {
         false
     }
 
-    fn grow(&mut self, min_cap: usize) {
+    /// `_ll_list_resize_hint_really(overallocate=True)` for this block.
+    pub fn grow(&mut self, min_cap: usize) {
         // rlist.py `_ll_list_resize_hint_really(overallocate=True)`:
         // 0, 4, 8, 16, 25, 35, ...
         let extra = if min_cap < 9 { 3 } else { 6 };

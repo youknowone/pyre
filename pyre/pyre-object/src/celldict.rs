@@ -503,13 +503,14 @@ pub fn module_dict_storage_gc_type_id() -> u32 {
 /// `celldict.py getitem_str`'s
 /// `self.unerase(w_dict.dstorage).get(key)`.
 ///
-/// Residualise the probe alone (`@dont_look_inside`, `rlib/jit.py`), the
-/// twin of `dictmultiobject::dict_entries_probe_str`: the `IndexMap::get` it
-/// wraps is an external-crate heap lookup the tracer cannot model — the
-/// oopspec'd residual arm of `rordereddict.ll_dict_getitem` (traced only for a
-/// virtual dict).  The keys are owned `String`s, so no user `__eq__` or
-/// `__hash__` can run inside the boundary at all.
-#[majit_macros::dont_look_inside]
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rordereddict.py`).  Keys are owned `String`s, so no
+/// user `__eq__` or `__hash__` runs inside the probe.
+fn module_dict_entries_get_iff(entries: &ModuleDictEntries, key: &str) -> bool {
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(key)
+}
+
+#[majit_macros::look_inside_iff(module_dict_entries_get_iff)]
 pub fn module_dict_entries_get(entries: &ModuleDictEntries, key: &str) -> Option<PyObjectRef> {
     entries.get(key).copied()
 }
@@ -518,14 +519,18 @@ pub fn module_dict_entries_get(entries: &ModuleDictEntries, key: &str) -> Option
 /// `self.unerase(w_dict.dstorage)[key] = w_value`, returning the displaced
 /// value so the caller can tell an overwrite from an insert.
 ///
-/// `IndexMap::insert` preserves the existing slot's position on overwrite,
-/// matching Python `{}`'s assignment semantics (rewriting an existing key does
-/// not move it to the end).  Residualised for [`module_dict_entries_get`]'s
-/// reason; upstream's `_ll_dict_setitem_lookup_done` (`rordereddict.py`)
-/// is likewise `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))`
-/// and neither conjunct can hold for an `IndexMap` here.  The borrowed name is
-/// copied to the owned `String` the entry table stores inside the boundary.
-#[majit_macros::dont_look_inside]
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `_ll_dict_setitem_lookup_done` (`rordereddict.py`).  Overwrite keeps
+/// the existing slot's position (`{}` assignment).
+fn module_dict_entries_insert_iff(
+    entries: &mut ModuleDictEntries,
+    key: &str,
+    _w_value: PyObjectRef,
+) -> bool {
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(key)
+}
+
+#[majit_macros::look_inside_iff(module_dict_entries_insert_iff)]
 pub fn module_dict_entries_insert(
     entries: &mut ModuleDictEntries,
     key: &str,

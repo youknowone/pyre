@@ -588,6 +588,42 @@ pub fn bridge_diag(i: usize) -> u64 {
         .unwrap_or(0)
 }
 
+/// Last `compile_loop` `Err` reason. The guest has no stderr, so the
+/// `BackendError` string otherwise dies inside `catch_unwind` / `?` and the
+/// host only sees `cl_entered` without `cl_ok` / `cl_decl_*`.
+static LAST_COMPILE_ERR: Mutex<String> = Mutex::new(String::new());
+
+fn record_last_compile_err(err: &majit_backend::BackendError) {
+    *LAST_COMPILE_ERR.lock() = err.to_string();
+}
+
+// Snapshot of `last_compile_err` for the host's byte-at-index read.
+// `last_compile_err_len` refreshes it so each byte load does not re-lock
+// and re-clone the live string.
+thread_local! {
+    static LAST_COMPILE_ERR_SNAP: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Host-visible last `compile_loop` decline. Empty when every compile
+/// returned a token.
+pub fn last_compile_err() -> String {
+    LAST_COMPILE_ERR.lock().clone()
+}
+
+/// Refresh the snapshot and return its length.
+pub fn last_compile_err_len() -> u32 {
+    let bytes = last_compile_err().into_bytes();
+    let len = bytes.len() as u32;
+    LAST_COMPILE_ERR_SNAP.with(|snap| *snap.borrow_mut() = bytes);
+    len
+}
+
+/// Byte `i` of the snapshot [`last_compile_err_len`] last built. 0 if
+/// `i` is out of range.
+pub fn last_compile_err_byte(i: u32) -> u32 {
+    LAST_COMPILE_ERR_SNAP.with(|snap| snap.borrow().get(i as usize).copied().unwrap_or(0) as u32)
+}
+
 /// Number of JIT trace entries made from the guest.
 #[cfg(target_arch = "wasm32")]
 pub fn jit_execute_count() -> u64 {
@@ -4014,7 +4050,14 @@ impl majit_backend::Backend for WasmBackend {
                 },
             ),
         };
-        let (wasm_bytes, guard_exits, num_ref_homes) = codegen::build_wasm_module(&module_inputs)?;
+        let (wasm_bytes, guard_exits, num_ref_homes) =
+            match codegen::build_wasm_module(&module_inputs) {
+                Ok(built) => built,
+                Err(err) => {
+                    record_last_compile_err(&err);
+                    return Err(err);
+                }
+            };
 
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
@@ -5005,7 +5048,14 @@ impl majit_backend::Backend for WasmBackend {
             frame: source_frame,
             ca: ca_params,
         };
-        let (wasm_bytes, guard_exits, _num_ref_homes) = codegen::build_wasm_module(&module_inputs)?;
+        let (wasm_bytes, guard_exits, _num_ref_homes) =
+            match codegen::build_wasm_module(&module_inputs) {
+                Ok(built) => built,
+                Err(err) => {
+                    record_last_compile_err(&err);
+                    return Err(err);
+                }
+            };
 
         // Bridge exit descrs (fail_index already base-offset by build_wasm_module).
         let bridge_descrs: Vec<Arc<WasmFailDescr>> = guard_exits

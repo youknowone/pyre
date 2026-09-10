@@ -1,4 +1,10 @@
 # pyre-check: max-pypy-ratio=16
+# pyre-check: max-wasm-ratio=5.0
+# Function-entry resume: `f` compiles as a function-entry trace and the
+# falsy `or` guard fails into blackhole, then ContinueRunningNormally at
+# the merge-point. wasm compiles each of those traces as its own module.
+# ubuntu-24.04 (PR 1738, production `isconstant` walk) measured 4.3x
+# against dynasm; 5.0x is that reading plus `WASM_RATIO_FIT_HEADROOM` (15%).
 # Loop-carried short-circuit `or` exercised on the FALSY leg, where the loop
 # lives in a callee invoked repeatedly from a hot outer loop.
 #

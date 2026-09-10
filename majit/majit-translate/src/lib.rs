@@ -2174,6 +2174,7 @@ fn analyze_pipeline_from_module_paths(
             parse::CallPath::from_segments(["jit", func_name]),
             parse::CallPath::from_segments(["crate", "jit", func_name]),
             parse::CallPath::from_segments(["majit_metainterp", "jit", func_name]),
+            parse::CallPath::from_segments(["majit_rlib", "jit", func_name]),
         ] {
             call_control.mark_oopspec(path, spec.to_string());
         }

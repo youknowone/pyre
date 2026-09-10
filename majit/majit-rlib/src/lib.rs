@@ -11,6 +11,7 @@
 //! upstream package it came from.
 
 pub mod debug;
+pub mod jit;
 pub mod lltypesystem;
 pub mod rbigint;
 

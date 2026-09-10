@@ -3701,6 +3701,9 @@ struct Lowering<'a> {
     /// two-variant enum tag switches (real `__discriminant` reads) are absent
     /// and keep the `Int`-exitcase path.
     niche_disc_vars: std::collections::HashSet<u64>,
+    /// Source GC pointer of each `cast_ptr_to_int` / `p as usize` result.
+    /// A following `cast_int_to_ptr` is `jtransform.py rewrite_op_cast_opaque_ptr`.
+    cast_ptr_to_int_src: std::collections::HashMap<Variable, Variable>,
 }
 
 impl<'a> Lowering<'a> {
@@ -3958,6 +3961,7 @@ impl<'a> Lowering<'a> {
             is_none_sites: Vec::new(),
             closure_select_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),
+            cast_ptr_to_int_src: std::collections::HashMap::new(),
         })
     }
 
@@ -5502,9 +5506,20 @@ impl<'a> Lowering<'a> {
                         && matches!(dst_kind, ValueType::Unsigned)
                     {
                         let bb_id = self.block_id[mir_bb];
+                        let orig = arg.clone();
                         let (retype, result) =
                             push_ptr_to_unsigned_cast(&mut self.graph, bb_id, arg);
+                        self.cast_ptr_to_int_src.insert(result.clone(), orig);
                         return Ok((Some(retype), result));
+                    }
+                    // `p as usize as *mut T` is `lltype.cast_opaque_ptr`.
+                    // Fold the int→ptr half back to the original GC pointer
+                    // so OptEarlyForce does not force_box a virtual
+                    // W_IntObject (`jtransform.py rewrite_op_cast_opaque_ptr`).
+                    if matches!(dst_kind, ValueType::Ref(_))
+                        && let Some(orig) = self.cast_ptr_to_int_src.get(&arg).cloned()
+                    {
+                        return Ok((None, orig));
                     }
                     return Ok(
                         match src_kind
@@ -5515,6 +5530,11 @@ impl<'a> Lowering<'a> {
                                 let res = self
                                     .graph
                                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                                if matches!(src_kind, Some(ValueType::Ref(_)))
+                                    && matches!(dst_kind, ValueType::Int | ValueType::Unsigned)
+                                {
+                                    self.cast_ptr_to_int_src.insert(res.clone(), arg.clone());
+                                }
                                 (
                                     Some(OpKind::Call {
                                         target: CallTarget::FunctionPath { segments },
@@ -8693,7 +8713,7 @@ impl<'a> Lowering<'a> {
                 // phaseA lift and drop the whole graph to the legacy walker.
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
-                    && fd.item_meta.name_path() == "majit_metainterp::jit::we_are_jitted"
+                    && path_ends_with_segments(&fd.item_meta.name_path(), "jit::we_are_jitted")
                 {
                     let res = self
                         .graph

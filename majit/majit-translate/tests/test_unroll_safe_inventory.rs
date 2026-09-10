@@ -219,6 +219,25 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "release_arguments",
         "ctypefunc.py W_CTypeFunc._call's finally block",
     ),
+    // `look_inside_iff` does `func = unroll_safe(func)` (`rlib/jit.py`
+    // `look_inside_iff.inner`).  The harvested name is the inlined original
+    // (`_orig_*`), not the dispatch wrapper.
+    //
+    // Evidence: `pypy/module/sys/vm.py getframe` is
+    // `@jit.look_inside_iff(jit.isconstant(depth))`.  Windows
+    // `pyre/check.py --backend dynasm` on this SHA passed, and a local
+    // remesure of the getframe/list/join fixtures did not raise
+    // `fbw_rolled_back_with_effects`.
+    (
+        "_orig_getframe",
+        "rlib/jit.py look_inside_iff unroll_safe(getframe)",
+    ),
+    // Same `func = unroll_safe(func)` as above, for
+    // `stringmethods.py _str_join_many_items`.
+    (
+        "_orig_str_join_many_items",
+        "rlib/jit.py look_inside_iff unroll_safe(_str_join_many_items)",
+    ),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`

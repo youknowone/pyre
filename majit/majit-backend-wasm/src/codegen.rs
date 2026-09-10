@@ -9686,9 +9686,9 @@ fn unbound_pool_const_seeds(
         }
     }
     let mut seeds: Vec<(u32, i64)> = Vec::new();
-    let mut unresolved: Vec<u32> = Vec::new();
+    let mut unresolved: Vec<(OpRef, OpCode, bool)> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
-    let mut consider = |a: OpRef, seeds: &mut Vec<(u32, i64)>, seen: &mut HashSet<u32>| {
+    let mut consider = |a: OpRef, opcode: OpCode, failarg: bool, seeds: &mut Vec<(u32, i64)>| {
         if a == OpRef::NONE || a.is_constant() {
             return;
         }
@@ -9698,27 +9698,44 @@ fn unbound_pool_const_seeds(
         }
         match constants.get(&raw) {
             Some(&bits) => seeds.push((raw, bits)),
-            // No producer and no pool entry: the local would read as the zero
-            // wasm initializes it to, which is a wrong value, not a missing
-            // one. Decline the trace (the interpreter runs it correctly,
-            // unaccelerated) exactly as the unhandled-opcode arm does.
-            None => unresolved.push(raw),
+            // No producer and no pool entry: the local would read as the
+            // zero wasm initializes it to, which is a wrong value, not a
+            // missing one. Decline the trace (the interpreter runs it
+            // correctly, unaccelerated) exactly as the unhandled-opcode
+            // arm does.
+            None => unresolved.push((a, opcode, failarg)),
         }
     };
     for op in ops {
         for a in op.getarglist().iter() {
-            consider(a.to_opref(), &mut seeds, &mut seen);
+            consider(a.to_opref(), op.opcode, false, &mut seeds);
         }
         if let Some(fa) = op.getfailargs() {
             for a in fa.iter() {
-                consider(a.to_opref(), &mut seeds, &mut seen);
+                consider(a.to_opref(), op.opcode, true, &mut seeds);
             }
         }
     }
     if !unresolved.is_empty() {
+        let labels: Vec<Vec<OpRef>> = ops
+            .iter()
+            .filter(|op| op.opcode == OpCode::Label)
+            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+            .collect();
+        let sameas: Vec<OpRef> = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.opcode,
+                    OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
+                )
+            })
+            .map(|op| op.pos.get())
+            .collect();
+        let in_idx: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
         return Err(BackendError::Unsupported(format!(
             "wasm codegen: value{unresolved:?} read with no producing op and no \
-             constant-pool entry"
+             constant-pool entry; inputargs={in_idx:?} labels={labels:?} sameas={sameas:?}"
         )));
     }
     Ok(seeds)

@@ -996,6 +996,20 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
         return Ok(str_result_unchanged(item));
     }
+    str_join_many_items(sep, &items)
+}
+
+/// `stringmethods.py _str_join_many_items`:
+/// `@jit.look_inside_iff(lambda self, space, list_w, size: jit.loop_unrolling_heuristic(list_w, size))`.
+fn str_join_many_items_iff(_sep: &rustpython_wtf8::Wtf8, items: &[PyObjectRef]) -> bool {
+    majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), 2)
+}
+
+#[majit_macros::look_inside_iff(str_join_many_items_iff)]
+fn str_join_many_items(
+    sep: &rustpython_wtf8::Wtf8,
+    items: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     for (i, item) in items.iter().enumerate() {
         if unsafe { !is_str(*item) } {

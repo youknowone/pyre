@@ -6763,7 +6763,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
-    let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
+    let allboxes = build_allboxes(
+        funcptr,
+        &r_args,
+        &argbox_types,
+        call_descr.arg_types(),
+        None,
+    );
     if let Err(e) = ensure_residual_call_args_bound(&allboxes, op.pc) {
         if fbw_debug_abort_enabled() {
             let len_pc = op.pc + 1 + 1;
@@ -8149,6 +8155,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         &argboxes,
         &argbox_types,
         original_call_descr.arg_types(),
+        None,
     );
 
     // pyjitpl.py `opimpl_jit_force_quasi_immutable` must run before
@@ -9647,7 +9654,13 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
     argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
     argboxes.extend_from_slice(&f_args);
     argbox_types.extend(std::iter::repeat(Type::Float).take(f_args.len()));
-    let allboxes = build_allboxes(funcptr, &argboxes, &argbox_types, call_descr.arg_types());
+    let allboxes = build_allboxes(
+        funcptr,
+        &argboxes,
+        &argbox_types,
+        call_descr.arg_types(),
+        None,
+    );
     ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
     let ei = call_descr.get_extra_info();
@@ -9851,5 +9864,87 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         }
     }
 
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `pyjitpl.py opimpl_conditional_call_ir_v` / `do_conditional_call`.
+///
+/// Operand layout `iiIRd`: condition, funcptr, I-list, R-list, descr.
+/// A constant-false condition records nothing so the heapcache can keep
+/// the arguments virtual.
+pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let cond = read_int_reg(code, op, 0, ctx)?;
+    let funcptr = read_int_reg(code, op, 1, ctx)?;
+    let (i_args, i_width) = read_int_var_list(code, op, 2, ctx)?;
+    let (r_args, r_width) = read_ref_var_list(code, op, 2 + i_width, ctx)?;
+    let descr_offset = 2 + i_width + r_width;
+    let descr = read_descr(code, op, descr_offset, ctx)?;
+    let call_descr = descr
+        .as_call_descr()
+        .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
+            pc: op.pc,
+            descr_index: decode_descr_index(code, op, descr_offset),
+        })?;
+    // pyjitpl.py `opimpl_conditional_call_ir_v`: ConstInt(0) returns without recording.
+    if cond.is_constant() {
+        let zero = matches!(ctx.trace_ctx.box_value(cond), Some(majit_ir::Value::Int(0)));
+        if zero {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+    let mut argboxes: Vec<OpRef> = Vec::with_capacity(i_args.len() + r_args.len());
+    let mut argbox_types: Vec<Type> = Vec::with_capacity(i_args.len() + r_args.len());
+    argboxes.extend_from_slice(&i_args);
+    argbox_types.extend(std::iter::repeat(Type::Int).take(i_args.len()));
+    argboxes.extend_from_slice(&r_args);
+    argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
+    let allboxes = build_allboxes(
+        funcptr,
+        &argboxes,
+        &argbox_types,
+        call_descr.arg_types(),
+        Some(cond),
+    );
+    assert!(
+        !call_descr
+            .get_extra_info()
+            .check_forces_virtual_or_virtualizable(),
+        "conditional_call target must not force virtualizable"
+    );
+    ctx.trace_ctx
+        .profiler()
+        .count_ops(OpCode::CondCallN, majit_metainterp::counters::OPS);
+    ctx.trace_ctx
+        .profiler()
+        .count_ops(OpCode::CondCallN, majit_metainterp::counters::RECORDED_OPS);
+    let _recorded = ctx
+        .trace_ctx
+        .record_op_with_descr(OpCode::CondCallN, &allboxes, descr);
+    let cond_true = match ctx.trace_ctx.box_value(cond) {
+        Some(majit_ir::Value::Int(n)) => n != 0,
+        _ => match read_int_reg_concrete(code, op, 0, ctx) {
+            ConcreteValue::Int(n) => n != 0,
+            ConcreteValue::Bool(b) => b,
+            _ => false,
+        },
+    };
+    if cond_true {
+        let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr) else {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        };
+        let mut concrete_args = Vec::with_capacity(allboxes.len().saturating_sub(2));
+        for boxref in allboxes.iter().skip(2) {
+            match ctx.trace_ctx.box_value(*boxref) {
+                Some(majit_ir::Value::Int(n)) => concrete_args.push(n),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) => concrete_args.push(p as i64),
+                _ => return Ok((DispatchOutcome::Continue, op.next_pc)),
+            }
+        }
+        majit_metainterp::call_void_function(func_addr as *const (), &concrete_args);
+    }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }

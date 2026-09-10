@@ -4772,6 +4772,18 @@ fn write_int_reg<Sym: WalkSym>(
     Ok(())
 }
 
+/// `pyjitpl.py` `_opimpl_isconstant` / `_opimpl_isvirtual`: `ConstInt`, no IR.
+fn write_hint_bool<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dst: usize,
+    predicate: bool,
+) -> Result<(), DispatchError> {
+    let value = i64::from(predicate);
+    let result = ctx.trace_ctx.const_int(value);
+    write_int_reg(ctx, pc, dst, result, ConcreteValue::Int(value))
+}
+
 /// Derive a `ConcreteValue` for shadow write-back from a freshly
 /// recorded `OpRef` via `concrete_of_opref` (concrete_of_opref derivation).
 ///
@@ -5397,15 +5409,14 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
 /// `read_float_var_list`) tag each entry with its bank, so the parallel
 /// array is correct without needing a runtime type query.
 ///
-/// The RPython `prepend_box` parameter is unused at every
-/// `residual_call*` call site (only `conditional_call*` uses it, not
-/// yet ported), so it's omitted from the walker signature. Add it back
-/// when porting `opimpl_conditional_call*`.
+/// `pyjitpl.py _build_allboxes(..., prepend_box=)`. Residual calls pass
+/// `None`; `opimpl_conditional_call*` prepends the condition/value box.
 fn build_allboxes(
     funcbox: OpRef,
     argboxes: &[OpRef],
     argbox_types: &[Type],
     arg_types: &[Type],
+    prepend_box: Option<OpRef>,
 ) -> Vec<OpRef> {
     debug_assert_eq!(
         argboxes.len(),
@@ -5413,8 +5424,12 @@ fn build_allboxes(
         "argboxes and argbox_types must align",
     );
     // RPython line 1961: `allboxes = [None] * (len(argboxes)+1 + …)`.
-    let total = arg_types.len() + 1;
+    let extra = usize::from(prepend_box.is_some());
+    let total = arg_types.len() + 1 + extra;
     let mut allboxes: Vec<OpRef> = Vec::with_capacity(total);
+    if let Some(pre) = prepend_box {
+        allboxes.push(pre);
+    }
     // RPython line 1966: `allboxes[i] = funcbox`.
     allboxes.push(funcbox);
     // RPython line 1968: `src_i = src_r = src_f = 0`.
@@ -12216,6 +12231,8 @@ fn handle<Sym: WalkSym>(
         // family per `resoperation.py Type::Void => CallN`.
         "residual_call_r_v/iRd" => dispatch_residual_call_iRd_kind(code, op, ctx, 'v'),
         "residual_call_ir_v/iIRd" => dispatch_residual_call_iIRd_kind(code, op, ctx, 'v'),
+        // `pyjitpl.py opimpl_conditional_call_ir_v`: condition + func + I/R.
+        "conditional_call_ir_v/iiIRd" => dispatch_conditional_call_ir_v(code, op, ctx),
         "residual_call_irf_v/iIRFd" => dispatch_residual_call_iIRFd_kind(code, op, ctx, 'v'),
         // The `int_*` / `float_*` / `ptr_*` record families are routed
         // through `dispatch_regular_record` (see `arith.rs`) before this
@@ -12671,6 +12688,26 @@ fn handle<Sym: WalkSym>(
             let opref = read_ref_reg(code, op, 0, ctx)?;
             let cls = read_int_reg(code, op, 1, ctx)?;
             ctx.trace_ctx.trace_record_exact_class(opref, cls);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // `pyjitpl.py` `_opimpl_isconstant` / `_opimpl_isvirtual`: write
+        // `ConstInt(...)` and record no IR.  Operand layout `[src][dst]`.
+        "int_isconstant/i>i" => {
+            let src = read_int_reg(code, op, 0, ctx)?;
+            let dst = code[op.pc + 2] as usize;
+            write_hint_bool(ctx, op.pc, dst, src.is_constant())?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "ref_isconstant/r>i" => {
+            let src = read_ref_reg(code, op, 0, ctx)?;
+            let dst = code[op.pc + 2] as usize;
+            write_hint_bool(ctx, op.pc, dst, src.is_constant())?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "ref_isvirtual/r>i" => {
+            let src = read_ref_reg(code, op, 0, ctx)?;
+            let dst = code[op.pc + 2] as usize;
+            write_hint_bool(ctx, op.pc, dst, ctx.trace_ctx.is_likely_virtual(src))?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // RPython `pyjitpl.py opimpl_new` delegates to `execute_new`:

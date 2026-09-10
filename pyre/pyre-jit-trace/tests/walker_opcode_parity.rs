@@ -239,6 +239,9 @@ const MAJIT_ONLY: &[&str] = &[
 const PYRE_ONLY: &[&str] = &[
     // The walker's own abort marker.
     "abort/>r",
+    // jtransform `_rewrite_op_cond_call` emits this key; majit's tracer
+    // walks the `#[jit_interp]` `cond_call_void_ext/P` byte instead.
+    "conditional_call_ir_v/iiIRd",
     // Pointer/integer casts.
     "cast_int_to_ptr/i>r",
     "cast_ptr_to_int/r>i",
@@ -285,7 +288,6 @@ const PYRE_ONLY: &[&str] = &[
 /// so a new arrival costs compilation rather than correctness.
 const NEITHER: &[&str] = &[
     "check_neg_index/rid>i",
-    "conditional_call_ir_v/iiIRd",
     "gc_load_indexed_f/riiii>f",
     "gc_load_indexed_i/riiii>i",
     "getinteriorfield_gc_f/rid>f",

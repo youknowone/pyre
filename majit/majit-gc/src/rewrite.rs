@@ -47,6 +47,23 @@ fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
 /// numbering is untouched. Returns the rewritten ops and the
 /// `gcrefs_output_list` (rewrite.py:352) the caller turns into the
 /// per-loop table.
+/// rewrite.py `remove_constptr` sees the Const box after
+/// `get_box_replacement`. A folded InputArg/Op still carries
+/// `Forwarded::Const`; `const_value()` on the operand itself is
+/// then `None`, so follow the replacement before deciding the arg
+/// is not a ref constant.
+fn const_ref_operand(arg: &Operand) -> Option<(Operand, GcRef)> {
+    let replaced = if arg.const_value().is_some() {
+        arg.clone()
+    } else {
+        arg.get_box_replacement(false)
+    };
+    match replaced.const_value() {
+        Some(Value::Ref(gcref)) => Some((replaced, gcref)),
+        _ => None,
+    }
+}
+
 pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRef>) {
     // rewrite.py:352-354 `gcrefs_output_list` / `gcrefs_map` /
     // `gcrefs_recently_loaded`.
@@ -54,6 +71,33 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
     let mut gcrefs_map: IndexMap<usize, u32> = IndexMap::default();
     let mut recently_loaded: IndexMap<u32, Operand> = IndexMap::default();
     let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+
+    let mut intern = |gcref: GcRef,
+                      recently_loaded: &mut IndexMap<u32, Operand>,
+                      out: &mut Vec<Op>,
+                      next_pos: &mut u32|
+     -> Operand {
+        let index = *gcrefs_map.entry(gcref.0).or_insert_with(|| {
+            let index = gcrefs.len() as u32;
+            gcrefs.push(gcref);
+            index
+        });
+        match recently_loaded.get(&index) {
+            Some(load) => load.clone(),
+            None => {
+                let load_op = std::rc::Rc::new(mk_op(
+                    OpCode::LoadFromGcTable,
+                    &[Operand::const_from_value(Value::Int(index as i64))],
+                ));
+                load_op.pos.set(OpRef::ref_op(*next_pos));
+                *next_pos += 1;
+                out.push((*load_op).clone());
+                let load = Operand::from_bound_op(&load_op);
+                recently_loaded.insert(index, load.clone());
+                load
+            }
+        }
+    };
 
     for op in ops {
         // rewrite.py:1005 — the per-basic-block CSE cache is dropped at
@@ -67,36 +111,39 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
         // rewrite.py:105 `keep` — JIT_DEBUG keeps its constants inline.
         if op.opcode != OpCode::JitDebug {
             for i in 0..op.num_args() {
-                // rewrite.py `bool(arg.value)` — null stays inline.
-                let Some(Value::Ref(gcref)) = op.arg(i).const_value() else {
+                // rewrite.py `bool(arg.value)` — null stays inline as a
+                // ConstPtr so `to_opref` is not a dead InputArgRef index.
+                let Some((replaced, gcref)) = const_ref_operand(&op.arg(i)) else {
                     continue;
                 };
                 if gcref.is_null() {
+                    if !op.arg(i).is_constant() {
+                        op.setarg(i, replaced);
+                    }
                     continue;
                 }
-                // rewrite.py `_gcref_index`.
-                let index = *gcrefs_map.entry(gcref.0).or_insert_with(|| {
-                    let index = gcrefs.len() as u32;
-                    gcrefs.push(gcref);
-                    index
-                });
-                // rewrite.py `remove_constptr`.
-                let load = match recently_loaded.get(&index) {
-                    Some(load) => load.clone(),
-                    None => {
-                        let load_op = std::rc::Rc::new(mk_op(
-                            OpCode::LoadFromGcTable,
-                            &[Operand::const_from_value(Value::Int(index as i64))],
-                        ));
-                        load_op.pos.set(OpRef::ref_op(next_pos));
-                        next_pos += 1;
-                        out.push((*load_op).clone());
-                        let load = Operand::from_bound_op(&load_op);
-                        recently_loaded.insert(index, load.clone());
-                        load
-                    }
-                };
+                let load = intern(gcref, &mut recently_loaded, &mut out, &mut next_pos);
                 op.setarg(i, load);
+            }
+            if let Some(mut fail_args) = op.getfailargs() {
+                let mut changed = false;
+                for arg in fail_args.iter_mut() {
+                    let Some((replaced, gcref)) = const_ref_operand(arg) else {
+                        continue;
+                    };
+                    if gcref.is_null() {
+                        if !arg.is_constant() {
+                            *arg = replaced;
+                            changed = true;
+                        }
+                        continue;
+                    }
+                    *arg = intern(gcref, &mut recently_loaded, &mut out, &mut next_pos);
+                    changed = true;
+                }
+                if changed {
+                    op.setfailargs(fail_args);
+                }
             }
         }
         out.push(op);
@@ -3494,7 +3541,23 @@ mod tests {
     use std::sync::Arc;
 
     use majit_ir::descr::{ArrayDescr, Descr, DescrRef, SizeDescr};
-    use majit_ir::value::Type;
+    use majit_ir::value::{InputArg, Type};
+
+    #[test]
+    fn remove_ref_constants_interns_forwarded_inputarg_on_label() {
+        // Compact remap leaves a virtual InputArg at a dead index whose
+        // `_forwarded` is Const(Ref). `to_opref` still spells InputArgRef(99);
+        // rewrite.py `remove_constptr` sees the Const after get_box_replacement.
+        let ia = InputArg::new_ref_rc(99);
+        let operand = Operand::from_bound_inputarg(&ia);
+        operand.set_forwarded_const(Const::Ref(GcRef(0x1000)));
+        let label = Op::new(OpCode::Label, &[operand]);
+        let (out, gcrefs) = remove_ref_constants(&[label], 0);
+        assert_eq!(gcrefs, vec![GcRef(0x1000)]);
+        assert_eq!(out[0].opcode, OpCode::LoadFromGcTable);
+        assert_eq!(out[1].opcode, OpCode::Label);
+        assert_eq!(out[1].arg(0).to_opref(), OpRef::ref_op(0));
+    }
 
     impl GcRewriterImpl {
         fn rewrite_ops(&self, ops: &[Op]) -> Vec<OpRc> {

@@ -2047,7 +2047,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // `ca_result` with the executed concrete on success, and seeds the
     // standing exception state on a raise.
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
-    let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
+    let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types(), None);
     let exec = {
         let _selfrec_ca_fold_guard = SelfRecCaFoldGuard::enter();
         try_execute_residual_call_via_executor(
@@ -10136,7 +10136,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
         return Ok(None);
     };
-    if body_facts.owns_loop_header || body_facts.has_exception_table {
+    if body_facts.owns_loop_header {
         return Ok(None);
     }
 
@@ -10288,7 +10288,11 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
         return Ok(None);
     };
-    if body_facts.owns_loop_header || body_facts.has_exception_table {
+    // Admit a raising `__next__` the way `try_walker_inline_subscr_getitem`
+    // admits a raising `__getitem__`: StopIteration at the end of the
+    // iterator is the shape worth inlining.  A callee that owns a portal
+    // loop header is still declined — that body is a trace of its own.
+    if body_facts.owns_loop_header {
         return Ok(None);
     }
     let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)

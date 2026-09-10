@@ -472,6 +472,13 @@ pub struct Transformer<'a> {
         crate::flowspace::model::Variable,
         crate::flowspace::model::Variable,
     >,
+    /// Source GC pointer of each `cast_ptr_to_int` result.  Rust spells
+    /// `lltype.cast_opaque_ptr` as `p as usize as *mut T`; the second
+    /// cast folds back to this source (`rewrite_op_cast_opaque_ptr`).
+    cast_ptr_to_int_src: std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
@@ -1235,6 +1242,7 @@ impl<'a> Transformer<'a> {
             vable_array_vars: std::collections::HashMap::new(),
             vable_flags: std::collections::HashMap::new(),
             aliases: std::collections::HashMap::new(),
+            cast_ptr_to_int_src: std::collections::HashMap::new(),
             notes: Vec::new(),
             vable_rewrites: 0,
             calls_classified: 0,
@@ -1990,6 +1998,8 @@ impl<'a> Transformer<'a> {
             // RPython `Transformer.rewrite_op_cast_opaque_ptr` aliases
             // only the explicit low-level operation. A ptr/int roundtrip
             // remains two casts; it is not an opaque-pointer cast.
+            // The Rust `p as usize as *mut T` spelling is the Call pair
+            // folded in `rewrite_op_direct_call`.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -4300,6 +4310,32 @@ impl<'a> Transformer<'a> {
             "CallTarget::Indirect must be lowered by translator/rtyper/rpbc.rs \
              before reaching rewrite_op_direct_call",
         );
+        // `jtransform.py rewrite_op_cast_opaque_ptr` returns None (alias
+        // args[0]).  The same identity applies to the Rust spelling of
+        // that op: `cast_int_to_ptr(cast_ptr_to_int(p))`.
+        // Match the `lltype.cast_*` host path `cast_call_segments` emits,
+        // not a bare leaf — a user function named `cast_int_to_ptr` is
+        // an ordinary call (`pointer_cast_function_names_do_not_alias`).
+        if let CallTarget::FunctionPath { segments } = target {
+            if is_lltype_cast_path(segments, "cast_opaque_ptr") && args.len() == 1 {
+                return RewriteResult::Identity(args[0].clone());
+            }
+            if is_lltype_cast_path(segments, "cast_ptr_to_int") && args.len() == 1 {
+                if let Some(res) = op.result.clone() {
+                    let src = resolve_alias(&args[0], &self.aliases);
+                    self.cast_ptr_to_int_src.insert(res, src);
+                }
+                // `rewrite_op_cast_ptr_to_int` keeps a GC pointer cast;
+                // fall through so the existing Call residual path still
+                // emits it.
+            }
+            if is_lltype_cast_path(segments, "cast_int_to_ptr") && args.len() == 1 {
+                let arg = resolve_alias(&args[0], &self.aliases);
+                if let Some(src) = self.cast_ptr_to_int_src.get(&arg).cloned() {
+                    return RewriteResult::Identity(src);
+                }
+            }
+        }
         // RPython `IntegerRepr.rtype_float` (`rint.py`) converts an
         // Unsigned input to Float, emitting `cast_uint_to_float`; jtransform
         // then applies `_do_builtin_call` (`jtransform.py`) and reaches
@@ -6547,6 +6583,17 @@ impl<'a> Transformer<'a> {
                     None,
                 )
             }
+            // `rlib/jit.py` `_jit_conditional_call` is an llop in upstream
+            // (`ConditionalCallEntry.specialize_call` → `jit_conditional_call`),
+            // rewritten by `rewrite_op_jit_conditional_call`. pyre harvests
+            // the interpreter-facing helper as `oopspec("jit.conditional_call")`
+            // so this arm is the `__handle_jit_call` entry that reaches it.
+            "jit.conditional_call" => {
+                self.rewrite_op_jit_conditional_call(graph, op, target, args, result_ty, graph_name)
+            }
+            "jit.conditional_call_value" => self.rewrite_op_jit_conditional_call_value(
+                graph, op, target, args, result_ty, graph_name,
+            ),
             // jtransform.py:1756-1757
             _ => {
                 // jtransform.py:1757
@@ -6611,30 +6658,18 @@ impl<'a> Transformer<'a> {
         self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name)
     }
 
-    // NOTE: rewrite_op_jit_conditional_call, _rewrite_op_cond_call, and
-    // rewrite_op_jit_record_known_result are handled by jitcode_lower
-    // (proc-macro level), not jtransform. The codewriter AST parser does
-    // not expand macro_rules!, so these macros never reach jtransform.
-    // See jitcode_lower.rs: lower_conditional_call, lower_conditional_call_elidable,
-    // lower_record_known_result.
-    //
-    // `_rewrite_op_cond_call` below is a structural mirror of
-    // `rpython/jit/codewriter/jtransform.py:1665-1683`. pyre dispatches
-    // conditional_call via the proc-macro path (see above), so this
-    // function is never reached at runtime; the Rust #[allow(dead_code)]
-    // is deliberate. Keeping the body
-    // here lets future porters cross-reference our conditional_call
-    // lowering against the upstream flow line-by-line.
+    // `#[jit_interp] conditional_call!` still lowers through jitcode_lower.
+    // Interpreter-facing `majit_rlib::jit::conditional_call*` is an oopspec
+    // and reaches this rewrite via `_handle_jit_call`, matching
+    // `jtransform.py rewrite_op_jit_conditional_call`.
 
     /// RPython: `Transformer._rewrite_op_cond_call(op, rewritten_opname)`
     /// (jtransform.py:1665-1683).
     ///
-    /// Called by upstream `rewrite_op_jit_conditional_call` and
-    /// `rewrite_op_jit_conditional_call_value`; in pyre those two
-    /// lower through `jitcode_lower::lower_conditional_call` /
-    /// `lower_conditional_call_elidable` instead. This body is kept as
-    /// structural documentation so the two code paths stay aligned.
-    #[allow(dead_code)]
+    /// `rewrite_call(op, name, op.args[:2], args=op.args[2:])`: args[0] is
+    /// the condition (or elidable value), args[1] is the callee, args[2:]
+    /// are the callee's arguments. `target` is the oopspec wrapper and is
+    /// not the residual funcptr.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -6643,7 +6678,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         graph: &mut FunctionGraph,
         op: &SpaceOperation,
-        target: &CallTarget,
+        _target: &CallTarget,
         args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
@@ -6658,17 +6693,36 @@ impl<'a> Transformer<'a> {
         if args.len() > 4 + 2 {
             panic!("Conditional call does not support more than 4 arguments");
         }
-        // jtransform.py:1673-1676: calldescr from function call (args[1:] → result)
+        assert!(
+            args.len() >= 2,
+            "jit.conditional_call needs a condition and a function"
+        );
+        // jtransform.py `_rewrite_op_cond_call`: rewrite_call(..., op.args[:2], args=op.args[2:])
         let condition_or_value_var = args[0].clone();
-        let func_args: &[crate::flowspace::model::Variable] =
-            if args.len() > 1 { &args[1..] } else { &[] };
+        let func_var = &args[1];
+        let func_args = &args[2..];
+        let func_target = fn_const_target_for_var(graph, func_var, 0).unwrap_or_else(|| {
+            panic!(
+                "conditional_call function must be a constant function item \
+                 (rtyper get_concrete_llfn); graph={graph_name}"
+            )
+        });
+        // jtransform.py `_rewrite_op_cond_call`: `direct_call` of op.args[1:] (func + args)
         let non_void_args = resolve_non_void_arg_types_from_vars(func_args);
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_ir_type = resolved_result.ir_type;
+        let callee_op = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::Call {
+                target: func_target.clone(),
+                args: func_args.to_vec(),
+                result_ty: result_ty.clone(),
+            },
+        };
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
-                op,
+                &callee_op,
                 non_void_args,
                 result_ir_type,
                 OopSpecIndex::None,
@@ -6705,7 +6759,7 @@ impl<'a> Transformer<'a> {
         let call_kind = if is_value {
             OpKind::ConditionalCallValue {
                 value: condition_or_value_var,
-                funcptr: target.clone(),
+                funcptr: func_target,
                 descriptor: descriptor.clone(),
                 args_i,
                 args_r,
@@ -6715,7 +6769,7 @@ impl<'a> Transformer<'a> {
         } else {
             OpKind::ConditionalCall {
                 condition: condition_or_value_var,
-                funcptr: target.clone(),
+                funcptr: func_target,
                 descriptor: descriptor.clone(),
                 args_i,
                 args_r,
@@ -6736,10 +6790,7 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(ops)
     }
 
-    /// RPython: `Transformer.rewrite_op_jit_conditional_call(op)`
-    /// (jtransform.py:1685-1686). Dispatch wrapper kept for structural
-    /// parity; pyre's `rewrite_operation` match does not reach it.
-    #[allow(dead_code)]
+    /// RPython: `Transformer.rewrite_op_jit_conditional_call(op)`.
     fn rewrite_op_jit_conditional_call(
         &mut self,
         graph: &mut FunctionGraph,
@@ -6752,10 +6803,7 @@ impl<'a> Transformer<'a> {
         self._rewrite_op_cond_call(graph, op, target, args, result_ty, graph_name, false)
     }
 
-    /// RPython: `Transformer.rewrite_op_jit_conditional_call_value(op)`
-    /// (jtransform.py:1687-1688). Dispatch wrapper kept for structural
-    /// parity; pyre's `rewrite_operation` match does not reach it.
-    #[allow(dead_code)]
+    /// RPython: `Transformer.rewrite_op_jit_conditional_call_value(op)`.
     fn rewrite_op_jit_conditional_call_value(
         &mut self,
         graph: &mut FunctionGraph,
@@ -8794,6 +8842,17 @@ fn remap_op(
     }
 }
 
+/// `rpython.rtyper.lltypesystem.lltype.cast_*` — the host-callable path
+/// `front::mir::cast_call_segments` emits for a bank-crossing cast.
+fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
+    segments.len() == 5
+        && segments[0] == "rpython"
+        && segments[1] == "rtyper"
+        && segments[2] == "lltypesystem"
+        && segments[3] == "lltype"
+        && segments[4] == name
+}
+
 /// Rewrite `we_are_jitted()` calls to the `_we_are_jitted` symbolic
 /// constant (`OpKind::ConstSymbolic`) on the model graph — the
 /// JIT-codewriter counterpart of RPython's rtyper `specialize_call`
@@ -8811,6 +8870,15 @@ fn remap_op(
 /// un-annotatable `SpecTag` out of `Bookkeeper.immutablevalue` (which
 /// has no symbolic branch — in RPython the symbolic is likewise
 /// introduced only post-annotation, at rtype).
+/// `rlib/jit.py we_are_jitted` — both the metainterp hook and the
+/// `majit_rlib` interpreter-facing spelling `look_inside_iff` emits.
+fn is_we_are_jitted_path(segments: &[String], args: &[crate::flowspace::model::Variable]) -> bool {
+    args.is_empty()
+        && segments.len() >= 2
+        && segments[segments.len() - 2] == "jit"
+        && segments[segments.len() - 1] == "we_are_jitted"
+}
+
 fn fold_we_are_jitted_calls(graph: &mut crate::model::FunctionGraph) {
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
@@ -8822,12 +8890,7 @@ fn fold_we_are_jitted_calls(graph: &mut crate::model::FunctionGraph) {
             else {
                 continue;
             };
-            if !args.is_empty()
-                || segments.len() != 3
-                || segments[0] != "majit_metainterp"
-                || segments[1] != "jit"
-                || segments[2] != "we_are_jitted"
-            {
+            if !is_we_are_jitted_path(segments, args) {
                 continue;
             }
             op.kind = OpKind::ConstSymbolic {
@@ -14380,6 +14443,106 @@ mod tests {
         }
     }
 
+    /// `jtransform.py rewrite_op_cast_opaque_ptr` returns None.
+    #[test]
+    fn cast_opaque_ptr_elides_to_operand_alias() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_opaque");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_opaque_ptr",
+        ]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![arg.clone()],
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "cast_opaque",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// Rust `p as usize as *mut T` is `cast_opaque_ptr`; the int-to-ptr
+    /// half folds back to the original GC pointer.
+    #[test]
+    fn cast_ptr_int_ptr_roundtrip_elides_to_original() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_roundtrip");
+        let ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let as_int = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let as_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let to_int = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ]);
+        let to_ptr = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_int_to_ptr",
+        ]);
+        let first = SpaceOperation {
+            result: Some(as_int.clone()),
+            kind: OpKind::Call {
+                target: to_int.clone(),
+                args: vec![ptr.clone()],
+                result_ty: ValueType::Int,
+            },
+        };
+        let _ = transformer.rewrite_op_direct_call(
+            &first,
+            &to_int,
+            std::slice::from_ref(&ptr),
+            &ValueType::Int,
+            "cast_roundtrip",
+            &mut graph,
+        );
+        let second = SpaceOperation {
+            result: Some(as_ptr),
+            kind: OpKind::Call {
+                target: to_ptr.clone(),
+                args: vec![as_int.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &second,
+            &to_ptr,
+            std::slice::from_ref(&as_int),
+            &ValueType::Ref(None),
+            "cast_roundtrip",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, ptr),
+            _ => panic!("expected Identity alias to the original pointer"),
+        }
+    }
+
     /// Both root-stack operations keep their call.  `pin_root` publishes a
     /// slot that bound `shadow_stack_get` residuals read back positionally,
     /// and `reload_top_root` re-reads the slot after a collection may have
@@ -14794,6 +14957,40 @@ mod tests {
         let mut graph = FunctionGraph::new("we_are_jitted_specialize");
         let entry = graph.startblock;
         let target = CallTarget::function_path(["majit_metainterp", "jit", "we_are_jitted"]);
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target,
+                    args: vec![],
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result_var.clone()));
+        fold_we_are_jitted_calls(&mut graph);
+        let op = graph.blocks[0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&result_var))
+            .expect("we_are_jitted op present");
+        match &op.kind {
+            OpKind::ConstSymbolic { tag, .. } => assert_eq!(
+                *tag,
+                crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID
+            ),
+            other => panic!("expected ConstSymbolic, got {other:?}"),
+        }
+    }
+
+    /// `look_inside_iff` emits `majit_rlib::jit::we_are_jitted`; the
+    /// fold must recognise that spelling too (`rlib/jit.py we_are_jitted`).
+    #[test]
+    fn we_are_jitted_rlib_path_specializes_to_symbolic() {
+        let mut graph = FunctionGraph::new("we_are_jitted_rlib_specialize");
+        let entry = graph.startblock;
+        let target = CallTarget::function_path(["majit_rlib", "jit", "we_are_jitted"]);
         let result_var = graph
             .push_op_var(
                 entry,
