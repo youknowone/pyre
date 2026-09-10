@@ -14222,6 +14222,24 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
     {
         let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+        // Emit the machine-int body before descending `binary_value_from_tag`.
+        // The descent walks `int_add_ovf`; a bridge InputArg for `total`
+        // has no sidecar stamp, so that walk used to abort the except
+        // path (`IntOvfOperandNotConcrete`) before this emit ran.
+        // Boxed concretes are available here (`try_emit_exact_int_binop`
+        // reads the heap objects), so `total += 2` after a caught raise
+        // records `int_add_ovf` instead of aborting the bridge.
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::BinaryOpDescent, || {
+            super::specialize::try_emit_exact_int_binop(
+                ctx, op.pc, op_tag, &ref_args, dst, dst_bank,
+            )
+        })? {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
+            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
         if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
             super::specialize::try_walker_orthodox_binary_op(
                 ctx,
@@ -14239,17 +14257,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         // declined int walk) must not fall through to a successful
         // `binary_value_from_tag` walk that residualizes `descr_add` as
         // `CallMayForce` — that is the 19x `float_loop` hole.
-        if let Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }) = spec_gate(SpecFold::BinaryOpDescent, || {
-            super::specialize::try_emit_exact_int_binop(
-                ctx, op.pc, op_tag, &ref_args, dst, dst_bank,
-            )
-        })? {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::BinaryOpFloat, || {
