@@ -485,7 +485,7 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 fn unsafe_escaping_ptr_for_ptr_or_array(cdata: &W_CData) -> Result<*mut u8, PyError> {
     let ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
-    if !ct.has(ctypeobj::F_NONFUNC_POINTER_OR_ARRAY) {
+    if !ct.has(ctypeobj::CTypeFlags::NONFUNC_POINTER_OR_ARRAY) {
         return Err(PyError::type_error(format!(
             "expected a pointer or array ctype, got '{}'",
             ct.name()

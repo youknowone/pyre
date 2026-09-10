@@ -71,42 +71,6 @@ bitflags::bitflags! {
     }
 }
 
-/// `W_CType.is_primitive_integer`.
-pub const F_PRIMITIVE_INTEGER: i64 = CTypeFlags::PRIMITIVE_INTEGER.bits();
-/// `W_CType.is_nonfunc_pointer_or_array`.
-pub const F_NONFUNC_POINTER_OR_ARRAY: i64 = CTypeFlags::NONFUNC_POINTER_OR_ARRAY.bits();
-/// `W_CTypePtrOrArray.accept_str`.
-pub const F_ACCEPT_STR: i64 = CTypeFlags::ACCEPT_STR.bits();
-/// `W_CTypePtrBase.is_void_ptr`.
-pub const F_VOID_PTR: i64 = CTypeFlags::VOID_PTR.bits();
-/// `W_CTypePtrBase.is_voidchar_ptr`.
-pub const F_VOIDCHAR_PTR: i64 = CTypeFlags::VOIDCHAR_PTR.bits();
-/// `W_CTypePtrBase.is_onebyte_ptr`.
-pub const F_ONEBYTE_PTR: i64 = CTypeFlags::ONEBYTE_PTR.bits();
-/// `W_CTypePointer.is_file`.
-pub const F_FILE_PTR: i64 = CTypeFlags::FILE_PTR.bits();
-/// `W_CTypePrimitiveSigned.value_fits_long` /
-/// `W_CTypePrimitiveUnsigned.value_fits_long`.
-pub const F_VALUE_FITS_LONG: i64 = CTypeFlags::VALUE_FITS_LONG.bits();
-/// `W_CTypePrimitiveSigned.value_smaller_than_long`.
-pub const F_VALUE_SMALLER_THAN_LONG: i64 = CTypeFlags::VALUE_SMALLER_THAN_LONG.bits();
-/// `W_CTypePrimitiveUnsigned.value_fits_ulong`.
-pub const F_VALUE_FITS_ULONG: i64 = CTypeFlags::VALUE_FITS_ULONG.bits();
-/// `W_CTypePrimitiveUniChar.is_signed_wchar`.
-pub const F_SIGNED_WCHAR: i64 = CTypeFlags::SIGNED_WCHAR.bits();
-/// `W_CTypeFunc.ellipsis`.
-pub const F_ELLIPSIS: i64 = CTypeFlags::ELLIPSIS.bits();
-/// The ctype is `ctypeenum.py W_CTypeEnumSigned` or `W_CTypeEnumUnsigned`.
-/// `_Mixin_Enum` mixes into the primitive signed and unsigned classes, so an
-/// enum keeps their kind and only adds the two enumerator maps.
-pub const F_ENUM: i64 = CTypeFlags::ENUM.bits();
-/// `W_CTypeStructOrUnion._custom_field_pos`.
-pub const F_CUSTOM_FIELD_POS: i64 = CTypeFlags::CUSTOM_FIELD_POS.bits();
-/// `W_CTypeStructOrUnion._with_var_array`.
-pub const F_WITH_VAR_ARRAY: i64 = CTypeFlags::WITH_VAR_ARRAY.bits();
-/// `W_CTypeStructOrUnion._with_packed_change`.
-pub const F_WITH_PACKED_CHANGE: i64 = CTypeFlags::WITH_PACKED_CHANGE.bits();
-
 /// `ctypeobj.py W_CType` and the RPython subclasses that share its typedef.
 ///
 /// `UniqueCache` keeps primitive/singleton ctypes strongly and reaches derived
@@ -151,7 +115,7 @@ pub struct W_CType {
     pub ctptr: PyObjectRef,
     /// `W_CTypeArray.length` — -1 for `int[]` and for anything not an array.
     pub length: i64,
-    /// The `F_*` class attributes above.
+    /// Packed [`CTypeFlags`].
     pub flags: i64,
     /// `W_CTypeFunc.fargs` — the argument ctypes, as a tuple.  `PY_NULL` on
     /// every other kind.
@@ -188,8 +152,8 @@ impl W_CType {
         self.name
     }
 
-    pub fn has(&self, flag: i64) -> bool {
-        self.flags & flag != 0
+    pub fn has(&self, flag: CTypeFlags) -> bool {
+        self.flags & flag.bits() != 0
     }
 
     /// The ctype as the object it is; every ctype is allocated non-moving, so
@@ -218,7 +182,7 @@ impl W_CType {
 
     /// `isinstance(ct, W_CTypePtrOrArray)`.  A function ctype answers yes:
     /// `W_CTypeFunc` is a `W_CTypePtrBase`, which is a `W_CTypePtrOrArray`.
-    /// The predicate that excludes it is `F_NONFUNC_POINTER_OR_ARRAY`.
+    /// The predicate that excludes it is `CTypeFlags::NONFUNC_POINTER_OR_ARRAY`.
     pub fn is_ptr_or_array(&self) -> bool {
         self.kind == KIND_POINTER || self.kind == KIND_ARRAY || self.kind == KIND_FUNC
     }
@@ -254,14 +218,14 @@ impl W_CType {
     /// `W_CTypePtrOrArray.is_unichar_ptr_or_array`, which `W_CTypeFunc`
     /// overrides to false.
     pub fn is_unichar_ptr_or_array(&self) -> bool {
-        self.has(F_NONFUNC_POINTER_OR_ARRAY)
+        self.has(CTypeFlags::NONFUNC_POINTER_OR_ARRAY)
             && ctype_at(self.ctitem).is_some_and(|it| it.kind == KIND_PRIM_UNICHAR)
     }
 
     /// `W_CTypePtrOrArray.is_char_or_unichar_ptr_or_array`, which
     /// `W_CTypeFunc` overrides to false.
     pub fn is_char_or_unichar_ptr_or_array(&self) -> bool {
-        self.has(F_NONFUNC_POINTER_OR_ARRAY)
+        self.has(CTypeFlags::NONFUNC_POINTER_OR_ARRAY)
             && ctype_at(self.ctitem).is_some_and(|it| it.is_char_or_unichar())
     }
 
@@ -345,7 +309,7 @@ impl W_CType {
         if self.kind == KIND_PRIM_LONGDOUBLE {
             return Ok(unsafe { super::misc::longdouble2str(cdata) });
         }
-        if self.has(F_ENUM) {
+        if self.has(CTypeFlags::ENUM) {
             return unsafe { super::ctypeenum::extra_repr(self, cdata) };
         }
         if self.is_primitive() {
@@ -659,7 +623,9 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
     let ct = ctype_of(cdata).ok_or_else(|| PyError::type_error("expected a cdata object"))?;
     match ct.kind {
         KIND_POINTER | KIND_ARRAY => super::ctypeptr::string(w_cdata, maxlen),
-        _ if ct.has(F_ENUM) => unsafe { super::ctypeenum::string(ct, cdata.ptr as *const u8) },
+        _ if ct.has(CTypeFlags::ENUM) => unsafe {
+            super::ctypeenum::string(ct, cdata.ptr as *const u8)
+        },
         _ if ct.is_primitive() => super::ctypeprim::string(w_cdata, maxlen),
         _ => Err(unexpected_string_argument(ct)),
     }
@@ -887,12 +853,14 @@ fn fget(w_self: PyObjectRef, attrchar: char) -> Result<PyObjectRef, PyError> {
         // `W_CTypeFunc._fget`.
         'a' if ct.kind == KIND_FUNC => Ok(ct.fargs),
         'r' if ct.kind == KIND_FUNC => Ok(ct.ctitem),
-        'E' if ct.kind == KIND_FUNC => Ok(pyre_object::boolobject::w_bool_from(ct.has(F_ELLIPSIS))),
+        'E' if ct.kind == KIND_FUNC => Ok(pyre_object::boolobject::w_bool_from(
+            ct.has(CTypeFlags::ELLIPSIS),
+        )),
         'A' if ct.kind == KIND_FUNC => Ok(pyre_object::w_int_new(ct.abi)),
         // `_Mixin_Enum._fget` builds a fresh dict on each read, so the two
         // maps a ctype holds stay its own.
-        'e' if ct.has(F_ENUM) => super::ctypeenum::copy_map(ct.enumvalues2erators),
-        'R' if ct.has(F_ENUM) => super::ctypeenum::copy_map(ct.enumerators2values),
+        'e' if ct.has(CTypeFlags::ENUM) => super::ctypeenum::copy_map(ct.enumvalues2erators),
+        'R' if ct.has(CTypeFlags::ENUM) => super::ctypeenum::copy_map(ct.enumerators2values),
         _ => Err(PyError::attribute_error(format!(
             "ctype '{}' has no such attribute",
             ct.name()
@@ -909,7 +877,7 @@ pub fn kind_name(ct: &W_CType) -> &'static str {
         KIND_STRUCT => "struct",
         KIND_UNION => "union",
         KIND_FUNC => "function",
-        _ if ct.has(F_ENUM) => "enum",
+        _ if ct.has(CTypeFlags::ENUM) => "enum",
         _ => "primitive",
     }
 }

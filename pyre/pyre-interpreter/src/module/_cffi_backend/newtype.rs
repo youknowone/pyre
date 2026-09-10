@@ -160,32 +160,32 @@ pub fn new_primitive_type(name: &str) -> Result<PyObjectRef, PyError> {
         | ctypeobj::KIND_PRIM_SIGNED
         | ctypeobj::KIND_PRIM_UNSIGNED
         | ctypeobj::KIND_PRIM_BOOL => {
-            flags |= ctypeobj::F_PRIMITIVE_INTEGER;
+            flags |= ctypeobj::CTypeFlags::PRIMITIVE_INTEGER.bits();
         }
         _ => {}
     }
     match kind {
         ctypeobj::KIND_PRIM_SIGNED => {
             if size <= word {
-                flags |= ctypeobj::F_VALUE_FITS_LONG;
+                flags |= ctypeobj::CTypeFlags::VALUE_FITS_LONG.bits();
             }
             if size < word {
-                flags |= ctypeobj::F_VALUE_SMALLER_THAN_LONG;
+                flags |= ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG.bits();
             }
         }
         ctypeobj::KIND_PRIM_UNSIGNED | ctypeobj::KIND_PRIM_BOOL => {
             if size < word {
-                flags |= ctypeobj::F_VALUE_FITS_LONG;
+                flags |= ctypeobj::CTypeFlags::VALUE_FITS_LONG.bits();
             }
             if size <= word {
-                flags |= ctypeobj::F_VALUE_FITS_ULONG;
+                flags |= ctypeobj::CTypeFlags::VALUE_FITS_ULONG.bits();
             }
         }
         ctypeobj::KIND_PRIM_UNICHAR => {
             // `char16_t` and `char32_t` are always unsigned; only `wchar_t`
             // follows the platform's signedness.
             if key == "wchar_t" && wchar_is_signed() {
-                flags |= ctypeobj::F_SIGNED_WCHAR;
+                flags |= ctypeobj::CTypeFlags::SIGNED_WCHAR.bits();
             }
         }
         _ => {}
@@ -271,18 +271,18 @@ pub fn new_pointer_type(w_ctitem: PyObjectRef) -> Result<PyObjectRef, PyError> {
         " *"
     };
     let (name, name_position) = ctitem.insert_name(extra, 2);
-    let mut flags = ctypeobj::F_NONFUNC_POINTER_OR_ARRAY;
+    let mut flags = ctypeobj::CTypeFlags::NONFUNC_POINTER_OR_ARRAY.bits();
     if ctitem.kind == ctypeobj::KIND_VOID {
-        flags |= ctypeobj::F_VOID_PTR | ctypeobj::F_VOIDCHAR_PTR;
+        flags |= ctypeobj::CTypeFlags::VOID_PTR.bits() | ctypeobj::CTypeFlags::VOIDCHAR_PTR.bits();
     }
     if ctitem.kind == ctypeobj::KIND_PRIM_CHAR {
-        flags |= ctypeobj::F_VOIDCHAR_PTR;
+        flags |= ctypeobj::CTypeFlags::VOIDCHAR_PTR.bits();
     }
     if ctitem.size == 1 {
-        flags |= ctypeobj::F_ONEBYTE_PTR;
+        flags |= ctypeobj::CTypeFlags::ONEBYTE_PTR.bits();
     }
     if ctitem.name() == "struct _IO_FILE" || ctitem.name() == "FILE" {
-        flags |= ctypeobj::F_FILE_PTR;
+        flags |= ctypeobj::CTypeFlags::FILE_PTR.bits();
     }
     flags |= accept_str_flag(ctitem);
     let obj = ctypeobj::new_ctype(
@@ -315,8 +315,12 @@ pub fn new_pointer_type(w_ctitem: PyObjectRef) -> Result<PyObjectRef, PyError> {
 fn accept_str_flag(ctitem: &W_CType) -> i64 {
     let accepts = ctitem.kind == ctypeobj::KIND_VOID
         || ctitem.kind == ctypeobj::KIND_PRIM_CHAR
-        || (ctitem.has(ctypeobj::F_PRIMITIVE_INTEGER) && ctitem.size == 1);
-    if accepts { ctypeobj::F_ACCEPT_STR } else { 0 }
+        || (ctitem.has(ctypeobj::CTypeFlags::PRIMITIVE_INTEGER) && ctitem.size == 1);
+    if accepts {
+        ctypeobj::CTypeFlags::ACCEPT_STR.bits()
+    } else {
+        0
+    }
 }
 
 /// `newtype.py _new_array_type`.
@@ -351,7 +355,7 @@ pub fn new_array_type(w_ctptr: PyObjectRef, length: i64) -> Result<PyObjectRef, 
         (arraysize, format!("[{length}]"))
     };
     let (name, name_position) = ctitem.insert_name(&extra, 0);
-    let flags = ctypeobj::F_NONFUNC_POINTER_OR_ARRAY | accept_str_flag(ctitem);
+    let flags = ctypeobj::CTypeFlags::NONFUNC_POINTER_OR_ARRAY.bits() | accept_str_flag(ctitem);
     let obj = ctypeobj::new_ctype(
         ctypeobj::KIND_ARRAY,
         arraysize,
@@ -425,46 +429,37 @@ bitflags::bitflags! {
     }
 }
 
-/// `newtype.py SF_MSVC_BITFIELDS`.
-pub const SF_MSVC_BITFIELDS: i64 = StructFlags::MSVC_BITFIELDS.bits();
-/// `newtype.py SF_GCC_ARM_BITFIELDS`.
-pub const SF_GCC_ARM_BITFIELDS: i64 = StructFlags::GCC_ARM_BITFIELDS.bits();
-/// `newtype.py SF_GCC_X86_BITFIELDS`.
-pub const SF_GCC_X86_BITFIELDS: i64 = StructFlags::GCC_X86_BITFIELDS.bits();
-/// `newtype.py SF_GCC_BIG_ENDIAN`.
-pub const SF_GCC_BIG_ENDIAN: i64 = StructFlags::GCC_BIG_ENDIAN.bits();
-/// `newtype.py SF_GCC_LITTLE_ENDIAN`.
-pub const SF_GCC_LITTLE_ENDIAN: i64 = StructFlags::GCC_LITTLE_ENDIAN.bits();
-/// `newtype.py SF_PACKED`.
-pub const SF_PACKED: i64 = StructFlags::PACKED.bits();
-/// `newtype.py SF_STD_FIELD_POS`.
-pub const SF_STD_FIELD_POS: i64 = StructFlags::STD_FIELD_POS.bits();
-
 /// `newtype.py SF_DEFAULT_PACKING`.
 const SF_DEFAULT_PACKING: i64 = if cfg!(windows) { 8 } else { 0x4000_0000 };
 
 /// `newtype.py DEFAULT_SFLAGS_PLATFORM`.
 const DEFAULT_SFLAGS_PLATFORM: i64 = if cfg!(windows) {
-    SF_MSVC_BITFIELDS
+    StructFlags::MSVC_BITFIELDS.bits()
 } else if cfg!(any(target_arch = "arm", target_arch = "aarch64")) {
-    SF_GCC_ARM_BITFIELDS
+    StructFlags::GCC_ARM_BITFIELDS.bits()
 } else {
-    SF_GCC_X86_BITFIELDS
+    StructFlags::GCC_X86_BITFIELDS.bits()
 };
 
 /// `newtype.py DEFAULT_SFLAGS_ENDIAN`.
 const DEFAULT_SFLAGS_ENDIAN: i64 = if cfg!(target_endian = "big") {
-    SF_GCC_BIG_ENDIAN
+    StructFlags::GCC_BIG_ENDIAN.bits()
 } else {
-    SF_GCC_LITTLE_ENDIAN
+    StructFlags::GCC_LITTLE_ENDIAN.bits()
 };
 
 /// `newtype.py complete_sflags`.
 fn complete_sflags(mut sflags: i64) -> i64 {
-    if sflags & (SF_MSVC_BITFIELDS | SF_GCC_ARM_BITFIELDS | SF_GCC_X86_BITFIELDS) == 0 {
+    if sflags
+        & (StructFlags::MSVC_BITFIELDS
+            | StructFlags::GCC_ARM_BITFIELDS
+            | StructFlags::GCC_X86_BITFIELDS)
+            .bits()
+        == 0
+    {
         sflags |= DEFAULT_SFLAGS_PLATFORM;
     }
-    if sflags & (SF_GCC_BIG_ENDIAN | SF_GCC_LITTLE_ENDIAN) == 0 {
+    if sflags & (StructFlags::GCC_BIG_ENDIAN | StructFlags::GCC_LITTLE_ENDIAN).bits() == 0 {
         sflags |= DEFAULT_SFLAGS_ENDIAN;
     }
     sflags
@@ -519,7 +514,7 @@ pub fn detect_custom_layout(
     if compiler_value == cdef_value {
         return Ok(());
     }
-    if sflags & SF_STD_FIELD_POS != 0 {
+    if sflags & StructFlags::STD_FIELD_POS.bits() != 0 {
         let name = ct.name();
         let mut err = PyError::value_error(format!(
             "{name}: {msg} (cdef says {cdef_value}, but C compiler says {compiler_value}). fix it or use \"...;\" as the last field in the cdef for {name} to make it flexible"
@@ -532,7 +527,7 @@ pub fn detect_custom_layout(
         ])?;
         return Err(err);
     }
-    ct.flags |= ctypeobj::F_CUSTOM_FIELD_POS;
+    ct.flags |= ctypeobj::CTypeFlags::CUSTOM_FIELD_POS.bits();
     Ok(())
 }
 
@@ -559,12 +554,12 @@ pub fn complete_struct_or_union(
     pack: i64,
 ) -> Result<(), PyError> {
     let sflags = complete_sflags(sflags);
-    let (sflags, pack) = if sflags & SF_PACKED != 0 {
+    let (sflags, pack) = if sflags & StructFlags::PACKED.bits() != 0 {
         (sflags, 1)
     } else if pack <= 0 {
         (sflags, SF_DEFAULT_PACKING)
     } else {
-        (sflags | SF_PACKED, pack)
+        (sflags | StructFlags::PACKED.bits(), pack)
     };
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     if !ct.is_struct_or_union() || ct.size >= 0 {
@@ -597,7 +592,7 @@ pub fn complete_struct_or_union(
     let mut byteoffsetmax = 0i64;
     let mut prev_bitfield_size = 0i64;
     let mut prev_bitfield_free = 0i64;
-    ct.flags &= !ctypeobj::F_CUSTOM_FIELD_POS;
+    ct.flags &= !ctypeobj::CTypeFlags::CUSTOM_FIELD_POS.bits();
     let mut with_var_array = false;
     let mut with_packed_change = false;
 
@@ -630,7 +625,7 @@ pub fn complete_struct_or_union(
             ftype.force_lazy_struct()?;
             // A var-sized array anywhere inside a field propagates outward,
             // so a struct holding such a struct is var-sized too.
-            if ftype.has(ctypeobj::F_WITH_VAR_ARRAY) {
+            if ftype.has(ctypeobj::CTypeFlags::WITH_VAR_ARRAY) {
                 with_var_array = true;
             }
         }
@@ -644,8 +639,8 @@ pub fn complete_struct_or_union(
         let falignorg = ftype.alignof()?;
         let falign = pack.min(falignorg);
         let mut do_align = true;
-        if sflags & SF_GCC_ARM_BITFIELDS == 0 && fbitsize >= 0 {
-            do_align = if sflags & SF_MSVC_BITFIELDS == 0 {
+        if sflags & StructFlags::GCC_ARM_BITFIELDS.bits() == 0 && fbitsize >= 0 {
+            do_align = if sflags & StructFlags::MSVC_BITFIELDS.bits() == 0 {
                 // Anonymous bitfields of any size do not cause alignment.
                 !fname.is_empty()
             } else {
@@ -703,7 +698,7 @@ pub fn complete_struct_or_union(
                     }
                 }
                 // Such a structure can never be passed by value.
-                ct.flags |= ctypeobj::F_CUSTOM_FIELD_POS;
+                ct.flags |= ctypeobj::CTypeFlags::CUSTOM_FIELD_POS.bits();
             } else {
                 let w_fld =
                     super::ctypestruct::new_cfield(descr.w_ftype, byteoffset, bs_flag, -1, fflags);
@@ -749,7 +744,7 @@ pub fn complete_struct_or_union(
                         ct.name()
                     )));
                 }
-                if sflags & SF_MSVC_BITFIELDS == 0 {
+                if sflags & StructFlags::MSVC_BITFIELDS.bits() == 0 {
                     // GCC's notion of "ftype :0;" pads to a value aligned for
                     // `ftype`.
                     if roundup_bytes(byteoffset, bitoffset) > field_offset_bytes {
@@ -763,12 +758,14 @@ pub fn complete_struct_or_union(
                 prev_bitfield_size = 0;
             } else {
                 let mut bitshift;
-                if sflags & SF_MSVC_BITFIELDS == 0 {
+                if sflags & StructFlags::MSVC_BITFIELDS.bits() == 0 {
                     // GCC's algorithm: the field can start where we are if it
                     // would fit entirely into an aligned `ftype` field.
                     let bits_already_occupied = (byteoffset - field_offset_bytes) * 8 + bitoffset;
                     if bits_already_occupied + fbitsize > 8 * ftype.size {
-                        if sflags & SF_PACKED != 0 && bits_already_occupied & 7 != 0 {
+                        if sflags & StructFlags::PACKED.bits() != 0
+                            && bits_already_occupied & 7 != 0
+                        {
                             return Err(PyError::not_implemented(format!(
                                 "with 'packed', gcc would compile field '{}.{fname}' to reuse some bits in the previous field",
                                 ct.name()
@@ -802,7 +799,7 @@ pub fn complete_struct_or_union(
                     prev_bitfield_free -= fbitsize;
                     field_offset_bytes = byteoffset - ftype.size;
                 }
-                if sflags & SF_GCC_BIG_ENDIAN != 0 {
+                if sflags & StructFlags::GCC_BIG_ENDIAN.bits() != 0 {
                     bitshift = 8 * ftype.size - fbitsize - bitshift;
                 }
                 if !fname.is_empty() {
@@ -858,10 +855,10 @@ pub fn complete_struct_or_union(
     ct.fields_list = roots.get(list_slot);
     ct.fields_dict = roots.get(dict_slot);
     if with_var_array {
-        ct.flags |= ctypeobj::F_WITH_VAR_ARRAY;
+        ct.flags |= ctypeobj::CTypeFlags::WITH_VAR_ARRAY.bits();
     }
     if with_packed_change {
-        ct.flags |= ctypeobj::F_WITH_PACKED_CHANGE;
+        ct.flags |= ctypeobj::CTypeFlags::WITH_PACKED_CHANGE.bits();
     }
     // The ctype is old-gen and both containers are young, so the barrier has
     // to run after the two writes.
@@ -978,7 +975,7 @@ pub fn new_enum_type(
         basectype.align,
         pyre_object::PY_NULL,
         -1,
-        basectype.flags | ctypeobj::F_ENUM,
+        basectype.flags | ctypeobj::CTypeFlags::ENUM.bits(),
     );
     let ctype_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_ctype);
@@ -1048,7 +1045,7 @@ fn function_type_matches(
     };
     if ctype.kind != ctypeobj::KIND_FUNC
         || ctype.ctitem != w_fresult
-        || ctype.has(ctypeobj::F_ELLIPSIS) != ellipsis
+        || ctype.has(ctypeobj::CTypeFlags::ELLIPSIS) != ellipsis
         || ctype.abi != abi
         || unsafe { pyre_object::w_tuple_len(ctype.fargs) } != fargs.len()
     {
@@ -1135,7 +1132,11 @@ pub fn build_function_type(
         -1,
         w_fresult,
         -1,
-        if ellipsis { ctypeobj::F_ELLIPSIS } else { 0 },
+        if ellipsis {
+            ctypeobj::CTypeFlags::ELLIPSIS.bits()
+        } else {
+            0
+        },
     );
     let roots = pyre_object::gc_roots::push_roots();
     let ctype_slot = roots.base();

@@ -130,12 +130,6 @@ bitflags::bitflags! {
     }
 }
 
-pub const F_UNION: c_int = CffiTypeFlags::UNION.bits();
-pub const F_CHECK_FIELDS: c_int = CffiTypeFlags::CHECK_FIELDS.bits();
-pub const F_PACKED: c_int = CffiTypeFlags::PACKED.bits();
-pub const F_EXTERNAL: c_int = CffiTypeFlags::EXTERNAL.bits();
-pub const F_OPAQUE: c_int = CffiTypeFlags::OPAQUE.bits();
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GlobalS {

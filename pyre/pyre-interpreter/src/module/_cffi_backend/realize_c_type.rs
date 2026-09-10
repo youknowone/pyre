@@ -522,8 +522,8 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
     let c_flags = s.flags;
     let first_field = s.first_field_index;
     let mut lazy = false;
-    let x = if c_flags & parse_c_type::F_EXTERNAL == 0 {
-        let (kind, prefix) = if c_flags & parse_c_type::F_UNION != 0 {
+    let x = if c_flags & parse_c_type::CffiTypeFlags::EXTERNAL.bits() == 0 {
+        let (kind, prefix) = if c_flags & parse_c_type::CffiTypeFlags::UNION.bits() != 0 {
             (ctypeobj::KIND_UNION, "union ")
         } else {
             (ctypeobj::KIND_STRUCT, "struct ")
@@ -536,7 +536,7 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
         } else {
             newtype::new_struct_type(&name)
         };
-        if c_flags & parse_c_type::F_OPAQUE == 0 {
+        if c_flags & parse_c_type::CffiTypeFlags::OPAQUE.bits() == 0 {
             assert!(first_field >= 0);
             let ct = ctypeobj::ctype_arg(x)?;
             ct.size = signed_size(s.size);
@@ -552,7 +552,7 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
     } else {
         assert!(first_field < 0);
         let Some(x) = fetch_external_struct_or_union(&s, roots.get(ffi_slot))? else {
-            let kind = if c_flags & parse_c_type::F_UNION != 0 {
+            let kind = if c_flags & parse_c_type::CffiTypeFlags::UNION.bits() != 0 {
                 "union"
             } else {
                 "struct"
@@ -563,8 +563,8 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
             )));
         };
         let ct = ctypeobj::ctype_arg(x)?;
-        if c_flags & parse_c_type::F_OPAQUE == 0 && ct.size < 0 {
-            let kind = if c_flags & parse_c_type::F_UNION != 0 {
+        if c_flags & parse_c_type::CffiTypeFlags::OPAQUE.bits() == 0 && ct.size < 0 {
+            let kind = if c_flags & parse_c_type::CffiTypeFlags::UNION.bits() != 0 {
                 "union"
             } else {
                 "struct"
@@ -776,7 +776,7 @@ pub fn do_realize_lazy_struct(w_ctype: PyObjectRef) -> Result<(), PyError> {
         } else {
             newtype::detect_custom_layout(
                 ctypeobj::ctype_arg(roots.get(ctype_slot))?,
-                newtype::SF_STD_FIELD_POS,
+                newtype::StructFlags::STD_FIELD_POS.bits(),
                 ctypeobj::ctype_arg(w_ctf)?.size,
                 field_size,
                 &format!("wrong size for field '{field_name}'"),
@@ -797,11 +797,11 @@ pub fn do_realize_lazy_struct(w_ctype: PyObjectRef) -> Result<(), PyError> {
         };
     }
     let mut sflags = 0;
-    if s.flags & parse_c_type::F_CHECK_FIELDS != 0 {
-        sflags |= newtype::SF_STD_FIELD_POS;
+    if s.flags & parse_c_type::CffiTypeFlags::CHECK_FIELDS.bits() != 0 {
+        sflags |= newtype::StructFlags::STD_FIELD_POS.bits();
     }
-    if s.flags & parse_c_type::F_PACKED != 0 {
-        sflags |= newtype::SF_PACKED;
+    if s.flags & parse_c_type::CffiTypeFlags::PACKED.bits() != 0 {
+        sflags |= newtype::StructFlags::PACKED.bits();
     }
     let old_size = ctypeobj::ctype_arg(roots.get(ctype_slot))?.size;
     let old_align = ctypeobj::ctype_arg(roots.get(ctype_slot))?.align;
@@ -860,8 +860,10 @@ fn fetch_external_struct_or_union(
             continue;
         }
         let s1 = unsafe { *ctx1.struct_unions.offset(sindex) };
-        if s1.flags & (parse_c_type::F_EXTERNAL | parse_c_type::F_UNION)
-            == s.flags & parse_c_type::F_UNION
+        if s1.flags
+            & (parse_c_type::CffiTypeFlags::EXTERNAL.bits()
+                | parse_c_type::CffiTypeFlags::UNION.bits())
+            == s.flags & parse_c_type::CffiTypeFlags::UNION.bits()
         {
             return realize_c_struct_or_union(w_ffi1, sindex).map(Some);
         }

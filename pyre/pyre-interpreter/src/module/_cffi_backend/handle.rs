@@ -9,7 +9,7 @@ use super::ctypeobj;
 /// `handle.py newp_handle`.
 pub fn newp_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(args[0])?;
-    if ct.kind != ctypeobj::KIND_POINTER || !ct.has(ctypeobj::F_VOID_PTR) {
+    if ct.kind != ctypeobj::KIND_POINTER || !ct.has(ctypeobj::CTypeFlags::VOID_PTR) {
         return Err(PyError::type_error(format!(
             "needs 'void *', got '{}'",
             ct.name()
@@ -23,7 +23,7 @@ pub fn from_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdataobj::cdata_arg(args[0])?;
     let ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
-    if ct.kind != ctypeobj::KIND_POINTER || !ct.has(ctypeobj::F_VOIDCHAR_PTR) {
+    if ct.kind != ctypeobj::KIND_POINTER || !ct.has(ctypeobj::CTypeFlags::VOIDCHAR_PTR) {
         return Err(PyError::type_error(format!(
             "expected a 'cdata' object with a 'void *' out of new_handle(), got '{}'",
             ct.name()

@@ -987,7 +987,7 @@ fn ffi_list_types(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         }
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(pyre_object::w_str_new_managed(&name));
-        let target = if su.flags & parse_c_type::F_UNION != 0 {
+        let target = if su.flags & parse_c_type::CffiTypeFlags::UNION.bits() != 0 {
             unions_slot
         } else {
             structs_slot

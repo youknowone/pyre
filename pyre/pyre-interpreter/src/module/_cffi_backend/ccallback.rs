@@ -156,7 +156,7 @@ pub fn make_callback(
     let fresult = ctypeobj::ctype_arg(functype.ctitem)?;
     let error_size = if fresult.size < 0 {
         0
-    } else if fresult.has(ctypeobj::F_PRIMITIVE_INTEGER)
+    } else if fresult.has(ctypeobj::CTypeFlags::PRIMITIVE_INTEGER)
         && (fresult.size as usize) < SIZE_OF_FFI_ARG
     {
         SIZE_OF_FFI_ARG
@@ -305,8 +305,8 @@ unsafe fn convert_from_object_fficallback(
         return Ok(());
     }
     let small_result = fresult.size >= 0 && (fresult.size as usize) < SIZE_OF_FFI_ARG;
-    if small_result && fresult.has(ctypeobj::F_PRIMITIVE_INTEGER) {
-        if fresult.kind == ctypeobj::KIND_PRIM_SIGNED && !fresult.has(ctypeobj::F_ENUM) {
+    if small_result && fresult.has(ctypeobj::CTypeFlags::PRIMITIVE_INTEGER) {
+        if fresult.kind == ctypeobj::KIND_PRIM_SIGNED && !fresult.has(ctypeobj::CTypeFlags::ENUM) {
             unsafe { ctypeobj::convert_from_object(fresult, ll_res as usize, w_res)? };
             let value = super::misc::as_long(w_res)?;
             return unsafe {

@@ -546,7 +546,7 @@ pub fn dlopen_w(w_filename: PyObjectRef, flags: i64) -> Result<(String, usize, b
         // 'flags' is ignored in this case.
         let ct = ctypeobj::ctype_at(cdata.ctype)
             .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
-        if ct.kind != ctypeobj::KIND_POINTER || !ct.has(ctypeobj::F_VOID_PTR) {
+        if ct.kind != ctypeobj::KIND_POINTER || !ct.has(ctypeobj::CTypeFlags::VOID_PTR) {
             return Err(PyError::type_error(format!(
                 "dlopen() takes a file name or 'void *' handle, not '{}'",
                 ct.name()

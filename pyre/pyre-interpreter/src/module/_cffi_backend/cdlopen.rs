@@ -230,7 +230,11 @@ pub fn ffiobj_init(
             target.type_index = decoder.next_4bytes()?;
             target.flags = decoder.next_4bytes()?;
             target.name = decoder.next_name()?;
-            if target.flags & (parse_c_type::F_OPAQUE | parse_c_type::F_EXTERNAL) != 0 {
+            if target.flags
+                & (parse_c_type::CffiTypeFlags::OPAQUE | parse_c_type::CffiTypeFlags::EXTERNAL)
+                    .bits()
+                != 0
+            {
                 target.size = usize::MAX;
                 target.alignment = -1;
                 target.first_field_index = -1;

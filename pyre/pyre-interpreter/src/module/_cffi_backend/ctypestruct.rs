@@ -180,7 +180,7 @@ unsafe fn write_v(
         return Ok(optvarsize);
     }
     if ct.is_struct_or_union()
-        && ct.has(ctypeobj::F_WITH_VAR_ARRAY)
+        && ct.has(ctypeobj::CTypeFlags::WITH_VAR_ARRAY)
         && W_CData::from_obj(roots.get(ob_slot)).is_none()
     {
         let subsize = unsafe {

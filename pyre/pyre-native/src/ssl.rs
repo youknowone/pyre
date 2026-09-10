@@ -339,9 +339,6 @@ bitflags::bitflags! {
     }
 }
 
-const OP_NO_TLSV1_2: u64 = SslOp::NO_TLSV1_2.bits();
-const OP_NO_TLSV1_3: u64 = SslOp::NO_TLSV1_3.bits();
-
 pub const DEFAULT_OPTIONS: u64 = SslOp::DEFAULT.bits();
 
 bitflags::bitflags! {
@@ -359,14 +356,6 @@ bitflags::bitflags! {
     }
 }
 
-pub const VERIFY_DEFAULT: i32 = VerifyFlags::DEFAULT.bits();
-pub const VERIFY_CRL_CHECK_LEAF: i32 = VerifyFlags::CRL_CHECK_LEAF.bits();
-pub const VERIFY_CRL_CHECK_CHAIN: i32 = VerifyFlags::CRL_CHECK_CHAIN.bits();
-pub const VERIFY_X509_STRICT: i32 = VerifyFlags::X509_STRICT.bits();
-pub const VERIFY_ALLOW_PROXY_CERTS: i32 = VerifyFlags::ALLOW_PROXY_CERTS.bits();
-pub const VERIFY_X509_TRUSTED_FIRST: i32 = VerifyFlags::X509_TRUSTED_FIRST.bits();
-pub const VERIFY_X509_PARTIAL_CHAIN: i32 = VerifyFlags::X509_PARTIAL_CHAIN.bits();
-
 /// Revocation scope requested by `verify_flags`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrlScope {
@@ -376,9 +365,11 @@ enum CrlScope {
 }
 
 fn crl_scope(verify_flags: i32) -> CrlScope {
-    if verify_flags & VERIFY_CRL_CHECK_LEAF == 0 {
+    if verify_flags & VerifyFlags::CRL_CHECK_LEAF.bits() == 0 {
         CrlScope::Disabled
-    } else if verify_flags & VERIFY_CRL_CHECK_CHAIN == VERIFY_CRL_CHECK_CHAIN {
+    } else if verify_flags & VerifyFlags::CRL_CHECK_CHAIN.bits()
+        == VerifyFlags::CRL_CHECK_CHAIN.bits()
+    {
         CrlScope::FullChain
     } else {
         CrlScope::EndEntityOnly
@@ -2098,7 +2089,7 @@ impl rustls::client::danger::ServerCertVerifier for ExplicitEndEntityVerifier {
                 rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
             })?;
         let self_issued = certificate.subject() == certificate.issuer();
-        if !self_issued && self.verify_flags & VERIFY_X509_PARTIAL_CHAIN == 0 {
+        if !self_issued && self.verify_flags & VerifyFlags::X509_PARTIAL_CHAIN.bits() == 0 {
             return Err(original_error);
         }
 
@@ -2717,7 +2708,7 @@ impl VerifiedChainBuilder {
                     .ok()
                     .is_some_and(|(_, certificate)| {
                         certificate.subject() == certificate.issuer()
-                            || self.verify_flags & VERIFY_X509_PARTIAL_CHAIN != 0
+                            || self.verify_flags & VerifyFlags::X509_PARTIAL_CHAIN.bits() != 0
                     })
             {
                 return Some(vec![end_entity.as_ref().to_vec()]);
@@ -2880,7 +2871,9 @@ fn client_config(
         let mut verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             Arc::new(PolicyServerVerifier {
                 inner: verifier,
-                require_authority_key_identifier: context.verify_flags & VERIFY_X509_STRICT != 0,
+                require_authority_key_identifier: context.verify_flags
+                    & VerifyFlags::X509_STRICT.bits()
+                    != 0,
                 require_crl: crl_scope(context.verify_flags) != CrlScope::Disabled,
                 has_crl: !context.crls.is_empty(),
             });
@@ -2986,16 +2979,16 @@ fn enabled_versions(
     let maximum = context.maximum_version;
     let tls12 = (minimum < 0 || minimum <= 0x303)
         && (maximum < 0 || maximum >= 0x303)
-        && context.options & OP_NO_TLSV1_2 == 0;
+        && context.options & SslOp::NO_TLSV1_2.bits() == 0;
     let tls13 = (minimum < 0 || minimum <= 0x304)
         && (maximum < 0 || maximum >= 0x304)
-        && context.options & OP_NO_TLSV1_3 == 0;
+        && context.options & SslOp::NO_TLSV1_3.bits() == 0;
     if !tls12 && !tls13 {
         return Err((0, "[SSL] no protocols available".to_string()));
     }
     #[cfg(feature = "host_env")]
     {
-        let options = (context.options & (OP_NO_TLSV1_2 | OP_NO_TLSV1_3)) as i32;
+        let options = (context.options & (SslOp::NO_TLSV1_2 | SslOp::NO_TLSV1_3).bits()) as i32;
         Ok(host_ssl::rustls_versions(minimum, maximum, options))
     }
     #[cfg(not(feature = "host_env"))]
