@@ -116,11 +116,13 @@ impl IntoIterator for ExtraQueue {
 }
 
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;
-/// this adapter copies OpRefs into a side table. Two or three boxes are
-/// 32–48 B, so those lengths mint from a reserved 48 B slot instead of
-/// the malloc class.
-const SNAP_LIST_SLAB_BYTES: usize = 48;
-const SNAP_LIST_SLAB: usize = SNAP_LIST_SLAB_BYTES / std::mem::size_of::<SnapshotBox>();
+/// this adapter copies OpRefs into a side table. A six-box list is one
+/// 96 B `Layout::array` (`SnapshotBox` is one `OpRef`); twelve boxes
+/// mint from the chunked slab instead. `create_numbering_arc` remains
+/// the leftover 96 B site (`resumecode.create_numbering` /
+/// `lltype.malloc(NUMBERING)`).
+const SNAP_LIST_SLAB: usize = 12;
+const SNAP_LIST_SLAB_BYTES: usize = SNAP_LIST_SLAB * std::mem::size_of::<SnapshotBox>();
 const SNAP_LIST_SLAB_BIT: u32 = 1 << 31;
 const SNAP_LIST_CHUNK: usize = 2048;
 
@@ -158,9 +160,9 @@ fn alloc_snap_list_slab() -> *mut SnapshotBox {
         SNAP_LIST_CHUNK * SNAP_LIST_SLAB_BYTES,
         std::mem::align_of::<SnapshotBox>(),
     )
-    .expect("48-byte snapshot-list chunk");
+    .expect("snapshot-list chunk");
     let base = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
-    assert!(!base.is_null(), "48-byte snapshot-list chunk alloc failed");
+    assert!(!base.is_null(), "snapshot-list chunk alloc failed");
     heap.chunks.push((base, 1));
     base
 }
@@ -400,6 +402,16 @@ mod snapshot_box_list_size {
             16,
             "Option<SnapshotBoxList> must niche so a 2-slot map leaves 48 B"
         );
+    }
+
+    #[test]
+    fn twelve_snapshot_boxes_stay_on_the_slab() {
+        let list = super::SnapshotBoxList::with_capacity(12);
+        assert!(
+            list.is_slab(),
+            "a 12-box resume frame must use the chunked slab, not a 96 B malloc"
+        );
+        assert!(list.capacity() >= 12);
     }
 }
 type OpRefFxIndexMap<V> = indexmap::IndexMap<OpRef, V, FxBuildHasher>;

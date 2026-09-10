@@ -1904,7 +1904,8 @@ impl BlackholeInterpreter {
             let opcode = code[self.position];
             // The remaining `shift` epilogue at pc 210 is `-live-`,
             // `goto/L`, `goto_if_not`, `int_copy`, getfield/setfield of
-            // `marked`/`empty`, `int_return`, and one native INLINE_CALL.
+            // `left`/`right`/`marked`/`empty`, `int_eq`/`int_add`,
+            // `int_return`, and one native INLINE_CALL.
             // RPython's translated `dispatch_loop` inlines those
             // `_get_method` bodies; the function-pointer table is the
             // untranslated form. Do not restart `fnaddr` from this
@@ -1952,6 +1953,61 @@ impl BlackholeInterpreter {
                         };
                         self.registers_i[dest] = val;
                         self.position = pos + 1;
+                        continue;
+                    }
+                    jitcode::insns::BC_GETFIELD_GC_R | jitcode::insns::BC_GETFIELD_GC_R_PURE => {
+                        let p = self.position + 1;
+                        let struct_ptr = self.registers_r[code[p] as usize];
+                        let (val, dest, pos) = {
+                            let (descr, pos) = read_descr(self, code, p + 1);
+                            (
+                                bh_load_ref_field(struct_ptr, descr),
+                                code[pos] as usize,
+                                pos,
+                            )
+                        };
+                        self.registers_r[dest] = val;
+                        self.position = pos + 1;
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_EQ => {
+                        let p = self.position + 1;
+                        let a = self.registers_i[code[p] as usize];
+                        let b = self.registers_i[code[p + 1] as usize];
+                        self.registers_i[code[p + 2] as usize] = bhimpl_int_eq(a, b);
+                        self.position = p + 3;
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_NE => {
+                        let p = self.position + 1;
+                        let a = self.registers_i[code[p] as usize];
+                        let b = self.registers_i[code[p + 1] as usize];
+                        self.registers_i[code[p + 2] as usize] = bhimpl_int_ne(a, b);
+                        self.position = p + 3;
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_LT => {
+                        let p = self.position + 1;
+                        let a = self.registers_i[code[p] as usize];
+                        let b = self.registers_i[code[p + 1] as usize];
+                        self.registers_i[code[p + 2] as usize] = bhimpl_int_lt(a, b);
+                        self.position = p + 3;
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_ADD => {
+                        let p = self.position + 1;
+                        let a = self.registers_i[code[p] as usize];
+                        let b = self.registers_i[code[p + 1] as usize];
+                        self.registers_i[code[p + 2] as usize] = bhimpl_int_add(a, b);
+                        self.position = p + 3;
+                        continue;
+                    }
+                    jitcode::insns::BC_GOTO_IF_NOT_INT_EQ => {
+                        let p = self.position + 1;
+                        let a = self.registers_i[code[p] as usize];
+                        let b = self.registers_i[code[p + 1] as usize];
+                        let target = (code[p + 2] as usize) | ((code[p + 3] as usize) << 8);
+                        self.position = if a == b { p + 4 } else { target };
                         continue;
                     }
                     jitcode::insns::BC_SETFIELD_GC_I => {
