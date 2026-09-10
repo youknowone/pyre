@@ -99,6 +99,9 @@ pub struct WasmFrameData {
     /// mid-call. `set_savedata` writes `jf_savedata` there so the
     /// later GUARD_NOT_FORCED exit can copy the word back.
     origin_jf: Option<*mut majit_backend::jitframe::JitFrame>,
+    /// Off-GC host-buffer owner. `take_host_frame` keeps the entry
+    /// JitFrame alive after `execute_token` returns.
+    host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
     /// Slots handed to [`crate::wasm_gc_add_roots`] by [`WasmFrameData::boxed`],
     /// released again in `Drop`.
     roots: Vec<usize>,
@@ -129,6 +132,7 @@ impl WasmFrameData {
             exc_value,
             savedata: 0,
             origin_jf: None,
+            host_frame: None,
             roots: Vec::new(),
         });
         let ref_count = data
@@ -198,6 +202,27 @@ impl WasmFrameData {
             crate::wasm_gc_remove_roots(std::iter::once(slot));
             self.roots.retain(|&s| s != slot);
         }
+    }
+
+    pub fn set_savedata_ref(&mut self, value: majit_ir::GcRef) {
+        self.set_savedata(value);
+    }
+
+    pub fn get_savedata_ref(&self) -> majit_ir::GcRef {
+        majit_ir::GcRef(self.savedata as usize)
+    }
+
+    /// Bind this snapshot to the live JITFRAME `force()` borrowed.
+    pub unsafe fn attach_forced_jitframe(&mut self, frame: majit_ir::GcRef) {
+        self.attach_origin_jf(frame.0 as *mut majit_backend::jitframe::JitFrame);
+    }
+
+    pub(crate) fn take_host_frame(
+        &mut self,
+        frame: majit_backend::libc_deadframe::LibcJitFrameDeadFrame,
+    ) {
+        self.attach_origin_jf(frame.frame_addr() as *mut majit_backend::jitframe::JitFrame);
+        self.host_frame = Some(frame);
     }
 }
 
