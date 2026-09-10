@@ -1904,7 +1904,7 @@ struct DescrWords {
 /// the packed forwarded word is 8 B, so the pair is 16 B — not a
 /// 24 B `DescrFwd` plus a 24 B `DescrWords`.
 struct ThinFwd {
-    thin: usize,
+    thin: u64,
     forwarded: u64,
 }
 
@@ -1912,7 +1912,7 @@ struct ThinFwd {
 /// both / inline forwarded). 16 B so `set_stamp_word` leaves the
 /// 24-byte `DescrWords` class.
 struct ThinStamp {
-    inner: usize,
+    inner: u64,
     stamp: u32,
 }
 
@@ -1962,7 +1962,7 @@ fn free_slot16(p: *mut u8) {
         .push(p);
 }
 
-fn alloc_thin_fwd(thin: usize, forwarded: u64) -> *mut ThinFwd {
+fn alloc_thin_fwd(thin: u64, forwarded: u64) -> *mut ThinFwd {
     let p = alloc_slot16() as *mut ThinFwd;
     unsafe {
         p.write(ThinFwd { thin, forwarded });
@@ -1976,7 +1976,7 @@ fn free_thin_fwd(p: *mut ThinFwd) -> ThinFwd {
     value
 }
 
-fn alloc_thin_stamp(inner: usize, stamp: u32) -> *mut ThinStamp {
+fn alloc_thin_stamp(inner: u64, stamp: u32) -> *mut ThinStamp {
     let p = alloc_slot16() as *mut ThinStamp;
     unsafe {
         p.write(ThinStamp { inner, stamp });
@@ -1993,38 +1993,41 @@ fn free_thin_stamp(p: *mut ThinStamp) -> ThinStamp {
 /// High bit marks a [`DescrWords`] or [`ThinFwd`] box. Heap pointers
 /// are 48-bit; `pack_forwarded` SmallConst ids would need bit 28 of
 /// the id to collide (256M mints).
-const SLOT_BOX_BIT: usize = 1 << 63;
+///
+/// Tags live in a `u64` word so wasm32 (`usize` = 32) can still
+/// compile and pack the same layout.
+const SLOT_BOX_BIT: u64 = 1u64 << 63;
 /// Boxed [`ThinFwd`]. Distinct from [`THIN_DESCR_BIT`] (62) and the
 /// box bit (63). Heap pointers do not set bit 61.
-const SLOT_THIN_FWD_BIT: usize = 1 << 61;
+const SLOT_THIN_FWD_BIT: u64 = 1u64 << 61;
 /// Extra-only `Box<OpKindExtra>` pointer, no `DescrWords` wrapper.
-const SLOT_EXTRA_BIT: usize = 1 << 60;
+const SLOT_EXTRA_BIT: u64 = 1u64 << 60;
 /// `Box<BothPayload>` pointer, no `DescrWords` wrapper.
-const SLOT_BOTH_BIT: usize = 1 << 59;
+const SLOT_BOTH_BIT: u64 = 1u64 << 59;
 /// Boxed [`ThinStamp`]. Aligned heap pointer plus bit 58; `pack_forwarded`
 /// SmallConst has low 3 bits = 3, so it cannot collide.
-const SLOT_STAMP_BOX_BIT: usize = 1 << 58;
+const SLOT_STAMP_BOX_BIT: u64 = 1u64 << 58;
 /// Stamp-only in the slot word: bits 48-62 = 0x7FFE, stamp in 0-31.
 /// Heap pointers leave bits 48-63 clear. SmallConst would need id
 /// `0x7FFE << 13` (256M) to collide.
-const SLOT_STAMP_INLINE_TAG: usize = 0x7FFE << 48;
+const SLOT_STAMP_INLINE_TAG: u64 = 0x7FFE << 48;
 /// Descr-only (no extra / stamp / forwarded) is a thin word: data
 /// pointer in bits 0-47, interned vtable id in 48-55, this flag at 62.
 /// Distinct from `pack_forwarded` SmallConst (low 3 bits = 3).
-const THIN_DESCR_BIT: usize = 1 << 62;
-const THIN_DESCR_ID_SHIFT: usize = 48;
-const THIN_DESCR_PTR_MASK: usize = (1 << 48) - 1;
+const THIN_DESCR_BIT: u64 = 1u64 << 62;
+const THIN_DESCR_ID_SHIFT: u32 = 48;
+const THIN_DESCR_PTR_MASK: u64 = (1u64 << 48) - 1;
 /// Small `_resint` stamps ride in bits 56-61 of a thin descr word so
 /// `marked`/`empty` GETFIELD (0/1) does not mint a 16 B `ThinStamp`.
 /// `pack_stamp(Int(i))` for `i` in `0..=15` fits.
-const THIN_STAMP_SHIFT: usize = 56;
-const THIN_STAMP_MASK: usize = 0x3f;
+const THIN_STAMP_SHIFT: u32 = 56;
+const THIN_STAMP_MASK: u64 = 0x3f;
 /// Wider stamps intern `(vtable_id, stamp)` and set bit 61 plus a 13-bit
 /// id in bits 48-60. Bit 61 on a thin descr (no `SLOT_BOX_BIT`) cannot
 /// collide with `ThinFwd` (which also sets bit 63).
-const THIN_STAMPED_BIT: usize = 1 << 61;
-const THIN_STAMPED_ID_SHIFT: usize = 48;
-const THIN_STAMPED_ID_MASK: usize = 0x1fff;
+const THIN_STAMPED_BIT: u64 = 1u64 << 61;
+const THIN_STAMPED_ID_SHIFT: u32 = 48;
+const THIN_STAMPED_ID_MASK: u64 = 0x1fff;
 
 #[derive(Clone, Copy)]
 struct ThinStamped {
@@ -2059,67 +2062,67 @@ fn descr_vtable_at(id: u8) -> usize {
     v[id as usize]
 }
 
-fn is_thin_descr(w: usize) -> bool {
+fn is_thin_descr(w: u64) -> bool {
     w & SLOT_BOX_BIT == 0 && w & THIN_DESCR_BIT != 0 && w & 7 == 0 && !is_stamp_inline(w)
 }
 
-fn is_thin_fwd_box(w: usize) -> bool {
+fn is_thin_fwd_box(w: u64) -> bool {
     w & SLOT_BOX_BIT != 0 && w & SLOT_THIN_FWD_BIT != 0
 }
 
-fn is_extra_inline(w: usize) -> bool {
+fn is_extra_inline(w: u64) -> bool {
     w & SLOT_BOX_BIT == 0 && w & SLOT_EXTRA_BIT != 0 && w & THIN_DESCR_BIT == 0 && w & 7 == 0
 }
 
-fn is_both_inline(w: usize) -> bool {
+fn is_both_inline(w: u64) -> bool {
     w & SLOT_BOX_BIT == 0 && w & SLOT_BOTH_BIT != 0 && w & THIN_DESCR_BIT == 0 && w & 7 == 0
 }
 
-fn is_stamp_box(w: usize) -> bool {
+fn is_stamp_box(w: u64) -> bool {
     w & SLOT_BOX_BIT == 0 && w & SLOT_STAMP_BOX_BIT != 0 && w & THIN_DESCR_BIT == 0 && w & 7 == 0
 }
 
-fn thin_stamped_at(w: usize) -> Option<ThinStamped> {
+fn thin_stamped_at(w: u64) -> Option<ThinStamped> {
     if w & THIN_STAMPED_BIT == 0 {
         return None;
     }
-    let id = (w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK;
+    let id = ((w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK) as usize;
     let v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
     v.get(id).copied()
 }
 
-fn thin_stamp(w: usize) -> u32 {
+fn thin_stamp(w: u64) -> u32 {
     if let Some(e) = thin_stamped_at(w) {
         return e.stamp;
     }
     ((w >> THIN_STAMP_SHIFT) & THIN_STAMP_MASK) as u32
 }
 
-fn thin_data_ptr(w: usize) -> usize {
+fn thin_data_ptr(w: u64) -> usize {
     match thin_stamped_at(w) {
         Some(e) if e.data != 0 => e.data,
-        _ => w & THIN_DESCR_PTR_MASK,
+        _ => (w & THIN_DESCR_PTR_MASK) as usize,
     }
 }
 
-fn thin_fwd_from_word(w: usize) -> u64 {
+fn thin_fwd_from_word(w: u64) -> u64 {
     match thin_stamped_at(w) {
-        Some(e) if e.data != 0 => (w as u64 & THIN_DESCR_PTR_MASK as u64) | u64::from(e.fwd_tag),
+        Some(e) if e.data != 0 => (w & THIN_DESCR_PTR_MASK) | u64::from(e.fwd_tag),
         _ => 0,
     }
 }
 
-fn thin_with_stamp(thin: usize, stamp: u32) -> Option<usize> {
+fn thin_with_stamp(thin: u64, stamp: u32) -> Option<u64> {
     let data = thin & THIN_DESCR_PTR_MASK;
     let vtable_id = thin_vtable_id(thin);
     if stamp == 0 {
-        return Some(data | ((vtable_id as usize) << THIN_DESCR_ID_SHIFT) | THIN_DESCR_BIT);
+        return Some(data | (u64::from(vtable_id) << THIN_DESCR_ID_SHIFT) | THIN_DESCR_BIT);
     }
     if stamp < 64 && stamp & (1 << 5) == 0 {
         // Bit 5 would set THIN_STAMPED_BIT (61); those values intern.
         return Some(
-            data | ((vtable_id as usize) << THIN_DESCR_ID_SHIFT)
-                | ((stamp as usize) << THIN_STAMP_SHIFT)
+            data | (u64::from(vtable_id) << THIN_DESCR_ID_SHIFT)
+                | (u64::from(stamp) << THIN_STAMP_SHIFT)
                 | THIN_DESCR_BIT,
         );
     }
@@ -2127,14 +2130,14 @@ fn thin_with_stamp(thin: usize, stamp: u32) -> Option<usize> {
         .map(|id| data | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT)
 }
 
-fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Option<usize> {
+fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Option<u64> {
     let mut v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(i) = v.iter().position(|e| {
         e.vtable == vtable && e.stamp == stamp && e.data == data && e.fwd_tag == fwd_tag
     }) {
-        return Some(i);
+        return Some(i as u64);
     }
-    if v.len() >= THIN_STAMPED_ID_MASK + 1 {
+    if v.len() as u64 >= THIN_STAMPED_ID_MASK + 1 {
         return None;
     }
     v.push(ThinStamped {
@@ -2143,10 +2146,10 @@ fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Opti
         data,
         fwd_tag,
     });
-    Some(v.len() - 1)
+    Some((v.len() - 1) as u64)
 }
 
-fn thin_with_forwarded(thin: usize, packed: u64) -> Option<usize> {
+fn thin_with_forwarded(thin: u64, packed: u64) -> Option<u64> {
     // SmallConst / SmallWide use bits 48+ for identity; they do not fit
     // in the thin word's 48-bit payload. Pointer-tagged forwarded does.
     if packed == 0 || matches!(packed & 7, 3 | 4) {
@@ -2155,23 +2158,23 @@ fn thin_with_forwarded(thin: usize, packed: u64) -> Option<usize> {
     let data = thin_data_ptr(thin);
     let tag = (packed & 7) as u8;
     let id = intern_thin_stamped(thin_vtable_id(thin), thin_stamp(thin), data, tag)?;
-    let fwd = packed as usize & THIN_DESCR_PTR_MASK & !7;
+    let fwd = packed & THIN_DESCR_PTR_MASK & !7;
     Some(fwd | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT)
 }
 
-fn is_stamp_inline(w: usize) -> bool {
+fn is_stamp_inline(w: u64) -> bool {
     (w & !0xFFFF_FFFF) == SLOT_STAMP_INLINE_TAG
 }
 
-fn tagged_ptr(w: usize) -> usize {
-    w & THIN_DESCR_PTR_MASK
+fn tagged_ptr(w: u64) -> usize {
+    (w & THIN_DESCR_PTR_MASK) as usize
 }
 
-fn box_payload(w: usize) -> usize {
-    w & !SLOT_BOX_BIT & !SLOT_THIN_FWD_BIT
+fn box_payload(w: u64) -> usize {
+    (w & !SLOT_BOX_BIT & !SLOT_THIN_FWD_BIT) as usize
 }
 
-fn take_word(w: usize) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32) {
+fn take_word(w: u64) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32) {
     if w == 0 {
         (None, None, 0, 0)
     } else if is_stamp_inline(w) {
@@ -2209,13 +2212,13 @@ fn take_word(w: usize) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32)
             (Some(descr_arc_from_bits(lo, hi)), None, 0, stamp)
         }
     } else {
-        let (d, e, f) = unsafe { decode_descr_extra(w, FWD_TAG) };
+        let (d, e, f) = unsafe { decode_descr_extra(w as usize, FWD_TAG) };
         let stamp = crate::forwarding::fwd_stamp(f);
         (d, e, crate::forwarding::strip_fwd_stamp(f), stamp)
     }
 }
 
-fn packed_forwarded_word(w: usize) -> u64 {
+fn packed_forwarded_word(w: u64) -> u64 {
     if is_stamp_inline(w) {
         return 0;
     }
@@ -2240,7 +2243,7 @@ fn packed_forwarded_word(w: usize) -> u64 {
     }
 }
 
-fn slot_bits(w: usize) -> (usize, usize) {
+fn slot_bits(w: u64) -> (usize, usize) {
     if w == 0 {
         (0, 0)
     } else if is_thin_fwd_box(w) {
@@ -2261,24 +2264,24 @@ fn slot_bits(w: usize) -> (usize, usize) {
     } else if is_stamp_inline(w) {
         (0, 0)
     } else {
-        (w, FWD_TAG)
+        (w as usize, FWD_TAG)
     }
 }
 
-fn encode_thin_descr(d: DescrRef) -> Result<usize, DescrRef> {
+fn encode_thin_descr(d: DescrRef) -> Result<u64, DescrRef> {
     let raw = std::sync::Arc::into_raw(d);
     let (data, vtable): (*const u8, *const u8) = unsafe { std::mem::transmute(raw) };
-    let data = data as usize;
+    let data = data as u64;
     let vtable = vtable as usize;
     debug_assert_eq!(data & !THIN_DESCR_PTR_MASK, 0);
     debug_assert_eq!(data & 7, 0);
     match intern_descr_vtable(vtable) {
-        Some(id) => Ok(data | ((id as usize) << THIN_DESCR_ID_SHIFT) | THIN_DESCR_BIT),
+        Some(id) => Ok(data | (u64::from(id) << THIN_DESCR_ID_SHIFT) | THIN_DESCR_BIT),
         None => Err(unsafe { std::sync::Arc::from_raw(raw) }),
     }
 }
 
-fn thin_vtable_id(w: usize) -> u8 {
+fn thin_vtable_id(w: u64) -> u8 {
     if let Some(e) = thin_stamped_at(w) {
         e.vtable
     } else {
@@ -2286,14 +2289,14 @@ fn thin_vtable_id(w: usize) -> u8 {
     }
 }
 
-fn thin_to_lo_hi(w: usize) -> (usize, usize) {
+fn thin_to_lo_hi(w: u64) -> (usize, usize) {
     (thin_data_ptr(w), descr_vtable_at(thin_vtable_id(w)))
 }
 
 /// `ResOpWithDescr._descr` slot. One tagged word: empty, inline
 /// `_forwarded`, or a box for descr/extra/stamp.
 pub struct DescrSlot {
-    word: std::cell::UnsafeCell<usize>,
+    word: std::cell::UnsafeCell<u64>,
 }
 
 impl DescrSlot {
@@ -2317,7 +2320,7 @@ impl DescrSlot {
         slot
     }
 
-    fn word(&self) -> usize {
+    fn word(&self) -> u64 {
         unsafe { *self.word.get() }
     }
 
@@ -2379,9 +2382,9 @@ impl DescrSlot {
             }
             let boxed = alloc_thin_stamp(w, stamp);
             debug_assert_eq!(boxed as usize & 7, 0);
-            debug_assert_eq!(boxed as usize & !THIN_DESCR_PTR_MASK, 0);
+            debug_assert_eq!(boxed as u64 & !THIN_DESCR_PTR_MASK, 0);
             unsafe {
-                *self.word.get() = boxed as usize | SLOT_STAMP_BOX_BIT;
+                *self.word.get() = boxed as u64 | SLOT_STAMP_BOX_BIT;
             }
             return;
         }
@@ -2399,14 +2402,14 @@ impl DescrSlot {
                 }
             } else if crate::forwarding::fwd_stamp(w as u64) != 0 {
                 unsafe {
-                    *self.word.get() = crate::forwarding::strip_fwd_stamp(w as u64) as usize;
+                    *self.word.get() = crate::forwarding::strip_fwd_stamp(w);
                 }
             }
             return;
         }
         if w == 0 || is_stamp_inline(w) {
             unsafe {
-                *self.word.get() = SLOT_STAMP_INLINE_TAG | stamp as usize;
+                *self.word.get() = SLOT_STAMP_INLINE_TAG | u64::from(stamp);
             }
             return;
         }
@@ -2434,7 +2437,7 @@ impl DescrSlot {
         }
         if let Some(packed) = crate::forwarding::try_pack_fwd_stamp(w as u64, stamp) {
             unsafe {
-                *self.word.get() = packed as usize;
+                *self.word.get() = packed;
             }
             return;
         }
@@ -2445,13 +2448,13 @@ impl DescrSlot {
         }
         let boxed = alloc_thin_stamp(w, stamp);
         debug_assert_eq!(boxed as usize & 7, 0);
-        debug_assert_eq!(boxed as usize & !THIN_DESCR_PTR_MASK, 0);
+        debug_assert_eq!(boxed as u64 & !THIN_DESCR_PTR_MASK, 0);
         unsafe {
-            *self.word.get() = boxed as usize | SLOT_STAMP_BOX_BIT;
+            *self.word.get() = boxed as u64 | SLOT_STAMP_BOX_BIT;
         }
     }
 
-    fn write_thin_fwd(&self, thin: usize, forwarded: u64) {
+    fn write_thin_fwd(&self, thin: u64, forwarded: u64) {
         debug_assert_eq!(self.word(), 0);
         if forwarded == 0 {
             unsafe {
@@ -2467,7 +2470,7 @@ impl DescrSlot {
         }
         let boxed = alloc_thin_fwd(thin, forwarded);
         unsafe {
-            *self.word.get() = boxed as usize | SLOT_BOX_BIT | SLOT_THIN_FWD_BIT;
+            *self.word.get() = boxed as u64 | SLOT_BOX_BIT | SLOT_THIN_FWD_BIT;
         }
     }
 
@@ -2483,15 +2486,15 @@ impl DescrSlot {
             return;
         }
         if hi == FWD_TAG && stamp == 0 {
-            debug_assert_eq!(lo & SLOT_BOX_BIT, 0);
+            debug_assert_eq!(lo as u64 & SLOT_BOX_BIT, 0);
             unsafe {
-                *self.word.get() = lo;
+                *self.word.get() = lo as u64;
             }
             return;
         }
         let boxed = Box::into_raw(Box::new(DescrWords { lo, hi, stamp }));
         unsafe {
-            *self.word.get() = boxed as usize | SLOT_BOX_BIT;
+            *self.word.get() = boxed as u64 | SLOT_BOX_BIT;
         }
     }
 
@@ -2520,10 +2523,10 @@ impl DescrSlot {
             (None, Some(e), false) => {
                 let ptr = Box::into_raw(e) as usize;
                 debug_assert_eq!(self.word(), 0);
-                debug_assert_eq!(ptr & !THIN_DESCR_PTR_MASK, 0);
+                debug_assert_eq!(ptr as u64 & !THIN_DESCR_PTR_MASK, 0);
                 debug_assert_eq!(ptr & 7, 0);
                 unsafe {
-                    *self.word.get() = ptr | SLOT_EXTRA_BIT;
+                    *self.word.get() = ptr as u64 | SLOT_EXTRA_BIT;
                 }
             }
             (Some(d), Some(e), false) => {
@@ -2532,10 +2535,10 @@ impl DescrSlot {
                     extra: *e,
                 })) as usize;
                 debug_assert_eq!(self.word(), 0);
-                debug_assert_eq!(ptr & !THIN_DESCR_PTR_MASK, 0);
+                debug_assert_eq!(ptr as u64 & !THIN_DESCR_PTR_MASK, 0);
                 debug_assert_eq!(ptr & 7, 0);
                 unsafe {
-                    *self.word.get() = ptr | SLOT_BOTH_BIT;
+                    *self.word.get() = ptr as u64 | SLOT_BOTH_BIT;
                 }
             }
             (None, None, true) => self.set_bits(forwarded as usize, FWD_TAG),
@@ -2759,10 +2762,10 @@ impl DescrSlot {
         if w != 0 {
             crate::forwarding::drop_packed_forwarded(w as u64);
         }
-        debug_assert_eq!(packed & SLOT_BOX_BIT as u64, 0);
+        debug_assert_eq!(packed & SLOT_BOX_BIT, 0);
         let packed = crate::forwarding::try_pack_fwd_stamp(packed, stamp).unwrap_or(packed);
         unsafe {
-            *self.word.get() = packed as usize;
+            *self.word.get() = packed;
         }
         if stamp != 0 && crate::forwarding::fwd_stamp(packed) == 0 {
             self.set_stamp_word(stamp);
