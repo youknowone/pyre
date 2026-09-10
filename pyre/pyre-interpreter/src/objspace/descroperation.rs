@@ -3555,6 +3555,9 @@ unsafe fn shortcut_mul(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObject
     if is_int(a) {
         return Ok(Some(int_mul(a, b)?));
     }
+    if is_float(a) {
+        return Ok(Some(float_mul(a, b)?));
+    }
     Ok(None)
 }
 
@@ -3566,6 +3569,9 @@ unsafe fn shortcut_floordiv(
     if is_int(a) {
         return Ok(Some(int_floordiv(a, b)?));
     }
+    if is_float(a) {
+        return Ok(Some(float_floordiv(a, b)?));
+    }
     Ok(None)
 }
 
@@ -3573,6 +3579,9 @@ unsafe fn shortcut_floordiv(
 unsafe fn shortcut_mod(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     if is_int(a) {
         return Ok(Some(int_mod(a, b)?));
+    }
+    if is_float(a) {
+        return Ok(Some(float_mod(a, b)?));
     }
     Ok(None)
 }
