@@ -11831,6 +11831,38 @@ fn execute_assembler(
     }
 }
 
+/// Snapshot the live cursor of every `range_iterator` reachable from
+/// the frame's locals/stack. `snapshot_for_tracing` copies the pointer,
+/// not `current`/`remaining`.
+fn capture_range_iter_cursors(
+    frame: &PyFrame,
+) -> Vec<(pyre_object::PyObjectRef, i64, i64)> {
+    locals_w!(frame)
+        .as_slice()
+        .iter()
+        .copied()
+        .filter(|&value| !value.is_null())
+        .filter_map(|value| unsafe {
+            if !pyre_object::is_range_iter(value) {
+                return None;
+            }
+            let (current, remaining, _) = pyre_object::w_range_iter_fields(value);
+            Some((value, current, remaining))
+        })
+        .collect()
+}
+
+fn restore_range_iter_cursors(cursors: &[(pyre_object::PyObjectRef, i64, i64)]) {
+    for &(value, current, remaining) in cursors {
+        if value.is_null() {
+            continue;
+        }
+        unsafe {
+            pyre_object::w_range_iter_set_cursor(value, current, remaining);
+        }
+    }
+}
+
 /// pyjitpl.py `initialize_original_boxes` for the Python portal.
 ///
 /// Greens are Const; reds are InputArg. `setup_call` then packs them
@@ -11954,7 +11986,13 @@ fn compile_and_run_once(
     // this snapshot so the interpreter can replay the opcode. RPython
     // never needs the snapshot: `convert_and_run_from_pyjitpl` always
     // raises. pyre still has unbound residuals the blackhole declines.
+    //
+    // The snapshot copies local pointers, not heap objects they name.
+    // A `range` iterator's cursor lives on the iterator, so save it
+    // separately or restore would rewind `i`/`total` while the
+    // iterator stays advanced and the next FOR_ITER skips an item.
     let abort_snapshot = frame_root.frame().snapshot_for_tracing();
+    let abort_range_iters = capture_range_iter_cursors(frame_root.frame());
     // pyjitpl.py `_compile_and_run_once`: `interpret()` on the seeded
     // portal framestack.
     let outcome = driver.jit_merge_point_keyed(
@@ -12027,12 +12065,14 @@ fn compile_and_run_once(
             frame_root
                 .frame()
                 .restore_resume_state_from(&abort_snapshot);
+            restore_range_iter_cursors(&abort_range_iters);
         }
     } else if outcome.is_none() && !driver.has_compiled_loop(green_key) {
         // Abort arm did not stage a blackhole. Rewind so replay is sound.
         frame_root
             .frame()
             .restore_resume_state_from(&abort_snapshot);
+        restore_range_iter_cursors(&abort_range_iters);
     }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
