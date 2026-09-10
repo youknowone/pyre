@@ -12840,48 +12840,83 @@ pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
 /// A mid-`shift` Sequence/Alternative PC (left child already stored)
 /// returns false — re-running the helper would reread `old_left` from
 /// the current-character marks.
+///
+/// `try_native_finish_at_node_entry` asks this on every `run()` before
+/// `run_inner`. The regex leaf resumes at pc 210, so a per-call walk of
+/// `_startpoints` was the per-character cost. The first unsafe PC is a
+/// property of the jitcode; cache it.
 pub fn native_entry_args_intact(jitcode: &JitCode, position: usize) -> bool {
     if position == 0 {
         return true;
     }
-    let Some(starts) = jitcode.startpoints.as_ref() else {
+    if jitcode.startpoints.is_none() {
+        return false;
+    }
+    position <= cached_first_unsafe_native_entry_pc(jitcode)
+}
+
+fn opcode_clobbers_native_entry_args(code: &[u8], pc: usize) -> bool {
+    let Some(&op) = code.get(pc) else {
         return false;
     };
-    let code = jitcode.code.as_slice();
-    for &pc in starts {
-        if pc >= position {
-            continue;
+    match op {
+        jitcode::insns::BC_INLINE_CALL
+        | jitcode::insns::BC_SETFIELD_GC_I
+        | jitcode::insns::BC_SETFIELD_GC_R
+        | jitcode::insns::BC_SETFIELD_GC_F => true,
+        jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_R => {
+            let dest = code.get(pc + 4).copied().unwrap_or(0xff);
+            dest == 0 || (op == jitcode::insns::BC_GETFIELD_GC_I && dest == 1)
         }
-        let Some(&op) = code.get(pc) else {
-            continue;
-        };
-        match op {
-            jitcode::insns::BC_INLINE_CALL
-            | jitcode::insns::BC_SETFIELD_GC_I
-            | jitcode::insns::BC_SETFIELD_GC_R
-            | jitcode::insns::BC_SETFIELD_GC_F => return false,
-            jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_R => {
-                let dest = code.get(pc + 4).copied().unwrap_or(0xff);
-                if dest == 0 || (op == jitcode::insns::BC_GETFIELD_GC_I && dest == 1) {
-                    return false;
-                }
-            }
-            jitcode::insns::BC_MOVE_I | jitcode::insns::BC_MOVE_I_C => {
-                let dest = code.get(pc + 2).copied().unwrap_or(0xff);
-                if dest == 0 || dest == 1 {
-                    return false;
-                }
-            }
-            jitcode::insns::BC_INT_EQ => {
-                let dest = code.get(pc + 3).copied().unwrap_or(0xff);
-                if dest == 0 || dest == 1 {
-                    return false;
-                }
-            }
-            _ => {}
+        jitcode::insns::BC_MOVE_I | jitcode::insns::BC_MOVE_I_C => {
+            let dest = code.get(pc + 2).copied().unwrap_or(0xff);
+            dest == 0 || dest == 1
+        }
+        jitcode::insns::BC_INT_EQ => {
+            let dest = code.get(pc + 3).copied().unwrap_or(0xff);
+            dest == 0 || dest == 1
+        }
+        _ => false,
+    }
+}
+
+/// Smallest startpoint whose opcode clobbers a native-entry param slot.
+/// `native_entry_args_intact(p)` is then `p == 0 || p <= this`.
+fn first_unsafe_native_entry_pc(jitcode: &JitCode) -> usize {
+    let Some(starts) = jitcode.startpoints.as_ref() else {
+        return 0;
+    };
+    let code = jitcode.code.as_slice();
+    let mut first = usize::MAX;
+    for &pc in starts {
+        if opcode_clobbers_native_entry_args(code, pc) {
+            first = first.min(pc);
         }
     }
-    true
+    first
+}
+
+thread_local! {
+    /// One-entry cache of [`first_unsafe_native_entry_pc`]. The regex
+    /// deopt chain reseats the same `shift` helper on every frame.
+    static NATIVE_ENTRY_UNSAFE_PC: std::cell::Cell<Option<(usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cached_first_unsafe_native_entry_pc(jitcode: &JitCode) -> usize {
+    let ptr = jitcode as *const JitCode as usize;
+    let nstarts = jitcode.startpoints.as_ref().map_or(0, |s| s.len());
+    NATIVE_ENTRY_UNSAFE_PC.with(|cell| {
+        if let Some((cached_ptr, cached_n, limit)) = cell.get()
+            && cached_ptr == ptr
+            && cached_n == nstarts
+        {
+            return limit;
+        }
+        let limit = first_unsafe_native_entry_pc(jitcode);
+        cell.set(Some((ptr, nstarts, limit)));
+        limit
+    })
 }
 
 /// Refuse to call an unresolved `inline_call_*` target when its jitcode
