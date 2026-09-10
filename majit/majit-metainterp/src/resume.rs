@@ -6735,7 +6735,23 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
         let size = ad
             .base_size()
             .saturating_add(length.saturating_mul(ad.item_size()));
-        llmodel_alloc(ad.type_id(), size)
+        let ptr = llmodel_alloc(ad.type_id(), size);
+        if ptr != 0 {
+            if let Some(ld) = ad.len_descr() {
+                // `llmodel.py bh_new_array` → `gc_malloc_array` writes
+                // `length` at `arraydescr.lendescr`. Dynasm does the same
+                // via `dynasm_alloc_oldgen_varsize_typed_and_set_len`.
+                unsafe {
+                    majit_backend::llmodel::write_int_at_mem(
+                        ptr as usize,
+                        ld.offset(),
+                        ld.field_size(),
+                        length as i64,
+                    );
+                }
+            }
+        }
+        ptr
     }
 
     fn bh_new_array_clear(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
@@ -6766,6 +6782,11 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
                 value as usize,
             );
         }
+        // `write_ref_at_mem` documents that the caller owes the barrier
+        // the GC transformer would wrap around `llop.raw_store`.
+        // `Backend::bh_setfield_gc_r` and `PyreBlackholeAllocator` both
+        // call it; this path materializes via `alloc_oldgen_typed`.
+        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
     }
 
     fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
@@ -6815,6 +6836,8 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
         unsafe {
             majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize);
         }
+        // Same old→young obligation as `bh_setfield_gc_r` above.
+        majit_gc::gc_write_barrier(majit_ir::GcRef(array as usize));
     }
 
     fn bh_setarrayitem_gc_f(
