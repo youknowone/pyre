@@ -2269,7 +2269,7 @@ fn string_index_type_error(index: PyObjectRef) -> PyError {
 }
 
 #[inline(never)]
-unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
     if is_slice(index) {
         let (rs, rp, st) = {
