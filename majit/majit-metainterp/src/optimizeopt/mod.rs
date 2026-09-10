@@ -4577,6 +4577,31 @@ impl OptContext {
             .push((opcode, arg0, arg1, result));
     }
 
+    /// Grain's reds (`Vm`, frame, `Scope`) live on the thread stack and
+    /// change address every `Vm::new`. Folding such an InputArg to
+    /// `ConstPtr` makes resume number it TAGCONST, so the next evaluation
+    /// has no live box to rebind. PyPy heap frames have stable GC identity
+    /// and stay foldable: only a Ref whose bits sit in this thread's stack
+    /// window is refused. Null / low sentinels (`addr <= 0x1000`) are not
+    /// stack objects.
+    fn operand_is_stack_resident_inputarg(op: &Operand) -> bool {
+        if !op.is_inputarg() {
+            return false;
+        }
+        match op.get_value() {
+            Some(Value::Ref(gcref)) => Self::ref_addr_is_stack_resident(gcref.0),
+            _ => false,
+        }
+    }
+
+    fn ref_addr_is_stack_resident(addr: usize) -> bool {
+        if addr <= 0x1000 {
+            return false;
+        }
+        let probe = 0usize;
+        (std::ptr::addr_of!(probe) as usize).abs_diff(addr) < 16 * 1024 * 1024
+    }
+
     /// `optimizer.py make_equal_to(op, newop)` (line-by-line port):
     ///
     /// ```python
@@ -4593,6 +4618,20 @@ impl OptContext {
         // chain head when `op` is itself a Const so callers can fold const
         // sources without an explicit guard.
         if op.is_constant() {
+            return;
+        }
+        // A stack-resident red (Grain's `Vm` / frame / `Scope`) folded
+        // to `ConstPtr` becomes TAGCONST in resume numbering
+        // (`isinstance(box, Const)` after `get_box_replacement`). The
+        // next evaluation has a different stack address, so the live
+        // InputArg must stay a TAGBOX.
+        if newop.is_constant()
+            && (Self::operand_is_stack_resident_inputarg(op)
+                || (op.is_inputarg()
+                    && newop.get_value().is_some_and(
+                        |v| matches!(v, Value::Ref(g) if Self::ref_addr_is_stack_resident(g.0)),
+                    )))
+        {
             return;
         }
         // optimizer.py op = get_box_replacement(op)
@@ -5809,6 +5848,12 @@ impl OptContext {
 
     /// optimizer.py make_constant(box, constbox)
     pub fn make_constant_box(&mut self, op: &Operand, value: Value) {
+        if Self::operand_is_stack_resident_inputarg(op)
+            || (op.is_inputarg()
+                && matches!(value, Value::Ref(g) if Self::ref_addr_is_stack_resident(g.0)))
+        {
+            return;
+        }
         // optimizer.py: box = get_box_replacement(box)
         let op = op.get_box_replacement(false);
         // optimizer.py:418-429: IntBound safety check
@@ -9366,6 +9411,34 @@ mod boxref_forwarding_tests {
         // Negative case: operand with no constant forwarding.
         let (nb, _ia_nb) = bound_inputarg_operand(Type::Int, 0);
         assert!(!nb.get_box_replacement(false).is_constant());
+    }
+
+    /// A stack-resident red InputArg must stay a TAGBOX. Folding it to
+    /// `ConstPtr` drops it from resume liveboxes; the next `Vm::new` then
+    /// has no InputArg to rebind.
+    #[test]
+    fn stack_resident_inputarg_is_not_folded_to_const() {
+        use majit_ir::GcRef;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
+        let (b0, ia0) = bound_inputarg_operand(Type::Ref, 0);
+        let probe = 0usize;
+        let stack_addr = std::ptr::addr_of!(probe) as usize;
+        ia0.set_value(Value::Ref(GcRef(stack_addr)));
+        ctx.seed_boxes_canonical(&[b0.clone()]);
+        ctx.make_constant_box(&b0, Value::Ref(GcRef(stack_addr)));
+        assert!(
+            !b0.get_box_replacement(false).is_constant(),
+            "stack-resident InputArg must not become ConstPtr"
+        );
+        let heap = GcRef(0x0000_0001_0000_0000);
+        let (b1, ia1) = bound_inputarg_operand(Type::Ref, 1);
+        ia1.set_value(Value::Ref(heap));
+        ctx.seed_boxes_canonical(&[b1.clone()]);
+        ctx.make_constant_box(&b1, Value::Ref(heap));
+        assert!(
+            b1.get_box_replacement(false).is_constant(),
+            "heap InputArg stays foldable (PyPy GC identity)"
+        );
     }
 
     /// `make_constant` mirrors PyPy optimizer.py

@@ -429,6 +429,14 @@ cover the condition they diagnose.
 - What it does: Whether `MAJIT_PROBE_LIVENESS` is set, cached at first access.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_REGALLOC_DEBUG`
+
+- Read sites: 2 — `majit/majit-translate/src/tool/algo/regalloc.rs`
+- Accessor: `std::env::var_os("MAJIT_REGALLOC_DEBUG")` in `perform_register_allocation` and `try_coalesce`
+- What it does: prints portal Ref colour occupancy, protected-sharing, and the names that share a merge-point red. Used to see whether a later Scope joined the reserved vm colour. The ordinary build still runs the reservation; this only opens the log.
+- Default polarity: **OFF**; unset disables the log.
+- Retirement condition: **UNRECORDED** — owed by this gate's owner.
+
 ### `MAJIT_REG_WRITE_AUDIT`
 
 - Read sites: 1 — `majit/majit-ir/src/reg_write_audit.rs`

@@ -260,6 +260,20 @@ impl RegAllocatorState {
         graph: &FunctionGraph,
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
     ) {
+        // SSI copies of a merge-point red must still share its colour
+        // (`reserve_portal_red_identity` pins that colour). A call
+        // result (`scope_from_frame`) or the GETFIELD/vable load that
+        // remains when that helper is inlined must not join that
+        // class: the back edge would otherwise put the Scope in the
+        // reserved vm register, and a mid-opcode guard snapshots it
+        // there.
+        let portal_reds: VarSet = [RegKind::Int, RegKind::Ref, RegKind::Float]
+            .into_iter()
+            .flat_map(|kind| portal_merge_point_reds(graph, kind))
+            .collect();
+        let call_results = collect_protected_results(graph);
+        let non_copy_defs = collect_non_copy_results(graph);
+        let all_vars: Vec<crate::flowspace::model::Variable> = graph.iter_variables();
         let order = graph.iterblocks_order();
         for &bid in order.iter().rev() {
             let block = graph.block(bid);
@@ -291,7 +305,15 @@ impl RegAllocatorState {
                         if consider(arg_var) {
                             self.depgraph.add_node(arg_var.clone());
                         }
-                        self.try_coalesce(arg_var, target_var, consider);
+                        self.try_coalesce(
+                            arg_var,
+                            target_var,
+                            consider,
+                            &portal_reds,
+                            &call_results,
+                            &non_copy_defs,
+                            &all_vars,
+                        );
                     }
                 }
             }
@@ -307,6 +329,10 @@ impl RegAllocatorState {
         v: &crate::flowspace::model::Variable,
         w: &crate::flowspace::model::Variable,
         consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
+        portal_reds: &VarSet,
+        call_results: &VarSet,
+        non_copy_defs: &VarSet,
+        all_vars: &[crate::flowspace::model::Variable],
     ) {
         if !consider(v) || !consider(w) {
             return;
@@ -315,6 +341,37 @@ impl RegAllocatorState {
         let w0 = self.unionfind.find_rep(w.clone());
         if v0 == w0 {
             return;
+        }
+        let v_has_red = class_hits_set(&mut self.unionfind, &v0, portal_reds, all_vars);
+        let w_has_red = class_hits_set(&mut self.unionfind, &w0, portal_reds, all_vars);
+        let v_has_call = class_hits_set(&mut self.unionfind, &v0, call_results, all_vars);
+        let w_has_call = class_hits_set(&mut self.unionfind, &w0, call_results, all_vars);
+        if (v_has_red && w_has_call) || (w_has_red && v_has_call) {
+            return;
+        }
+        // A later FieldRead / residual that is not in `call_results`
+        // (inlined `scope_from_frame`, a reborrow, a differently
+        // named load) must still stay off the reserved red: otherwise
+        // the class holds both `self` and `scope` and a mid-opcode
+        // guard snapshots Scope in the vm register.
+        let v_has_noncopy = class_hits_set(&mut self.unionfind, &v0, non_copy_defs, all_vars);
+        let w_has_noncopy = class_hits_set(&mut self.unionfind, &w0, non_copy_defs, all_vars);
+        if (v_has_red && w_has_noncopy) || (w_has_red && v_has_noncopy) {
+            return;
+        }
+        if (v_has_red || w_has_red) && std::env::var_os("MAJIT_REGALLOC_DEBUG").is_some() {
+            let other = if v_has_red {
+                w.name_prefix()
+            } else {
+                v.name_prefix()
+            };
+            if other != "self" && other != "frame" && other != "v" {
+                eprintln!(
+                    "[regalloc] coalesce red with {other} (v={} w={})",
+                    v.name_prefix(),
+                    w.name_prefix(),
+                );
+            }
         }
         if self
             .depgraph
@@ -329,6 +386,61 @@ impl RegAllocatorState {
             self.depgraph.coalesce(w0, v0);
         } else {
             self.depgraph.coalesce(v0, w0);
+        }
+    }
+
+    /// Keep portal merge-point reds off every other same-kind colour.
+    ///
+    /// Generated `#[jit_interp]` states put identity in
+    /// `[ref_identity_base, ref_end)` and raise the body's `next_reg`
+    /// past that range so a temp cannot reuse the slot. The LLBC
+    /// portal has no such floor: `frame` / `vm` are ordinary SSA
+    /// values, and once their live range ends the colourer hands the
+    /// register to a later ref. A guard mid-opcode then snapshots
+    /// that later object under the merge-point's red-R index, and
+    /// `rebind_bridge_reds` that trusts the index writes a Vm over a
+    /// frame or scope.
+    ///
+    /// After coalescing, the red and every SSI-threaded copy share a
+    /// rep. Interfering that rep with every other considered rep is
+    /// the same reservation: one colour, never reused. Graphs with
+    /// no `JitMergePoint` are unchanged.
+    fn reserve_portal_red_identity(
+        &mut self,
+        graph: &FunctionGraph,
+        kind: RegKind,
+        consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
+    ) {
+        // Identity reds are Ref (frame / vm). Int and float reds are
+        // loop-carried values with ordinary lifetimes; reserving those
+        // too can push a register-heavy portal past the assembler's
+        // 256-register cap.
+        if kind != RegKind::Ref {
+            return;
+        }
+        let reds = portal_merge_point_reds(graph, kind);
+        if reds.is_empty() {
+            return;
+        }
+        let red_reps: VarSet = reds
+            .into_iter()
+            .map(|var| self.unionfind.find_rep(var))
+            .collect();
+        let other_reps: VarSet = graph
+            .iter_variables()
+            .into_iter()
+            .filter(|var| consider(var))
+            .map(|var| self.unionfind.find_rep(var))
+            .filter(|rep| !red_reps.contains(rep))
+            .collect();
+        for red in &red_reps {
+            self.depgraph.add_node(red.clone());
+            for other in &other_reps {
+                self.depgraph.add_node(other.clone());
+                if red != other {
+                    self.depgraph.add_edge(red.clone(), other.clone());
+                }
+            }
         }
     }
 
@@ -665,6 +777,7 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
     let mut allocator = RegAllocatorState::new();
     allocator.make_dependencies(graph, &consider);
     allocator.coalesce_variables(graph, &consider);
+    allocator.reserve_portal_red_identity(graph, kind, &consider);
     allocator.find_node_coloring();
 
     let mut coloring: VarMap<usize> = VarMap::default();
@@ -682,6 +795,18 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
                 max_reg = color + 1;
             }
         }
+    }
+    if kind == RegKind::Ref && std::env::var_os("MAJIT_REGALLOC_DEBUG").is_some() {
+        let reds = portal_merge_point_reds(graph, kind);
+        if !reds.is_empty() || graph.name.contains("run_frame") {
+            eprintln!(
+                "[regalloc] graph {} merge_reds={} colored={}",
+                graph.name,
+                reds.len(),
+                coloring.len(),
+            );
+        }
+        log_portal_ref_colors(graph, &coloring);
     }
     RegAllocator {
         coloring,
@@ -704,6 +829,298 @@ fn variable_regkind(var: &crate::flowspace::model::Variable) -> Option<RegKind> 
 /// Signed → Int, GcRef → Ref, Float → Float.  Void / Unknown have
 /// no register class (the same way RPython's regalloc skips Void
 /// Variables, `flatten.py:325`).
+/// Merge-point reds of `kind` on this graph, if it is a portal.
+fn portal_merge_point_reds(
+    graph: &FunctionGraph,
+    kind: RegKind,
+) -> Vec<crate::flowspace::model::Variable> {
+    let mut reds = Vec::new();
+    for bid in graph.iterblocks_order() {
+        for op in &graph.block(bid).operations {
+            let OpKind::JitMergePoint {
+                reds_i,
+                reds_r,
+                reds_f,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            let list = match kind {
+                RegKind::Int => reds_i.as_slice(),
+                RegKind::Ref => reds_r.as_slice(),
+                RegKind::Float => reds_f.as_slice(),
+            };
+            for var in list {
+                if variable_regkind(var) == Some(kind) {
+                    reds.push(var.clone());
+                }
+            }
+        }
+    }
+    reds
+}
+
+fn is_defining_call(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call { .. }
+            | OpKind::CallResidual { .. }
+            | OpKind::CallElidable { .. }
+            | OpKind::CallMayForce { .. }
+            | OpKind::IndirectCall { .. }
+            | OpKind::InlineCall { .. }
+    )
+}
+
+fn log_portal_ref_colors(graph: &FunctionGraph, coloring: &VarMap<usize>) {
+    let reds = portal_merge_point_reds(graph, RegKind::Ref);
+    if reds.is_empty() {
+        return;
+    }
+    let red_colors: Vec<Option<usize>> =
+        reds.iter().map(|var| coloring.get(var).copied()).collect();
+    let mut call_hits = 0usize;
+    let mut scope_calls = 0usize;
+    let mut scope_fields = 0usize;
+    for bid in graph.iterblocks_order() {
+        for op in &graph.block(bid).operations {
+            if is_defining_call(&op.kind) {
+                call_hits += 1;
+                if call_kind_mentions_scope(&op.kind) {
+                    scope_calls += 1;
+                }
+            }
+            if is_scope_load(&op.kind) {
+                scope_fields += 1;
+            }
+        }
+    }
+    let protected = collect_protected_results(graph);
+    let shared = protected
+        .iter()
+        .filter(|var| {
+            coloring
+                .get(*var)
+                .is_some_and(|color| red_colors.iter().any(|red| *red == Some(*color)))
+        })
+        .count();
+    let mut red_occupancy: Vec<(usize, usize)> = Vec::new();
+    for color in red_colors.iter().flatten() {
+        let n = coloring.values().filter(|c| *c == color).count();
+        red_occupancy.push((*color, n));
+    }
+    let mut kind_hits: Vec<(String, usize)> = Vec::new();
+    let mut samples: Vec<String> = Vec::new();
+    for bid in graph.iterblocks_order() {
+        for op in &graph.block(bid).operations {
+            let Some(result) = &op.result else {
+                continue;
+            };
+            let Some(color) = coloring.get(result) else {
+                continue;
+            };
+            if !red_colors.iter().any(|red| *red == Some(*color)) {
+                continue;
+            }
+            let label = match &op.kind {
+                OpKind::Call { target, .. }
+                | OpKind::CallResidual {
+                    funcptr: crate::model::CallFuncPtr::Target(target),
+                    ..
+                }
+                | OpKind::CallElidable {
+                    funcptr: crate::model::CallFuncPtr::Target(target),
+                    ..
+                }
+                | OpKind::CallMayForce {
+                    funcptr: crate::model::CallFuncPtr::Target(target),
+                    ..
+                } => format!("call:{target}"),
+                OpKind::FieldRead { field, .. } | OpKind::InteriorFieldRead { field, .. } => {
+                    format!("field:{}", field.name)
+                }
+                OpKind::VableFieldRead { .. } => "vable".into(),
+                OpKind::Input { name, .. } => format!("input:{name}"),
+                other => format!("{other:?}")
+                    .split_once(' ')
+                    .map(|(head, _)| head.to_string())
+                    .unwrap_or_else(|| format!("{other:?}")),
+            };
+            if let Some((_, n)) = kind_hits.iter_mut().find(|(k, _)| *k == label) {
+                *n += 1;
+            } else {
+                kind_hits.push((label.clone(), 1));
+            }
+            if samples.len() < 24 {
+                samples.push(format!("r{color}:{label}"));
+            }
+        }
+    }
+    kind_hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut name_hits: Vec<(String, usize)> = Vec::new();
+    for (var, color) in coloring {
+        if !red_colors.iter().any(|red| *red == Some(*color)) {
+            continue;
+        }
+        let prefix = var.name_prefix();
+        if let Some((_, n)) = name_hits.iter_mut().find(|(k, _)| *k == prefix) {
+            *n += 1;
+        } else {
+            name_hits.push((prefix, 1));
+        }
+    }
+    name_hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if name_hits.len() > 16 {
+        name_hits.truncate(16);
+    }
+    eprintln!(
+        "[regalloc] portal {} ref reds={} colors={red_colors:?} \
+         occupancy={red_occupancy:?} calls={call_hits} scope_calls={scope_calls} \
+         scope_fields={scope_fields} protected_sharing_red={shared} colored={} \
+         red_kinds={kind_hits:?} samples={samples:?} red_names={name_hits:?}",
+        graph.name,
+        reds.len(),
+        coloring.len(),
+    );
+}
+
+fn call_kind_mentions_scope(kind: &OpKind) -> bool {
+    let target = match kind {
+        OpKind::Call { target, .. }
+        | OpKind::CallElidable {
+            funcptr: crate::model::CallFuncPtr::Target(target),
+            ..
+        }
+        | OpKind::CallResidual {
+            funcptr: crate::model::CallFuncPtr::Target(target),
+            ..
+        }
+        | OpKind::CallMayForce {
+            funcptr: crate::model::CallFuncPtr::Target(target),
+            ..
+        } => target,
+        _ => return false,
+    };
+    target.to_string().contains("scope_from_frame")
+}
+
+fn is_scope_load(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::FieldRead { field, .. } | OpKind::InteriorFieldRead { field, .. } => {
+            field.name == "scope"
+        }
+        OpKind::VableFieldRead { .. } => true,
+        _ => false,
+    }
+}
+
+fn is_protected_result_op(kind: &OpKind) -> bool {
+    // Any producer that is not an SSI/`same_as` copy can be a later
+    // object (Scope, engine, a residual). Seed the frontier with it
+    // so a reverse-order coalesce cannot union its inputarg copy
+    // with a portal red before the producer is attached.
+    !is_copy_kind(kind)
+}
+
+fn is_copy_kind(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Input { .. } => true,
+        OpKind::UnaryOp { op, .. } if op == "same_as" => true,
+        _ => false,
+    }
+}
+
+fn collect_non_copy_results(graph: &FunctionGraph) -> VarSet {
+    let mut results = VarSet::default();
+    for bid in graph.iterblocks_order() {
+        for op in &graph.block(bid).operations {
+            if let Some(result) = &op.result
+                && !is_copy_kind(&op.kind)
+            {
+                results.insert(result.clone());
+            }
+        }
+    }
+    results
+}
+
+fn collect_protected_results(graph: &FunctionGraph) -> VarSet {
+    let mut results = VarSet::default();
+    let mut frontier = VarSet::default();
+    for bid in graph.iterblocks_order() {
+        for op in &graph.block(bid).operations {
+            if let Some(result) = &op.result {
+                if is_defining_call(&op.kind) {
+                    results.insert(result.clone());
+                }
+                if is_protected_result_op(&op.kind) {
+                    results.insert(result.clone());
+                    frontier.insert(result.clone());
+                }
+            }
+        }
+    }
+    // Copies of a protected load are what the body actually uses:
+    // `same_as`, and the SSI inputarg a predecessor passes the load
+    // into. Leaving those unmarked lets a later back edge union the
+    // copy with the vm red while the GETFIELD result stays a
+    // different colour — occupancy then shows ~1300 vars in the red
+    // class and a mid-opcode guard snapshots Scope under the vm
+    // index.
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for bid in graph.iterblocks_order() {
+            let block = graph.block(bid);
+            for op in &block.operations {
+                let OpKind::UnaryOp {
+                    op: name, operand, ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if name != "same_as" || !frontier.contains(operand) {
+                    continue;
+                }
+                if let Some(result) = &op.result
+                    && frontier.insert(result.clone())
+                {
+                    results.insert(result.clone());
+                    grew = true;
+                }
+            }
+            for link in &block.exits {
+                let target_inputs: Vec<crate::flowspace::model::Variable> = graph
+                    .block(link.target)
+                    .input_variables()
+                    .cloned()
+                    .collect();
+                for (arg, target) in link.args.iter().zip(target_inputs.iter()) {
+                    let Some(arg_var) = arg.as_variable() else {
+                        continue;
+                    };
+                    if frontier.contains(arg_var) && frontier.insert(target.clone()) {
+                        results.insert(target.clone());
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    results
+}
+
+fn class_hits_set(
+    unionfind: &mut UnionFind<crate::flowspace::model::Variable>,
+    root: &crate::flowspace::model::Variable,
+    marked: &VarSet,
+    all: &[crate::flowspace::model::Variable],
+) -> bool {
+    all.iter()
+        .any(|var| marked.contains(var) && &unionfind.find_rep(var.clone()) == root)
+}
+
 fn concretetype_to_regkind(ty: &ConcreteType) -> Option<RegKind> {
     match ty {
         ConcreteType::Signed => Some(RegKind::Int),
@@ -716,7 +1133,7 @@ fn concretetype_to_regkind(ty: &ConcreteType) -> Option<RegKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ExitCase, ExitSwitch, FunctionGraph, Link, OpKind, ValueType};
+    use crate::model::{CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, OpKind, ValueType};
 
     fn push_int_input(
         graph: &mut FunctionGraph,
@@ -894,6 +1311,292 @@ mod tests {
             max_color <= 1,
             "chain needs at most 2 colors, got {}",
             max_color + 1
+        );
+    }
+
+    fn push_ref_input(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        name: &str,
+    ) -> crate::flowspace::model::Variable {
+        let var = graph
+            .push_op_var(
+                block,
+                OpKind::Input {
+                    name: name.into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(block, var.clone());
+        var
+    }
+
+    #[test]
+    fn portal_merge_point_red_does_not_share_a_register_with_a_later_ref() {
+        // frame dies at the merge point; temp is born after. Without the
+        // reservation they share a colour (non_overlapping_lifetimes).
+        // The portal red must keep its colour so a mid-opcode guard still
+        // names the Vm/frame, not the later object.
+        let mut graph = FunctionGraph::new("portal");
+        let entry = graph.startblock;
+        let frame = push_ref_input(&mut graph, entry, "frame");
+        graph.push_op_var(
+            entry,
+            OpKind::JitMergePoint {
+                jitdriver_index: 0,
+                greens_i: vec![],
+                greens_r: vec![],
+                greens_f: vec![],
+                reds_i: vec![],
+                reds_r: vec![frame.clone()],
+                reds_f: vec![],
+            },
+            false,
+        );
+        let temp = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        graph.set_return(entry, Some(temp.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&temp, ConcreteType::GcRef);
+        let result = perform_register_allocation(&graph, RegKind::Ref);
+        assert_ne!(
+            result.color_for_variable(&frame),
+            result.color_for_variable(&temp),
+            "a portal red must not share its colour with a later ref",
+        );
+        assert!(result.num_regs >= 2);
+    }
+
+    #[test]
+    fn a_graph_without_a_merge_point_still_shares_non_overlapping_refs() {
+        let mut graph = FunctionGraph::new("helper");
+        let entry = graph.startblock;
+        let early = push_ref_input(&mut graph, entry, "early");
+        let late = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        graph.set_return(entry, Some(late.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(&early, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&late, ConcreteType::GcRef);
+        let result = perform_register_allocation(&graph, RegKind::Ref);
+        assert_eq!(
+            result.color_for_variable(&early),
+            result.color_for_variable(&late),
+            "reservation is inert off a portal",
+        );
+        assert_eq!(result.num_regs, 1);
+    }
+
+    #[test]
+    fn portal_red_does_not_coalesce_with_a_call_result() {
+        // Back edge would otherwise union the call result with the
+        // merge-point red and put the Scope in the reserved vm colour.
+        let mut graph = FunctionGraph::new("portal");
+        let entry = graph.startblock;
+        let frame = push_ref_input(&mut graph, entry, "frame");
+        graph.push_op_var(
+            entry,
+            OpKind::JitMergePoint {
+                jitdriver_index: 0,
+                greens_i: vec![],
+                greens_r: vec![],
+                greens_f: vec![],
+                reds_i: vec![],
+                reds_r: vec![frame.clone()],
+                reds_f: vec![],
+            },
+            false,
+        );
+        let temp = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["scope_from_frame"]),
+                    args: vec![frame.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_goto(entry, entry, vec![temp.clone()]);
+
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&temp, ConcreteType::GcRef);
+        let result = perform_register_allocation(&graph, RegKind::Ref);
+        assert_ne!(
+            result.color_for_variable(&frame),
+            result.color_for_variable(&temp),
+            "a call result must not share the merge-point red's colour",
+        );
+    }
+
+    #[test]
+    fn portal_red_does_not_coalesce_with_a_scope_field_read() {
+        // The live portal still inlines `scope_from_frame` to a GETFIELD
+        // of `frame.scope`. That result must stay off the reserved vm
+        // colour the same way a residual call result does.
+        let mut graph = FunctionGraph::new("portal");
+        let entry = graph.startblock;
+        let frame = push_ref_input(&mut graph, entry, "frame");
+        graph.push_op_var(
+            entry,
+            OpKind::JitMergePoint {
+                jitdriver_index: 0,
+                greens_i: vec![],
+                greens_r: vec![],
+                greens_f: vec![],
+                reds_i: vec![],
+                reds_r: vec![frame.clone()],
+                reds_f: vec![],
+            },
+            false,
+        );
+        let temp = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: frame.clone(),
+                    field: crate::model::FieldDescriptor::new("scope", Some("GrainFrame".into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_goto(entry, entry, vec![temp.clone()]);
+
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&temp, ConcreteType::GcRef);
+        let result = perform_register_allocation(&graph, RegKind::Ref);
+        assert_ne!(
+            result.color_for_variable(&frame),
+            result.color_for_variable(&temp),
+            "a scope field read must not share the merge-point red's colour",
+        );
+    }
+
+    #[test]
+    fn portal_red_does_not_coalesce_with_a_threaded_scope_copy() {
+        // The GETFIELD result is passed into a successor inputarg; that
+        // copy is what a later back edge would union with the red.
+        let mut graph = FunctionGraph::new("portal");
+        let entry = graph.startblock;
+        let mid = graph.create_block();
+        let frame = push_ref_input(&mut graph, entry, "frame");
+        graph.push_op_var(
+            entry,
+            OpKind::JitMergePoint {
+                jitdriver_index: 0,
+                greens_i: vec![],
+                greens_r: vec![],
+                greens_f: vec![],
+                reds_i: vec![],
+                reds_r: vec![frame.clone()],
+                reds_f: vec![],
+            },
+            false,
+        );
+        let loaded = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: frame.clone(),
+                    field: crate::model::FieldDescriptor::new("scope", Some("GrainFrame".into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let mid_in = graph
+            .push_op_var(
+                mid,
+                OpKind::Input {
+                    name: "scope_copy".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(mid, mid_in.clone());
+        graph.set_goto(entry, mid, vec![loaded.clone()]);
+        graph.set_goto(mid, entry, vec![mid_in.clone()]);
+
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&loaded, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&mid_in, ConcreteType::GcRef);
+        let result = perform_register_allocation(&graph, RegKind::Ref);
+        assert_ne!(
+            result.color_for_variable(&frame),
+            result.color_for_variable(&mid_in),
+            "a threaded scope copy must not share the merge-point red's colour",
+        );
+    }
+
+    #[test]
+    fn portal_red_does_not_coalesce_with_a_threaded_non_scope_load() {
+        // Inlined helpers leave FieldReads whose name is not `scope`
+        // (`engine`, a reborrow). Those were not in `call_results`, so a
+        // back edge could union them with the vm red.
+        let mut graph = FunctionGraph::new("portal");
+        let entry = graph.startblock;
+        let mid = graph.create_block();
+        let frame = push_ref_input(&mut graph, entry, "frame");
+        graph.push_op_var(
+            entry,
+            OpKind::JitMergePoint {
+                jitdriver_index: 0,
+                greens_i: vec![],
+                greens_r: vec![],
+                greens_f: vec![],
+                reds_i: vec![],
+                reds_r: vec![frame.clone()],
+                reds_f: vec![],
+            },
+            false,
+        );
+        let loaded = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: frame.clone(),
+                    field: crate::model::FieldDescriptor::new("engine", Some("Vm".into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let mid_in = graph
+            .push_op_var(
+                mid,
+                OpKind::Input {
+                    name: "engine_copy".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(mid, mid_in.clone());
+        graph.set_goto(entry, mid, vec![loaded.clone()]);
+        graph.set_goto(mid, entry, vec![mid_in.clone()]);
+
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&loaded, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&mid_in, ConcreteType::GcRef);
+        let result = perform_register_allocation(&graph, RegKind::Ref);
+        assert_ne!(
+            result.color_for_variable(&frame),
+            result.color_for_variable(&mid_in),
+            "a threaded non-scope load must not share the merge-point red's colour",
         );
     }
 }

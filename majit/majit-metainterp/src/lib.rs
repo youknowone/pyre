@@ -242,7 +242,9 @@ pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_
 /// (`blackhole.py:1432-1483` reads the descr straight out of the constant
 /// pool).  Exported so the descr-identity census can compare it against the
 /// pool-side resolution without re-deriving a second copy of the logic.
-pub use pyjitpl::dispatch::{field_descr_ref_from_bh, symbolic_residual_trace_aborts};
+pub use pyjitpl::dispatch::{
+    field_descr_ref_from_bh, publish_walk_abort_handoff, symbolic_residual_trace_aborts,
+};
 pub use pyjitpl::{
     BackEdgeAction, BridgeCompileResult, BridgeRetraceResult, ClosureRuntime,
     ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout,
@@ -425,6 +427,58 @@ pub fn majit_log_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
     *ENABLED
+}
+
+thread_local! {
+    static BRIDGE_WALKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WALK_ABORT_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RESIDUAL_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the current thread as walking a guard-resume (bridge) trace.
+///
+/// A walk-local `Dynamic` has a real stack address, so a pointer-range
+/// check cannot tell it from a live cell. The bridge walk is the path
+/// that residual-calls `operand_stack_store` with those locals; the
+/// initial loop walk uses the live interpreter frame.
+pub fn set_bridge_walking(active: bool) {
+    BRIDGE_WALKING.with(|cell| cell.set(active));
+}
+
+/// Whether [`set_bridge_walking`] is currently set on this thread.
+#[must_use]
+pub fn is_bridge_walking() -> bool {
+    BRIDGE_WALKING.with(std::cell::Cell::get)
+}
+
+/// A bound residual saw a walk-local `Vm` or index and did not run.
+/// The walker checks this after the call and aborts to the merge point.
+pub fn request_walk_abort() {
+    WALK_ABORT_REQUESTED.with(|cell| cell.set(true));
+}
+
+/// Consume a pending [`request_walk_abort`].
+#[must_use]
+pub fn take_walk_abort() -> bool {
+    WALK_ABORT_REQUESTED.with(|cell| cell.replace(false))
+}
+
+/// A bound residual already applied a heap effect on this walk.
+///
+/// `publish_walk_abort_handoff` declines both resume handoffs when the
+/// abort is an unbound symbolic target and no residual has run — replay
+/// of the source arm is then sound. After a mutating residual, replay
+/// applies that effect twice (`ITER_NEXT` after `iter_next_store` has
+/// already popped the iterator). The host sets this so the publisher
+/// keeps the live portal pc.
+pub fn note_residual_committed() {
+    RESIDUAL_COMMITTED.with(|cell| cell.set(true));
+}
+
+/// Consume [`note_residual_committed`]. Cleared at the start of each walk.
+#[must_use]
+pub fn take_residual_committed() -> bool {
+    RESIDUAL_COMMITTED.with(|cell| cell.replace(false))
 }
 
 /// Strict JIT mode: a non-`InvalidLoop` panic during compilation is a bug and

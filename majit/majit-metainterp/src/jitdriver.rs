@@ -4919,14 +4919,28 @@ impl<S: JitState> JitDriver<S> {
                     } else {
                         None
                     };
+                    let det_bridge_abort = self
+                        .meta
+                        .tracing
+                        .as_ref()
+                        .is_some_and(|ctx| ctx.deterministic_bridge_abort);
                     if let Some(source_descr) = setup_aborted_bridge_descr {
-                        // `pyjitpl.rs`'s `record_declined_bridge_guard`
-                        // structural-decline contract:
-                        // a bridge abort before bytecode-body ops is deterministic
-                        // setup failure from the fixed guard resume shape, so it
-                        // must not refire. The lone GetfieldRawI case is emitted
-                        // by bridge symbolic init before the body walker runs.
-                        self.meta.record_declined_bridge_guard(&source_descr);
+                        // Setup died before any body op: the reachable
+                        // set of the first callee still names an unbound
+                        // residual. Retrying rebuilds the same refuse.
+                        if !self.source_guard_already_bridged(&source_descr) {
+                            self.meta.record_declined_bridge_guard(&source_descr);
+                        }
+                    } else if det_bridge_abort {
+                        // `BC_ABORT` / walk-local refuse: the reconstructed
+                        // arm is not a compilable bridge. Decline so we do
+                        // not rebuild it every eagerness cycle. Do not
+                        // stamp a guard that already has a compiled bridge.
+                        if let Some(bridge) = self.meta.bridge_info_cloned() {
+                            if !self.source_guard_already_bridged(&bridge.source_descr) {
+                                self.meta.record_declined_bridge_guard(&bridge.source_descr);
+                            }
+                        }
                     }
                     // pyjitpl.py `run_blackhole_interp_to_cancel_tracing(stb)`
                     // consumes both the reason and raising_exception from the
@@ -4989,12 +5003,19 @@ impl<S: JitState> JitDriver<S> {
                     // frames are the sole record of where that left the
                     // interpreter, so this bridge needs the handoff for the
                     // same reason a fresh trace does.
+                    //
+                    // A deterministic bridge abort (`BC_ABORT` in a helper
+                    // such as `malformed`) must not take that handoff: the
+                    // cancel-tracing blackhole would run the error-path
+                    // helper for real and leave the compiled loop's later
+                    // entries failing the same guard every iteration.
                     if matches!(
                         action,
                         TraceAction::Abort | TraceAction::SwitchToBlackhole(_)
-                    ) && (self.meta.bridge_info().is_none()
-                        || self.bridge_attempt_declined
-                        || self.bridge_entered_at_guard_resume)
+                    ) && !det_bridge_abort
+                        && (self.meta.bridge_info().is_none()
+                            || self.bridge_attempt_declined
+                            || self.bridge_entered_at_guard_resume)
                     {
                         // This gate asks whether the session still has a bridge
                         // artifact to resume into, which is the PHASE, not the
@@ -5726,7 +5747,24 @@ impl<S: JitState> JitDriver<S> {
                 }
                 call_sites.push(Some(site));
             }
+            let allocator = self.blackhole_allocator.as_deref();
             let ctx = self.meta.tracing.as_mut().ok_or(Decline::NoResumeState)?;
+            let virtual_count = resume
+                .storage
+                .as_ref()
+                .map_or(0, |storage| storage.rd_virtuals().len());
+            let mut virt_cache = match allocator {
+                Some(allocator) => crate::BridgeVirtualCache::executing(
+                    virtual_count,
+                    crate::default_bridge_array_descr,
+                    allocator,
+                    raw_values,
+                    &fail_types,
+                ),
+                None => {
+                    crate::BridgeVirtualCache::new(virtual_count, crate::default_bridge_array_descr)
+                }
+            };
             let mut frames = Vec::with_capacity(sections.len());
             for (depth, (jitcode, pc)) in sections.into_iter().enumerate() {
                 let values = &resume.frames[depth].values;
@@ -5766,6 +5804,19 @@ impl<S: JitState> JitDriver<S> {
                         reg_indices.int.len() + reg_indices.ref_.len(),
                     ),
                 ];
+                if crate::bridge_debug_enabled() {
+                    eprintln!(
+                        "[bridgeB] liveness pc={pc} i={:?} r={:?} f={:?}",
+                        reg_indices.int, reg_indices.ref_, reg_indices.float
+                    );
+                    let code = &jitcode.code;
+                    let n = code.len().saturating_sub(pc).min(16);
+                    eprint!("[bridgeB] code[{pc}..]=");
+                    for b in &code[pc..pc + n] {
+                        eprint!(" {b:02x}");
+                    }
+                    eprintln!();
+                }
                 let mut regs = Vec::with_capacity(values.len());
                 for (bank, indices, base) in banks {
                     for (i, &index) in indices.iter().enumerate() {
@@ -5785,12 +5836,43 @@ impl<S: JitState> JitDriver<S> {
                                 };
                                 (opref, bits)
                             }
-                            // A virtual has an OpRef but no concrete value, and
-                            // an unassigned slot has neither. The walk executes,
-                            // so a register it cannot read a value out of is not
-                            // a register it can run past — decline the whole
-                            // frame rather than enter it half-seeded.
-                            RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => {
+                            // resume.py consume_boxes → getvirtual: a virtual
+                            // is allocated and the register holds the object.
+                            // Unassigned still has nothing to execute.
+                            RebuiltValue::Virtual(vidx) => {
+                                let rd_virtuals =
+                                    resume.storage.as_ref().map(|storage| storage.rd_virtuals());
+                                let opref = crate::materialize_bridge_virtual(
+                                    ctx,
+                                    *vidx,
+                                    rd_virtuals,
+                                    resume,
+                                    &mut virt_cache,
+                                );
+                                let bits = if opref.is_none() {
+                                    None
+                                } else {
+                                    virt_cache.concrete_root_of(opref).or_else(|| {
+                                        ctx.box_value(opref).and_then(|value| match value {
+                                            majit_ir::Value::Ref(r) => Some(r.as_usize() as i64),
+                                            majit_ir::Value::Int(i) => Some(i),
+                                            majit_ir::Value::Float(f) => Some(f.to_bits() as i64),
+                                            majit_ir::Value::Void => None,
+                                        })
+                                    })
+                                };
+                                let Some(bits) = bits else {
+                                    if crate::bridge_debug_enabled() {
+                                        eprintln!(
+                                            "[bridgeB] DECLINE depth={depth} virtual {vidx} \
+                                             has no concrete"
+                                        );
+                                    }
+                                    return Err(Decline::UnreadableRegister);
+                                };
+                                (opref, bits)
+                            }
+                            RebuiltValue::Unassigned => {
                                 if crate::bridge_debug_enabled() {
                                     eprintln!(
                                         "[bridgeB] DECLINE depth={depth} unreadable slot {:?}",
@@ -5808,6 +5890,16 @@ impl<S: JitState> JitDriver<S> {
                         });
                     }
                 }
+                if crate::bridge_debug_enabled() {
+                    eprint!("[bridgeB] seeded");
+                    for reg in &regs {
+                        eprint!(
+                            " {:?}[{}]={:#x}/{:?}",
+                            reg.bank, reg.index, reg.value, reg.opref
+                        );
+                    }
+                    eprintln!();
+                }
                 frames.push(crate::jit_state::GuardResumeFrame {
                     jitcode,
                     pc,
@@ -5823,7 +5915,7 @@ impl<S: JitState> JitDriver<S> {
             }
             Ok(frames)
         })();
-        let frames = match seeded {
+        let mut frames = match seeded {
             Ok(frames) => frames,
             Err(why) => {
                 crate::mc_diag_bump(why.diag_slot());
@@ -5842,6 +5934,12 @@ impl<S: JitState> JitDriver<S> {
                 return None;
             }
         };
+
+        // Generated `setup_bridge_sym` rebinds a missing identity register
+        // from the live state. Grain's two reds are those identities and
+        // the resume stream can still name a walk-local address; rewrite
+        // the concrete shadows before the walk residual-calls through them.
+        state.rebind_bridge_reds_from_fail(&mut frames, raw_values);
 
         self.bridge_entered_at_guard_resume = true;
         let mut entered = false;
@@ -8920,6 +9018,23 @@ impl<S: JitState> JitDriver<S> {
             .opimpl_arraylen_vable(pc, vable_opref, vable_struct_ptr, fdescr, adescr)
     }
 
+    /// Whether `source_descr` already has a compiled bridge attached.
+    ///
+    /// Used to keep a working patch when a later FIRED re-enters setup
+    /// and aborts: `record_declined_bridge_guard` would otherwise make
+    /// every later fail skip that patch.
+    fn source_guard_already_bridged(
+        &self,
+        source_descr: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) -> bool {
+        let Some(fd) = source_descr.as_fail_descr() else {
+            return false;
+        };
+        let green_key = self.meta.bridge_info().map(|b| b.green_key).unwrap_or(0);
+        self.meta
+            .bridge_was_compiled(green_key, fd.trace_id(), fd.fail_index_per_trace())
+    }
+
     /// Start bridge tracing from a guard failure point.
     ///
     /// Uses the compiled loop's stored meta so that the sym's
@@ -8967,6 +9082,16 @@ impl<S: JitState> JitDriver<S> {
         let green_key = jct.green_key();
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
+        // `pyjitpl.py` `raise_continue_running_normally` leaves this
+        // path once a bridge is attached. A later `must_compile` FIRED
+        // here is a pyre re-entry; walking again can abort setup and
+        // terminally decline the working source.
+        if self
+            .meta
+            .bridge_was_compiled(green_key, trace_id, fail_index)
+        {
+            return false;
+        }
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
             majit_metainterp::mc_diag_bump(15); // sbt early: no compiled_meta
             return false;
