@@ -1,3 +1,4 @@
+# pyre-check: platforms=linux,darwin
 # CPython-suite gap: test_os.FwalkTests.test_fd_finalization only grades the
 # fwalk generator's own descriptors.  On a tracing GC, `close()` that pays a
 # whole-heap collect also runs `__del__` of unrelated FileIO left by earlier
