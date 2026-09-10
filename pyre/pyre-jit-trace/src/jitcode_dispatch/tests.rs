@@ -2564,7 +2564,7 @@ fn int_ovf_jump_constant_operands_fold_without_recording_an_ovf_op() {
 }
 
 #[test]
-fn int_ovf_jump_declines_when_an_operand_is_not_concrete() {
+fn int_ovf_jump_records_when_an_operand_is_not_concrete() {
     let byte = *insns_opname_to_byte()
         .get("int_add_jump_if_ovf/Lii>i")
         .expect("int_add_jump_if_ovf must be in the runtime instruction table");
@@ -2573,13 +2573,14 @@ fn int_ovf_jump_declines_when_an_operand_is_not_concrete() {
     let lhs = OpRef::input_arg_int(0);
     let rhs = OpRef::input_arg_int(1);
     let mut regs_i = [lhs, rhs, OpRef::NONE];
-    let err = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
-        .expect_err("an unstamped overflow operand must decline");
-    assert_eq!(
-        err,
-        DispatchError::IntOvfOperandNotConcrete { pc: 0, value: lhs }
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("unstamped overflow operands still record the sequential arm");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    assert!(
+        tc.num_ops() >= 1,
+        "bridge InputArgs must still record INT_ADD_OVF"
     );
-    assert_eq!(tc.num_ops(), 0, "a declined overflow jump records nothing");
 }
 
 /// Drive one of the `d>r` struct-allocation handlers (`new`,
