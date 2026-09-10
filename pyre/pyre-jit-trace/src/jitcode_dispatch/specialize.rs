@@ -16099,7 +16099,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
         );
     }
     let active = if nested_helper {
-        ctx.outer_active_boxes.clone()
+        ctx.frame_state.borrow().outer_active_boxes.clone()
     } else {
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
