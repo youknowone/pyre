@@ -6199,6 +6199,26 @@ mod tests {
             assert_eq!(targets.len(), 2);
             assert_eq!(targets[1].has_guard_not_forced_2, 1);
         }
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        drop(table);
+        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 0);
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&token_number))
+            .expect("published dispatch entry");
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a later publish without GNF2 must not clear the cell flag"
+        );
         drop(table);
         failguard::ca_dispatch_remove(token_number);
     }

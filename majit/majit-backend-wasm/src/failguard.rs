@@ -470,14 +470,23 @@ pub struct WasmCaRuntimeTarget {
 /// function with the temporary callback's frame geometry under concurrent
 /// execution.  Old snapshots stay owned by the entry for as long as any caller
 /// can still hold the pointer it loaded.
+///
+/// `has_guard_not_forced_2` is not snapshot state: an out-of-line
+/// `GUARD_NOT_FORCED_2` bridge can attach while a CALL_ASSEMBLER is
+/// already inside the callee. The in-flight footer still holds the
+/// pre-call snapshot, so this flag lives on the cell and only goes
+/// 0 → 1.
 #[repr(C)]
 pub struct WasmCaDispatchEntry {
     pub target_ptr: AtomicU32,
+    pub has_guard_not_forced_2: AtomicU32,
     pub targets: std::sync::Mutex<Vec<Box<WasmCaRuntimeTarget>>>,
 }
 
 pub const WASM_CA_DISPATCH_TARGET_PTR_OFS: u64 =
     std::mem::offset_of!(WasmCaDispatchEntry, target_ptr) as u64;
+pub const WASM_CA_DISPATCH_HAS_GNF2_OFS: u64 =
+    std::mem::offset_of!(WasmCaDispatchEntry, has_guard_not_forced_2) as u64;
 pub const WASM_CA_TARGET_FUNC_HANDLE_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, func_handle) as u64;
 pub const WASM_CA_TARGET_COMPILED_PTR_OFS: u64 =
@@ -640,6 +649,7 @@ pub fn ca_dispatch_slot(number: u64) -> u32 {
         .or_insert_with(|| {
             Box::new(WasmCaDispatchEntry {
                 target_ptr: AtomicU32::new(0),
+                has_guard_not_forced_2: AtomicU32::new(0),
                 targets: std::sync::Mutex::new(Vec::new()),
             })
         });
@@ -666,6 +676,9 @@ pub fn ca_dispatch_publish(
         .as_ref()
         .and_then(|table| table.get(&number))
         .expect("CALL_ASSEMBLER dispatch entry disappeared while publishing");
+    if has_guard_not_forced_2 != 0 {
+        entry.has_guard_not_forced_2.store(1, Ordering::Release);
+    }
     let mut targets = entry.targets.lock().unwrap();
     if targets.last().is_some_and(|current| {
         current.func_handle == func_handle

@@ -2465,9 +2465,11 @@ fn emit_ca_pop_shadowstack(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
 /// the caller footer is the x86 `SUB`. A callee that retains
 /// `GUARD_NOT_FORCED_2` still keeps the frame reachable after the pop;
 /// those traces keep `wasm_jit_ca_pop_frame` (finish map + write barrier
-/// + pop). The flag is the callee's, loaded from the redirectable
-/// snapshot — the caller's own ops do not describe the frame being
-/// popped, including after `redirect_call_assembler`.
+/// + pop). The flag is the callee's and lives on the stable dispatch
+/// cell, not the pre-call snapshot: a GNF2 bridge can attach while this
+/// invocation is inside the callee. The caller's own ops do not
+/// describe the frame being popped, including after
+/// `redirect_call_assembler`.
 fn emit_ca_pop_footer(
     sink: &mut PeepSink<'_, '_>,
     inline: CaInlineParams,
@@ -2475,11 +2477,11 @@ fn emit_ca_pop_footer(
     ca_pop_fn_ptr: i64,
     ca_cfp_local: u32,
     scratch: u32,
-    ca_target_local: u32,
+    dispatch_entry: i32,
 ) {
     use majit_backend::jitframe::{JF_FORCE_DESCR_OFS, JF_GCMAP_OFS, SIZEOFSIGNED};
-    sink.local_get(ca_target_local);
-    sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HAS_GNF2_OFS));
+    sink.i32_const(dispatch_entry);
+    sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_HAS_GNF2_OFS));
     sink.if_(BlockType::Empty);
     let ss_word = std::mem::size_of::<usize>() as i32;
     // `assembler.py` `_reload_frame_if_necessary`: `top[-WORD]` is the
@@ -8728,7 +8730,7 @@ fn build_function(
                         ca.ca_pop_fn_ptr,
                         ca_cfp_local,
                         alloc_scratch_local,
-                        ca_target_local,
+                        dispatch_entry,
                     );
                 } else if let Some(base) = residual_type_base {
                     sink.local_get(ca_cfp_local);
@@ -8769,8 +8771,8 @@ fn build_function(
                         ca.inline,
                     );
                 } else {
-                    sink.local_get(ca_target_local);
-                    sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HAS_GNF2_OFS));
+                    sink.i32_const(dispatch_entry);
+                    sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_HAS_GNF2_OFS));
                     sink.if_(BlockType::Empty);
                     emit_reload_ca_frame_if_necessary(
                         &mut sink,
