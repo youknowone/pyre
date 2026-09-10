@@ -17,6 +17,35 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
+/// info.py `init_fields`: one list sized to the descr, not a grow
+/// chain. A 4-entry `(u32, FieldEntry)` grow was 96 B on the regex
+/// `and`/`or` leaf (`PtrInfo::setfield`).
+fn reserve_assoc<T>(fields: &mut Vec<T>, n: usize) {
+    if n > fields.capacity() {
+        fields.reserve(n - fields.len());
+    }
+}
+
+fn push_assoc<V>(fields: &mut Vec<(u32, V)>, field_idx: u32, value: V, reserve_n: usize) {
+    for entry in fields.iter_mut() {
+        if entry.0 == field_idx {
+            entry.1 = value;
+            return;
+        }
+    }
+    if fields.capacity() == 0 {
+        fields.reserve(reserve_n.max(1));
+    }
+    fields.push((field_idx, value));
+}
+
+fn descr_field_len(descr: Option<&DescrRef>) -> usize {
+    descr
+        .and_then(|d| d.as_size_descr())
+        .map(|sd| sd.all_fielddescrs().len())
+        .unwrap_or(8)
+}
+
 /// info.py `reasonable_array_index(index)` — sanity gate on a
 /// constant array index or array size. Returns false for negative
 /// values or values above 150_000 so invalid loops and pathological
@@ -1089,7 +1118,9 @@ impl PtrInfo {
     }
 
     /// info.py `AbstractStructPtrInfo.init_fields` — upgrade the
-    /// descr when a more-precise one shows up via `setfield`.
+    /// descr when a more-precise one shows up via `setfield`, and
+    /// size `_fields` to `len(descr.get_all_fielddescrs())` so
+    /// subsequent `setfield`s do not grow a 96 B `Vec` mid-guard.
     pub fn init_fields(&mut self, descr: DescrRef, index: usize) {
         let Some(size_descr) = descr.as_size_descr() else {
             return;
@@ -1106,6 +1137,7 @@ impl PtrInfo {
                 if (v.descr.is_none() || index >= cur_len) && (cur_len == 0 || new_len > cur_len) {
                     v.descr = Some(descr);
                 }
+                reserve_assoc(&mut v.fields, new_len);
             }
             PtrInfo::Struct(v) => {
                 let cur_len = v
@@ -1116,6 +1148,7 @@ impl PtrInfo {
                 if cur_len == 0 || (index >= cur_len && new_len > cur_len) {
                     v.descr = descr;
                 }
+                reserve_assoc(&mut v.fields, new_len);
             }
             PtrInfo::Virtual(v) => {
                 let cur_len = v
@@ -1126,6 +1159,7 @@ impl PtrInfo {
                 if cur_len == 0 || (index >= cur_len && new_len > cur_len) {
                     v.descr = descr;
                 }
+                reserve_assoc(&mut v.fields, new_len);
             }
             PtrInfo::VirtualStruct(v) => {
                 let cur_len = v
@@ -1136,6 +1170,7 @@ impl PtrInfo {
                 if cur_len == 0 || (index >= cur_len && new_len > cur_len) {
                     v.descr = descr;
                 }
+                reserve_assoc(&mut v.fields, new_len);
             }
             _ => {}
         }
@@ -1145,49 +1180,23 @@ impl PtrInfo {
     pub fn setfield(&mut self, field_idx: u32, value: Operand) {
         match self {
             PtrInfo::Instance(v) => {
-                for entry in &mut v.fields {
-                    if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value.clone());
-                        return;
-                    }
-                }
-                v.fields.push((field_idx, FieldEntry::Value(value)));
+                let n = descr_field_len(v.descr.as_ref());
+                push_assoc(&mut v.fields, field_idx, FieldEntry::Value(value), n);
             }
             PtrInfo::Struct(v) => {
-                for entry in &mut v.fields {
-                    if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value.clone());
-                        return;
-                    }
-                }
-                v.fields.push((field_idx, FieldEntry::Value(value)));
+                let n = descr_field_len(Some(&v.descr));
+                push_assoc(&mut v.fields, field_idx, FieldEntry::Value(value), n);
             }
             PtrInfo::Virtual(v) => {
-                for entry in &mut v.fields {
-                    if entry.0 == field_idx {
-                        entry.1 = value.clone();
-                        return;
-                    }
-                }
-                v.fields.push((field_idx, value));
+                let n = descr_field_len(Some(&v.descr));
+                push_assoc(&mut v.fields, field_idx, value, n);
             }
             PtrInfo::VirtualStruct(v) => {
-                for entry in &mut v.fields {
-                    if entry.0 == field_idx {
-                        entry.1 = value.clone();
-                        return;
-                    }
-                }
-                v.fields.push((field_idx, value));
+                let n = descr_field_len(Some(&v.descr));
+                push_assoc(&mut v.fields, field_idx, value, n);
             }
             PtrInfo::Virtualizable(v) => {
-                for entry in &mut v.heap_fields {
-                    if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value.clone());
-                        return;
-                    }
-                }
-                v.heap_fields.push((field_idx, FieldEntry::Value(value)));
+                push_assoc(&mut v.heap_fields, field_idx, FieldEntry::Value(value), 8);
             }
             _ => {}
         }
@@ -1521,5 +1530,43 @@ impl PtrInfo {
             }
         }
         result
+    }
+
+    #[cfg(test)]
+    fn fields_capacity(&self) -> usize {
+        match self {
+            PtrInfo::Instance(v) => v.fields.capacity(),
+            PtrInfo::Struct(v) => v.fields.capacity(),
+            PtrInfo::Virtual(v) => v.fields.capacity(),
+            PtrInfo::VirtualStruct(v) => v.fields.capacity(),
+            _ => 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setfield_reserves_once_instead_of_growing_to_four() {
+        let mut info = PtrInfo::instance(None, None);
+        let value = Operand::from_opref(OpRef::ConstInt(1));
+        info.setfield(0, value.clone());
+        let cap = info.fields_capacity();
+        assert!(
+            cap >= 4,
+            "info.py init_fields sizes _fields in one go; first setfield \
+             should not leave a 1-slot Vec that grows to 96 B at 4 entries, \
+             cap={cap}"
+        );
+        for i in 1..4 {
+            info.setfield(i, value.clone());
+        }
+        assert_eq!(
+            info.fields_capacity(),
+            cap,
+            "later setfields must not grow the reserved list"
+        );
     }
 }

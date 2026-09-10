@@ -7332,6 +7332,7 @@ impl OptContext {
                     .unwrap_or_else(|| Operand::from_opref(*a))
             })
             .collect();
+        memo.recycle_ordered_liveboxes(liveboxes);
         let logical_rd_locs: majit_ir::RdLocs = final_operands
             .iter()
             .enumerate()
@@ -9055,7 +9056,10 @@ impl OptContext {
                 .is_some()
         {
             let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
-            if let Some(info) = self.get_const_info_mut(arg0, parent_descr) {
+            if let Some(info) = self.get_const_info_mut(arg0, parent_descr.clone()) {
+                if let Some(parent) = parent_descr {
+                    info.init_fields(parent, field_idx as usize);
+                }
                 info.setfield(field_idx, value.clone());
             }
             return;
@@ -9077,10 +9081,14 @@ impl OptContext {
         // info.py AbstractStructPtrInfo.setfield: mutate `_fields`
         // in the PtrInfo object stored in the operand's `_forwarded` slot.
         // PyPy has the same single-object behavior via `box._forwarded`.
+        let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
         self.with_ensured_ptr_info_arg0(op, |mut handle| {
             if let Some(mut pi) = handle.as_mut() {
                 if is_header_word && pi.is_virtual() {
                     return;
+                }
+                if let Some(parent) = parent_descr.clone() {
+                    pi.init_fields(parent, field_idx as usize);
                 }
                 pi.setfield(field_idx, value.clone());
             }
