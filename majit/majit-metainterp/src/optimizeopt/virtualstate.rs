@@ -2339,116 +2339,20 @@ impl VirtualState {
 }
 
 impl Clone for VirtualState {
-    /// Deep-clone the entire `VirtualStateInfoNode` tree so the cloned
-    /// `VirtualState` owns an independent set of `position` /
-    /// `position_in_notvirtuals` cells. Within a single clone, source nodes
-    /// shared by `Rc` identity remain shared in the destination (cached by
-    /// `Rc::as_ptr`), preserving RPython's `VirtualStateConstructor`
-    /// box-keyed instance sharing semantics.
-    ///
-    /// A naive `#[derive(Clone)]` would `Rc::clone` (refcount-only) and
-    /// leak position cells across clones; calling `enum_top_level` on
-    /// either copy then resets shared `Cell<i32>` positions, corrupting
-    /// the other. RPython's `VirtualState.__init__` constructs fresh
-    /// subclass instances per VirtualState — this manual impl reproduces
-    /// that invariant.
+    /// Share the `AbstractVirtualStateInfo` graph. RPython `VirtualState`
+    /// is one object; assignment (`TargetToken.virtual_state = vs`,
+    /// `ExportedState.virtual_state = vs`) never copies the instance tree.
+    /// `VirtualState.__init__` / `from_shared_rcs` is the only constructor
+    /// that walks `enum`; `refresh_from_gc` and `force_boxes` rewrite this
+    /// instance in place. A deep copy of the node tree was a compile-time
+    /// `IndexMap` + per-node `Rc` on every `token.virtual_state.clone()`.
     fn clone(&self) -> Self {
-        let mut cache: indexmap::IndexMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>> =
-            indexmap::IndexMap::new();
-        let cloned: Vec<Rc<VirtualStateInfoNode>> = self
-            .state
-            .iter()
-            .map(|src| deep_clone_node(src, &mut cache))
-            .collect();
-        VirtualState::from_shared_rcs(cloned)
+        VirtualState {
+            state: self.state.clone(),
+            numnotvirtuals: self.numnotvirtuals,
+            info_counter: self.info_counter,
+        }
     }
-}
-
-/// Deep-clone a `VirtualStateInfoNode` tree, mapping each source `Rc`
-/// identity to one fresh `Rc` in the destination via `cache`. Used by
-/// `<VirtualState as Clone>::clone`.
-fn deep_clone_node(
-    src: &Rc<VirtualStateInfoNode>,
-    cache: &mut indexmap::IndexMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>>,
-) -> Rc<VirtualStateInfoNode> {
-    let key = Rc::as_ptr(src);
-    if let Some(hit) = cache.get(&key) {
-        return Rc::clone(hit);
-    }
-    let cloned_info = match &src.info {
-        VirtualStateInfo::Constant(v) => VirtualStateInfo::Constant(*v),
-        VirtualStateInfo::KnownClass { class_ptr } => VirtualStateInfo::KnownClass {
-            class_ptr: *class_ptr,
-        },
-        VirtualStateInfo::NonNull => VirtualStateInfo::NonNull,
-        VirtualStateInfo::IntBounded(b) => VirtualStateInfo::IntBounded(b.clone()),
-        VirtualStateInfo::Unknown(t) => VirtualStateInfo::Unknown(*t),
-        VirtualStateInfo::Virtual {
-            descr,
-            known_class,
-            ob_type_descr,
-            fields,
-            field_descrs,
-        } => VirtualStateInfo::Virtual {
-            descr: descr.clone(),
-            known_class: *known_class,
-            ob_type_descr: ob_type_descr.clone(),
-            fields: fields
-                .iter()
-                .map(|(idx, child)| (*idx, deep_clone_node(child, cache)))
-                .collect(),
-            field_descrs: field_descrs.clone(),
-        },
-        VirtualStateInfo::VStruct {
-            descr,
-            fields,
-            field_descrs,
-        } => VirtualStateInfo::VStruct {
-            descr: descr.clone(),
-            fields: fields
-                .iter()
-                .map(|(idx, child)| (*idx, deep_clone_node(child, cache)))
-                .collect(),
-            field_descrs: field_descrs.clone(),
-        },
-        VirtualStateInfo::VArray {
-            descr,
-            items,
-            lenbound,
-        } => VirtualStateInfo::VArray {
-            descr: descr.clone(),
-            items: items
-                .iter()
-                .map(|child| child.as_ref().map(|child| deep_clone_node(child, cache)))
-                .collect(),
-            lenbound: lenbound.clone(),
-        },
-        VirtualStateInfo::VArrayStruct {
-            descr,
-            fielddescrs,
-            element_fields,
-        } => VirtualStateInfo::VArrayStruct {
-            descr: descr.clone(),
-            fielddescrs: fielddescrs.clone(),
-            element_fields: element_fields
-                .iter()
-                .map(|fields| {
-                    fields
-                        .iter()
-                        .map(|(idx, child)| {
-                            (
-                                *idx,
-                                child.as_ref().map(|child| deep_clone_node(child, cache)),
-                            )
-                        })
-                        .collect()
-                })
-                .collect(),
-        },
-    };
-    let new_rc = VirtualStateInfoNode::new_rc_with_lenbound(cloned_info, src.lenbound.clone());
-    cache.insert(key, Rc::clone(&new_rc));
-    new_rc
 }
 
 /// A guard that must be emitted to make an incoming state compatible.
@@ -3740,6 +3644,17 @@ mod tests {
             .expect("make_inputargs");
         // Single deduped slot, written by the first top-level visit.
         assert_eq!(inputargs, vec![outer_ref]);
+    }
+
+    /// `VirtualState` assignment shares the info graph (`VirtualState.__init__`
+    /// is the constructor; later copies are the same Python object).
+    #[test]
+    fn clone_shares_node_identity() {
+        let vs = VirtualState::new(vec![VirtualStateInfo::NonNull]);
+        let cloned = vs.clone();
+        assert!(Rc::ptr_eq(&vs.state[0], &cloned.state[0]));
+        assert_eq!(vs.num_boxes(), cloned.num_boxes());
+        assert_eq!(vs.state[0].position.get(), cloned.state[0].position.get());
     }
 
     #[test]

@@ -1273,6 +1273,12 @@ impl Optimization for OptPure {
         // preamble_pure_ops also NOT cleared — populated during import.
     }
 
+    fn reset_between_compiles(&mut self) {
+        self.setup();
+        self.extra_call_pure.clear();
+        self.preamble_pure_ops.clear();
+    }
+
     fn set_call_pure_results(&mut self, results: &crate::optimizeopt::util::ArgsDict) {
         self.call_pure_results = results.clone();
     }

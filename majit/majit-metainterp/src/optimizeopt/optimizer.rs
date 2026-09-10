@@ -77,6 +77,16 @@ pub trait Optimization {
     /// Called once before optimization starts.
     fn setup(&mut self) {}
 
+    /// Drop state that `setup` keeps for an intra-compile phase-1 → phase-2
+    /// handoff (`OptPure.extra_call_pure` / `preamble_pure_ops`) so a recycled
+    /// optimizer cannot leak it into the next `compile_bridge`.
+    ///
+    /// RPython `BridgeCompileData.optimize` constructs a new
+    /// `UnrollOptimizer` per compile; nursery allocation is cheap there.
+    fn reset_between_compiles(&mut self) {
+        self.setup();
+    }
+
     /// Called after all operations have been processed.
     fn flush(&mut self, _ctx: &mut OptContext) {}
 
@@ -1550,6 +1560,53 @@ impl Optimizer {
             cpu: crate::cpu::default_cpu(),
             emitted_operations: indexmap::IndexSet::new(),
             explicit_input_ops_seed: None,
+        }
+    }
+
+    /// Keep the pass boxes and `ResumeDataLoopMemo` scratch, drop the
+    /// per-compile graph. RPython `BridgeCompileData.optimize` constructs a
+    /// new `UnrollOptimizer` per compile; nursery allocation is cheap there.
+    pub fn recycle_for_next_compile(&mut self) {
+        self.final_num_inputs = 0;
+        self.call_pure_results = crate::optimizeopt::util::ArgsDict::default();
+        self.last_guard_op_idx = None;
+        self.replaces_guard.clear();
+        self.pendingfields.clear();
+        self.can_replace_guards = true;
+        self.quasi_immutable_deps.clear();
+        self.imported_virtuals.clear();
+        self.trace_inputargs.clear();
+        self.runtime_boxes.clear();
+        self.exported_loop_state = None;
+        self.imported_loop_state = None;
+        self.imported_short_aliases.clear();
+        self.imported_short_preamble = None;
+        self.imported_short_preamble_builder = None;
+        self.short_preamble_producer = None;
+        self.published_short_preamble_producer_slot = None;
+        self.imported_label_args = None;
+        self.patchguardop = None;
+        self.skip_flush = false;
+        self.terminal_op = None;
+        self.final_ctx = None;
+        self.pending_bridge_rd = None;
+        self.building_bridge = false;
+        self.simple_compile = false;
+        self.all_descrs = Arc::new(Vec::new());
+        self.snapshot_boxes = Vec::new();
+        self.snapshot_frame_sizes = Vec::new();
+        self.snapshot_vable_boxes = Vec::new();
+        self.snapshot_vref_boxes = Vec::new();
+        self.snapshot_frame_pcs = Vec::new();
+        self.phase1_emit_ops.clear();
+        self.opt_ops_emitted = 0;
+        self.opt_guards_emitted = 0;
+        self.opt_guards_shared_emitted = 0;
+        self.emitted_operations.clear();
+        self.explicit_input_ops_seed = None;
+        self.resumedata_memo.borrow_mut().recycle_for_next_compile();
+        for pass in &mut self.passes {
+            pass.reset_between_compiles();
         }
     }
 

@@ -2213,6 +2213,11 @@ pub struct MetaInterp<M: Clone> {
     /// `consts` — and the raw-address keys of its `refs` cache — name nothing
     /// the collector forwards. Emptied by [`CompileSnapshotRootsGuard`].
     pub(crate) compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
+    /// Reused across sequential `compile_bridge` calls so the pass boxes
+    /// and `ResumeDataLoopMemo` scratch stay allocated. RPython
+    /// `BridgeCompileData.optimize` constructs a new `UnrollOptimizer`
+    /// per compile; nursery allocation is cheap there.
+    cached_optimizer: Option<crate::optimizeopt::optimizer::Optimizer>,
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
@@ -3868,6 +3873,7 @@ impl<M: Clone> MetaInterp<M> {
             compile_snapshot_refs: Vec::new(),
             compile_short_preamble_producer: None,
             compile_resume_memos: Vec::new(),
+            cached_optimizer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
             pending_preamble_tokens: indexmap::IndexMap::new(),
@@ -5249,6 +5255,34 @@ impl<M: Clone> MetaInterp<M> {
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();
         opt
+    }
+
+    fn take_optimizer(&mut self) -> Optimizer {
+        match self.cached_optimizer.take() {
+            Some(mut opt) => {
+                let want_vable = self
+                    .current_virtualizable_optimizer_config()
+                    .map(|config| config.static_field_offsets.len() as i64)
+                    .unwrap_or(-1);
+                if opt.minimum_virtualizable_size != want_vable {
+                    return self.make_optimizer();
+                }
+                opt.recycle_for_next_compile();
+                opt.supports_efficient_uint_mul_high =
+                    self.backend.supports_efficient_uint_mul_high();
+                opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
+                opt.set_vrefinfo(self.virtualref_info().clone());
+                opt.string_length_resolver = self.string_length_resolver.clone();
+                opt.string_content_resolver = self.string_content_resolver.clone();
+                opt.string_constant_alloc = self.string_constant_alloc.clone();
+                opt
+            }
+            None => self.make_optimizer(),
+        }
+    }
+
+    fn return_optimizer(&mut self, optimizer: Optimizer) {
+        self.cached_optimizer = Some(optimizer);
     }
 
     /// Install the host-runtime `getstrlen1` resolver. The closure must be
@@ -14991,7 +15025,7 @@ impl<M: Clone> MetaInterp<M> {
         // optimize_bridge's generate_guards reads them in the re-minted space.
         let bridge_runtime_boxes = prepared_runtime_boxes.as_slice();
 
-        let mut optimizer = self.make_optimizer();
+        let mut optimizer = self.take_optimizer();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
@@ -15104,6 +15138,7 @@ impl<M: Clone> MetaInterp<M> {
                         inv.0, green_key, fail_index
                     );
                 }
+                self.return_optimizer(optimizer);
                 return false;
             }
         };
@@ -15160,6 +15195,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.retrace_needed(green_key, optimized_ops.clone(), renamed_inputargs, es);
             }
             self.retrace_after_bridge = true;
+            self.return_optimizer(optimizer);
             return false;
         }
 
@@ -15216,6 +15252,7 @@ impl<M: Clone> MetaInterp<M> {
                             "bridge giveup: JUMP args {jump_len} != target LABEL args {target_len}"
                         ),
                     );
+                    self.return_optimizer(optimizer);
                     return false;
                 }
             }
@@ -15374,6 +15411,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
                     hook(green_key, fail_index, num_optimized_ops);
                 }
+                self.return_optimizer(optimizer);
                 true
             }
             Err(e) => {
@@ -15401,6 +15439,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
+                self.return_optimizer(optimizer);
                 false
             }
         }

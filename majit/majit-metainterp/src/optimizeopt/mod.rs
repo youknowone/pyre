@@ -7311,6 +7311,7 @@ impl OptContext {
                     .unwrap_or(majit_ir::Type::Ref)
             })
             .collect();
+        memo.recycle_livebox_types(livebox_types);
 
         // optimizer.py:712 liveboxes are the canonical Box objects returned
         // by `resumedata.finish()`; resolve each numbering position to its

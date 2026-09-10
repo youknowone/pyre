@@ -158,6 +158,11 @@ impl LiveboxMap {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.index = None;
+    }
+
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -3493,6 +3498,11 @@ pub struct ResumeDataLoopMemo {
     writer_scratch: Vec<i32>,
     livebox_opt_scratch: Vec<Option<majit_ir::OpRef>>,
     ordered_livebox_scratch: Vec<majit_ir::OpRef>,
+    livebox_map_scratch: LiveboxMap,
+    new_livebox_map_scratch: LiveboxMap,
+    livebox_types_scratch: LiveboxTypeMap,
+    virtual_fields_scratch: indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
+    virtual_worklist_scratch: Vec<majit_ir::OpRef>,
 }
 
 impl ResumeDataLoopMemo {
@@ -3509,6 +3519,99 @@ impl ResumeDataLoopMemo {
             writer_scratch: Vec::new(),
             livebox_opt_scratch: Vec::new(),
             ordered_livebox_scratch: Vec::new(),
+            livebox_map_scratch: LiveboxMap::new(),
+            new_livebox_map_scratch: LiveboxMap::new(),
+            livebox_types_scratch: LiveboxTypeMap::default(),
+            virtual_fields_scratch: indexmap::IndexMap::new(),
+            virtual_worklist_scratch: Vec::new(),
+        }
+    }
+
+    /// Drop per-compile caches (`resume.py ResumeDataLoopMemo.__init__`)
+    /// but keep the writer / livebox scratch capacities.
+    pub fn recycle_for_next_compile(&mut self) {
+        self.consts = majit_ir::SharedConstPool::new(Vec::new());
+        self.large_ints.clear();
+        self.refs.clear();
+        self.cached_boxes.clear();
+        self.cached_virtuals.clear();
+        self.nvirtuals = 0;
+        self.nvholes = 0;
+        self.nvreused = 0;
+        self.livebox_map_scratch.clear();
+        self.new_livebox_map_scratch.clear();
+        self.livebox_types_scratch.clear();
+        self.virtual_fields_scratch.clear();
+        self.virtual_worklist_scratch.clear();
+    }
+
+    fn take_livebox_map(&mut self) -> LiveboxMap {
+        let mut map = std::mem::take(&mut self.livebox_map_scratch);
+        map.clear();
+        map
+    }
+
+    fn return_livebox_map(&mut self, mut map: LiveboxMap) {
+        map.clear();
+        if map.entries.capacity() > self.livebox_map_scratch.entries.capacity() {
+            self.livebox_map_scratch = map;
+        }
+    }
+
+    fn take_new_livebox_map(&mut self) -> LiveboxMap {
+        let mut map = std::mem::take(&mut self.new_livebox_map_scratch);
+        map.clear();
+        map
+    }
+
+    fn return_new_livebox_map(&mut self, mut map: LiveboxMap) {
+        map.clear();
+        if map.entries.capacity() > self.new_livebox_map_scratch.entries.capacity() {
+            self.new_livebox_map_scratch = map;
+        }
+    }
+
+    fn take_livebox_types(&mut self) -> LiveboxTypeMap {
+        let mut types = std::mem::take(&mut self.livebox_types_scratch);
+        types.clear();
+        types
+    }
+
+    pub fn recycle_livebox_types(&mut self, mut types: LiveboxTypeMap) {
+        types.clear();
+        if types.capacity() > self.livebox_types_scratch.capacity() {
+            self.livebox_types_scratch = types;
+        }
+    }
+
+    fn take_virtual_fields(
+        &mut self,
+    ) -> indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo> {
+        let mut fields = std::mem::take(&mut self.virtual_fields_scratch);
+        fields.clear();
+        fields
+    }
+
+    fn return_virtual_fields(
+        &mut self,
+        mut fields: indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
+    ) {
+        fields.clear();
+        if fields.capacity() > self.virtual_fields_scratch.capacity() {
+            self.virtual_fields_scratch = fields;
+        }
+    }
+
+    fn take_virtual_worklist(&mut self) -> Vec<majit_ir::OpRef> {
+        let mut worklist = std::mem::take(&mut self.virtual_worklist_scratch);
+        worklist.clear();
+        worklist
+    }
+
+    fn return_virtual_worklist(&mut self, mut worklist: Vec<majit_ir::OpRef>) {
+        worklist.clear();
+        if worklist.capacity() > self.virtual_worklist_scratch.capacity() {
+            self.virtual_worklist_scratch = worklist;
         }
     }
 
@@ -4388,12 +4491,14 @@ impl ResumeDataLoopMemo {
         };
         writer.current.clear();
         writer.current.reserve(size_hint);
+        let mut livebox_types = self.take_livebox_types();
+        livebox_types.reserve(size_hint);
         let mut numb_state = NumberingState {
             writer,
-            liveboxes: LiveboxMap::new(),
+            liveboxes: self.take_livebox_map(),
             num_boxes: 0,
             num_virtuals: 0,
-            livebox_types: indexmap::IndexMap::with_capacity_and_hasher(size_hint, FxBuildHasher),
+            livebox_types,
         };
 
         // resume.py:231-232: patch later
@@ -4494,7 +4599,7 @@ impl ResumeDataLoopMemo {
 
         // resume.py:413: self.vfieldboxes collected by virtual walk
         // resume.py:408: self.liveboxes — newly discovered boxes from field walk
-        let mut new_liveboxes = LiveboxMap::new();
+        let mut new_liveboxes = self.take_new_livebox_map();
 
         // resume.py:414-426: iterate liveboxes_from_env, discover virtual
         // fields. RPython walks the dict in insertion order; pyre's
@@ -4516,11 +4621,10 @@ impl ResumeDataLoopMemo {
         // (resume.py:419-426 visitor_walk_recursive pattern). Keyed by
         // typed OpRef so the same_box (resoperation.py) identity is
         // preserved end-to-end through the worklist drain.
-        let mut virtual_fields: indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo> =
-            indexmap::IndexMap::new();
+        let mut virtual_fields = self.take_virtual_fields();
 
         // resume.py:419-426: visitor_walk_recursive — worklist for nested virtuals.
-        let mut virtual_worklist: Vec<majit_ir::OpRef> = Vec::new();
+        let mut virtual_worklist = self.take_virtual_worklist();
 
         for (b, tagged) in numb_state.liveboxes.iter() {
             // #160/S11: liveboxes is now box-keyed; the serialized livebox
@@ -4741,6 +4845,10 @@ impl ResumeDataLoopMemo {
         }));
         liveboxes.clear();
         self.livebox_opt_scratch = liveboxes;
+        self.return_livebox_map(std::mem::take(&mut numb_state.liveboxes));
+        self.return_new_livebox_map(new_liveboxes);
+        self.return_virtual_fields(virtual_fields);
+        self.return_virtual_worklist(virtual_worklist);
 
         // Merge livebox_types: numbering-time types + types for boxes
         // discovered during virtual field walking.
