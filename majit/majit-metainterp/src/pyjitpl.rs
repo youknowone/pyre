@@ -1678,8 +1678,15 @@ fn densify_root_loop_inputargs(
         .collect();
 
     let remap = |operand: &majit_ir::operand::Operand| {
+        // compile.py emit_op walks `get_box_replacement` before the
+        // positional rebind. A leftover InputArg that optimizer
+        // `_forwarded` onto a renamed root box must follow that chain,
+        // or LABEL/JUMP/failargs keep the pre-densify id and wasm
+        // declines it as an unbound local.
+        let canon = operand.get_box_replacement(false);
         replacements
-            .get(&operand.to_opref())
+            .get(&canon.to_opref())
+            .or_else(|| replacements.get(&operand.to_opref()))
             .map(majit_ir::operand::Operand::from_bound_inputarg)
             .unwrap_or_else(|| operand.clone())
     };
@@ -2261,6 +2268,11 @@ pub struct MetaInterp<M: Clone> {
     pending_vable_ptr: *const u8,
     /// Virtualizable array lengths for trace-entry box layout.
     pub(crate) vable_array_lengths: Vec<usize>,
+    /// Field/array-item InputArgRefs minted at `initialize_virtualizable`.
+    /// `patch_new_loop` forwards leftover snapshot boxes through the
+    /// GETFIELD preamble when virtualstate has already dropped them from
+    /// `inputargs`.
+    pub(crate) vable_entry_oprefs: Vec<OpRef>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
     pub(crate) result_type: Type,
     /// PyPy warmspot.py max_unroll_recursion (default 7).
@@ -3980,6 +3992,7 @@ impl<M: Clone> MetaInterp<M> {
             stats: JitStatsCounters::default(),
             pending_vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
+            vable_entry_oprefs: Vec::new(),
             result_type: Type::Ref,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
             force_finish_trace: false,
@@ -5058,6 +5071,11 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py `initialize_virtualizable` closes by asserting the
         // freshly read boxes still match the object it read them from.
         ctx.check_synchronized_virtualizable();
+        // Keep the trace-entry lengths and minted field boxes for
+        // `patch_new_loop`. A later live read can see a shorter valuestack
+        // and drop InputArgRefs the snapshot still names.
+        self.set_vable_array_lengths(array_lengths);
+        self.vable_entry_oprefs = vable_oprefs;
     }
 
     /// warmstate.py: set_param_trace_eagerness — delegates to warmstate.
@@ -7172,10 +7190,6 @@ impl<M: Clone> MetaInterp<M> {
             Some(flat) => flat.len,
             None => driver.num_reds(),
         };
-        if inputargs.len() <= entry_prefix_len {
-            // Trace was never expanded (no virtualizable fields live at entry).
-            return;
-        }
         // compile.py:508-511
         //     vable = orig_inpargs[jitdriver_sd.index_of_virtualizable].getref_base()
         //     patch_new_loop_to_load_virtualizable_fields(loop, jitdriver_sd, vable)
@@ -7199,9 +7213,13 @@ impl<M: Clone> MetaInterp<M> {
         // length on the heap object must be fixed inside
         // `VirtualizableInfo` itself (to match `vinfo.get_array_length`'s
         // universal contract), not worked around in this helper.
-        let array_lengths: Vec<usize> = (0..vinfo.array_fields.len())
-            .map(|i| unsafe { vinfo.get_array_length(orig_vable_ptr, i) })
-            .collect();
+        let array_lengths: Vec<usize> = if !self.vable_array_lengths.is_empty() {
+            self.vable_array_lengths.clone()
+        } else {
+            (0..vinfo.array_fields.len())
+                .map(|i| unsafe { vinfo.get_array_length(orig_vable_ptr, i) })
+                .collect()
+        };
         compile::patch_new_loop_to_load_virtualizable_fields(
             ops,
             inputargs,
@@ -7210,6 +7228,7 @@ impl<M: Clone> MetaInterp<M> {
             entry_prefix_len,
             index_of_vable,
             constants,
+            &self.vable_entry_oprefs,
         );
         // compile.py `patch_new_loop_to_load_virtualizable_fields`
         // does not change LABEL/JUMP *arity*. `emit_op` still rewrites
@@ -25474,6 +25493,32 @@ mod tests {
         assert_eq!(
             ops[0].guard_fail_args().unwrap()[0].to_opref(),
             OpRef::input_arg_ref(2)
+        );
+    }
+
+    #[test]
+    fn test_densify_follows_forwarded_leftover_inputargs() {
+        let renamed = vec![OpRef::input_arg_ref(425)];
+        let canonical = std::rc::Rc::new(InputArg::new_ref(425));
+        let leftover = std::rc::Rc::new(InputArg::new_ref(98));
+        majit_ir::operand::Operand::from_bound_inputarg(&leftover)
+            .set_forwarded_inputarg(&canonical);
+        let guard = std::rc::Rc::new(mk_op(
+            OpCode::GuardClass,
+            &[renamed[0], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
+            OpRef::NONE.raw(),
+        ));
+        guard.setfailargs(
+            [majit_ir::operand::Operand::from_bound_inputarg(&leftover)]
+                .into_iter()
+                .collect(),
+        );
+        let (inputargs, ops) = densify_root_loop_inputargs(&renamed, vec![guard]);
+        assert_eq!(inputargs.len(), 1);
+        assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(0));
+        assert_eq!(
+            ops[0].getfailargs().unwrap()[0].to_opref(),
+            OpRef::input_arg_ref(0)
         );
     }
 
