@@ -1813,9 +1813,10 @@ impl BlackholeInterpreter {
     }
 
     /// Native-finish only at a node-entry PC. The regex leaf resumes at
-    /// mid-`shift` pc 210, so skip the `fnaddr` probe there.
+    /// mid-`shift` pc 210; probing `fnaddr` there was a TLS startpoint
+    /// walk on every frame of every character.
     fn run_after_rooting(&mut self) -> BhRunOutcome {
-        if native_entry_args_intact(&self.jitcode, self.position) {
+        if self.position == 0 {
             if let Some(outcome) = self.try_native_finish_at_node_entry() {
                 return outcome;
             }
@@ -1833,14 +1834,23 @@ impl BlackholeInterpreter {
         if !native_entry_args_intact(&self.jitcode, self.position) {
             return None;
         }
-        let body = self.jitcode.try_body()?;
-        let calldescr = body.calldescr.clone();
         let fnaddr = self.jitcode.fnaddr;
+        let (result_type, arg_ptr, arg_len, calldescr) = {
+            let body = self.jitcode.try_body()?;
+            (
+                body.calldescr.result_type,
+                body.calldescr.arg_classes.as_ptr(),
+                body.calldescr.arg_classes.len(),
+                &body.calldescr as *const majit_translate::jitcode::BhCallDescr,
+            )
+        };
         let mut args_i = smallvec::SmallVec::<[i64; 4]>::new();
         let mut args_r = smallvec::SmallVec::<[i64; 4]>::new();
         let mut args_f = smallvec::SmallVec::<[i64; 2]>::new();
         let (mut ni, mut nr, mut nf) = (0usize, 0usize, 0usize);
-        for ch in calldescr.arg_classes.bytes() {
+        // SAFETY: `self.jitcode` owns the body for the life of this frame.
+        for i in 0..arg_len {
+            let ch = unsafe { *arg_ptr.add(i) };
             match ch {
                 b'i' => {
                     args_i.push(*self.registers_i.get(ni)?);
@@ -1862,10 +1872,16 @@ impl BlackholeInterpreter {
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(args_r.as_mut_slice());
         }
-        let outcome = match calldescr.result_type {
+        let outcome = match result_type {
             'i' => {
-                let result =
-                    self.bhimpl_inline_call_irf_i(fnaddr, &args_i, &args_r, &args_f, &calldescr);
+                let result = self.bhimpl_inline_call_irf_i(
+                    fnaddr,
+                    &args_i,
+                    &args_r,
+                    &args_f,
+                    // SAFETY: `self.jitcode` owns the body for the life of this frame.
+                    unsafe { &*calldescr },
+                );
                 match check_residual_call_exception_after(self, self.position) {
                     Ok(()) => {
                         self.tmpreg_i = result;
@@ -13032,10 +13048,9 @@ pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
 /// returns false — re-running the helper would reread `old_left` from
 /// the current-character marks.
 ///
-/// `try_native_finish_at_node_entry` asks this on every `run()` before
-/// `run_inner`. The regex leaf resumes at pc 210, so a per-call walk of
-/// `_startpoints` was the per-character cost. The first unsafe PC is a
-/// property of the jitcode; cache it.
+/// `run_after_rooting` only asks this at pc 0. Mid-tree resumes (regex
+/// leaf pc 210) skip the probe; the first unsafe PC is cached for the
+/// leftover-opcode / Char-19/28 tests that still call this directly.
 pub fn native_entry_args_intact(jitcode: &JitCode, position: usize) -> bool {
     if position == 0 {
         return true;
@@ -13865,6 +13880,51 @@ fn handler_inline_call_nested_ext(
     // blackhole.py:150-157 `j` argcode resolves via `descrs[idx]`
     // asserted to be a JitCode entry; pyre's helper-side
     // `RuntimeBhDescr::JitCode(Arc<JitCode>)` is the analogous slot.
+    // Borrow the descrs slot only long enough to read `fnaddr` / `calldescr`
+    // (or to clone the Arc for the interpret fallback). Holding `&entry`
+    // across `inline_call_native` would alias `bh`.
+    let native = {
+        let entry = bh.jitcode.exec.descrs.get(sub_idx).unwrap_or_else(|| {
+            panic!(
+                "BC_INLINE_CALL: descrs[{sub_idx}] is absent \
+                 (runtime pool has {} items)",
+                bh.jitcode.exec.descrs.len()
+            )
+        });
+        // `bhimpl_inline_call_*` does not interpret a
+        // callee.  It runs `cpu.bh_call_X(adr2int(jitcode.fnaddr), args_i, args_r,
+        // args_f, jitcode.calldescr)`, so a whole callee subtree — a recursive tree
+        // walk included — executes as compiled code in ONE call.  Upstream's
+        // blackhole never byte-interprets a callee, and the ten canonical
+        // `inline_call_*` handlers in this file are the same thing for the bytes a
+        // build-time jitcode emits.
+        //
+        // `JitCodeBuilder::set_native_entry` stages that pair for a
+        // `#[jit_inline]` helper: the Rust function the macro re-emits IS the
+        // program the body was lowered from, so calling it answers what running
+        // the bytes answers.  Where it did not stage one — a `match`-arm fragment,
+        // which is a shape upstream does not have, or a body carrying an opcode
+        // whose operand comes from this interpreter rather than from the heap
+        // (`JitCodeBuilder::native_entry_denied`) — `fnaddr` is 0 and the nested
+        // interpreter below runs it, which is where every callee went before.
+        if let Some(sub) = entry.as_jitcode_exec()
+            && is_callable_fnaddr(sub.fnaddr)
+            && let Some(body) = sub.try_body()
+        {
+            Some((
+                sub.fnaddr,
+                &body.calldescr as *const majit_translate::jitcode::BhCallDescr,
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some((fnaddr, calldescr)) = native {
+        // SAFETY: `calldescr` lives in the JitCode Arc stored in this
+        // frame's descrs table. `inline_call_native` does not rebuild it.
+        return inline_call_native(bh, code, p, num_args, fnaddr, unsafe { &*calldescr });
+    }
+
     let sub_jitcode = bh
         .jitcode
         .exec
@@ -13877,30 +13937,7 @@ fn handler_inline_call_nested_ext(
                  (runtime pool has {} items)",
                 bh.jitcode.exec.descrs.len()
             )
-        })
-        .clone();
-
-    // `bhimpl_inline_call_*` (blackhole.py:1278-1319) does not interpret a
-    // callee.  It runs `cpu.bh_call_X(adr2int(jitcode.fnaddr), args_i, args_r,
-    // args_f, jitcode.calldescr)`, so a whole callee subtree — a recursive tree
-    // walk included — executes as compiled code in ONE call.  Upstream's
-    // blackhole never byte-interprets a callee, and the ten canonical
-    // `inline_call_*` handlers in this file are the same thing for the bytes a
-    // build-time jitcode emits.
-    //
-    // `JitCodeBuilder::set_native_entry` stages that pair for a
-    // `#[jit_inline]` helper: the Rust function the macro re-emits IS the
-    // program the body was lowered from, so calling it answers what running
-    // the bytes answers.  Where it did not stage one — a `match`-arm fragment,
-    // which is a shape upstream does not have, or a body carrying an opcode
-    // whose operand comes from this interpreter rather than from the heap
-    // (`JitCodeBuilder::native_entry_denied`) — `fnaddr` is 0 and the nested
-    // interpreter below runs it, which is where every callee went before.
-    if is_callable_fnaddr(sub_jitcode.fnaddr)
-        && let Some(body) = sub_jitcode.try_body()
-    {
-        return inline_call_native(bh, code, p, num_args, sub_jitcode.fnaddr, &body.calldescr);
-    }
+        });
 
     // The callee frame is seated before the argument triples are decoded so
     // each one can be copied where it is read, with no list in between.  The

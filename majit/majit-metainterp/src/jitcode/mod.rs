@@ -339,6 +339,9 @@ impl RuntimeBhDescr {
     /// and a recursive helper's back edge names a jitcode that walk has already
     /// numbered.  Use [`Self::as_jitcode_owned`] where the question is "what
     /// does this `j` operand execute".
+    ///
+    /// The native `INLINE_CALL` path borrows here (`fnaddr` / `calldescr`)
+    /// and does not clone the `Arc`.
     pub fn as_jitcode(&self) -> Option<&std::sync::Arc<JitCode>> {
         match self {
             Self::JitCode(arc) => Some(arc),
@@ -357,6 +360,27 @@ impl RuntimeBhDescr {
         match self {
             Self::JitCode(arc) => Some(std::sync::Arc::clone(arc)),
             Self::JitCodeBackEdge(weak) => weak.upgrade(),
+            _ => None,
+        }
+    }
+
+    /// The callee a `j` operand executes, including a live back edge.
+    ///
+    /// Does not clone the `Arc`. Recursive `#[jit_inline]` helpers record
+    /// the self-call as [`Self::JitCodeBackEdge`]; the native `INLINE_CALL`
+    /// path only needs `fnaddr` / `calldescr` off that allocation.
+    pub fn as_jitcode_exec(&self) -> Option<&JitCode> {
+        match self {
+            Self::JitCode(arc) => Some(arc.as_ref()),
+            Self::JitCodeBackEdge(weak) => {
+                if weak.strong_count() == 0 {
+                    return None;
+                }
+                // SAFETY: a strong ref still owns this allocation (the
+                // owning edge in the jitcode table). The blackhole is
+                // single-threaded and does not drop that edge here.
+                Some(unsafe { &*weak.as_ptr() })
+            }
             _ => None,
         }
     }
@@ -1139,6 +1163,43 @@ mod tests {
     /// Both routes into a body now record it, and this is the crossing where a
     /// body assembled by `majit-translate` would otherwise arrive looking like
     /// one that has no marker at all.
+    #[test]
+    fn as_jitcode_does_not_clone_the_arc() {
+        let core = BuildJitCode::new("callee");
+        core.set_body(BuildJitCodeBody::default());
+        let jitcode = std::sync::Arc::new(JitCode::from_canonical(core));
+        let before = std::sync::Arc::strong_count(&jitcode);
+        let descr = RuntimeBhDescr::JitCode(std::sync::Arc::clone(&jitcode));
+        assert_eq!(std::sync::Arc::strong_count(&jitcode), before + 1);
+        let borrowed = descr.as_jitcode().expect("JitCode variant");
+        assert!(std::sync::Arc::ptr_eq(borrowed, &jitcode));
+        assert_eq!(std::sync::Arc::strong_count(&jitcode), before + 1);
+        assert!(std::ptr::eq(
+            descr.as_jitcode_exec().expect("exec borrow"),
+            jitcode.as_ref()
+        ));
+        assert_eq!(std::sync::Arc::strong_count(&jitcode), before + 1);
+        let owned = descr.as_jitcode_owned().expect("owned clone");
+        assert!(std::sync::Arc::ptr_eq(&owned, &jitcode));
+        assert_eq!(std::sync::Arc::strong_count(&jitcode), before + 2);
+    }
+
+    #[test]
+    fn as_jitcode_exec_reads_a_live_back_edge_without_cloning() {
+        let core = BuildJitCode::new("callee");
+        core.set_body(BuildJitCodeBody::default());
+        let jitcode = std::sync::Arc::new(JitCode::from_canonical(core));
+        let before = std::sync::Arc::strong_count(&jitcode);
+        let descr = RuntimeBhDescr::JitCodeBackEdge(std::sync::Arc::downgrade(&jitcode));
+        assert_eq!(std::sync::Arc::strong_count(&jitcode), before);
+        assert!(descr.as_jitcode().is_none());
+        assert!(std::ptr::eq(
+            descr.as_jitcode_exec().expect("live back edge"),
+            jitcode.as_ref()
+        ));
+        assert_eq!(std::sync::Arc::strong_count(&jitcode), before);
+    }
+
     #[test]
     fn from_canonical_carries_the_bodys_merge_point_offset() {
         let core = BuildJitCode::new("portal");
