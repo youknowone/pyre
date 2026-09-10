@@ -909,10 +909,15 @@ impl RegisterManager {
     }
 
     /// RegBindingsDict.__setitem__
-    /// regalloc.py RegBindingsDict.__setitem__
+    ///
+    /// Overwrites the reverse slot (`reg_bindings_list[new]`) but leaves any
+    /// previous occupant's `current_register_index` alone. `loc()` reads that
+    /// index, so two liveboxes recovered from the same physical register
+    /// (duplicate `rd_locs` entries) stay findable. Clearing the old occupant
+    /// here made `RegisterManager.loc` panic on the first box.
     pub fn reg_bindings_set(&mut self, v: OpRef, reg: RegLoc, longevity: &mut LifetimeManager) {
         let new_index = self._register_index(reg);
-        // regalloc.py:284-286: clear variable's OLD register slot first.
+        // Clear this variable's previous reverse slot first.
         let old_index = longevity
             .get(v)
             .map(|lt| lt.current_register_index)
@@ -920,14 +925,6 @@ impl RegisterManager {
         if old_index >= 0 {
             self.reg_bindings_list[old_index as usize] = None;
         }
-        // Clear new slot's old occupant's register index.
-        if let Some(old_v) = self.reg_bindings_list[new_index]
-            && old_v != v
-            && let Some(lt) = longevity.get_mut(old_v)
-        {
-            lt.current_register_index = -1;
-        }
-        // regalloc.py:287-288: set new binding.
         let lifetime = longevity
             .get_mut(v)
             .expect("reg_bindings_set: not in longevity");
@@ -6478,6 +6475,29 @@ mod tests {
         assert_eq!(lt_i1.definition_pos, 0);
         assert_eq!(lt_i1.last_usage, 2);
         assert_eq!(lt_i1.real_usages.as_ref().unwrap().as_slice(), &[1]);
+    }
+
+    #[test]
+    fn shared_register_keeps_both_boxes_findable() {
+        let regs = all_core_regs();
+        let mut rm = RegisterManager::new(
+            regs.clone(),
+            vec![],
+            regs.clone(),
+            frame_reg(),
+            None,
+            call_result_gpr(),
+        );
+        let first = OpRef::input_arg_ref(1218);
+        let second = OpRef::input_arg_ref(1220);
+        let mut longevity = LifetimeManager::new();
+        longevity.set(first, Lifetime::new(-1, 1));
+        longevity.set(second, Lifetime::new(-1, 1));
+        let shared = regs[regs.len() - 1];
+        rm.reg_bindings_set(first, shared, &mut longevity);
+        rm.reg_bindings_set(second, shared, &mut longevity);
+        assert_eq!(rm.reg_bindings_get(first, &longevity), Some(shared));
+        assert_eq!(rm.reg_bindings_get(second, &longevity), Some(shared));
     }
 
     #[test]
