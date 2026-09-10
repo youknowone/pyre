@@ -1798,6 +1798,49 @@ pub(crate) fn normalize_closing_jump_args(
     ops
 }
 
+fn leftover_inputarg_refs(
+    ops: &[majit_ir::OpRc],
+    present: &rustc_hash::FxHashSet<u32>,
+) -> Vec<OpRef> {
+    let mut leftover = Vec::new();
+    let mut consider = |r: OpRef| {
+        if r.is_input_arg()
+            && !present.contains(&r.raw())
+            && leftover.iter().all(|x: &OpRef| x.raw() != r.raw())
+        {
+            leftover.push(r);
+        }
+    };
+    for op in ops {
+        for a in op.getarglist() {
+            consider(a.to_opref());
+        }
+        if let Some(fa) = op.getfailargs() {
+            for a in fa {
+                consider(a.to_opref());
+            }
+        }
+    }
+    leftover
+}
+
+/// Types of the expanded virtualizable tail, in the same order
+/// `initialize_virtualizable` mints `InputArg(num_reds + i)`.
+fn expanded_vable_slot_types(
+    vinfo: &crate::virtualizable::VirtualizableInfo,
+    array_lengths: &[usize],
+) -> Vec<Type> {
+    let mut types = Vec::new();
+    for field in &vinfo.static_fields {
+        types.push(field.field_type);
+    }
+    for (ai, array) in vinfo.array_fields.iter().enumerate() {
+        let len = array_lengths.get(ai).copied().unwrap_or(0);
+        types.extend(std::iter::repeat(array.item_type).take(len));
+    }
+    types
+}
+
 /// `rpython/jit/metainterp/compile.py:425-461`
 /// `patch_new_loop_to_load_virtualizable_fields`.
 ///
@@ -1897,6 +1940,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     entry_prefix_len: usize,
     index_of_virtualizable: usize,
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
+    entry_field_oprefs: &[OpRef],
 ) {
     // `compile.py:425-461` redirects each entry inputarg at its own
     // `_forwarded` slot — `box.set_forwarded(extra_ops[-1])` — and `emit_op`
@@ -1999,9 +2043,95 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         index_of_virtualizable < entry_prefix_len,
         "virtualizable must live inside the entry prefix (pyjitpl.py:3589 index_of_virtualizable < num_red_args)"
     );
+    let present: rustc_hash::FxHashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
+    let leftover = leftover_inputarg_refs(ops, &present);
+    let field_types = expanded_vable_slot_types(vinfo, vable_array_lengths);
+    let expanded_len = entry_prefix_len + field_types.len();
+    let mut field_raws: rustc_hash::FxHashSet<u32> = entry_field_oprefs
+        .iter()
+        .filter(|opref| opref.is_input_arg())
+        .map(|opref| opref.raw())
+        .collect();
+    for raw in entry_prefix_len as u32..expanded_len as u32 {
+        field_raws.insert(raw);
+    }
+    let leftover_fields: Vec<OpRef> = leftover
+        .iter()
+        .copied()
+        .filter(|r| field_raws.contains(&r.raw()))
+        .collect();
+    let leftover_identity: Vec<OpRef> = leftover
+        .iter()
+        .copied()
+        .filter(|r| r.ty() == Some(Type::Ref) && !field_raws.contains(&r.raw()))
+        .collect();
+
     if inputargs.len() <= entry_prefix_len {
-        // Already reduced or no virtualizable expansion in the trace.
-        return;
+        // Virtualstate + densify may already have reduced `inputargs` to the
+        // red prefix (`start_state.renamed_inputargs`). Skip-unmodified
+        // store-back and short-preamble `used_boxes` leave the original
+        // InputArgRefs on LABEL/JUMP/failargs. RPython remaps them via
+        // `box.set_forwarded` because those boxes are still in
+        // `loop.inputargs`. Rebuild the expanded field list when a leftover
+        // names a field slot; a leftover Ref that is not a field is the
+        // virtualizable identity and rewrites onto the vable red.
+        if leftover_fields.is_empty() {
+            if leftover_identity.is_empty() {
+                return;
+            }
+            let vable_rc = std::rc::Rc::new(inputargs[index_of_virtualizable].fresh_value_copy());
+            let vable_box = Operand::from_bound_inputarg(&vable_rc);
+            let max_runtime_ref = leftover_identity
+                .iter()
+                .map(|r| r.raw())
+                .chain(ops.iter().flat_map(|op| {
+                    std::iter::once(op.pos.get())
+                        .chain(op.getarglist_copy().into_iter().map(|b| b.to_opref()))
+                        .chain(op.getfailargs().into_iter().flatten().map(|b| b.to_opref()))
+                        .map(|r| {
+                            if r.is_none() || r.is_constant() {
+                                0
+                            } else {
+                                r.raw()
+                            }
+                        })
+                }))
+                .max()
+                .unwrap_or(0);
+            let mut next_opref = max_runtime_ref + 1;
+            let mut forwarding: Vec<Option<Operand>> =
+                vec![None; (max_runtime_ref as usize).saturating_add(1)];
+            for &identity in &leftover_identity {
+                set_local_forwarded(&mut forwarding, identity, vable_box.clone());
+            }
+            let original_ops = std::mem::take(ops);
+            let mut extra_ops: Vec<majit_ir::OpRc> = Vec::new();
+            for op in original_ops.iter() {
+                emit_forwarded_patch_op(&mut extra_ops, op, &mut forwarding, &mut next_opref);
+            }
+            *ops = extra_ops;
+            return;
+        }
+        let mut expanded = Vec::with_capacity(expanded_len);
+        for i in 0..entry_prefix_len {
+            expanded.push(
+                inputargs
+                    .iter()
+                    .find(|ia| ia.index as usize == i)
+                    .map(InputArg::fresh_value_copy)
+                    .unwrap_or_else(|| InputArg::from_type(Type::Ref, i as u32)),
+            );
+        }
+        for (offset, ty) in field_types.into_iter().enumerate() {
+            let idx = entry_field_oprefs
+                .get(offset)
+                .copied()
+                .filter(|opref| opref.is_input_arg())
+                .map(OpRef::raw)
+                .unwrap_or((entry_prefix_len + offset) as u32);
+            expanded.push(InputArg::from_type(ty, idx));
+        }
+        *inputargs = expanded;
     }
 
     let expanded_inputargs: Vec<majit_ir::InputArgRc> = inputargs
@@ -2085,7 +2215,13 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         op.pos().set(new_opref);
         op.setdescr(descr);
         let op = OpRc::new(op);
-        set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&op));
+        let bound = Operand::from_bound_op(&op);
+        set_local_forwarded(&mut forwarding, old_opref, bound.clone());
+        if let Some(&snap) = entry_field_oprefs.get(fi) {
+            if snap.is_input_arg() && snap != old_opref {
+                set_local_forwarded(&mut forwarding, snap, bound);
+            }
+        }
         extra_ops.push(op);
         i += 1;
     }
@@ -2234,7 +2370,13 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             elem_op.pos().set(new_opref);
             elem_op.setdescr(item_descr.clone());
             let elem_op = OpRc::new(elem_op);
-            set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&elem_op));
+            let bound = Operand::from_bound_op(&elem_op);
+            set_local_forwarded(&mut forwarding, old_opref, bound.clone());
+            if let Some(&snap) = entry_field_oprefs.get(i - entry_prefix_len) {
+                if snap.is_input_arg() && snap != old_opref {
+                    set_local_forwarded(&mut forwarding, snap, bound);
+                }
+            }
             extra_ops.push(elem_op);
             i += 1;
         }
@@ -2251,6 +2393,13 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         "compile.py:458 assert i == len(inputargs) failed ({i} != {})",
         expanded_inputargs.len()
     );
+
+    // compile.py `box.set_forwarded` on the virtualizable red: a leftover
+    // InputArgRef that is not a field snapshot is the identity box
+    // virtualstate left on LABEL/JUMP/failargs after densify dropped it.
+    for &identity in &leftover_identity {
+        set_local_forwarded(&mut forwarding, identity, vable_box.clone());
+    }
 
     // compile.py — emit_op walks the existing ops re-emitting
     // each one with `get_box_replacement` applied to args + fail_args.
@@ -2932,6 +3081,7 @@ mod tests {
             1,
             0,
             &mut constants,
+            &[],
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
@@ -2973,6 +3123,137 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_new_loop_reloads_leftover_inputargs_after_virtualstate_reduce() {
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        // Densify already dropped the expanded field, but skip-unmodified
+        // store-back left the snapshot InputArgRef on LABEL/JUMP/failargs.
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+            ],
+        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 0)]);
+        guard.setfailargs(smallvec::smallvec![
+            rooted_inputarg_operand(Type::Ref, 0),
+            rooted_inputarg_operand(Type::Ref, 1),
+        ]);
+        let jump = Op::new(
+            OpCode::Jump,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, guard, jump]
+            .into_iter()
+            .map(std::rc::Rc::new)
+            .collect();
+        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &[],
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        let reloaded = ops[0].pos.get();
+        assert_eq!(
+            ops[1]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), reloaded]
+        );
+        assert_eq!(
+            ops[2]
+                .getfailargs()
+                .unwrap()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), reloaded]
+        );
+        assert_eq!(
+            ops[3]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), reloaded]
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_rewrites_leftover_identity_inputarg() {
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 98),
+            ],
+        );
+        let jump = Op::new(
+            OpCode::Jump,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 98),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, jump]
+            .into_iter()
+            .map(std::rc::Rc::new)
+            .collect();
+        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &[],
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            ops[0]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(0)]
+        );
+        assert_eq!(
+            ops[1]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(0)]
+        );
+    }
+
+    #[test]
     fn test_patch_new_loop_reads_embedded_array_items_from_backing_storage() {
         let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
         vinfo.add_embedded_array_field(
@@ -3010,6 +3291,7 @@ mod tests {
             1,
             0,
             &mut constants,
+            &[],
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
@@ -3092,6 +3374,7 @@ mod tests {
             2,
             1,
             &mut constants,
+            &[],
         );
 
         // The scalar at slot 0 survives the truncation alongside the

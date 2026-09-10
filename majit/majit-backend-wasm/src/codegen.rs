@@ -11350,9 +11350,34 @@ fn unbound_pool_const_seeds(
             .map(|op| op.pos().get())
             .collect();
         let in_idx: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
+        let unresolved_raws: std::collections::HashSet<u32> =
+            unresolved.iter().map(|(a, _, _)| a.raw()).collect();
+        let mut readers = Vec::new();
+        for op in ops {
+            let push = |readers: &mut Vec<String>, where_: &str, a: OpRef| {
+                if a == OpRef::NONE || a.is_constant() {
+                    return;
+                }
+                if unresolved_raws.contains(&a.raw()) {
+                    readers.push(format!("{:?} {where_} {a:?}", op.opcode));
+                }
+            };
+            for a in op.getarglist().iter() {
+                push(&mut readers, "arg", a.to_opref());
+            }
+            if let Some(fa) = op.getfailargs() {
+                for a in fa.iter() {
+                    push(&mut readers, "failarg", a.to_opref());
+                }
+            }
+        }
         return Err(BackendError::Unsupported(format!(
             "wasm codegen: value{unresolved:?} read with no producing op and no \
-             constant-pool entry; inputargs={in_idx:?} labels={labels:?} sameas={sameas:?}"
+             constant-pool entry; inputargs={in_idx:?} labels={labels:?} sameas={sameas:?} \
+             readers=[{}] defined={} pool={}",
+            readers.join(", "),
+            defined.len(),
+            constants.len(),
         )));
     }
     Ok(seeds)
