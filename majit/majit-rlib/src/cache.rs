@@ -96,14 +96,24 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
         key: K,
         builder: &B,
     ) -> Result<V, CacheError<B::Error>> {
-        // cache.py's host RLock acquisition releases the interpreter lock
-        // during the external wait, never during _build/_ready. Unregistered
-        // translator threads naturally need no runtime transition. Keys and
-        // builder references must be nonmoving host/prebuilt identities, or
-        // explicitly rooted and reloaded across this allocation boundary.
-        let blocked = majit_gc::gc_sync::before_external_block();
-        let _lock = LOCK.lock();
-        drop(blocked);
+        // cache.py getorbuild takes the module RLock while the host thread
+        // already holds the GIL. Host `threading.RLock.acquire` keeps the GIL
+        // on the uncontended path and drops it only while waiting. Always
+        // releasing first opened a window where a libtest waiter could take
+        // the GIL and then block on `TYPEOBJECT_CACHE.get_or_init` while this
+        // thread needed the GIL back after taking LOCK.
+        // Unregistered translator threads naturally need no runtime
+        // transition. Keys and builder references must be nonmoving
+        // host/prebuilt identities, or explicitly rooted and reloaded across
+        // this allocation boundary.
+        let _lock = if let Some(guard) = LOCK.try_lock() {
+            guard
+        } else {
+            let blocked = majit_gc::gc_sync::before_external_block();
+            let guard = LOCK.lock();
+            drop(blocked);
+            guard
+        };
         {
             let mut state = self.state.lock();
             if let Some(result) = state.content.get(&key) {

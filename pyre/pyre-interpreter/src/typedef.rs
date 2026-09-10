@@ -33503,6 +33503,67 @@ mod tests {
         );
     }
 
+    /// `init_typeobjects` publishes iterator TypeDefs through
+    /// `Cache.getorbuild` (`object_space().gettypeobject`). That acquire
+    /// must not drop the GIL unless the cache RLock is actually contended:
+    /// a sibling that already holds the GIL and then waits on
+    /// `TYPEOBJECT_CACHE` would otherwise deadlock with the initializer
+    /// trying to take the GIL back.
+    ///
+    /// Fresh process: `TYPEOBJECT_CACHE` is process-wide, and a prior
+    /// `#[test]` would close the window.
+    #[test]
+    fn init_typeobjects_does_not_deadlock_against_a_gil_holder() {
+        use std::sync::Barrier;
+
+        if std::env::var_os("PYRE_TYPEOBJECT_DEADLOCK_CHILD").is_none() {
+            let exe = std::env::current_exe().expect("test harness path");
+            let mut child = std::process::Command::new(exe)
+                .arg("typedef::tests::init_typeobjects_does_not_deadlock_against_a_gil_holder")
+                .arg("--exact")
+                .env("PYRE_TYPEOBJECT_DEADLOCK_CHILD", "1")
+                .env("RUST_TEST_THREADS", "1")
+                .spawn()
+                .expect("spawn deadlock-scenario child");
+            let start = std::time::Instant::now();
+            loop {
+                match child.try_wait().expect("wait deadlock-scenario child") {
+                    Some(status) => {
+                        assert!(
+                            status.success(),
+                            "child init_typeobjects deadlock scenario failed: {status}"
+                        );
+                        return;
+                    }
+                    None if start.elapsed() > std::time::Duration::from_secs(30) => {
+                        let _ = child.kill();
+                        panic!(
+                            "init_typeobjects deadlocked against a GIL-holding waiter \
+                             (Cache.getorbuild released the GIL inside TYPEOBJECT_CACHE.get_or_init)"
+                        );
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        }
+
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Take the GIL before the initializer starts, then wait on
+                // TYPEOBJECT_CACHE while still holding it — the Windows CI
+                // hang: install_hash_hook then get_or_init on a waiter.
+                crate::module::thread::ensure_runtime_thread();
+                barrier.wait();
+                crate::typedef::init_typeobjects();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                crate::typedef::init_typeobjects();
+            });
+        });
+    }
+
     /// Concurrent `init_typeobjects` callers must not observe the
     /// post-registration patch passes mid-write: the libtest harness
     /// calls it from many test threads, and an unsynchronized second
