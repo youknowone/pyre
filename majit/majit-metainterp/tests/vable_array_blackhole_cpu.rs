@@ -118,3 +118,58 @@ fn setarrayitem_vable_i_then_arraylen_vable_use_the_cpu_chain() {
     assert_eq!(state.regs.to_vec(), vec![10, 99, 30]);
     assert_eq!(bh.tmpreg_i, 3);
 }
+
+struct VecState {
+    regs: Vec<i64>,
+}
+
+fn vec_data_ptr(p: *mut u8) -> *mut i64 {
+    unsafe { (*(p as *mut VecState)).regs.as_mut_ptr() }
+}
+
+fn vec_len(p: *const u8) -> usize {
+    unsafe { (*(p as *const VecState)).regs.len() }
+}
+
+/// `bhimpl_getarrayitem_vable_*` only accepts `Ptr(GcArray)`. A `Vec`
+/// field registers `RustVec`; the CPU chain must refuse it rather than
+/// load a `Vec` metadata word as the array pointer.
+#[test]
+#[should_panic(expected = "DirectPointer")]
+fn rustvec_getarrayitem_vable_i_refuses_the_cpu_chain() {
+    let cpu = TestBackend::new();
+    let mut builder = bh_builder();
+    builder.set_cpu(&cpu);
+
+    let mut info = VirtualizableInfo::without_vable_token();
+    register_virt_array_field(
+        &mut info,
+        "regs",
+        majit_ir::Type::Int,
+        std::mem::size_of::<i64>(),
+        std::mem::offset_of!(VecState, regs),
+        vec_data_ptr,
+        vec_len,
+        |s: &VecState| &s.regs,
+    );
+    assert!(matches!(
+        info.array_fields[0].storage,
+        VableArrayStorage::RustVec { .. }
+    ));
+
+    let mut b = JitCodeBuilder::new();
+    b.vable_getarrayitem_int_with_base(2, 0, 0, 1);
+    b.int_return(2);
+    let jitcode = std::sync::Arc::new(b.finish());
+
+    let mut state = VecState {
+        regs: vec![10i64, 20, 30],
+    };
+
+    let mut bh = builder.acquire_interp();
+    bh.virtualizable_info = &info;
+    bh.setposition(jitcode, 0);
+    bh.registers_r[0] = &mut state as *mut VecState as i64;
+    bh.registers_i[1] = 2;
+    let _ = bh.run();
+}
