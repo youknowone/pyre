@@ -1,8 +1,10 @@
-# pyre-check: max-pypy-ratio=4.2
+# pyre-check: max-pypy-ratio=2.4
 #
-# Ceiling 6 derived floor 1.0x; after N=4300000, macos dynasm reads 0.8x
-# (PR 1736: exec 0.21s vs pypy 0.26s). 4.2 keeps ubuntu dynasm 1.1x and
-# cranelift 1.4x under the ceiling and drops the floor to 0.7x.
+# Ceiling 6 derived floor. After `get_instantiate` became a word load of
+# the immutable OBJECT_VTABLE slot, ubuntu dynasm reads 0.5x and
+# cranelift 0.6x (run 34382609753). 2.4 puts the derived floor at 0.4x
+# under those and still covers the slower 1.4x cranelift host span from
+# before the slot folded.
 #
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #
