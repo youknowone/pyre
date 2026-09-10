@@ -1150,7 +1150,7 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
         // the same so the recorded residual is a void `CALL_N`.
         Ok(_) => {}
         Err(err) => {
-            crate::runtime_ops::jit_publish_residual_error(err);
+            let _ = crate::runtime_ops::jit_publish_residual_error(err);
         }
     }
 }
@@ -1409,6 +1409,25 @@ mod tests {
         let err = compare_value_from_tag(std::ptr::null_mut(), w_int_new(1), 5).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         assert!(err.to_string().contains("comparison on null operand"));
+    }
+
+    #[test]
+    fn test_jit_compare_exc_match_invalid_class_publishes_both_channels() {
+        // Residual CHECK_EXC_MATCH (tag 10) against a non-exception target
+        // must fill BH_LAST_EXC_VALUE as well as the backend cells.  Backend
+        // only leaves blackhole/FBW seeing no standing exception, so Truth
+        // of the NULL result takes the mismatch re-raise and the original
+        // ValueError escapes the outer `except TypeError`.
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
+        let exc = crate::PyError::value_error("x").to_exc_object();
+        let result = jit_compare_value_from_tag(
+            exc as i64,
+            w_int_new(5) as i64,
+            crate::runtime_ops::ISINSTANCE_OP_TAG,
+        );
+        assert_eq!(result, 0);
+        let published = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.get());
+        assert_ne!(published, 0, "TypeError must reach BH_LAST_EXC_VALUE");
     }
 
     #[test]
