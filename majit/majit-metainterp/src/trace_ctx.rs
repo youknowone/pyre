@@ -2400,6 +2400,26 @@ impl TraceCtx {
         self.recorder.num_inputargs()
     }
 
+    /// True when `r` names a recorded void opcode (e.g. `DebugMergePoint`)
+    /// at that raw slot. A Ref-tagged copy of the same raw must not be
+    /// used as a JUMP red — `box_for_operand` would otherwise bind it to
+    /// the void producer.
+    pub fn opref_is_void_producer(&self, r: OpRef) -> bool {
+        if r.is_none() || r.ty() == Some(Type::Void) {
+            return true;
+        }
+        if r.is_constant() || r.is_input_arg() {
+            return false;
+        }
+        let n = self.recorder.num_inputargs();
+        let Some(idx) = (r.raw() as usize).checked_sub(n) else {
+            return false;
+        };
+        self.recorder.ops().get(idx).is_some_and(|op| {
+            op.pos().get().raw() == r.raw() && op.opcode.result_type() == Type::Void
+        })
+    }
+
     /// Input argument types in loop-header order.
     pub fn inputarg_types(&self) -> Vec<Type> {
         self.recorder.inputarg_types()

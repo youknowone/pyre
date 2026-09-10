@@ -971,7 +971,7 @@ impl Trace {
         let n = self.inputargs.len();
         if let Some(idx) = (r.raw() as usize).checked_sub(n)
             && let Some(op) = self.ops.get(idx)
-            && op.pos().get().raw() == r.raw()
+            && op.pos().get() == r
         {
             return Operand::from_bound_op(op);
         }

@@ -1539,28 +1539,37 @@ impl OpPos {
     }
 }
 
-/// Packed `Op.pos` view. Payload is a `u32`; the tag nibble lives on
-/// `arg_len` so `Op` does not need a second 8 B field.
+/// Packed `Op.pos` view. Tag lives in bits 28-31 of [`Op::pos_payload`]
+/// so [`Op::arg_len`] can be a full `u8` — JUMP reds include every
+/// virtualizable array cell (`VirtArray`) and exceed a 4-bit count.
 pub struct OpPosRef<'a> {
     payload: &'a std::cell::Cell<u32>,
-    meta: &'a std::cell::Cell<u8>,
 }
+
+const POS_TAG_SHIFT: u32 = 28;
+const POS_PAYLOAD_MASK: u32 = (1 << POS_TAG_SHIFT) - 1;
 
 impl OpPosRef<'_> {
     #[inline]
     pub fn get(&self) -> OpRef {
-        let tag = self.meta.get() >> 4;
-        unpack_op_pos(((tag as u64) << 32) | u64::from(self.payload.get()))
+        let packed = self.payload.get();
+        let tag = (packed >> POS_TAG_SHIFT) as u8;
+        let payload = packed & POS_PAYLOAD_MASK;
+        unpack_op_pos(((tag as u64) << 32) | u64::from(payload))
     }
 
     #[inline]
     pub fn set(&self, r: OpRef) {
         let packed = pack_op_pos(r);
-        let tag = (packed >> 32) as u8;
+        let mut tag = (packed >> 32) as u8;
+        let mut payload = packed as u32;
+        if payload > POS_PAYLOAD_MASK {
+            tag = 15;
+            payload = intern_overflow_pos(r);
+            debug_assert!(payload <= POS_PAYLOAD_MASK);
+        }
         debug_assert!(tag < 16);
-        self.payload.set(packed as u32);
-        let meta = self.meta.get();
-        self.meta.set((meta & 0x0f) | (tag << 4));
+        self.payload.set(((tag as u32) << POS_TAG_SHIFT) | payload);
     }
 }
 
@@ -3126,10 +3135,10 @@ pub struct Op {
     /// (`resoperation.py` `optypes[opnum]`). Populated at construction from
     /// `opcode.result_type()`. Replaces side-table `value_types: HashMap<u32, Type>`.
     pub type_: Type,
-    /// `N_aryOp._args` length in the low nibble; `Op.pos` tag in the high
-    /// nibble so the payload can be a `u32` beside it.
+    /// `N_aryOp._args` length. A full `u8` so JUMP can carry a
+    /// virtualizable array's cells (braininterp tape is 128 in tests).
     pub(crate) arg_len: std::cell::Cell<u8>,
-    /// Packed `OpRef` payload. Tag lives in [`Self::arg_len`].
+    /// Packed `OpRef` payload. Tag lives in bits 28-31.
     pos_payload: std::cell::Cell<u32>,
     /// `resoperation.py AbstractResOp` operand list. `ArgSlot` so
     /// `setarg` / `initarglist` can mutate through a shared `Op` reached
@@ -3172,7 +3181,7 @@ impl Clone for Op {
         let op = Op {
             opcode: self.opcode,
             type_: self.type_,
-            arg_len: std::cell::Cell::new(self.arg_len.get() & 0x0f),
+            arg_len: std::cell::Cell::new(self.arg_len.get()),
             pos_payload: std::cell::Cell::new(0),
             args: ArgSlot::new(self.args.clone_vec(self.arg_len_value())),
             descr,
@@ -3347,23 +3356,19 @@ impl Op {
 
     #[inline]
     pub(crate) fn arg_len_value(&self) -> u8 {
-        self.arg_len.get() & 0x0f
+        self.arg_len.get()
     }
 
     #[inline]
     pub(crate) fn set_arg_len_value(&self, n: u8) {
-        debug_assert!(n < 16);
-        let tag = self.arg_len.get() & 0xf0;
-        self.arg_len.set(tag | n);
+        self.arg_len.set(n);
     }
 
-    /// Packed `op.pos` view. Tag lives in [`Self::arg_len`]; payload is
-    /// `pos_payload`.
+    /// Packed `op.pos` view. Tag lives in [`Self::pos_payload`] bits 28-31.
     #[inline]
     pub fn pos(&self) -> OpPosRef<'_> {
         OpPosRef {
             payload: &self.pos_payload,
-            meta: &self.arg_len,
         }
     }
 
@@ -5757,6 +5762,27 @@ mod tests {
                 std::mem::size_of::<ThinStamp>()
             );
         }
+    }
+
+    #[test]
+    fn jump_keeps_more_than_fifteen_args() {
+        // VirtArray JUMP reds (braininterp tape is 128 in tests) used
+        // to truncate at the pos-tag nibble on `arg_len`, so `num_args`
+        // became `n & 15` and the heap `ArgHeap.cap` was read as arg1.
+        let n = 130usize;
+        let args: Vec<crate::operand::Operand> = (0..n)
+            .map(|i| crate::operand::Operand::from_opref(OpRef::const_int(i as i64)))
+            .collect();
+        let op = Op::new(OpCode::Jump, &args);
+        op.pos().set(OpRef::VoidOp(143));
+        assert_eq!(op.num_args(), n);
+        assert_eq!(op.pos().get(), OpRef::VoidOp(143));
+        assert_eq!(op.arg(0).const_int(), Some(0));
+        assert_eq!(op.arg(1).const_int(), Some(1));
+        assert_eq!(op.arg(n - 1).const_int(), Some((n - 1) as i64));
+        op.pos().set(OpRef::ConstInt(-7));
+        assert_eq!(op.pos().get(), OpRef::ConstInt(-7));
+        assert_eq!(op.num_args(), n);
     }
 
     #[test]

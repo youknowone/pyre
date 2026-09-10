@@ -2254,9 +2254,9 @@ impl MIFrame {
         // next `op_count` slot) cannot be a JUMP red. Recover the
         // virtualizable identity (`virtualizable_boxes[-1]`), which is
         // seeded once from the portal frame.
-        if self.sym().frame.ty() == Some(Type::Void) {
+        if ctx.opref_is_void_producer(self.sym().frame) {
             if let Some(identity) = ctx.standard_virtualizable_box() {
-                if identity.ty() != Some(Type::Void) {
+                if !ctx.opref_is_void_producer(identity) {
                     self.sym_mut().frame = identity;
                 }
             }
@@ -2454,6 +2454,20 @@ impl MIFrame {
         // `remove_consts_and_duplicates` additionally mutates
         // `self.virtualizable_boxes` in place so subsequent reads see the
         // SameAs-wrapped identities).
+        for (i, arg) in args.iter_mut().enumerate() {
+            if !ctx.opref_is_void_producer(*arg) {
+                continue;
+            }
+            *arg = if i == 0 {
+                ctx.standard_virtualizable_box()
+                    .filter(|id| !ctx.opref_is_void_producer(*id))
+                    .unwrap_or(*arg)
+            } else {
+                let tp = inputarg_types.get(i).copied().unwrap_or(Type::Ref);
+                let typed_null = extract_concrete_typed_value(tp, PY_NULL);
+                fail_arg_opref_for_typed_value(ctx, typed_null)
+            };
+        }
         let mut dedup_changed: Vec<(usize, OpRef)> = Vec::new();
         {
             use std::collections::HashSet;
