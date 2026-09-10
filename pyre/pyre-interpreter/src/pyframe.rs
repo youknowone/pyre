@@ -1864,7 +1864,9 @@ pub struct FrameLocalsRoot {
 }
 
 impl FrameLocalsRoot {
-    #[majit_macros::dont_look_inside]
+    /// Look-inside: the 2-word `{frame, registered}` return cannot be a
+    /// residual. The interior slot address stays inside
+    /// [`register_frame_locals_slot`].
     pub fn new(frame_ptr: *mut PyFrame) -> Self {
         let registered = unsafe { register_frame_locals_slot(frame_ptr) };
         Self {

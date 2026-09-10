@@ -3248,9 +3248,7 @@ where
                             "<non-string panic payload>"
                         };
                         let pc = self.frames.frames.last().map(|f| f.pc).unwrap_or(0);
-                        eprintln!(
-                            "[jit] trace_jitcode panic while tracing pc={pc}: {message}"
-                        );
+                        eprintln!("[jit] trace_jitcode panic while tracing pc={pc}: {message}");
                     }
                     // The unwind left `code_cursor` inside the panicking
                     // instruction, so the frames name no resumable position.

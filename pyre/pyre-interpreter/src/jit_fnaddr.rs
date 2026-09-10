@@ -1806,6 +1806,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::try_gc_remove_root",
         pyre_object::gc_hook::try_gc_remove_root,
     );
+    // `FrameLocalsRoot::new` is look-inside; these word-ABI helpers keep
+    // `addr_of_mut!(locals_cells_stack_w)` out of compiled GCREF slots.
+    upa1(
+        &mut entries,
+        "pyre_interpreter::pyframe::register_frame_locals_slot",
+        "pyframe::register_frame_locals_slot",
+        crate::pyframe::register_frame_locals_slot,
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::pyframe::unregister_frame_locals_slot",
+        "pyframe::unregister_frame_locals_slot",
+        crate::pyframe::unregister_frame_locals_slot,
+    );
     // #346: direct allocation roots residualised via `#[dont_look_inside]`;
     // each binds both the qualified module path and the glob-re-exported root
     // alias. `function_new_impl` lives in this crate so it binds through
@@ -5076,11 +5090,10 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 mod tests {
     use super::{
         is_abi_unsound_argument_residual, is_frame_anchor_word_residual, is_list_write_barrier,
-        is_pyframe_operand_stack_accessor,
-        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
-        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        w_list_pop_end_inner_word, w_list_pop_end_word,
+        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
+        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs, pyre_class_pytype_addrs,
+        pyre_class_pytype_by_struct_addrs, shadow_stack_get_word, shadow_stack_push_word,
+        shadow_stack_try_pop_to_word, w_list_pop_end_inner_word, w_list_pop_end_word,
     };
     use std::collections::HashMap;
 
