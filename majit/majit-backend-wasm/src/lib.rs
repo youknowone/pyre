@@ -47,7 +47,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// that was never offered: 19 = labels published off a peeled trace, 20 =
 /// published off a non-peeled trace, 21 = a non-peeled trace's first label left
 /// unpublished (no descr, or its arity is not the inputarg count), 22 = a
-/// dropped loop retracted a published entry. 19-21 count loops and
+/// dropped loop or a retired widened bridge retracted a published entry.
+/// 19-21 count loops and
 /// LABEL-bearing bridges alike, since both go through the same publish step
 /// (`x86/assembler.py fixup_target_tokens` runs on either path); a bridge
 /// with no LABEL is not tallied by 21. `compile_loop`'s own outcome
@@ -799,8 +800,8 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
 /// Returns `(label_descrs, published_descrs)`: the descr identity of every
 /// LABEL in ordinal order, and the subset actually entered into
 /// `LABEL_TARGETS`. `compile_loop` keeps the first for its own JUMP
-/// resolution; `compile_bridge` hands the second to the source loop so its
-/// `Drop` retracts them.
+/// resolution; `compile_bridge` hands the second to the source loop so
+/// `Drop` and `retract_bridge_label_targets_for_slots` retract them.
 fn stamp_and_publish_label_targets(
     func_handle: u32,
     frame: codegen::FrameGeometry,
@@ -3303,6 +3304,8 @@ impl WasmBackend {
             }
         }
         if owner_extent_grew {
+            let retired: Vec<u32> = compiled.bridge_slots.borrow().values().copied().collect();
+            compiled.retract_bridge_label_targets_for_slots(retired);
             compiled.bridge_slots.borrow_mut().clear();
             let owner_tid = compiled.trace_id;
             compiled
@@ -3349,6 +3352,14 @@ impl WasmBackend {
                 // as live; the next fail retraces against the merged floor.
                 let extent_grew = prev_homes < widened || prev_labels < widened_labels;
                 if extent_grew {
+                    let retired: Vec<u32> = compiled
+                        .chained_bridge_slots
+                        .borrow()
+                        .iter()
+                        .filter(|&(&(tid, _), _)| tid == region.trace_id)
+                        .map(|(_, &slot)| slot)
+                        .collect();
+                    compiled.retract_bridge_label_targets_for_slots(retired);
                     compiled
                         .chained_bridge_slots
                         .borrow_mut()
