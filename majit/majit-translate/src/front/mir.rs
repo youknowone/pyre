@@ -357,6 +357,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
             functions: Vec::new(),
+            harvested_hints: std::collections::HashMap::new(),
             known_struct_names: std::collections::HashSet::new(),
             known_trait_names: std::collections::HashSet::new(),
             struct_fields: crate::front::semantic::StructFieldRegistry::default(),
@@ -1222,6 +1223,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     }
     Ok(crate::front::semantic::SemanticProgram {
         functions,
+        harvested_hints: std::collections::HashMap::new(),
         known_struct_names,
         known_trait_names,
         struct_fields,
