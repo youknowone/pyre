@@ -41,10 +41,12 @@ struct FrameLocalsRoot {
 }
 
 impl FrameLocalsRoot {
-    #[majit_macros::dont_look_inside]
+    /// Look-inside: the 2-word `{frame, registered}` return cannot be a
+    /// residual. The interior slot address stays inside the word-ABI
+    /// [`crate::pyframe::register_frame_locals_slot`] residual.
     fn new(frame: &PyFrame) -> Self {
         let frame = frame as *const PyFrame as *mut PyFrame;
-        let registered = unsafe { register_frame_locals_slot(frame) };
+        let registered = unsafe { crate::pyframe::register_frame_locals_slot(frame) };
         Self { frame, registered }
     }
 
@@ -56,21 +58,9 @@ impl FrameLocalsRoot {
 impl Drop for FrameLocalsRoot {
     fn drop(&mut self) {
         if self.registered {
-            unregister_frame_locals_slot(self.frame);
+            crate::pyframe::unregister_frame_locals_slot(self.frame);
         }
     }
-}
-
-#[majit_macros::dont_look_inside]
-unsafe fn register_frame_locals_slot(frame: *mut PyFrame) -> bool {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) } as *mut *mut u8;
-    unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }
-}
-
-#[majit_macros::dont_look_inside]
-fn unregister_frame_locals_slot(frame: *mut PyFrame) {
-    let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) } as *mut *mut u8;
-    pyre_object::gc_hook::try_gc_remove_root(slot);
 }
 
 thread_local! {

@@ -2516,27 +2516,42 @@ impl TraceCtx {
         greens: &(Vec<i64>, Vec<i64>, Vec<i64>),
     ) -> Option<GreenKey> {
         let (ints, refs, floats) = greens;
-        let spec: smallvec::SmallVec<[GreenType; 4]> =
+        // Two bank layouts:
+        //
+        // * A structured `can_enter_jit` key that *prepends* the back-edge
+        //   target in front of the remaining declared greens. The banks
+        //   then hold only those remaining greens; rebuild by pushing `pc`
+        //   and consuming `types[1..]`.
+        // * No structured key (portal `bound_reached`). The banks already
+        //   are the declared greens, and for pypyjit the first int *is*
+        //   `next_instr`. Prepending `pc` again hashed the loop under
+        //   `[pc, pc, profiled, pycode]` so `can_enter` never found it.
+        let (spec, prepend_pc): (smallvec::SmallVec<[GreenType; 4]>, bool) =
             if let Some(key) = self.green_key_values.as_ref() {
                 debug_assert_eq!(
                     key.types.first().copied(),
                     Some(GreenType::Int),
                     "structured green key must start with the prepended target pc",
                 );
-                smallvec::SmallVec::from_slice(key.types.get(1..)?)
+                (smallvec::SmallVec::from_slice(key.types.get(1..)?), true)
             } else {
-                smallvec::SmallVec::from_iter(
-                    self.driver_descriptor
-                        .as_ref()
-                        .map(|d| d.green_args_spec())?
-                        .into_iter(),
+                (
+                    smallvec::SmallVec::from_iter(
+                        self.driver_descriptor
+                            .as_ref()
+                            .map(|d| d.green_args_spec())?
+                            .into_iter(),
+                    ),
+                    false,
                 )
             };
 
         let mut values = smallvec::SmallVec::<[i64; 4]>::new();
         let mut types = smallvec::SmallVec::<[GreenType; 4]>::new();
-        values.push(pc);
-        types.push(GreenType::Int);
+        if prepend_pc {
+            values.push(pc);
+            types.push(GreenType::Int);
+        }
         let mut int_i = 0;
         let mut ref_i = 0;
         let mut float_i = 0;
