@@ -3218,6 +3218,7 @@ impl WasmBackend {
         inputs.bridge_cells_base = new_cells_base;
         inputs.ca.compute_home_gcmap = true;
         inputs.ca.home_gcmap_has_prior = true;
+        inputs.ca.home_gcmap_null_grown_labels = true;
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =

@@ -3815,6 +3815,14 @@ pub struct CaParams {
     /// on a first compile, where min=0 must not wipe live homes on keyed
     /// resume. Distinguishes a 0→N merge from an initial compile.
     pub home_gcmap_has_prior: bool,
+    /// True only for a loop re-emission that may mark more LABEL-capture
+    /// homes than the previous publication. Those new slots were never
+    /// stored on a recycled CALL_ASSEMBLER frame that keyed in from an
+    /// older bridge, so they must be nulled before the widened map is
+    /// installed. A compiled bridge with more captures than its source
+    /// leaves this false: it writes those slots on the first crossing
+    /// and a later keyed tail-call restores them.
+    pub home_gcmap_null_grown_labels: bool,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -5735,10 +5743,25 @@ fn build_function(
                 |_| true,
             );
         }
-        // LABEL captures stay on keyed resume: a bridge with more captures
-        // than its source writes them on the first crossing, and a later
-        // keyed tail-call restores from those slots. Key-0 still clears
-        // the full used-label range below.
+        // Re-emission may mark a longer LABEL tail than the previous
+        // publication. Those new slots are region-only captures the live
+        // frame never stored; null them before the widened map is
+        // published. Previously published captures stay: a bridge that
+        // grew past its source writes them on the first crossing, and a
+        // later keyed tail-call restores from those slots. Key-0 still
+        // clears the full used-label range below.
+        if ca.home_gcmap_has_prior
+            && ca.home_gcmap_null_grown_labels
+            && used_labels > ca.home_gcmap_min_labels
+        {
+            let label_base = frame.ordinary_home_slots() as u64;
+            emit_null_home_slots(
+                &mut sink,
+                frame,
+                label_base + ca.home_gcmap_min_labels as u64..label_base + used_labels as u64,
+                |_| true,
+            );
+        }
         Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
             as usize as i64
     } else {

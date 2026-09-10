@@ -2909,6 +2909,60 @@ fn compute_home_gcmap_simple_loop_is_valid() {
     validate_wasm(&bytes);
 }
 
+/// A re-emission that grew the LABEL-capture tail must still build when
+/// asked to null only the newly marked slots before publishing.
+#[test]
+fn reemit_nulls_grown_label_homes_and_builds() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let ops = vec![
+        Op::new(OpCode::Label, &[rb(OpRef::input_arg_ref(0))]),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::const_int(1)],
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::input_arg_ref(0))]),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.compute_home_gcmap = true;
+    ca.home_gcmap_has_prior = true;
+    ca.home_gcmap_null_grown_labels = true;
+    ca.home_gcmap_min_labels = 0;
+    let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, used_labels) =
+        codegen::build_wasm_module(&inputs).expect("re-emission grown LABEL tail should build");
+    validate_wasm(&bytes);
+    assert!(used_labels >= 1);
+}
+
 /// A peeled loop's start LABEL can still name an import_state source
 /// (`InputArgRef(128)` on attr_delete) after every real use was rewritten
 /// to the folded constant. That argument is the phi destination, not a
