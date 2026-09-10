@@ -1104,6 +1104,10 @@ pub struct CompiledWasmLoop {
     /// region (`codegen::HOME_SLOT_BASE`). `execute_token` sizes the host
     /// frame to include this region and registers each home slot as a GC root.
     pub num_ref_homes: usize,
+    /// LABEL-capture homes this loop actually initialized. Frozen geometry
+    /// may reserve more; a later bridge's published map must still cover
+    /// these so a keyed tail-call cannot drop them.
+    pub used_label_homes: usize,
     /// Geometry frozen when this token was first compiled. Every bridge
     /// chained onto it is emitted against this exact layout.
     pub frame: crate::codegen::FrameGeometry,

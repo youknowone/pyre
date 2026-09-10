@@ -1723,6 +1723,41 @@ pub fn label_ref_capture_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     LabelResumeData::collect(inputargs, ops).ref_slots
 }
 
+/// Mark the homes this module initializes: the used ordinary prefix and the
+/// LABEL-capture tail. Frozen geometry reserves extra ordinary slots so a
+/// later bridge can fit; those unused reserved words stay unmarked so
+/// recycled nursery bytes are not traced. assembler.py writes `jf_gcmap`
+/// for live slots only.
+pub(crate) fn build_home_gcmap(
+    frame: FrameGeometry,
+    used_ordinary: usize,
+    used_labels: usize,
+) -> Box<[usize]> {
+    let sign = std::mem::size_of::<isize>();
+    let bits_per_word = std::mem::size_of::<usize>() * 8;
+    let ordinary = used_ordinary.min(frame.ordinary_home_slots());
+    let label_base = frame.ordinary_home_slots();
+    let label_n = used_labels.min(frame.label_ref_slots);
+    if ordinary == 0 && label_n == 0 {
+        // One empty data word: a non-null jf_gcmap that traces nothing.
+        return vec![1usize, 0usize].into_boxed_slice();
+    }
+    let last_h = if label_n == 0 {
+        ordinary.saturating_sub(1)
+    } else {
+        label_base + label_n - 1
+    };
+    let last_index = (frame.home_slot_base as usize + last_h * 8) / sign;
+    let num_words = last_index / bits_per_word + 1;
+    let mut buf = vec![0usize; 1 + num_words];
+    buf[0] = num_words;
+    for h in (0..ordinary).chain(label_base..label_base + label_n) {
+        let index = (frame.home_slot_base as usize + h * 8) / sign;
+        buf[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
+    }
+    buf.into_boxed_slice()
+}
+
 /// First free value position — one past the highest id any value reference in
 /// the trace occupies (input args, op results, and every op argument, including
 /// a folded value the constants pool alone binds).
@@ -3763,10 +3798,18 @@ pub struct CaParams {
     /// `None` retains the helpers (including under gc_stress).
     pub inline: Option<CaInlineParams>,
     /// `build_home_gcmap` pointer published after the fresh-entry home/input
-    /// stores. The map marks only initialized ordinary homes plus LABEL
-    /// captures. Zero leaves `jf_gcmap` unset in the generated module (tests).
+    /// stores. Used only when [`Self::compute_home_gcmap`] is false. Zero
+    /// leaves `jf_gcmap` unset in the generated module (tests).
     /// assembler.py writes `jf_gcmap` at safepoints once those slots are live.
     pub home_gcmap_ptr: i64,
+    /// When set, leak a map from this module's `RefHomes` and LABEL captures
+    /// (raised to the `home_gcmap_min_*` floors) instead of
+    /// [`Self::home_gcmap_ptr`]. Re-emission and out-of-line bridges need
+    /// the floors so a later keyed tail-call cannot drop the source loop's
+    /// already-initialized homes.
+    pub compute_home_gcmap: bool,
+    pub home_gcmap_min_ordinary: usize,
+    pub home_gcmap_min_labels: usize,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -5845,7 +5888,15 @@ fn build_function(
     }
     // assembler.py writes `jf_gcmap` at safepoints once the slots are live.
     // CA alloc left the map null so leftover item words were not traced.
-    emit_publish_home_gcmap(&mut sink, ca.home_gcmap_ptr);
+    let publish_ptr = if ca.compute_home_gcmap {
+        let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
+        let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
+        Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
+            as usize as i64
+    } else {
+        ca.home_gcmap_ptr
+    };
+    emit_publish_home_gcmap(&mut sink, publish_ptr);
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
     if let Some((probe, type_idx)) = inline_trip {

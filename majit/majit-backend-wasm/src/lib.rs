@@ -2250,35 +2250,13 @@ fn wasm_jitframe_tid() -> u32 {
 /// marked bit, so marking those indices exposes each home's `GcRef` (the high
 /// word stays unmarked). Returns `[data_word_count, word0, ...]` in `usize`
 /// words (GCMAP array layout: `gcmap[0]` = number of data words).
-/// Mark the homes this module initializes: the used ordinary prefix and the
-/// LABEL-capture tail. Frozen geometry reserves
-/// [`FROZEN_CHAIN_REF_HOMES`] ordinary slots so a later bridge can fit;
-/// those unused reserved words stay unmarked so recycled nursery bytes
-/// are not traced. assembler.py writes `jf_gcmap` for live slots only.
-fn build_home_gcmap(frame: codegen::FrameGeometry, used_ordinary: usize) -> Box<[usize]> {
-    let sign = std::mem::size_of::<isize>();
-    let bits_per_word = std::mem::size_of::<usize>() * 8;
-    let ordinary = used_ordinary.min(frame.ordinary_home_slots());
-    let label_base = frame.ordinary_home_slots();
-    let label_n = frame.label_ref_slots;
-    if ordinary == 0 && label_n == 0 {
-        // One empty data word: a non-null jf_gcmap that traces nothing.
-        return vec![1usize, 0usize].into_boxed_slice();
-    }
-    let last_h = if label_n == 0 {
-        ordinary.saturating_sub(1)
-    } else {
-        label_base + label_n - 1
-    };
-    let last_index = (frame.home_slot_base as usize + last_h * 8) / sign;
-    let num_words = last_index / bits_per_word + 1;
-    let mut buf = vec![0usize; 1 + num_words];
-    buf[0] = num_words;
-    for h in (0..ordinary).chain(label_base..label_base + label_n) {
-        let index = (frame.home_slot_base as usize + h * 8) / sign;
-        buf[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
-    }
-    buf.into_boxed_slice()
+fn leak_home_gcmap(
+    frame: codegen::FrameGeometry,
+    used_ordinary: usize,
+    used_labels: usize,
+) -> usize {
+    Box::leak(codegen::build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
+        as usize
 }
 
 /// Allocate the immutable guard-token gcmap which PyPy's
@@ -3237,7 +3215,10 @@ impl WasmBackend {
         inputs.fail_index_base = reserve_fail_descrs(merged_guard_count);
         let (new_cells_base, new_cells_owner) = codegen::alloc_bridge_cells(merged_guard_count);
         inputs.bridge_cells_base = new_cells_base;
-        let (wasm_bytes, guard_exits, _) = codegen::build_wasm_module(&inputs)?;
+        inputs.ca.compute_home_gcmap = true;
+        inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes;
+        inputs.ca.home_gcmap_min_labels = compiled.used_label_homes;
+        let (wasm_bytes, guard_exits, merged_ref_homes) = codegen::build_wasm_module(&inputs)?;
         let code_size = wasm_bytes.len();
         let descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
@@ -3315,6 +3296,7 @@ impl WasmBackend {
         compiled.bridge_cells_base.set(new_cells_base);
         compiled.module_bytes.set(code_size as u32);
         compiled.num_guard_cells.set(guard_exits.len());
+        let _ = merged_ref_homes;
         {
             let mut metas = compiled.chained_trace_meta.borrow_mut();
             let mut offset = own_guard_count;
@@ -4217,11 +4199,10 @@ impl majit_backend::Backend for WasmBackend {
         let fail_index_base = reserve_fail_descrs(guard_exit_count);
         let (bridge_cells_base, bridge_cells_owner) = codegen::alloc_bridge_cells(guard_exit_count);
         let bridge_param_dispatch = bridge_param_dispatch_for(guard_exit_count);
-        // assembler.py keeps `_finish_gcmap` with the compiled loop. Leak
-        // before the module build so the fresh-entry path can publish it
-        // after home/input stores, matching a safepoint write.
-        let home_gcmap_ptr =
-            Box::leak(build_home_gcmap(frame, raw_num_ref_homes)).as_ptr() as *const usize as usize;
+        // assembler.py keeps `_finish_gcmap` with the compiled loop. The
+        // module leaks the map from its own RefHomes / LABEL captures after
+        // those stores, matching a safepoint write.
+        let used_label_homes = codegen::label_ref_capture_slots(inputargs, ops);
         let module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             // Keep these rewritten operations exactly as intern_ref_constants
@@ -4253,7 +4234,7 @@ impl majit_backend::Backend for WasmBackend {
                 || codegen::CaParams {
                     ca_reload_fn_ptr: body_reload_fn_ptr(),
                     jf_top_addr: jf_top_addr(),
-                    home_gcmap_ptr: home_gcmap_ptr as i64,
+                    compute_home_gcmap: true,
                     ..codegen::CaParams::default()
                 },
                 |targets| codegen::CaParams {
@@ -4267,7 +4248,8 @@ impl majit_backend::Backend for WasmBackend {
                         as i64,
                     inline: ca_inline_params(ca_max_frame_bytes(targets)),
                     jf_top_addr: jf_top_addr(),
-                    home_gcmap_ptr: home_gcmap_ptr as i64,
+                    compute_home_gcmap: true,
+                    ..codegen::CaParams::default()
                 },
             ),
         };
@@ -4280,6 +4262,7 @@ impl majit_backend::Backend for WasmBackend {
                     return Err(err);
                 }
             };
+        let home_gcmap_ptr = leak_home_gcmap(frame, num_ref_homes, used_label_homes);
 
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
@@ -4405,6 +4388,7 @@ impl majit_backend::Backend for WasmBackend {
             num_inputs: inputargs.len(),
             max_output_slots,
             num_ref_homes,
+            used_label_homes,
             frame,
             home_gcmap_ptr,
             bridge_cells_base: std::cell::Cell::new(bridge_cells_base),
@@ -5177,8 +5161,12 @@ impl majit_backend::Backend for WasmBackend {
         // CALL_ASSEMBLER: the CA arm allocates a fresh callee using the target
         // token's frozen geometry. The earlier frame-fit decline guarantees a
         // movable callee cannot execute a trampoline-lowered op.
-        let home_gcmap_ptr = Box::leak(build_home_gcmap(source_frame, bridge_ref_homes)).as_ptr()
-            as *const usize as usize;
+        // A keyed tail-call back into the source skips that module's
+        // fresh-entry publish, so this map must cover the source loop's
+        // already-initialized homes.
+        let source_used_homes = compiled_wasm_loop(original_token)
+            .map(|loop_| (loop_.num_ref_homes, loop_.used_label_homes))
+            .unwrap_or((0, 0));
         let ca_params = if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
             codegen::CaParams {
                 emit_ca: true,
@@ -5196,14 +5184,18 @@ impl majit_backend::Backend for WasmBackend {
                 // per-op callee frame in this trace.
                 inline: ca_inline_params(ca_max_frame_bytes(targets)),
                 jf_top_addr: jf_top_addr(),
-                home_gcmap_ptr: home_gcmap_ptr as i64,
+                compute_home_gcmap: true,
+                home_gcmap_min_ordinary: source_used_homes.0,
+                home_gcmap_min_labels: source_used_homes.1,
                 ..codegen::CaParams::default()
             }
         } else {
             codegen::CaParams {
                 ca_reload_fn_ptr: body_reload_fn_ptr(),
                 jf_top_addr: jf_top_addr(),
-                home_gcmap_ptr: home_gcmap_ptr as i64,
+                compute_home_gcmap: true,
+                home_gcmap_min_ordinary: source_used_homes.0,
+                home_gcmap_min_labels: source_used_homes.1,
                 ..codegen::CaParams::default()
             }
         };
@@ -6042,7 +6034,7 @@ mod tests {
     fn home_gcmap_marks_used_homes_and_label_captures_only() {
         let sign = std::mem::size_of::<isize>();
         let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
-        let map = build_home_gcmap(frame, 5);
+        let map = codegen::build_home_gcmap(frame, 5, 2);
         let idx = |h: usize| (frame.home_slot_base as usize + h * 8) / sign;
         for h in 0..5 {
             assert!(gcmap_marks(&map, idx(h)), "used ordinary home {h}");
@@ -6052,6 +6044,12 @@ mod tests {
         }
         assert!(gcmap_marks(&map, idx(128)), "label capture 0");
         assert!(gcmap_marks(&map, idx(129)), "label capture 1");
+        let narrow = codegen::build_home_gcmap(frame, 5, 1);
+        assert!(gcmap_marks(&narrow, idx(128)), "actual label capture");
+        assert!(
+            !gcmap_marks(&narrow, idx(129)),
+            "reserved unused label slot"
+        );
     }
 
     #[test]
