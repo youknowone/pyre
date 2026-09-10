@@ -542,18 +542,17 @@ impl PtrInfo {
     /// must walk the actual `OpRef` / `GcRef` slots explicitly.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_field(entry: &mut FieldEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
-            match entry {
-                FieldEntry::Value(b) => b.walk_const_ptr_refs(visitor),
-                FieldEntry::Preamble(pop) => {
-                    pop.op.walk_const_ptr_refs(visitor);
-                    pop.preamble_op.walk_const_ptr_refs_mut(visitor);
-                    // An invented ref-typed alias can carry a `ConstPtr`
-                    // `same_as_source`; walk it so a moving GC updates the
-                    // pointer before the cached preamble emits its `SameAs`.
-                    if let Some(src) = &pop.same_as_source {
-                        src.walk_const_ptr_refs(visitor);
-                    }
+            if let Some(pop) = entry.as_preamble_mut() {
+                pop.op.walk_const_ptr_refs(visitor);
+                pop.preamble_op.walk_const_ptr_refs_mut(visitor);
+                // An invented ref-typed alias can carry a `ConstPtr`
+                // `same_as_source`; walk it so a moving GC updates the
+                // pointer before the cached preamble emits its `SameAs`.
+                if let Some(src) = &pop.same_as_source {
+                    src.walk_const_ptr_refs(visitor);
                 }
+            } else if let Some(b) = entry.as_value() {
+                b.walk_const_ptr_refs(visitor);
             }
         }
 

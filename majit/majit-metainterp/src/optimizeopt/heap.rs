@@ -2299,8 +2299,8 @@ impl OptHeap {
             // RPython falls through here even when lazy_set exists (CANNOT_ALIAS).
             if !force_lazy && let Some(entry) = cf._getfield(obj, &descr, field_idx, ctx) {
                 // heap.py:182-186: isinstance(res, PreambleOp)
-                match entry {
-                    crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                match entry.kind() {
+                    crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
                         // heap.py:185-186:
                         //     res = optheap.optimizer.force_op_from_preamble(res)
                         //     opinfo.setfield(descr, None, res, optheap=optheap)
@@ -2316,7 +2316,7 @@ impl OptHeap {
                         ctx.make_equal_to(&b_old, &b_cached);
                         return OptimizationResult::Remove;
                     }
-                    crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                    crate::optimizeopt::info::FieldEntryKind::Value(cached) => {
                         if !cached.is_none() {
                             // heap.py `CachedField._getfield` asserts that an
                             // AbstractStructPtrInfo supplying a cached value
@@ -2387,8 +2387,8 @@ impl OptHeap {
         if let Some(cf) = self.get_cached_field(&descr)
             && let Some(entry) = cf._getfield(obj, &descr, field_idx, ctx)
         {
-            match entry {
-                crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+            match entry.kind() {
+                crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
                     // heap.py:185-186: force the preamble op, then write the
                     // forced value back into the struct info.
                     let cached = ctx.force_op_from_preamble_op(&pop);
@@ -2400,7 +2400,7 @@ impl OptHeap {
                     ctx.make_equal_to(&b_old, &b_cached);
                     return OptimizationResult::Remove;
                 }
-                crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                crate::optimizeopt::info::FieldEntryKind::Value(cached) => {
                     if !cached.is_none() {
                         let obj_box = ctx.get_box_replacement_operand(obj);
                         self.field_cache(&descr).register_info(&obj_box);
@@ -2572,8 +2572,8 @@ impl OptHeap {
             .field_cache(descr)
             ._getfield(obj, descr, field_idx, ctx)
         {
-            match entry {
-                crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+            match entry.kind() {
+                crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
                     let cached_seen = pop.op.get_box_replacement(false).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
@@ -2586,7 +2586,7 @@ impl OptHeap {
                         return OptimizationResult::Remove;
                     }
                 }
-                crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                crate::optimizeopt::info::FieldEntryKind::Value(cached) => {
                     // heap.py:85-88 `if cached_field is not None:
                     // cached_field = cached_field.get_box_replacement()` then
                     // `if not cached_field or not cached_field.same_box(arg1)`
@@ -2707,8 +2707,8 @@ impl OptHeap {
             .arrayitem_cache(descr, const_index)
             ._getfield(array, descr, ctx)
         {
-            match entry {
-                crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+            match entry.kind() {
+                crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
                     let cached_seen = pop.op.get_box_replacement(false).to_opref();
                     // heap.py:88 not cached_field.same_box(arg1)
                     if ctx.same_box(cached_seen, arg1) {
@@ -2722,7 +2722,7 @@ impl OptHeap {
                         return OptimizationResult::Remove;
                     }
                 }
-                crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                crate::optimizeopt::info::FieldEntryKind::Value(cached) => {
                     // heap.py:85-88 `if cached_field is not None:
                     // cached_field = cached_field.get_box_replacement()` then
                     // `if not cached_field or not cached_field.same_box(arg1)`
@@ -2884,8 +2884,8 @@ impl OptHeap {
                 if !force_lazy_arr
                     && let Some(entry) = cai._getfield(array, &op.getdescr().unwrap(), ctx)
                 {
-                    match entry {
-                        crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                    match entry.kind() {
+                        crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
                             // heap.py ArrayCachedItem._getfield:
                             //   res = optheap.optimizer.force_op_from_preamble(res)
                             //   opinfo.setitem(descr, index, None, res, optheap=optheap)
@@ -2899,7 +2899,7 @@ impl OptHeap {
                             ctx.make_equal_to(&b_old, &b_cached);
                             return OptimizationResult::Remove;
                         }
-                        crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                        crate::optimizeopt::info::FieldEntryKind::Value(cached) => {
                             if !cached.is_none() {
                                 let b_old = Operand::from_bound_op(op_rc);
                                 let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
@@ -2972,8 +2972,8 @@ impl OptHeap {
                 .and_then(|s| s.const_get(const_index))
                 && let Some(entry) = cai._getfield(array, &op.getdescr().unwrap(), ctx)
             {
-                match entry {
-                    crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                match entry.kind() {
+                    crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
                         // heap.py:243-249: force the preamble op, then write
                         // the forced value back into the array info.
                         let cached = ctx.force_op_from_preamble_op(&pop);
@@ -2986,7 +2986,7 @@ impl OptHeap {
                         ctx.make_equal_to(&b_old, &b_cached);
                         return OptimizationResult::Remove;
                     }
-                    crate::optimizeopt::info::FieldEntry::Value(cached) => {
+                    crate::optimizeopt::info::FieldEntryKind::Value(cached) => {
                         if !cached.is_none() {
                             let b_old = Operand::from_bound_op(op_rc);
                             let b_cached = ctx.get_box_replacement_operand(cached.to_opref());

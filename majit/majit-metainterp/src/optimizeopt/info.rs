@@ -136,7 +136,7 @@ fn allocation_initialized_w_class(
     ))
 }
 
-pub use majit_ir::field_entry::{FieldEntry, PreambleOp};
+pub use majit_ir::field_entry::{FieldEntry, FieldEntryKind, PreambleOp};
 pub use majit_ir::op_info::{EmptyInfo, FloatConstInfo, OpInfo};
 pub use majit_ir::ptr_info::reasonable_array_index;
 pub use majit_ir::ptr_info::{PtrInfo, StrPtrInfo};

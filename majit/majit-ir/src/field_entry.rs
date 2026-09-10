@@ -53,23 +53,65 @@ pub struct PreambleOp {
 /// to decide whether to force the value via the short preamble.
 ///
 /// Rust equivalent: typed enum instead of Python's duck-typed list.
-#[derive(Clone, Debug)]
-pub enum FieldEntry {
-    /// Normal cached field value (info.py setfield). Stored as an
-    /// [`Operand`](crate::operand::Operand) so a `Const` ref is GC-walked
-    /// through `Operand::walk_const_ptr_refs`, never persisting a Copy
-    /// `OpRef::ConstPtr` that a moving collection cannot reach.
-    Value(crate::operand::Operand),
-    /// shortpreamble.py PreambleOp — sentinel stored during Phase 2 import.
-    /// Boxed so `(u32, FieldEntry)` stays 16 B and a one-field
-    /// `PtrInfo` clone does not mint the 48-byte class.
-    Preamble(Box<PreambleOp>),
+///
+/// Packed to 8 B so `(u32, FieldEntry)` is 16 B. A 4-entry grow of the
+/// 24 B pair was 96 B on the regex and/or leaf. Value words reuse
+/// [`Operand`]'s tag space (0-5); preamble is an 8-aligned `Box` with
+/// tag 6, which `Operand` does not use.
+#[repr(transparent)]
+pub struct FieldEntry {
+    packed: u64,
 }
 
+const FE_PREAMBLE: u64 = 6;
+
 impl FieldEntry {
+    /// Normal cached field value (info.py setfield).
+    #[allow(non_snake_case)]
+    pub fn Value(op: crate::operand::Operand) -> Self {
+        let packed = op.into_packed();
+        FieldEntry { packed }
+    }
+
+    /// shortpreamble.py PreambleOp — sentinel stored during Phase 2 import.
+    #[allow(non_snake_case)]
+    pub fn Preamble(pop: Box<PreambleOp>) -> Self {
+        let p = Box::into_raw(pop) as u64;
+        debug_assert_eq!(p & 7, 0, "PreambleOp box must be 8-aligned");
+        FieldEntry {
+            packed: p | FE_PREAMBLE,
+        }
+    }
+
     pub fn preamble(pop: PreambleOp) -> Self {
         FieldEntry::Preamble(Box::new(pop))
     }
+
+    fn is_preamble_word(&self) -> bool {
+        self.packed != 0 && self.packed & 7 == FE_PREAMBLE
+    }
+
+    pub fn as_value(&self) -> Option<crate::operand::Operand> {
+        if self.is_preamble_word() {
+            None
+        } else {
+            Some(crate::operand::Operand::clone_from_packed(self.packed))
+        }
+    }
+
+    pub fn kind(&self) -> FieldEntryKind<'_> {
+        if let Some(pop) = self.as_preamble() {
+            FieldEntryKind::Preamble(pop)
+        } else {
+            FieldEntryKind::Value(crate::operand::Operand::clone_from_packed(self.packed))
+        }
+    }
+}
+
+/// View of a [`FieldEntry`] for `match`.
+pub enum FieldEntryKind<'a> {
+    Value(crate::operand::Operand),
+    Preamble(&'a PreambleOp),
 }
 
 impl FieldEntry {
@@ -77,23 +119,29 @@ impl FieldEntry {
     /// Returns `None` for `Preamble` entries (those need special handling
     /// via `force_op_from_preamble`).
     pub fn as_opref(&self) -> Option<OpRef> {
-        match self {
-            FieldEntry::Value(b) => Some(b.to_opref()),
-            FieldEntry::Preamble(_) => None,
-        }
+        self.as_value().map(|b| b.to_opref())
     }
 
     /// Returns true if this is a `Preamble` entry.
     pub fn is_preamble(&self) -> bool {
-        matches!(self, FieldEntry::Preamble(_))
+        self.is_preamble_word()
     }
 
     /// Extract the `PreambleOp` if this is a `Preamble` entry.
     pub fn as_preamble(&self) -> Option<&PreambleOp> {
-        match self {
-            FieldEntry::Preamble(pop) => Some(pop.as_ref()),
-            FieldEntry::Value(_) => None,
+        if !self.is_preamble_word() {
+            return None;
         }
+        let p = (self.packed & !7) as *const PreambleOp;
+        Some(unsafe { &*p })
+    }
+
+    pub fn as_preamble_mut(&mut self) -> Option<&mut PreambleOp> {
+        if !self.is_preamble_word() {
+            return None;
+        }
+        let p = (self.packed & !7) as *mut PreambleOp;
+        Some(unsafe { &mut *p })
     }
 
     /// View this slot the same way RPython reads `_fields[]` / `_items[]`
@@ -104,9 +152,10 @@ impl FieldEntry {
     /// their original Phase 1 source box (`pop.op`), matching PyPy's
     /// `get_box_replacement(PreambleOp(...))` behavior.
     pub fn as_seen_opref(&self) -> OpRef {
-        match self {
-            FieldEntry::Value(b) => b.to_opref(),
-            FieldEntry::Preamble(pop) => pop.op.to_opref(),
+        if let Some(pop) = self.as_preamble() {
+            pop.op.to_opref()
+        } else {
+            crate::operand::Operand::clone_from_packed(self.packed).to_opref()
         }
     }
 
@@ -118,17 +167,53 @@ impl FieldEntry {
     /// info, so the returned operands coincide by identity (clones of the
     /// same stored handle).
     pub fn as_seen_operand(&self) -> crate::operand::Operand {
-        match self {
-            FieldEntry::Value(b) => b.clone(),
-            FieldEntry::Preamble(pop) => pop.op.clone(),
+        if let Some(pop) = self.as_preamble() {
+            pop.op.clone()
+        } else {
+            crate::operand::Operand::clone_from_packed(self.packed)
         }
     }
 
     /// Consume and extract the `PreambleOp` if this is a `Preamble` entry.
     pub fn into_preamble(self) -> Option<PreambleOp> {
-        match self {
-            FieldEntry::Preamble(pop) => Some(*pop),
-            FieldEntry::Value(_) => None,
+        if !self.is_preamble_word() {
+            return None;
+        }
+        let p = (self.packed & !7) as *mut PreambleOp;
+        std::mem::forget(self);
+        Some(*unsafe { Box::from_raw(p) })
+    }
+}
+
+impl Clone for FieldEntry {
+    fn clone(&self) -> Self {
+        if self.is_preamble_word() {
+            FieldEntry::Preamble(Box::new(self.as_preamble().expect("preamble").clone()))
+        } else {
+            FieldEntry::Value(crate::operand::Operand::clone_from_packed(self.packed))
+        }
+    }
+}
+
+impl Drop for FieldEntry {
+    fn drop(&mut self) {
+        if self.is_preamble_word() {
+            let p = (self.packed & !7) as *mut PreambleOp;
+            drop(unsafe { Box::from_raw(p) });
+        } else {
+            crate::operand::Operand::drop_packed(self.packed);
+        }
+    }
+}
+
+impl std::fmt::Debug for FieldEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(pop) = self.as_preamble() {
+            f.debug_tuple("Preamble").field(pop).finish()
+        } else {
+            f.debug_tuple("Value")
+                .field(&crate::operand::Operand::clone_from_packed(self.packed))
+                .finish()
         }
     }
 }
@@ -138,10 +223,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn field_entry_value_pair_leaves_the_48_byte_class() {
+    fn field_entry_value_pair_leaves_the_96_byte_class() {
+        assert_eq!(
+            std::mem::size_of::<FieldEntry>(),
+            8,
+            "FieldEntry is {} B; must pack into Operand's unused tag",
+            std::mem::size_of::<FieldEntry>()
+        );
         assert!(
-            std::mem::size_of::<(u32, FieldEntry)>() <= 24,
-            "(u32, FieldEntry) is {} B; a one-field PtrInfo clone must not mint 48 B",
+            std::mem::size_of::<(u32, FieldEntry)>() <= 16,
+            "(u32, FieldEntry) is {} B; a 4-entry grow must not mint 96 B",
             std::mem::size_of::<(u32, FieldEntry)>()
         );
     }

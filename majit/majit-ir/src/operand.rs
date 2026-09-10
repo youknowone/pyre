@@ -256,6 +256,26 @@ impl Operand {
     pub fn is_null_ref(&self) -> bool {
         self.packed == OP_NULLREF
     }
+
+    /// Steal the packed word. The caller owns the refs.
+    pub(crate) fn into_packed(self) -> u64 {
+        let packed = self.packed;
+        std::mem::forget(self);
+        packed
+    }
+
+    /// Clone an operand from a packed word the caller still owns.
+    pub(crate) fn clone_from_packed(packed: u64) -> Operand {
+        let view = Operand { packed };
+        let out = view.clone();
+        std::mem::forget(view);
+        out
+    }
+
+    /// Drop the refs in a packed word the caller is releasing.
+    pub(crate) fn drop_packed(packed: u64) {
+        drop(Operand { packed });
+    }
 }
 
 impl Clone for Operand {
