@@ -467,6 +467,21 @@ pub extern "C" fn pyre_jit_bridge_diag(i: u32) -> u64 {
     majit_backend_wasm::bridge_diag(i as usize)
 }
 
+/// Last `compile_loop` `Err` string, byte `i`. The guest has no stderr, so
+/// this is how the host reads `build_wasm_module`'s decline. Pair with
+/// [`pyre_jit_last_compile_err_len`].
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_last_compile_err_byte(i: u32) -> u32 {
+    majit_backend_wasm::last_compile_err_byte(i)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_last_compile_err_len() -> u32 {
+    majit_backend_wasm::last_compile_err_len()
+}
+
 /// Packed `(kind, needed, available)` geometry for an inline-module trial that
 /// did not fit its owner's frozen frame. The host formats this diagnostic only.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]

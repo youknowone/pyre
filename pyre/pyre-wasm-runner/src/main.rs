@@ -922,6 +922,25 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             }
             eprintln!("[jit-stats] bridge_diag {}", parts.join(" "));
         }
+        // `compile_loop` `Err` reason. `cl_entered` without `cl_ok` /
+        // `cl_decl_*` means `build_wasm_module` declined and the string
+        // never left the guest; this is the only host-visible copy.
+        if let (Ok(len_fn), Ok(byte_fn)) = (
+            instance.get_typed_func::<(), u32>(&mut store, "pyre_jit_last_compile_err_len"),
+            instance.get_typed_func::<u32, u32>(&mut store, "pyre_jit_last_compile_err_byte"),
+        ) {
+            let len = len_fn.call(&mut store, ()).unwrap_or(0);
+            if len > 0 {
+                let mut bytes = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    bytes.push(byte_fn.call(&mut store, i).unwrap_or(0) as u8);
+                }
+                eprintln!(
+                    "[jit-stats] last_compile_err {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+        }
         // The portal's own decision tallies. POSITIONAL MIRROR of
         // `pyre_jit::eval::PORTAL_DIAG_LABELS`, but unlike `bridge_diag` above
         // the guest also exports the slot count, so a slot added there without
