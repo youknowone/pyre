@@ -3265,13 +3265,13 @@ impl OptContext {
         .any(|op| {
             matches!(
                 op.forwarded().borrow(),
-                Forwarded::Const(_) | Forwarded::SmallWide(_)
+                Forwarded::Const(_) | Forwarded::SmallConst(_) | Forwarded::SmallWide(_)
             )
         });
         let inputarg_const = self.inputarg_refs.get(&raw).is_some_and(|ia| {
             matches!(
                 ia.forwarded.borrow(),
-                Forwarded::Const(_) | Forwarded::SmallWide(_)
+                Forwarded::Const(_) | Forwarded::SmallConst(_) | Forwarded::SmallWide(_)
             )
         });
         resop_const || inputarg_const
@@ -9646,6 +9646,33 @@ mod input_ops_index_tests {
         assert!(
             !OpRc::ptr_eq(&producer, &first),
             "the earlier occurrence must be shadowed by the later one"
+        );
+    }
+
+    /// `make_constant` stores an i32 ConstInt as `Forwarded::SmallConst`.
+    /// `allocate_next_pos_raw` must treat that as a claimed position.
+    #[test]
+    fn reserve_pos_skips_a_smallconst_forwarded_position() {
+        use majit_ir::forwarding::ForwardingHost;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 0, 0, 0);
+        let pos = OpRef::int_op(5);
+        let op = Op::new(OpCode::SameAsI, &[]);
+        op.pos().set(pos);
+        op.set_forwarded_const(majit_ir::Const::from_value(majit_ir::Value::Int(7)));
+        assert!(
+            matches!(
+                op.forwarded().borrow(),
+                majit_ir::forwarding::Forwarded::SmallConst(_)
+            ),
+            "i32 ConstInt must pack as SmallConst"
+        );
+        ctx.resop_refs.insert(pos, OpRc::new(op));
+        ctx.next_pos = 5;
+        let reserved = ctx.reserve_pos_typed(majit_ir::Type::Int);
+        assert_eq!(
+            reserved.raw(),
+            6,
+            "SmallConst-forwarded position 5 must stay claimed"
         );
     }
 }

@@ -8795,7 +8795,12 @@ fn bh_store_ref_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
     unsafe {
         majit_backend::llmodel::write_ref_at_mem(struct_ptr as usize, offset, value as usize);
     }
-    majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+    // dynasm `bh_setfield_gc_r` / cranelift `write_barrier_if_managed`:
+    // skip the header walk when the base is a reconstructed unmanaged
+    // object. `gc_write_barrier` alone does not do that check.
+    if majit_gc::gc_owns_object(struct_ptr as usize) {
+        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+    }
 }
 
 #[inline(always)]
