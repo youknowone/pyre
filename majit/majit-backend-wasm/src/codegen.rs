@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+use majit_ir::forwarding::Forwarded;
+use majit_ir::operand::Operand;
+use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
     FunctionSection, GlobalSection, GlobalType, ImportSection, InstructionSink, MemArg, MemoryType,
@@ -10941,6 +10943,30 @@ fn emit_resolve_f64(
 ///
 /// Only positions actually read as a plain OpRef are returned, so a trace
 /// whose pool holds no such value emits no extra prologue instruction.
+/// Scalar bits a folded producer still carries after it left the compiled
+/// stream. `RegisterManager::loc` (dynasm `regalloc.rs`) recovers the same
+/// payload from the box; flattening to `IntOp(pos)` and looking only at the
+/// backend pool drops `_resint` / `_forwarded` (`history.py *FrontendOp`).
+fn folded_scalar_bits(arg: &Operand) -> Option<i64> {
+    let value = match arg.get_value() {
+        Some(value) => value,
+        None => match arg.get_forwarded() {
+            Forwarded::Const(c) => c.get(),
+            _ => {
+                let replaced = arg.get_box_replacement(false);
+                if !replaced.is_constant() {
+                    return None;
+                }
+                replaced.const_value()?
+            }
+        },
+    };
+    match value {
+        Value::Ref(_) => None,
+        value => Some(value.as_raw_i64()),
+    }
+}
+
 fn unbound_pool_const_seeds(
     inputargs: &[InputArg],
     ops: &[Op],
@@ -10986,28 +11012,53 @@ fn unbound_pool_const_seeds(
         }
     }
     let mut seeds: Vec<(u32, i64)> = Vec::new();
-    let mut unresolved: Vec<(OpRef, OpCode, bool)> = Vec::new();
+    let mut unresolved: Vec<u32> = Vec::new();
+    let mut readers: Vec<String> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
-    let mut consider = |a: OpRef, opcode: OpCode, failarg: bool, seeds: &mut Vec<(u32, i64)>| {
-        if a == OpRef::NONE || a.is_constant() {
-            return;
-        }
-        let raw = a.raw();
-        if raw >= num_vars || defined.contains(&raw) || !seen.insert(raw) {
-            return;
-        }
-        match constants.get(&raw) {
-            Some(&bits) => seeds.push((raw, bits)),
-            // No producer and no pool entry: the local would read as the
-            // zero wasm initializes it to, which is a wrong value, not a
-            // missing one. Decline the trace (the interpreter runs it
-            // correctly, unaccelerated) exactly as the unhandled-opcode
-            // arm does. Live failargs are spilled from that same local
-            // (`emit_guard_fail_args_spill`); accepting a hole here
-            // would resume with a zero instead of declining.
-            None => unresolved.push((a, opcode, failarg)),
-        }
-    };
+    let mut consider =
+        |op: &Op, slot: &str, a: &Operand, seeds: &mut Vec<(u32, i64)>, seen: &mut HashSet<u32>| {
+            if a.is_constant() {
+                return;
+            }
+            let opref = a.to_opref();
+            if opref == OpRef::NONE || opref.is_constant() {
+                return;
+            }
+            let raw = opref.raw();
+            if raw >= num_vars || defined.contains(&raw) {
+                return;
+            }
+            if !seen.insert(raw) {
+                if unresolved.contains(&raw) {
+                    readers.push(format!("{:?}.{slot} {opref:?}", op.opcode));
+                }
+                return;
+            }
+            if let Some(&bits) = constants.get(&raw) {
+                seeds.push((raw, bits));
+                return;
+            }
+            if let Some(bits) = folded_scalar_bits(a) {
+                seeds.push((raw, bits));
+                return;
+            }
+            // A peeled-loop fallthrough scan can append a resume live-in
+            // (`assemble_peeled_trace_with_jump_args`) that is an InputArg
+            // not in the token's input list and has no producer — leftover
+            // of a residualized interior slot (`FrameLocalsRoot` keeps that
+            // address out of compiled Ref homes). Dynasm `RegisterManager.loc`
+            // allocates a dummy frame slot; seed the wasm local with 0
+            // (null Ref / zero scalar) so the module is well-formed.
+            if a.is_inputarg() && !inputargs.iter().any(|ia| ia.index == raw) {
+                seeds.push((raw, 0));
+                return;
+            }
+            // No producer, no pool entry, no leftover box value: the local
+            // would read as the zero wasm initializes it to. Decline the
+            // trace (the interpreter runs it correctly, unaccelerated).
+            unresolved.push(raw);
+            readers.push(format!("{:?}.{slot} {opref:?}", op.opcode));
+        };
     for op in ops {
         // rewrite.py `keep` — JIT_DEBUG / DebugMergePoint keep their
         // constants inline and never execute as values. LABEL args are
@@ -11018,8 +11069,8 @@ fn unbound_pool_const_seeds(
         if op.opcode.is_label() || op.opcode.is_jit_debug() {
             continue;
         }
-        for a in op.getarglist().iter() {
-            consider(a.to_opref(), op.opcode, false, &mut seeds);
+        for (i, a) in op.getarglist().iter().enumerate() {
+            consider(op, &format!("arg{i}"), a, &mut seeds, &mut seen);
         }
         // Same live extent `emit_guard_fail_args_spill` writes. A hole
         // (`rd_locs == 0xFFFF`) is spilled as zero and is not a read of
@@ -11027,9 +11078,11 @@ fn unbound_pool_const_seeds(
         let fail_args = exit_fail_args(op);
         let live = live_fail_arg_mask(op.getdescr().as_ref(), fail_args.len());
         let extent = live_fail_arg_extent(op.getdescr().as_ref(), fail_args.len());
-        for (i, &a) in fail_args.iter().take(extent).enumerate() {
-            if live.get(i).copied().unwrap_or(true) {
-                consider(a, op.opcode, true, &mut seeds);
+        if let Some(fa) = op.getfailargs() {
+            for (i, a) in fa.iter().take(extent).enumerate() {
+                if live.get(i).copied().unwrap_or(true) {
+                    consider(op, &format!("fail{i}"), a, &mut seeds, &mut seen);
+                }
             }
         }
     }
@@ -11052,7 +11105,9 @@ fn unbound_pool_const_seeds(
         let in_idx: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
         return Err(BackendError::Unsupported(format!(
             "wasm codegen: value{unresolved:?} read with no producing op and no \
-             constant-pool entry; inputargs={in_idx:?} labels={labels:?} sameas={sameas:?}"
+             constant-pool entry; readers=[{}]; inputargs={in_idx:?} \
+             labels={labels:?} sameas={sameas:?}",
+            readers.join(" | "),
         )));
     }
     Ok(seeds)

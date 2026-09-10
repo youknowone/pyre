@@ -3139,6 +3139,91 @@ fn unbound_non_label_read_of_import_hole_is_declined() {
 }
 
 #[test]
+fn test_folded_producer_value_seeds_unbound_local() {
+    // The producer at pos 99 is not in the compiled stream. Its `_resint`
+    // still holds the folded constant (`history.py IntFrontendOp`). Flattening
+    // to `IntOp(99)` without a pool entry used to decline the module.
+    let producer = std::rc::Rc::new(Op::new(OpCode::IntAdd, &[]));
+    producer.pos.set(OpRef::int_op(99));
+    producer.set_value(majit_ir::Value::Int(7));
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let add = Op::new(
+        OpCode::IntAdd,
+        &[
+            Operand::from_bound_op(&producer),
+            rb(OpRef::input_arg_int(0)),
+        ],
+    );
+    add.pos.set(OpRef::int_op(1));
+    let ops = vec![add, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+}
+
+#[test]
+fn test_folded_producer_ref_is_interned() {
+    // Same hole as the scalar case, but a leftover `_resref` must become
+    // `LoadFromGcTable` (`rewrite.py remove_constptr`), not a baked pointer.
+    let producer = std::rc::Rc::new(Op::new(OpCode::SameAsR, &[]));
+    producer.pos.set(OpRef::ref_op(99));
+    producer.set_value(majit_ir::Value::Ref(majit_ir::GcRef(0x1000)));
+
+    let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+    let same = Op::new(OpCode::SameAsR, &[Operand::from_bound_op(&producer)]);
+    same.pos.set(OpRef::ref_op(1));
+    let ops = vec![same, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(1))])];
+    // `compile_loop` intern_ref_constants runs this pass first; a leftover
+    // `_resref` must become LoadFromGcTable before unbound-seed.
+    let (ops, gcrefs) = majit_gc::rewrite::remove_ref_constants(&ops, 2);
+    assert_eq!(gcrefs.len(), 1, "folded Ref must enter the gc table");
+    assert!(
+        ops.iter().any(|op| op.opcode == OpCode::LoadFromGcTable),
+        "remove_constptr must emit LoadFromGcTable, ops={ops:?}"
+    );
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+}
+
+#[test]
+fn test_stray_label_inputarg_is_seeded() {
+    // Loop LABEL / JUMP carry an InputArg that is not in the token input
+    // list (peeled fallthrough leftover). Must compile, not decline.
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[
+                rb(OpRef::input_arg_ref(0)),
+                rb(OpRef::input_arg_ref(1)),
+                rb(OpRef::input_arg_ref(99)),
+            ],
+        ),
+        make_op(
+            OpCode::SameAsR,
+            &[OpRef::input_arg_ref(0)],
+            OpRef::ref_op(2),
+        ),
+        Op::new(
+            OpCode::Jump,
+            &[
+                rb(OpRef::input_arg_ref(0)),
+                rb(OpRef::input_arg_ref(1)),
+                rb(OpRef::input_arg_ref(99)),
+            ],
+        ),
+    ];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+}
+
+#[test]
 fn test_float_ops() {
     let inputargs = vec![
         InputArg::from_type(Type::Float, 0),

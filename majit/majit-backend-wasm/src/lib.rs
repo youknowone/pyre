@@ -130,6 +130,13 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// 65 = the same eager arm declined an owner already too large to re-emit. The
 /// arm cannot wait for the entry evidence the deferred arm waits for, so the
 /// only thing it can read is what the re-emission will cost.
+///
+/// 66 = `compile_loop` entered (`cl_entered`) but `build_wasm_module` returned
+/// `Unsupported`. Slots 25/26 only name the pre-codegen CALL_ASSEMBLER filter
+/// and a host module reject; every other `Result` return on that stretch was
+/// silent, so a `cl_entered` without `cl_ok` could not say which opcode or
+/// frame-layout check declined. The last reason string is also kept for the
+/// host (`compile_loop_last_error`).
 pub static BRIDGE_DIAG: [AtomicU64; BRIDGE_DIAG_LABELS.len()] =
     [const { AtomicU64::new(0) }; BRIDGE_DIAG_LABELS.len()];
 
@@ -212,6 +219,7 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "ca_decl_terminal",
     "inline_decl_foreign_eager",
     "inline_decl_eager_too_large",
+    "cl_decl_codegen",
 ];
 
 #[repr(u8)]
@@ -257,6 +265,18 @@ static INLINE_TRIAL_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// census, whose `entries` count is how often that crossing actually ran.
 static INLINE_DECLINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 const INLINE_DECLINE_LOG_CAP: usize = 64;
+/// Last `compile_loop` decline reason. Guest `eprintln` never reaches the
+/// host; this string is packed out through `pyre_jit_compile_loop_last_error`.
+static COMPILE_LOOP_LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+
+fn record_compile_loop_error(error: &BackendError) {
+    *COMPILE_LOOP_LAST_ERROR.lock() = error.to_string();
+}
+
+/// Last `compile_loop` `Unsupported` reason, or empty if none declined.
+pub fn compile_loop_last_error() -> String {
+    COMPILE_LOOP_LAST_ERROR.lock().clone()
+}
 
 pub(crate) fn record_inline_geometry(kind: FrameShortageKind, needed: usize, available: usize) {
     const FIELD_MASK: u64 = (1 << 24) - 1;
@@ -4433,6 +4453,8 @@ impl majit_backend::Backend for WasmBackend {
                 Err(err) => {
                     diag_bump(25);
                     record_last_compile_err(&err);
+                    record_compile_loop_error(&err);
+                    diag_bump(66);
                     return Err(err);
                 }
             };
