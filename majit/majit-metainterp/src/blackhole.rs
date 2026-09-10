@@ -1902,6 +1902,32 @@ impl BlackholeInterpreter {
                 );
             }
             let opcode = code[self.position];
+            // The remaining `shift` epilogue at pc 210 is mostly `-live-`,
+            // `goto/L`, and `goto_if_not` around one native INLINE_CALL.
+            // RPython's translated `dispatch_loop` inlines those `_get_method`
+            // bodies; the function-pointer table is the untranslated form.
+            // Do not restart `fnaddr` from this mid-node PC.
+            if !trace {
+                match opcode {
+                    jitcode::insns::BC_LIVE if LIVE_MARKER_HOOK.get().is_none() => {
+                        self.position += 1 + majit_translate::liveness::OFFSET_SIZE;
+                        continue;
+                    }
+                    jitcode::insns::BC_JUMP => {
+                        let p = self.position + 1;
+                        self.position = (code[p] as usize) | ((code[p + 1] as usize) << 8);
+                        continue;
+                    }
+                    jitcode::insns::BC_GOTO_IF_NOT => {
+                        let p = self.position + 1;
+                        let a = self.registers_i[code[p] as usize];
+                        let target = (code[p + 1] as usize) | ((code[p + 2] as usize) << 8);
+                        self.position = bhimpl_goto_if_not(a, target, p + 3);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             self.position += 1;
             if trace {
                 eprintln!(

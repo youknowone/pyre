@@ -3488,6 +3488,10 @@ pub struct ResumeDataLoopMemo {
     pub nvirtuals: usize,
     pub nvholes: usize,
     pub nvreused: usize,
+    /// Reused by `number_slices` / `finish` so timed-section guards do not
+    /// mint a fresh writer `Vec` and livebox hole list on every bridge.
+    writer_scratch: Vec<i32>,
+    livebox_opt_scratch: Vec<Option<majit_ir::OpRef>>,
 }
 
 impl ResumeDataLoopMemo {
@@ -3501,6 +3505,8 @@ impl ResumeDataLoopMemo {
             nvirtuals: 0,
             nvholes: 0,
             nvreused: 0,
+            writer_scratch: Vec::new(),
+            livebox_opt_scratch: Vec::new(),
         }
     }
 
@@ -4366,7 +4372,18 @@ impl ResumeDataLoopMemo {
                 .map(|(_, _, _, boxes)| boxes.len() + 3)
                 .sum::<usize>()
             + 4;
-        let mut numb_state = NumberingState::new(size_hint);
+        let mut writer = majit_ir::resumecode::Writer {
+            current: std::mem::take(&mut self.writer_scratch),
+        };
+        writer.current.clear();
+        writer.current.reserve(size_hint);
+        let mut numb_state = NumberingState {
+            writer,
+            liveboxes: LiveboxMap::new(),
+            num_boxes: 0,
+            num_virtuals: 0,
+            livebox_types: indexmap::IndexMap::with_capacity_and_hasher(size_hint, FxBuildHasher),
+        };
 
         // resume.py:231-232: patch later
         numb_state.append_int(0); // slot 0: size of resume section
@@ -4460,7 +4477,9 @@ impl ResumeDataLoopMemo {
         let num_env_virtuals = numb_state.num_virtuals;
 
         // resume.py: split liveboxes_from_env into TAGBOX/TAGVIRTUAL
-        let mut liveboxes: Vec<Option<majit_ir::OpRef>> = vec![None; numb_state.num_boxes as usize];
+        let mut liveboxes = std::mem::take(&mut self.livebox_opt_scratch);
+        liveboxes.clear();
+        liveboxes.resize(numb_state.num_boxes as usize, None);
 
         // resume.py:413: self.vfieldboxes collected by virtual walk
         // resume.py:408: self.liveboxes — newly discovered boxes from field walk
@@ -4660,6 +4679,7 @@ impl ResumeDataLoopMemo {
 
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
         let rd_numb = numb_state.create_numbering_arc();
+        self.writer_scratch = std::mem::take(&mut numb_state.writer.current);
         let rd_consts = self.consts.clone();
 
         // Resolve each livebox through the forwarding chain so the backend
@@ -4694,7 +4714,7 @@ impl ResumeDataLoopMemo {
         // numbering snapshot, which would break rd_numb / liveboxes
         // alignment downstream.
         let ordered_liveboxes: Vec<majit_ir::OpRef> = liveboxes
-            .into_iter()
+            .iter()
             .map(|opt| {
                 opt.map(|opref| {
                     let walked = env.get_box_replacement_not_const(opref);
@@ -4709,6 +4729,8 @@ impl ResumeDataLoopMemo {
                 .unwrap_or(majit_ir::OpRef::NONE)
             })
             .collect();
+        liveboxes.clear();
+        self.livebox_opt_scratch = liveboxes;
 
         // Merge livebox_types: numbering-time types + types for boxes
         // discovered during virtual field walking.
