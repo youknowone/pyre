@@ -1692,6 +1692,29 @@ impl BlackholeInterpreter {
         }
     }
 
+    /// Whether `run` must walk the caller chain to install register /
+    /// virtualizable roots. False when every frame is already registered
+    /// and no heap virtualizable (`has_vable_token`) is attached.
+    fn chain_needs_run_rooting(&self) -> bool {
+        let mut frame = Some(self);
+        while let Some(f) = frame {
+            if !f.rooted {
+                return true;
+            }
+            if !f.virtualizable_info.is_null() {
+                // SAFETY: `virtualizable_info` is the process-owned
+                // `VirtualizableInfo` `seed_deopt_vinfo_ptr` / the
+                // portal stamped; it outlives the drive.
+                let vinfo = unsafe { &*f.virtualizable_info };
+                if vinfo.has_vable_token() {
+                    return true;
+                }
+            }
+            frame = f.nextblackholeinterp.as_deref();
+        }
+        false
+    }
+
     /// Execute the dispatch loop on the current jitcode.
     ///
     /// RPython: `BlackholeInterpreter.run()` catches `LeaveFrame` and breaks,
@@ -1700,6 +1723,18 @@ impl BlackholeInterpreter {
     /// jitexc.ContinueRunningNormally propagates through run→_run_forever).
     pub fn run(&mut self) -> BhRunOutcome {
         let _bh_phase = majit_gc::BhProbePhase::enter("blackhole");
+        // Pooled interpreters are registered for life (`acquire_interp`).
+        // `seed_deopt_vinfo_ptr` still stamps a no-token state-field
+        // `VirtualizableInfo` on every regex frame, and the vable register
+        // scan below then walks the whole chain on every `run()` — O(frames²)
+        // `gc_owns_object` probes per character, against a vtype that is
+        // never a `NodeRec`. Skip that walk when every frame is already
+        // rooted and no heap virtualizable is present.
+        if !self.chain_needs_run_rooting() {
+            return self
+                .try_native_finish_at_node_entry()
+                .unwrap_or_else(|| self.run_inner());
+        }
         // Root this frame's register bank AND every pending caller frame
         // reachable through `nextblackholeinterp`.  RPython keeps the whole
         // blackhole interpreter chain transitively GC-traced from the head for
@@ -1921,11 +1956,21 @@ impl BlackholeInterpreter {
                         self.position = (code[p] as usize) | ((code[p + 1] as usize) << 8);
                         continue;
                     }
-                    jitcode::insns::BC_GOTO_IF_NOT => {
+                    jitcode::insns::BC_GOTO_IF_NOT | jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
+                        // `if mark` / `if old_left` lower to
+                        // `goto_if_not_int_is_true`; `bhimpl_goto_if_not_int_is_true`
+                        // is `bhimpl_goto_if_not`.
                         let p = self.position + 1;
                         let a = self.registers_i[code[p] as usize];
                         let target = (code[p + 1] as usize) | ((code[p + 2] as usize) << 8);
                         self.position = bhimpl_goto_if_not(a, target, p + 3);
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_IS_TRUE => {
+                        let p = self.position + 1;
+                        let a = self.registers_i[code[p] as usize];
+                        self.registers_i[code[p + 1] as usize] = bhimpl_int_is_true(a);
+                        self.position = p + 2;
                         continue;
                     }
                     jitcode::insns::BC_MOVE_I => {
@@ -4464,6 +4509,15 @@ mod tests {
             let mut builder = build_test_bh_builder();
             let framestack = crate::pyjitpl::MIFrameStack::empty();
             let _ = convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+        }
+
+        #[test]
+        fn rooted_state_field_chain_skips_run_rooting() {
+            let mut builder = build_test_bh_builder();
+            let bh = builder.acquire_interp();
+            assert!(bh.rooted);
+            assert!(bh.virtualizable_info.is_null());
+            assert!(!bh.chain_needs_run_rooting());
         }
 
         /// `_setup_return_value_i` reads `code[position-1]`, the single
