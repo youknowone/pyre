@@ -6221,6 +6221,63 @@ mod tests {
         assert_eq!(unknown, None);
     }
 
+    /// `gcreftracer.py` `llop.gc_writebarrier(tr)`: `compile_loop` must
+    /// remember the interned table on the active MiniMark, not only pin it
+    /// on the CLT. Minor collection walks `pending_gc_tables`, so a nursery
+    /// ConstPtr that is only in `LIVE_GC_TABLES` would stay unforwarded.
+    #[test]
+    fn compile_loop_remembers_gc_table_for_minor_collection() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..majit_gc::collector::GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E701 };
+        let mut backend = WasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let constant = majit_ir::Op::new(
+            majit_ir::OpCode::SameAsR,
+            &[rb(majit_ir::OpRef::const_ptr(root))],
+        );
+        constant.pos.set(majit_ir::OpRef::ref_op(1));
+        let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[rb(majit_ir::OpRef::ref_op(1))]);
+        finish.pos.set(majit_ir::OpRef::void_op(2));
+        finish.set_fail_arg_types(vec![majit_ir::Type::Ref]);
+        finish.setfailargs(vec![rb(majit_ir::OpRef::ref_op(1))].into());
+
+        let token = JitCellToken::new(1_500_294);
+        backend
+            .compile_loop(
+                &[],
+                &[std::rc::Rc::new(constant), std::rc::Rc::new(finish)],
+                &token,
+            )
+            .expect("compile wasm loop with a reference constant");
+
+        let clt = token.compiled_loop_token().expect("CLT");
+        let table = {
+            let tracers = clt.asmmemmgr_gcreftracers.lock();
+            tracers
+                .iter()
+                .find_map(|tracer| {
+                    std::sync::Arc::clone(tracer)
+                        .downcast::<majit_gc::GcTable>()
+                        .ok()
+                })
+                .expect("compile_loop must pin the interned GcTable on the CLT")
+        };
+        assert_eq!(table.slot(0), root);
+
+        with_wasm_active_gc_mut(|gc| gc.collect_nursery()).expect("active wasm MiniMark");
+        let moved = table.slot(0);
+        assert_ne!(moved, root, "remembered table slot must be forwarded");
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E701);
+    }
+
     /// Spike for the wasm-JITFRAME refactor: prove the shared
     /// `MiniMarkGC` forwards a JitFrame's interior Ref item through the
     /// `jf_gcmap` custom-trace when the frame is discovered via the jitframe
