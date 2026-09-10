@@ -2083,7 +2083,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                                 call_jit_pc,
                                 'r',
                                 color,
-                                ctx.concrete_registers_r.len(),
+                                ctx.frame_state.borrow().concrete_registers_r.len(),
                                 got,
                             );
                             report_caller_image_ref_box(ctx, color);
