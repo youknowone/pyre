@@ -5620,6 +5620,26 @@ fn assemble_peeled_trace_with_jump_args(
             stream_defs.insert(op.pos().get());
         }
     }
+    // Phase 2 optimizer inputargs live at `[inputarg_base, inputarg_base+n)`.
+    // The assembled trace shares `[0, n)` with the preamble (`shift_back`
+    // used to do this translation; assembly now owns it). A Phase-2
+    // InputArg that is not rewritten here is appended as a LABEL live-in
+    // with no producer (`InputArgRef(99)` with token inputs `[0, 1]`).
+    let mut phase2_input_remap: std::collections::HashMap<OpRef, OpRef> =
+        std::collections::HashMap::new();
+    if inputarg_base > 0 {
+        for i in 0..body_num_inputs {
+            let tp = ctx.inputarg_type_at_strict(i);
+            let src = OpRef::input_arg_typed(inputarg_base + i as u32, tp);
+            let dst = start_label_args
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| OpRef::input_arg_typed(i as u32, tp));
+            if src != dst {
+                phase2_input_remap.insert(src, dst);
+            }
+        }
+    }
     {
         let mut seen_body_defs = indexmap::IndexSet::new();
         for op in p2_ops {
@@ -5639,6 +5659,7 @@ fn assemble_peeled_trace_with_jump_args(
                 if label_set.contains(&arg)
                     || carried_source_slots.contains(&arg)
                     || seen_body_defs.contains(&arg)
+                    || phase2_input_remap.contains_key(&arg)
                 {
                     return;
                 }
@@ -5766,8 +5787,7 @@ fn assemble_peeled_trace_with_jump_args(
         .chain(preamble_defs.iter().copied())
         .collect();
 
-    let mut assembly_alias_remap: std::collections::HashMap<OpRef, OpRef> =
-        std::collections::HashMap::new();
+    let mut assembly_alias_remap: std::collections::HashMap<OpRef, OpRef> = phase2_input_remap;
     for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
         if source_slot.is_none() {
             continue;
@@ -5977,7 +5997,14 @@ fn assemble_peeled_trace_with_jump_args(
                     if arg.is_constant() {
                         return arg;
                     }
-                    let i = arg.raw() as usize;
+                    if let Some(&mapped) = assembly_alias_remap.get(&arg) {
+                        return mapped;
+                    }
+                    let i = if arg.is_input_arg() && arg.raw() >= inputarg_base {
+                        (arg.raw() - inputarg_base) as usize
+                    } else {
+                        arg.raw() as usize
+                    };
                     start_label_args.get(i).copied().unwrap_or(arg)
                 })
                 .collect();
@@ -6064,9 +6091,17 @@ fn assemble_peeled_trace_with_jump_args(
         // label, so snapshot refs to label args stay intact.
         if let Some(fa) = new_op.fail_args_mut() {
             for a in fa.iter_mut() {
-                if let Some(&mapped) = body_result_remap.get(&a.to_opref())
-                    && seen_body_defs.contains(&a.to_opref())
-                    && !visible_before_label.contains(&a.to_opref())
+                let current = a.to_opref();
+                if let Some(&mapped) = assembly_alias_remap.get(&current) {
+                    *a = match emitted_at.get(&mapped) {
+                        Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
+                        None => ctx.materialize_operand_at(mapped),
+                    };
+                    continue;
+                }
+                if let Some(&mapped) = body_result_remap.get(&current)
+                    && seen_body_defs.contains(&current)
+                    && !visible_before_label.contains(&current)
                 {
                     *a = match emitted_at.get(&mapped) {
                         Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
@@ -9551,6 +9586,75 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[OpRef::int_op(200), OpRef::int_op(300)]
         );
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_rewrites_phase2_inputargs_to_start_label() {
+        // Phase 2 optimizer inputargs sit at `[inputarg_base, inputarg_base+n)`.
+        // Assembly must rewrite them onto the shared start-label slots;
+        // leaving `InputArg(base)` in the LABEL/JUMP is an unbound local.
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
+        let base = 99u32;
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, base)]);
+                op.pos.set(OpRef::ref_op(200));
+                op
+            },
+            {
+                let mut jump = Op::new(
+                    OpCode::Jump,
+                    &[
+                        rooted_inputarg_operand(Type::Ref, base),
+                        rooted_inputarg_operand(Type::Ref, base + 1),
+                    ],
+                );
+                jump.setdescr(loop_descr.clone());
+                jump
+            },
+        ];
+        let mut ctx = assemble_test_context(&[], &p2_ops, 2);
+        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
+        let start = [OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)];
+        let combined = assemble_peeled_trace_with_jump_args(
+            &[],
+            &p2_ops_rc,
+            &start,
+            &start,
+            &[],
+            &[],
+            2,
+            base,
+            false,
+            &[],
+            &constants,
+            None,
+            Some(loop_descr),
+            &[],
+            &mut Vec::new(),
+            &mut ctx,
+        );
+        let label = combined
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("assembled loop LABEL");
+        let label_args: Vec<OpRef> = label.getarglist().iter().map(|a| a.to_opref()).collect();
+        assert!(
+            !label_args
+                .iter()
+                .any(|a| a.is_input_arg() && a.raw() >= base),
+            "Phase-2 InputArg({base}+i) must not remain on the LABEL: {label_args:?}"
+        );
+        let jump = combined
+            .iter()
+            .find(|op| op.opcode == OpCode::Jump)
+            .expect("assembled JUMP");
+        let jump_args: Vec<OpRef> = jump.getarglist().iter().map(|a| a.to_opref()).collect();
+        assert_eq!(jump_args, start.to_vec());
     }
 
     /// A JUMP redirected onto ANOTHER trace's target token already carries the
