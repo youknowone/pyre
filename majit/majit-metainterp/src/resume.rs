@@ -6274,6 +6274,12 @@ pub trait VirtualizableInfo {
     /// object already present in a blackhole Ref register bank.
     fn push_resume_ref_roots_for_value(&self, _value: i64) {}
 
+    /// False for a state-field machine with no heap `vable_token`.
+    /// `consume_one_section` asks once so it can skip the per-ref dyn call.
+    fn has_vable_token(&self) -> bool {
+        false
+    }
+
     /// pyre: register virtualizable-owned Ref buffers for any virtualizable
     /// object already present in a blackhole Ref register bank.
     fn push_resume_ref_roots_for_registers(&self, registers_r: &[i64]) {
@@ -7847,24 +7853,16 @@ impl<'a> ResumeDataDirectReader<'a> {
         // jitcode.py:152
         let mut offset = info + 3;
 
-        let bh_debug = crate::bh_debug_enabled();
-        if bh_debug {
-            eprintln!(
-                "[bh-section] info={info} length_i={length_i} length_r={length_r} length_f={length_f} \
-                 items_read={} items_resume_section={}",
-                self.resumecodereader.items_read, self.items_resume_section,
-            );
-        }
+        // resume.py `write_an_int` / `write_a_ref` / `write_a_float`
+        // assign the register file directly. `setarg_*` is the same
+        // store plus a `jit_strict_mode` bound check; the regex leaf
+        // pays that call once per live slot per frame per character.
+        let vinfo_heap = vinfo.filter(|v| v.has_vable_token());
         // resume.py `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             for reg_idx in it.by_ref() {
-                let value = self.next_int();
-                if bh_debug {
-                    eprintln!("[bh-seed] i{reg_idx} = {value}");
-                }
-                // resume.py `write_an_int`.
-                bh.setarg_i(reg_idx as usize, value);
+                bh.registers_i[reg_idx as usize] = self.next_int();
             }
             offset = it.offset;
         }
@@ -7873,12 +7871,8 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             for reg_idx in it.by_ref() {
                 let value = self.next_ref_for_resume_slot();
-                if bh_debug {
-                    eprintln!("[bh-seed] r{reg_idx} = {value:#x}");
-                }
-                // resume.py `write_a_ref`.
-                bh.setarg_r(reg_idx as usize, value);
-                if let Some(vinfo) = vinfo {
+                bh.registers_r[reg_idx as usize] = value;
+                if let Some(vinfo) = vinfo_heap {
                     vinfo.push_resume_ref_roots_for_value(value);
                 }
             }
@@ -7888,9 +7882,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             for reg_idx in it {
-                let value = self.next_float();
-                // resume.py `write_a_float`.
-                bh.setarg_f(reg_idx as usize, value);
+                bh.registers_f[reg_idx as usize] = self.next_float();
             }
             // `offset` is the end of the float section; no further use.
             let _ = offset;

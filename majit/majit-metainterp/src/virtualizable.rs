@@ -3041,6 +3041,10 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         VirtualizableInfo::push_resume_ref_roots_for_value(self, value);
     }
 
+    fn has_vable_token(&self) -> bool {
+        VirtualizableInfo::has_vable_token(self)
+    }
+
     fn push_resume_ref_roots_for_registers(&self, registers_r: &[i64]) {
         VirtualizableInfo::push_resume_ref_roots_for_registers(self, registers_r);
     }

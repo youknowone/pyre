@@ -835,6 +835,7 @@ impl BlackholeInterpreter {
     /// `setposition` without taking the `Arc`. A 4–7 frame `shift` resume
     /// reseats the same helper; skip the clone and the constant walk when
     /// the banks are already that jitcode's.
+    #[inline]
     pub fn setposition_ref(&mut self, jitcode: &std::sync::Arc<JitCode>, position: usize) {
         // `copy_constants` is idempotent for one jitcode. Working regs are
         // filled by `consume_one_section` from liveness.
@@ -946,6 +947,7 @@ impl BlackholeInterpreter {
     ///
     /// The working registers occupy `0 .. num_regs_i`; everything above is the
     /// jitcode's constant table, which no write may reach.
+    #[inline(always)]
     pub fn setarg_i(&mut self, index: usize, value: i64) {
         // `init_register_file_from_i64s` lays the jitcode's integer constants
         // out at `num_regs_i ..`, so a write at or above that bound replaces a
@@ -961,12 +963,14 @@ impl BlackholeInterpreter {
     /// Same constant-table bound as [`Self::setarg_i`]: a write at or past
     /// `num_regs_r` replaces a jitcode constant the instruction stream still
     /// reads as one.
+    #[inline(always)]
     pub fn setarg_r(&mut self, index: usize, value: i64) {
         debug_assert_constant_slot_untouched(index, self.jitcode.num_regs_r(), "setarg_r");
         self.registers_r[index] = value;
     }
 
     /// Set a float register value.
+    #[inline(always)]
     pub fn setarg_f(&mut self, index: usize, value: i64) {
         debug_assert_constant_slot_untouched(index, self.jitcode.num_regs_f(), "setarg_f");
         self.registers_f[index] = value;
@@ -14097,6 +14101,13 @@ fn inline_call_native(
     calldescr: &majit_translate::jitcode::BhCallDescr,
 ) -> Result<usize, DispatchError> {
     let mut p = p;
+    // Translated `bhimpl_inline_call_*` becomes a direct C call of the
+    // known `calldescr` signature. `shift` is `rii -> i`; skip the
+    // `collect_call_args` / dispatch-table walk that the generic stub
+    // pays on every child of every character.
+    if num_args == 3 && calldescr.arg_classes == "rii" && calldescr.result_type == 'i' {
+        return inline_call_native_rii(bh, code, p, fnaddr);
+    }
     // `descr.py create_call_stub` places arguments by declaration position,
     // and `collect_call_args` recovers that position by walking `arg_classes`
     // and taking the next value from the matching per-kind list.  So the lists
@@ -14216,6 +14227,51 @@ fn inline_call_native(
 /// callsites that thread a local cursor instead of mutating
 /// `self.position`.  `NO_RETURN_REG` encodes the "no caller destination"
 /// sentinel.
+/// `shift(n, c, mark)`: one Ref then two Ints, result Int.
+/// Same placement as `inline_call_native` (`callee_dst` is the dense
+/// per-kind index) and the same `extern "C" fn(i64, i64, i64)` ABI
+/// `bh_call_i_dispatch` uses for three integer-class arguments.
+fn inline_call_native_rii(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    mut p: usize,
+    fnaddr: i64,
+) -> Result<usize, DispatchError> {
+    let mut r0 = 0i64;
+    let mut i0 = 0i64;
+    let mut i1 = 0i64;
+    for _ in 0..3 {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let caller_src = jitcode::read_reg(code, &mut p) as usize;
+        let callee_dst = jitcode::read_reg(code, &mut p) as usize;
+        match kind {
+            JitArgKind::Ref => r0 = bh.registers_r[caller_src],
+            JitArgKind::Int if callee_dst == 0 => i0 = bh.registers_i[caller_src],
+            JitArgKind::Int => i1 = bh.registers_i[caller_src],
+            JitArgKind::Float => {
+                unreachable!("rii calldescr has no float argument");
+            }
+        }
+    }
+    let dest = decode_return_slot_at(code, &mut p);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut r0));
+    }
+    let result = unsafe {
+        let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(fnaddr as usize);
+        f(r0, i0, i1)
+    };
+    let outcome = check_residual_call_exception_after(bh, p);
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(args_root_depth);
+    outcome?;
+    if let Some(dst) = dest {
+        bh.registers_i[dst] = result;
+    }
+    Ok(p)
+}
+
 fn decode_return_slot_at(code: &[u8], cursor: &mut usize) -> Option<usize> {
     let dst = jitcode::read_reg(code, cursor) as usize;
     if dst == jitcode::NO_RETURN_REG as usize {
