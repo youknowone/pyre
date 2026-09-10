@@ -2250,18 +2250,31 @@ fn wasm_jitframe_tid() -> u32 {
 /// marked bit, so marking those indices exposes each home's `GcRef` (the high
 /// word stays unmarked). Returns `[data_word_count, word0, ...]` in `usize`
 /// words (GCMAP array layout: `gcmap[0]` = number of data words).
-fn build_home_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
+/// Mark the homes this module initializes: the used ordinary prefix and the
+/// LABEL-capture tail. Frozen geometry reserves
+/// [`FROZEN_CHAIN_REF_HOMES`] ordinary slots so a later bridge can fit;
+/// those unused reserved words stay unmarked so recycled nursery bytes
+/// are not traced. assembler.py writes `jf_gcmap` for live slots only.
+fn build_home_gcmap(frame: codegen::FrameGeometry, used_ordinary: usize) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;
-    if frame.home_slots == 0 {
+    let ordinary = used_ordinary.min(frame.ordinary_home_slots());
+    let label_base = frame.ordinary_home_slots();
+    let label_n = frame.label_ref_slots;
+    if ordinary == 0 && label_n == 0 {
         // One empty data word: a non-null jf_gcmap that traces nothing.
         return vec![1usize, 0usize].into_boxed_slice();
     }
-    let last_index = (frame.home_slot_base as usize + (frame.home_slots - 1) * 8) / sign;
+    let last_h = if label_n == 0 {
+        ordinary.saturating_sub(1)
+    } else {
+        label_base + label_n - 1
+    };
+    let last_index = (frame.home_slot_base as usize + last_h * 8) / sign;
     let num_words = last_index / bits_per_word + 1;
     let mut buf = vec![0usize; 1 + num_words];
     buf[0] = num_words;
-    for h in 0..frame.home_slots {
+    for h in (0..ordinary).chain(label_base..label_base + label_n) {
         let index = (frame.home_slot_base as usize + h * 8) / sign;
         buf[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
     }
@@ -4207,7 +4220,8 @@ impl majit_backend::Backend for WasmBackend {
         // assembler.py keeps `_finish_gcmap` with the compiled loop. Leak
         // before the module build so the fresh-entry path can publish it
         // after home/input stores, matching a safepoint write.
-        let home_gcmap_ptr = Box::leak(build_home_gcmap(frame)).as_ptr() as *const usize as usize;
+        let home_gcmap_ptr =
+            Box::leak(build_home_gcmap(frame, raw_num_ref_homes)).as_ptr() as *const usize as usize;
         let module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             // Keep these rewritten operations exactly as intern_ref_constants
@@ -5163,8 +5177,8 @@ impl majit_backend::Backend for WasmBackend {
         // CALL_ASSEMBLER: the CA arm allocates a fresh callee using the target
         // token's frozen geometry. The earlier frame-fit decline guarantees a
         // movable callee cannot execute a trampoline-lowered op.
-        let home_gcmap_ptr =
-            Box::leak(build_home_gcmap(source_frame)).as_ptr() as *const usize as usize;
+        let home_gcmap_ptr = Box::leak(build_home_gcmap(source_frame, bridge_ref_homes)).as_ptr()
+            as *const usize as usize;
         let ca_params = if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
             codegen::CaParams {
                 emit_ca: true,
@@ -5682,10 +5696,8 @@ impl majit_backend::Backend for WasmBackend {
                 // `JitFrame::init` requires zero-filled storage, which the
                 // native `calloc` entry (`runner.rs` `execute_token`) provides
                 // but the old-gen arena does not — `ArenaCollection::malloc`
-                // deliberately returns recycled bytes. `build_home_gcmap`
-                // marks every Ref home of the frozen geometry, so a home the
-                // trace has not defined yet when a collection lands must read
-                // as null rather than as a stale word.
+                // deliberately returns recycled bytes. Zero the block so a
+                // home the trace has not defined yet reads as null.
                 unsafe {
                     std::ptr::write_bytes(jf as *mut u8, 0, JitFrame::alloc_size(depth));
                     JitFrame::init(jf, std::ptr::null(), depth);
@@ -6019,6 +6031,28 @@ mod tests {
     use majit_gc::collector::MiniMarkGC;
     use majit_gc::trace::TypeInfo;
     use majit_ir::forwarding::bound_operand_from_opref as rb;
+
+    fn gcmap_marks(buf: &[usize], index: usize) -> bool {
+        let bits = usize::BITS as usize;
+        let word = 1 + index / bits;
+        word < buf.len() && (buf[word] & (1usize << (index % bits))) != 0
+    }
+
+    #[test]
+    fn home_gcmap_marks_used_homes_and_label_captures_only() {
+        let sign = std::mem::size_of::<isize>();
+        let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
+        let map = build_home_gcmap(frame, 5);
+        let idx = |h: usize| (frame.home_slot_base as usize + h * 8) / sign;
+        for h in 0..5 {
+            assert!(gcmap_marks(&map, idx(h)), "used ordinary home {h}");
+        }
+        for h in 5..128 {
+            assert!(!gcmap_marks(&map, idx(h)), "reserved ordinary home {h}");
+        }
+        assert!(gcmap_marks(&map, idx(128)), "label capture 0");
+        assert!(gcmap_marks(&map, idx(129)), "label capture 1");
+    }
 
     #[test]
     fn parameter_bridge_dispatch_is_bounded_by_guard_population() {

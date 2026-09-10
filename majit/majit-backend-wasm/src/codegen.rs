@@ -431,7 +431,8 @@ pub struct FrameGeometry {
     /// resume-at-LABEL live-ins.  Ordinary per-trace Ref homes grow upward
     /// from `home_slot_base`; these captures grow from the frozen boundary and
     /// therefore survive execution of a chained bridge, whose own home map may
-    /// use the low slots.  The whole home region remains covered by jf_gcmap.
+    /// use the low slots.  The published `jf_gcmap` marks the used ordinary
+    /// prefix plus these captures, not the unused reserved tail.
     pub label_ref_slots: usize,
     /// Start of the GUARD_NOT_FORCED(_2) failarg spill area. It contains one
     /// i64 slot per value slot and is disjoint from exits, dispatch, homes and
@@ -3762,7 +3763,8 @@ pub struct CaParams {
     /// `None` retains the helpers (including under gc_stress).
     pub inline: Option<CaInlineParams>,
     /// `build_home_gcmap` pointer published after the fresh-entry home/input
-    /// stores. Zero leaves `jf_gcmap` unset in the generated module (tests).
+    /// stores. The map marks only initialized ordinary homes plus LABEL
+    /// captures. Zero leaves `jf_gcmap` unset in the generated module (tests).
     /// assembler.py writes `jf_gcmap` at safepoints once those slots are live.
     pub home_gcmap_ptr: i64,
 }
