@@ -1902,11 +1902,13 @@ impl BlackholeInterpreter {
                 );
             }
             let opcode = code[self.position];
-            // The remaining `shift` epilogue at pc 210 is mostly `-live-`,
-            // `goto/L`, and `goto_if_not` around one native INLINE_CALL.
-            // RPython's translated `dispatch_loop` inlines those `_get_method`
-            // bodies; the function-pointer table is the untranslated form.
-            // Do not restart `fnaddr` from this mid-node PC.
+            // The remaining `shift` epilogue at pc 210 is `-live-`,
+            // `goto/L`, `goto_if_not`, `int_copy`, getfield/setfield of
+            // `marked`/`empty`, and `int_return` around one native
+            // INLINE_CALL. RPython's translated `dispatch_loop` inlines
+            // those `_get_method` bodies; the function-pointer table is
+            // the untranslated form. Do not restart `fnaddr` from this
+            // mid-node PC.
             if !trace {
                 match opcode {
                     jitcode::insns::BC_LIVE if LIVE_MARKER_HOOK.get().is_none() => {
@@ -1936,6 +1938,59 @@ impl BlackholeInterpreter {
                         self.registers_i[code[p + 1] as usize] = code[p] as i8 as i64;
                         self.position = p + 2;
                         continue;
+                    }
+                    jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_I_PURE => {
+                        let p = self.position + 1;
+                        let struct_ptr = self.registers_r[code[p] as usize];
+                        let (val, dest, pos) = {
+                            let (descr, pos) = read_descr(self, code, p + 1);
+                            (
+                                bh_load_int_field(struct_ptr, descr),
+                                code[pos] as usize,
+                                pos,
+                            )
+                        };
+                        self.registers_i[dest] = val;
+                        self.position = pos + 1;
+                        continue;
+                    }
+                    jitcode::insns::BC_SETFIELD_GC_I => {
+                        let p = self.position + 1;
+                        let struct_ptr = self.registers_r[code[p] as usize];
+                        let value = self.registers_i[code[p + 1] as usize];
+                        let pos = {
+                            let (descr, pos) = read_descr(self, code, p + 2);
+                            bh_store_int_field(struct_ptr, value, descr);
+                            pos
+                        };
+                        self.position = pos;
+                        continue;
+                    }
+                    jitcode::insns::BC_SETFIELD_GC_I_C => {
+                        let p = self.position + 1;
+                        let struct_ptr = self.registers_r[code[p] as usize];
+                        let value = code[p + 1] as i8 as i64;
+                        let pos = {
+                            let (descr, pos) = read_descr(self, code, p + 2);
+                            bh_store_int_field(struct_ptr, value, descr);
+                            pos
+                        };
+                        self.position = pos;
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_RETURN => {
+                        let p = self.position + 1;
+                        self.tmpreg_i = self.registers_i[code[p] as usize];
+                        self.return_type = BhReturnType::Int;
+                        self.position = p + 1;
+                        return BhRunOutcome::LeaveFrame;
+                    }
+                    jitcode::insns::BC_INT_RETURN_C => {
+                        let p = self.position + 1;
+                        self.tmpreg_i = code[p] as i8 as i64;
+                        self.return_type = BhReturnType::Int;
+                        self.position = p + 1;
+                        return BhRunOutcome::LeaveFrame;
                     }
                     _ => {}
                 }
