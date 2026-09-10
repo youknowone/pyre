@@ -41,6 +41,9 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
     // objectmodel.py `not_rpython` sets `_not_rpython_ = True`;
     // flowspace/objspace.py:21 rejects the function before graph building.
     ("_not_rpython_", &["not_rpython"]),
+    // objectmodel.py specialize.memo's function attribute, consumed by
+    // Bookkeeper.newfuncdesc (not an elidable/residual JIT-policy flag).
+    ("_annspecialcase_memo_", &["specialize:memo"]),
 ];
 
 /// Build a `{crate_stripped_fn_path → sorted-deduped hints}` map from
@@ -408,6 +411,24 @@ mod tests {
     use super::{decode_str_const, marker_path_to_fn_path, parse_immutable_entry_list};
     use crate::model::ImmutableRank;
     use std::collections::HashSet;
+
+    #[test]
+    fn memo_marker_recovers_its_function_attribute_and_owner() {
+        let (prefix, hints) = super::CONST_PREFIX_HINTS
+            .iter()
+            .find(|(prefix, _)| *prefix == "_annspecialcase_memo_")
+            .unwrap();
+        assert_eq!(*hints, &["specialize:memo"]);
+        let functions = HashSet::from(["owner::Cache::getorbuild".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "pyre_interpreter::owner::Cache::getorbuild::_annspecialcase_memo_getorbuild",
+                prefix,
+                &functions,
+            ),
+            "owner::Cache::getorbuild"
+        );
+    }
 
     #[test]
     fn marker_path_keeps_same_named_module_function() {

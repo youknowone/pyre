@@ -274,14 +274,16 @@ impl DictStrategy for KwargsDictStrategy {
         kwargs_storage(w_dict).1.clone()
     }
 
-    /// `kwargsdict.py items` — zip parallel arrays into pairs.
+    /// `kwargsdict.py KwargsDictStrategy.items` — the list comprehension
+    /// reads both arrays at each index in range(len(keys_w)). Keep that
+    /// index-driven flow rather than zip's shortest-input truncation.
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
         let (keys_w, values_w) = kwargs_storage(w_dict);
-        keys_w
-            .iter()
-            .zip(values_w.iter())
-            .map(|(&k, &v)| (k, v))
-            .collect()
+        let mut items = Vec::new();
+        for i in 0..keys_w.len() {
+            items.push((keys_w[i], values_w[i]));
+        }
+        items
     }
 
     /// `create_iterator_classes(KwargsDictStrategy)` reads the two backing
@@ -403,6 +405,29 @@ mod tests {
             crate::dictmultiobject::StrategyKind::Kwargs
         );
         w_dict
+    }
+
+    #[test]
+    fn kwargs_items_copy_preserves_parallel_array_order_and_identity() {
+        unsafe {
+            let empty = kwargs_with(&[("temporary", 0)]);
+            KWARGS_DICT_STRATEGY.clear(empty);
+            assert!(KWARGS_DICT_STRATEGY.items(empty).is_empty());
+
+            let w_dict = kwargs_with(&[("first", 1), ("second", 2)]);
+            let mut items = KWARGS_DICT_STRATEGY.items(w_dict);
+            let (keys_w, values_w) = kwargs_storage(w_dict);
+            assert_eq!(items.len(), keys_w.len());
+            for i in 0..keys_w.len() {
+                assert_eq!(items[i], (keys_w[i], values_w[i]));
+            }
+            items.reverse();
+            let fresh = KWARGS_DICT_STRATEGY.items(w_dict);
+            assert_eq!(crate::w_str_get_value(fresh[0].0), "first");
+            assert_eq!(crate::w_int_get_value(fresh[0].1), 1);
+            assert_eq!(crate::w_str_get_value(fresh[1].0), "second");
+            assert_eq!(crate::w_int_get_value(fresh[1].1), 2);
+        }
     }
 
     #[test]

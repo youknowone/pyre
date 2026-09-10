@@ -2187,6 +2187,7 @@ pub unsafe fn w_dict_strategy_name(obj: PyObjectRef) -> &'static str {
         StrategyKind::Kwargs => "KwargsDictStrategy",
         StrategyKind::Module => "ModuleDictStrategy",
         StrategyKind::Map => "MapDictStrategy",
+        StrategyKind::Class => "ClassDictStrategy",
     }
 }
 
@@ -3950,6 +3951,10 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
     match dict.dstrategy.strategy_kind() {
         StrategyKind::Empty => return false,
         StrategyKind::Object => {}
+        StrategyKind::Map | StrategyKind::Class => {
+            let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
+            return dict.dstrategy.delitem(obj, w_key);
+        }
         _ => dict.dstrategy.switch_to_object_strategy(obj),
     }
     let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
@@ -6086,6 +6091,10 @@ pub enum StrategyKind {
     /// (`objspace::std::mapdict::MapDictStrategy`) because the map-node layer
     /// lives there; this variant lets `strategy_is` discriminate it.
     Map,
+    /// `pypy/objspace/std/classdict.py ClassDictStrategy` — exposes a
+    /// `W_TypeObject` namespace. `dstorage` erases the type; implemented in
+    /// pyre-interpreter (`objspace::std::classdict::ClassDictStrategy`).
+    Class,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

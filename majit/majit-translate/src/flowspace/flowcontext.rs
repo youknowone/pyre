@@ -649,24 +649,26 @@ impl BlockRecorder {
     ) -> Result<(), FlowContextError> {
         let mut links = Vec::new();
         for case in std::iter::once(None).chain(cases.iter().cloned().map(Some)) {
-            let (vars, inputargs, last_exception) = if let Some(case_value) = case.clone() {
-                let last_exc = if is_host_class_named(&case_value, "Exception") {
-                    Hlvalue::Variable(Variable::named("last_exception"))
+            let (vars, inputargs, last_exception, last_exc_value) =
+                if let Some(case_value) = case.clone() {
+                    let last_exc = if is_host_class_named(&case_value, "Exception") {
+                        Hlvalue::Variable(Variable::named("last_exception"))
+                    } else {
+                        case_value.clone()
+                    };
+                    let last_exc_value = Hlvalue::Variable(Variable::named("last_exc_value"));
+                    (
+                        vec![last_exc.clone(), last_exc_value.clone()],
+                        vec![
+                            Hlvalue::Variable(Variable::new()),
+                            Hlvalue::Variable(Variable::new()),
+                        ],
+                        Some(last_exc),
+                        Some(last_exc_value),
+                    )
                 } else {
-                    case_value.clone()
+                    (Vec::new(), Vec::new(), None, None)
                 };
-                let last_exc_value = Hlvalue::Variable(Variable::named("last_exc_value"));
-                (
-                    vec![last_exc.clone(), last_exc_value.clone()],
-                    vec![
-                        Hlvalue::Variable(Variable::new()),
-                        Hlvalue::Variable(Variable::new()),
-                    ],
-                    Some(last_exc),
-                )
-            } else {
-                (Vec::new(), Vec::new(), None)
-            };
             let mut egg = EggBlock::new(
                 inputargs,
                 self.crnt_block.clone(),
@@ -679,10 +681,9 @@ impl BlockRecorder {
                 .push_back(PendingBlock::Egg(Box::new(egg.clone())));
             let mut link = Link::new(vars, Some(egg.block.clone()), case.clone());
             if let Some(last_exc) = last_exception {
-                link.extravars(
-                    Some(last_exc),
-                    Some(Hlvalue::Variable(Variable::named("last_exc_value"))),
-                );
+                // flowcontext.py::BlockRecorder.guessexception: the link
+                // defines the very exception variables it passes to the egg.
+                link.extravars(Some(last_exc), last_exc_value);
             }
             links.push(link.into_ref());
         }
@@ -3686,6 +3687,34 @@ mod test {
             other => panic!("expected FlowingError, got {other:?}"),
         }
         assert!(ctx.graph.startblock.borrow().exits.is_empty());
+    }
+
+    #[test]
+    fn guessexception_links_pass_their_own_exception_extravars() {
+        let mut ctx = flow_context("def f():\n    return 1\n");
+        let Some(Recorder::Block(mut recorder)) = ctx.recorder.take() else {
+            panic!("expected block recorder");
+        };
+        let cases = [
+            exception_class_value("ValueError"),
+            exception_class_value("Exception"),
+        ];
+        assert_eq!(
+            recorder.guessexception(&mut ctx, &cases),
+            Err(FlowContextError::StopFlowing)
+        );
+        let exits = recorder.crnt_block.borrow().exits.clone();
+        assert_eq!(exits.len(), 3);
+        assert!(exits[0].borrow().args.is_empty());
+        assert!(exits[0].borrow().last_exception.is_none());
+        assert!(exits[0].borrow().last_exc_value.is_none());
+        for exit in &exits[1..] {
+            let link = exit.borrow();
+            // flowcontext.py::BlockRecorder.guessexception passes the same
+            // last_exc / last_exc_value to Link.args and Link.extravars.
+            assert_eq!(link.args[0], link.last_exception);
+            assert_eq!(link.args[1], link.last_exc_value);
+        }
     }
 
     #[test]

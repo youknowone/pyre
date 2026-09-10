@@ -9311,7 +9311,7 @@ fn exception_layout_pytype(name: &str, base: PyObjectRef) -> *const pyre_object:
 fn exception_overridetypedef(
     layout_pytype: *const pyre_object::PyType,
     base: PyObjectRef,
-) -> *const pyre_object::typeobject::InterpreterTypeDef {
+) -> *const pyre_object::typedef::TypeDef {
     unsafe {
         let parent = pyre_object::w_type_get_layout_ptr(base);
         if parent.is_null() || !std::ptr::eq((*(*parent).typedef).instance_type, layout_pytype) {

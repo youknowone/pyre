@@ -719,11 +719,14 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     // of its own; `walk_gc_refs` below forwards the interior PyObjectRef
     // slots, matching the mapdict / set-items leaf-storage pattern. Only the
     // storage-box strategies own their `dstorage`: a MapDictStrategy
-    // `dstorage` is instead the backing instance (a GC edge that its own
-    // `walk_gc_refs` forwards), and the off-GC side-table storage
+    // `dstorage` is the backing instance and a ClassDictStrategy
+    // `dstorage` is the type (GC edges that `walk_gc_refs` forwards),
+    // and the off-GC side-table storage
     // (`w_dict_new_unmanaged_side_table_value`) is not collector-owned —
     // both are skipped (Map by kind, the side table by `try_gc_owns_object`).
-    if strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map {
+    if strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map
+        && strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Class
+    {
         if !dict.dstorage.is_null() && pyre_object::gc_hook::try_gc_owns_object(dict.dstorage) {
             let dstorage_slot = std::ptr::addr_of_mut!(dict.dstorage);
             f(dstorage_slot as *mut majit_ir::GcRef);
@@ -1762,17 +1765,24 @@ thread_local! {
     static GC_TLS_INSTALLED: Cell<bool> = const { Cell::new(false) };
 }
 
-fn write_subclass_ranges<I, F>(classptrs: I, mut range_for: F)
+fn assert_subclass_ranges<'a, I, F>(pytypes: I, mut range_for: F)
 where
-    I: IntoIterator<Item = usize>,
+    I: IntoIterator<Item = &'a pyre_object::pyobject::PyType>,
     F: FnMut(usize) -> Option<(i64, i64)>,
 {
-    let _range_guard = pyre_object::pyobject::subclass_range_write_guard();
-    for classptr in classptrs {
-        if let Some((min, max)) = range_for(classptr) {
-            let tp = unsafe { &*(classptr as *const pyre_object::pyobject::PyType) };
-            pyre_object::pyobject::assign_subclass_range(tp, min, max);
-        }
+    use std::sync::atomic::Ordering;
+
+    // rclass.py ClassRepr.fill_vtable_root owns the prebuilt vtable values;
+    // rebuilding a collector must not rewrite them. init_subclass_ranges'
+    // OnceLock has published the full census before this validation runs.
+    for tp in pytypes {
+        let expected = range_for(tp as *const _ as usize)
+            .expect("every published vtable alias must have a GC subclass range");
+        let actual = (
+            tp.subclassrange_min.load(Ordering::Relaxed),
+            tp.subclassrange_max.load(Ordering::Relaxed),
+        );
+        assert_eq!(actual, expected, "{} published subclass range", tp.name);
     }
 }
 
@@ -4739,6 +4749,27 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_object::rbuilder::set_stringpiece_gc_type_id(stringpiece_tid);
     let _ = pyre_jit_trace::descr::stringpiece_size_descr();
 
+    // gateway.py interp2app is an internal prebuilt W_Root, not an
+    // app-level builtin type. Trace its Code reference like the hidden
+    // WeakrefLifeline above. This is the tail of fixed layouts, BEFORE
+    // register_unresolved_struct_tids: that dynamic cache registers only
+    // previously unresolved descriptors, so its count differs on GC rebuild.
+    let gateway_descr =
+        <pyre_object::gateway::interp2app as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let gateway_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        gateway_descr.object_size,
+        gateway_descr.ptr_offsets.to_vec(),
+    ));
+    if gateway_descr.gc_type_id.is_unassigned() {
+        gateway_descr.gc_type_id.set(gateway_tid);
+    } else {
+        debug_assert_eq!(gateway_descr.gc_type_id.get(), gateway_tid);
+    }
+    pyre_object::gc_hook::register_pyre_class_offsets(
+        gateway_descr.pytype_ptr as usize,
+        gateway_descr.ptr_offsets,
+    );
+
     // `gc.py GcLLDescr_framework.init_size_descr` asks the
     // gctypelayout layoutbuilder for a collector type id after the translated
     // GC layouts are known, and only walks Size/Array objects already in
@@ -4840,11 +4871,9 @@ fn build_gc() -> Box<MiniMarkGC> {
         );
     }
 
-    // rclass.py — assign subclassrange_{min,max} to each
-    // vtable entry. freeze_types() runs assign_inheritance_ids
-    // (normalizecalls.py:373-389), then we write the computed ranges
-    // back into the static PyType structs so that ll_issubclass
-    // (rclass.py:1133-1137) can read them directly from the typeptr.
+    // rclass.py ClassRepr.fill_vtable_root owns subclassrange_{min,max}.
+    // freeze_types computes the collector's matching inheritance ids; it
+    // must not republish the interpreter's prebuilt vtables.
     let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
     let interpreter_aliases = pyre_interpreter::all_subclass_range_aliases();
     let mut expected_aliases: Vec<_> = object_aliases
@@ -4875,12 +4904,14 @@ fn build_gc() -> Box<MiniMarkGC> {
         "GC rclass.OBJECT registration order must match the shared subclass-range census",
     );
     gc.freeze_types();
-    // Publish the byte-identical GC-side recomputation inside one seqlock
-    // write section so a concurrent interpreter `ll_issubclass` never sees a
-    // partially restamped hierarchy.
-    write_subclass_ranges(pytype_to_tid.keys().copied(), |classptr| {
-        gc.subclass_range(classptr)
-    });
+    pyre_interpreter::typedef::init_subclass_ranges();
+    assert_subclass_ranges(
+        object_aliases
+            .iter()
+            .chain(interpreter_aliases.iter())
+            .map(|alias| alias.pytype),
+        |classptr| gc.subclass_range(classptr),
+    );
     Box::new(gc)
 }
 
@@ -5329,10 +5360,10 @@ fn build_gc_global() {
     // `is_initialized()` is a plain check-then-act, so on a fresh process
     // every thread that reaches here before the first `store_singleton`
     // observes the flag unset and would each run `build_gc()`.  `build_gc`
-    // calls `freeze_types()` and the subclass-range writeback, which mutate
-    // the shared global `PyType` GC-tid table and `subclassrange_{min,max}`
-    // atomics; concurrent writebacks race a sibling thread reading those
-    // ranges.  A `Once` collapses the build to a single initializer.
+    // populates the shared type registry as well as the collector. A `Once`
+    // collapses the build to a single initializer. Vtable publication has
+    // its own interpreter-owned OnceLock; repeated test GC builds validate
+    // the same published ranges without writing them again.
     static BUILT: std::sync::Once = std::sync::Once::new();
     BUILT.call_once(|| {
         if majit_gc::gc_sync::is_initialized() {
@@ -17086,8 +17117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interpreter_and_gc_subclass_ranges_match_in_both_orders() {
-        use pyre_object::pyobject::compute_subclass_ranges_from;
+    fn test_gc_rebuild_verifies_published_subclass_ranges() {
         use std::sync::atomic::Ordering;
 
         let _ = driver_pair();
@@ -17124,20 +17154,54 @@ mod tests {
             }
         };
 
-        // GC init ran in `driver_pair`; the interpreter writer must leave
-        // every object- and interpreter-owned alias byte-identical.
-        compute_subclass_ranges_from(&[&object_aliases, &interpreter_aliases]);
+        // Both startup paths use the same once-published full census.
+        pyre_interpreter::typedef::init_subclass_ranges();
         assert_matches_gc();
 
-        // Re-run the interpreter writer first, then the same batched GC
-        // writeback helper production init uses.
-        compute_subclass_ranges_from(&[&object_aliases, &interpreter_aliases]);
-        write_subclass_ranges(
-            aliases
-                .iter()
-                .map(|alias| alias.pytype as *const _ as usize),
-            majit_gc::subclass_range,
-        );
+        // Exercise the same reconstruction used by reset_gc_fresh_for_test,
+        // without replacing the installed collector or rewriting vtables.
+        let rebuilt = build_gc();
+        assert_subclass_ranges(aliases.iter().map(|alias| alias.pytype), |classptr| {
+            rebuilt.subclass_range(classptr)
+        });
         assert_matches_gc();
+    }
+
+    #[test]
+    fn prebuilt_gateway_traces_its_code_reference() {
+        let _ = driver_pair();
+        let code =
+            pyre_interpreter::gateway::builtin_code_new(
+                "root_probe",
+                |_| Ok(pyre_object::w_none()),
+            );
+        let gateway = pyre_interpreter::gateway::interp2app(code);
+        let mut found = false;
+        unsafe {
+            pyre_interpreter::eval::walk_raw_immortal_roots(gateway, &mut |slot| {
+                found |= slot.0 == code as usize;
+            });
+        }
+        assert!(found, "raw interp2app must expose its inline Code to GC");
+    }
+
+    #[test]
+    fn test_gc_subclass_range_mismatch_does_not_repair_the_vtable() {
+        use std::sync::atomic::Ordering;
+
+        let tp = pyre_object::pyobject::new_pytype("publication_probe");
+        tp.subclassrange_min.store(1, Ordering::Relaxed);
+        tp.subclassrange_max.store(9, Ordering::Relaxed);
+        assert_subclass_ranges([&tp], |_| Some((1, 9)));
+        let mismatch = std::panic::catch_unwind(|| {
+            assert_subclass_ranges([&tp], |_| Some((2, 8)));
+        });
+        assert!(mismatch.is_err(), "GC must reject a different numbering");
+        assert_eq!(tp.subclassrange_min.load(Ordering::Relaxed), 1);
+        assert_eq!(tp.subclassrange_max.load(Ordering::Relaxed), 9);
+        let missing = std::panic::catch_unwind(|| {
+            assert_subclass_ranges([&tp], |_| None);
+        });
+        assert!(missing.is_err(), "a published alias cannot disappear");
     }
 }

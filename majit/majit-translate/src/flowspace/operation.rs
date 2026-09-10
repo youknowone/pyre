@@ -2956,8 +2956,8 @@ mod tests {
         let cls = HostObject::new_class("Foo", vec![]);
         cls.class_set("x".to_string(), ConstValue::Int(1)); // class-level
         let inst = HostObject::new_instance(cls, vec![]);
-        inst.instance_set("x", ConstValue::Int(99)); // shadow
-        inst.instance_set("y", ConstValue::Int(7)); // instance-only
+        inst.instance_set("x", ConstValue::Int(99)).unwrap(); // shadow
+        inst.instance_set("y", ConstValue::Int(7)).unwrap(); // instance-only
         // Need to make the instance foldable for the test — it isn't by
         // default (foldable() returns false for user instances). The
         // exercise here is `const_runtime_getattr` itself, so call the

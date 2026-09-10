@@ -842,20 +842,15 @@ pub fn is_list_write_barrier(addr: usize) -> bool {
 ///
 /// The FBW effect accounting proxies "writes live heap" by a `Void` result
 /// type, because a void residual has no value for the walk to carry and is
-/// therefore usually a store.  These two are the void residuals a descent into
-/// a translated body meets first, and for both the proxy is wrong:
+/// therefore usually a store. For `stack_check`, the proxy is wrong:
 ///
-/// * `stack_check` only READS — the recursion depth counter and the stack
-///   bounds — and raises on overflow; the counter is bumped around calls, not
-///   here.  Its slow path revises a cached stack bound, which recomputes to
-///   the same answer.
-/// * `ensure_object_subclass_ranges_initialized` is a `OnceLock` lazy init,
-///   idempotent by construction, and every production entry point has already
-///   run the full initialisation before a trace executes, so the residual is a
-///   no-op there.
+/// `stack_check` only READS — the recursion depth counter and the stack
+/// bounds — and raises on overflow; the counter is bumped around calls, not
+/// here. Its slow path revises a cached stack bound, which recomputes to
+/// the same answer.
 ///
-/// Neither leaves anything for a replay to double, so counting them keeps a
-/// walk that met only these from taking any of the no-replay walk-end roads —
+/// It leaves nothing for a replay to double, so counting it keeps a
+/// walk that met only this helper from taking any of the no-replay walk-end roads —
 /// the abort then falls back to the legacy entry replay, which re-applies
 /// whatever the walk really did commit.
 ///
@@ -872,11 +867,7 @@ pub fn is_rerunnable_bookkeeping_residual(addr: usize) -> bool {
     let addrs = RERUNNABLE_ADDRS.get_or_init(|| {
         jit_trace_fnaddrs()
             .into_iter()
-            .filter(|(path, _)| {
-                path.ends_with("::stack_check::stack_check")
-                    || path.ends_with("::pyobject::ensure_object_subclass_ranges_initialized")
-                    || *path == "pyre_object::ensure_object_subclass_ranges_initialized"
-            })
+            .filter(|(path, _)| path.ends_with("::stack_check::stack_check"))
             .map(|(_, fnaddr)| fnaddr)
             .collect()
     });
@@ -3029,12 +3020,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_bool_from",
         w_bool_from,
     );
-    cpa0(
-        &mut entries,
-        "pyre_object::pyobject::ensure_object_subclass_ranges_initialized",
-        "pyre_object::ensure_object_subclass_ranges_initialized",
-        pyre_object::pyobject::ensure_object_subclass_ranges_initialized,
-    );
     cpa1(
         &mut entries,
         "pyre_object::gc_hook::try_gc_write_barrier",
@@ -4887,22 +4872,29 @@ mod tests {
     use std::collections::HashMap;
 
     /// The exemption is keyed on the registered path, so a rename or a typo in
-    /// one of the three patterns silently drops a helper out of the set and the
-    /// walk that met only it stops taking the no-replay roads. Pin each
+    /// the pattern silently drops the helper out of the set and the
+    /// walk that met only it stops taking the no-replay roads. Pin the
     /// pattern, and pin a sibling in the same module that must NOT be exempt:
     /// `pyre_stack_too_big_slowpath` shares `::stack_check::` with the one
     /// match, so a pattern loosened to the module would take it too.
     #[test]
     fn is_rerunnable_bookkeeping_residual_matches_the_registered_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let path = "pyre_interpreter::stack_check::stack_check";
+        assert!(
+            is_rerunnable_bookkeeping_residual(bindings[path] as usize),
+            "{path} is registered but not exempt"
+        );
+        // rclass.py ll_isinstance has no lazy initialization call. The
+        // object-only seeding helper belongs to standalone unit tests, not
+        // the production residual registry or replay bookkeeping.
         for path in [
-            "pyre_interpreter::stack_check::stack_check",
             "pyre_object::pyobject::ensure_object_subclass_ranges_initialized",
             "pyre_object::ensure_object_subclass_ranges_initialized",
         ] {
             assert!(
-                is_rerunnable_bookkeeping_residual(bindings[path] as usize),
-                "{path} is registered but not exempt"
+                !bindings.contains_key(path),
+                "test-only initialization must not be registered: {path}"
             );
         }
         assert!(!is_rerunnable_bookkeeping_residual(

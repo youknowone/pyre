@@ -1,3 +1,24 @@
+mod source_memo {
+    #[majit_macros::specialize_memo]
+    fn memo(value: usize) -> usize {
+        value + 1
+    }
+
+    struct Owner;
+    impl Owner {
+        #[majit_macros::specialize_memo]
+        fn memo(&self, value: usize) -> usize {
+            value + 2
+        }
+    }
+
+    #[test]
+    fn memo_attribute_preserves_free_and_method_native_calls() {
+        assert_eq!(memo(3), 4);
+        assert_eq!(Owner.memo(3), 5);
+    }
+}
+
 mod driver {
     use majit_macros::{
         dont_look_inside, elidable, elidable_cannot_raise, elidable_or_memerror, jit_driver,

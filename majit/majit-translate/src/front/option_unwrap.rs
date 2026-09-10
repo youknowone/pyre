@@ -80,7 +80,7 @@ pub(crate) struct UnwrapSite {
 pub(crate) fn rewire_unwrap_call_sites(graph: &mut FunctionGraph, sites: &[UnwrapSite]) -> usize {
     let mut rewritten = 0;
     for site in sites {
-        match rewire_one_unwrap_site(graph, site) {
+        match rewire_one_unwrap_site(graph, site, 1) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
                 // Leave the residual `unwrap` call; the unregistered callee
@@ -91,7 +91,21 @@ pub(crate) fn rewire_unwrap_call_sites(graph: &mut FunctionGraph, sites: &[Unwra
     rewritten
 }
 
-fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Result<(), String> {
+/// Result::expect has the same Ok/Err guard as unwrap, with an extra panic
+/// message argument. The implicit failure edge follows the existing RPython
+/// remove_assertion_errors contract; it is not a value-returning branch.
+pub(crate) fn rewire_result_expect_sites(graph: &mut FunctionGraph, sites: &[UnwrapSite]) -> usize {
+    sites
+        .iter()
+        .filter(|site| rewire_one_unwrap_site(graph, site, 2).is_ok())
+        .count()
+}
+
+fn rewire_one_unwrap_site(
+    graph: &mut FunctionGraph,
+    site: &UnwrapSite,
+    arity: usize,
+) -> Result<(), String> {
     let name = graph.name.clone();
     // Block A: the `unwrap` residual call producing `result_var`.
     let a = graph
@@ -145,12 +159,12 @@ fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Resul
             "{name}: unwrap call is not the last op of block {a}"
         ));
     };
-    // Capture the receiver enum operand (the sole argument).
+    // Capture the receiver enum operand; expect also carries a panic message.
     let recv = match &graph.blocks[a].operations[call_idx].kind {
-        OpKind::Call { args, .. } if args.len() == 1 => args[0].clone(),
+        OpKind::Call { args, .. } if args.len() == arity => args[0].clone(),
         other => {
             return Err(format!(
-                "{name}: unwrap producer op is not a 1-arg call: {other:?}"
+                "{name}: unwrap/expect producer op is not a {arity}-arg call: {other:?}"
             ));
         }
     };
@@ -448,17 +462,34 @@ mod tests {
     /// the true (`Err`) exit raises. This is the mirror of `Option::Some = 1`.
     #[test]
     fn rewrite_lifts_result_unwrap_payload_on_disc_false() {
+        check_result_payload_on_disc_false(false);
+    }
+
+    #[test]
+    fn rewrite_lifts_result_expect_payload_on_disc_false() {
+        check_result_payload_on_disc_false(true);
+    }
+
+    fn check_result_payload_on_disc_false(expect: bool) {
         use crate::model::ExitCase;
 
         let mut g = FunctionGraph::new("test_result_unwrap");
         let a = g.startblock;
         let recv = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let mut args = vec![recv];
+        if expect {
+            args.push(g.push_op_var(a, OpKind::ConstInt(1), true).unwrap());
+        }
         let result = g
             .push_op_var(
                 a,
                 OpKind::Call {
-                    target: unwrap_target(),
-                    args: vec![recv],
+                    target: if expect {
+                        CallTarget::method("expect", Some("Result".into()))
+                    } else {
+                        unwrap_target()
+                    },
+                    args,
                     result_ty: ValueType::Unsigned,
                 },
                 true,
@@ -468,7 +499,12 @@ mod tests {
         g.set_return(b, None);
         g.set_goto(a, b, vec![result.clone()]);
 
-        let rewritten = rewire_unwrap_call_sites(
+        let rewrite = if expect {
+            rewire_result_expect_sites
+        } else {
+            rewire_unwrap_call_sites
+        };
+        let rewritten = rewrite(
             &mut g,
             &[UnwrapSite {
                 result_var: result,

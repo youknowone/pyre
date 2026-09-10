@@ -850,6 +850,10 @@ fn make_heap_structseq_type(
             mro.push(base);
         }
         pyre_object::w_type_set_mro(cls, mro);
+        crate::typedef::copy_getset_properties(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            cls,
+        );
         crate::typedef::stamp_new_descr_self(pyre_object::gc_roots::shadow_stack_get(ns_slot), cls);
         pyre_object::typeobject::w_type_ready(cls);
     }

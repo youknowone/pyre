@@ -431,8 +431,11 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// `ll_dict_remove_deleted_items` (rordereddict.py:803) — drop the
+    /// `rpython/rtyper/lltypesystem/rordereddict.py::ll_dict_remove_deleted_items`
+    /// — drop the
     /// tombstones, renumbering the survivors, then reindex at the same size.
+    /// Upstream makes compaction opaque to tracing (not to translation).
+    #[majit_macros::dont_look_inside]
     fn remove_deleted_items(&mut self) {
         let shrink = self.num_live_items < self.entries.capacity() / 4;
         self.entries.retain(|e| e.is_some());

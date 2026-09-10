@@ -25,6 +25,7 @@ pub mod float_array;
 pub mod floatobject;
 pub mod function;
 pub mod functional;
+pub mod gateway;
 pub mod gc_hook;
 pub mod gc_interp;
 pub mod gc_roots;

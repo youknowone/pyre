@@ -52,6 +52,14 @@ pub(crate) type Flags = HashMap<String, ConstValue>;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, LazyLock};
 
+thread_local! {
+    // rclass.py:InstanceRepr._initialize_data_flattenrec is a class-owned
+    // FlattenRecursion; upstream tool/flattenrec.py derives from thread._local.
+    // Share one queue across reprs on the translation thread, not per instance.
+    static INITIALIZE_DATA_FLATTENREC: crate::tool::flattenrec::FlattenRecursion<TyperError> =
+        crate::tool::flattenrec::FlattenRecursion::new();
+}
+
 use crate::annotator::classdesc::ClassDef;
 use crate::annotator::description::{ClassDefKey, DescEntry};
 use crate::annotator::model::{DescKind, SomePBC, SomeValue};
@@ -2452,7 +2460,22 @@ impl InstanceRepr {
         let rbase = self.rbase.borrow().clone().ok_or_else(|| {
             TyperError::message("InstanceRepr.getfieldrepr: rbase missing — call setup() first")
         })?;
-        rbase.getfieldrepr(attr)
+        rbase.getfieldrepr(attr).map_err(|err| {
+            // Keep the failing owner's annotation beside its built fields:
+            // this distinguishes an absent attribute from premature repr
+            // setup without changing rclass.py::InstanceRepr.getfieldrepr's
+            // lookup or allowing a missing field.
+            let classdef = self.classdef.as_ref().unwrap().borrow();
+            let attribute = classdef.attrs.get(attr).map(|value| {
+                (value.readonly, value.s_value.clone())
+            });
+            let mut fields: Vec<_> = self.fields.borrow().keys().cloned().collect();
+            fields.sort();
+            TyperError::message(format!(
+                "{err}; InstanceRepr {:?}: attribute {attr:?} (readonly, value)={attribute:?}, built fields={fields:?}",
+                classdef.name
+            ))
+        })
     }
 
     /// RPython `InstanceRepr.hook_access_field(self, vinst, cname,
@@ -2975,13 +2998,8 @@ impl InstanceRepr {
     ///   `Ellipsis` sentinel meaning "use defaults"). The Ellipsis
     ///   path skips the live `instance_get` probe and falls through
     ///   straight to `read_attribute` → `_defl`.
-    /// - Upstream's `try: getattr(value, name) except AttributeError:`
-    ///   is split into an explicit `host.instance_get(name)` lookup
-    ///   on the per-instance `__dict__` followed by the same
-    ///   `read_attribute(name, None)` → `_defl` cascade upstream uses
-    ///   inside the except branch — see the body block at
-    ///   `for (name, ...) in &fields_snapshot` below for the full
-    ///   try/except mirror.
+    /// - Upstream's `getattr(value, name)` uses the host descriptor protocol;
+    ///   only a missing attribute takes the class-declaration/default branch.
     pub fn initialize_prebuilt_data(
         &self,
         _value: Option<&HostObject>,
@@ -3019,12 +3037,9 @@ impl InstanceRepr {
             //               llattrvalue = r.convert_const(attrvalue)
             //       setattr(result, mangled_name, llattrvalue)
             //
-            // Pyre splits the upstream try/except on `getattr` into an
-            // explicit `instance_get` (live `__dict__`) → fall through
-            // to `read_attribute` (class-level dict) → fall through to
-            // `_defl` cascade. The Ellipsis-sentinel path
+            // The Ellipsis-sentinel path
             // (`get_reusable_prebuilt_instance` with `_value = None`)
-            // skips the `instance_get` lookup entirely and goes
+            // skips the host lookup entirely and goes
             // straight to `read_attribute` / `_defl`.
             #[expect(
                 clippy::type_complexity,
@@ -3047,10 +3062,19 @@ impl InstanceRepr {
                         // is modeled as `LowLevelValue::Void`.
                         lltype::LowLevelValue::Void
                     } else {
-                        // upstream try/except: `getattr(value, name)` ⇒
-                        // pyre's `host.instance_get(name)`. AttributeError
-                        // ⇒ `read_attribute(name, None)` ⇒ `_defl`.
-                        let probe = _value.and_then(|host| host.instance_get(name));
+                        // rclass.py:InstanceRepr.initialize_prebuilt_data
+                        // reads getattr, not __dict__: native prebuilt views
+                        // and data descriptors must be observed before defaults.
+                        use crate::flowspace::model::{HostGetAttrError, host_getattr};
+                        let probe = match _value.map(|host| host_getattr(host, name)) {
+                            Some(Ok(value)) => Some(value),
+                            None | Some(Err(HostGetAttrError::Missing)) => None,
+                            Some(Err(HostGetAttrError::Unsupported)) => {
+                                return Err(TyperError::message(format!(
+                                    "InstanceRepr.initialize_prebuilt_data: unsupported getattr({name:?})"
+                                )));
+                            }
+                        };
                         if let Some(attrvalue) = probe {
                             let const_for_field =
                                 (r.as_ref() as &dyn Repr).convert_const(&attrvalue)?;
@@ -3150,12 +3174,9 @@ impl InstanceRepr {
     /// (rclass.py); upstream uses `identity_dict()` which is
     /// pointer-keyed dict semantics — pyre keys on
     /// [`HostObject`]'s Arc identity (Hash + Eq via `Arc::ptr_eq`).
-    /// `initialize_prebuilt_instance` is a thin wrapper around
-    /// `initialize_prebuilt_data` (the recursion shield via
-    /// `_initialize_data_flattenrec` is folded into pyre's recursive
-    /// call structure since the `flattenrec` mechanism is upstream-only
-    /// and operates as a no-op for non-recursive
-    /// `initialize_prebuilt_data` graphs).
+    /// `initialize_prebuilt_instance` queues nested initialization through
+    /// the shared FlattenRecursion, as upstream does for circular prebuilt
+    /// graphs and their hash initialization order.
     pub fn convert_const_exact(
         self: &Arc<Self>,
         host_obj: &HostObject,
@@ -3193,12 +3214,32 @@ impl InstanceRepr {
         self.iprebuiltinstances
             .borrow_mut()
             .insert(host_obj.clone(), initial.clone());
-        let mut local = initial;
-        self.initialize_prebuilt_data(Some(host_obj), self.classdef.as_ref(), &mut local, &[])?;
+        let local = initial;
+        self.initialize_prebuilt_instance(host_obj, self.classdef.as_ref(), &local)?;
         Ok(Constant::with_concretetype(
             ConstValue::LLPtr(Box::new(local)),
             self.lowleveltype.clone(),
         ))
+    }
+
+    /// RPython `InstanceRepr.initialize_prebuilt_instance`: defer nested
+    /// initialization until the outer object's fields (including hash state)
+    /// have been populated. Pointer clones share the allocated field storage.
+    pub fn initialize_prebuilt_instance(
+        self: &Arc<Self>,
+        value: &HostObject,
+        classdef: Option<&Rc<RefCell<ClassDef>>>,
+        result: &_ptr,
+    ) -> Result<(), TyperError> {
+        let repr = self.clone();
+        let value = value.clone();
+        let classdef = classdef.cloned();
+        let mut result = result.clone();
+        INITIALIZE_DATA_FLATTENREC.with(|flat| {
+            flat.call(Box::new(move || {
+                repr.initialize_prebuilt_data(Some(&value), classdef.as_ref(), &mut result, &[])
+            }))
+        })
     }
 
     /// RPython `InstanceRepr.get_reusable_prebuilt_instance(self)`
@@ -3839,49 +3880,6 @@ impl Repr for InstanceRepr {
     fn rtype_isinstance(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::translator::rtyper::rtyper::{ConvertedTo, make_ll_isinstance};
 
-        // pyre models type objects as `PyType` GcStruct instances that
-        // carry `subclassrange_{min,max}` directly (the OBJECT_VTABLE
-        // layout is unified into the runtime `PyType`). When the class arg
-        // is such a PyType instance the upstream `class_repr` path cannot
-        // apply — there is no InstanceRepr->RootClassRepr conversion
-        // (`castable` rejects the GcStruct->Struct gc-status change).
-        // Detect the PyType-shaped class arg structurally and lower to a
-        // getfield+int_between helper that reads the ranges off the PyType
-        // ptr, mirroring `ll_isinstance` (rclass.py) on the pyre
-        // `PyObject`/`PyType` structs. The class arg (`&EXCEPTION_TYPE`) is
-        // an opaque host-address `_ptr` whose ranges are re-stamped at
-        // runtime under a seqlock, so it is read at runtime rather than
-        // const-folded through `make_ll_isinstance`.
-        let r_cls = hop.args_r.borrow().get(1).cloned().flatten();
-        if let Some(r_cls) = &r_cls {
-            let cls_is_pytype = (r_cls.as_ref() as &dyn std::any::Any)
-                .downcast_ref::<InstanceRepr>()
-                .is_some_and(|inst| {
-                    let f = inst.allinstancefields();
-                    f.contains_key("subclassrange_min") && f.contains_key("subclassrange_max")
-                });
-            if cls_is_pytype && self.allinstancefields().contains_key("ob_type") {
-                let rtyper = self.rtyper.upgrade().ok_or_else(|| {
-                    TyperError::message("InstanceRepr.rtype_isinstance: rtyper weak ref expired")
-                })?;
-                // Keep `obj` in its own PyObject repr (not `common_repr`):
-                // `ob_type` lives on `PyObject`, and coercing to `OBJECTPTR`
-                // would retarget the getfield owner to `object`. Pass `cls`
-                // in its own repr so both coercions are identity — no
-                // `convert_const` on the `&EXCEPTION_TYPE` Constant.
-                let v = hop.inputargs(vec![
-                    ConvertedTo::Repr(self as &dyn Repr),
-                    ConvertedTo::Repr(r_cls.as_ref()),
-                ])?;
-                let helper = rtyper.lowlevel_helper_function(
-                    "ll_isinstance_pytype",
-                    vec![self.lowleveltype().clone(), r_cls.lowleveltype().clone()],
-                    LowLevelType::Bool,
-                )?;
-                return hop.gendirectcall(&helper, vec![v[0].clone(), v[1].clone()]);
-            }
-        }
-
         // upstream: `class_repr = get_type_repr(hop.rtyper)`.
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
             TyperError::message("InstanceRepr.rtype_isinstance: rtyper weak ref expired")
@@ -3951,48 +3949,6 @@ impl Repr for InstanceRepr {
             LowLevelType::Bool,
         )?;
         hop.gendirectcall(&helper, vec![v_obj, v_cls])
-    }
-
-    /// pyre-specific `issubtype` lowering for a `PyType` InstanceRepr.
-    ///
-    /// Upstream `issubtype` only reaches `AbstractClassRepr`
-    /// (rclass.py:403-414) because `type(x)` yields a class-repr
-    /// (`CLASSTYPE`) value. pyre's type objects are `PyType` GcStruct
-    /// *instances* carrying `subclassrange_{min,max}` directly, and
-    /// `flowspace_adapter` rewrites `ll_issubclass(subcls, cls)` to an
-    /// `issubtype` op whose operands are `PyType` InstanceReprs. Lower it
-    /// like `ClassRepr.rtype_issubtype`'s variable case — a
-    /// getfield+int_between helper (rclass.py `ll_issubclass`) —
-    /// but reading the ranges off the PyType ptrs (no object_vtable, no
-    /// InstanceRepr->RootClassRepr cast, which `castable` rejects on the
-    /// gc-status change). Gate structurally on the two range fields so
-    /// only PyType-shaped InstanceReprs take this path; every other
-    /// InstanceRepr keeps the rmodel `missing_rtype_operation` default.
-    fn rtype_issubtype(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
-        use crate::translator::rtyper::rtyper::ConvertedTo;
-        let is_pytype = {
-            let f = self.allinstancefields();
-            f.contains_key("subclassrange_min") && f.contains_key("subclassrange_max")
-        };
-        if !is_pytype {
-            return Err(self.missing_rtype_operation("issubtype"));
-        }
-        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
-            TyperError::message("InstanceRepr.rtype_issubtype: rtyper weak ref expired")
-        })?;
-        // Both operands are the same PyType InstanceRepr; coerce each to
-        // `self` (identity) so no conversion is emitted. subcls = arg0,
-        // cls = arg1, matching `ll_issubclass(subcls, cls)`.
-        let v = hop.inputargs(vec![
-            ConvertedTo::Repr(self as &dyn Repr),
-            ConvertedTo::Repr(self as &dyn Repr),
-        ])?;
-        let helper = rtyper.lowlevel_helper_function(
-            "ll_issubclass_pytype",
-            vec![self.lowleveltype().clone(), self.lowleveltype().clone()],
-            LowLevelType::Bool,
-        )?;
-        hop.gendirectcall(&helper, vec![v[0].clone(), v[1].clone()])
     }
 
     /// RPython `InstanceRepr.convert_const(self, value)` (rclass.py):
@@ -6082,6 +6038,90 @@ mod tests {
         );
         // The cache holds exactly one entry for this prebuilt.
         assert_eq!(inst.iprebuiltinstances.borrow().len(), 1);
+    }
+
+    #[test]
+    fn prebuilt_data_defers_nested_initialization_and_reads_descriptors() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::HostObject;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().unwrap();
+        let host_class = HostObject::new_class("PrebuiltDescriptor", vec![]);
+        let cd = ann.bookkeeper.getuniqueclassdef(&host_class).unwrap();
+        ClassDef::generalize_attr(
+            &cd,
+            "value",
+            Some(SomeValue::Integer(SomeInteger::new(false, false))),
+        )
+        .unwrap();
+        cd.borrow_mut()
+            .attrs
+            .get_mut("value")
+            .unwrap()
+            .modified(None)
+            .unwrap();
+        let repr = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).unwrap();
+        Repr::setup(repr.as_ref()).unwrap();
+        rtyper.call_all_setups().unwrap();
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+
+        // Supply the live host descriptor after the field layout is known.
+        // rclass.py:InstanceRepr.initialize_prebuilt_data must observe
+        // getattr(value, name), even with a shadowing __dict__ entry.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let getter_reads = reads.clone();
+        let getter = HostObject::new_native_callable(
+            "PrebuiltDescriptor.value",
+            Arc::new(move |_| {
+                getter_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(ConstValue::Int(42))
+            }),
+        );
+        host_class.class_set(
+            "value",
+            ConstValue::HostObject(HostObject::new_property(
+                "PrebuiltDescriptor.value",
+                Some(getter),
+                None,
+                None,
+            )),
+        );
+        let value = HostObject::new_instance(host_class, vec![]);
+        value.instance_set("value", ConstValue::Int(7)).unwrap();
+        let saved = Rc::new(RefCell::new(None));
+        let saved_inner = saved.clone();
+        let repr_inner = repr.clone();
+        let reads_inner = reads.clone();
+        INITIALIZE_DATA_FLATTENREC
+            .with(|flat| {
+                flat.call(Box::new(move || {
+                    *saved_inner.borrow_mut() = Some(repr_inner.convert_const_exact(&value)?);
+                    assert_eq!(
+                        reads_inner.load(std::sync::atomic::Ordering::Relaxed),
+                        0,
+                        "nested prebuilt initialization must wait for the outer object"
+                    );
+                    Ok(())
+                }))
+            })
+            .unwrap();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let constant = saved.borrow_mut().take().unwrap();
+        let ConstValue::LLPtr(ptr) = constant.value else {
+            panic!("typed instance")
+        };
+        let lltype::_ptr_obj::Struct(object) = ptr._obj().unwrap() else {
+            panic!("struct")
+        };
+        let fields = repr.fields();
+        let (field, _) = fields.get("value").expect("nonconstant instance field");
+        assert!(matches!(
+            object._getattr(field).unwrap(),
+            lltype::LowLevelValue::Signed(42)
+        ));
     }
 
     #[test]

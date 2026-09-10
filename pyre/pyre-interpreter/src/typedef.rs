@@ -24,14 +24,146 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 use crate::{make_builtin_function, make_builtin_function_with_arity};
 
-/// Compatibility stand-ins for PyPy `typedef.py` API (type descriptor helpers).
-#[derive(Debug, Default)]
-pub struct TypeDef;
+// The same TypeDef object that Layout.typedef references, not an independent
+// interpreter-side placeholder. See typedef.py TypeDef / typeobject.py Layout.
+pub use pyre_object::typedef::TypeDef;
 
-impl TypeDef {
-    pub fn new(_name: &str, _base: Option<crate::W_Root>, _dict: Option<PyObjectRef>) -> Self {
-        let _ = (_name, _base, _dict);
-        Self
+#[cfg(test)]
+mod typedef_identity_tests {
+    #[test]
+    fn getsets_are_bound_before_layout_and_not_recopied_after_initialization() {
+        use pyre_object::*;
+
+        super::init_typeobjects();
+        let _roots = gc_roots::push_roots();
+        for name in ["FirstOwner", "SecondOwner"] {
+            let ns_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(w_dict_new());
+            let template = super::dict_descr();
+            unsafe {
+                w_dict_setitem_str_no_proxy(gc_roots::shadow_stack_get(ns_slot), "field", template);
+                let bases = w_tuple_new(vec![super::w_object()]);
+                let w_type = super::new_builtin_typeobject(
+                    name,
+                    bases,
+                    gc_roots::shadow_stack_get(ns_slot) as *mut u8,
+                    &INSTANCE_TYPE,
+                    PY_NULL,
+                );
+                // The low-level initialization has finished, but Layout/MRO
+                // and the post-init stamping pass have not run yet.
+                assert!(w_type_get_layout_ptr(w_type).is_null());
+                assert!(w_type_get_mro(w_type).is_null());
+                let ns = gc_roots::shadow_stack_get(ns_slot);
+                let bound = w_dict_getitem_str(ns, "field").unwrap();
+                assert_ne!(bound, super::dict_descr());
+                assert_eq!(w_getset_get_objclass(bound), w_type);
+                let bound_slot = gc_roots::shadow_stack_len();
+                let _ = gc_roots::pin_root(bound);
+                super::stamp_new_descr_self(ns, w_type);
+                let after =
+                    w_dict_getitem_str(gc_roots::shadow_stack_get(ns_slot), "field").unwrap();
+                assert_eq!(after, gc_roots::shadow_stack_get(bound_slot));
+                assert!(w_getset_get_objclass(super::dict_descr()).is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn method_descriptor_declarations_reach_builtin_type_flags() {
+        super::init_typeobjects();
+        for (tp, expected) in [
+            (&crate::FUNCTION_TYPE, true),
+            (&crate::SLOT_WRAPPER_TYPE, true),
+            (&crate::METHOD_DESCRIPTOR_TYPE, true),
+            (&crate::BUILTIN_FUNCTION_TYPE, false),
+            (&pyre_object::INT_TYPE, false),
+        ] {
+            let w_type = super::gettypefor(tp).unwrap().as_ptr();
+            unsafe {
+                let layout = pyre_object::w_type_get_layout_ptr(w_type);
+                assert_eq!((*(*layout).typedef).method_descriptor, expected);
+                assert_eq!(
+                    pyre_object::w_type_get_flag_method_descriptor(w_type),
+                    expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn heap_slots_reuse_the_best_bases_typedef() {
+        use pyre_object::*;
+
+        super::init_typeobjects();
+        let _roots = gc_roots::push_roots();
+        // Exercise the actual heap-type slot builder, not hand-built Layouts.
+        // typeobject.py create_all_slots reuses the Layout for empty slots,
+        // and retains Layout.typedef when extra slots need a new Layout.
+        for (base, slot_names) in [
+            (super::w_object(), vec![]),
+            (super::w_object(), vec!["field"]),
+            (super::gettypefor(&INT_TYPE).unwrap().as_ptr(), vec![]),
+        ] {
+            let ns_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(w_dict_new());
+            let slots = slot_names
+                .iter()
+                .map(|name| gc_roots::pin_root(w_str_new(name)))
+                .collect();
+            let slots = gc_roots::pin_root(w_tuple_new(slots));
+            unsafe {
+                w_dict_setitem_str_no_proxy(
+                    gc_roots::shadow_stack_get(ns_slot),
+                    "__slots__",
+                    slots,
+                );
+                let bases_slot = gc_roots::shadow_stack_len();
+                let _ = gc_roots::pin_root(w_tuple_new(vec![base]));
+                let child = gc_roots::pin_root(w_type_new(
+                    "Child",
+                    gc_roots::shadow_stack_get(bases_slot),
+                    gc_roots::shadow_stack_get(ns_slot) as *mut u8,
+                ));
+                crate::call::create_all_slots(child, gc_roots::shadow_stack_get(bases_slot))
+                    .unwrap();
+                let parent_layout = w_type_get_layout_ptr(base);
+                let child_layout = w_type_get_layout_ptr(child);
+                assert_eq!((*child_layout).typedef, (*parent_layout).typedef);
+                assert_eq!(child_layout == parent_layout, slot_names.is_empty());
+                assert_eq!(
+                    (*child_layout).nslots,
+                    (*parent_layout).nslots + slot_names.len() as u32,
+                );
+                if !slot_names.is_empty() {
+                    assert_eq!((*child_layout).base_layout, parent_layout);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_layout_uses_the_exported_typedef_identity() {
+        super::init_typeobjects();
+        let w_int = super::gettypefor(&pyre_object::INT_TYPE).unwrap();
+        unsafe {
+            let layout = pyre_object::w_type_get_layout_ptr(w_int.as_ptr());
+            assert!(!layout.is_null());
+            // This assignment requires the re-export and the runtime Layout
+            // to share the same Rust type, not merely compatible fields.
+            let definition: *const super::TypeDef = (*layout).typedef;
+            assert!(!definition.is_null());
+            assert!(std::ptr::eq(
+                (*definition).instance_type,
+                &pyre_object::INT_TYPE
+            ));
+            assert!((*definition)._freeze_());
+            let again = super::gettypefor(&pyre_object::INT_TYPE).unwrap();
+            assert!(std::ptr::eq(
+                definition,
+                (*pyre_object::w_type_get_layout_ptr(again.as_ptr())).typedef,
+            ));
+        }
     }
 }
 
@@ -255,6 +387,26 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
     }
 }
 
+/// Initialize the complete interpreter vtable census once, independently
+/// of Python type-object allocation and GC construction.
+///
+/// RPython `ClassRepr.fill_vtable_root` (rclass.py) fills prebuilt vtables
+/// from `assign_inheritance_ids` (normalizecalls.py). This is the existing
+/// Rust startup adaptation's publication owner: interpreter-only startup
+/// and GC-first startup share it, and repeated GC builds only compare their
+/// numbering against it. The OnceLock publishes all cross-crate aliases.
+pub fn init_subclass_ranges() {
+    static INITIALIZED: OnceLock<()> = OnceLock::new();
+    INITIALIZED.get_or_init(|| {
+        let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
+        let interpreter_aliases = crate::all_subclass_range_aliases();
+        pyre_object::pyobject::initialize_subclass_ranges_from_hierarchy(
+            crate::active_subclass_range_hierarchy(),
+            &[&object_aliases, &interpreter_aliases],
+        );
+    });
+}
+
 /// Initialize the type registry with all builtin types.
 ///
 /// PyPy: each W_XxxObject.typedef = TypeDef("xxx", ...) is set at
@@ -279,23 +431,7 @@ pub fn init_typeobjects() {
     #[cfg(any(test, feature = "test-hooks"))]
     crate::test_hooks::install_hash_hook();
     TYPEOBJECT_CACHE.get_or_init(|| {
-        // Seed `subclassrange_{min,max}` on every registered PyType so
-        // `ll_isinstance` works on the interpreter-only test path that
-        // skips the JIT init. This uses the same registration-ordered
-        // reversed-MRO peer census as GC `assign_inheritance_ids`, so JIT
-        // init's later `gc.subclass_range` writeback is byte-identical.
-        // Calling
-        // `mark_subclass_ranges_initialized` afterwards stops the
-        // pyre-object-internal `is_exception` fallback from
-        // omitting the cross-crate `CODE_TYPE` / `PYTRACEBACK_TYPE`
-        // aliases from a later redundant write.
-        let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
-        let interpreter_aliases = crate::all_subclass_range_aliases();
-        pyre_object::pyobject::compute_subclass_ranges_from_hierarchy(
-            crate::active_subclass_range_hierarchy(),
-            &[&object_aliases, &interpreter_aliases],
-        );
-        pyre_object::pyobject::mark_subclass_ranges_initialized();
+        init_subclass_ranges();
         let mut reg: HashMap<usize, usize> = HashMap::new();
 
         // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef
@@ -575,17 +711,17 @@ pub fn init_typeobjects() {
 
         // function — PyPy: funcobject.py
         // Functions are descriptors: function.__get__ returns a bound method.
-        let function_type = new_typeobject_with_base("function", init_function_type, object_type);
+        // typedef.py Function.typedef declares method_descriptor=True.
+        let function_type = new_typeobject_with_metatype_and_layout(
+            "function", init_function_type, object_type, &INSTANCE_TYPE,
+            PY_NULL, std::ptr::null(), true,
+        );
         // typedef.py:742 Function.typedef.acceptable_as_base_class = False
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(function_type, false) };
         // typedef.py:735/740 — Function exposes __dict__ and __weakref__.
         unsafe {
             pyre_object::w_type_set_hasdict(function_type, true);
             pyre_object::w_type_set_weakrefable(function_type, true);
-            // typedef.py `method_descriptor=True` → typeobject.py:256
-            // `flag_method_descriptor` (the LOAD_METHOD fast-path gate,
-            // callmethod.py:66).
-            pyre_object::typeobject::w_type_set_flag_method_descriptor(function_type, true);
         }
         reg.insert(
             &crate::FUNCTION_TYPE as *const PyType as usize,
@@ -617,12 +753,13 @@ pub fn init_typeobjects() {
         // CPython `wrapper_descriptor`: slot wrappers bind their receiver and
         // are callable, but are not Python functions. Their Rust payload is
         // the immutable BuiltinCode-backed Function carrier.
-        let slot_wrapper_type =
-            new_typeobject_with_base("wrapper_descriptor", init_slot_wrapper_type, object_type);
+        let slot_wrapper_type = new_typeobject_with_metatype_and_layout(
+            "wrapper_descriptor", init_slot_wrapper_type, object_type, &INSTANCE_TYPE,
+            PY_NULL, std::ptr::null(), true,
+        );
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(slot_wrapper_type, false);
             pyre_object::w_type_set_disallow_instantiation(slot_wrapper_type);
-            pyre_object::typeobject::w_type_set_flag_method_descriptor(slot_wrapper_type, true);
             pyre_object::set_instantiate(&crate::SLOT_WRAPPER_TYPE, slot_wrapper_type);
         }
         reg.insert(
@@ -630,18 +767,18 @@ pub fn init_typeobjects() {
             slot_wrapper_type as usize,
         );
 
-        let method_descriptor_type = new_typeobject_with_base(
+        let method_descriptor_type = new_typeobject_with_metatype_and_layout(
             "method_descriptor",
             init_method_descriptor_type,
             object_type,
+            &INSTANCE_TYPE,
+            PY_NULL,
+            std::ptr::null(),
+            true,
         );
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(method_descriptor_type, false);
             pyre_object::w_type_set_disallow_instantiation(method_descriptor_type);
-            pyre_object::typeobject::w_type_set_flag_method_descriptor(
-                method_descriptor_type,
-                true,
-            );
             pyre_object::set_instantiate(&crate::METHOD_DESCRIPTOR_TYPE, method_descriptor_type);
         }
         reg.insert(
@@ -1173,8 +1310,11 @@ pub fn init_typeobjects() {
             &pyre_object::memoryview::BUFFER_WRAPPER_TYPE as *const PyType as usize,
             buffer_wrapper_type as usize,
         );
-        let seq_iterator_type =
-            new_typeobject_with_base("iterator", init_sequence_iterator_type, object_type);
+        let seq_iterator_type = unsafe {
+            crate::baseobjspace::object_space()
+                .gettypeobject(crate::objspace::std::iterobject::typedef())
+                .expect("sequence iterator TypeDef construction")
+        };
         // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — an iterator is produced only by
         // `iter(obj)`, never by `iterator()`, so `tp_new` is NULL.
         unsafe {
@@ -1184,6 +1324,19 @@ pub fn init_typeobjects() {
         reg.insert(
             &pyre_object::iterobject::SEQ_ITER_TYPE as *const PyType as usize,
             seq_iterator_type as usize,
+        );
+        let reverse_iterator_type = unsafe {
+            crate::baseobjspace::object_space()
+                .gettypeobject(crate::objspace::std::iterobject::reverse_typedef())
+                .expect("reverse sequence iterator TypeDef construction")
+        };
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(reverse_iterator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(reverse_iterator_type, false);
+        }
+        reg.insert(
+            &pyre_object::iterobject::LIST_REVERSE_ITER_TYPE as *const PyType as usize,
+            reverse_iterator_type as usize,
         );
         let callable_iterator_type = new_typeobject_with_base(
             "callable_iterator",
@@ -1203,11 +1356,6 @@ pub fn init_typeobjects() {
                 &pyre_object::iterobject::LIST_ITER_TYPE as *const PyType,
                 "list_iterator",
                 init_list_iterator_type as fn(PyObjectRef),
-            ),
-            (
-                &pyre_object::iterobject::LIST_REVERSE_ITER_TYPE as *const PyType,
-                "list_reverseiterator",
-                init_list_reverse_iterator_type as fn(PyObjectRef),
             ),
             (
                 &pyre_object::iterobject::TUPLE_ITER_TYPE as *const PyType,
@@ -1802,6 +1950,24 @@ pub fn init_typeobjects() {
                 pyre_object::typeobject::w_type_set_flag_map_or_seq(w_typeobject, flag);
             }
         }
+        // typeobject.py TypeCache.build: `w_type.flag_sequence_bug_compat =
+        // typedef.flag_sequence_bug_compat` for list/tuple/bytes/bytearray/str.
+        for pytype in [
+            &pyre_object::pyobject::LIST_TYPE,
+            &pyre_object::pyobject::TUPLE_TYPE,
+            &pyre_object::pyobject::STR_TYPE,
+            &pyre_object::bytesobject::BYTES_TYPE,
+            &pyre_object::bytearrayobject::BYTEARRAY_TYPE,
+        ] {
+            let w_typeobject = *reg
+                .get(&(pytype as *const PyType as usize))
+                .expect(
+                    "built-in type object must be registered before flag_sequence_bug_compat init",
+                ) as PyObjectRef;
+            unsafe {
+                pyre_object::typeobject::w_type_set_flag_sequence_bug_compat(w_typeobject, true);
+            }
+        }
         // `Py_TPFLAGS_HAVE_GC` — cleared for the builtin types whose CPython
         // counterpart declares no `tp_traverse`, so `_PyType_PreHeaderSize`
         // charges them no collector pre-header and `sys.getsizeof` adds none.
@@ -2140,7 +2306,7 @@ pub fn w_object() -> PyObjectRef {
 /// missing from the table below takes an owner with no layout test — the
 /// receiver must be present, but a foreign one still reaches the
 /// implementation.
-fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner> {
+pub(crate) fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner> {
     macro_rules! owners {
         ($($name:literal => $pred:path),+ $(,)?) => {
             match type_name {
@@ -2379,7 +2545,10 @@ unsafe fn is_any_object(_obj: PyObjectRef) -> bool {
 ///
 /// # Safety
 /// `ns` must be a valid, live `W_DictObject`.
-unsafe fn stamp_method_owners(ns: PyObjectRef, owner: &'static crate::gateway::MethodOwner) {
+pub(crate) unsafe fn stamp_method_owners(
+    ns: PyObjectRef,
+    owner: &'static crate::gateway::MethodOwner,
+) {
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
@@ -2550,11 +2719,8 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
             }
         }
     }
-    // typeobject.py:1738-1742 — `if isinstance(descrvalue, GetSetProperty):
-    // descrvalue = descrvalue.copy_for_type(w_type)`.  Bind every reqcls-less
-    // GetSetProperty in the namespace to its owning type so that
-    // `T.__dict__['x'].__objclass__` (descr_get_objclass reads `w_objclass`)
-    // resolves instead of raising "generic self has no __objclass__".
+    // TypeCache.build's post-initialization function metadata pass. Getsets
+    // have already been copied for the allocated owner before initialization.
     let keys: Vec<String> = pyre_object::w_dict_items(ns)
         .into_iter()
         .filter_map(|(key, _)| pyre_object::w_str_get_value_opt(key).map(str::to_owned))
@@ -2580,22 +2746,23 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
         // `__get__`, so `str.maketrans` and `dict.fromkeys` stay ordinary
         // builtin callables; the stamping below still applies to both.
         let is_plain_entry = std::ptr::eq(function, descr);
-        if !function.is_null()
-            && pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE)
-        {
+        if !function.is_null() && crate::function::is_function_with_fixed_code(function) {
+            // TypeCache.build tests the Function subclass, not its Code
+            // subclass: fixed PyCode functions need ownership metadata too.
+            let qualname = format!("{}.{}", pyre_object::w_type_get_qualname(type_obj), key);
+            let _function_roots = pyre_object::gc_roots::push_roots();
+            let function_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(function);
+            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(descr);
+            let w_qualname = pyre_object::w_str_new(&qualname);
+            let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
+            let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
+            let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
+            crate::function::function_set_qualname(function, w_qualname);
+            crate::function::function_set_objclass(function, type_obj);
             let code = crate::function::getcode(function) as PyObjectRef;
             if !code.is_null() && crate::gateway::is_builtin_code(code) {
-                let qualname = format!("{}.{}", pyre_object::w_type_get_qualname(type_obj), key);
-                // Building the qualname string may collect, so pin the carrier
-                // and re-read both it and the type before stamping them.
-                let _function_roots = pyre_object::gc_roots::push_roots();
-                let function_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(function);
-                let w_qualname = pyre_object::w_str_new(&qualname);
-                let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
-                let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
-                crate::function::function_set_objclass(function, type_obj);
-                crate::function::function_set_qualname(function, w_qualname);
                 // Same `is_slot_wrapper` split the TypeDef sweep applies: the
                 // slot half becomes a `wrapper_descriptor`, the `tp_methods`
                 // half a `method_descriptor`.  Both sweeps reach a builtin
@@ -2640,16 +2807,35 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
         if !descr.is_null() && crate::function::is_method_descriptor(descr) {
             crate::function::function_set_objclass(descr, type_obj);
         }
+    }
+}
+
+/// TypeCache.build's pre-initialization GetSetProperty copy loop, separated
+/// from the function metadata pass which requires the initialized qualname.
+/// Also used by the existing app-level structseq construction adapter.
+pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let keys: Vec<String> = pyre_object::w_dict_items(ns)
+        .into_iter()
+        .filter_map(|(key, _)| pyre_object::w_str_get_value_opt(key).map(str::to_owned))
+        .collect();
+    for key in keys {
+        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+        let Some(descr) = pyre_object::w_dict_getitem_str(ns, &key) else {
+            continue;
+        };
         if !descr.is_null() && pyre_object::typedef::is_getset_property(descr) {
+            let _entry_roots = pyre_object::gc_roots::push_roots();
             let descr_slot = pyre_object::gc_roots::shadow_stack_len();
             let descr = pyre_object::gc_roots::pin_root(descr);
-            let bound = copy_for_type(descr, type_obj);
-            if !std::ptr::eq(bound, descr) {
-                let ns = pyre_object::gc_roots::shadow_stack_get(save_point);
-                let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
-                if !std::ptr::eq(bound, descr) {
-                    pyre_object::w_dict_setitem_str_no_proxy(ns, &key, bound);
-                }
+            let w_type = pyre_object::gc_roots::shadow_stack_get(ns_slot + 1);
+            let bound = copy_for_type(descr, w_type);
+            if !std::ptr::eq(bound, pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
+                let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+                pyre_object::w_dict_setitem_str_no_proxy(ns, &key, bound);
             }
         }
     }
@@ -2680,26 +2866,72 @@ fn new_builtin_typeobject(
     name: &str,
     bases: PyObjectRef,
     dict_ptr: *mut u8,
-    layout_pytype: *const PyType,
+    _layout_pytype: *const PyType,
     w_metatype: PyObjectRef,
 ) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(bases);
+    let _ = pyre_object::gc_roots::pin_root(dict_ptr as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(w_metatype);
+    // TypeCache.build: establish the final type identity before copying the
+    // descriptors, then initialize that same object. No post-init recopy.
+    let type_obj = pyre_object::w_type_alloc_builtin();
+    unsafe {
+        copy_getset_properties(
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1),
+            type_obj,
+        );
+    }
+    init_builtin_typeobject(
+        type_obj,
+        name,
+        pyre_object::gc_roots::shadow_stack_get(save_point),
+        pyre_object::gc_roots::shadow_stack_get(save_point + 1),
+        pyre_object::gc_roots::shadow_stack_get(save_point + 2),
+    )
+}
+
+/// Initialize TypeCache.build's already allocated identity. Descriptor
+/// copying belongs to the caller, before W_TypeObject.__init__ begins.
+pub(crate) fn init_builtin_typeobject(
+    type_obj: PyObjectRef,
+    name: &str,
+    bases: PyObjectRef,
+    ns: PyObjectRef,
+    w_metatype: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(bases);
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    let _ = pyre_object::gc_roots::pin_root(w_metatype);
+    unsafe {
+        pyre_object::w_type_init_builtin(
+            type_obj,
+            name,
+            pyre_object::gc_roots::shadow_stack_get(save_point),
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1) as *mut u8,
+        );
+    }
     // `typeobject.py ensure_common_attributes` runs for every PyPy TypeDef,
     // not only for types which spell these entries in their rawdict.  Keep
     // the same common preparation at the single builtin construction point:
     // every type owns a `__doc__` entry, and `ensure_hash` prevents a type
     // defining equality from silently inheriting an unrelated hash.
-    let ns = dict_ptr as PyObjectRef;
+    let ns = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
     unsafe {
         if pyre_object::w_dict_getitem_str(ns, "__doc__").is_none() {
             pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", pyre_object::w_none());
         }
+        let ns = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
         if pyre_object::w_dict_getitem_str(ns, "__eq__").is_some()
             && pyre_object::w_dict_getitem_str(ns, "__hash__").is_none()
         {
             pyre_object::w_dict_setitem_str_no_proxy(ns, "__hash__", pyre_object::w_none());
         }
     }
-    let type_obj = w_type_new_builtin(name, bases, dict_ptr, layout_pytype);
+    let w_metatype = pyre_object::gc_roots::shadow_stack_get(save_point + 2);
     let w_metatype = match w_metatype.is_null() {
         true => w_type(),
         false => w_metatype,
@@ -2734,7 +2966,7 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
     // typeobject.py setup_builtin_type — root type gets its own Layout.
     unsafe {
         let layout = pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
-            typedef: pyre_object::typeobject::leak_interpreter_typedef(&INSTANCE_TYPE, true, false),
+            typedef: pyre_object::typedef::leak_typedef(&INSTANCE_TYPE, true, false),
             nslots: 0,
             newslotnames: vec![],
             base_layout: std::ptr::null(),
@@ -2779,6 +3011,7 @@ fn new_typeobject_with_base_and_layout(
         layout_pytype,
         PY_NULL,
         std::ptr::null(),
+        false,
     )
 }
 
@@ -2793,7 +3026,8 @@ fn new_typeobject_with_metatype_and_layout(
     base: PyObjectRef,
     layout_pytype: *const PyType,
     w_metatype: PyObjectRef,
-    overridetypedef: *const pyre_object::typeobject::InterpreterTypeDef,
+    overridetypedef: *const pyre_object::typedef::TypeDef,
+    method_descriptor: bool,
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2850,11 +3084,13 @@ fn new_typeobject_with_metatype_and_layout(
         let typedef = if overridetypedef.is_null() {
             let has_new = pyre_object::w_dict_getitem_str(ns, "__new__").is_some();
             let inherited_hasdict = !parent_layout.is_null() && (*(*parent_layout).typedef).hasdict;
-            pyre_object::typeobject::leak_interpreter_typedef(
-                layout_pytype,
-                has_new,
-                has_dict || inherited_hasdict,
-            )
+            let mut definition =
+                TypeDef::new(layout_pytype, has_new, has_dict || inherited_hasdict);
+            // typedef.py TypeDef.__init__: declaration metadata is set
+            // before publication. W_TypeObject.__init__ consumes the selected
+            // Layout.typedef, including when an override reuses a base.
+            definition.method_descriptor = method_descriptor;
+            pyre_object::lltype::malloc_raw(definition) as *const TypeDef
         } else {
             overridetypedef
         };
@@ -2955,7 +3191,7 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
     init: impl FnOnce(PyObjectRef),
     bases: &[PyObjectRef],
     layout_pytype: *const PyType,
-    overridetypedef: *const pyre_object::typeobject::InterpreterTypeDef,
+    overridetypedef: *const pyre_object::typedef::TypeDef,
 ) -> PyObjectRef {
     let base = bases[0];
     let _roots = pyre_object::gc_roots::push_roots();
@@ -2973,11 +3209,7 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
             let layout = pyre_object::w_type_get_layout_ptr(base);
             !layout.is_null() && (*(*layout).typedef).hasdict
         });
-        pyre_object::typeobject::leak_interpreter_typedef(
-            layout_pytype,
-            has_new,
-            has_dict || inherited_hasdict,
-        )
+        pyre_object::typedef::leak_typedef(layout_pytype, has_new, has_dict || inherited_hasdict)
     } else {
         overridetypedef
     };
@@ -3069,7 +3301,7 @@ pub(crate) fn make_builtin_type_with_layout_owner(
     init: impl FnOnce(PyObjectRef),
     base: PyObjectRef,
     layout_pytype: *const PyType,
-    overridetypedef: *const pyre_object::typeobject::InterpreterTypeDef,
+    overridetypedef: *const pyre_object::typedef::TypeDef,
 ) -> PyObjectRef {
     new_typeobject_with_metatype_and_layout(
         name,
@@ -3078,6 +3310,7 @@ pub(crate) fn make_builtin_type_with_layout_owner(
         layout_pytype,
         PY_NULL,
         overridetypedef,
+        false,
     )
 }
 
@@ -3089,7 +3322,7 @@ pub fn make_builtin_type_with_overridetypedef(
     name: &str,
     init: impl FnOnce(PyObjectRef),
     base: PyObjectRef,
-    overridetypedef: *const pyre_object::typeobject::InterpreterTypeDef,
+    overridetypedef: *const pyre_object::typedef::TypeDef,
 ) -> PyObjectRef {
     let layout_pytype = unsafe { (*overridetypedef).instance_type };
     new_typeobject_with_metatype_and_layout(
@@ -3099,6 +3332,7 @@ pub fn make_builtin_type_with_overridetypedef(
         layout_pytype,
         PY_NULL,
         overridetypedef,
+        false,
     )
 }
 
@@ -3144,6 +3378,7 @@ pub fn make_builtin_type_with_metatype(
         layout_pytype,
         w_metatype,
         overridetypedef,
+        false,
     )
 }
 
@@ -5859,6 +6094,27 @@ static __majit_builtin_wrapper_target_list_descr_pop: crate::gateway::BuiltinWra
         func: __majit_wrap_list_descr_pop,
     };
 
+/// listobject.py:W_ListObject.typedef exposes W_ListObject.append through
+/// interp2app, so its gateway must be a member of BuiltinCode.func's PBC
+/// family just like pop. Keep the native argument checks and body; the
+/// translator generates the JitCode from this ordinary wrapper.
+pub fn __majit_wrap_list_descr_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::list_method_append(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_list_descr_append: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_list_descr_append)
+        ),
+        func: __majit_wrap_list_descr_append,
+    };
+
 /// Name of `obj`'s type, for operand-type error messages.
 fn arg_type_name(obj: PyObjectRef) -> String {
     unsafe {
@@ -5975,7 +6231,7 @@ fn init_list_type(ns: PyObjectRef) {
             "append",
             crate::gateway::make_method_descriptor_with_arity_and_doc(
                 "append",
-                crate::type_methods::list_method_append,
+                __majit_wrap_list_descr_append,
                 2,
                 "Append object to the end of the list.",
             ),
@@ -10667,6 +10923,19 @@ fn slice_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 }
 
 fn init_slice_type(ns: PyObjectRef) {
+    // sliceobject.py W_SliceObject.typedef declares interp2app objects;
+    // GatewayCache binds each declaration to a Function in this space.
+    // Keep the already-established CPython text signatures/arity contract.
+    let wrap_method = |name: &'static str, func, arity, text_sig: &'static str| {
+        let code = crate::gateway::builtin_code_new_with_arity(name, func, arity);
+        let gateway = crate::gateway::interp2app(code);
+        unsafe {
+            let declaration = &mut *(gateway as *mut crate::gateway::interp2app);
+            declaration._explicit_text_sig = Some(text_sig);
+            declaration._is_type_method = true;
+        }
+        crate::gateway::interp2app_spacebind(gateway, crate::baseobjspace::object_space())
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -10685,12 +10954,7 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            crate::gateway::make_builtin_function_with_arity_and_text_signature(
-                "__repr__",
-                slice_descr_repr,
-                1,
-                "($self, /)",
-            ),
+            wrap_method("__repr__", slice_descr_repr, 1, "($self, /)"),
         )
     };
     for (name, func) in [
@@ -10705,12 +10969,7 @@ fn init_slice_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                crate::gateway::make_builtin_function_with_arity_and_text_signature(
-                    name,
-                    func,
-                    2,
-                    "($self, value, /)",
-                ),
+                wrap_method(name, func, 2, "($self, value, /)"),
             )
         };
     }
@@ -10719,24 +10978,14 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            crate::gateway::make_builtin_function_with_arity_and_text_signature(
-                "__hash__",
-                slice_descr_hash,
-                1,
-                "($self, /)",
-            ),
+            wrap_method("__hash__", slice_descr_hash, 1, "($self, /)"),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            crate::gateway::make_builtin_function_with_arity_and_text_signature(
-                "__reduce__",
-                slice_descr_reduce,
-                1,
-                "($self, /)",
-            ),
+            wrap_method("__reduce__", slice_descr_reduce, 1, "($self, /)"),
         )
     };
     unsafe {
@@ -10776,12 +11025,7 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "indices",
-            crate::gateway::make_builtin_function_with_arity_and_text_signature(
-                "indices",
-                slice_method_indices,
-                2,
-                "($self, object, /)",
-            ),
+            wrap_method("indices", slice_method_indices, 2, "($self, object, /)"),
         )
     };
 }
@@ -13236,17 +13480,12 @@ fn init_type_type(ns: PyObjectRef) {
         "__dict__",
         |args| {
             let cls = args[1];
-            unsafe {
-                let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(cls);
-                if ns_ptr.is_null() {
-                    return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
-                }
-                // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
-                // returns a read-only live view over the type's canonical
-                // regular dict object.
-                let canonical = ns_ptr as PyObjectRef;
-                Ok(pyre_object::w_dict_proxy_new(canonical))
+            // typeobject.py type_get_dict: mappingproxy(w_cls.getdict(space)).
+            let w_dict = crate::baseobjspace::getdict(cls)?;
+            if w_dict.is_null() {
+                return Ok(pyre_object::w_none());
             }
+            Ok(pyre_object::w_dict_proxy_new(w_dict))
         },
         2,
     );
@@ -30216,56 +30455,28 @@ fn set_iterator_text_signatures(ns: PyObjectRef, signatures: &[(&'static str, &'
 
 /// PyPy `iterobject.py W_AbstractSeqIterObject.typedef`.
 fn init_sequence_iterator_type(ns: PyObjectRef) {
-    // PyPy carries the `iter()` builtin documentation on the abstract typedef;
-    // Python 3.14's concrete `iterator` type exposes `__doc__ is None`.
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
-    let entries = [
-        (
-            "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
-        ),
-        (
-            "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
-        ),
-        (
-            "__reduce__",
-            make_builtin_function_with_arity(
-                "__reduce__",
-                crate::baseobjspace::seq_iter_reduce_method,
-                1,
+    // Remaining concrete string/bytes iterator bootstrap adapters consume
+    // the same host declarations; only their type construction is legacy.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
+    for (name, value) in crate::objspace::std::iterobject::rawdict() {
+        let value = match value {
+            pyre_object::typedef::TypeDefValue::None => w_none(),
+            pyre_object::typedef::TypeDefValue::Text(text) => w_str_new(&text),
+            pyre_object::typedef::TypeDefValue::Root(slot) => crate::gateway::interp2app_spacebind(
+                unsafe { *slot.get() },
+                crate::baseobjspace::object_space(),
             ),
-        ),
-        (
-            "__length_hint__",
-            make_builtin_function_with_arity(
-                "__length_hint__",
-                crate::baseobjspace::seq_iter_length_hint_method,
-                1,
-            ),
-        ),
-        (
-            "__setstate__",
-            make_builtin_function_with_arity(
-                "__setstate__",
-                crate::baseobjspace::seq_iter_setstate_method,
-                2,
-            ),
-        ),
-    ];
-    for (name, value) in entries {
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+        };
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                &name,
+                value,
+            )
+        };
     }
-    set_iterator_text_signatures(
-        ns,
-        &[
-            ("__iter__", "($self, /)"),
-            ("__next__", "($self, /)"),
-            ("__reduce__", "($self, /)"),
-            ("__length_hint__", "($self, /)"),
-            ("__setstate__", "($self, object, /)"),
-        ],
-    );
 }
 
 /// Python 3.14 `PySeqIter_Type` restricted to `memory_iterator`'s surface:
@@ -30688,57 +30899,6 @@ fn init_list_iterator_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__setstate__",
                 crate::baseobjspace::list_iter_setstate_method,
-                2,
-            ),
-        ),
-    ];
-    for (name, value) in entries {
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
-    }
-    set_iterator_text_signatures(
-        ns,
-        &[
-            ("__iter__", "($self, /)"),
-            ("__next__", "($self, /)"),
-            ("__length_hint__", "($self, /)"),
-            ("__reduce__", "($self, /)"),
-            ("__setstate__", "($self, object, /)"),
-        ],
-    );
-}
-
-fn init_list_reverse_iterator_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
-    let entries = [
-        (
-            "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
-        ),
-        (
-            "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
-        ),
-        (
-            "__length_hint__",
-            make_builtin_function_with_arity(
-                "__length_hint__",
-                crate::baseobjspace::list_reverse_iter_length_hint_method,
-                1,
-            ),
-        ),
-        (
-            "__reduce__",
-            make_builtin_function_with_arity(
-                "__reduce__",
-                crate::baseobjspace::list_reverse_iter_reduce_method,
-                1,
-            ),
-        ),
-        (
-            "__setstate__",
-            make_builtin_function_with_arity(
-                "__setstate__",
-                crate::baseobjspace::list_reverse_iter_setstate_method,
                 2,
             ),
         ),
@@ -33107,7 +33267,7 @@ fn getset_descr_mismatch(
 ///     else:
 ///         return self
 /// ```
-fn copy_for_type(
+pub(crate) fn copy_for_type(
     descr: pyre_object::PyObjectRef,
     w_objclass: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
@@ -33123,7 +33283,12 @@ fn copy_for_type(
     // typedef.py — allocate a fresh GetSetProperty and copy
     // every slot from the source descriptor (reqcls passes through as
     // None per the source's `if self.reqcls is None` precondition).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(descr);
+    let _ = pyre_object::gc_roots::pin_root(w_objclass);
     let _ = getset_descriptor_type(); // ensure type registered
+    let descr = pyre_object::gc_roots::shadow_stack_get(save_point);
     let src = unsafe { &*(descr as *const pyre_object::typedef::GetSetProperty) };
     let new = pyre_object::typedef::w_getset_property_new(
         src.fget,
@@ -33136,6 +33301,7 @@ fn copy_for_type(
     );
     // typedef.py:353 new.w_objclass = w_objclass — write directly to
     // the typed slot, mirroring PyPy's instance-field assignment.
+    let w_objclass = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
     unsafe { pyre_object::typedef::w_getset_set_objclass(new, w_objclass) };
     new
 }
@@ -33254,6 +33420,41 @@ fn descr_get_weakref(
 #[cfg(test)]
 mod tests {
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn list_append_uses_a_registered_gateway_body() {
+        use pyre_object::*;
+        super::init_typeobjects();
+        let w_list_type = super::gettypeobject(&LIST_TYPE);
+        let append = unsafe {
+            w_dict_getitem_str(w_type_get_dict_ptr(w_list_type) as PyObjectRef, "append")
+                .expect("list.append declaration")
+        };
+        let code = unsafe { crate::function::getcode(append) as PyObjectRef };
+        let callable = unsafe { crate::gateway::builtin_code_get(code) };
+        assert!(std::ptr::fn_addr_eq(
+            callable,
+            super::__majit_wrap_list_descr_append as crate::gateway::BuiltinCodeFn,
+        ));
+        assert!(
+            crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS
+                .iter()
+                .any(|entry| {
+                    entry.path.ends_with("::__majit_wrap_list_descr_append")
+                        && std::ptr::fn_addr_eq(entry.func, callable)
+                })
+        );
+        let _roots = gc_roots::push_roots();
+        let slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_list_new(vec![]));
+        let item = w_int_new(9);
+        let list = gc_roots::shadow_stack_get(slot);
+        assert_eq!(callable(&[list, item]).unwrap(), w_none());
+        let list = gc_roots::shadow_stack_get(slot);
+        assert_eq!(unsafe { w_list_len(list) }, 1);
+        assert!(callable(&[list]).is_err(), "native arity check must remain");
+    }
+
+    #[test]
     fn complex_repr_keeps_pypy_positive_zero_and_sign_rules() {
         for (re, im, expected) in [
             (0.0, 2.0, "2j"),
@@ -33295,6 +33496,67 @@ mod tests {
             unsafe { pyre_object::w_dict_getitem_str(w_dict, "__name__") },
             Some(w_name)
         );
+    }
+
+    /// `init_typeobjects` publishes iterator TypeDefs through
+    /// `Cache.getorbuild` (`object_space().gettypeobject`). That acquire
+    /// must not drop the GIL unless the cache RLock is actually contended:
+    /// a sibling that already holds the GIL and then waits on
+    /// `TYPEOBJECT_CACHE` would otherwise deadlock with the initializer
+    /// trying to take the GIL back.
+    ///
+    /// Fresh process: `TYPEOBJECT_CACHE` is process-wide, and a prior
+    /// `#[test]` would close the window.
+    #[test]
+    fn init_typeobjects_does_not_deadlock_against_a_gil_holder() {
+        use std::sync::Barrier;
+
+        if std::env::var_os("PYRE_TYPEOBJECT_DEADLOCK_CHILD").is_none() {
+            let exe = std::env::current_exe().expect("test harness path");
+            let mut child = std::process::Command::new(exe)
+                .arg("typedef::tests::init_typeobjects_does_not_deadlock_against_a_gil_holder")
+                .arg("--exact")
+                .env("PYRE_TYPEOBJECT_DEADLOCK_CHILD", "1")
+                .env("RUST_TEST_THREADS", "1")
+                .spawn()
+                .expect("spawn deadlock-scenario child");
+            let start = std::time::Instant::now();
+            loop {
+                match child.try_wait().expect("wait deadlock-scenario child") {
+                    Some(status) => {
+                        assert!(
+                            status.success(),
+                            "child init_typeobjects deadlock scenario failed: {status}"
+                        );
+                        return;
+                    }
+                    None if start.elapsed() > std::time::Duration::from_secs(30) => {
+                        let _ = child.kill();
+                        panic!(
+                            "init_typeobjects deadlocked against a GIL-holding waiter \
+                             (Cache.getorbuild released the GIL inside TYPEOBJECT_CACHE.get_or_init)"
+                        );
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        }
+
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Take the GIL before the initializer starts, then wait on
+                // TYPEOBJECT_CACHE while still holding it — the Windows CI
+                // hang: install_hash_hook then get_or_init on a waiter.
+                crate::module::thread::ensure_runtime_thread();
+                barrier.wait();
+                crate::typedef::init_typeobjects();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                crate::typedef::init_typeobjects();
+            });
+        });
     }
 
     /// Concurrent `init_typeobjects` callers must not observe the

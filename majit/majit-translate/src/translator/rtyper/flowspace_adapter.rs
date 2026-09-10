@@ -407,12 +407,12 @@ fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
 /// `pairtype(Repr, VoidRepr).convert_from_to` (rmodel.py)
 /// converts into Void as `inputconst(lltype.Void, None)`.
 ///
-/// The front end relies on that: `front::mir` mints a Void operand with
-/// no defining operation when a field read lands on a fieldless enum,
-/// and says so — "No defining operation, matching the bare
-/// `Constant(None, lltype.Void)` the argument lists skip". Materialising
-/// that constant here is the other half of the same decision, so a Void
-/// operand resolves instead of tripping the undefined-operand invariant.
+/// PRE-EXISTING-ADAPTATION: tolerate legacy graphs with undefined Void
+/// operands. MIR's erased-call results and fieldless-enum projections now
+/// emit actual ConstNone definitions: this fallback must not replace those
+/// producers, because it runs after framestate and loses their provenance.
+/// Remove it once the other input-graph producers and their fixtures enforce
+/// the upstream defined-operand invariant, not by treating Unknown as Void.
 ///
 /// Only Void is treated this way. A missing operand of any other kind
 /// still fails loud: it names a value some op was supposed to define.
@@ -2564,41 +2564,6 @@ pub fn translate_op(
                             FlowspaceOp::new("simple_call", vec![bound_method, source], result),
                         ]);
                     }
-                    // `ll_issubclass(subcls, cls)` / `ll_isinstance(obj, cls)`
-                    // (`pyre-object/src/pyobject.rs`, ports of `rclass.py:1133`
-                    // / `:1143`).  Their bodies read `subclassrange_{min,max}`
-                    // through a pyre-only seqlock (`subclass_range_read` over
-                    // `SUBCLASS_RANGE_SEQ`, an adaptation for the two-pass
-                    // startup renumbering that has no upstream analog); tracing
-                    // into that body stalls at the unmodellable static load.
-                    // Upstream never lets the JIT see the call: the rtyper
-                    // lowers `issubtype`/`isinstance` to `ll_issubclass`/
-                    // `ll_isinstance` and the inliner folds the helper into a
-                    // single `int_between` over the immutable vtable fields
-                    // (`OBJECT_VTABLE` `hints={'immutable': True}`,
-                    // rclass.py:167-174).  Mirror that by rewriting the
-                    // recognised call back into the high-level operation, so
-                    // `ClassRepr.rtype_issubtype` (`rclass.rs`) /
-                    // `InstanceRepr.rtype_isinstance` (`rclass.rs`) emit
-                    // the seqlock-free `int_between` helper the same as a
-                    // Python-level `issubtype`/`isinstance`.
-                    if segments.len() >= 2 && segments[segments.len() - 2] == "pyobject" {
-                        let leaf = segments[segments.len() - 1].as_str();
-                        let opname = match leaf {
-                            "ll_issubclass" => Some("issubtype"),
-                            "ll_isinstance" => Some("isinstance"),
-                            _ => None,
-                        };
-                        if let Some(opname) = opname {
-                            if arg_hls.len() != 2 {
-                                return Err(TyperError::message(format!(
-                                    "`{leaf}` requires exactly two args (value, class), got {}",
-                                    arg_hls.len()
-                                )));
-                            }
-                            return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
-                        }
-                    }
                     // Fail-closed on an UNFUSED
                     // `lltype::malloc[_typed/_managed/_stable]`. A GC
                     // struct gets its `NewWithVtable` lowering before the rtyper
@@ -2994,10 +2959,10 @@ pub fn translate_op(
                         // matched variant's, breaking enum base/variant class
                         // identity (RPython keys identity on the live class
                         // object, never a name, so this cannot arise upstream).
-                        // Interning still keys on the bare tail: a constructed
-                        // value and a discriminant-narrowed value both reach
-                        // the SAME base classdef (the narrowing reads back the
-                        // classdef name the ctor minted), so they agree.
+                        // Keep the qualified owner when interning too. A
+                        // withdrawn or absent bare-leaf alias must not split
+                        // the constructor from the class used by field reads
+                        // and the common-base join (Bookkeeper.getuniqueclassdef).
                         let owner_tail = owner_path.last();
                         let owner_qual = owner_path.join("::");
                         let is_enum_variant =
@@ -3006,7 +2971,7 @@ pub fn translate_op(
                                     || owner_tail.is_some_and(|tail| reg.is_enum_base(tail))
                             });
                         if is_enum_variant {
-                            bk.intern_enum_variant_host(owner_tail.unwrap(), name)
+                            bk.intern_enum_variant_host(&owner_qual, name)
                         } else {
                             // A closure env ctor.  Normal struct ctors keep the
                             // dotted qualname (`_init_classdef`'s
@@ -3383,6 +3348,10 @@ pub struct FlowspaceAdapterOutput {
     /// does not have to reconstruct the kind from the reduced legacy
     /// `ValueType` view.
     pub constant_concretetypes: HashMap<Variable, LowLevelType>,
+    /// Actual constant representatives, retained for the Constant arm of
+    /// simplify.py::remove_identical_vars_SSA's phi renaming. Type equality
+    /// alone is not evidence that two incoming constants are equal.
+    pub constant_hlvalues: HashMap<Variable, Hlvalue>,
     /// `BlockId → flowspace::BlockRef` mapping. Includes the canonical
     /// `returnblock` and `exceptblock` (mapped to the
     /// `FunctionGraph::with_return_var`-allocated final blocks) so any
@@ -3732,6 +3701,7 @@ fn link_arg_to_hlvalue(
 )]
 fn link_extravar_to_hlvalue(
     arg: &LinkArg,
+    name: &str,
     value_map: &mut HashMap<Variable, Hlvalue>,
     value_to_var: &mut LegacyToTyped,
 ) -> Result<Hlvalue, TyperError> {
@@ -3740,7 +3710,13 @@ fn link_extravar_to_hlvalue(
             if let Some(existing) = value_map.get(legacy_var).cloned() {
                 return Ok(existing);
             }
-            let var = seed_variable(legacy_var);
+            let mut var = seed_variable(legacy_var);
+            // flowcontext.py BlockRecorder.guessexception gives these
+            // link-scoped definitions their last_exception/last_exc_value
+            // names. SSA_to_SSI excludes those prefixes from ordinary
+            // cross-block uses; anonymous variables would be threaded back
+            // before the raising operation that actually defines them.
+            var.rename(name);
             value_to_var
                 .entry(legacy_var.clone())
                 .or_insert_with(|| var.clone());
@@ -4581,12 +4557,26 @@ fn function_graph_to_flowspace_inner(
             let last_exception = legacy_link
                 .last_exception
                 .as_ref()
-                .map(|arg| link_extravar_to_hlvalue(arg, &mut link_value_map, &mut value_to_var))
+                .map(|arg| {
+                    link_extravar_to_hlvalue(
+                        arg,
+                        "last_exception",
+                        &mut link_value_map,
+                        &mut value_to_var,
+                    )
+                })
                 .transpose()?;
             let last_exc_value = legacy_link
                 .last_exc_value
                 .as_ref()
-                .map(|arg| link_extravar_to_hlvalue(arg, &mut link_value_map, &mut value_to_var))
+                .map(|arg| {
+                    link_extravar_to_hlvalue(
+                        arg,
+                        "last_exc_value",
+                        &mut link_value_map,
+                        &mut value_to_var,
+                    )
+                })
                 .transpose()?;
             let target = block_map.get(&legacy_link.target).cloned().ok_or_else(|| {
                 TyperError::message(format!(
@@ -4698,6 +4688,7 @@ fn function_graph_to_flowspace_inner(
         value_to_var,
         value_to_var_candidates,
         constant_concretetypes,
+        constant_hlvalues,
         #[cfg(test)]
         block_map,
     })
@@ -6320,85 +6311,84 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_ll_issubclass_call_rewrites_to_issubtype() {
-        // `ll_issubclass(subcls, cls)` (rclass.py) must be recognised
-        // and rewritten to the flowspace `issubtype` op so the rtyper lowers
-        // it to `int_between` over the immutable subclassrange fields, rather
-        // than tracing into the pyre-only seqlock body.
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let mut graph = LegacyGraph::new("translate_op_fixture");
-        let vars = mint_vars(&mut graph, 4);
-        let subcls_hl = Variable::new();
-        let cls_hl = Variable::new();
-        value_map.insert(vars[1].clone(), Hlvalue::Variable(subcls_hl.clone()));
-        value_map.insert(vars[2].clone(), Hlvalue::Variable(cls_hl.clone()));
-        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
-        let op = SpaceOperation {
-            result: Some(vars[3].clone()),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        crate::runtime_names::crates::OBJECT.into(),
-                        "pyobject".into(),
-                        "ll_issubclass".into(),
-                    ],
-                },
-                args: vec![vars[1].clone(), vars[2].clone()],
-                result_ty: ValueType::Bool,
-            },
-        };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("ll_issubclass must lower");
-        assert_eq!(translated.len(), 1);
-        assert_eq!(
-            translated[0].opname, "issubtype",
-            "ll_issubclass must emit the flowspace `issubtype` opname",
-        );
-        assert_eq!(translated[0].args.len(), 2, "issubtype args: [subcls, cls]");
-        match &translated[0].args[0] {
-            Hlvalue::Variable(v) => assert_eq!(v, &subcls_hl, "args[0] must be subcls"),
-            other => panic!("args[0] must be Variable, got {other:?}"),
-        }
-        match &translated[0].args[1] {
-            Hlvalue::Variable(v) => assert_eq!(v, &cls_hl, "args[1] must be cls"),
-            other => panic!("args[1] must be Variable, got {other:?}"),
-        }
-    }
+    fn class_helper_calls_use_registered_bodies_not_high_level_rewrites() {
+        use crate::codewriter::call::GraphStore;
+        use crate::parse::CallPath;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+        use crate::translator::rtyper::cutover::populate_call_registry_from_call_graphs;
 
-    #[test]
-    fn translate_op_ll_isinstance_call_rewrites_to_isinstance() {
-        // `ll_isinstance(obj, cls)` (rclass.py) recognised and rewritten
-        // to the flowspace `isinstance` op — same seqlock-free lowering path.
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let mut graph = LegacyGraph::new("translate_op_fixture");
-        let vars = mint_vars(&mut graph, 4);
-        let obj_hl = Variable::new();
-        let cls_hl = Variable::new();
-        value_map.insert(vars[1].clone(), Hlvalue::Variable(obj_hl.clone()));
-        value_map.insert(vars[2].clone(), Hlvalue::Variable(cls_hl.clone()));
-        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
-        let op = SpaceOperation {
-            result: Some(vars[3].clone()),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        crate::runtime_names::crates::OBJECT.into(),
-                        "pyobject".into(),
-                        "ll_isinstance".into(),
-                    ],
+        for (name, arity) in [
+            ("ll_issubclass", 2),
+            ("ll_isinstance", 2),
+            ("ll_issubclass_const", 3),
+        ] {
+            let segments = vec![
+                crate::runtime_names::crates::OBJECT.to_string(),
+                "pyobject".to_string(),
+                name.to_string(),
+            ];
+            let mut caller = LegacyGraph::new("caller");
+            let vars = mint_vars(&mut caller, arity + 1);
+            let value_map: HashMap<Variable, Hlvalue> = vars
+                .iter()
+                .map(|v| (v.clone(), Hlvalue::Variable(Variable::new())))
+                .collect();
+            let op = SpaceOperation {
+                result: Some(vars[arity].clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: segments.clone(),
+                    },
+                    args: vars[..arity].to_vec(),
+                    result_ty: ValueType::Bool,
                 },
-                args: vec![vars[1].clone(), vars[2].clone()],
-                result_ty: ValueType::Bool,
-            },
-        };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("ll_isinstance must lower");
-        assert_eq!(translated.len(), 1);
-        assert_eq!(
-            translated[0].opname, "isinstance",
-            "ll_isinstance must emit the flowspace `isinstance` opname",
-        );
-        assert_eq!(translated[0].args.len(), 2, "isinstance args: [obj, cls]");
+            };
+
+            // With no body, fail as any unregistered call does: never turn a
+            // helper name into isinstance/issubtype to conceal missing input.
+            let missing = translate_op(&op, &value_map, &empty_call_registry())
+                .expect_err("an absent class helper must not become a high-level operation");
+            assert!(
+                missing
+                    .to_string()
+                    .contains("not registered in CallRegistry"),
+                "{missing}"
+            );
+
+            // Deliberately simple fixture body: this test pins registration
+            // and exact callable identity, not subclass arithmetic. Use the
+            // PRODUCTION population path so restoring its name-based skip
+            // would fail even if manually registered calls still worked.
+            let mut body = LegacyGraph::new(name);
+            let inputs = mint_vars(&mut body, arity);
+            body.block_mut(body.startblock).inputargs = inputs.clone();
+            body.set_return(body.startblock, Some(inputs[0].clone()));
+            let mut graphs = GraphStore::default();
+            graphs.insert(CallPath::from_segments(segments.clone()), body);
+            let registry = empty_call_registry();
+            populate_call_registry_from_call_graphs(&graphs, &[], &[], &registry)
+                .expect("register ordinary helper body");
+            let entry = registry
+                .lookup(&FunctionPathKey::from_segments(segments))
+                .expect("helper must not be excluded by name");
+            assert!(entry.lift_error().is_none(), "{:?}", entry.lift_error());
+            let translated =
+                translate_op(&op, &value_map, &registry).expect("registered class helper call");
+            assert_eq!(translated.len(), 1);
+            assert_eq!(translated[0].opname, "simple_call");
+            assert_eq!(translated[0].args.len(), arity + 1);
+            let Hlvalue::Constant(callable) = &translated[0].args[0] else {
+                panic!("registered callable constant required");
+            };
+            assert_eq!(
+                callable.value,
+                ConstValue::HostObject(entry.host_object.clone())
+            );
+            for (actual, source) in translated[0].args[1..].iter().zip(&vars[..arity]) {
+                assert_eq!(actual, &value_map[source]);
+            }
+            assert_eq!(translated[0].result, value_map[&vars[arity]]);
+        }
     }
 
     #[test]
@@ -7318,6 +7308,27 @@ mod tests {
             exc_link.last_exc_value.as_ref(),
             "exception value arg must reuse link.last_exc_value Variable"
         );
+        drop(exc_link);
+        drop(startblock);
+        drop(flowspace_graph);
+
+        // SSA_to_SSI deliberately ignores the startblock when collecting
+        // cross-block uses. Put the raising operation in a successor so this
+        // test actually reaches its exception-extravar handling.
+        let entry_args = vec![
+            Hlvalue::Variable(Variable::new()),
+            Hlvalue::Variable(Variable::new()),
+        ];
+        let entry = flowspace_model::Block::shared(entry_args.clone());
+        let old_start = output.graph.borrow().startblock.clone();
+        let mut link = FlowspaceLink::new(entry_args, Some(old_start), None);
+        link.prevblock = Some(Rc::downgrade(&entry));
+        entry.borrow_mut().closeblock(vec![link.into_ref()]);
+        output.graph.borrow_mut().startblock = entry;
+        let graph = output.graph.borrow();
+        flowspace_model::checkgraph(&graph);
+        crate::translator::backendopt::ssa::ssa_to_ssi(&graph, None);
+        flowspace_model::checkgraph(&graph);
     }
 
     #[test]

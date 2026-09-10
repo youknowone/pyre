@@ -20,14 +20,13 @@
 //! `getdesc` later looks up the host object, it short-circuits at
 //! the cache lookup at upstream `bookkeeper.py:362-364`
 //! (`try: return self.descs[obj_key]; except KeyError: ...`) and
-//! returns the pre-built FunctionDesc instead of falling through to
-//! `newfuncdesc`.  Without the pre-register, `newfuncdesc` would
-//! call `cpython_code_signature(pyfunc.__code__)`
-//! (`bookkeeper.py:418`) and fail on the synthetic GraphFunc that
-//! has no `code` slot — the `Signature(["entry"])` upstream branch
-//! at `bookkeeper.py:413-416` is reserved for the
-//! `_generator_next_method_of_` special case, not a general
-//! signature fallback.
+//! returns the descriptor constructed through
+//! `Bookkeeper::newfuncdesc_with_signature`. This is the native-source
+//! signature boundary for upstream `Bookkeeper.newfuncdesc`: LLBC supplies
+//! the signature instead of `cpython_code_signature(pyfunc.__code__)`, while
+//! the bookkeeper still owns specialization policy and `MemoDesc` selection.
+//! Source metadata and an optional native evaluator stay on the same
+//! `GraphFunc`; memo functions do not pre-fill an ordinary body graph.
 //!
 //! ## Module ownership
 //!
@@ -66,7 +65,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::annotator::bookkeeper::Bookkeeper;
-use crate::annotator::description::{AnnSignature, DescEntry, FunctionDesc, GraphCacheKey};
+use crate::annotator::description::{AnnSignature, FunctionDesc, GraphCacheKey};
 use crate::annotator::model::{SomeInstance, SomeValue};
 use crate::annotator::signature::{ParamType, TypeMarker};
 use crate::flowspace::argument::Signature;
@@ -272,6 +271,8 @@ pub struct TwoPhaseSubject {
         crate::flowspace::model::Variable,
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     >,
+    pub constant_hlvalues:
+        HashMap<crate::flowspace::model::Variable, crate::flowspace::model::Hlvalue>,
 }
 
 /// Whole-program two-phase type cache, keyed by subject path canonical key
@@ -921,7 +922,7 @@ impl CallRegistry {
     /// than silently route the second caller through the first
     /// caller's signature.
     pub fn get_or_register(&self, key: FunctionPathKey, signature: Signature) -> Rc<FunctionEntry> {
-        if let Some(existing) = self.entries.borrow().get(&key) {
+        if let Some(existing) = self.lookup(&key) {
             assert_eq!(
                 existing.function_desc.borrow().signature,
                 signature,
@@ -947,16 +948,39 @@ impl CallRegistry {
             // sentinel directly.
             Constant::new(ConstValue::Dict(HashMap::new())),
         );
+        self.get_or_register_with_func(key, signature, graph_func)
+    }
+
+    /// Register the actual source callable metadata before annotating any
+    /// caller. In particular `_annspecialcase_` and the native host evaluator
+    /// belong to this canonical GraphFunc, not to an auxiliary result table
+    /// or a second GraphFunc synthesized while lifting its body.
+    pub fn get_or_register_with_func(
+        &self,
+        key: FunctionPathKey,
+        signature: Signature,
+        graph_func: GraphFunc,
+    ) -> Rc<FunctionEntry> {
+        if let Some(existing) = self.lookup(&key) {
+            assert_eq!(
+                existing.function_desc.borrow().signature,
+                signature,
+                "conflicting source callable signatures"
+            );
+            assert_eq!(
+                existing.host_object.user_function().map(|f| f.id),
+                Some(graph_func.id),
+                "source callable metadata must be installed before registration"
+            );
+            return existing;
+        }
         let host_object = HostObject::new_user_function(graph_func);
         let exception_object_result = is_exception_object_materializer(&key);
-        let mut function_desc = FunctionDesc::new(
-            self.bookkeeper.clone(),
-            Some(host_object.clone()),
-            name,
-            signature,
-            None,
-            None,
-        );
+        let desc = self
+            .bookkeeper
+            .newfuncdesc_with_signature(&host_object, signature)
+            .expect("invalid source callable descriptor metadata");
+        let function_desc = desc.as_function().expect("function or memo descriptor");
         if exception_object_result {
             // These two `dont_look_inside` functions use raw pointers only
             // for Rust's one-word residual-call ABI.  Semantically they
@@ -971,15 +995,14 @@ impl CallRegistry {
             // `InstanceRepr.rtype_type`, as it does upstream, without
             // inventing a `PtrRepr.rtype_type` operation that RPython does
             // not have.
-            publish_exception_object_result_signature(&mut function_desc);
+            publish_exception_object_result_signature(&mut function_desc.borrow_mut());
         }
-        let function_desc = Rc::new(RefCell::new(function_desc));
         // Pre-register in bookkeeper.descs so the rtyper's
         // getdesc(host_object) lookup short-circuits at the cache.
-        self.bookkeeper.descs.borrow_mut().insert(
-            host_object.clone(),
-            DescEntry::function(function_desc.clone()),
-        );
+        self.bookkeeper
+            .descs
+            .borrow_mut()
+            .insert(host_object.clone(), desc);
         let entry = Rc::new(FunctionEntry {
             host_object,
             function_desc,
@@ -1137,6 +1160,86 @@ mod tests {
             "unregistered path must return None"
         );
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn source_callable_keeps_memo_policy_evaluator_and_alias_identity() {
+        use crate::annotator::description::SpecializeResult;
+        use crate::annotator::model::SomeBool;
+        use crate::flowspace::model::HostCall;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let registry = CallRegistry::new(bk.clone());
+        let count = Arc::new(AtomicUsize::new(0));
+        let called = count.clone();
+        let mut func = GraphFunc::new("memo_body", Constant::new(ConstValue::Dict(HashMap::new())));
+        func.annspecialcase = Some("specialize:memo".into());
+        func.host_call = Some(HostCall(Arc::new(move |args| {
+            called.fetch_add(1, Ordering::Relaxed);
+            match args {
+                [ConstValue::Bool(value)] => Ok(ConstValue::Int(if *value { 10 } else { 20 })),
+                _ => Err("expected one bool".into()),
+            }
+        })));
+        let key = FunctionPathKey::from_segments(["owner", "memo_body"]);
+        let entry =
+            registry.get_or_register_with_func(key.clone(), signature(&["value"]), func.clone());
+        assert_eq!(entry.host_object.user_function().unwrap().id, func.id);
+        let desc = bk.getdesc(&entry.host_object).unwrap();
+        assert!(desc.as_func_entry().unwrap().is_memo());
+        assert!(Rc::ptr_eq(
+            &entry.function_desc,
+            &desc.as_function().unwrap()
+        ));
+        let alias = FunctionPathKey::from_segments(["alias", "memo_body"]);
+        registry.alias(alias.clone(), &key);
+        assert!(Rc::ptr_eq(
+            &entry,
+            &registry.get_or_register(alias, signature(&["value"]))
+        ));
+        let mut args = vec![Some(SomeValue::Bool(SomeBool::new()))];
+        let result = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut args, None)
+            .unwrap();
+        assert!(matches!(result, SpecializeResult::Annotation(_)));
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+        entry
+            .function_desc
+            .borrow()
+            .specialize(&mut args, None)
+            .unwrap();
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "memo table owns cached results"
+        );
+    }
+
+    #[test]
+    fn source_memo_without_evaluator_is_not_silently_default_specialized() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut func = GraphFunc::new("missing", Constant::new(ConstValue::Dict(HashMap::new())));
+        func.annspecialcase = Some("specialize:memo".into());
+        let entry = registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["missing"]),
+            signature(&[]),
+            func,
+        );
+        let err = entry
+            .function_desc
+            .borrow()
+            .specialize(&mut Vec::new(), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no host_call hook registered"),
+            "{err}"
+        );
     }
 
     #[test]

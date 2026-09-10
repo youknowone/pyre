@@ -4514,9 +4514,9 @@ mod tests {
         // instance = C()
         let inst = HostObject::new_instance(class_c.clone(), vec![]);
         // Per-instance shadow: inst.a = 2
-        inst.instance_set("a", ConstValue::Int(2));
+        inst.instance_set("a", ConstValue::Int(2)).unwrap();
         // Instance-only attribute: inst.b = 3
-        inst.instance_set("b", ConstValue::Int(3));
+        inst.instance_set("b", ConstValue::Int(3)).unwrap();
 
         let fd = FrozenDesc::new(bk, inst).unwrap();
         // Instance dict shadows class MRO.
