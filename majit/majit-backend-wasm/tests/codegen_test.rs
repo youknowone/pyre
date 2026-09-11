@@ -2311,10 +2311,9 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     );
 }
 
-/// `build_home_gcmap` marks every frozen home, not just this trace's live
-/// Ref homes. Recycled nursery bytes in the unused padding must be nulled
-/// before that map is published, or a later minor walk treats them as
-/// young objects (`invalid type_id` from an oldgen type-3 JitFrame).
+/// Key-0 nulls the frozen home region before `jf_gcmap` is published.
+/// Recycled nursery bytes in unused padding must not be live when the
+/// map goes up (`invalid type_id` from an oldgen type-3 JitFrame).
 #[test]
 fn entry_prologue_nulls_the_frozen_home_region() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];

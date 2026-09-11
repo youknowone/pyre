@@ -3798,9 +3798,11 @@ pub struct CaParams {
     /// `None` retains the helpers (including under gc_stress).
     pub inline: Option<CaInlineParams>,
     /// `build_home_gcmap` pointer published after the fresh-entry home/input
-    /// stores. Used only when [`Self::compute_home_gcmap`] is false. Zero
-    /// leaves `jf_gcmap` unset in the generated module (tests).
-    /// assembler.py writes `jf_gcmap` at safepoints once those slots are live.
+    /// stores, and again on each keyed LABEL resume after those slots are
+    /// already valid or newly marked ones have been nulled. Used only when
+    /// [`Self::compute_home_gcmap`] is false. Zero leaves `jf_gcmap` unset
+    /// in the generated module (tests). assembler.py writes `jf_gcmap` at
+    /// safepoints once those slots are live.
     pub home_gcmap_ptr: i64,
     /// When set, leak a map from this module's `RefHomes` and LABEL captures
     /// (raised to the `home_gcmap_min_*` floors) instead of
@@ -5724,10 +5726,11 @@ fn build_function(
         sink.local_set(value_types.local(raw));
     }
 
-    // Every entry path, including a keyed LABEL resume, must install this
-    // module's map. A loop-closing bridge compiled before a merge still
-    // carries its old prefix map; the keyed resume branches past the
-    // key-0 clear below, so null any newly marked homes first.
+    // Build the map now; publish it only after the slots it marks are
+    // null or written (`push_gcmap` at a live safepoint). Key-0 does
+    // that after the entry stores. A keyed LABEL resume branches past
+    // those stores, so it publishes in the resume loader after the
+    // grown-slot null below.
     let publish_ptr = if ca.compute_home_gcmap {
         let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
         let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
@@ -5766,7 +5769,6 @@ fn build_function(
     } else {
         ca.home_gcmap_ptr
     };
-    emit_publish_home_gcmap(&mut sink, publish_ptr);
 
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
     // preamble runs once on entry, the LABEL is the loop-back target, and
@@ -5882,13 +5884,13 @@ fn build_function(
         emit_trace_entry_census(&mut sink, census, bridge_slot_local, None);
     }
 
-    // Fresh entry owns key 0. `build_home_gcmap` marks every frozen home,
-    // including the chain-padding slots a later bridge may use and the high
-    // LABEL-capture homes. The nursery bump leaves `jf_gcmap` null and does
-    // not fill items, so unused padding still holds recycled nursery bytes;
-    // those must be null before the map is published. A resume dispatch
-    // branches past this code, preserving captures written when the source
-    // loop first crossed the LABEL.
+    // Fresh entry owns key 0. `build_home_gcmap` marks the used ordinary
+    // prefix and the LABEL-capture tail, not reserved chain-padding.
+    // The nursery bump leaves `jf_gcmap` null and does not fill items, so
+    // unused marked homes still hold recycled nursery bytes; those must
+    // be null before the map is published. A resume dispatch branches
+    // past this code, preserving captures written when the source loop
+    // first crossed the LABEL, and publishes in the resume loader.
     // A home the input loop fills below needs no null first: its store follows
     // immediately and nothing between the two allocates, so no collection can
     // read the slot while it is stale. Homes no input fills keep their clear
@@ -5943,6 +5945,9 @@ fn build_function(
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
         }
     }
+    // assembler.py `push_gcmap`: the map goes up once the slots it marks
+    // are live or null. Keyed resume publishes in the loader instead.
+    emit_publish_home_gcmap(&mut sink, publish_ptr);
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
     if let Some((probe, type_idx)) = inline_trip {
@@ -6025,6 +6030,11 @@ fn build_function(
             }
             sink.br(1); // segment done -> past_loader_j, over the resume loader
             sink.end(); // end C_j (the br_table lands here for key j+1)
+            // Keyed resume skipped the key-0 stores. Grown slots were
+            // nulled before `br_table`; remaining marked homes already
+            // hold the previous module's values. Publish before the
+            // loader stores, matching `push_gcmap` at a live safepoint.
+            emit_publish_home_gcmap(&mut sink, publish_ptr);
             // Resume loader: a loop-closing bridge wrote each label arg into
             // frame slot i (positionally, matching the in-loop JUMP move);
             // load them into the label-arg locals and refresh their Ref
