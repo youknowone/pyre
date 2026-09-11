@@ -416,21 +416,26 @@ pub(crate) fn walker_guard_int_div_domain_if_exact<Sym: WalkSym>(
     }
     let la = unsafe { pyre_object::w_int_get_value(lhs_obj) };
     let rb = unsafe { pyre_object::w_int_get_value(rhs_obj) };
-    // Pin the boxed divisor.  `int_eq(unbox(rhs), 0)` folds away when
-    // the unbox is const 7, but a live `divisor = 7 if ... else 0`
-    // still passes 0 at runtime (`flip_floor`).
-    //
-    // A `NewWithVtable` box is unescaped and the optimizer virtualizes
-    // it; `GUARD_VALUE` on that box is `promote of a virtual`
-    // (`optimizeopt` `optimize_GUARD_VALUE`).  The pin is only for a
-    // red / already-escaped divisor whose identity can change later.
-    if !rhs.is_constant() && !ctx.trace_ctx.heap_cache().is_unescaped(rhs) {
-        let expected = ctx.trace_ctx.const_ref(rhs_obj as i64);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[rhs, expected])?;
-    }
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr)?;
     let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr)?;
+    // Pin the boxed divisor only when the unbox is already a ConstInt.
+    // `int_eq(unbox(rhs), 0)` folds away in that case, so a later
+    // `divisor = 7 if ... else 0` (`flip_floor`) would skip the zer
+    // check.  A red GetfieldGc unbox keeps the check live; pinning the
+    // box identity there retraces every new divisor (`check(depth-2)`
+    // in `selfrec_tail_exception_unwind`).
+    //
+    // A `NewWithVtable` box is unescaped and the optimizer virtualizes
+    // it; `GUARD_VALUE` on that box is `promote of a virtual`
+    // (`optimizeopt` `optimize_GUARD_VALUE`).
+    if rhs_raw.is_constant()
+        && !rhs.is_constant()
+        && !ctx.trace_ctx.heap_cache().is_unescaped(rhs)
+    {
+        let expected = ctx.trace_ctx.const_ref(rhs_obj as i64);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[rhs, expected])?;
+    }
     walker_emit_int_div_domain_guards(ctx, op_pc, lhs_raw, rhs_raw, la, rb)
 }
 
