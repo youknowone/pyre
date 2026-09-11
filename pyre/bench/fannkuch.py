@@ -1,3 +1,12 @@
+# pyre-check: max-wasm-ratio=6.3
+# Almost nothing but cross-loop JUMP. After the wasm32 stack-residency
+# fix, peeled loops compile instead of declining, so every JUMP pays
+# wasm's module-local br / jitframe-slot path where dynasm remaps
+# LABEL values in registers. Highest reading 5.4x (exec 1.80s / dynasm
+# 0.33s) on this host; an earlier run saw 4.3x (4.04s / 0.93s). 6.3x
+# is 5.4x plus WASM_RATIO_FIT_HEADROOM (15%). The 4x default ceiling
+# is not raised: this bench was already in the first set of
+# per-fixture allowances that 4x replaced.
 # Fannkuch-Redux benchmark (The Computer Language Benchmarks Game)
 # Ported for pyre: while-loop only, no range/list/enumerate
 
