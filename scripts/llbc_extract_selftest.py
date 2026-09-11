@@ -225,9 +225,57 @@ def run_layout_sidecar(engine) -> int:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def run_stamp_skip(engine) -> int:
+    """Skip extract when only `closure=` moved; refuse when `source=` moved."""
+    failures = 0
+
+    def expect(name, condition):
+        nonlocal failures
+        if condition:
+            print(f"ok   {name}")
+        else:
+            failures += 1
+            print(f"FAIL {name}")
+
+    keys = engine.STAMP_KEYS
+    base = {key: f"{key}-v1" for key in keys}
+    expected = "\n".join(f"{key}={base[key]}" for key in keys)
+
+    recorded = expected + "\n"
+    ok, closure_moved = engine.stamp_skip_ok(recorded, expected)
+    expect("identical stamp skips and reports closure still", ok and not closure_moved)
+
+    crlf = expected.replace("\n", "\r\n") + "\r\n"
+    ok, closure_moved = engine.stamp_skip_ok(crlf, expected)
+    expect("CRLF stamp folds to the same skip", ok and not closure_moved)
+
+    closure_only = "\n".join(
+        f"{key}={base[key] if key != 'closure' else 'closure-v2'}" for key in keys
+    )
+    ok, closure_moved = engine.stamp_skip_ok(closure_only + "\n", expected)
+    expect("closure-only move still skips", ok and closure_moved)
+
+    source_moved = "\n".join(
+        f"{key}={base[key] if key != 'source' else 'source-v2'}" for key in keys
+    )
+    ok, closure_moved = engine.stamp_skip_ok(source_moved + "\n", expected)
+    expect("source move refuses the skip", not ok and not closure_moved)
+
+    missing = "\n".join(f"{key}={base[key]}" for key in keys if key != "artefacts")
+    ok, _ = engine.stamp_skip_ok(missing + "\n", expected)
+    expect("stamp missing a gate field refuses the skip", not ok)
+
+    return failures
+
+
 def main() -> None:
     engine = load_engine()
-    failures = run(engine) + run_fingerprint(engine) + run_layout_sidecar(engine)
+    failures = (
+        run(engine)
+        + run_fingerprint(engine)
+        + run_layout_sidecar(engine)
+        + run_stamp_skip(engine)
+    )
     if failures:
         raise SystemExit(f"llbc_extract_selftest: {failures} failed")
     print("llbc_extract_selftest: all passed")
