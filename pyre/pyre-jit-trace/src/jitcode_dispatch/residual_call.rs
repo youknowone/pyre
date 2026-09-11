@@ -5628,6 +5628,87 @@ pub(crate) fn residual_call_specialized_plain_numeric_binop(
     }
 }
 
+/// Flatten lowered `BINARY_OP` to `inline_call_ir_r/dIR>r` of
+/// `binary_value_from_tag` / named `add`.  The residual-call exemption
+/// above never sees that form, so a one-line `return a + i` body was
+/// `Dirty` (`UnprovableStoreOrCallForm`) and stayed a per-iteration
+/// residual (`inlined_helper_arith_hot`).
+pub(crate) fn inline_call_specialized_plain_numeric_binop(
+    body_code: &[u8],
+    numeric_ref_regs: &[bool; u8::MAX as usize + 1],
+    plain_int_ref_regs: &[bool; u8::MAX as usize + 1],
+    d: &DecodedOp,
+    num_regs_i: usize,
+    constants_i: &[i64],
+    callee_descr_refs: &[DescrRef],
+) -> Option<SpecializedBinop> {
+    if !d.opname.starts_with("inline_call_ir_r") {
+        return None;
+    }
+    let descr_index = {
+        let lo = *body_code.get(d.pc + 1)? as usize;
+        let hi = *body_code.get(d.pc + 2)? as usize;
+        lo | (hi << 8)
+    };
+    let sub_index = callee_descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_jitcode_descr())
+        .map(|jc| jc.jitcode_index());
+    let &i_len = body_code.get(d.pc + 3)?;
+    let r_len_pc = d.pc + 3 + 1 + i_len as usize;
+    if body_code.get(r_len_pc) != Some(&2) {
+        return None;
+    }
+    let lhs_reg = *body_code.get(r_len_pc + 1)?;
+    let rhs_reg = *body_code.get(r_len_pc + 2)?;
+    if !numeric_ref_regs[lhs_reg as usize] || !numeric_ref_regs[rhs_reg as usize] {
+        return None;
+    }
+    let int_concretes: Vec<ConcreteValue> = if i_len == 0 {
+        Vec::new()
+    } else {
+        let tag_reg = *body_code.get(d.pc + 4)?;
+        (tag_reg as usize)
+            .checked_sub(num_regs_i)
+            .and_then(|index| constants_i.get(index).copied())
+            .map(|tag| vec![ConcreteValue::Int(tag)])
+            .unwrap_or_default()
+    };
+    // Prefer the I-list tag.  Flatten's per-fn descr index can name a
+    // different jitcode (`dict_write_barrier` at descr 109) while the
+    // I-list still carries BINARY_OP Add=0; the helper-name lookup then
+    // declines a body the walker will specialize.
+    let tag = match int_concretes.first() {
+        Some(ConcreteValue::Int(tag)) => *tag,
+        _ => super::specialize::binary_op_tag_for_helper_index(sub_index?, &int_concretes)?,
+    };
+    use pyre_interpreter::bytecode::BinaryOperator;
+    match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {
+        Some(
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::InplaceAdd
+            | BinaryOperator::InplaceSubtract
+            | BinaryOperator::InplaceMultiply,
+        ) => Some(SpecializedBinop::Numeric),
+        Some(
+            BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Xor
+            | BinaryOperator::InplaceAnd
+            | BinaryOperator::InplaceOr
+            | BinaryOperator::InplaceXor
+            | BinaryOperator::FloorDivide
+            | BinaryOperator::Remainder
+            | BinaryOperator::InplaceFloorDivide
+            | BinaryOperator::InplaceRemainder,
+        ) => (plain_int_ref_regs[lhs_reg as usize] && plain_int_ref_regs[rhs_reg as usize])
+            .then_some(SpecializedBinop::PlainInt),
+        _ => None,
+    }
+}
+
 /// The register holding the receiver of a `STORE_ATTR` residual in a callee
 /// body, or `None` for any other op or an unexpected shape.
 ///
