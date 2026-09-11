@@ -2727,6 +2727,47 @@ fn walker_executing_frame_box<Sym: WalkSym>(
     Some((vable_box, vable_ptr))
 }
 
+/// Concrete immediate caller of the inlined level now executing, and the red
+/// box that names it: the standard virtualizable when that caller is the
+/// portal, otherwise the virtual box `walker_ec_enter` published for the
+/// ancestor.
+fn walker_immediate_inline_caller_box<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(OpRef, usize)> {
+    let inline = current_inline_concrete_frame();
+    if inline == 0 {
+        return None;
+    }
+    let raw = unsafe { (*(inline as *const pyre_interpreter::PyFrame)).f_backref };
+    if raw.is_null() {
+        return None;
+    }
+    let caller_ptr =
+        if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8) } {
+            let referent = unsafe {
+                majit_metainterp::virtualref::vref_forced(raw as *const u8)
+                    as *mut pyre_interpreter::PyFrame
+            };
+            if referent.is_null() {
+                return None;
+            }
+            referent as usize
+        } else {
+            raw as usize
+        };
+    if let (Some(vable_box), Some(vable_ptr)) = (
+        ctx.trace_ctx.standard_virtualizable_box(),
+        ctx.trace_ctx.standard_virtualizable_ptr(),
+    ) && vable_ptr == caller_ptr
+    {
+        return Some((vable_box, caller_ptr));
+    }
+    let caller_box = ctx
+        .trace_ctx
+        .virtualref_virtual_for_object_ptr(caller_ptr)?;
+    Some((caller_box, caller_ptr))
+}
+
 fn walker_frame_executing_py_pc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     concrete_obj: pyre_object::PyObjectRef,
@@ -2739,11 +2780,10 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     if unsafe { &*(concrete_obj as *const pyre_interpreter::PyFrame) }.frame_finished_execution() {
         return None;
     }
-    // Inside an inlined callee the portal is still executing: it sits at
-    // the CALL. `_getframe(1).f_lasti` / `f_lineno` on that frame owe
-    // that coordinate, not the callee's pc and not the heap `last_instr`
-    // a residual force would publish (three different values on
-    // `frame_caller_image_from_inlined_callee_regression`).
+    // The portal stays at the outermost CALL (`inline_caller_py_pc`).
+    // An intermediate inlined caller stays at the CALL that entered THIS
+    // level (`immediate_inline_caller_py_pc`), which nested inlines do not
+    // inherit.
     if let (Some(vable_box), Some(vable_ptr), Some(caller_py_pc)) = (
         ctx.trace_ctx.standard_virtualizable_box(),
         ctx.trace_ctx.standard_virtualizable_ptr(),
@@ -2751,6 +2791,12 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     ) && vable_ptr == concrete_obj as usize
     {
         return Some((vable_box, caller_py_pc));
+    }
+    if let Some(caller_py_pc) = ctx.fbw_mode.immediate_inline_caller_py_pc
+        && let Some((caller_box, caller_ptr)) = walker_immediate_inline_caller_box(ctx)
+        && caller_ptr == concrete_obj as usize
+    {
+        return Some((caller_box, caller_py_pc));
     }
     let (frame_box, frame_ptr) = walker_executing_frame_box(ctx)?;
     if frame_ptr != concrete_obj as usize {
@@ -13677,13 +13723,18 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // Until every app-level frame getter is lowered through its own red frame,
     // admitting an arbitrary positive-depth result would expose it to a
     // generic residual whose single live-coordinate slot cannot describe a
-    // nested caller chain.  The completed landing is the outer standard
-    // frame: `f_locals` write-back, `f_code`, `f_lasti` and `f_lineno` all
-    // name that same red box, so STORE_FAST of the getframe result no
-    // longer has to force the residual heap reader.  An intermediate
-    // inlined caller (not the portal) still declines here.
+    // nested caller chain.  The completed landings are the outer standard
+    // frame and an inlined ancestor that `walker_ec_enter` published a
+    // virtual_ref for: `f_code`, `f_lasti` and `f_lineno` all name that same
+    // red box.  A hop whose concrete frame is neither still declines here.
     if inline_level && depth_value > 0 {
-        let standard_frame = final_concrete_frame as usize == standard_vable_ptr
+        let landing_ptr = final_concrete_frame as usize;
+        let standard_frame = landing_ptr == standard_vable_ptr;
+        let inlined_ancestor = ctx
+            .trace_ctx
+            .virtualref_virtual_for_object_ptr(landing_ptr)
+            .is_some();
+        let known_red = (standard_frame || inlined_ancestor)
             && unsafe { (*final_concrete_frame).ob_header.ob_type }
                 == &pyre_interpreter::pyframe::FRAME_TYPE
             && unsafe {
@@ -13694,7 +13745,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             };
         let w_type =
             pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
-        if !standard_frame
+        if !known_red
             || unsafe { (*final_concrete_frame).ob_header.w_class } != w_type
             || unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) } == 0
         {

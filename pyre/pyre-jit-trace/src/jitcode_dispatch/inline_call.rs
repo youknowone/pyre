@@ -4677,6 +4677,21 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     }
 }
 
+fn immediate_inline_caller_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_jitcode_pc: usize,
+) -> Option<u32> {
+    if let Some(consts) = ctx.inline_callee_consts {
+        crate::py_coord::containing_py_pc_for_jitcode_pc_public(
+            consts.jitcode_index,
+            call_jitcode_pc as i32,
+        )
+        .map(|py| py as u32)
+    } else {
+        inline_caller_py_pc_from_snapshot(ctx, call_jitcode_pc)
+    }
+}
+
 fn inline_caller_py_pc_from_snapshot<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     call_jitcode_pc: usize,
@@ -7055,6 +7070,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             fbw_mode: FbwWalkMode {
                 inline_subwalk: true,
                 inline_caller_py_pc,
+                immediate_inline_caller_py_pc: immediate_inline_caller_py_pc(ctx, op.pc),
                 instance_next_foriter_green_key,
                 instance_next_foriter_census_active: instance_next_seeded_route,
                 ..ctx.fbw_mode

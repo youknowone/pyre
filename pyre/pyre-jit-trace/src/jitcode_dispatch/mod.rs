@@ -1599,7 +1599,13 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// Python pc of the caller CALL instruction an inline sub-walk is
     /// executing under.  Used only for the temporary live-frame coordinate a
     /// residual frame reader observes; it is not a walk-end resume claim.
+    /// Nested inlines inherit the outermost portal CALL so a residual can
+    /// still publish `last_instr` onto the portal frame.
     pub inline_caller_py_pc: Option<u32>,
+    /// Python pc of the CALL that entered THIS level, in the immediate
+    /// caller's own code.  Nested inlines do not inherit: `leaf` reading
+    /// `_getframe(1).f_lasti` on `mid` owes `mid`'s CALL, not the portal's.
+    pub immediate_inline_caller_py_pc: Option<u32>,
     /// The current sub-walk is a translated builtin gateway helper.  The
     /// helper is not a Python frame, but it is an RPython `MIFrame` and must be
     /// retained as the innermost blackhole frame so a post-residual guard can
@@ -1716,6 +1722,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             snapshot_sym: std::ptr::null(),
             inline_subwalk: false,
             inline_caller_py_pc: None,
+            immediate_inline_caller_py_pc: None,
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
             carrier_resume: false,
