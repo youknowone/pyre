@@ -2632,14 +2632,38 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
 
 /// Publish `build_home_gcmap` on the live frame (`local 0` is the items
 /// base). `ptr == 0` is the test path that never installs a map.
-fn emit_publish_home_gcmap(sink: &mut PeepSink<'_, '_>, ptr: i64) {
+///
+/// `only_if_null` is for an out-of-line bridge: the owner already published
+/// a used-home map, and replacing it with this module's (possibly shorter)
+/// prefix would unmark homes the owner grew after this bridge was compiled.
+/// `push_gcmap` writes the live set; a later module must not shrink it.
+fn emit_publish_home_gcmap(sink: &mut PeepSink<'_, '_>, ptr: i64, only_if_null: bool) {
     if ptr == 0 {
         return;
     }
-    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_GCMAP_OFS};
-    sink.local_get(0);
-    sink.i32_const(FIRST_ITEM_OFFSET as i32);
-    sink.i32_sub();
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_GCMAP_OFS, SIZEOFSIGNED};
+    let emit_hdr = |sink: &mut PeepSink<'_, '_>| {
+        sink.local_get(0);
+        sink.i32_const(FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+    };
+    if only_if_null {
+        emit_hdr(sink);
+        if SIZEOFSIGNED == 4 {
+            sink.i32_load(memarg(JF_GCMAP_OFS as u64, 2));
+            sink.i32_eqz();
+        } else {
+            sink.i64_load(memarg(JF_GCMAP_OFS as u64, 3));
+            sink.i64_eqz();
+        }
+        sink.if_(BlockType::Empty);
+        emit_hdr(sink);
+        sink.i64_const(ptr);
+        emit_word_store(sink, JF_GCMAP_OFS as u64);
+        sink.end();
+        return;
+    }
+    emit_hdr(sink);
     sink.i64_const(ptr);
     emit_word_store(sink, JF_GCMAP_OFS as u64);
 }
@@ -5947,7 +5971,8 @@ fn build_function(
     }
     // assembler.py `push_gcmap`: the map goes up once the slots it marks
     // are live or null. Keyed resume publishes in the loader instead.
-    emit_publish_home_gcmap(&mut sink, publish_ptr);
+    // A bridge keeps a map the owner already published.
+    emit_publish_home_gcmap(&mut sink, publish_ptr, bridge_entry_arity.is_some());
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
     if let Some((probe, type_idx)) = inline_trip {
@@ -6034,7 +6059,7 @@ fn build_function(
             // nulled before `br_table`; remaining marked homes already
             // hold the previous module's values. Publish before the
             // loader stores, matching `push_gcmap` at a live safepoint.
-            emit_publish_home_gcmap(&mut sink, publish_ptr);
+            emit_publish_home_gcmap(&mut sink, publish_ptr, false);
             // Resume loader: a loop-closing bridge wrote each label arg into
             // frame slot i (positionally, matching the in-loop JUMP move);
             // load them into the label-arg locals and refresh their Ref

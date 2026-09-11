@@ -3321,28 +3321,18 @@ impl WasmBackend {
             old_handle,
             &wasm_bytes,
         );
+        // Keep already-compiled bridges. They no longer overwrite a wider
+        // owner map (`emit_publish_home_gcmap` only_if_null). Dropping them
+        // here forced `trace_eagerness` (200) extra guard failures and a
+        // new compile — the SNAPDIFF on this PR.
         #[cfg(target_arch = "wasm32")]
-        if new_cells_base != 0 && !owner_extent_grew {
+        if new_cells_base != 0 {
             for (&fail_index, &bridge_slot) in compiled.bridge_slots.borrow().iter() {
                 let cell = (new_cells_base as usize + fail_index as usize * 4) as *mut u32;
                 unsafe { core::ptr::write(cell, bridge_slot) };
             }
         }
-        if owner_extent_grew {
-            let retired: Vec<u32> = compiled.bridge_slots.borrow().values().copied().collect();
-            crate::failguard::retarget_slots_to_module(
-                retired.iter().copied(),
-                old_handle,
-                &wasm_bytes,
-            );
-            compiled.retract_bridge_label_targets_for_slots(retired);
-            compiled.bridge_slots.borrow_mut().clear();
-            let owner_tid = compiled.trace_id;
-            compiled
-                .bridge_descr_ranges
-                .borrow_mut()
-                .retain(|&(tid, _, _, _)| tid != owner_tid);
-        }
+        let _ = owner_extent_grew;
         if let Some(owner) = new_cells_owner {
             compiled._bridge_owned_cells.borrow_mut().push(owner);
         }
@@ -3374,36 +3364,10 @@ impl WasmBackend {
                 // rebased refs now occupy. Floor to the merged extent.
                 let num_ref_homes = prev_homes.max(widened);
                 let used_label_homes = prev_labels.max(widened_labels);
-                // Existing nested sub-bridges still publish the standalone
-                // map. Replaying them after the extent grew would collect
-                // through that short prefix. Drop the dispatch slots and
-                // the `bridge_descr_ranges` attach record so
-                // `bridge_was_compiled` does not treat the retired module
-                // as live; the next fail retraces against the merged floor.
-                let extent_grew = prev_homes < widened || prev_labels < widened_labels;
-                if extent_grew {
-                    let retired: Vec<u32> = compiled
-                        .chained_bridge_slots
-                        .borrow()
-                        .iter()
-                        .filter(|&(&(tid, _), _)| tid == region.trace_id)
-                        .map(|(_, &slot)| slot)
-                        .collect();
-                    crate::failguard::retarget_slots_to_module(
-                        retired.iter().copied(),
-                        old_handle,
-                        &wasm_bytes,
-                    );
-                    compiled.retract_bridge_label_targets_for_slots(retired);
-                    compiled
-                        .chained_bridge_slots
-                        .borrow_mut()
-                        .retain(|&(tid, _), _| tid != region.trace_id);
-                    compiled
-                        .bridge_descr_ranges
-                        .borrow_mut()
-                        .retain(|&(tid, _, _, _)| tid != region.trace_id);
-                } else if new_cells_base != 0 {
+                // Nested sub-bridges keep their dispatch slots. They no
+                // longer overwrite a wider owner map (bridge publish is
+                // null-only), so a grow does not need a retrace.
+                if new_cells_base != 0 {
                     // This region's guards are carved out of the array that
                     // was just reallocated. Replay still-valid nested
                     // sub-bridges into the new cells; unreplayed, a guard
