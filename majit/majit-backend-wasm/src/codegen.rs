@@ -7015,24 +7015,50 @@ fn build_function(
                 }
             }
 
-            // ── String/Unicode ops (direct memory access) ──
-            // strlen/strgetitem/unicodelen/unicodegetitem were lowered with a
-            // hardcoded layout (length as an 8-byte load of a 4-byte word field;
-            // item as a 1-byte, stride-1 read at a fixed offset) that is wrong for
-            // UNICODE (4-byte code units, stride 4) and folds garbage into a str
-            // length's high bits — a silent wrong value on wasm, where offset is
-            // valid linear memory and does not trap. pyre models strings/unicode
-            // as Array(Char) and routes these through the descr-driven
-            // GETARRAYITEM/ARRAYLEN paths, so no producer emits these ops (verified
-            // with PYRE_DUMP_PERFN_JITCODE: a str-subscript / len / compare / find
-            // hot loop traces to GETARRAYITEM, never STRGETITEM). Decline them
-            // (interpreter fallback) rather than ship a descr-driven lowering that
-            // no trace exercises — a valid but untestable path here.
-            OpCode::Strlen | OpCode::Unicodelen | OpCode::Strgetitem | OpCode::Unicodegetitem => {
-                return Err(BackendError::Unsupported(format!(
-                    "wasm codegen: string/unicode direct-memory op {:?} (no descr-driven layout)",
-                    op.opcode
-                )));
+            // rewrite.py fills these from `str_descr` / `unicode_descr`.
+            // `inject_builtin_string_descrs` attaches the same ArrayDescr,
+            // so the length word and item stride are the array path.
+            OpCode::Strlen | OpCode::Unicodelen => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i32_wrap_i64();
+                    let (len_offset, len_size) = array_len_layout_from_descr(op);
+                    emit_sized_int_load(&mut sink, len_offset, len_size, false);
+                    sink.local_set(value_types.local(vi));
+                }
+            }
+            OpCode::Strgetitem | OpCode::Unicodegetitem => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    // rewrite.py:299/311: STR `extra_item_after_alloc=1` is
+                    // already in `basesize`; subtract it before the index.
+                    let (base_size, item_size) = op
+                        .with_array_descr(|ad| {
+                            let item_size = ad.item_size() as u64;
+                            let base_size = if item_size == 1 {
+                                ad.base_size() as u64 - 1
+                            } else {
+                                ad.base_size() as u64
+                            };
+                            (base_size, item_size)
+                        })
+                        .unwrap_or_else(|| {
+                            missing_layout_descr("array descr (str/unicodegetitem)", op)
+                        });
+                    let disp = emit_scaled_index_addr(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
+                        item_size,
+                        base_size,
+                    );
+                    let (access_size, signed) = array_item_access_size_sign(op);
+                    emit_sized_int_load(&mut sink, disp, access_size, signed);
+                    sink.local_set(value_types.local(vi));
+                }
             }
 
             // ── GC rewrite memory ops ──
