@@ -5554,6 +5554,18 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
+        self.execute_token_with_dispatch_key(token, args, 0)
+    }
+
+    /// Cranelift `execute_token_with_dispatch_key`: key 0 is the peeled
+    /// preamble, `label_block_id + 1` is the LABEL resume loader. The key is
+    /// the i64 at `frame.dispatch_key_ofs` the entry `br_table` reads.
+    fn execute_token_with_dispatch_key(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+        dispatch_key: u32,
+    ) -> DeadFrame {
         let compiled = token
             .compiled
             .get()
@@ -5571,7 +5583,7 @@ impl majit_backend::Backend for WasmBackend {
         let frame_size = (compiled.frame.frame_bytes as usize).div_ceil(8);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = (frame_size, args);
+            let _ = (frame_size, args, dispatch_key);
             panic!("wasm backend execute_token requires a wasm host");
         }
         #[cfg(target_arch = "wasm32")]
@@ -5633,6 +5645,10 @@ impl majit_backend::Backend for WasmBackend {
                         Value::Void => 0,
                     };
                     unsafe { *((items_base + fsb + i * 8) as *mut i64) = v };
+                }
+                unsafe {
+                    *((items_base + compiled.frame.dispatch_key_ofs as usize) as *mut i64) =
+                        i64::from(dispatch_key);
                 }
 
                 let saved = majit_gc::shadow_stack::push_jf(jf_ref);
@@ -5701,6 +5717,10 @@ impl majit_backend::Backend for WasmBackend {
                 };
                 unsafe { *items.add(1 + i) = v };
             }
+            unsafe {
+                *((items as usize + compiled.frame.dispatch_key_ofs as usize) as *mut i64) =
+                    i64::from(dispatch_key);
+            }
             let home_base = compiled.frame.home_slot_base as usize / 8;
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
@@ -5738,6 +5758,10 @@ impl majit_backend::Backend for WasmBackend {
     fn execute_token_ints(&self, token: &JitCellToken, args: &[i64]) -> DeadFrame {
         let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
         self.execute_token(token, &values)
+    }
+
+    fn supports_dispatch_key_entry(&self) -> bool {
+        true
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
