@@ -1504,13 +1504,15 @@ fn densify_root_loop_inputargs(
         .iter()
         .enumerate()
         .map(|(position, &opref)| {
-            let tp = opref.ty().unwrap_or_else(|| {
-                panic!(
+            let tp = match opref.ty() {
+                Some(majit_ir::Type::Void) => majit_ir::Type::Ref,
+                Some(tp) => tp,
+                None => panic!(
                     "renamed inputarg {:?} has no intrinsic type \
                      (history.py:220 Box.type invariant)",
                     opref
-                )
-            });
+                ),
+            };
             let dense = InputArgRc::new(InputArg::from_type(tp, position as u32));
             replacements.insert(opref, dense.clone());
             InputArg::from_type(tp, position as u32)

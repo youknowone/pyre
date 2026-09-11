@@ -2463,7 +2463,11 @@ impl MIFrame {
                     .filter(|id| !ctx.opref_is_void_producer(*id))
                     .unwrap_or(*arg)
             } else {
-                let tp = inputarg_types.get(i).copied().unwrap_or(Type::Ref);
+                let tp = inputarg_types
+                    .get(i)
+                    .copied()
+                    .filter(|t| *t != Type::Void)
+                    .unwrap_or(Type::Ref);
                 let typed_null = extract_concrete_typed_value(tp, PY_NULL);
                 fail_arg_opref_for_typed_value(ctx, typed_null)
             };

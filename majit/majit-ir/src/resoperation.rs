@@ -1702,7 +1702,34 @@ const ARG_INLINE: usize = 2;
 /// longer lists still heap-grow a `Vec`.
 const ARG_SLAB: usize = 4;
 const ARG_SLAB_BIT: usize = 1 << (usize::BITS - 1);
+const ARG_OVERFLOW_BIT: usize = 1 << (usize::BITS - 2);
 const ARG_SLAB_CHUNK: usize = 2048;
+/// `N_aryOp._args` has no length cap (`resoperation.py numargs`).
+/// `Op.arg_len` stays a `u8` so `Op` remains 32 B; 255 means the
+/// true count sits in the heap prefix (a JUMP of a long VirtArray).
+const ARG_LEN_STORED_MAX: u8 = 254;
+const ARG_LEN_OVERFLOW: u8 = 255;
+
+fn overflow_header_size() -> usize {
+    std::mem::size_of::<usize>().max(std::mem::align_of::<Operand>())
+}
+
+unsafe fn overflow_len(ptr: *mut Operand) -> usize {
+    unsafe {
+        ptr.cast::<u8>()
+            .sub(overflow_header_size())
+            .cast::<usize>()
+            .read()
+    }
+}
+
+fn store_arg_len(n: usize) -> u8 {
+    if n <= ARG_LEN_STORED_MAX as usize {
+        n as u8
+    } else {
+        ARG_LEN_OVERFLOW
+    }
+}
 
 struct Arg32Heap {
     chunks: Vec<(*mut Operand, usize)>,
@@ -1759,6 +1786,14 @@ union ArgData {
     heap: std::mem::ManuallyDrop<ArgHeap>,
 }
 
+fn live_arg_len(stored: u8, data: &ArgData) -> usize {
+    if stored < ARG_LEN_OVERFLOW {
+        stored as usize
+    } else {
+        unsafe { overflow_len(data.heap.ptr) }
+    }
+}
+
 /// Construction-time arg lengths. Nested `ArgSlot::new` (an operand
 /// that itself mints an `Op`) must not clobber the outer `op!` length.
 thread_local! {
@@ -1780,7 +1815,7 @@ pub struct ArgSlot(std::cell::UnsafeCell<ArgData>);
 
 impl ArgSlot {
     pub fn new(v: OpArgVec) -> Self {
-        let len = u8::try_from(v.len()).expect("ResOp arg count fits u8");
+        let len = store_arg_len(v.len());
         push_arg_len(len);
         ArgSlot(std::cell::UnsafeCell::new(Self::pack_data(v)))
     }
@@ -1811,7 +1846,7 @@ impl ArgSlot {
                     cap: ARG_SLAB | ARG_SLAB_BIT,
                 }),
             }
-        } else {
+        } else if len_us <= ARG_LEN_STORED_MAX as usize {
             let mut vec = v.into_vec();
             let heap = ArgHeap {
                 ptr: vec.as_mut_ptr(),
@@ -1821,6 +1856,31 @@ impl ArgSlot {
             ArgData {
                 heap: std::mem::ManuallyDrop::new(heap),
             }
+        } else {
+            // `resoperation.py N_aryOp._args` is an uncapped list.
+            // Prefix the allocation with the true length so `arg_len`
+            // can stay a `u8` (255 = overflow).
+            let header = overflow_header_size();
+            let layout = std::alloc::Layout::from_size_align(
+                header + std::mem::size_of::<Operand>() * len_us,
+                std::mem::align_of::<Operand>(),
+            )
+            .expect("N_aryOp overflow arg heap");
+            let base = unsafe { std::alloc::alloc(layout) };
+            assert!(!base.is_null(), "N_aryOp overflow arg heap");
+            unsafe {
+                base.cast::<usize>().write(len_us);
+                let ptr = base.add(header).cast::<Operand>();
+                for (i, arg) in v.into_iter().enumerate() {
+                    ptr.add(i).write(arg);
+                }
+                ArgData {
+                    heap: std::mem::ManuallyDrop::new(ArgHeap {
+                        ptr,
+                        cap: ARG_OVERFLOW_BIT,
+                    }),
+                }
+            }
         }
     }
 
@@ -1828,7 +1888,7 @@ impl ArgSlot {
     pub fn borrow(&self, len: u8) -> &[Operand] {
         unsafe {
             let data = &*self.0.get();
-            let n = len as usize;
+            let n = live_arg_len(len, data);
             if n <= ARG_INLINE {
                 std::slice::from_raw_parts((*data.inline).as_ptr().cast::<Operand>(), n)
             } else {
@@ -1841,7 +1901,7 @@ impl ArgSlot {
     pub fn borrow_mut(&self, len: u8) -> &mut [Operand] {
         unsafe {
             let data = &mut *self.0.get();
-            let n = len as usize;
+            let n = live_arg_len(len, data);
             if n <= ARG_INLINE {
                 std::slice::from_raw_parts_mut((*data.inline).as_mut_ptr().cast::<Operand>(), n)
             } else {
@@ -1855,7 +1915,7 @@ impl ArgSlot {
     }
 
     pub fn replace(&self, old_len: u8, v: OpArgVec) -> u8 {
-        let new_len = u8::try_from(v.len()).expect("ResOp arg count fits u8");
+        let new_len = store_arg_len(v.len());
         unsafe {
             let data = &mut *self.0.get();
             drop_arg_data(data, old_len);
@@ -1871,7 +1931,7 @@ impl ArgSlot {
 
 unsafe fn drop_arg_data(data: &mut ArgData, len: u8) {
     unsafe {
-        let n = len as usize;
+        let n = live_arg_len(len, data);
         if n <= ARG_INLINE {
             for slot in (*data.inline).iter_mut().take(n) {
                 slot.assume_init_drop();
@@ -1883,6 +1943,18 @@ unsafe fn drop_arg_data(data: &mut ArgData, len: u8) {
                     heap.ptr.add(i).drop_in_place();
                 }
                 free_arg32(heap.ptr);
+            } else if heap.cap & ARG_OVERFLOW_BIT != 0 {
+                for i in 0..n {
+                    heap.ptr.add(i).drop_in_place();
+                }
+                let header = overflow_header_size();
+                let base = heap.ptr.cast::<u8>().sub(header);
+                let layout = std::alloc::Layout::from_size_align(
+                    header + std::mem::size_of::<Operand>() * n,
+                    std::mem::align_of::<Operand>(),
+                )
+                .expect("N_aryOp overflow arg heap");
+                std::alloc::dealloc(base, layout);
             } else {
                 let _ = Vec::from_raw_parts(heap.ptr, n, heap.cap);
             }
@@ -3359,7 +3431,7 @@ impl Op {
 
     pub fn new(opcode: OpCode, args: &[Operand]) -> Self {
         let collected: OpArgVec = args.iter().cloned().collect();
-        let arg_len = u8::try_from(collected.len()).expect("ResOp arg count fits u8");
+        let arg_len = store_arg_len(collected.len());
         let op = Op {
             opcode,
             type_: opcode.result_type(),
@@ -3375,7 +3447,7 @@ impl Op {
 
     pub fn with_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Self {
         let collected: OpArgVec = args.iter().cloned().collect();
-        let arg_len = u8::try_from(collected.len()).expect("ResOp arg count fits u8");
+        let arg_len = store_arg_len(collected.len());
         let op = Op {
             opcode,
             type_: opcode.result_type(),
@@ -3431,7 +3503,7 @@ impl Op {
     }
 
     pub fn num_args(&self) -> usize {
-        self.arg_len_value() as usize
+        unsafe { live_arg_len(self.arg_len_value(), &*self.args.0.get()) }
     }
 
     pub fn result_type(&self) -> Type {
@@ -3509,7 +3581,7 @@ impl Op {
             Some(d) => d,
             None => self.descr.borrow(),
         };
-        let new_len = u8::try_from(new_args.len()).expect("ResOp arg count fits u8");
+        let new_len = store_arg_len(new_args.len());
         let stamp = self.descr.stamp_word();
         let descr = DescrSlot::from_parts(new_descr, self.descr.extra_clone_box());
         if stamp != 0 {
@@ -5829,6 +5901,26 @@ mod tests {
         op.pos().set(OpRef::ConstInt(-7));
         assert_eq!(op.pos().get(), OpRef::ConstInt(-7));
         assert_eq!(op.num_args(), n);
+    }
+
+    #[test]
+    fn jump_keeps_more_than_two_hundred_fifty_five_args() {
+        // `resoperation.py N_aryOp._args` is an uncapped list. A
+        // virtualizable array longer than 254 cells (the u8 store)
+        // still has to round-trip as JUMP reds so numbering can
+        // TagOverflow / giveup instead of panicking at construction.
+        let n = 300usize;
+        let args: Vec<crate::operand::Operand> = (0..n)
+            .map(|i| crate::operand::Operand::from_opref(OpRef::const_int(i as i64)))
+            .collect();
+        let op = Op::new(OpCode::Jump, &args);
+        assert_eq!(op.num_args(), n);
+        assert_eq!(op.arg(0).const_int(), Some(0));
+        assert_eq!(op.arg(254).const_int(), Some(254));
+        assert_eq!(op.arg(n - 1).const_int(), Some((n - 1) as i64));
+        let clone = op.clone();
+        assert_eq!(clone.num_args(), n);
+        assert_eq!(clone.arg(n - 1).const_int(), Some((n - 1) as i64));
     }
 
     #[test]

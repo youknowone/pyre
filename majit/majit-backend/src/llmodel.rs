@@ -149,7 +149,7 @@ impl<'a> FailArgSource<'a> {
     #[inline]
     pub fn get(&self, index: usize) -> i64 {
         match self {
-            Self::Slice(s) => s[index],
+            Self::Slice(s) => s.get(index).copied().unwrap_or(0),
             Self::JitFrame { root, descr, n } => {
                 debug_assert!(index < *n);
                 let ptr = root.get().0 as *const JitFrame;
@@ -340,5 +340,20 @@ pub unsafe fn get_savedata_ref(ptr: *const JitFrame) -> usize {
 pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
     unsafe {
         (*ptr).jf_savedata = value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FailArgSource;
+
+    #[test]
+    fn empty_slice_get_does_not_panic() {
+        // A host copy can be empty when resume numbering still asks
+        // for TAGBOX 0 (`cpu.get_int_value(deadframe, 0)`). The
+        // jitframe arm is the deadframe; a missing host slot reads 0.
+        let src = FailArgSource::Slice(&[]);
+        assert_eq!(src.get(0), 0);
+        assert_eq!(src.len(), 0);
     }
 }
