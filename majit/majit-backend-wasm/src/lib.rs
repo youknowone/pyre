@@ -4092,7 +4092,8 @@ impl majit_backend::Backend for WasmBackend {
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
-        let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
+        let mut ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
+        codegen::materialize_unbound_label_args(inputargs, &mut ops_owned);
         let (ops_owned, gc_table) = Self::intern_ref_constants(inputargs, ops_owned);
         let gc_table_base = gc_table.as_ref().map_or(0, |t| t.base_addr() as u32);
         let ops: &[Op] = &ops_owned;

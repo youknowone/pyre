@@ -852,6 +852,30 @@ fn label_livein_inputarg_is_defined_at_the_label() {
     assert_eq!(guards.len(), 1);
 }
 
+/// Same as `label_livein_inputarg_is_defined_at_the_label`, but the peeled
+/// live-in is an `InputArgRef`. Declining every `Type::Ref` at LABEL
+/// re-broke those traces (`fib_loop` / `int_loop`). Residual vable slots
+/// are `RefOp`s and stay declined — see
+/// `label_ref_phi_without_a_producer_declines`.
+#[test]
+fn label_livein_inputarg_ref_is_defined_at_the_label() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let live_in = OpRef::input_arg_ref(101);
+    let ops = vec![
+        Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0)), rb(live_in)]),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(1)], &[live_in]),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(1)), rb(live_in)]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+}
+
 /// A LABEL live-in that is only a constants-map entry must still be seeded
 /// in the prologue. Treating every LABEL arg as defined skipped that store,
 /// so the local read as the zero wasm initializes it to.
@@ -2678,6 +2702,125 @@ fn test_int_add_loop() {
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1); // one guard
     assert!(!guards[0].is_finish);
+}
+
+#[test]
+fn label_int_phi_without_a_producer_still_compiles() {
+    // A body LABEL can carry a virtualstate int box the peel never wrote.
+    // Treating that id as unbound declined every wasm loop.
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let const_1 = OpRef::const_int(1);
+    let const_100 = OpRef::const_int(100);
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[
+                rb(OpRef::input_arg_int(0)),
+                rb(OpRef::input_arg_int(1)),
+                rb(OpRef::int_op(85)),
+            ],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(1), OpRef::input_arg_int(0)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), const_100],
+            OpRef::int_op(4),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(4)],
+            &[OpRef::int_op(3), OpRef::int_op(2), OpRef::int_op(85)],
+        ),
+        Op::new(
+            OpCode::Jump,
+            &[
+                rb(OpRef::int_op(3)),
+                rb(OpRef::int_op(2)),
+                rb(OpRef::int_op(85)),
+            ],
+        ),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+}
+
+#[test]
+fn label_ref_phi_without_a_producer_declines() {
+    // A residual virtualizable Ref on the LABEL is not a phi wasm can
+    // bind to a local. Compiling it stores null on failarg writeback.
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::ref_op(85))],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(2), OpRef::const_int(100)],
+            OpRef::int_op(3),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(3)],
+            &[OpRef::int_op(2), OpRef::ref_op(85)],
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(2)), rb(OpRef::ref_op(85))]),
+    ];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants,
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let error = match codegen::build_wasm_module(&inputs) {
+        Ok(_) => panic!("an unbound LABEL Ref must not compile as a null local"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("no producing op"),
+        "unexpected decline: {error}"
+    );
 }
 
 #[test]
