@@ -588,7 +588,9 @@ impl AsyncActionOps for CheckSignalAction {
             let _roots = pyre_object::gc_roots::push_roots();
             let cls_slot = pyre_object::gc_roots::pin_roots(&[w_exc]);
             let w_msg =
-                pyre_object::w_str_new("asynchronous exception triggered from another thread");
+                pyre_object::w_str_new_managed(
+                    "asynchronous exception triggered from another thread",
+                );
             let msg_slot = pyre_object::gc_roots::pin_roots(&[w_msg]);
             let w_obj = crate::builtins::exc_exception_new(&[
                 pyre_object::gc_roots::shadow_stack_get(cls_slot),

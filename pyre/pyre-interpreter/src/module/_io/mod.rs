@@ -320,7 +320,19 @@ fn iobase_tell(args: &[PyObjectRef]) -> crate::PyResult {
         .first()
         .copied()
         .ok_or_else(|| crate::PyError::type_error("tell() requires self"))?;
-    call_method_result(self_obj, "seek", &[w_int_new(0), w_int_new(1)])
+    let _seek_roots = pyre_object::gc_roots::push_roots();
+    let pos_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+    let whence_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
+    call_method_result(
+        self_obj,
+        "seek",
+        &[
+            pyre_object::gc_roots::shadow_stack_get(pos_slot),
+            pyre_object::gc_roots::shadow_stack_get(whence_slot),
+        ],
+    )
 }
 
 fn iobase_enter(args: &[PyObjectRef]) -> crate::PyResult {

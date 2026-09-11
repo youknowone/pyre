@@ -251,7 +251,7 @@ pub mod frame_locals_proxy {
             // the GC heap and so stays valid across those collections.
             let code = self.frame().code();
             let matches = |name: &str| -> Result<bool, crate::PyError> {
-                roots.set(candidate_slot, pyre_object::w_str_new(name));
+                roots.set(candidate_slot, pyre_object::w_str_new_managed(name));
                 // A name whose hash differs is never compared, so a key that
                 // claims equality with a name it does not hash like does not
                 // reach that name's slot.
@@ -383,7 +383,7 @@ pub mod frame_locals_proxy {
                     unsafe { pyre_object::w_str_get_wtf8(roots.get(key_slot)) }.as_bytes()
                         == name.as_bytes()
                 } else {
-                    roots.set(candidate_slot, pyre_object::w_str_new(name));
+                    roots.set(candidate_slot, pyre_object::w_str_new_managed(name));
                     // A name whose hash differs is never compared: a key that
                     // claims equality with a name it does not hash like reads
                     // as absent rather than as that name's slot.
@@ -473,7 +473,10 @@ pub mod frame_locals_proxy {
                 let key_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
                 let _ = pyre_object::gc_roots::pin_root(value);
-                pyre_object::gc_roots::shadow_stack_set(key_slot, pyre_object::w_str_new(name));
+                pyre_object::gc_roots::shadow_stack_set(
+                    key_slot,
+                    pyre_object::w_str_new_managed(name),
+                );
                 count += 1;
             }
             let extra = self.frame().get_extra_locals();
@@ -6574,7 +6577,7 @@ fn finditem_str_object(
     let object_slot = roots.base();
     let _ = roots.pin_root(w_obj);
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(unsafe { pyre_object::w_str_new(name) });
+    let _ = roots.pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     match crate::baseobjspace::getitem(roots.get(object_slot), roots.get(key_slot)) {
         Ok(v) if !v.is_null() => Ok(Some(v)),
         Ok(_) => Ok(None),
@@ -6596,7 +6599,7 @@ fn setitem_str_object(
     let _ = roots.pin_root(w_obj);
     let _ = roots.pin_root(value);
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(unsafe { pyre_object::w_str_new(name) });
+    let _ = roots.pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     crate::baseobjspace::setitem(
         roots.get(object_slot),
         roots.get(key_slot),
@@ -6612,7 +6615,7 @@ fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyErr
     let object_slot = roots.base();
     let _ = roots.pin_root(w_obj);
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(unsafe { pyre_object::w_str_new(name) });
+    let _ = roots.pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     match crate::baseobjspace::delitem(roots.get(object_slot), roots.get(key_slot)) {
         Ok(_) => Ok(()),
         Err(e) if e.kind == crate::PyErrorKind::KeyError => Ok(()),
@@ -6742,7 +6745,7 @@ pub extern "C" fn jit_locals_dict_delitem_local(dict: i64, code: i64, index: i64
     let code = unsafe { &*(code as usize as *const CodeObject) };
     let name: &str = &code.varnames[index as usize];
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_str_new(name) });
+    let _ = pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     let deleted = unsafe {
         pyre_object::dictmultiobject::w_dict_delitem_checked(
             pyre_object::gc_roots::shadow_stack_get(dict_slot),

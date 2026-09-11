@@ -1631,7 +1631,17 @@ impl W_TextIOWrapper {
             if !self.w_decoder.is_null() {
                 super::call_method_result(self.w_decoder, "reset", &[])?;
             }
-            let result = self.call_buffer("seek", &[w_position, w_int_new(whence)])?;
+            let pos_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_position);
+            let whence_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(whence));
+            let result = self.call_buffer(
+                "seek",
+                &[
+                    pyre_object::gc_roots::shadow_stack_get(pos_slot),
+                    pyre_object::gc_roots::shadow_stack_get(whence_slot),
+                ],
+            )?;
             if !self.w_encoder.is_null() {
                 let at_start = crate::builtins::space_index_w(result)? == 0;
                 self.encoder_reset(at_start)?;

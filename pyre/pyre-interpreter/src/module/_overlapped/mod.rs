@@ -978,12 +978,14 @@ fn get_queued_completion_status(args: &[PyObjectRef]) -> crate::PyResult {
     .map_err(win32_err)?
     {
         host_overlapped::WaitResult::Timeout => Ok(pyre_object::w_none()),
-        host_overlapped::WaitResult::Queued(status) => Ok(pyre_object::w_tuple_new(vec![
-            pyre_object::w_int_new(status.error as i64),
-            pyre_object::w_int_new(status.bytes_transferred as i64),
-            w_uintptr(status.completion_key),
-            w_uintptr(status.overlapped as usize),
-        ])),
+        host_overlapped::WaitResult::Queued(status) => {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_int_new(status.error as i64));
+            fields.push(pyre_object::w_int_new(status.bytes_transferred as i64));
+            fields.push(w_uintptr(status.completion_key));
+            fields.push(w_uintptr(status.overlapped as usize));
+            Ok(pyre_object::w_tuple_new(fields.take()))
+        }
     }
 }
 
