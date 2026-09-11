@@ -10582,19 +10582,24 @@ fn unbound_pool_const_seeds(
         }
         match constants.get(&raw) {
             Some(&bits) => seeds.push((raw, bits)),
-            // No producer and no pool entry: the local would read as the
-            // zero wasm initializes it to, which is a wrong value, not a
-            // missing one. Decline the trace (the interpreter runs it
-            // correctly, unaccelerated) exactly as the unhandled-opcode
-            // arm does.
+            // No producer and no pool entry: a body read would load the
+            // zero wasm initializes the local to. Decline that (the
+            // interpreter runs it correctly). A failarg is only a
+            // snapshot slot — import_state can leave the same leftover
+            // hole on a guard after every real use was rewritten, and
+            // dynasm still compiles the loop.
+            None if failarg => {}
             None => unresolved.push((a, opcode, failarg)),
         }
     };
     for op in ops {
         // rewrite.py `keep` — JIT_DEBUG / DebugMergePoint keep their
-        // constants inline and never execute as values. An unbound
-        // remint sitting only on a debug op must not decline the trace.
-        if op.opcode.is_jit_debug() {
+        // constants inline and never execute as values. LABEL args are
+        // phi destinations (`consider_label` / `LabelResumeData`), not
+        // reads. An unbound remint sitting only on those ops must not
+        // decline the trace. A later real operand of the same id is
+        // still considered.
+        if op.opcode.is_label() || op.opcode.is_jit_debug() {
             continue;
         }
         for a in op.getarglist().iter() {
@@ -12227,6 +12232,102 @@ mod tests {
     fn aligned_varsize_frame_bump_rejects_u32_overflow() {
         assert_eq!(aligned_varsize_frame_bump(20), Some(24));
         assert_eq!(aligned_varsize_frame_bump(0xffff_fffc), None);
+    }
+
+    #[test]
+    fn label_arg_that_is_also_a_later_read_is_still_seeded() {
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+        let mut constants = indexmap::IndexMap::new();
+        constants.insert(50, 42);
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[rb(OpRef::int_op(50)), rb(OpRef::const_int(1))],
+        );
+        add.pos.set(OpRef::int_op(200));
+        let ops = vec![
+            Op::new(
+                OpCode::Label,
+                &[rb(OpRef::input_arg_int(0)), rb(OpRef::int_op(50))],
+            ),
+            add,
+        ];
+        let seeds = unbound_pool_const_seeds(&inputargs, &ops, &constants, 256)
+            .expect("dual-use LABEL id must not decline");
+        assert!(
+            seeds.contains(&(50, 42)),
+            "later IntAdd of a producer-less LABEL arg must seed from the pool, got {seeds:?}"
+        );
+    }
+
+    #[test]
+    fn label_arg_import_hole_is_not_an_unbound_read() {
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let inputargs = vec![
+            InputArg::from_type(Type::Int, 0),
+            InputArg::from_type(Type::Int, 1),
+        ];
+        let constants = indexmap::IndexMap::new();
+        let ops = vec![
+            Op::new(
+                OpCode::Label,
+                &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_ref(101))],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
+            ),
+        ];
+        unbound_pool_const_seeds(&inputargs, &ops, &constants, 256)
+            .expect("stale LABEL import hole must not decline");
+    }
+
+    #[test]
+    fn debug_merge_point_import_hole_is_not_an_unbound_read() {
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let inputargs = vec![
+            InputArg::from_type(Type::Int, 0),
+            InputArg::from_type(Type::Int, 1),
+        ];
+        let constants = indexmap::IndexMap::new();
+        let ops = vec![
+            Op::new(
+                OpCode::Label,
+                &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_ref(101))],
+            ),
+            Op::new(OpCode::DebugMergePoint, &[rb(OpRef::input_arg_ref(101))]),
+            Op::new(
+                OpCode::IntAdd,
+                &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
+            ),
+        ];
+        unbound_pool_const_seeds(&inputargs, &ops, &constants, 256)
+            .expect("stale debug_merge_point import hole must not decline");
+    }
+
+    #[test]
+    fn guard_failarg_import_hole_is_not_an_unbound_read() {
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let inputargs = vec![
+            InputArg::from_type(Type::Int, 0),
+            InputArg::from_type(Type::Int, 1),
+        ];
+        let constants = indexmap::IndexMap::new();
+        let guard = Op::new(OpCode::GuardNotInvalidated, &[]);
+        guard.setfailargs(vec![rb(OpRef::input_arg_ref(101))].into());
+        let ops = vec![
+            Op::new(
+                OpCode::Label,
+                &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_ref(101))],
+            ),
+            guard,
+            Op::new(
+                OpCode::IntAdd,
+                &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
+            ),
+        ];
+        unbound_pool_const_seeds(&inputargs, &ops, &constants, 256)
+            .expect("stale guard failarg import hole must not decline");
     }
 
     #[test]
