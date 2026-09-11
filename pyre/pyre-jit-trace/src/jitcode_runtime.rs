@@ -3598,6 +3598,10 @@ mod tests {
         let expected = [
             "abort/>r",
             "assert_not_none/r",
+            "call_assembler_float_ext/P",
+            "call_assembler_int_ext/P",
+            "call_assembler_ref_ext/P",
+            "call_assembler_void_ext/P",
             "cast_int_to_float/i>f",
             "cast_int_to_ptr/i>r",
             "check_neg_index/rid>i",
