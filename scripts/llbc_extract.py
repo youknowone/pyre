@@ -1620,6 +1620,31 @@ def parse_stamp(text: str) -> dict[str, str]:
     return fields
 
 
+# `closure=` is a residual detector, not a skip/stale gate. `check` already
+# warns when it alone moves; `extract` used to require the whole stamp to
+# match, so a comment in a cargo-closure crate re-extracted every consumer
+# even when that crate was absent from the artefact's file table. Keep the
+# two verdicts on the same field set.
+STAMP_GATE_KEYS = tuple(key for key in STAMP_KEYS if key != "closure")
+
+
+def stamp_skip_ok(recorded_text: str, expected: str) -> tuple[bool, bool]:
+    """Whether extract may skip, and whether `closure=` alone moved.
+
+    `recorded_text` is the on-disk stamp (CRLF folded to LF). `expected` is
+    the string `stamp_for` just produced, without its trailing newline.
+    Missing any `STAMP_KEYS` field refuses the skip: a stamp that predates a
+    field cannot certify what that field now covers.
+    """
+    recorded = parse_stamp(recorded_text.replace("\r\n", "\n"))
+    want = parse_stamp(expected)
+    if any(key not in recorded for key in STAMP_KEYS):
+        return False, False
+    gates_match = all(recorded[key] == want.get(key) for key in STAMP_GATE_KEYS)
+    closure_moved = recorded.get("closure") != want.get("closure")
+    return gates_match, closure_moved
+
+
 def file_mtime(path: Path) -> str:
     return datetime.datetime.fromtimestamp(path.stat().st_mtime).isoformat(
         timespec="seconds"
@@ -2398,15 +2423,27 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         sidecars = [
             dest_dir / spec.layout_sidecar_name(t) for t in crate_layout_targets(eng, spec)
         ]
+        recorded_ok = False
+        closure_moved = False
+        if stamp_path.exists():
+            recorded_text = stamp_path.read_bytes().decode(
+                "utf-8", errors="replace"
+            )
+            recorded_ok, closure_moved = stamp_skip_ok(recorded_text, stamp)
         if (
             not args.force
             and dest.exists()
             and dest.stat().st_size > 0
             and all(s.exists() and s.stat().st_size > 0 for s in sidecars)
-            and stamp_path.exists()
-            and stamp_path.read_text() == stamp + "\n"
+            and recorded_ok
         ):
-            print(f"=== skipping {crate} -> {dest} (fingerprint unchanged) ===")
+            if closure_moved:
+                print(
+                    f"=== skipping {crate} -> {dest} "
+                    "(source unchanged; closure moved) ==="
+                )
+            else:
+                print(f"=== skipping {crate} -> {dest} (fingerprint unchanged) ===")
             # No provenance is written here on purpose. The sidecar describes
             # the artefact, and the artefact is the one the previous run built:
             # re-stamping it with the current HEAD would claim this checkout produced
@@ -2922,27 +2959,20 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
             layout_flags=crate_layout_flags(spec, features, flags),
             artefacts=artefacts_fingerprint(eng, spec, dest_dir),
         )
-        if text == expected + "\n":
+        skip_ok, closure_moved = stamp_skip_ok(text, expected)
+        if skip_ok:
+            if closure_moved:
+                print(
+                    f"    WARNING: {crate}.ullbc's declared inputs are unchanged, "
+                    "but something else in its dependency closure moved; if a trait "
+                    "impl or proc macro changed, re-extract"
+                )
             print(f"    fingerprint matches the tree (source={recorded['source']})")
             verified.add(crate)
             continue
 
         want = parse_stamp(expected)
         differing = [key for key in STAMP_KEYS if recorded[key] != want.get(key)]
-        if "closure" in differing and "source" not in differing:
-            print(
-                f"    WARNING: {crate}.ullbc's declared inputs are unchanged, "
-                "but something else in its dependency closure moved; if a trait "
-                "impl or proc macro changed, re-extract"
-            )
-            differing.remove("closure")
-            expected_with_recorded_closure = "\n".join(
-                f"closure={recorded['closure']}" if line.startswith("closure=") else line
-                for line in expected.splitlines()
-            )
-            if not differing and text == expected_with_recorded_closure + "\n":
-                verified.add(crate)
-                continue
         if not differing:
             # The text differs while every modelled field agrees, so the stamp
             # carries content this engine does not write. Reporting nothing

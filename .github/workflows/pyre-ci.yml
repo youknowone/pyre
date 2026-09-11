@@ -243,11 +243,13 @@ jobs:
     # any edit anywhere misses every crate. The fallback is what lets the
     # narrow digest decide instead: `extract-llbc.py` recomputes each crate's
     # stamp against the current tree, using the restored `.readfiles` to
-    # narrow `source=`, and compares it to the restored stamp as exact text.
-    # A crate whose own closure did not move skips; every other crate
-    # re-extracts. So the key only chooses what is OFFERED — a stale
-    # restore costs a download and is then re-extracted, it cannot survive
-    # into the artefact.
+    # narrow `source=`. Skip agrees with `check`: `source=` / `external=` /
+    # `artefacts=` (and the configuration fields) are gates; `closure=`
+    # alone only warns. A comment in a cargo-closure crate therefore
+    # re-extracts only the crates whose file table actually named that
+    # file. So the key only chooses what is OFFERED — a stale restore
+    # costs a download and is then re-extracted, it cannot survive into
+    # the artefact.
     - name: Cache LLBC (majit-rlib)
       id: llbc-cache-rlib
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
