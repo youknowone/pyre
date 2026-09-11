@@ -11191,7 +11191,7 @@ fn emit_force_arm(
     ));
     for (i, &arg_ref) in force_args.iter().enumerate() {
         sink.local_get(0);
-        if undefined == Some(arg_ref.raw()) {
+        if !arg_ref.is_constant() && undefined == Some(arg_ref.raw()) {
             sink.i64_const(0);
         } else if let Some(home) = ref_homes.home(arg_ref) {
             let ofs = frame.home_slot_base + home as u64 * SLOT_SIZE;

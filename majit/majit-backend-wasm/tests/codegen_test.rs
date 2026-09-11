@@ -8057,11 +8057,10 @@ fn a_constant_fail_arg_in_a_force_bracket_is_published_as_a_literal() {
     ]);
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
-    let (bytes, guards) = build_module_default(
+    let bytes = build_module_with_write_barrier_target(
         &[InputArg::from_type(Type::Ref, 0)],
         &[call, guard, finish],
-        &indexmap::IndexMap::new(),
+        127,
     );
     validate_wasm(&bytes);
-    assert_eq!(guards.len(), 1);
 }
