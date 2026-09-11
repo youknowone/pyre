@@ -394,6 +394,13 @@ mod tests {
         super::retract_label_target_if_handle(id, 9);
         assert!(super::label_target(id).is_none());
     }
+
+    #[test]
+    fn retarget_slots_skips_the_owner_and_zero() {
+        // Native has no host table; the helper must still ignore the
+        // owner's own slot and a missing handle without panicking.
+        super::retarget_slots_to_module([0, 4, 4], 4, b"\0asm");
+    }
 }
 
 /// A resumable `LABEL` of a compiled loop, published in `LABEL_TARGETS` so a
@@ -1081,6 +1088,30 @@ pub fn retract_label_target_if_handle(descr_id: usize, func_handle: u32) {
     {
         map.remove(&descr_id);
         crate::BRIDGE_DIAG[22].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Point retired table slots at `wasm_bytes` so a caller that baked
+/// `return_call_indirect(slot)` enters the replacement module.
+/// `assembler.py` `patch_jump_for_descr` rewrites the jump; wasm
+/// modules are immutable, so the slot is the patch site
+/// (`glue::replace_module` also rewrites the reserved wide half).
+pub(crate) fn retarget_slots_to_module(
+    slots: impl IntoIterator<Item = u32>,
+    owner_handle: u32,
+    wasm_bytes: &[u8],
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        for slot in slots {
+            if slot != 0 && slot != owner_handle {
+                let _ = crate::glue::replace_module(slot, wasm_bytes);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (slots, owner_handle, wasm_bytes);
     }
 }
 

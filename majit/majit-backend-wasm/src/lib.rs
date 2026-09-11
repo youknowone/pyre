@@ -3130,7 +3130,8 @@ impl WasmBackend {
         // on the error path. So install directly and let the build answer,
         // instead of asking it once as a trial and once for real.
         let old_inputs = source_loop.reemit.replace(Some(candidate));
-        match self.reemit_loop(owner) {
+        let extra_retire: Vec<u32> = old_bridge_slots.iter().map(|&(_, slot)| slot).collect();
+        match self.reemit_loop_retiring(owner, &extra_retire) {
             Ok(()) => {
                 diag_bump(31);
                 for _ in 0..attached {
@@ -3145,9 +3146,9 @@ impl WasmBackend {
                 // `bridge_slots` no longer names these — they were removed
                 // above so re-emission cannot replay them. Retract their
                 // LABEL_TARGETS rows here; `reemit_loop` only sees slots
-                // that are still attached.
-                let retired: Vec<u32> = old_bridge_slots.iter().map(|&(_, slot)| slot).collect();
-                source_loop.retract_bridge_label_targets_for_slots(retired);
+                // that are still attached. The replacement bytes were
+                // already written into those slots inside re-emission.
+                source_loop.retract_bridge_label_targets_for_slots(extra_retire);
                 return true;
             }
             Err(error) => {
@@ -3178,6 +3179,15 @@ impl WasmBackend {
     /// second GC reference table or change any reference-constant immediate.
     #[allow(unreachable_code, unused_variables)]
     pub fn reemit_loop(&mut self, token: &JitCellToken) -> Result<(), BackendError> {
+        self.reemit_loop_retiring(token, &[])
+    }
+
+    #[allow(unreachable_code, unused_variables)]
+    fn reemit_loop_retiring(
+        &mut self,
+        token: &JitCellToken,
+        extra_retire_slots: &[u32],
+    ) -> Result<(), BackendError> {
         let compiled = token
             .compiled
             .get()
@@ -3302,6 +3312,15 @@ impl WasmBackend {
         let widened = merged_ref_homes.max(old_homes);
         let widened_labels = merged_labels.max(old_labels);
         let owner_extent_grew = old_homes < widened || old_labels < widened_labels;
+        // Bridges removed before re-emission (inlined regions) still have
+        // compiled callers that baked `return_call_indirect` to those
+        // slots. Point the slots at this replacement so they pick up the
+        // new map; x86 patches the jump instead.
+        crate::failguard::retarget_slots_to_module(
+            extra_retire_slots.iter().copied(),
+            old_handle,
+            &wasm_bytes,
+        );
         #[cfg(target_arch = "wasm32")]
         if new_cells_base != 0 && !owner_extent_grew {
             for (&fail_index, &bridge_slot) in compiled.bridge_slots.borrow().iter() {
@@ -3311,6 +3330,11 @@ impl WasmBackend {
         }
         if owner_extent_grew {
             let retired: Vec<u32> = compiled.bridge_slots.borrow().values().copied().collect();
+            crate::failguard::retarget_slots_to_module(
+                retired.iter().copied(),
+                old_handle,
+                &wasm_bytes,
+            );
             compiled.retract_bridge_label_targets_for_slots(retired);
             compiled.bridge_slots.borrow_mut().clear();
             let owner_tid = compiled.trace_id;
@@ -3365,6 +3389,11 @@ impl WasmBackend {
                         .filter(|&(&(tid, _), _)| tid == region.trace_id)
                         .map(|(_, &slot)| slot)
                         .collect();
+                    crate::failguard::retarget_slots_to_module(
+                        retired.iter().copied(),
+                        old_handle,
+                        &wasm_bytes,
+                    );
                     compiled.retract_bridge_label_targets_for_slots(retired);
                     compiled
                         .chained_bridge_slots
