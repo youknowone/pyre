@@ -4480,6 +4480,15 @@ fn jit_ca_handle_guard_failure(
     let n_fail_args = descr_fd.fail_arg_types().len();
     let fail0 = unsafe { majit_backend::get_int_value(deadframe, descr_fd, 0) };
     let guard_value_operand = guard_value_operand_present.then_some(guard_value_operand);
+    // pyjitpl.py: the virtualizable stays a GC root for the whole
+    // handle_fail. `must_compile` and `get_compiled_exit_layout` allocate,
+    // so root failarg 0 before either runs — a raw `&mut PyFrame` taken
+    // here would dangle by the time `trace_and_compile_from_bridge`
+    // builds its `FrameRoot`.
+    if fail0 == 0 {
+        return false;
+    }
+    let mut frame_root = FrameRoot::new(unsafe { &mut *(fail0 as *mut PyFrame) });
 
     // This callback has no channel for the exception value carried by a
     // failing CALL_ASSEMBLER exception guard.  Compiling from its post-call
@@ -4532,15 +4541,6 @@ fn jit_ca_handle_guard_failure(
         return false;
     };
 
-    // Obtain callee frame from deadframe vable header.
-    // pyre vable_boxes = [frame, ni, code, vsd, ns, locals..., stack...],
-    // so failarg 0 is the callee's PyFrame pointer.
-    let frame_ptr = fail0 as *mut PyFrame;
-    if frame_ptr.is_null() {
-        return false;
-    }
-    let frame = unsafe { &mut *frame_ptr };
-
     // compile.py try/finally: `start_compiling()` before
     // bridge, `done_compiling()` on every unwind path.  RAII guard
     // dispatches both via `descr.as_fail_descr()` (instance-method
@@ -4571,8 +4571,14 @@ fn jit_ca_handle_guard_failure(
                 index == 0 || exit_layout.is_traced_ref_slot(index)
             })
         };
-        match trace_and_compile_from_bridge(&descr_arc, frame, &raw_values, &exit_layout, 0, false)
-        {
+        let compiled = match trace_and_compile_from_bridge(
+            &descr_arc,
+            frame_root.frame(),
+            &raw_values,
+            &exit_layout,
+            0,
+            false,
+        ) {
             BridgeResolution::CompiledContinue => true,
             BridgeResolution::ResumeBlackhole => false,
             // Unreachable: for this caller a kept stash takes the
@@ -4585,7 +4591,8 @@ fn jit_ca_handle_guard_failure(
                 );
                 false
             }
-        }
+        };
+        compiled
     };
     // compile.py record_loop_or_bridge registers every bridge's dependencies.
     crate::eval::register_quasi_immutable_deps(source_green_key);

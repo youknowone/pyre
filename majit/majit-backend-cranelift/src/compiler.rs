@@ -3758,15 +3758,23 @@ fn call_assembler_guard_failure_inner(
     let owning_jct = majit_backend::descr_owning_jct(fail_descr);
     maybe_increment_fail_count(fail_descr);
 
-    // compile.py handle_fail would call `_trace_and_compile_from_bridge`
-    // here. Cranelift's CALL_ASSEMBLER walk is not collection-safe:
-    // `try_execute_residual_call_via_executor` snapshots `locals_w`
-    // and the heapcache holds raw GCREFs that are not rewritten when
-    // the nursery moves. On `exception_reused_object_tb_not_doubled`
-    // that walk SIGSEGVs in memcpy. Dynasm still compiles the bridge
-    // (`save_all_regs` + rd_locs). This arm falls through to
-    // `resume_in_blackhole`, the same continuation
-    // `ResumeGuardForcedDescr.handle_fail` takes.
+    // compile.py handle_fail → must_compile → bridge tracing.
+    // Check jitcounter threshold; if reached, trace alternate path and
+    // compile bridge. The bridge is attached to fail_descr for fast
+    // dispatch on subsequent guard failures.  Skipped on giveup (None).
+    if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
+        if bridge_fn(
+            frame_ptr as *mut majit_backend::jitframe::JitFrame,
+            fail_descr_ptr as usize,
+            0,
+            false,
+        ) {
+            // compile.py `_trace_and_compile_from_bridge` / dynasm
+            // parity: the hook traces and attaches the bridge; the
+            // current occurrence still resumes through blackhole
+            // instead of re-entering the new bridge.
+        }
+    }
     let _ = owning_jct;
 
     // resume.py blackhole_from_resumedata parity: materialize

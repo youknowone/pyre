@@ -4086,15 +4086,23 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let mut residual_locals_roots = ((fbw_debug_abort_enabled()
         || fbw_import_residual_locals_enabled())
         && is_may_force
-        && live_frame != 0)
-        .then(|| unsafe {
-            let pf = &*(live_frame as *const pyre_interpreter::PyFrame);
-            let snapshot = locals_w!(pf).as_slice().to_vec();
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.publish(&snapshot);
-            roots.normalize(base, snapshot.len());
-            (roots, base, snapshot.len())
-        });
+        && live_frame != 0
+        && majit_gc::gc_owns_object(live_frame))
+    .then(|| unsafe {
+        // The residual is a collection point. `live_frame` is a raw
+        // copy of the virtualizable; follow the nursery stub before
+        // projecting `locals_cells_stack_w` (`incminimark`
+        // `gc_current_object_address`). A collected frame is refused
+        // by `gc_owns_object` above so this memcpy never runs on a
+        // from-space slice (exception_reused_object_tb_not_doubled).
+        let live_frame = majit_gc::gc_current_object_address(live_frame);
+        let pf = &*(live_frame as *const pyre_interpreter::PyFrame);
+        let snapshot = locals_w!(pf).as_slice().to_vec();
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.publish(&snapshot);
+        roots.normalize(base, snapshot.len());
+        (roots, base, snapshot.len())
+    });
     let exec_result = {
         let escape_frame = if is_may_force { live_frame } else { 0 };
         // Latch the operand-stack mirror for the escape flush: at force time
