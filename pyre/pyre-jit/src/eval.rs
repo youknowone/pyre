@@ -9839,19 +9839,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // the `action_dispatcher` slow path itself is still a stub
         // pending the actionflag port.
         //
-        // This is `dispatch_bytecode`'s NON-jitted arm only.  Its jitted arm
-        // (`if jit.we_are_jitted(): _d = self.debugdata; ...`) has no
-        // counterpart here because this body is never traced: pyre records
-        // from a per-CodeObject JitCode built by `jit/codewriter.rs` and walked
-        // by `pyre-jit-trace`'s `run_perfn_walk`, not from this Rust loop.  The
-        // port of that arm is `record_portal_debugdata_guard`
-        // (`pyre-jit-trace/src/jitcode_dispatch/mod.rs`), which runs at the
-        // portal merge point — the walker's counterpart of this loop's top.
-        // `we_are_jitted()` here would be a runtime thread-local set only while
-        // cranelift-compiled code is on the stack, not the folded compile-time
-        // constant upstream's translator sees, so splitting on it would strip
-        // the ticker from nested interpreted frames rather than from traced
-        // ones.
+        // pyopcode.py dispatch_bytecode: ticker / bytecode_trace is the
+        // non-jitted arm. The jitted arm is still folded at the portal
+        // merge point (`record_portal_debugdata_guard`); wrapping this
+        // block in `we_are_jitted()` currently drops the portal graph.
         let ec_ptr = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
             // Keep the JIT portal's concrete dispatch in lockstep with

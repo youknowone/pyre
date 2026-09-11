@@ -3357,9 +3357,13 @@ pub unsafe fn w_code_set_hidden_applevel(obj: PyObjectRef, hidden_applevel: bool
 
 /// Extract the opaque code pointer from a known PyCode.
 ///
+/// `co_code` is immutable; a constant `PyCode` folds this to the body
+/// pointer so decode can fold `code_unit_at` as well.
+///
 /// # Safety
 /// `obj` must point to a valid `PyCode`.
 #[inline]
+#[majit_macros::elidable_cannot_raise]
 pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const PyCode)).code_ptr }
 }
