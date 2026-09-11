@@ -98,9 +98,48 @@ fn const_ref_replacement(ctx: &OptContext, opref: OpRef) -> Option<Operand> {
     // at the same raw; `find_producer_op` is variant-aware and misses
     // the InputArgRef use.
     if matches!(opref, OpRef::InputArgRef(_)) {
-        return as_const_ref(ctx.get_box_replacement_operand(OpRef::ref_op(opref.raw())));
+        if let Some(term) =
+            as_const_ref(ctx.get_box_replacement_operand(OpRef::ref_op(opref.raw())))
+        {
+            return Some(term);
+        }
+    }
+    // Compact remap / Phase 2 remint: the Const may sit on the bound
+    // InputArg or ResOp host at this raw even when the ctx-keyed
+    // replacement walk starts from a different variant.
+    if let Some(ia) = ctx.inputarg_refs.get(&opref.raw()) {
+        if let Some(term) =
+            as_const_ref(Operand::from_bound_inputarg(ia).get_box_replacement(false))
+        {
+            return Some(term);
+        }
+    }
+    if let Some(op) = ctx
+        .resop_refs
+        .get(&OpRef::ref_op(opref.raw()))
+        .or_else(|| ctx.resop_refs.get(&opref))
+    {
+        if let Some(term) = as_const_ref(Operand::from_bound_op(op).get_box_replacement(false)) {
+            return Some(term);
+        }
     }
     None
+}
+
+/// rewrite.py `remove_constptr` / `get_box_replacement` on the operand
+/// itself. Compact remap keeps the InputArg variant; the Const lives on
+/// that box's `_forwarded`, which `to_opref()` drops. Walk the operand
+/// before falling back to a ctx-keyed lookup.
+fn const_ref_from_operand(arg: &Operand) -> Option<Operand> {
+    let replaced = if arg.const_value().is_some() {
+        arg.clone()
+    } else {
+        arg.get_box_replacement(false)
+    };
+    match replaced.const_value() {
+        Some(Value::Ref(gcref)) if !gcref.is_null() => Some(replaced),
+        _ => None,
+    }
 }
 
 fn callee_rca_virtual_state_summary(
@@ -5586,11 +5625,10 @@ fn assemble_peeled_trace_with_jump_args(
                 continue;
             }
             let op_args = op.getarglist_copy();
-            let all_refs = op_args
-                .iter()
-                .map(|a| a.to_opref())
-                .chain(op.getfailargs().into_iter().flatten().map(|b| b.to_opref()));
-            for arg in all_refs {
+            let fail_ops: Vec<Operand> = op.getfailargs().into_iter().flatten().collect();
+            let all_operands = op_args.iter().cloned().chain(fail_ops);
+            for operand in all_operands {
+                let arg = operand.to_opref();
                 if !is_trace_runtime_ref(arg, constants) {
                     continue; // skip NONE and constants
                 }
@@ -5604,7 +5642,9 @@ fn assemble_peeled_trace_with_jump_args(
                 // preamble rather than carrying it on the header.
                 // `forget_optimization_info` then clears `_forwarded`,
                 // so the backend only sees the SameAs + Const.
-                if let Some(const_op) = const_ref_replacement(ctx, arg) {
+                if let Some(const_op) =
+                    const_ref_from_operand(&operand).or_else(|| const_ref_replacement(ctx, arg))
+                {
                     let tp = const_op.type_();
                     if tp != Type::Void {
                         let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[const_op]);
@@ -6057,9 +6097,21 @@ fn assemble_peeled_trace_with_jump_args(
         // label, so snapshot refs to label args stay intact.
         if let Some(fa) = new_op.fail_args_mut() {
             for a in fa.iter_mut() {
-                if let Some(&mapped) = body_result_remap.get(&a.to_opref())
-                    && seen_body_defs.contains(&a.to_opref())
-                    && !visible_before_label.contains(&a.to_opref())
+                let arg = a.to_opref();
+                // Phase 2 remints a ConstPtr as InputArg at a dead index
+                // (`import_state` source → ConstPtr target). rewrite.py
+                // `remove_constptr` drops Const from snapshots; emit the
+                // Const on the failarg instead of leaving a producer-less
+                // InputArg the backend cannot bind.
+                if let Some(const_op) =
+                    const_ref_from_operand(a).or_else(|| const_ref_replacement(ctx, arg))
+                {
+                    *a = const_op;
+                    continue;
+                }
+                if let Some(&mapped) = body_result_remap.get(&arg)
+                    && seen_body_defs.contains(&arg)
+                    && !visible_before_label.contains(&arg)
                 {
                     *a = match emitted_at.get(&mapped) {
                         Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
@@ -9326,6 +9378,60 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[OpRef::int_op(10), OpRef::int_op(8)]
         );
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_rewrites_constptr_failarg_remint() {
+        // Phase 2 remints a folded ConstPtr as InputArgRef(inputarg_base+k).
+        // Guard failargs still mention the remint; emit the Const on the
+        // snapshot instead of leaving a producer-less InputArg.
+        let inputarg_base = 99u32;
+        let remint = OpRef::input_arg_ref(inputarg_base);
+        let ptr = GcRef(0x1000);
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::GuardNotInvalidated, &[]);
+                op.setfailargs(vec![rooted_inputarg_operand(Type::Ref, remint.raw())].into());
+                op
+            },
+            Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Ref, 0)]),
+        ];
+        let mut ctx = assemble_test_context(&[], &p2_ops, 1);
+        let remint_box = ctx.materialize_operand_at(remint);
+        ctx.seed_constant(&remint_box, Value::Ref(ptr));
+        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
+            .iter()
+            .map(|op| std::rc::Rc::new(op.clone()))
+            .collect();
+        let combined = assemble_peeled_trace_with_jump_args(
+            &[],
+            &p2_ops_rc,
+            &[OpRef::input_arg_ref(0)],
+            &[OpRef::input_arg_ref(0)],
+            &[],
+            &[],
+            1,
+            inputarg_base,
+            false,
+            &[],
+            &majit_ir::ConstMap::default(),
+            None,
+            None,
+            &[],
+            &mut Vec::new(),
+            &mut ctx,
+        );
+        let guard = combined
+            .iter()
+            .find(|op| op.opcode == OpCode::GuardNotInvalidated)
+            .expect("guard");
+        let failargs: Vec<OpRef> = guard
+            .getfailargs()
+            .expect("failargs")
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(failargs, vec![OpRef::const_ptr(ptr)]);
     }
 
     #[test]
