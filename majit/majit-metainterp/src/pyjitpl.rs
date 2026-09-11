@@ -8408,6 +8408,21 @@ impl<M: Clone> MetaInterp<M> {
         //
         // The abort ceiling turns a key that keeps producing this shape into a
         // `JC_DONT_TRACE_HERE`, so the frontend converges on interpreting it.
+        //
+        // A constant JUMP arg the body never reads is not a derived next-iter
+        // value — it is the recorded iteration's leftover in an unread slot.
+        // Rewrite those back onto the LABEL boxes so the single label stays a
+        // general entry (the quine hang was this overwrite). A constant the
+        // body actually consumes is left in place, and the refusal below still
+        // catches that remaining specialized shape.
+        if no_unroll && retried_without_unroll {
+            Self::despecialize_unread_closing_jump_slots(&compiled_ops);
+        }
+        // Remaining specializing JUMP slots are values the body reads — the
+        // recorded next-iter constants. `compile.py compile_simple_loop`
+        // publishes that shape (`patch_jumpop_at_end=True`); refusing it was
+        // a deviation that forced this driver onto a two-phase peel of a
+        // ~27k-op recording. Count the shape, do not abort it.
         if no_unroll
             && retried_without_unroll
             && Self::closing_jump_fixes_label_slots(&compiled_ops)
@@ -8417,13 +8432,10 @@ impl<M: Clone> MetaInterp<M> {
             ));
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] unroll-free loop label is specialized by its own \
-                     closing jump at key={green_key}"
+                    "[jit] unroll-free loop label keeps a body-read constant \
+                     on its closing jump at key={green_key}"
                 );
             }
-            self.warm_state.abort_tracing(green_key, false);
-            self.exported_state = None;
-            return CompileOutcome::Aborted;
         }
 
         // Use the pre-allocated token object if available (for self-recursion
@@ -11322,6 +11334,7 @@ impl<M: Clone> MetaInterp<M> {
         );
 
         let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        Self::despecialize_unread_closing_jump_slots(&optimized_ops);
 
         // This path mints one TargetToken with no virtual state and no
         // preamble in front of it, so its LABEL is the only entry the key
@@ -11860,6 +11873,47 @@ impl<M: Clone> MetaInterp<M> {
             packed.push(value);
         }
         Some(packed)
+    }
+
+    /// Rewrite unread JUMP constants back onto the LABEL boxes they specialize.
+    ///
+    /// A simple-loop LABEL is a general entry. The recorded iteration may
+    /// still close with a constant in a slot the body never reads; leaving
+    /// that constant on the JUMP overwrites any other value a bridge supplies
+    /// on the first back edge. A constant the body consumes is a real
+    /// next-iter value and is left in place — `closing_jump_fixes_label_slots`
+    /// still sees that remaining specialized shape.
+    fn despecialize_unread_closing_jump_slots(ops: &[majit_ir::OpRc]) -> usize {
+        let Some(jump) = ops.last().filter(|op| op.opcode == OpCode::Jump) else {
+            return 0;
+        };
+        let Some(label) = ops.iter().find(|op| op.opcode == OpCode::Label) else {
+            return 0;
+        };
+        let jump_args = jump.getarglist();
+        let label_args = label.getarglist();
+        let n = jump_args.len().min(label_args.len());
+        let mut rewritten = 0;
+        for i in 0..n {
+            if !jump_args[i].is_constant() || label_args[i].is_constant() {
+                continue;
+            }
+            let slot = label_args[i].to_opref();
+            let used = ops.iter().any(|op| {
+                if op.opcode == OpCode::Label || op.opcode == OpCode::Jump {
+                    return false;
+                }
+                op.with_arglist(|args| {
+                    args.iter()
+                        .any(|arg| !arg.is_constant() && arg.to_opref() == slot)
+                })
+            });
+            if !used {
+                jump.setarg(i, label_args[i].clone());
+                rewritten += 1;
+            }
+        }
+        rewritten
     }
 
     /// Whether the loop's own closing JUMP fills a slot the LABEL declares as
@@ -28912,6 +28966,38 @@ mod closing_jump_fixes_label_slots_tests {
             OpCode::Jump,
             &[boxed(1), boxed(2)]
         )]));
+    }
+
+    #[test]
+    fn unread_jump_constant_is_rewritten_onto_the_label_box() {
+        let ops = vec![
+            op(OpCode::Label, &[boxed(1), boxed(2)]),
+            op(OpCode::IntAdd, &[boxed(1), boxed(1)]),
+            op(OpCode::Jump, &[boxed(1), OpRef::ConstInt(605)]),
+        ];
+        assert_eq!(
+            MetaInterp::<()>::despecialize_unread_closing_jump_slots(&ops),
+            1
+        );
+        assert!(
+            !MetaInterp::<()>::closing_jump_fixes_label_slots(&ops),
+            "the unread constant must not remain as a specializing JUMP arg"
+        );
+        assert!(!ops[2].arg(1).is_constant());
+    }
+
+    #[test]
+    fn a_jump_constant_the_body_reads_is_left_in_place() {
+        let ops = vec![
+            op(OpCode::Label, &[boxed(1), boxed(2)]),
+            op(OpCode::IntAdd, &[boxed(2), boxed(2)]),
+            op(OpCode::Jump, &[boxed(1), OpRef::ConstInt(605)]),
+        ];
+        assert_eq!(
+            MetaInterp::<()>::despecialize_unread_closing_jump_slots(&ops),
+            0
+        );
+        assert!(MetaInterp::<()>::closing_jump_fixes_label_slots(&ops));
     }
 }
 

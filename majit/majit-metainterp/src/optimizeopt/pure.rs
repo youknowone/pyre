@@ -65,7 +65,10 @@ struct KnownResultEntry {
 #[derive(Clone, Debug)]
 enum PureRingValue {
     Direct(OpRef),
-    Preamble { pop: PreambleOp, forced: Option<OpRef> },
+    Preamble {
+        pop: PreambleOp,
+        forced: Option<OpRef>,
+    },
 }
 
 impl PureRingValue {
@@ -106,13 +109,7 @@ impl RecentPureOps {
     /// shortpreamble.py `opt.pure(opnum, PreambleOp(...))` — the same ring
     /// RPython `getrecentops` writes, not a side list.
     fn insert_preamble(&mut self, key: PureOpKey<Operand>, pop: PreambleOp) {
-        self.insert_value(
-            key,
-            PureRingValue::Preamble {
-                pop,
-                forced: None,
-            },
-        );
+        self.insert_value(key, PureRingValue::Preamble { pop, forced: None });
     }
 
     fn insert_value(&mut self, key: PureOpKey<Operand>, value: PureRingValue) {
@@ -2083,7 +2080,10 @@ mod tests {
             OpCode::IntAdd,
             &[Operand::const_from_value(Value::Int(7)), b],
         );
-        assert_eq!(pass.get_pure_result(&query, &mut ctx), Some(OpRef::int_op(4)));
+        assert_eq!(
+            pass.get_pure_result(&query, &mut ctx),
+            Some(OpRef::int_op(4))
+        );
     }
 
     #[test]
