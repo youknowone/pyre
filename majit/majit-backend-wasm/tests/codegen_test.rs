@@ -358,13 +358,20 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     let loops = stat_value(&stderr, "cl_ok");
     let bridges = stat_value(&stderr, "BRIDGE_OK");
     let reemits = stat_value(&stderr, "reemit_ok");
+    let compiles = stat_value(&stderr, "compiles");
+    let cache_hits = stat_value(&stderr, "compile_cache_hits");
     assert!(
         reemits <= bridges,
         "more owner re-emissions ({reemits}) than bridges to have merged:\n{stderr}"
     );
+    // A merge that re-emits an already-cached owner increments `reemit_ok`
+    // without another host compile. ubuntu-24.04 read compiles=30 against
+    // loops+bridges+1 with one cache hit.
     assert_eq!(
-        stat_value(&stderr, "compiles") + stat_value(&stderr, "compile_cache_hits"),
-        loops + bridges + reemits
+        compiles + cache_hits,
+        loops + bridges + reemits,
+        "compiles={compiles} cache_hits={cache_hits} loops={loops} \
+         bridges={bridges} reemits={reemits}\n{stderr}"
     );
     assert!(
         stat_value(&stderr, "jit_calls") < 100,
