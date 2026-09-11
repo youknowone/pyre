@@ -952,31 +952,12 @@ impl OptHeap {
     /// caller's `heap.py:809 is_constant()` gate.
     ///
     /// The identity test asks the recorded instance whether it is still the
-    /// field's own, instead of re-reading the field to compare: the two answers
-    /// coincide, because a fresh instance is only ever minted into a field the
-    /// sweep has nulled, and the recorded one needs no second walk from the
-    /// struct to the hidden `mutate_*` slot.
+    /// field's own. A fresh instance is only minted into a field the sweep
+    /// has nulled, so `is_current` is `qmut is not self.qmut`.
     ///
-    /// The value comparison is upstream's closing assert: the recording
-    /// captured the field on `QuasiImmutDescr.constantfieldbox`
-    /// (`quasiimmut.py QuasiImmutDescr.__init__`) and a live re-read
-    /// through `get_runtime_field` is `get_current_constant_fieldvalue`.
-    /// It is answered as a verdict rather than an assert, and skipped
-    /// when the descr carries no captured value.
-    ///
-    /// ⚠️Answering it as a verdict is LOAD-BEARING here and must not be
-    /// demoted to the `debug_assert!` upstream has (gh#964 proposes exactly
-    /// that, on the reading that the identity test above already decides
-    /// every real invalidation). It does not:
-    /// `mapdict::delattr_would_force_quasi_immut` states in its own doc that
-    /// the `PlainAttribute.delete` -> `_copy_attr` -> `add_attr` ->
-    /// `pick_attr` re-add chain is deliberately NOT modelled, and that what
-    /// makes a missed force cost only a wasted trace rather than a wrong
-    /// answer is this revalidation discarding a loop whose recorded value
-    /// moved. A missed force leaves the instance linked, so `is_current` is
-    /// true and only the value has changed — precisely the case the identity
-    /// test cannot see. Modelling that chain, or installing the watcher along
-    /// it, is what has to come first.
+    /// The value comparison is upstream's closing assert
+    /// (`same_constant`). Translated PyPy does not run it; a mismatch
+    /// after identity matches is not `InvalidLoop`.
     fn quasiimmut_field_still_valid(
         _op: &Op,
         obj: OpRef,
@@ -990,17 +971,17 @@ impl OptHeap {
         if !qmutdescr.qmut().is_current() {
             return false;
         }
-        let Some(constantfieldbox) = qmutdescr.constantfieldbox() else {
-            return true;
-        };
-        let Some(currentbox) = ctx
-            .get_runtime_field(obj, qmutdescr.fielddescr())
-            .and_then(|r| r.inline_const_to_value())
-        else {
-            return true;
-        };
-        // history.py `Const.same_constant`.
-        currentbox == constantfieldbox
+        if let (Some(constantfieldbox), Some(currentbox)) = (
+            qmutdescr.constantfieldbox(),
+            ctx.get_runtime_field(obj, qmutdescr.fielddescr())
+                .and_then(|r| r.inline_const_to_value()),
+        ) {
+            debug_assert_eq!(
+                currentbox, constantfieldbox,
+                "quasiimmut.py same_constant after qmut identity"
+            );
+        }
+        true
     }
 
     /// Slot space for the object header words, above every position a parent's
