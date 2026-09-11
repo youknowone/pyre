@@ -74,6 +74,17 @@ fn rewrite_operand(
     ) {
         return load;
     }
+    // rewrite.py keeps a null ConstPtr inline. A live InputArg/Op forwarded
+    // to null still has a runtime pointer (the virtualizable identity);
+    // baking ConstPtr(0) over it publishes null at deopt.
+    if let Some(Value::Ref(gcref)) = replaced.const_value()
+        && gcref.is_null()
+    {
+        let orig = operand.to_opref();
+        if !orig.is_none() && !orig.is_constant() && defined.contains(&orig.raw()) {
+            return operand;
+        }
+    }
     // Off-stream producer: flattening left a `RefOp(pos)` / InputArg whose
     // `_resref` still names the object (`history.py *FrontendOp`). rewrite.py
     // never sees that shape — RPython Box identity keeps the Const on the
@@ -175,20 +186,34 @@ fn leftover_folded_ref(arg: &Operand, defined: &HashSet<u32>) -> Option<GcRef> {
     }
 }
 
-pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRef>) {
+pub fn remove_ref_constants(ops: &[Op], next_pos: u32) -> (Vec<Op>, Vec<GcRef>) {
+    remove_ref_constants_for_inputs(ops, next_pos, &[])
+}
+
+/// Same as [`remove_ref_constants`], but token input indices stay live-ins.
+/// A live InputArg forwarded to null must not be rewritten to `ConstPtr(0)`:
+/// that publishes a null virtualizable identity and panics in
+/// `consume_vable_info`. A dead leftover InputArg (not in this set) is still
+/// interned or inlined as rewrite.py does.
+pub fn remove_ref_constants_for_inputs(
+    ops: &[Op],
+    mut next_pos: u32,
+    input_indices: &[u32],
+) -> (Vec<Op>, Vec<GcRef>) {
     // rewrite.py:352-354 `gcrefs_output_list` / `gcrefs_map` /
     // `gcrefs_recently_loaded`.
     let mut gcrefs: Vec<GcRef> = Vec::new();
     let mut gcrefs_map: IndexMap<usize, u32> = IndexMap::default();
     let mut recently_loaded: IndexMap<u32, Operand> = IndexMap::default();
     let mut out: Vec<Op> = Vec::with_capacity(ops.len());
-    let defined: HashSet<u32> = ops
+    let mut defined: HashSet<u32> = ops
         .iter()
         .filter_map(|op| {
             let pos = op.pos.get();
             (pos != OpRef::NONE && !pos.is_constant()).then_some(pos.raw())
         })
         .collect();
+    defined.extend(input_indices.iter().copied());
 
     for op in ops {
         // rewrite.py:1005 — the per-basic-block CSE cache is dropped at
@@ -3703,6 +3728,26 @@ mod tests {
         assert_eq!(out[0].opcode, OpCode::LoadFromGcTable);
         assert_eq!(out[1].opcode, OpCode::Label);
         assert_eq!(out[1].arg(0).to_opref(), OpRef::ref_op(0));
+    }
+
+    #[test]
+    fn remove_ref_constants_keeps_live_inputarg_forwarded_to_null() {
+        // Token input 0 is the virtualizable identity. Optimizer forwarding
+        // it to ConstPtr(0) must not bake that null into the guard snapshot:
+        // deopt would then call consume_vable_info with identity 0.
+        let ia = InputArg::new_ref_rc(0);
+        let operand = Operand::from_bound_inputarg(&ia);
+        operand.set_forwarded_const(Const::Ref(GcRef(0)));
+        let guard = Op::new(OpCode::GuardTrue, &[operand.clone()]);
+        guard.setfailargs(vec![operand].into());
+        let (out, gcrefs) = remove_ref_constants_for_inputs(&[guard], 1, &[0]);
+        assert!(gcrefs.is_empty(), "null must stay un-interned");
+        let fa = out[0].getfailargs().expect("guard failargs");
+        assert!(
+            fa[0].to_opref().is_input_arg(),
+            "live InputArg forwarded to null must stay an InputArg, got {:?}",
+            fa[0].to_opref()
+        );
     }
 
     impl GcRewriterImpl {

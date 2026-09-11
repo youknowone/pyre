@@ -3224,6 +3224,113 @@ fn test_stray_label_inputarg_is_seeded() {
 }
 
 #[test]
+fn test_stray_failarg_ref_declines() {
+    // Same leftover InputArgRef as `test_stray_label_inputarg_is_seeded`,
+    // but now it is a guard snapshot. Seeding 0 compiles a null identity
+    // and panics in `consume_vable_info` / `BytecodeCorruption` at deopt.
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_ref(0)],
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_ref(99),
+        ],
+    );
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[
+                rb(OpRef::input_arg_ref(0)),
+                rb(OpRef::input_arg_ref(1)),
+                rb(OpRef::input_arg_ref(99)),
+            ],
+        ),
+        guard,
+        Op::new(
+            OpCode::Jump,
+            &[
+                rb(OpRef::input_arg_ref(0)),
+                rb(OpRef::input_arg_ref(1)),
+                rb(OpRef::input_arg_ref(99)),
+            ],
+        ),
+    ];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants,
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let error = match codegen::build_wasm_module(&inputs) {
+        Ok(_) => panic!("a stray Ref failarg must decline, not compile as null"),
+        Err(error) => error,
+    };
+    let msg = error.to_string();
+    assert!(
+        msg.contains("value[99]") || msg.contains("InputArgRef(99)"),
+        "decline must name the stray failarg, got {msg}"
+    );
+}
+
+#[test]
+fn test_force_arm_accepts_constptr_failarg() {
+    // `emit_force_arm` used to call `OpRef::raw()` on every failarg.
+    // An inline `ConstPtr` (null or interned) has no raw index and panicked
+    // while compiling a `CallMayForce` + `GuardNotForced` bridge.
+    let call = make_op(
+        OpCode::CallMayForceI,
+        &[OpRef::const_int(42)],
+        OpRef::int_op(1),
+    );
+    call.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        vec![],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    ));
+    let guard = Op::new(OpCode::GuardNotForced, &[]);
+    guard.setfailargs(smallvec![
+        rb(OpRef::input_arg_ref(0)),
+        rb(OpRef::const_ptr(majit_ir::GcRef(0))),
+    ]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    let bytes = build_module_with_write_barrier_target(
+        &[InputArg::from_type(Type::Ref, 0)],
+        &[call, guard, finish],
+        127,
+    );
+    validate_wasm(&bytes);
+}
+
+#[test]
 fn test_float_ops() {
     let inputargs = vec![
         InputArg::from_type(Type::Float, 0),
