@@ -520,18 +520,20 @@ mod virt_array_with_float_scalar {
         };
         let program: &Bytecode = &[OP_NOP, OP_STEP];
         let meta = state.build_meta(0, program);
+        // `virtualizable.py VirtualizableInfo.__init__`: `sp` and `acc` sit
+        // on the virtualizable with `stack`, so they are not independent
+        // JitDriver reds. The red block is the fixed `[int]` cells plus the
+        // one identity.
         assert_eq!(
             state.live_value_types(&meta),
             vec![
-                majit_ir::Type::Int,   // sp
-                majit_ir::Type::Int,   // cells[0]
-                majit_ir::Type::Int,   // cells[1]
-                majit_ir::Type::Ref,   // __vable_identity
-                majit_ir::Type::Float, // acc
+                majit_ir::Type::Int, // cells[0]
+                majit_ir::Type::Int, // cells[1]
+                majit_ir::Type::Ref, // __vable_identity
             ],
             "no `stack` element belongs in the red block",
         );
-        assert_eq!(state.extract_live(&meta).len(), 5);
+        assert_eq!(state.extract_live(&meta).len(), 3);
     }
 
     #[test]
@@ -547,31 +549,26 @@ mod virt_array_with_float_scalar {
         let mut sym = <MixedState as JitState>::create_sym(&meta, 0);
         state.initialize_sym(&mut sym, &meta);
 
-        // The mints, in the flat order `live_value_types` above declares.
-        // Spelled out rather than asserted `is_some` so the test also states
-        // WHICH position each field claims.
-        assert_eq!(sym.sp, majit_ir::OpRef::input_arg_int(0));
-        assert_eq!(sym.cells[0], majit_ir::OpRef::input_arg_int(1));
-        assert_eq!(sym.cells[1], majit_ir::OpRef::input_arg_int(2));
-        assert_eq!(sym.__vable_identity, majit_ir::OpRef::input_arg_ref(3));
-        assert_eq!(sym.acc, majit_ir::OpRef::input_arg_float(4));
+        // The mints that remain on the JitSym. `sp` / `acc` belong to the
+        // virtualizable (`virtualizable.py VirtualizableInfo.__init__`) and
+        // are not JitSym slots.
+        assert_eq!(sym.cells[0], majit_ir::OpRef::input_arg_int(0));
+        assert_eq!(sym.cells[1], majit_ir::OpRef::input_arg_int(1));
+        assert_eq!(sym.__vable_identity, majit_ir::OpRef::input_arg_ref(2));
 
         <MixedState as JitState>::clear_sym_inputarg_bindings(&mut sym);
 
-        assert!(sym.sp.is_none(), "int scalar kept its position");
         assert!(sym.cells[0].is_none(), "array cell 0 kept its position");
         assert!(sym.cells[1].is_none(), "array cell 1 kept its position");
         assert!(
             sym.__vable_identity.is_none(),
             "the virtualizable identity kept its position"
         );
-        assert!(sym.acc.is_none(), "float scalar kept its position");
 
         // The concrete mirrors are runtime data, not positions: clearing must
         // not touch them, or the bridge loses the values `initialize_sym` read
         // off the live state.
-        assert_eq!(sym.sp_value, 7);
         assert_eq!(sym.cells_values, vec![11, 13]);
-        assert_eq!(sym.acc_value, 1.5f64.to_bits() as i64);
+        assert_eq!(sym.stack_len_value, 2);
     }
 }

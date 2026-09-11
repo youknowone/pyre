@@ -2415,7 +2415,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 _statics: &mut ::std::vec::Vec<i64>,
                 arrays: &mut ::std::vec::Vec<::std::vec::Vec<i64>>,
             ) -> bool {
-                _statics.extend([#(#scalar_export_parts),*]);
+                // A virt-array-only state has no static boxes, so this
+                // slice is empty. `extend([])` cannot pick `Extend<i64>`
+                // over `Extend<&i64>`; `extend_from_slice` names `&[i64]`.
+                _statics.extend_from_slice(&[#(#scalar_export_parts),*]);
                 arrays.resize_with(#num_virt_arrays, ::std::vec::Vec::new);
                 #( #virt_array_export_into_parts )*
                 true
