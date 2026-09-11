@@ -203,7 +203,10 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
 
     // Capture the slice receiver and the index operand.
     let (slice, index) = match &graph.blocks[a].operations[ci].kind {
-        OpKind::Call { args, .. } if args.len() == 2 => (args[0].clone(), args[1].clone()),
+        OpKind::Call { args, .. } if args.len() == 2 => (
+            args[0].clone().into_variable(),
+            args[1].clone().into_variable(),
+        ),
         other => {
             return Err(format!(
                 "{name}: slice::get producer op is not a 2-arg call: {other:?}"
@@ -336,7 +339,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
             target: CallTarget::FunctionPath {
                 segments: vec!["__len".to_string()],
             },
-            args: vec![slice],
+            args: crate::model::call_args(vec![slice]),
             result_ty: ValueType::Int,
         },
     });
@@ -345,7 +348,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
         result: Some(cond.clone()),
         kind: OpKind::BinOp {
             op: "lt".to_string(),
-            lhs: index,
+            lhs: index.clone(),
             rhs: len,
             result_ty: ValueType::Int,
         },
@@ -384,7 +387,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "slice".into(), "<Impl>".into(), "get".into()],
                 },
-                args,
+                args: crate::model::call_args(args),
                 result_ty: ValueType::Ref(None),
             },
             true,
@@ -617,7 +620,7 @@ mod tests {
                             "PyObject".into(),
                         ],
                     },
-                    args: vec![opt.clone()],
+                    args: crate::model::call_args(vec![opt.clone()]),
                     result_ty: ValueType::Ref(Some("PyObject".into())),
                 },
                 true,

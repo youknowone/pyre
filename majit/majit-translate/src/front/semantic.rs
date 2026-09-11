@@ -1139,7 +1139,7 @@ mod tests {
         // shapes differ only in whether the value was hinted.
         let passed = if hint.is_some() { hinted } else { param };
         for (callee, arity) in calls {
-            let args = (0..*arity)
+            let args: Vec<Variable> = (0..*arity)
                 .map(|i| {
                     if i == 0 {
                         passed.clone()
@@ -1154,7 +1154,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec![(*callee).to_string()],
                     },
-                    args,
+                    args: crate::model::call_args(args),
                     result_ty: ValueType::Void,
                 },
             });
@@ -1202,7 +1202,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__cast_pointer".to_string(), receiver_root.to_string()],
                     },
-                    args: vec![hinted],
+                    args: crate::model::call_args(vec![hinted]),
                     result_ty: ValueType::Ref(Some(receiver_root.to_string())),
                 },
             });
@@ -1218,7 +1218,7 @@ mod tests {
                     receiver_root: Some(receiver_root.to_string()),
                     resolved_path: None,
                 },
-                args: vec![passed],
+                args: crate::model::call_args(vec![passed]),
                 result_ty: ValueType::Void,
             },
         });
@@ -1385,7 +1385,7 @@ mod tests {
                         receiver_root: Some("PyFrame".to_string()),
                         resolved_path: None,
                     },
-                    args: vec![carried],
+                    args: crate::model::call_args(vec![carried]),
                     result_ty: ValueType::Void,
                 },
             });
@@ -1536,7 +1536,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["call_function".to_string()],
                     },
-                    args: vec![normal],
+                    args: crate::model::call_args(vec![normal]),
                     result_ty: ValueType::Void,
                 },
             });
@@ -1603,7 +1603,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["init_cells".to_string()],
                 },
-                args: vec![hinted],
+                args: crate::model::call_args(vec![hinted]),
                 result_ty: ValueType::Void,
             },
         });
@@ -1658,7 +1658,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["call_function".to_string()],
                 },
-                args: vec![merged],
+                args: crate::model::call_args(vec![merged]),
                 result_ty: ValueType::Void,
             },
         });
@@ -1720,7 +1720,7 @@ mod tests {
                 _ => None,
             })
             .expect("the log call");
-        log_call[0] = crate::flowspace::model::Variable::named("unrelated");
+        log_call[0] = crate::flowspace::model::Variable::named("unrelated").into();
         propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(fns[1].graph.access_directly, "handle_bytecode is flagged");
         assert!(!fns[2].graph.access_directly, "log is not");

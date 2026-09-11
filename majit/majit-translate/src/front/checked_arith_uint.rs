@@ -156,7 +156,11 @@ fn rewire_one_checked_arith_uint_site(
             let arith = UintArith::from_leaf(leaf).ok_or_else(|| {
                 format!("{name}: unsigned checked lowering does not handle {leaf}")
             })?;
-            (args[0].clone(), args[1].clone(), arith)
+            (
+                args[0].clone().into_variable(),
+                args[1].clone().into_variable(),
+                arith,
+            )
         }
         _ => {
             return Err(format!(
@@ -201,7 +205,7 @@ fn rewire_one_checked_arith_uint_site(
                 ValueType::Unsigned,
             );
             // Unsigned carry: the wrapped sum is strictly below an addend.
-            let ovf = push_binop(graph, a_id, "uint_lt", sum.clone(), lhs, ValueType::Int);
+            let ovf = push_binop(graph, a_id, "uint_lt", sum.clone(), lhs.clone(), ValueType::Int);
             let disc = push_no_overflow_disc(graph, a_id, ovf);
             (sum, disc)
         }
@@ -341,7 +345,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: checked_target(leaf),
-                    args: vec![x, y],
+                    args: crate::model::call_args(vec![x, y]),
                     result_ty: ValueType::Ref(Some("core::option::Option".into())),
                 },
                 true,

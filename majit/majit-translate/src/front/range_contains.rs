@@ -219,7 +219,7 @@ fn rewire_one_range_contains_site(
     let lo_le = graph.alloc_value_var();
     let hi_ge = graph.alloc_value_var();
     let inserts =
-        build_range_contains_compares(&site.result_var, lo_in_c, hi_in_c, x, lo_le, hi_ge);
+        build_range_contains_compares(&site.result_var, lo_in_c, hi_in_c, x.into_variable(), lo_le, hi_ge);
     let ops = &mut graph.blocks[c_idx].operations;
     ops.remove(call_idx);
     for (offset, op) in inserts.into_iter().enumerate() {
@@ -570,7 +570,7 @@ mod tests {
                 n,
                 OpKind::Call {
                     target: new_target(),
-                    args: vec![a.clone(), b.clone()],
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
                     result_ty: ValueType::Ref(Some("RangeInclusive".into())),
                 },
                 true,
@@ -585,7 +585,7 @@ mod tests {
                 c,
                 OpKind::Call {
                     target: contains_target(),
-                    args: vec![range_in_c.clone(), x.clone()],
+                    args: crate::model::call_args(vec![range_in_c.clone(), x.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -640,7 +640,7 @@ mod tests {
                 n,
                 OpKind::Call {
                     target: new_target(),
-                    args: vec![a.clone(), b.clone()],
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
                     result_ty: ValueType::Ref(Some("RangeInclusive".into())),
                 },
                 true,
@@ -664,7 +664,7 @@ mod tests {
                 c,
                 OpKind::Call {
                     target: contains_target(),
-                    args: vec![range_in_c.clone(), x.clone()],
+                    args: crate::model::call_args(vec![range_in_c.clone(), x.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -712,7 +712,7 @@ mod tests {
                 n,
                 OpKind::Call {
                     target: new_target(),
-                    args: vec![a.clone(), b.clone()],
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
                     result_ty: ValueType::Ref(Some("RangeInclusive".into())),
                 },
                 true,
@@ -730,7 +730,7 @@ mod tests {
                 m,
                 OpKind::Call {
                     target: contains_target(),
-                    args: vec![range_in_m.clone(), x],
+                    args: crate::model::call_args(vec![range_in_m.clone(), x]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -790,7 +790,7 @@ mod tests {
                 n,
                 OpKind::Call {
                     target: new_target(),
-                    args: vec![a.clone(), b.clone()],
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
                     result_ty: ValueType::Ref(Some("RangeInclusive".into())),
                 },
                 true,
@@ -804,7 +804,7 @@ mod tests {
                 c,
                 OpKind::Call {
                     target: contains_target(),
-                    args: vec![range_in_c.clone()],
+                    args: crate::model::call_args(vec![range_in_c.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -851,7 +851,7 @@ mod tests {
                 n,
                 OpKind::Call {
                     target: new_target(),
-                    args: vec![a.clone(), b.clone()],
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
                     result_ty: ValueType::Ref(Some("RangeInclusive".into())),
                 },
                 true,
@@ -867,7 +867,7 @@ mod tests {
                 c,
                 OpKind::Call {
                     target: contains_target(),
-                    args: vec![range_in_c.clone(), x],
+                    args: crate::model::call_args(vec![range_in_c.clone(), x]),
                     result_ty: ValueType::Int,
                 },
                 true,

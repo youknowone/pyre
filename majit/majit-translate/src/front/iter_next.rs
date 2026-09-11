@@ -133,7 +133,7 @@ fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> 
             target: CallTarget::FunctionPath { segments },
             args,
             ..
-        } if is_iter_op_segments(segments) => args.first().cloned(),
+        } if is_iter_op_segments(segments) => args.first().cloned().map(LinkArg::into_variable),
         _ => None,
     })
 }
@@ -518,7 +518,7 @@ fn rewire_one_next_site(
     // Capture the iterator operand (the `next` op's single argument) from
     // the raw call, before peeling any recast narrows off its result.
     let iter_arg = match &graph.blocks[a].operations[next_idx].kind {
-        OpKind::Call { args, .. } if args.len() == 1 => args[0].clone(),
+        OpKind::Call { args, .. } if args.len() == 1 => args[0].clone().into_variable(),
         other => {
             return Err(format!(
                 "{name}: next() producer op is not a 1-arg call: {other:?}"
@@ -716,7 +716,7 @@ fn rewire_one_next_site(
                     ..
                 } if args.is_empty() && segments == &["core", "ptr", "null_mut"] => break,
                 OpKind::Call { args, .. } if is_recast_narrow(&op.kind) => {
-                    null_source = args[0].clone();
+                    null_source = args[0].clone().into_variable();
                 }
                 _ => {
                     return Err(format!(
@@ -935,7 +935,7 @@ fn rewire_one_next_site(
             target: CallTarget::FunctionPath {
                 segments: next_op_segments(),
             },
-            args: vec![iter_arg],
+            args: crate::model::call_args(vec![iter_arg]),
             result_ty: item_ty,
         },
     };
@@ -1017,7 +1017,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
                     },
-                    args: vec![container],
+                    args: crate::model::call_args(vec![container]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,

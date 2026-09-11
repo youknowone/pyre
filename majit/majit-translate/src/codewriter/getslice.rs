@@ -563,7 +563,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
                 },
-                args: vec![Variable::new(), Variable::new()],
+                args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
                 result_ty: ValueType::Ref(None),
             },
         };

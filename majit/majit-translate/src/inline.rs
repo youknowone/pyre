@@ -311,7 +311,10 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // inputargs.
     let inputarg_count = callee_entry_block.inputargs.len();
     let entry_arg_vars: Vec<crate::flowspace::model::Variable> =
-        call_args.iter().take(inputarg_count).cloned().collect();
+        crate::model::call_arg_vars(&call_args)
+            .into_iter()
+            .take(inputarg_count)
+            .collect();
     graph.set_goto(block_id, callee_entry, entry_arg_vars);
 }
 
@@ -597,7 +600,10 @@ pub(crate) fn remap_op_kind(
             result_ty,
         } => OpKind::Call {
             target: target.clone(),
-            args: args.iter().map(&remap_var).collect(),
+            args: args
+                .iter()
+                .map(|arg| arg.map_value(|var| remap_var(var)))
+                .collect(),
             result_ty: result_ty.clone(),
         },
         OpKind::GuardTrue { cond } => OpKind::GuardTrue {
@@ -1041,7 +1047,10 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::InteriorFieldWrite {
             base, index, value, ..
         } => vec![clone_var(base), clone_var(index), clone_var(value)],
-        OpKind::Call { args, .. } => args.iter().map(&clone_var).collect(),
+        OpKind::Call { args, .. } => args
+            .iter()
+            .filter_map(|arg| arg.as_variable().map(&clone_var))
+            .collect(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![clone_var(cond)],
         OpKind::GuardValue { value, .. } => vec![clone_var(value)],
         OpKind::AssertGreen { value, .. }
@@ -1732,7 +1741,7 @@ mod tests {
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
-                args: vec![base_var],
+                args: crate::model::call_args(vec![base_var]),
                 result_ty: ValueType::Ref(None),
             },
             true,
@@ -1776,7 +1785,7 @@ mod tests {
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["unknown_fn"]),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
             },
             true,
@@ -1819,7 +1828,7 @@ mod tests {
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
-                args: vec![base_var],
+                args: crate::model::call_args(vec![base_var]),
                 result_ty: ValueType::Ref(None),
             },
             true,
@@ -1844,7 +1853,7 @@ mod tests {
             centry,
             OpKind::Call {
                 target: CallTarget::function_path(["outer"]),
-                args: vec![x_var],
+                args: crate::model::call_args(vec![x_var]),
                 result_ty: ValueType::Ref(None),
             },
             true,
@@ -1899,7 +1908,7 @@ mod tests {
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
-                args: vec![base_var],
+                args: crate::model::call_args(vec![base_var]),
                 result_ty: ValueType::Ref(None),
             },
             true,

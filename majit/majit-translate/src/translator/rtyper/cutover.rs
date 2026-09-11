@@ -5692,7 +5692,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["side_effect".into()],
                     },
-                    args: vec![base.clone(), index.clone()],
+                    args: crate::model::call_args(vec![base.clone(), index.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
             }],
@@ -5968,7 +5968,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["consume".into()],
                     },
-                    args: vec![pay.clone()],
+                    args: crate::model::call_args(vec![pay.clone()]),
                     result_ty: ValueType::Int,
                 },
             }
@@ -6045,7 +6045,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["consume_carrier".into()],
                 },
-                args: vec![consumed_carrier.clone()],
+                args: crate::model::call_args(vec![consumed_carrier.clone()]),
                 result_ty: ValueType::Void,
             },
         });
@@ -6193,7 +6193,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["consume".into()],
                         },
-                        args: vec![threaded.clone()],
+                        args: crate::model::call_args(vec![threaded.clone()]),
                         result_ty: ValueType::Int,
                     },
                 }]
@@ -6500,7 +6500,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                     },
-                    args: vec![fill.clone(), count.clone()],
+                    args: crate::model::call_args(vec![fill.clone(), count.clone()]),
                     result_ty: ValueType::Int,
                 },
             }],
@@ -6748,7 +6748,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["foo".into()],
                     },
-                    args: vec![v1_var.clone(), v2_var.clone()],
+                    args: crate::model::call_args(vec![v1_var.clone(), v2_var.clone()]),
                     result_ty: ValueType::Unknown,
                 },
             }],
@@ -6795,7 +6795,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                     },
-                    args: vec![foo_v10_var.clone(), foo_v11_var.clone()],
+                    args: crate::model::call_args(vec![foo_v10_var.clone(), foo_v11_var.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
             }],

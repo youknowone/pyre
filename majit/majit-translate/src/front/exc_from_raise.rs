@@ -56,68 +56,18 @@
 //! synthesised `type(evalue)` call, which would be a residual with a dead
 //! result register on every raise tail.
 //!
-//! ### TODO: `Constant` SSA carrier shape
+//! ### Operand shape
 //!
-//! Upstream RPython encodes the exception class operand as a
-//! `Constant(class_obj)` SSA value living directly inside
-//! `SpaceOperation.args` — `flowspace/model.py` defines
-//! `Constant(value)`, `flowspace/model.py` makes `args` a mixed
-//! `Variable | Constant` list, and `flowspace/operation.py:666
-//! SimpleCall.eval` reads `w_callable, args_w = self.args[0],
-//! self.args[1:]` — that is, `args[0]` is *itself* the Constant
-//! carrier, with no producing op.
-//!
-//! Pyre's `FunctionGraph` represents every SSA value through a
-//! `Variable` produced by a `SpaceOperation`.  The op-args slot
-//! is currently `Vec<Variable>` and still carries no
-//! `LinkArg`-style mixed enum.  The properly orthodox fix is to
-//! migrate `OpKind::Call.args` to `Vec<LinkArg>` (RPython parity rule
-//! #1: structural equivalence) and update every consumer (~80 sites
-//! across 14 files spanning `front/`, `inline.rs`,
-//! `codewriter/{call,jtransform,liveness,regalloc,assembler,
-//! format,flatten,support}.rs`, `translator/rtyper/rpbc.rs`, plus
-//! tests).  That port is **deferred**.
-//!
-//! Until the `Vec<LinkArg>` migration lands, this helper carries the
-//! constant exception class as the *second segment* of the
-//! `simple_call` Call's `FunctionPath` target — `["simple_call",
-//! exc_class_name]` — instead of as `simple_call.args[0]`.  That
-//! preserves the per-segment string identity of the class without
-//! needing a real `Constant` SSA carrier, but is **not** RPython-
-//! orthodox at the operand level (`args[0]` should be a Constant,
-//! not a path segment).  Three earlier attempts to remove this
-//! adaptation each ran into a different blocker:
-//!
-//! 1. **`["const", X]` Call producer** — emitted a 0-arg Call to
-//!    materialise the class as a real `args[0]` Variable.  Reviewer
-//!    rejected it because RPython has no `const` op at all (Constants
-//!    are SSA values, not ops).
-//! 2. **`FunctionGraph.constants` side table + `alloc_const`** — gave
-//!    each constant a real `Variable` with no producer op, mirroring
-//!    upstream's "Constant has no producer".  Broke regalloc /
-//!    assembler `lookup_coloring_var` because the downstream pipeline
-//!    requires every `args` `Variable` to have a regalloc coloring,
-//!    which non-Variable Constants don't have.  Plumbing constants
-//!    through liveness / regalloc / assembler is deferred.
-//! 3. **`OpKind::Const { value, result_ty }`** — a typed parallel of
-//!    `OpKind::ConstInt(i64)`.  Reviewer would still reject because
-//!    `ConstInt` is itself a deviation
-//!    (RPython has no `const_int` op either), so adding more of the
-//!    same does not improve parity.  Also `ConstValue` lacks
-//!    `Serialize`/`Deserialize` derives, so wiring it into `OpKind`
-//!    bytes-stable serialisation is its own deep change.
-//!
-//! Once the `Vec<LinkArg>` migration is on the roadmap, the helper
-//! collapses to a `LinkArg::Const(ConstValue::HostObject(class))`
-//! at `args[0]` and this comment block goes away.
-//!
-//! ### Operand-position parity (the non-class args)
-//!
-//! `simple_call`'s *non-class* args (the message values) are real
-//! Variables and live at `args[1..]`, matching upstream
-//! `flowspace/operation.py SimpleCall.eval` reading
-//! `args_w = self.args[1:]`.  This part is already orthodox — only
-//! the operand-0 class slot is the deviation noted above.
+//! Upstream encodes the exception class as a `Constant(class_obj)`
+//! living in `SpaceOperation.args` — `flowspace/model.py` makes
+//! `args` a mixed `Variable | Constant` list, and
+//! `flowspace/operation.py SimpleCall.eval` reads
+//! `w_callable, args_w = self.args[0], self.args[1:]`.  The helper
+//! emits that list: `args[0]` is
+//! `LinkArg::Const(HostObject(exc_class))` from
+//! `HOST_ENV.lookup_builtin`, and the message Variables occupy
+//! `args[1..]`.  The Call's `FunctionPath` is the op name
+//! `["simple_call"]`; the adapter does not wrap a second callable.
 //!
 //! The Rust macro → RPython exception class mapping is an adapter
 //! decision (mirroring upstream's per-bytecode adapter at
@@ -136,8 +86,8 @@
 //!   opaque Call targets any more — that earlier deviation is removed
 //!   by the same change that introduced this module.
 
-use crate::flowspace::model::Variable;
-use crate::model::{BlockId, CallTarget, FunctionGraph, OpKind, ValueType};
+use crate::flowspace::model::{ConstValue, Variable, HOST_ENV};
+use crate::model::{BlockId, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
 /// Close `block` with an `(etype, evalue)` Link to `exceptblock`
 /// whose value comes from the canonical RPython `exc_from_raise` op
@@ -145,42 +95,38 @@ use crate::model::{BlockId, CallTarget, FunctionGraph, OpKind, ValueType};
 /// slot reuses `evalue` — see the module-level "etype link arg" note.
 ///
 /// `exc_class_name` is the Python-layer exception class name
-/// (`"AssertionError"`, `"PanicError"`, …) carried as the second
-/// segment of the `simple_call` target's `FunctionPath`.  See the
-/// module-level TODO block for why the class
-/// is not yet at `simple_call.args[0]` — the orthodox fix is the
-/// `Vec<Variable>` → `Vec<LinkArg>` migration tracked separately.
+/// (`"AssertionError"`, `"ValueError"`, …).  It is resolved through
+/// `HOST_ENV.lookup_builtin` and placed at `simple_call.args[0]` as
+/// a `Constant`, matching `flowcontext.py exc_from_raise`
+/// (`op.simple_call(w_arg1, …)` when `w_arg1` is a class Constant).
 ///
 /// `message_args` is the pre-evaluated list of message `Variable`s
 /// (side effects already on the graph from the caller's walk).
 /// Empty for bare `panic!()` / `assert!(cond)`; single element for
 /// `panic!(msg)` / `assert!(cond, msg)`; multiple for
-/// `panic!("fmt", a, b)`.  In every case they become the trailing
-/// positional arguments of the `simple_call` op — `simple_call`
-/// itself is variadic upstream (`flowspace/operation.py:663
-/// SimpleCall(SingleDispatchMixin, CallOp)`, `CallOp.args =
-/// [callable, *args]`), so the multi-arg shape is RPython-canonical.
-pub fn lower_exc_from_raise(
+/// `panic!("fmt", a, b)`.  They become `simple_call.args[1..]`.
+/// `simple_call` is variadic upstream (`flowspace/operation.py
+/// SimpleCall` / `CallOp.args = [callable, *args]`).
+#[allow(dead_code)] // exercised by tests; raise-class sites call this helper
+pub(crate) fn lower_exc_from_raise(
     graph: &mut FunctionGraph,
     block: BlockId,
     exc_class_name: &str,
     message_args: Vec<Variable>,
 ) {
-    // `op.simple_call(const(exc_class), *args)` — upstream
-    // `flowcontext.py:614/623`.  The class is carried as the second
-    // path segment so the single op still models
-    // `simple_call(const(exc_class), *args)`; downstream readers can
-    // reconstruct `(op, const_class, args…)` from `(path[0], path[1],
-    // op.args)`.  This is a documented deviation — see the module-level
-    // docstring for why it stands until the `Vec<Variable>` →
-    // `Vec<LinkArg>` migration lands.
-    let simple_call_target = CallTarget::function_path(["simple_call", exc_class_name]);
+    // `op.simple_call(const(exc_class), *args)` — `flowcontext.py`.
+    let exc_class = HOST_ENV.lookup_builtin(exc_class_name).unwrap_or_else(|| {
+        panic!("lower_exc_from_raise: {exc_class_name} is not a HOST_ENV builtin exception class")
+    });
+    let mut args = Vec::with_capacity(message_args.len() + 1);
+    args.push(LinkArg::from(ConstValue::HostObject(exc_class)));
+    args.extend(message_args.into_iter().map(LinkArg::from));
     let evalue_var = graph
         .push_op_var(
             block,
             OpKind::Call {
-                target: simple_call_target,
-                args: message_args,
+                target: CallTarget::function_path(["simple_call"]),
+                args,
                 result_ty: ValueType::Ref(None),
             },
             true,
@@ -195,12 +141,48 @@ pub fn lower_exc_from_raise(
     // `args[0]`, and `make_exception_link` drops both for a direct `reraise`.
     // So the `etype` link arg is write-only in every emitted jitcode. The
     // emitted drain tail is `-live-` + `raise <evalue>` and nothing else.
-    // Materialising it as a `type(evalue)` call — which pyre
-    // did, because `set_raise_values` takes `Variable`s and every pyre SSA
-    // value needs a producing op (see the `Constant` carrier TODO above) —
-    // left a residual whose result register is dead by construction on every
-    // raise tail in the corpus, and made the raise arm unwalkable in the
-    // blackhole (canonical `inline_call_*` on a callee with no runtime
-    // address). Reuse `evalue`: same ref kind, no new op.
+    // Materialising it as a `type(evalue)` call left a residual whose
+    // result register is dead by construction on every raise tail, and
+    // made the raise arm unwalkable in the blackhole (canonical
+    // `inline_call_*` on a callee with no runtime address). Reuse
+    // `evalue`: same ref kind, no new op.
     graph.set_raise_values(block, evalue_var.clone(), evalue_var);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{CallTarget, FunctionGraph, OpKind};
+
+    #[test]
+    fn lower_exc_from_raise_puts_class_constant_at_args_0() {
+        let mut graph = FunctionGraph::new("exc_from_raise_shape");
+        let start = graph.startblock;
+        let msg = graph.alloc_value_var();
+        lower_exc_from_raise(&mut graph, start, "ValueError", vec![msg.clone()]);
+        let op = graph.blocks[start.0]
+            .operations
+            .last()
+            .expect("simple_call must be emitted");
+        let OpKind::Call { target, args, .. } = &op.kind else {
+            panic!("expected Call, got {:?}", op.kind);
+        };
+        assert_eq!(
+            target,
+            &CallTarget::function_path(["simple_call"]),
+            "FunctionPath is the op name, not the class"
+        );
+        assert_eq!(args.len(), 2);
+        let LinkArg::Const(class) = &args[0] else {
+            panic!("args[0] must be the class Constant");
+        };
+        let expected = HOST_ENV
+            .lookup_builtin("ValueError")
+            .expect("ValueError is a builtin exception");
+        assert!(
+            matches!(&class.value, ConstValue::HostObject(h) if *h == expected),
+            "args[0] must be HOST_ENV ValueError"
+        );
+        assert_eq!(args[1], LinkArg::from(msg));
+    }
 }

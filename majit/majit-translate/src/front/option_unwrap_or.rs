@@ -215,11 +215,11 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     // below from `payload_on_disc_true`.
     let mut payload_sources = carried.clone();
     if !payload_sources.contains(&opt) {
-        payload_sources.push(opt.clone());
+        payload_sources.push(opt.clone().into_variable());
     }
     let mut default_sources = carried.clone();
     if !default_sources.contains(&default) {
-        default_sources.push(default.clone());
+        default_sources.push(default.clone().into_variable());
     }
     let (payload_bb, payload_inputs) = graph.create_block_with_arg_vars(payload_sources.len());
     let (default_bb, default_inputs) = graph.create_block_with_arg_vars(default_sources.len());
@@ -303,7 +303,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
                 op: "ne".to_string(),
-                lhs: opt.clone(),
+                lhs: opt.clone().into_variable(),
                 rhs: nullc,
                 result_ty: ValueType::Int,
             },
@@ -316,7 +316,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
                 op: "ne".to_string(),
-                lhs: opt.clone(),
+                lhs: opt.clone().into_variable(),
                 rhs: none,
                 result_ty: ValueType::Int,
             },
@@ -325,7 +325,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::FieldRead {
-                base: opt.clone(),
+                base: opt.clone().into_variable(),
                 field: FieldDescriptor {
                     name: "__discriminant".to_string(),
                     owner_root: Some(site.enum_owner.clone()),
@@ -367,7 +367,7 @@ pub(crate) fn emit_narrow(
             target: CallTarget::FunctionPath {
                 segments: segments.clone(),
             },
-            args: vec![raw],
+            args: crate::model::call_args(vec![raw]),
             result_ty: result_ty.clone(),
         },
     });
@@ -440,7 +440,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt.clone(), default.clone()],
+                    args: crate::model::call_args(vec![opt.clone(), default.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -514,7 +514,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt.clone(), default.clone()],
+                    args: crate::model::call_args(vec![opt.clone(), default.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -532,7 +532,7 @@ mod tests {
                             "PyObject".into(),
                         ],
                     },
-                    args: vec![result.clone()],
+                    args: crate::model::call_args(vec![result.clone()]),
                     result_ty: ValueType::Ref(Some("PyObject".into())),
                 },
                 true,
@@ -591,7 +591,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: result_target(),
-                    args: vec![res.clone(), default.clone()],
+                    args: crate::model::call_args(vec![res.clone(), default.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -640,7 +640,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt, default],
+                    args: crate::model::call_args(vec![opt, default]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -677,7 +677,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt.clone(), default.clone()],
+                    args: crate::model::call_args(vec![opt.clone(), default.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -747,7 +747,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt, default],
+                    args: crate::model::call_args(vec![opt, default]),
                     result_ty: ValueType::Int,
                 },
                 true,

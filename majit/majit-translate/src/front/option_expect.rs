@@ -154,7 +154,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
     // source-var lists double as the branch link args.
     let mut then_sources = carried.clone();
     if !then_sources.contains(&opt) {
-        then_sources.push(opt.clone());
+        then_sources.push(opt.clone().into_variable());
     }
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, _else_inputs) = graph.create_block_with_arg_vars(0);
@@ -216,7 +216,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
                 op: "ne".to_string(),
-                lhs: opt.clone(),
+                lhs: opt.clone().into_variable(),
                 rhs: nullc,
                 result_ty: ValueType::Int,
             },
@@ -225,7 +225,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::FieldRead {
-                base: opt.clone(),
+                base: opt.clone().into_variable(),
                 field: FieldDescriptor {
                     name: "__discriminant".to_string(),
                     owner_root: Some(site.option_owner.clone()),
@@ -266,7 +266,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: expect_target(),
-                    args: vec![opt.clone(), msg],
+                    args: crate::model::call_args(vec![opt.clone(), msg]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -336,7 +336,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: expect_target(),
-                    args: vec![opt],
+                    args: crate::model::call_args(vec![opt]),
                     result_ty: ValueType::Int,
                 },
                 true,

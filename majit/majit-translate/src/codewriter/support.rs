@@ -181,10 +181,11 @@ pub(crate) fn split_before_jit_merge_point(
         Some(JitMarkerKey::JitMergePoint),
         "split portal block must start with jit_merge_point"
     );
-    let marker_args = args
-        .get(1..)
-        .expect("jit_merge_point method call must carry its receiver");
-    let (greens, reds) = decode_hp_hint_args(marker_args, numgreens, numreds);
+    let marker_args = crate::model::call_arg_vars(
+        args.get(1..)
+            .expect("jit_merge_point method call must carry its receiver"),
+    );
+    let (greens, reds) = decode_hp_hint_args(&marker_args, numgreens, numreds);
     let mut linkargs = greens;
     linkargs.extend(reds);
     crate::unsimplify::split_block(graph, portalblock, 0, Some(&linkargs))
@@ -276,7 +277,8 @@ pub fn decode_builtin_call(
     match &op.kind {
         // `support.py:756-759`: op.opname == 'direct_call' → resolve via fnobj
         OpKind::Call { target, args, .. } => {
-            let args: &[crate::flowspace::model::Variable] = args.as_slice();
+            let args = crate::model::call_arg_vars(args);
+            let args: &[crate::flowspace::model::Variable] = &args;
             // `support.py decode_builtin_call fnobj = op.args[0].value._obj` →
             // `:759 get_call_oopspec_opargs(fnobj, opargs)` →
             // `:707 operation_name, args = ll_func.oopspec.split('(', 1)`.
@@ -1254,7 +1256,7 @@ mod tests {
             result: None,
             kind: OpKind::Call {
                 target,
-                args: arg_vars.clone(),
+                args: crate::model::call_args(arg_vars.clone()),
                 result_ty: crate::model::ValueType::Int,
             },
         };

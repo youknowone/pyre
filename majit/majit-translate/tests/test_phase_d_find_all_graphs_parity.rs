@@ -161,7 +161,7 @@ fn build_indirect_caller_graph(name: &str, trait_root: &str, method_name: &str) 
             result: Some(result_var.clone()),
             kind: OpKind::Call {
                 target: CallTarget::indirect(trait_root, method_name),
-                args: vec![receiver],
+                args: majit_translate::model::call_args(vec![receiver]),
                 result_ty: ValueType::Int,
             },
         });

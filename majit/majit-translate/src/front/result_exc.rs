@@ -830,7 +830,7 @@ pub(crate) fn materialize_error_to_exc_object(
                     target: CallTarget::FunctionPath {
                         segments: segments.iter().copied().map(str::to_string).collect(),
                     },
-                    args: vec![payload],
+                    args: crate::model::call_args(vec![payload]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -1004,8 +1004,8 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
             value,
             ..
         } => vec![base.clone(), elem_index.clone(), value.clone()],
-        OpKind::Call { args, .. }
-        | OpKind::JitDebug { args }
+        OpKind::Call { args, .. } => crate::model::call_arg_vars(args),
+        OpKind::JitDebug { args }
         | OpKind::NewTuple { args }
         | OpKind::NewList { args }
         | OpKind::GetSlice { args }
@@ -1506,7 +1506,7 @@ fn rewire_one_option_ok_or_else_try_site(
     }
     let mut some_sources = carried.clone();
     if !some_sources.contains(&opt) {
-        some_sources.push(opt.clone());
+        some_sources.push(opt.clone().into_variable());
     }
     let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
     let (none_bb, none_inputs) = graph.create_block_with_arg_vars(1);
@@ -1572,7 +1572,7 @@ fn rewire_one_option_ok_or_else_try_site(
                 result: Some(disc.clone()),
                 kind: OpKind::BinOp {
                     op: "ne".to_string(),
-                    lhs: opt.clone(),
+                    lhs: opt.clone().into_variable(),
                     rhs: null,
                     result_ty: ValueType::Int,
                 },
@@ -1584,7 +1584,7 @@ fn rewire_one_option_ok_or_else_try_site(
             .push(crate::model::SpaceOperation {
                 result: Some(disc.clone()),
                 kind: OpKind::FieldRead {
-                    base: opt.clone(),
+                    base: opt.clone().into_variable(),
                     field: crate::model::FieldDescriptor {
                         name: "__discriminant".to_string(),
                         owner_root: Some(site.option_owner.clone()),
@@ -1597,7 +1597,7 @@ fn rewire_one_option_ok_or_else_try_site(
                 },
             });
     }
-    graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, vec![env]);
+    graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, vec![env.into_variable()]);
     Ok(())
 }
 
@@ -2039,7 +2039,7 @@ fn catch_and_rewrap(
                     e_id,
                     OpKind::Call {
                         target: CallTarget::method(method, Some(receiver_root.to_string())),
-                        args: vec![e_exc_value_in],
+                        args: crate::model::call_args(vec![e_exc_value_in]),
                         result_ty: ValueType::Ref(None),
                     },
                     true,
@@ -2722,11 +2722,12 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
             unreachable!("validated RootScope close is a call")
         };
         for arg in args {
-            if !close_vars_a.contains(arg) {
+            let arg = arg.clone().into_variable();
+            if !close_vars_a.contains(&arg) {
                 close_vars_a.push(arg.clone());
             }
-            if !forwarded.contains(arg) {
-                forwarded.push(arg.clone());
+            if !forwarded.contains(&arg) {
+                forwarded.push(arg);
             }
         }
     }
@@ -2761,7 +2762,7 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
                     "error",
                     "exception_object_matches_stop_iteration",
                 ]),
-                args: vec![h_vb.clone()],
+                args: crate::model::call_args(vec![h_vb.clone()]),
                 result_ty: ValueType::Int,
             },
             true,
@@ -2807,7 +2808,7 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
             r_id,
             OpKind::Call {
                 target,
-                args,
+                args: crate::model::call_args(args),
                 result_ty,
             },
             true,
@@ -2976,7 +2977,7 @@ fn remap_root_scope_close_through_links(
                 .position(|v| *v == current)
                 .ok_or_else(|| format!("{name}: close argument is not forwarded"))?;
             current = match link.args.get(pos) {
-                Some(LinkArg::Value(v)) => v.clone(),
+                Some(LinkArg::Value(v)) => v.clone().into(),
                 _ => return Err(format!("{name}: close argument is not a value")),
             };
         }
@@ -3338,7 +3339,7 @@ pub(crate) fn peel_recast_chain_from(
             let OpKind::Call { args, .. } = &op.kind else {
                 return None;
             };
-            if args.first() != Some(&cur) {
+            if args.first().and_then(|a| a.as_variable()) != Some(&cur) {
                 return None;
             }
             op.result.clone().map(|r| (i, r))

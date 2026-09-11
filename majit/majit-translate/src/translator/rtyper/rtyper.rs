@@ -649,6 +649,25 @@ impl RPythonTyper {
         })
     }
 
+    /// RPython `RPythonTyper.lltype_to_classdef_mapping` (`rtyper.py`).
+    ///
+    /// ```python
+    /// def lltype_to_classdef_mapping(self):
+    ///     result = {}
+    ///     for (classdef, _), repr in self.instance_reprs.iteritems():
+    ///         result[repr.lowleveltype] = classdef
+    ///     return result
+    /// ```
+    pub fn lltype_to_classdef_mapping(
+        &self,
+    ) -> HashMap<LowLevelType, Option<Rc<RefCell<crate::annotator::classdesc::ClassDef>>>> {
+        let mut result = HashMap::new();
+        for repr in self.instance_reprs.borrow().values() {
+            result.insert(repr.lowleveltype().clone(), repr.classdef());
+        }
+        result
+    }
+
     /// RPython `ExceptionData.finish(rtyper)`
     /// (`rpython/rtyper/exceptiondata.py:28-32`):
     ///
@@ -2987,6 +3006,14 @@ impl LowLevelFunction {
             result,
             graph: Some(graph),
         }
+    }
+
+    /// Graph identity used as `args[0].value._obj.graph` when comparing
+    /// a `direct_call` funcptr to `exceptiondata.fn_exception_match`.
+    pub fn graph_key(&self) -> Option<usize> {
+        self.graph
+            .as_ref()
+            .map(|g| crate::flowspace::model::GraphKey::of(&g.graph).as_usize())
     }
 }
 
@@ -6202,6 +6229,12 @@ mod tests {
         assert_eq!(inst.gcflavor(), Flavor::Gc);
         assert_eq!(inst.object_type(), &OBJECT.clone());
         drop(cache);
+
+        let mapping = rtyper.lltype_to_classdef_mapping();
+        assert!(
+            mapping.get(&OBJECTPTR.clone()).is_some_and(Option::is_none),
+            "root InstanceRepr maps OBJECTPTR to classdef=None"
+        );
 
         // rtyper.py:71 / exceptiondata.py — ExceptionData fields.
         let ed = rtyper.exceptiondata().expect("exceptiondata");

@@ -230,14 +230,14 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
     // source-var lists double as the branch link args.
     let mut then_sources = carried.clone();
     if !then_sources.contains(&opt) {
-        then_sources.push(opt.clone());
+        then_sources.push(opt.clone().into_variable());
     }
     if !then_sources.contains(&env) {
-        then_sources.push(env.clone());
+        then_sources.push(env.clone().into_variable());
     }
     let mut else_sources = carried.clone();
     if !else_sources.contains(&default) {
-        else_sources.push(default.clone());
+        else_sources.push(default.clone().into_variable());
     }
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, else_inputs) = graph.create_block_with_arg_vars(else_sources.len());
@@ -310,7 +310,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         result: Some(call_result.clone()),
         kind: OpKind::Call {
             target: CallTarget::method("call_once", Some(site.call_once_owner.clone())),
-            args: vec![env_in_then, args_tuple],
+            args: crate::model::call_args(vec![env_in_then, args_tuple]),
             result_ty: site.result_ty.clone(),
         },
     });
@@ -367,7 +367,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
                 op: "ne".to_string(),
-                lhs: opt.clone(),
+                lhs: opt.clone().into_variable(),
                 rhs: nullc,
                 result_ty: ValueType::Int,
             },
@@ -376,7 +376,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::FieldRead {
-                base: opt.clone(),
+                base: opt.clone().into_variable(),
                 field: FieldDescriptor {
                     name: "__discriminant".to_string(),
                     owner_root: Some(site.option_owner.clone()),
@@ -416,7 +416,7 @@ pub(crate) fn emit_narrow(
                     root.clone(),
                 ],
             },
-            args: vec![value],
+            args: crate::model::call_args(vec![value]),
             result_ty: ValueType::Ref(Some(root.clone())),
         },
     });
@@ -458,7 +458,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::method("map_or", Some("core::option::Option".into())),
-                    args: vec![opt.clone(), default.clone(), env.clone()],
+                    args: crate::model::call_args(vec![opt.clone(), default.clone(), env.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -534,7 +534,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::method("map_or", Some("core::option::Option".into())),
-                    args: vec![opt.clone(), default.clone(), env.clone()],
+                    args: crate::model::call_args(vec![opt.clone(), default.clone(), env.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -551,7 +551,7 @@ mod tests {
                             "PyObject".into(),
                         ],
                     },
-                    args: vec![result.clone()],
+                    args: crate::model::call_args(vec![result.clone()]),
                     result_ty: ValueType::Ref(Some("PyObject".into())),
                 },
                 true,
@@ -603,7 +603,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::method("map_or", Some("core::option::Option".into())),
-                    args: vec![opt, default, env],
+                    args: crate::model::call_args(vec![opt, default, env]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -658,7 +658,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::method("map_or", Some("core::option::Option".into())),
-                    args: vec![opt, default, env],
+                    args: crate::model::call_args(vec![opt, default, env]),
                     result_ty: ValueType::Int,
                 },
                 true,

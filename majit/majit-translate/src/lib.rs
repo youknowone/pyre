@@ -2489,7 +2489,7 @@ fn register_configured_jitdrivers(
                         .iter()
                         .skip(1)
                         .take(spec.greens.len())
-                        .cloned()
+                        .filter_map(|a| a.as_variable().cloned())
                         .collect::<Vec<_>>(),
                     _ => panic!("jit_merge_point must be a call"),
                 };
@@ -2501,7 +2501,9 @@ fn register_configured_jitdrivers(
                 // support.py autodetect_jit_markers_redvars: `op.args.extend(reds_v)`
                 // so `decode_hp_hint_args` can split greens/reds off the marker.
                 match &mut portal.block_mut(marker_block).operations[marker_index].kind {
-                    crate::model::OpKind::Call { args, .. } => args.extend(reds.iter().cloned()),
+                    crate::model::OpKind::Call { args, .. } => {
+                        args.extend(reds.iter().cloned().map(crate::model::LinkArg::from));
+                    }
                     _ => panic!("jit_merge_point must be a call"),
                 }
                 reds.len()
@@ -2924,7 +2926,7 @@ mod portal_driver_tests {
                 result: None,
                 kind: OpKind::Call {
                     target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
-                    args: vec![receiver],
+                    args: crate::model::call_args(vec![receiver]),
                     result_ty: ValueType::Void,
                 },
             });
@@ -2992,14 +2994,14 @@ mod portal_driver_tests {
                 result: None,
                 kind: OpKind::Call {
                     target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
-                    args: vec![
+                    args: crate::model::call_args(vec![
                         frame.clone(),
                         next_instr,
                         is_being_profiled,
                         pycode,
                         frame.clone(),
                         ec.clone(),
-                    ],
+                    ]),
                     result_ty: ValueType::Void,
                 },
             });
@@ -3121,7 +3123,7 @@ mod portal_driver_tests {
                         "jit_merge_point",
                         Some("UnpackIterableJitDriver".into()),
                     ),
-                    args: vec![receiver, green.clone()],
+                    args: crate::model::call_args(vec![receiver, green.clone()]),
                     result_ty: ValueType::Void,
                 },
             });

@@ -94,7 +94,7 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
             result: Some(null.clone()),
             kind: OpKind::Call {
                 target: CallTarget::function_path(["core", "ptr", "null_mut"]),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
             },
         }];
@@ -109,7 +109,7 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
                             root.clone(),
                         ],
                     },
-                    args: vec![null],
+                    args: crate::model::call_args(vec![null]),
                     result_ty: result_ty.clone(),
                 },
             });
@@ -126,7 +126,7 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
             result: Some(is_none.clone()),
             kind: OpKind::BinOp {
                 op: "is_".to_string(),
-                lhs: opt,
+                lhs: opt.into_variable(),
                 rhs,
                 result_ty: ValueType::Int,
             },
@@ -156,7 +156,7 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
             SpaceOperation {
                 result: Some(disc.clone()),
                 kind: OpKind::FieldRead {
-                    base: opt,
+                    base: opt.into_variable(),
                     field: FieldDescriptor {
                         name: "__discriminant".to_string(),
                         owner_root: Some(site.option_owner.clone()),
@@ -219,7 +219,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: is_none_target(method),
-                    args: vec![opt.clone()],
+                    args: crate::model::call_args(vec![opt.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -293,7 +293,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: is_none_target("is_some"),
-                    args: vec![opt.clone()],
+                    args: crate::model::call_args(vec![opt.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -374,7 +374,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: is_none_target("is_none"),
-                    args: vec![opt, default],
+                    args: crate::model::call_args(vec![opt, default]),
                     result_ty: ValueType::Int,
                 },
                 true,
