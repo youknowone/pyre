@@ -6778,7 +6778,7 @@ impl<S: JitState> JitDriver<S> {
                     rd_numb,
                     rd_consts_slice,
                     all_liveness,
-                    &raw_values,
+                    majit_backend::FailArgSource::Slice(&raw_values),
                     Some(fd.fail_arg_types()),
                     rd_virtuals_slice,
                     Some(fd.rd_pendingfields().unwrap_or(&[])), // rd_guard_pendingfields

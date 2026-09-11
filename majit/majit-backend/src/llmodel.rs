@@ -171,6 +171,21 @@ impl<'a, const N: usize> From<&'a [i64; N]> for FailArgSource<'a> {
     }
 }
 
+impl std::fmt::Debug for FailArgSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let vals: Vec<i64> = (0..self.len()).map(|i| self.get(i)).collect();
+        match self {
+            Self::Slice(_) => f.debug_tuple("Slice").field(&vals).finish(),
+            Self::JitFrame { ptr, n, .. } => f
+                .debug_struct("JitFrame")
+                .field("ptr", ptr)
+                .field("n", n)
+                .field("vals", &vals)
+                .finish(),
+        }
+    }
+}
+
 /// Symmetric setter for `get_int_value_direct`.
 ///
 /// llsupport/llmodel.py does not expose this: compiled code writes

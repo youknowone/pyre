@@ -2648,7 +2648,7 @@ pub(crate) fn propagate_portal_frame_escape(frame: *mut PyFrame, got_exception: 
 pub fn blackhole_resume_via_rd_numb<'df>(
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],
-    deadframe: impl Into<majit_backend::FailArgSource<'df>>,
+    deadframe: majit_backend::FailArgSource<'df>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     deadframe_types: Option<&[majit_ir::Type]>,
@@ -2745,7 +2745,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // resume.py `cpu.get_int_value(deadframe, i)`: values stay in
     // `jf_frame[]`. `jitframe_trace` walks the Ref slots. A host copy
     // is not a deadframe.
-    let deadframe = deadframe.into();
 
     // resume.py _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
     // for lazy materialization in getvirtual_ptr/getvirtual_int.
@@ -7934,7 +7933,7 @@ pub fn cranelift_resumedata_deopt(
         rd_numb,
         rd_consts,
         &all_liveness,
-        &deadframe,
+        majit_backend::FailArgSource::Slice(&deadframe),
         Some(types),
         None,
         &allocator,

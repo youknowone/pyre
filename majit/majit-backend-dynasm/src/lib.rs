@@ -14,7 +14,7 @@
 ///
 /// arch.rs, codebuf.rs, guard.rs, regloc.rs are from llsupport/.
 // ── Shared modules (llsupport/ parity) ──
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 
 pub mod arch;
 pub mod callbuilder;

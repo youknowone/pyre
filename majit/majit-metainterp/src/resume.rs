@@ -5833,7 +5833,7 @@ mod tests {
             &rd_numb,
             &[],
             &all_liveness,
-            &[],
+            FailArgSource::Slice(&[]),
             None,
             None,
             None,
@@ -5878,8 +5878,15 @@ mod tests {
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
-        let mut reader =
-            ResumeDataDirectReader::new(&rd_numb, &[], &[], &[], None, None, &NullAllocator);
+        let mut reader = ResumeDataDirectReader::new(
+            &rd_numb,
+            &[],
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &NullAllocator,
+        );
         reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None, None);
     }
 
@@ -5932,7 +5939,7 @@ mod tests {
                 &rd_numb,
                 &[],
                 &all_liveness,
-                &deadframe,
+                FailArgSource::Slice(&deadframe),
                 Some(&deadframe_types),
                 None, // rd_virtuals
                 None, // rd_guard_pendingfields
@@ -6079,7 +6086,7 @@ mod tests {
             &rd_numb,
             &[],
             &all_liveness,
-            &deadframe,
+            FailArgSource::Slice(&deadframe),
             Some(&deadframe_types),
             None, // rd_virtuals
             None, // rd_guard_pendingfields
@@ -6138,7 +6145,7 @@ mod tests {
             &[0, 0],
             &[],
             &[],
-            &[],
+            FailArgSource::Slice(&[]),
             None,
             Some((vec![0x1234], vec![7])),
             &NullAllocator,
@@ -6155,8 +6162,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "load_next_value_of_type: unexpected type Void")]
     fn test_next_value_of_type_rejects_void() {
-        let mut reader =
-            ResumeDataDirectReader::new(&[0, 0], &[], &[], &[], None, None, &NullAllocator);
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &[],
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &NullAllocator,
+        );
         let _ = reader.next_value_of_type(majit_ir::Type::Void);
     }
 
@@ -6181,8 +6195,15 @@ mod tests {
         // Model the root walker forwarding rd_consts during the allocation
         // window. The later field decode must observe the new pointer.
         consts[0] = majit_ir::Const::Ref(majit_ir::GcRef(0x2000));
-        let mut reader =
-            ResumeDataDirectReader::new(&[0, 0], &consts, &[], &[], None, None, &NullAllocator);
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &consts,
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &NullAllocator,
+        );
         assert_eq!(reader.decode_field_source(&parent), 0x2000);
     }
 
@@ -7239,7 +7260,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         rd_numb: &'a [u8],
         rd_consts: &'a [majit_ir::Const],
         all_liveness: &'a [u8],
-        deadframe: impl Into<FailArgSource<'a>>,
+        deadframe: FailArgSource<'a>,
         deadframe_types: Option<&'a [majit_ir::Type]>,
         all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
         allocator: &'a dyn BlackholeAllocator,
@@ -7263,7 +7284,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             items_resume_section,
             count,
             consts: rd_consts,
-            deadframe: deadframe.into(),
+            deadframe,
             deadframe_types,
             resume_after_guard_not_forced,
             rd_virtuals: None,
@@ -8648,7 +8669,7 @@ pub fn prepare_resume_heap<'a>(
         rd_numb,
         rd_consts,
         all_liveness,
-        deadframe,
+        deadframe.into(),
         deadframe_types,
         None,
         allocator,
@@ -8667,7 +8688,7 @@ pub fn blackhole_from_resumedata<'a>(
     rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
-    deadframe: impl Into<FailArgSource<'a>>,
+    deadframe: FailArgSource<'a>,
     deadframe_types: Option<&'a [majit_ir::Type]>,
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
@@ -8832,7 +8853,7 @@ pub fn force_from_resumedata<'a>(
         rd_numb,
         rd_consts,
         all_liveness,
-        deadframe,
+        deadframe.into(),
         deadframe_types,
         None,
         allocator,
