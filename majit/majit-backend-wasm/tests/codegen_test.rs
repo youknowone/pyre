@@ -333,10 +333,11 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     assert_same_stdout("wasm fannkuch", &wasm_run, &dynasm_run);
     // `compiles` is the host's module-compile tally: one per loop, one per
     // accepted bridge, and one more each time a region merged into its owner
-    // re-emits it. Loops follow `cl_ok`; bridges follow `BRIDGE_OK` (entered
-    // minus declines), not the guest `bridges_compiled` snapshot. `reemit_ok`
-    // is the merge count. The identity breaks if a compile belongs to none of
-    // the three. A merge re-emits the owner once for a bridge it took.
+    // re-emits it. A byte-identical loop hits `compile_module_cached` and
+    // increments `compile_cache_hits` instead, while `cl_ok` still counts
+    // it. Loops follow `cl_ok`; bridges follow `BRIDGE_OK` (entered minus
+    // declines), not the guest `bridges_compiled` snapshot. `reemit_ok` is
+    // the merge count. The identity is compiles + cache hits.
     let loops = stat_value(&stderr, "cl_ok");
     let bridges = stat_value(&stderr, "BRIDGE_OK");
     let reemits = stat_value(&stderr, "reemit_ok");
@@ -344,7 +345,10 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
         reemits <= bridges,
         "more owner re-emissions ({reemits}) than bridges to have merged:\n{stderr}"
     );
-    assert_eq!(stat_value(&stderr, "compiles"), loops + bridges + reemits);
+    assert_eq!(
+        stat_value(&stderr, "compiles") + stat_value(&stderr, "compile_cache_hits"),
+        loops + bridges + reemits
+    );
     assert!(
         stat_value(&stderr, "jit_calls") < 100,
         "uniform-i64 blackhole helpers still reflected through the host:\n{stderr}"
