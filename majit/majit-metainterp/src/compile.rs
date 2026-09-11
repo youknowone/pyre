@@ -1958,19 +1958,61 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // which is what makes the two constructions equivalent.
     use majit_ir::{Op, OpCode, OpRef, descr::ArrayFlag};
 
-    fn set_local_forwarded(forwarding: &mut Vec<Option<Operand>>, source: OpRef, target: Operand) {
-        if source.is_none() || source.is_constant() {
-            return;
+    // compile.py `box.set_forwarded` is Box identity, not a raw number.
+    // InputArg(n) and {Int,Ref}Op(n) share `OpRef::raw()`; a single vec
+    // keyed by raw remaps a leftover last_instr mint onto a live pointer
+    // op (SIGSEGV: ldr [8, #0x18]) and the frame onto an int local.
+    struct LocalForwarding {
+        inputargs: Vec<Option<Operand>>,
+        ops: Vec<Option<Operand>>,
+    }
+
+    impl LocalForwarding {
+        fn with_op_capacity(max_runtime_ref: u32) -> Self {
+            Self {
+                inputargs: Vec::new(),
+                ops: vec![None; (max_runtime_ref as usize).saturating_add(1)],
+            }
         }
-        let idx = source.raw() as usize;
-        if idx >= forwarding.len() {
-            forwarding.resize(idx + 1, None);
+
+        fn slot_mut(&mut self, source: OpRef) -> Option<&mut Option<Operand>> {
+            if source.is_none() || source.is_constant() {
+                return None;
+            }
+            let idx = source.raw() as usize;
+            let bank = if source.is_input_arg() {
+                &mut self.inputargs
+            } else {
+                &mut self.ops
+            };
+            if idx >= bank.len() {
+                bank.resize(idx + 1, None);
+            }
+            Some(&mut bank[idx])
         }
-        forwarding[idx] = Some(target);
+
+        fn slot(&self, source: OpRef) -> Option<&Operand> {
+            if source.is_none() || source.is_constant() {
+                return None;
+            }
+            let idx = source.raw() as usize;
+            let bank = if source.is_input_arg() {
+                &self.inputargs
+            } else {
+                &self.ops
+            };
+            bank.get(idx).and_then(|s| s.as_ref())
+        }
+    }
+
+    fn set_local_forwarded(forwarding: &mut LocalForwarding, source: OpRef, target: Operand) {
+        if let Some(slot) = forwarding.slot_mut(source) {
+            *slot = Some(target);
+        }
     }
 
     fn get_local_box_replacement(
-        forwarding: &[Option<Operand>],
+        forwarding: &LocalForwarding,
         mut opref: OpRef,
     ) -> Option<Operand> {
         if opref.is_none() || opref.is_constant() {
@@ -1978,13 +2020,12 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         }
         let mut found = None;
         loop {
-            let idx = opref.raw() as usize;
-            match forwarding.get(idx) {
-                Some(Some(next)) => {
+            match forwarding.slot(opref) {
+                Some(next) => {
                     opref = next.to_opref();
                     found = Some(next.clone());
                 }
-                _ => return found,
+                None => return found,
             }
         }
     }
@@ -1992,7 +2033,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     fn emit_forwarded_patch_op(
         extra_ops: &mut Vec<majit_ir::OpRc>,
         op: &Op,
-        forwarding: &mut Vec<Option<Operand>>,
+        forwarding: &mut LocalForwarding,
         next_opref: &mut u32,
     ) {
         let mut emitted = op.clone();
@@ -2075,16 +2116,19 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // InputArgRefs, and rewriting them all onto the frame puts `last_instr`
     // in a pointer slot (SIGSEGV at locals_cells_stack_w) and the frame in
     // an int local (`TypeError: 'frame' < 'int'`).
-    let leftover_identity_all: Vec<OpRef> = leftover
+    // compile.py forwards only `virtualizable_boxes[-1]`. That box is
+    // the red at `index_of_virtualizable` (PyFrame: InputArg 0). A
+    // leftover range-iterator or list Ref is not the identity; remapping
+    // it onto the frame is `TypeError: 'frame' object is not an iterator`.
+    let leftover_identity: Vec<OpRef> = leftover
         .iter()
         .copied()
-        .filter(|r| r.ty() == Some(Type::Ref) && !field_raws.contains(&r.raw()))
+        .filter(|r| {
+            r.ty() == Some(Type::Ref)
+                && !field_raws.contains(&r.raw())
+                && r.raw() == index_of_virtualizable as u32
+        })
         .collect();
-    let leftover_identity: Vec<OpRef> = if leftover_identity_all.len() == 1 {
-        leftover_identity_all
-    } else {
-        Vec::new()
-    };
 
     // `compile.py:458 assert i == len(inputargs)` requires the expanded
     // list to be exactly prefix + statics + baked array items. Virtualstate
@@ -2128,8 +2172,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 .max()
                 .unwrap_or(0);
             let mut next_opref = max_runtime_ref + 1;
-            let mut forwarding: Vec<Option<Operand>> =
-                vec![None; (max_runtime_ref as usize).saturating_add(1)];
+            let mut forwarding = LocalForwarding::with_op_capacity(max_runtime_ref);
             for &identity in &leftover_identity {
                 set_local_forwarded(&mut forwarding, identity, vable_box.clone());
             }
@@ -2216,8 +2259,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         .map(|m| m + 1)
         .unwrap_or(0);
 
-    let mut forwarding: Vec<Option<Operand>> =
-        vec![None; (max_runtime_ref as usize).saturating_add(1)];
+    let mut forwarding = LocalForwarding::with_op_capacity(max_runtime_ref);
     let mut extra_ops: Vec<majit_ir::OpRc> = Vec::new();
     let mut i = entry_prefix_len;
 
@@ -2258,7 +2300,10 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         let bound = Operand::from_bound_op(&op);
         set_local_forwarded(&mut forwarding, old_opref, bound.clone());
         if let Some(&snap) = entry_field_oprefs.get(fi) {
-            if snap.is_input_arg() && snap != old_opref {
+            if snap.is_input_arg()
+                && snap != old_opref
+                && leftover_fields.iter().any(|r| r.raw() == snap.raw())
+            {
                 set_local_forwarded(&mut forwarding, snap, bound);
             }
         }
@@ -2413,7 +2458,10 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             let bound = Operand::from_bound_op(&elem_op);
             set_local_forwarded(&mut forwarding, old_opref, bound.clone());
             if let Some(&snap) = entry_field_oprefs.get(i - entry_prefix_len) {
-                if snap.is_input_arg() && snap != old_opref {
+                if snap.is_input_arg()
+                    && snap != old_opref
+                    && leftover_fields.iter().any(|r| r.raw() == snap.raw())
+                {
                     set_local_forwarded(&mut forwarding, snap, bound);
                 }
             }
@@ -2862,7 +2910,7 @@ pub fn compile_tmp_callback(
 mod tests {
     use super::*;
     use crate::compile::make_fail_descr_with_index;
-    use crate::history::test_support::rooted_inputarg_operand;
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
 
@@ -3238,7 +3286,10 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_new_loop_rewrites_leftover_identity_inputarg() {
+    fn test_patch_new_loop_leaves_non_identity_leftover_ref() {
+        // InputArg 98 is a virtualstate body Ref, not virtualizable_boxes[-1]
+        // (the prefix red at index_of_virtualizable). compile.py does not
+        // forward it onto the frame.
         let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
         vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
 
@@ -3281,7 +3332,7 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(0)]
+            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(98)]
         );
         assert_eq!(
             ops[1]
@@ -3289,7 +3340,7 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(0)]
+            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(98)]
         );
     }
 
@@ -3426,6 +3477,59 @@ mod tests {
         assert!(
             ops.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
             "must emit GETFIELD_GC_I for last_instr"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_inputarg_forward_does_not_alias_op_raw() {
+        // InputArg(50) and RefOp(50) share OpRef::raw(). Forwarding the
+        // leftover last_instr mint must not rewrite a live pointer op.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Int, 50),
+            ],
+        );
+        let get = Op::new(
+            OpCode::GetfieldGcR,
+            &[rooted_resop_operand(Type::Ref, 50)],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, get]
+            .into_iter()
+            .map(std::rc::Rc::new)
+            .collect();
+        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_int(50)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+        );
+
+        let get_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::GetfieldGcR)
+            .expect("getfield")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(
+            get_args,
+            vec![OpRef::ref_op(50)],
+            "RefOp(50) must stay a pointer; InputArg(50) last_instr must not steal its raw"
         );
     }
 

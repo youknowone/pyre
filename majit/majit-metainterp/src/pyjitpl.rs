@@ -1520,15 +1520,15 @@ fn densify_root_loop_inputargs(
         .collect();
 
     let remap = |operand: &majit_ir::operand::Operand| {
-        // compile.py emit_op walks `get_box_replacement` before the
-        // positional rebind. A leftover InputArg that optimizer
-        // `_forwarded` onto a renamed root box must follow that chain,
-        // or LABEL/JUMP/failargs keep the pre-densify id and wasm
-        // declines it as an unbound local.
-        let canon = operand.get_box_replacement(false);
+        // Only the renamed root boxes. Following `get_box_replacement`
+        // here remaps a leftover range-iterator (or any body Ref the
+        // optimizer parked on the vable red) onto the frame:
+        // `TypeError: 'frame' object is not an iterator`. Leftover
+        // *field* InputArgs are remapped in
+        // `patch_new_loop_to_load_virtualizable_fields`, which knows
+        // the vable mint list.
         replacements
-            .get(&canon.to_opref())
-            .or_else(|| replacements.get(&operand.to_opref()))
+            .get(&operand.to_opref())
             .map(majit_ir::operand::Operand::from_bound_inputarg)
             .unwrap_or_else(|| operand.clone())
     };
@@ -25040,7 +25040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_densify_follows_forwarded_leftover_inputargs() {
+    fn test_densify_does_not_follow_forwarded_leftover_onto_the_frame() {
         let renamed = vec![OpRef::input_arg_ref(425)];
         let canonical = std::rc::Rc::new(InputArg::new_ref(425));
         let leftover = std::rc::Rc::new(InputArg::new_ref(98));
@@ -25061,7 +25061,8 @@ mod tests {
         assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(0));
         assert_eq!(
             ops[0].getfailargs().unwrap()[0].to_opref(),
-            OpRef::input_arg_ref(0)
+            OpRef::input_arg_ref(98),
+            "a leftover body Ref must not become the vable red"
         );
     }
 
