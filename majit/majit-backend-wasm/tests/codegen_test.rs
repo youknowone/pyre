@@ -3225,9 +3225,9 @@ fn test_stray_label_inputarg_is_seeded() {
 
 #[test]
 fn test_stray_failarg_ref_declines() {
-    // Same leftover InputArgRef as `test_stray_label_inputarg_is_seeded`,
-    // but now it is a guard snapshot. Seeding 0 compiles a null identity
-    // and panics in `consume_vable_info` / `BytecodeCorruption` at deopt.
+    // A failarg InputArg that is not a token input and not a LABEL
+    // live-in has no producer. #1780 treats LABEL args as defined;
+    // a snapshot-only leftover is still a null identity at deopt.
     let inputargs = vec![
         InputArg::from_type(Type::Ref, 0),
         InputArg::from_type(Type::Ref, 1),
@@ -3244,20 +3244,12 @@ fn test_stray_failarg_ref_declines() {
     let ops = vec![
         Op::new(
             OpCode::Label,
-            &[
-                rb(OpRef::input_arg_ref(0)),
-                rb(OpRef::input_arg_ref(1)),
-                rb(OpRef::input_arg_ref(99)),
-            ],
+            &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))],
         ),
         guard,
         Op::new(
             OpCode::Jump,
-            &[
-                rb(OpRef::input_arg_ref(0)),
-                rb(OpRef::input_arg_ref(1)),
-                rb(OpRef::input_arg_ref(99)),
-            ],
+            &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))],
         ),
     ];
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
