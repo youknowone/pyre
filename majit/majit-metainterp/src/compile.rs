@@ -2148,10 +2148,15 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         // `loop.inputargs`. Rebuild the expanded field list when a leftover
         // names a field slot; a leftover Ref that is not a field is the
         // virtualizable identity and rewrites onto the vable red.
+        if leftover_fields.is_empty() && leftover_identity.is_empty() {
+            // Virtualstate already replaced the expanded tail with live
+            // LABEL boxes. Rebuilding to `expanded_len` drops those
+            // InputArgs from `inputargs` while they remain on JUMP —
+            // a frame lands in `range()` (`'frame' object is not an
+            // iterator`) and last_instr in a pointer slot (SIGSEGV).
+            return;
+        }
         if leftover_fields.is_empty() && inputargs.len() <= entry_prefix_len {
-            if leftover_identity.is_empty() {
-                return;
-            }
             let vable_rc = std::rc::Rc::new(inputargs[index_of_virtualizable].fresh_value_copy());
             let vable_box = Operand::from_bound_inputarg(&vable_rc);
             let max_runtime_ref = leftover_identity
@@ -3439,6 +3444,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 0),
                 rooted_inputarg_operand(Type::Int, 2),
                 rooted_inputarg_operand(Type::Ref, 3),
+                rooted_inputarg_operand(Type::Int, 50),
             ],
         );
         let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
@@ -3580,10 +3586,17 @@ mod tests {
             &[],
         );
 
-        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            inputargs,
+            vec![
+                InputArg::new_ref(0),
+                InputArg::new_ref(1),
+                InputArg::new_ref(2),
+            ]
+        );
         assert!(
-            ops.iter().any(|op| op.opcode == OpCode::GetarrayitemRawR),
-            "partial tail must still emit the baked GETARRAYITEM reloads"
+            ops.iter().all(|op| op.opcode != OpCode::GetarrayitemRawR),
+            "a leftover-empty length mismatch must not rebuild live LABEL boxes as array items"
         );
     }
 
