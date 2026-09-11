@@ -876,13 +876,6 @@ bitflags::bitflags! {
     }
 }
 
-/// eval.py:16 — `FLATPYCALL = 0x100`.
-pub const FLATPYCALL: u16 = BuiltinCodeFlags::FLATPYCALL.bits();
-/// eval.py — `PASSTHROUGHARGS1 = 0x200`.
-pub const PASSTHROUGHARGS1: u16 = BuiltinCodeFlags::PASSTHROUGHARGS1.bits();
-/// eval.py — `HOPELESS = 0x400`. Default for code that cannot fast-path.
-pub const HOPELESS: u16 = BuiltinCodeFlags::HOPELESS.bits();
-
 /// Allocate a new `BuiltinCode` with no docstring.
 /// `fast_natural_arity` defaults to HOPELESS (no fast path).
 pub fn builtin_code_new(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
@@ -913,7 +906,13 @@ pub fn builtin_code_new_with_doc(
     func: BuiltinCodeFn,
     docstring: Option<&'static str>,
 ) -> PyObjectRef {
-    builtin_code_new_full(name, func, docstring, HOPELESS, std::ptr::null())
+    builtin_code_new_full(
+        name,
+        func,
+        docstring,
+        BuiltinCodeFlags::HOPELESS.bits(),
+        std::ptr::null(),
+    )
 }
 
 /// Allocate a new `BuiltinCode` with `fast_natural_arity = PASSTHROUGHARGS1`.
@@ -926,7 +925,13 @@ pub fn builtin_code_new_with_doc(
 /// `function.rs:funccall_valuestack` peeks `args[0]` separately to mirror
 /// `function.py:194-199`, but the closure still receives `[w_obj, ...rest]`.
 pub fn builtin_code_new_passthrough_args1(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
-    builtin_code_new_full(name, func, None, PASSTHROUGHARGS1, std::ptr::null())
+    builtin_code_new_full(
+        name,
+        func,
+        None,
+        BuiltinCodeFlags::PASSTHROUGHARGS1.bits(),
+        std::ptr::null(),
+    )
 }
 
 /// Full constructor for `BuiltinCode`.  `sig` is a `*const Signature`
@@ -1007,7 +1012,13 @@ pub fn builtin_code_new_with_signature(
     signature: Signature,
 ) -> PyObjectRef {
     let sig: *const Signature = Box::into_raw(Box::new(signature));
-    builtin_code_new_full(name, func, docstring, HOPELESS, sig)
+    builtin_code_new_full(
+        name,
+        func,
+        docstring,
+        BuiltinCodeFlags::HOPELESS.bits(),
+        sig,
+    )
 }
 
 /// Check if an object is a built-in function.
@@ -1197,7 +1208,7 @@ pub unsafe fn builtin_code_call(
     // count above the fast-path ceiling is rejected here too; only the
     // `FLATPYCALL` / `PASSTHROUGHARGS1` / `HOPELESS` markers, whose bodies read
     // the raw slice themselves, are left to do their own checking.
-    if arity < FLATPYCALL as usize
+    if arity < BuiltinCodeFlags::FLATPYCALL.bits() as usize
         && unsafe { (*code).sig.is_null() }
         && crate::builtins::has_real_kwargs(kwargs)
     {
@@ -1757,7 +1768,9 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
     signature: Option<Signature>,
 ) -> PyObjectRef {
     let arity = match &signature {
-        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => HOPELESS,
+        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => {
+            BuiltinCodeFlags::HOPELESS.bits()
+        }
         _ => arity,
     };
     let sig: *const Signature = match signature {
@@ -1972,7 +1985,7 @@ pub fn make_module_builtin_function_with_arity_and_sig(
 ) -> PyObjectRef {
     let arity =
         if signature.has_vararg() || signature.has_kwarg() || signature.num_kwonlyargnames() > 0 {
-            HOPELESS
+            BuiltinCodeFlags::HOPELESS.bits()
         } else {
             arity
         };
@@ -1998,7 +2011,9 @@ pub fn make_module_builtin_function_with_arity_and_maybe_sig(
     signature: Option<Signature>,
 ) -> PyObjectRef {
     let arity = match &signature {
-        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => HOPELESS,
+        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => {
+            BuiltinCodeFlags::HOPELESS.bits()
+        }
         _ => arity,
     };
     let sig: *const Signature = match signature {

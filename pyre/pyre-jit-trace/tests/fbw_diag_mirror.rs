@@ -98,23 +98,73 @@ fn extract(runner_src: &str) -> (&'static [&'static str], Vec<String>) {
     )
 }
 
-/// The integer literal a constant is declared with, decimal or `0x` hex.
+/// The integer a declaration evaluates to: decimal, `0x` hex, or `N << M`.
 ///
 /// Hex is accepted because the bit-layout half of the mirror is only readable
 /// as masks — a `FIELD_MASK` spelled `65535` to keep a decimal-only parser
-/// happy would trade the thing being guarded for the guard.
+/// happy would trade the thing being guarded for the guard. `N << M` is the
+/// spelling `bitflags!` uses for a single bit, so a flag written that way
+/// does not need a second decimal alias for this test to see it.
 fn declared_int(src: &str, anchor: &str, what: &str) -> u64 {
     let at = src
         .find(anchor)
         .unwrap_or_else(|| panic!("{what}: {anchor:?} declaration not found"));
     let tail = src[at + anchor.len()..].trim_start();
-    let (radix, rest) = match tail.strip_prefix("0x") {
-        Some(rest) => (16, rest),
-        None => (10, tail),
-    };
-    let digits: String = rest.chars().take_while(|c| c.is_digit(radix)).collect();
-    u64::from_str_radix(&digits, radix)
-        .unwrap_or_else(|e| panic!("{what}: {anchor:?} is not a number ({digits:?}) — {e}"))
+    let expr: String = tail
+        .chars()
+        .take_while(|c| !matches!(*c, ';' | ',' | '\n' | '}'))
+        .collect();
+    parse_u64_expr(expr.trim())
+        .unwrap_or_else(|| panic!("{what}: {anchor:?} is not a number or `N << M` ({expr:?})"))
+}
+
+fn parse_u64_expr(expr: &str) -> Option<u64> {
+    if let Some((left, right)) = expr.split_once("<<") {
+        let left = parse_u64_literal(left.trim())?;
+        let right = parse_u64_literal(right.trim())?;
+        return left.checked_shl(u32::try_from(right).ok()?);
+    }
+    parse_u64_literal(expr)
+}
+
+#[test]
+fn declared_int_reads_shift_and_hex() {
+    assert_eq!(
+        declared_int("const X: u64 = 20;", "const X: u64 = ", "t"),
+        20
+    );
+    assert_eq!(
+        declared_int("const X: u64 = 0xffff;", "const X: u64 = ", "t"),
+        0xffff
+    );
+    assert_eq!(
+        declared_int("const VALID = 1 << 0;", "const VALID = ", "t"),
+        1
+    );
+    assert_eq!(
+        declared_int("const COMMITTED = 1 << 1;", "const COMMITTED = ", "t"),
+        2
+    );
+    assert_eq!(
+        declared_int("const BRIDGE = 1 << 2;", "const BRIDGE = ", "t"),
+        4
+    );
+}
+
+fn parse_u64_literal(s: &str) -> Option<u64> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}
+
+/// A `bitflags!` member under `type_name`, e.g. `FbwRingFlags` / `VALID`.
+fn declared_bitflag(src: &str, type_name: &str, flag: &str, what: &str) -> u64 {
+    let type_at = src
+        .find(type_name)
+        .unwrap_or_else(|| panic!("{what}: bitflags type {type_name:?} not found"));
+    declared_int(&src[type_at..], &format!("const {flag} = "), what)
 }
 
 /// The slots whose two spellings disagree, over the shorter of the two.
@@ -316,9 +366,9 @@ fn the_mirror_check_catches_injected_drift() {
     );
 }
 
-/// The ring GEOMETRY and BIT LAYOUT are mirrored too, and unlike the labels
-/// they are bare integers with nothing to derive them from on the runner's
-/// side.
+/// The ring GEOMETRY and BIT LAYOUT are mirrored too. Geometry and shift
+/// widths are bare integers with nothing to derive them from on the runner's
+/// side; the `FLAG_*` bits live on `FbwRingFlags` / `RingFlags`.
 ///
 /// `RING_BASE` is `LABELS.len()` here, so a tally added on the authority side
 /// moves the ring's start — and the runner, which decodes the ring by
@@ -350,13 +400,6 @@ fn the_runner_mirrors_the_ring_layout() {
             d::NAME_SLOTS as u64,
             "NAME_SLOTS",
         ),
-        ("const FLAG_VALID: u64 = ", d::FLAG_VALID, "FLAG_VALID"),
-        (
-            "const FLAG_COMMITTED: u64 = ",
-            d::FLAG_COMMITTED,
-            "FLAG_COMMITTED",
-        ),
-        ("const FLAG_BRIDGE: u64 = ", d::FLAG_BRIDGE, "FLAG_BRIDGE"),
         (
             "const SHIFT_EFFECTS: u32 = ",
             d::SHIFT_EFFECTS as u64,
@@ -382,8 +425,23 @@ fn the_runner_mirrors_the_ring_layout() {
              pyre_jit_trace::trace::fbw_diag::{name} is {authority}. The runner \
              indexes the `pyre_fbw_diag` export with `RING_BASE + entry * \
              RING_STRIDE` and unpacks the counter slot with the `SHIFT_*` / \
-             `FLAG_*` set, so a stale copy decodes the wrong words and prints \
+             `RingFlags` set, so a stale copy decodes the wrong words and prints \
              them as a walk outcome rather than failing.",
+        );
+    }
+    for (flag, authority) in [
+        ("VALID", d::RingFlags::VALID.bits()),
+        ("COMMITTED", d::RingFlags::COMMITTED.bits()),
+        ("BRIDGE", d::RingFlags::BRIDGE.bits()),
+    ] {
+        let mirrored = declared_bitflag(&runner_src, "FbwRingFlags", flag, "runner");
+        assert_eq!(
+            mirrored, authority,
+            "pyre-wasm-runner FbwRingFlags::{flag} = {mirrored} but \
+             pyre_jit_trace::trace::fbw_diag::RingFlags::{flag} is {authority}. \
+             The runner unpacks the counter slot with these bits, so a stale \
+             copy decodes the wrong words and prints them as a walk outcome \
+             rather than failing.",
         );
     }
 }

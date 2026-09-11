@@ -3920,7 +3920,7 @@ mod tests {
     #[test]
     fn function_desc_buildgraph_surfaces_flow_error_from_objspace() {
         use crate::flowspace::bytecode::HostCode;
-        use crate::flowspace::objspace::CO_NEWLOCALS;
+        use crate::flowspace::objspace::CoFlags;
 
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let mut func = crate::flowspace::model::GraphFunc::new(
@@ -3935,7 +3935,7 @@ mod tests {
             co_nlocals: 0,
             co_argcount: 0,
             co_stacksize: 0,
-            co_flags: CO_NEWLOCALS,
+            co_flags: CoFlags::NEWLOCALS.bits(),
             co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
             co_varnames: Vec::new(),
             co_freevars: Vec::new(),

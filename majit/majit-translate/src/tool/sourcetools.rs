@@ -7,7 +7,7 @@
 //! helper surface onto `GraphFunc` / `HostObject` where the surrounding
 //! translator can carry equivalent metadata.
 
-use crate::flowspace::bytecode::HostCode;
+use crate::flowspace::bytecode::{CoFlags, HostCode};
 use crate::flowspace::model::{Constant, GraphFunc, HostObject};
 
 /// RPython `sourcetools.render_docstr(func, indent_str='',
@@ -61,31 +61,16 @@ pub fn valid_identifier(stuff: impl std::fmt::Display) -> String {
     stuff
 }
 
-/// RPython `CO_VARARGS` (`sourcetools.py`).
-pub const CO_VARARGS: u32 = 0x0004;
-/// RPython `CO_VARKEYWORDS` (`sourcetools.py`).
-pub const CO_VARKEYWORDS: u32 = 0x0008;
-
-bitflags::bitflags! {
-    /// RPython `sourcetools.py` `CO_*` compile flags.
-    #[repr(transparent)]
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub struct CoFlags: u32 {
-        const VARARGS = CO_VARARGS;
-        const VARKEYWORDS = CO_VARKEYWORDS;
-    }
-}
-
 /// RPython `has_varargs(func)` for callers that already have
 /// `co_flags` (`sourcetools.py:250-252`).
 pub fn has_varargs_flags(co_flags: u32) -> bool {
-    (co_flags & CO_VARARGS) != 0
+    (co_flags & CoFlags::VARARGS.bits()) != 0
 }
 
 /// RPython `has_varkeywords(func)` for callers that already have
 /// `co_flags` (`sourcetools.py:254-256`).
 pub fn has_varkeywords_flags(co_flags: u32) -> bool {
-    (co_flags & CO_VARKEYWORDS) != 0
+    (co_flags & CoFlags::VARKEYWORDS.bits()) != 0
 }
 
 /// RPython `has_varargs(func)` (`sourcetools.py`). Upstream
@@ -262,9 +247,9 @@ mod tests {
 
     #[test]
     fn vararg_flag_helpers_match_upstream_masks() {
-        assert!(has_varargs_flags(CO_VARARGS));
-        assert!(has_varkeywords_flags(CO_VARKEYWORDS));
-        assert!(!has_varargs_flags(CO_VARKEYWORDS));
+        assert!(has_varargs_flags(CoFlags::VARARGS.bits()));
+        assert!(has_varkeywords_flags(CoFlags::VARKEYWORDS.bits()));
+        assert!(!has_varargs_flags(CoFlags::VARKEYWORDS.bits()));
     }
 
     #[test]

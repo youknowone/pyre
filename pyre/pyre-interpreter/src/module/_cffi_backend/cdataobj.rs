@@ -1341,7 +1341,7 @@ fn cdata_sub(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let item_size = ctypeobj::ctype_at(other_ct.ctitem).map_or(-1, |it| it.size);
     if !std::ptr::eq(self_ct as *const W_CType, other_ct as *const W_CType)
         || other_ct.kind != ctypeobj::KIND_POINTER
-        || (item_size <= 0 && !other_ct.has(ctypeobj::F_VOID_PTR))
+        || (item_size <= 0 && !other_ct.has(ctypeobj::CTypeFlags::VOID_PTR))
     {
         return Err(PyError::type_error(format!(
             "cannot subtract cdata '{}' and cdata '{}'",
@@ -1383,7 +1383,7 @@ pub fn cdata_sizeof(w_cdata: PyObjectRef) -> Result<i64, PyError> {
 pub fn unpack(w_cdata: PyObjectRef, length: i64) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(w_cdata)?;
     let ct = cdata.ctype_ref()?;
-    if !ct.has(ctypeobj::F_NONFUNC_POINTER_OR_ARRAY) {
+    if !ct.has(ctypeobj::CTypeFlags::NONFUNC_POINTER_OR_ARRAY) {
         return Err(PyError::type_error(format!(
             "expected a pointer or array, got '{}'",
             ct.name()

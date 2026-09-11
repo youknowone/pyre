@@ -3837,8 +3837,8 @@ pub fn funccall_valuestack(
     // baseobjspace.py:1243 — skip when profiling (c_call/c_return events)
     if natural_arity_call && nargs <= 4 && !frame.get_is_being_profiled() {
         debug_assert!(
-            (fast_natural_arity & crate::FLATPYCALL as usize) == 0,
-            "FLATPYCALL bit set on arity {fast_natural_arity} — not a builtin code"
+            (fast_natural_arity & crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == 0,
+            "BuiltinCodeFlags::FLATPYCALL.bits() bit set on arity {fast_natural_arity} — not a builtin code"
         );
         // function.py:154-184 — BuiltinCodeN.fastcall_N dispatch.
         // RPython translation keeps the BuiltinCode and each peeked argument
@@ -3901,12 +3901,16 @@ pub fn funccall_valuestack(
     }
 
     // function.py:185-187 — (nargs | FLATPYCALL) == fast_natural_arity
-    if !natural_arity_call && (nargs | crate::FLATPYCALL as usize) == fast_natural_arity {
+    if !natural_arity_call
+        && (nargs | crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == fast_natural_arity
+    {
         return _flat_pycall(func, code, nargs, frame, dropvalues);
     }
 
     // function.py:188-193 — FLATPYCALL bit set + nargs within defaults range
-    if !natural_arity_call && (fast_natural_arity & crate::FLATPYCALL as usize) != 0 {
+    if !natural_arity_call
+        && (fast_natural_arity & crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) != 0
+    {
         let natural_arity = fast_natural_arity & 0xff;
         if nargs < natural_arity {
             let raw_defs = unsafe { crate::function_get_defaults(func) };
@@ -3937,7 +3941,10 @@ pub fn funccall_valuestack(
     // single BuiltinCodeFn signature already takes a flat slice, so the
     // peek/Arguments split is structural — the final closure invocation
     // sees `[w_obj, ...rest]` exactly as PyPy's post-merge args_w.
-    if !natural_arity_call && fast_natural_arity == crate::PASSTHROUGHARGS1 as usize && nargs >= 1 {
+    if !natural_arity_call
+        && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
+        && nargs >= 1
+    {
         let w_obj = frame.peekvalue(nargs - 1);
         let rest = frame.make_arguments(nargs - 1, false, func);
         // Same live-variable set as the fixed-arity arm above, for the same

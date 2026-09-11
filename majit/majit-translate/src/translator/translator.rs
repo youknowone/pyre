@@ -592,7 +592,7 @@ mod tests {
             co_nlocals: argnames.len() as u32,
             co_argcount: argnames.len() as u32,
             co_stacksize: 0,
-            co_flags: crate::flowspace::objspace::CO_NEWLOCALS,
+            co_flags: crate::flowspace::objspace::CoFlags::NEWLOCALS.bits(),
             co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
             co_varnames: argnames.iter().map(|arg| (*arg).to_string()).collect(),
             co_freevars: Vec::new(),

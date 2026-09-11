@@ -103,7 +103,7 @@ pub unsafe fn convert_from_object(
                 let ob_slot = roots.base();
                 let _ = roots.pin_root(w_ob);
                 let value = misc::as_long(roots.get(ob_slot))?;
-                if ct.has(ctypeobj::F_VALUE_SMALLER_THAN_LONG)
+                if ct.has(ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG)
                     && value != misc::signext(value, ct.size)
                 {
                     return Err(overflow(ct, roots.get(ob_slot)));
@@ -117,7 +117,7 @@ pub unsafe fn convert_from_object(
                 let ob_slot = roots.base();
                 let _ = roots.pin_root(w_ob);
                 let value = misc::as_unsigned_long(roots.get(ob_slot), true)?;
-                if ct.has(ctypeobj::F_VALUE_FITS_LONG) && value > vrange_max(ct) {
+                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) && value > vrange_max(ct) {
                     return Err(overflow(ct, roots.get(ob_slot)));
                 }
                 misc::write_raw_unsigned_data(cdata, value, ct.size)
@@ -327,7 +327,7 @@ pub unsafe fn cast_to_int(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef,
             ctypeobj::KIND_PRIM_CHAR => Ok(pyre_object::w_int_new(i64::from(cdata.read()))),
             // `W_CTypePrimitiveUniChar.cast_to_int`.
             ctypeobj::KIND_PRIM_UNICHAR => {
-                if ct.has(ctypeobj::F_SIGNED_WCHAR) {
+                if ct.has(ctypeobj::CTypeFlags::SIGNED_WCHAR) {
                     Ok(pyre_object::w_int_new(misc::read_raw_signed_data(
                         cdata as usize,
                         ct.size,
@@ -431,7 +431,7 @@ pub unsafe fn pack_list_of_items(
                 let Some(value) = exact_int(w_item) else {
                     return Ok(false);
                 };
-                if ct.has(ctypeobj::F_VALUE_SMALLER_THAN_LONG)
+                if ct.has(ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG)
                     && value != misc::signext(value, ct.size)
                 {
                     return Err(overflow_value(ct, value));
@@ -492,7 +492,7 @@ pub unsafe fn unpack_list_of_items(
         }
         // `W_CTypePrimitiveUnsigned.unpack_list_of_int_items` only takes the
         // fast path for a width that still fits a signed word.
-        ctypeobj::KIND_PRIM_UNSIGNED if ct.has(ctypeobj::F_VALUE_FITS_LONG) => {
+        ctypeobj::KIND_PRIM_UNSIGNED if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) => {
             for i in 0..length {
                 items.push(pyre_object::w_int_new(unsafe {
                     misc::read_raw_unsigned_data(
@@ -530,7 +530,7 @@ fn instance_ctype(ct: &W_CType) -> PyObjectRef {
 /// `W_CTypePrimitiveUnsigned.convert_to_object`'s two arms: a width narrower
 /// than a word is an ordinary `int`, and a full word may need a bigint.
 pub fn unsigned_as_object(ct: &W_CType, value: u64) -> PyObjectRef {
-    if ct.has(ctypeobj::F_VALUE_FITS_LONG) {
+    if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) {
         return pyre_object::w_int_new(value as i64);
     }
     if value <= i64::MAX as u64 {
@@ -570,7 +570,7 @@ unsafe fn read_bool_0_or_1(cdata: *const u8) -> Result<u8, PyError> {
 /// `W_CTypePrimitiveUniChar.convert_to_object`'s code-point check.
 fn unichr(ct: &W_CType, value: u32) -> Result<PyObjectRef, PyError> {
     if value > 0x10FFFF {
-        let rendered = if ct.has(ctypeobj::F_SIGNED_WCHAR) {
+        let rendered = if ct.has(ctypeobj::CTypeFlags::SIGNED_WCHAR) {
             format!("{:#x}", value as i32)
         } else {
             format!("{value:#x}")

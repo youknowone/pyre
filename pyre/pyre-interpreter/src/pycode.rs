@@ -1164,7 +1164,7 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
         release_code_locations(code_ptr as *mut crate::CodeObject, firstlineno_raw);
     }
     let mut fast_natural_arity = if !code_ptr_aligned {
-        crate::gateway::HOPELESS
+        crate::gateway::BuiltinCodeFlags::HOPELESS.bits()
     } else {
         compute_flatcall(unsafe { &*(code_ptr as *const crate::CodeObject) })
     };
@@ -4233,18 +4233,18 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
 /// **kwargs, keyword-only args). Returns HOPELESS otherwise.
 fn compute_flatcall(code: &crate::CodeObject) -> u16 {
     use crate::CodeFlags;
-    use crate::gateway::{FLATPYCALL, HOPELESS};
+    use crate::gateway::BuiltinCodeFlags;
     if code
         .flags
         .intersects(CodeFlags::VARARGS | CodeFlags::VARKEYWORDS)
     {
-        return HOPELESS;
+        return BuiltinCodeFlags::HOPELESS.bits();
     }
     if code.kwonlyarg_count > 0 {
-        return HOPELESS;
+        return BuiltinCodeFlags::HOPELESS.bits();
     }
     if code.arg_count > 0xff {
-        return HOPELESS;
+        return BuiltinCodeFlags::HOPELESS.bits();
     }
     // pycode.py:234 — disqualify if any arg is also a cellvar.
     // Pyre's CodeObject exposes cellvars; check for overlap.
@@ -4253,12 +4253,12 @@ fn compute_flatcall(code: &crate::CodeObject) -> u16 {
         for cellname in &code.cellvars {
             for j in 0..argcount {
                 if j < code.varnames.len() && *cellname == code.varnames[j] {
-                    return HOPELESS;
+                    return BuiltinCodeFlags::HOPELESS.bits();
                 }
             }
         }
     }
-    FLATPYCALL | (code.arg_count as u16)
+    BuiltinCodeFlags::FLATPYCALL.bits() | (code.arg_count as u16)
 }
 
 /// eval.py:16-23 — read `fast_natural_arity` from a PyCode.
@@ -4268,7 +4268,7 @@ fn compute_flatcall(code: &crate::CodeObject) -> u16 {
 #[inline]
 pub unsafe fn w_code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
     if obj.is_null() {
-        return crate::gateway::HOPELESS;
+        return crate::gateway::BuiltinCodeFlags::HOPELESS.bits();
     }
     unsafe { (*(obj as *const PyCode)).fast_natural_arity & !YIELDS_INSIDE_TRY_BIT }
 }
@@ -4281,7 +4281,7 @@ pub unsafe fn w_code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
 #[inline]
 pub unsafe fn code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
     if obj.is_null() {
-        return crate::gateway::HOPELESS;
+        return crate::gateway::BuiltinCodeFlags::HOPELESS.bits();
     }
     unsafe {
         if crate::gateway::is_builtin_code(obj) {

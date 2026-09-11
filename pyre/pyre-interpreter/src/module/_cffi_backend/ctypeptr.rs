@@ -62,13 +62,17 @@ pub unsafe fn pointer_convert_from_object(
         return Err(ct.convert_error("compatible pointer", w_ob));
     }
     if !std::ptr::eq(ct as *const W_CType, other as *const W_CType) {
-        if ct.has(ctypeobj::F_VOID_PTR) || other.has(ctypeobj::F_VOID_PTR) {
+        if ct.has(ctypeobj::CTypeFlags::VOID_PTR) || other.has(ctypeobj::CTypeFlags::VOID_PTR) {
             // A cast from or to 'void *' is always allowed.
-        } else if ct.has(ctypeobj::F_VOIDCHAR_PTR) || other.has(ctypeobj::F_VOIDCHAR_PTR) {
+        } else if ct.has(ctypeobj::CTypeFlags::VOIDCHAR_PTR)
+            || other.has(ctypeobj::CTypeFlags::VOIDCHAR_PTR)
+        {
             // 'char *' is accepted either way for backward compatibility;
             // between two single-byte pointers it is silent, otherwise it
             // warns that the acceptance will end.
-            if !(ct.has(ctypeobj::F_ONEBYTE_PTR) && other.has(ctypeobj::F_ONEBYTE_PTR)) {
+            if !(ct.has(ctypeobj::CTypeFlags::ONEBYTE_PTR)
+                && other.has(ctypeobj::CTypeFlags::ONEBYTE_PTR))
+            {
                 crate::warn::warn_category(
                     &format!(
                         "implicit cast from '{}' to '{}' will be forbidden in the future (check that the types are as you expect; use an explicit ffi.cast() if they are correct)",
@@ -145,7 +149,7 @@ pub unsafe fn convert_array_from_object(
         }
         return Ok(());
     }
-    if ct.has(ctypeobj::F_ACCEPT_STR) {
+    if ct.has(ctypeobj::CTypeFlags::ACCEPT_STR) {
         if !unsafe { pyre_object::bytesobject::is_bytes(w_ob) } {
             return Err(ct.convert_error("bytes or list or tuple", w_ob));
         }
@@ -209,7 +213,7 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
         )));
     }
     // `W_CTypePointer.cast`: casting a stream to a `FILE *` opens one over it.
-    if ct.has(ctypeobj::F_FILE_PTR) {
+    if ct.has(ctypeobj::CTypeFlags::FILE_PTR) {
         let file = prepare_file(w_ob)?;
         if !file.is_null() {
             return Ok(cdataobj::new_cdata(file as usize, w_ctype));
@@ -262,7 +266,7 @@ pub(crate) fn pointer_newp_with_allocator(
         // cdata that really holds the struct, so `p[0]` is that object.
         let mut varsize_length = -1;
         item.force_lazy_struct()?;
-        if item.has(ctypeobj::F_WITH_VAR_ARRAY) {
+        if item.has(ctypeobj::CTypeFlags::WITH_VAR_ARRAY) {
             if !unsafe { pyre_object::pyobject::is_none(roots.get(init_slot)) } {
                 datasize = unsafe {
                     super::ctypestruct::convert_struct_from_object(
@@ -399,7 +403,7 @@ pub fn add(w_ctype: PyObjectRef, cdata: *mut u8, i: i64) -> Result<PyObjectRef, 
     let item = item_of(ct)?;
     let mut item_size = item.size;
     if item_size < 0 {
-        if ct.has(ctypeobj::F_VOID_PTR) {
+        if ct.has(ctypeobj::CTypeFlags::VOID_PTR) {
             item_size = 1;
         } else {
             return Err(PyError::type_error(format!(
@@ -545,7 +549,7 @@ pub unsafe fn pointer_convert_argument_from_object(
 
     let mut result = MUSTFREE_NOTHING;
     if W_CData::from_obj(w_ob).is_none() {
-        if ct.has(ctypeobj::F_ACCEPT_STR)
+        if ct.has(ctypeobj::CTypeFlags::ACCEPT_STR)
             && let Some(offset) = super::func::OffsetInBytes::from_obj(w_ob)
         {
             let value = unsafe { pyre_object::bytesobject::w_bytes_data(offset.w_bytes) };
@@ -554,7 +558,9 @@ pub unsafe fn pointer_convert_argument_from_object(
             set_mustfree_flag(cdata, MUSTFREE_NOTHING);
             return Ok(false);
         }
-        if ct.has(ctypeobj::F_ACCEPT_STR) && unsafe { pyre_object::bytesobject::is_bytes(w_ob) } {
+        if ct.has(ctypeobj::CTypeFlags::ACCEPT_STR)
+            && unsafe { pyre_object::bytesobject::is_bytes(w_ob) }
+        {
             // A `bytes` passed to a `char *` argument reaches C as a copy
             // with its own null terminator; RPython instead pins or hands
             // over the string's own characters, which pyre has no equivalent
@@ -637,7 +643,7 @@ unsafe fn prepare_pointer_call_argument(
                 value.code_points().count() as i64
             };
             n + 1
-        } else if ct.has(ctypeobj::F_FILE_PTR) {
+        } else if ct.has(ctypeobj::CTypeFlags::FILE_PTR) {
             let file = prepare_file(w_init)?;
             if file.is_null() {
                 return Ok(MUSTFREE_NOTHING);

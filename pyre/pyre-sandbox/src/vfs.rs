@@ -68,20 +68,6 @@ bitflags::bitflags! {
     }
 }
 
-const S_IFDIR: Mode = ModeBits::IFDIR.bits();
-const S_IFREG: Mode = ModeBits::IFREG.bits();
-const S_IFMT: Mode = ModeBits::IFMT.bits();
-const S_IWUSR: Mode = ModeBits::IWUSR.bits();
-const S_IRUSR: Mode = ModeBits::IRUSR.bits();
-const S_IRGRP: Mode = ModeBits::IRGRP.bits();
-const S_IROTH: Mode = ModeBits::IROTH.bits();
-const S_IXUSR: Mode = ModeBits::IXUSR.bits();
-const S_IXGRP: Mode = ModeBits::IXGRP.bits();
-const S_IXOTH: Mode = ModeBits::IXOTH.bits();
-const S_IRWXO: Mode = ModeBits::IRWXO.bits();
-const S_IRWXU: Mode = ModeBits::IRWXU.bits();
-const S_IRWXG: Mode = ModeBits::IRWXG.bits();
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatResult {
     pub st_mode: Mode,
@@ -134,9 +120,12 @@ pub trait FSObject {
         let st_nlink = 1;
         let st_size = self.getsize()?;
         let mut st_mode = self.kind();
-        st_mode |= S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH;
+        st_mode |= ModeBits::IWUSR.bits()
+            | ModeBits::IRUSR.bits()
+            | ModeBits::IRGRP.bits()
+            | ModeBits::IROTH.bits();
         if is_dir(self.kind()) {
-            st_mode |= S_IXUSR | S_IXGRP | S_IXOTH;
+            st_mode |= ModeBits::IXUSR.bits() | ModeBits::IXGRP.bits() | ModeBits::IXOTH.bits();
         }
         let (st_uid, st_gid) = if self.read_only() { (0, 0) } else { (UID, GID) };
         Ok(StatResult {
@@ -156,12 +145,12 @@ pub trait FSObject {
     // vfs.py:40
     fn access(&self, mode: Mode) -> VfsResult<bool> {
         let s = self.stat()?;
-        let mut e_mode = s.st_mode & S_IRWXO;
+        let mut e_mode = s.st_mode & ModeBits::IRWXO.bits();
         if UID == s.st_uid {
-            e_mode |= (s.st_mode & S_IRWXU) >> 6;
+            e_mode |= (s.st_mode & ModeBits::IRWXU.bits()) >> 6;
         }
         if GID == s.st_gid {
-            e_mode |= (s.st_mode & S_IRWXG) >> 3;
+            e_mode |= (s.st_mode & ModeBits::IRWXG.bits()) >> 3;
         }
         Ok((e_mode & mode) == mode)
     }
@@ -223,7 +212,7 @@ impl FSObject for Dir {
 
     // vfs.py:60
     fn kind(&self) -> Mode {
-        S_IFDIR
+        ModeBits::IFDIR.bits()
     }
 
     // vfs.py:63
@@ -283,7 +272,7 @@ impl FSObject for RealDir {
 
     // vfs.py:60
     fn kind(&self) -> Mode {
-        S_IFDIR
+        ModeBits::IFDIR.bits()
     }
 
     // vfs.py:87
@@ -404,7 +393,7 @@ impl FSObject for File {
 
     // vfs.py:116
     fn kind(&self) -> Mode {
-        S_IFREG
+        ModeBits::IFREG.bits()
     }
 
     // vfs.py:119
@@ -431,7 +420,7 @@ impl RealFile {
         Self {
             state: FSObjectState::default(),
             path: path.into(),
-            kind: S_IFREG | mode,
+            kind: ModeBits::IFREG.bits() | mode,
         }
     }
 
@@ -469,7 +458,7 @@ impl FSObject for RealFile {
 
 // vfs.py:25
 pub fn is_dir(mode: Mode) -> bool {
-    (mode & S_IFMT) == S_IFDIR
+    (mode & ModeBits::IFMT.bits()) == ModeBits::IFDIR.bits()
 }
 
 // vfs.py:134
@@ -539,7 +528,7 @@ mod tests {
     #[test]
     fn test_file() {
         let f = File::new("hello world");
-        assert_eq!(f.kind() & S_IFMT, S_IFREG);
+        assert_eq!(f.kind() & ModeBits::IFMT.bits(), ModeBits::IFREG.bits());
         assert!(f.keys().is_err());
         assert_eq!(f.getsize().unwrap(), 11);
         assert_eq!(
@@ -548,7 +537,7 @@ mod tests {
         );
 
         let st = f.stat().unwrap();
-        assert_eq!(st.st_mode & S_IFMT, S_IFREG);
+        assert_eq!(st.st_mode & ModeBits::IFMT.bits(), ModeBits::IFREG.bits());
         assert_eq!(st.st_size, 11);
         assert!(f.access(R_OK).unwrap());
         assert!(!f.access(W_OK).unwrap());

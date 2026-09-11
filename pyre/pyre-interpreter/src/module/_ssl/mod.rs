@@ -7,8 +7,6 @@
 use pyre_native::ssl::{
     CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, PROTOCOL_TLS, PROTOCOL_TLS_CLIENT,
     PROTOCOL_TLS_SERVER, PROTOCOL_TLSV1, PROTOCOL_TLSV1_1, PROTOCOL_TLSV1_2, PROTOCOL_TLSV1_3,
-    VERIFY_ALLOW_PROXY_CERTS, VERIFY_CRL_CHECK_CHAIN, VERIFY_CRL_CHECK_LEAF, VERIFY_DEFAULT,
-    VERIFY_X509_PARTIAL_CHAIN, VERIFY_X509_STRICT, VERIFY_X509_TRUSTED_FIRST,
 };
 use pyre_object::*;
 
@@ -3239,13 +3237,13 @@ crate::py_module! {
         "CERT_NONE" => CERT_NONE,
         "CERT_OPTIONAL" => CERT_OPTIONAL,
         "CERT_REQUIRED" => CERT_REQUIRED,
-        "VERIFY_DEFAULT" => VERIFY_DEFAULT,
-        "VERIFY_CRL_CHECK_LEAF" => VERIFY_CRL_CHECK_LEAF,
-        "VERIFY_CRL_CHECK_CHAIN" => VERIFY_CRL_CHECK_CHAIN,
-        "VERIFY_X509_STRICT" => VERIFY_X509_STRICT,
-        "VERIFY_ALLOW_PROXY_CERTS" => VERIFY_ALLOW_PROXY_CERTS,
-        "VERIFY_X509_TRUSTED_FIRST" => VERIFY_X509_TRUSTED_FIRST,
-        "VERIFY_X509_PARTIAL_CHAIN" => VERIFY_X509_PARTIAL_CHAIN,
+        "VERIFY_DEFAULT" => pyre_native::ssl::VerifyFlags::DEFAULT.bits(),
+        "VERIFY_CRL_CHECK_LEAF" => pyre_native::ssl::VerifyFlags::CRL_CHECK_LEAF.bits(),
+        "VERIFY_CRL_CHECK_CHAIN" => pyre_native::ssl::VerifyFlags::CRL_CHECK_CHAIN.bits(),
+        "VERIFY_X509_STRICT" => pyre_native::ssl::VerifyFlags::X509_STRICT.bits(),
+        "VERIFY_ALLOW_PROXY_CERTS" => pyre_native::ssl::VerifyFlags::ALLOW_PROXY_CERTS.bits(),
+        "VERIFY_X509_TRUSTED_FIRST" => pyre_native::ssl::VerifyFlags::X509_TRUSTED_FIRST.bits(),
+        "VERIFY_X509_PARTIAL_CHAIN" => pyre_native::ssl::VerifyFlags::X509_PARTIAL_CHAIN.bits(),
         "OP_ALL" => pyre_native::ssl::SslOp::ALL.bits() as i32,
         "OP_NO_SSLv2" => 0,
         "OP_NO_SSLv3" => pyre_native::ssl::SslOp::NO_SSLV3.bits() as i32,

@@ -410,7 +410,7 @@ pub(crate) mod cif {
             // out differently from the one the C compiler saw, and the calling
             // convention depends on the fields; so may an anonymous nested
             // struct, whose origin is no longer recorded here.
-            if ct.has(ctypeobj::F_CUSTOM_FIELD_POS) {
+            if ct.has(ctypeobj::CTypeFlags::CUSTOM_FIELD_POS) {
                 return Err(unsupported(
                     ct,
                     is_result,
@@ -419,7 +419,7 @@ pub(crate) mod cif {
                     "It is a struct declared with \"...;\", but the C calling convention may depend on the missing fields; or, it contains anonymous struct/unions".to_string(),
                 ));
             }
-            if ct.has(ctypeobj::F_WITH_PACKED_CHANGE) {
+            if ct.has(ctypeobj::CTypeFlags::WITH_PACKED_CHANGE) {
                 return Err(unsupported(
                     ct,
                     is_result,

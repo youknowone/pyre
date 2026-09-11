@@ -2,7 +2,7 @@
 //!
 //! `_Mixin_Enum` mixes into `W_CTypePrimitiveSigned` and
 //! `W_CTypePrimitiveUnsigned`, so an enum ctype keeps their kind and adds
-//! only the two enumerator maps; [`ctypeobj::F_ENUM`] is what selects the
+//! only the two enumerator maps; [`ctypeobj::CTypeFlags::ENUM`] is what selects the
 //! mixin's overrides.
 
 use crate::PyError;
