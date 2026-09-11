@@ -744,7 +744,10 @@ fn same_as_before_label_defines_a_fresh_label_arg() {
 }
 
 #[test]
-fn unbound_label_arg_without_a_producer_declines() {
+fn unbound_read_without_a_producer_declines() {
+    // A LABEL arg with no producer is a peeled-header live-in and is
+    // defined at the LABEL. A Finish that reads a never-written box
+    // is not; that local would stay the zero wasm initializes it to.
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![
         make_op(
@@ -752,13 +755,7 @@ fn unbound_label_arg_without_a_producer_declines() {
             &[OpRef::input_arg_int(0), OpRef::const_int(1)],
             OpRef::int_op(1),
         ),
-        Op::new(OpCode::Label, &[rb(OpRef::int_op(100))]),
-        make_op(
-            OpCode::IntAdd,
-            &[OpRef::int_op(100), OpRef::const_int(1)],
-            OpRef::int_op(2),
-        ),
-        Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(100))]),
     ];
 
     let inputs = codegen::ModuleBuildInputs {
@@ -787,7 +784,7 @@ fn unbound_label_arg_without_a_producer_declines() {
         ca: codegen::CaParams::default(),
     };
     let error = match codegen::build_wasm_module(&inputs) {
-        Ok(_) => panic!("a LABEL arg with no producer must decline"),
+        Ok(_) => panic!("a read with no producer and no pool entry must decline"),
         Err(error) => error,
     };
     assert!(
