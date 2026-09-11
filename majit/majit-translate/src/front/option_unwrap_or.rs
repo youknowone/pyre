@@ -48,7 +48,7 @@
 use crate::flowspace::model::Variable;
 use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{
-    CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
+    FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
 /// A recognized `Option::unwrap_or(opt, default)` / `Result::unwrap_or(res,
@@ -139,23 +139,17 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     // The cast is jitcode-identity (`cast_pointer` → `same_as`); carry it into
     // each arm so B keeps receiving a narrowed value.  `out_var` is the value
     // block B actually consumes for the select result.
-    let (cast, out_var): (Option<(Vec<String>, ValueType)>, Variable) = if call_idx == last_idx {
+    let (cast, out_var): (Option<(String, ValueType)>, Variable) = if call_idx == last_idx {
         (None, site.result_var.clone())
     } else if call_idx == last_idx - 1 {
         let tail = &graph.blocks[a].operations[last_idx];
-        match (&tail.kind, tail.result.clone()) {
-            (
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    args,
-                    result_ty,
-                },
-                Some(narrowed),
-            ) if segments.first().map(String::as_str)
-                == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                && args.as_slice() == std::slice::from_ref(&site.result_var) =>
+        match tail.result.clone() {
+            Some(narrowed)
+                if let Some(root) =
+                    crate::model::cast_instance_of(&tail.kind, &site.result_var)
+                    && let OpKind::Call { result_ty, .. } = &tail.kind =>
             {
-                (Some((segments.clone(), result_ty.clone())), narrowed)
+                (Some((root.to_string(), result_ty.clone())), narrowed)
             }
             _ => {
                 return Err(format!(
@@ -354,22 +348,16 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
 pub(crate) fn emit_narrow(
     graph: &mut FunctionGraph,
     bb: crate::model::BlockId,
-    cast: &Option<(Vec<String>, ValueType)>,
+    cast: &Option<(String, ValueType)>,
     raw: Variable,
 ) -> Variable {
-    let Some((segments, result_ty)) = cast else {
+    let Some((root, result_ty)) = cast else {
         return raw;
     };
     let narrowed = graph.alloc_value_var();
     graph.block_mut(bb).operations.push(SpaceOperation {
         result: Some(narrowed.clone()),
-        kind: OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: segments.clone(),
-            },
-            args: crate::model::call_args(vec![raw]),
-            result_ty: result_ty.clone(),
-        },
+        kind: crate::model::cast_instance_call_result(root.clone(), raw, result_ty.clone()),
     });
     narrowed
 }
@@ -525,16 +513,7 @@ mod tests {
         let narrowed = g
             .push_op_var(
                 a,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.into(),
-                            "PyObject".into(),
-                        ],
-                    },
-                    args: crate::model::call_args(vec![result.clone()]),
-                    result_ty: ValueType::Ref(Some("PyObject".into())),
-                },
+                crate::model::cast_instance_call("PyObject", result.clone()),
                 true,
             )
             .unwrap();

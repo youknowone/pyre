@@ -4876,9 +4876,8 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
-        // `__cast_instance_intrinsic/<Root>` — front::mir's pointer-downcast
-        // narrow (#298, `mir.rs` emits `Call(["__cast_instance_intrinsic",
-        // root], [v])` for a `Ref → *Struct` reinterpret).  The rtyper
+        // `__cast_instance_intrinsic` — front::mir's pointer-downcast
+        // narrow (`cast_instance_call`: operand + const(root)).  The rtyper
         // lowers it to `cast_pointer` (`rbuiltin.rs rtype_cast_instance_intrinsic`,
         // `exception_cannot_occur`), which jtransform folds to `same_as`;
         // the charon front-end skips the rtyper, so fold the marker to the
@@ -4890,10 +4889,10 @@ impl<'a> Transformer<'a> {
         // from its erasure than from its downcast, so it folds the same
         // way: the operand alias, no jitcode op.
         if let CallTarget::FunctionPath { segments } = target
-            && ((segments.len() == 2 && segments[0] == crate::runtime_names::shims::CAST_INSTANCE)
-                || (segments.len() == 1
-                    && segments[0] == crate::runtime_names::shims::CAST_ADDRESS))
-            && args.len() == 1
+            && ((segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE]
+                && args.len() == 1)
+                || (segments.as_slice() == [crate::runtime_names::shims::CAST_ADDRESS]
+                    && args.len() == 1))
         {
             return RewriteResult::Identity(args[0].clone());
         }

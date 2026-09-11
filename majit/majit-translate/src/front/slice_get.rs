@@ -174,20 +174,12 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
         (site.result_var.clone(), None, ci)
     } else if ci + 2 == ops_len {
         let cast = &graph.blocks[a].operations[ci + 1];
-        match (&cast.kind, cast.result.as_ref()) {
-            (
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    args,
-                    ..
-                },
-                Some(narrowed),
-            ) if segments.len() == 2
-                && segments[0] == crate::runtime_names::shims::CAST_INSTANCE
-                && args.len() == 1
-                && args[0] == site.result_var =>
+        match cast.result.as_ref() {
+            Some(narrowed)
+                if let Some(root) =
+                    crate::model::cast_instance_of(&cast.kind, &site.result_var) =>
             {
-                (narrowed.clone(), Some(segments[1].clone()), ci + 1)
+                (narrowed.clone(), Some(root.to_string()), ci + 1)
             }
             _ => {
                 return Err(format!(
@@ -548,7 +540,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
                         ..
-                    } if segments == &[crate::runtime_names::shims::CAST_INSTANCE, "PyObject"]
+                    } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
                 )
             })
             .count();
@@ -613,16 +605,7 @@ mod tests {
         let narrowed = g
             .push_op_var(
                 a,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.into(),
-                            "PyObject".into(),
-                        ],
-                    },
-                    args: crate::model::call_args(vec![opt.clone()]),
-                    result_ty: ValueType::Ref(Some("PyObject".into())),
-                },
+                crate::model::cast_instance_call("PyObject", opt.clone()),
                 true,
             )
             .unwrap();

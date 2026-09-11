@@ -1545,10 +1545,9 @@ fn ll_arraymove_intrinsic(
 /// same-bank `obj as *const RegisteredStruct` cast, so a field read on
 /// the pointee blocks on a classdef-less `SomeInstance` (unaryop.rs
 /// getattr arm).  The frontend instead lowers such a cast to
-/// `simple_call(__cast_instance_intrinsic, operand)`, stashing the target
-/// struct root in the `FunctionPath`; `flowspace_adapter` reconstructs
-/// the root as a trailing `ByteStr` constant arg (the `Vec<Variable>`
-/// arg carrier cannot hold a `Constant`).  The result is
+/// `simple_call(__cast_instance_intrinsic, operand, const(root))`.
+/// The frontend puts the target struct root in `Call.args[1]` as a
+/// `ByteStr` Constant.  The result is
 /// `SomeInstance(classdef)` for that root so the field read resolves;
 /// the rtyper lowers the call to a `cast_pointer` (rclass
 /// `pairtype(InstanceRepr, InstanceRepr).convert_from_to`,
@@ -1574,8 +1573,8 @@ fn cast_instance_intrinsic(
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    // The marker is `Call(["__cast_instance_intrinsic", <root>], [operand])`:
-    // exactly the pointer operand plus the constant-root string, no
+    // The marker is `Call(["__cast_instance_intrinsic"], [operand, const(root)])`:
+    // the pointer operand plus the constant-root string, no
     // keywords.  A different shape is a producer bug, surfaced here
     // rather than silently swallowed.
     if !kwds.is_empty() || args_s.len() != 2 {

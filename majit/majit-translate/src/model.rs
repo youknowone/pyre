@@ -1869,6 +1869,66 @@ pub fn call_arg_vars(args: &[LinkArg]) -> Vec<crate::flowspace::model::Variable>
         .collect()
 }
 
+/// `simple_call(__cast_instance_intrinsic, operand, const(root))`.
+///
+/// The root is a trailing `ByteStr` Constant —
+/// `annotator/builtin.rs cast_instance_intrinsic` reads `args[1]`.
+pub fn cast_instance_call(
+    root: impl Into<String>,
+    operand: crate::flowspace::model::Variable,
+) -> OpKind {
+    let root = root.into();
+    cast_instance_call_result(root.clone(), operand, ValueType::Ref(Some(root)))
+}
+
+/// Same as [`cast_instance_call`] with an explicit result type.
+/// Niche-null string payloads use `ValueType::Str` rather than `Ref`.
+pub fn cast_instance_call_result(
+    root: impl Into<String>,
+    operand: crate::flowspace::model::Variable,
+    result_ty: ValueType,
+) -> OpKind {
+    OpKind::Call {
+        target: CallTarget::function_path([crate::runtime_names::shims::CAST_INSTANCE]),
+        args: vec![
+            LinkArg::from(operand),
+            LinkArg::from(ConstValue::byte_str(root.into())),
+        ],
+        result_ty,
+    }
+}
+
+/// The target-struct root of a [`cast_instance_call`], if `kind` is one.
+pub fn cast_instance_root(kind: &OpKind) -> Option<&str> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments },
+        args,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    if segments.as_slice() != [crate::runtime_names::shims::CAST_INSTANCE] {
+        return None;
+    }
+    match args.get(1) {
+        Some(LinkArg::Const(c)) => c.value.as_pystr(),
+        _ => None,
+    }
+}
+
+/// [`cast_instance_root`] when `args[0]` is `operand`.
+pub fn cast_instance_of<'a>(
+    kind: &'a OpKind,
+    operand: &crate::flowspace::model::Variable,
+) -> Option<&'a str> {
+    let root = cast_instance_root(kind)?;
+    let OpKind::Call { args, .. } = kind else {
+        return None;
+    };
+    (args.first().and_then(LinkArg::as_variable) == Some(operand)).then_some(root)
+}
+
 /// A basic block in the control flow graph.
 ///
 /// RPython equivalent: `flowspace/model.py Block` — slots
@@ -3476,22 +3536,8 @@ pub fn lower_struct_ptr_writes(
                 continue;
             };
             let destination_owner = block.operations[..oi].iter().find_map(|candidate| {
-                match (&candidate.result, &candidate.kind) {
-                    (
-                        Some(result),
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
-                            args,
-                            ..
-                        },
-                    ) if result == destination
-                        && args.len() == 1
-                        && segments.first().map(String::as_str)
-                            == Some("__cast_instance_intrinsic")
-                        && segments.len() == 2 =>
-                    {
-                        Some(segments[1].as_str())
-                    }
+                match candidate.result.as_ref() {
+                    Some(result) if result == destination => cast_instance_root(&candidate.kind),
                     _ => None,
                 }
             });
@@ -4024,9 +4070,9 @@ pub fn fuse_boxing_alloc(
         } = &producer.kind
             && segments.first().map(String::as_str)
                 == Some(crate::runtime_names::shims::CAST_INSTANCE)
-            && args.len() == 1
+            && let Some(operand) = args.first().and_then(LinkArg::as_variable)
         {
-            return resolve_addr(graph, &args[0], depth - 1, terminal);
+            return resolve_addr(graph, operand, depth - 1, terminal);
         }
         terminal(graph, &producer.kind, depth)
     }
@@ -4900,13 +4946,13 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             args,
             ..
         } => {
-            // `__cast_instance_intrinsic[<root>]` — the front-end pointer-downcast
-            // narrow (`front::mir`), always a single-operand reinterpret.
+            // `__cast_instance_intrinsic` — the front-end pointer-downcast
+            // narrow (`cast_instance_call`: operand + const(root)).
             // Pin the arity so an unrelated multi-arg path that happens to
             // share the synthetic marker leaf is never swept as a cast.
             let is_cast = segments.first().map(String::as_str)
                 == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                && args.len() == 1;
+                && args.len() == 2;
             // The same single-argument runtime helper recognized by
             // `get_instantiate_arg_addr`; its result feeds only the class word
             // removed with the dead header. Restrict the owner so an unrelated
@@ -8567,13 +8613,7 @@ mod tests {
         let destination = graph
             .push_op_var(
                 write_block,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".into(), "Payload".into()],
-                    },
-                    args: crate::model::call_args(vec![raw]),
-                    result_ty: ValueType::Ref(Some("Payload".into())),
-                },
+                crate::model::cast_instance_call("Payload", raw),
                 true,
             )
             .unwrap();
@@ -8664,13 +8704,7 @@ mod tests {
         let destination = graph
             .push_op_var(
                 join,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".into(), "Payload".into()],
-                    },
-                    args: crate::model::call_args(vec![raw]),
-                    result_ty: ValueType::Ref(Some("Payload".into())),
-                },
+                crate::model::cast_instance_call("Payload", raw),
                 true,
             )
             .unwrap();
@@ -9487,12 +9521,9 @@ mod tests {
             let ty = graph
                 .push_op_var(entry, OpKind::ConstRefAddr(FLOAT_TYPE_ADDR), true)
                 .unwrap();
-            call(
-                graph,
-                entry,
-                &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
-                vec![ty],
-            )
+            graph
+                .push_op_var(entry, cast_instance_call("PyType", ty), true)
+                .unwrap()
         };
         let ob_type = cast(&mut graph);
         let w_class_cast = cast(&mut graph);
@@ -9759,12 +9790,9 @@ mod tests {
                 let ty = graph
                     .push_op_var(entry, OpKind::ConstRefAddr(addr), true)
                     .unwrap();
-                call(
-                    graph,
-                    entry,
-                    &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
-                    vec![ty],
-                )
+                graph
+                    .push_op_var(entry, cast_instance_call("PyType", ty), true)
+                    .unwrap()
             };
             let ob_type = cast(&mut graph, FLOAT_TYPE_ADDR);
             let w_class_cast = cast(&mut graph, FLOAT_TYPE_ADDR);
@@ -9882,12 +9910,9 @@ mod tests {
             let other = graph
                 .push_op_var(blk, OpKind::ConstRefAddr(OTHER_TYPE_ADDR), true)
                 .unwrap();
-            let cast = call(
-                graph,
-                blk,
-                &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
-                vec![other],
-            );
+            let cast = graph
+                .push_op_var(blk, cast_instance_call("PyType", other), true)
+                .unwrap();
             graph.push_op_var(blk, field(header, "ob_type", "PyObject", &cast), false);
         };
 
@@ -10019,12 +10044,9 @@ mod tests {
                 let ty = graph
                     .push_op_var(blk, OpKind::ConstRefAddr(addr), true)
                     .unwrap();
-                call(
-                    graph,
-                    blk,
-                    &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
-                    vec![ty],
-                )
+                graph
+                    .push_op_var(blk, cast_instance_call("PyType", ty), true)
+                    .unwrap()
             };
             let ob_type = cast(graph);
             let w_class_cast = cast(graph);
@@ -10176,13 +10198,7 @@ mod tests {
         // constants; the dual-gate seeds them from the constant table, so they
         // do not diverge.)
         type Var = crate::flowspace::model::Variable;
-        let cast_instance = |to: &str, arg: &Var| OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec![crate::runtime_names::shims::CAST_INSTANCE.into(), to.into()],
-            },
-            args: crate::model::call_args(vec![arg.clone()]),
-            result_ty: ValueType::Ref(Some(to.into())),
-        };
+        let cast_instance = |to: &str, arg: &Var| crate::model::cast_instance_call(to, arg.clone());
         let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
             base: base.clone(),
             field: FieldDescriptor {
@@ -10320,12 +10336,8 @@ mod tests {
             ops.iter().map(|o| &o.kind).collect::<Vec<_>>()
         );
         assert!(
-            !ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                        && segments.get(1).map(String::as_str) == Some("PyType")
-            )),
+            !ops.iter()
+                .any(|op| cast_instance_root(&op.kind) == Some("PyType")),
             "the dead ob_type/w_class header casts must be swept"
         );
         assert!(
@@ -10349,12 +10361,8 @@ mod tests {
             "NewWithVtable must survive carrying the captured type pointer"
         );
         assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                        && segments.get(1).map(String::as_str) == Some("PyObject")
-            )),
+            ops.iter()
+                .any(|op| cast_instance_root(&op.kind) == Some("PyObject")),
             "the live return cast must survive"
         );
         let _ = ret;
@@ -11038,16 +11046,7 @@ mod tests {
         let p = graph
             .push_op_var(
                 entry,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.into(),
-                            "W_FloatObject".into(),
-                        ],
-                    },
-                    args: crate::model::call_args(vec![obj.clone()]),
-                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
-                },
+                crate::model::cast_instance_call("W_FloatObject", obj.clone()),
                 true,
             )
             .unwrap();
@@ -11100,16 +11099,7 @@ mod tests {
         // target inputarg is itself unread, then `prune_dead_phis` reclaims
         // the dangling inputarg / link arg / address constant.
         type Var = crate::flowspace::model::Variable;
-        let cast_pytype = |arg: &Var| OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec![
-                    crate::runtime_names::shims::CAST_INSTANCE.into(),
-                    "PyType".into(),
-                ],
-            },
-            args: crate::model::call_args(vec![arg.clone()]),
-            result_ty: ValueType::Ref(Some("PyType".into())),
-        };
+        let cast_pytype = |arg: &Var| crate::model::cast_instance_call("PyType", arg.clone());
         let field = |base: &Var, name: &str, value: &Var| OpKind::FieldWrite {
             base: base.clone(),
             field: FieldDescriptor {
@@ -11214,16 +11204,7 @@ mod tests {
         let ret = graph
             .push_op_var(
                 blk,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.into(),
-                            "PyObject".into(),
-                        ],
-                    },
-                    args: crate::model::call_args(vec![boxed.clone()]),
-                    result_ty: ValueType::Ref(Some("PyObject".into())),
-                },
+                crate::model::cast_instance_call("PyObject", boxed.clone()),
                 true,
             )
             .unwrap();
@@ -11249,12 +11230,7 @@ mod tests {
             "the cross-block dead header ctor must be swept: {kinds:#?}"
         );
         assert!(
-            !kinds.iter().any(|k| matches!(
-                k,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                        && segments.get(1).map(String::as_str) == Some("PyType")
-            )),
+            !kinds.iter().any(|k| cast_instance_root(k) == Some("PyType")),
             "the dead PyType cast threaded across the block boundary must be swept"
         );
         assert!(
@@ -11264,11 +11240,7 @@ mod tests {
             "the live NewWithVtable must survive"
         );
         assert!(
-            kinds.iter().any(|k| matches!(
-                k,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.get(1).map(String::as_str) == Some("PyObject")
-            )),
+            kinds.iter().any(|k| cast_instance_root(k) == Some("PyObject")),
             "the live return cast must survive"
         );
         assert!(

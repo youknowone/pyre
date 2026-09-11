@@ -2177,23 +2177,18 @@ pub fn translate_op(
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
                     // `__cast_instance_intrinsic` — front-end pointer-downcast
-                    // narrow (#298).  `front::mir` emits a synthetic
-                    // `Call(["__cast_instance_intrinsic", <root>], [operand])`
-                    // for `obj as *const RegisteredStruct`, stashing the
-                    // target struct root in `segments[1]`.
-                    // Reconstruct it here as `simple_call(callable,
-                    // operand, Constant(root))`: the analyzer reads the
-                    // trailing `ByteStr` root to type the result
+                    // narrow (#298).  `front::mir` emits
+                    // `Call(["__cast_instance_intrinsic"], [operand, const(root)])`
+                    // for `obj as *const RegisteredStruct`.  The analyzer
+                    // reads the trailing `ByteStr` root to type the result
                     // `SomeInstance(root)`, and the typer lowers the call
                     // to a `cast_pointer`.  The callable resolves through
                     // the `__cast_instance_intrinsic` HOST_ENV singleton so its
                     // Arc identity matches the `BUILTIN_TYPER` key.
-                    if segments.len() == 2
-                        && segments[0] == crate::runtime_names::shims::CAST_INSTANCE
-                    {
-                        if arg_hls.len() != 1 {
+                    if segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE] {
+                        if arg_hls.len() != 2 {
                             return Err(TyperError::message(format!(
-                                "__cast_instance_intrinsic requires exactly one operand, got {}",
+                                "__cast_instance_intrinsic requires (operand, constant_root), got {}",
                                 arg_hls.len()
                             )));
                         }
@@ -2207,12 +2202,9 @@ pub fn translate_op(
                             })?;
                         let callable =
                             Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
-                        let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                         call_args.push(callable);
                         call_args.extend(arg_hls);
-                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                            &segments[1],
-                        ))));
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
                     // `__cast_address_intrinsic` — the erasing twin of the narrow
@@ -6058,6 +6050,46 @@ mod tests {
             .intern_class_by_qualname("W_CastTarget");
         assert_eq!(class_host, &interned);
         assert!(matches!(lowered.args[2], Hlvalue::Variable(ref v) if *v == operand));
+    }
+
+    #[test]
+    fn translate_op_cast_instance_uses_trailing_root_constant() {
+        // `cast_instance_call` puts the target root at args[1] as a
+        // ByteStr Constant.  The adapter prepends the HOST_ENV
+        // callable and leaves that mixed list intact.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 10);
+        let operand = Variable::new();
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(operand.clone()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: crate::model::cast_instance_call("W_CastTarget", vars[1].clone()),
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("cast_instance_call must lower to simple_call");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(translated[0].args.len(), 3);
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be HostObject");
+        };
+        let expected = HOST_ENV
+            .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+            .expect("HOST_ENV must register __cast_instance_intrinsic");
+        assert_eq!(host, &expected);
+        assert!(
+            matches!(&translated[0].args[1], Hlvalue::Variable(v) if *v == operand),
+            "operand stays args[1] of simple_call"
+        );
+        let Hlvalue::Constant(ref root) = translated[0].args[2] else {
+            panic!("root must stay a trailing Constant");
+        };
+        assert_eq!(root.value.as_pystr(), Some("W_CastTarget"));
     }
 
     #[test]

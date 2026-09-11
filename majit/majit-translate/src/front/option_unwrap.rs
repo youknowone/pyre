@@ -130,23 +130,17 @@ fn rewire_one_unwrap_site(
         .position(|op| op.result.as_ref() == Some(&site.result_var))
         .expect("result var producer resolved to block A above");
     let last_idx = graph.blocks[a].operations.len() - 1;
-    let (cast, out_var): (Option<(Vec<String>, ValueType)>, Variable) = if call_idx == last_idx {
+    let (cast, out_var): (Option<(String, ValueType)>, Variable) = if call_idx == last_idx {
         (None, site.result_var.clone())
     } else if call_idx == last_idx - 1 {
         let tail = &graph.blocks[a].operations[last_idx];
-        match (&tail.kind, tail.result.clone()) {
-            (
-                OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath { segments },
-                    args,
-                    result_ty,
-                },
-                Some(narrowed),
-            ) if segments.first().map(String::as_str)
-                == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                && args.as_slice() == std::slice::from_ref(&site.result_var) =>
+        match tail.result.clone() {
+            Some(narrowed)
+                if let Some(root) =
+                    crate::model::cast_instance_of(&tail.kind, &site.result_var)
+                    && let OpKind::Call { result_ty, .. } = &tail.kind =>
             {
-                (Some((segments.clone(), result_ty.clone())), narrowed)
+                (Some((root.to_string(), result_ty.clone())), narrowed)
             }
             _ => {
                 return Err(format!(
@@ -418,16 +412,7 @@ mod tests {
         let narrowed = g
             .push_op_var(
                 a,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                            "Tuple<f64,f64>".to_string(),
-                        ],
-                    },
-                    args: crate::model::call_args(vec![result.clone()]),
-                    result_ty: ValueType::Ref(Some("Tuple<f64,f64>".into())),
-                },
+                crate::model::cast_instance_call("Tuple<f64,f64>", result.clone()),
                 true,
             )
             .unwrap();

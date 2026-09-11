@@ -5335,13 +5335,7 @@ impl<'a> Lowering<'a> {
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(narrowed.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec!["__cast_instance_intrinsic".to_string(), root.to_string()],
-                },
-                args: crate::model::call_args(vec![value]),
-                result_ty: ValueType::Ref(Some(root.to_string())),
-            },
+            kind: crate::model::cast_instance_call(root, value),
         });
         LinkArg::Value(narrowed)
     }
@@ -6525,13 +6519,13 @@ impl<'a> Lowering<'a> {
                 )
             } else {
                 let root = tyref_class_root(dest_ty, self.llbc)?;
-                (
-                    vec![
-                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                        root.clone(),
-                    ],
-                    ValueType::Ref(Some(root)),
-                )
+                let res = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                return Some((
+                    crate::model::cast_instance_call(root, arg.clone()),
+                    res,
+                ));
             };
         let res = self
             .graph
@@ -6855,16 +6849,7 @@ impl<'a> Lowering<'a> {
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(narrowed.clone()),
-                            kind: OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: vec![
-                                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                                        root.clone(),
-                                    ],
-                                },
-                                args: crate::model::call_args(vec![base]),
-                                result_ty: ValueType::Ref(Some(root)),
-                            },
+                            kind: crate::model::cast_instance_call(root, base),
                         });
                         narrowed
                     } else {
@@ -7082,16 +7067,7 @@ impl<'a> Lowering<'a> {
                                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                                 result: Some(narrowed.clone()),
-                                kind: OpKind::Call {
-                                    target: CallTarget::FunctionPath {
-                                        segments: vec![
-                                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                                            owner.clone(),
-                                        ],
-                                    },
-                                    args: crate::model::call_args(vec![base]),
-                                    result_ty: ValueType::Ref(Some(owner.clone())),
-                                },
+                                kind: crate::model::cast_instance_call(owner.clone(), base),
                             });
                             narrowed
                         } else {
@@ -7164,16 +7140,7 @@ impl<'a> Lowering<'a> {
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    "__cast_instance_intrinsic".to_string(),
-                                    "PyObject".to_string(),
-                                ],
-                            },
-                            args: crate::model::call_args(vec![raw]),
-                            result_ty: ValueType::Ref(Some("PyObject".to_string())),
-                        },
+                        kind: crate::model::cast_instance_call("PyObject", raw),
                     });
                     return Ok(res);
                 }
@@ -7233,16 +7200,7 @@ impl<'a> Lowering<'a> {
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                                    root.clone(),
-                                ],
-                            },
-                            args: crate::model::call_args(vec![raw]),
-                            result_ty: ValueType::Ref(Some(root)),
-                        },
+                        kind: crate::model::cast_instance_call(root, raw),
                     });
                     return Ok(res);
                 }
@@ -7268,16 +7226,7 @@ impl<'a> Lowering<'a> {
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                                    root.clone(),
-                                ],
-                            },
-                            args: crate::model::call_args(vec![raw]),
-                            result_ty: ValueType::Ref(Some(root)),
-                        },
+                        kind: crate::model::cast_instance_call(root, raw),
                     });
                     return Ok(res);
                 }
@@ -9385,16 +9334,7 @@ impl<'a> Lowering<'a> {
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(narrowed.clone()),
-                            kind: OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: vec![
-                                        "__cast_instance_intrinsic".to_string(),
-                                        root.clone(),
-                                    ],
-                                },
-                                args: crate::model::call_args(vec![res]),
-                                result_ty: ValueType::Ref(Some(root)),
-                            },
+                            kind: crate::model::cast_instance_call(root, res),
                         });
                         self.local_var[dest_local] = Some(narrowed);
                     } else {
@@ -10020,16 +9960,7 @@ impl<'a> Lowering<'a> {
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(res.clone()),
-                            kind: OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: vec![
-                                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                                        root.clone(),
-                                    ],
-                                },
-                                args: crate::model::call_args(vec![args[0].clone()]),
-                                result_ty: ValueType::Ref(Some(root)),
-                            },
+                            kind: crate::model::cast_instance_call(root, args[0].clone()),
                         });
                         self.local_var[dest_local] = Some(res);
                     } else {
@@ -11729,16 +11660,10 @@ impl<'a> Lowering<'a> {
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(narrowed_receiver.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                            "RBigInt".to_string(),
-                        ],
-                    },
-                    args: crate::model::call_args(vec![args[0].clone().into_variable()]),
-                    result_ty: ValueType::Ref(Some("RBigInt".to_string())),
-                },
+                kind: crate::model::cast_instance_call(
+                    "RBigInt",
+                    args[0].clone().into_variable(),
+                ),
             });
             let mut narrowed_args = args.clone();
             narrowed_args[0] = narrowed_receiver.into();
@@ -12616,16 +12541,7 @@ impl<'a> Lowering<'a> {
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(narrowed.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                            root.clone(),
-                        ],
-                    },
-                    args: crate::model::call_args(vec![result_var.clone()]),
-                    result_ty: ValueType::Ref(Some(root)),
-                },
+                kind: crate::model::cast_instance_call(root, result_var.clone()),
             });
             self.local_var[dest_local] = Some(narrowed);
         }
@@ -12974,16 +12890,7 @@ impl<'a> Lowering<'a> {
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(narrowed.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec![
-                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                        "Constants".to_string(),
-                    ],
-                },
-                args: crate::model::call_args(vec![base]),
-                result_ty: ValueType::Ref(Some("Constants".to_string())),
-            },
+            kind: crate::model::cast_instance_call("Constants", base),
         });
         let result = self
             .graph
@@ -16370,13 +16277,7 @@ impl<'a> Lowering<'a> {
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(narrowed.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec![crate::runtime_names::shims::CAST_INSTANCE.to_string(), root],
-                },
-                args: crate::model::call_args(vec![null]),
-                result_ty,
-            },
+            kind: crate::model::cast_instance_call_result(root, null, result_ty),
         });
         narrowed
     }
@@ -28989,7 +28890,7 @@ mod tests {
     #[test]
     #[ignore]
     fn random_wrapper_narrows_nullable_self_to_w_random() {
-        use crate::model::{CallTarget, OpKind, ValueType};
+        use crate::model::{CallTarget, OpKind};
 
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
@@ -29024,15 +28925,10 @@ mod tests {
             .find(|block| block.id == block_id)
             .expect("producer block")
             .operations[idx];
-        assert!(matches!(
-            &producer.kind,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
-                result_ty: ValueType::Ref(Some(root)),
-                ..
-            } if segments == &[crate::runtime_names::shims::CAST_INSTANCE.to_string(), "W_Random".to_string()]
-                && root == "W_Random"
-        ));
+        assert_eq!(
+            crate::model::cast_instance_root(&producer.kind),
+            Some("W_Random")
+        );
     }
 
     #[test]
@@ -34211,22 +34107,20 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|b| &b.operations)
-            .filter_map(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    args,
-                    ..
-                } if segments
-                    == &[
-                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                        "PyObject".to_string(),
-                    ]
-                    && args.len() == 1
-                    && null_results.contains(&args[0]) =>
+            .filter_map(|op| {
+                let OpKind::Call { args, .. } = &op.kind else {
+                    return None;
+                };
+                if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
+                    && args
+                        .first()
+                        .and_then(crate::model::LinkArg::as_variable)
+                        .is_some_and(|v| null_results.contains(v))
                 {
                     op.result.clone()
+                } else {
+                    None
                 }
-                _ => None,
             })
             .collect();
         assert!(
@@ -34436,16 +34330,7 @@ mod tests {
                 let Some(cast_result) = ops[0].result.as_ref() else {
                     return false;
                 };
-                matches!(
-                    &ops[0].kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        ..
-                    } if segments == &[
-                        "__cast_instance_intrinsic".to_string(),
-                        "PyObject".to_string(),
-                    ]
-                ) && matches!(
+                crate::model::cast_instance_root(&ops[0].kind) == Some("PyObject") && matches!(
                     &ops[1].kind,
                     OpKind::ArrayWrite {
                         value: crate::model::LinkArg::Value(value),
@@ -34468,7 +34353,7 @@ mod tests {
     #[test]
     #[ignore]
     fn popvalue_py_null_narrows_to_nullable_instance() {
-        use crate::model::{CallTarget, OpKind};
+        use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../build/llbc/pyre-interpreter.ullbc"
@@ -34484,17 +34369,7 @@ mod tests {
                 matches!(
                     &ops[0].kind,
                     OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_mut"
-                ) && matches!(
-                    &ops[1].kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        ..
-                    } if segments.as_slice()
-                        == [
-                            "__cast_instance_intrinsic".to_string(),
-                            "PyObject".to_string(),
-                        ]
-                )
+                ) && crate::model::cast_instance_root(&ops[1].kind) == Some("PyObject")
             })
         });
         assert!(
@@ -34832,8 +34707,8 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments },
                     ..
-                } if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
-                    && segments.get(1).is_some_and(|root| root.ends_with("PyObject"))
+                } if crate::model::cast_instance_root(&op.kind)
+                    .is_some_and(|root| root.ends_with("PyObject"))
             )
         });
         assert!(
@@ -36294,13 +36169,7 @@ mod tests {
              representation (Some(ptr)=ptr, None=null), not an Option aggregate"
         );
         let is_instance_narrow = |op: &crate::model::SpaceOperation| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    ..
-                } if segments == &["__cast_instance_intrinsic", "PyObject"]
-            )
+            crate::model::cast_instance_root(&op.kind) == Some("PyObject")
         };
         let join = graph.blocks.iter().find_map(|block| {
             let has_call_once = block.operations.iter().any(|op| {
@@ -36404,7 +36273,9 @@ mod tests {
                             target: CallTarget::FunctionPath { segments },
                             ..
                         },
-                    ) if segments == &["__cast_instance_intrinsic", owner] => Some(result),
+                    ) if crate::model::cast_instance_root(&op.kind) == Some(owner) => {
+                        Some(result)
+                    }
                     _ => None,
                 })
                 .expect("typed raw allocation destination");
@@ -36953,9 +36824,8 @@ mod tests {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath { segments },
                                 ..
-                            } if segments.first().map(String::as_str)
-                                == Some("__cast_instance_intrinsic")
-                                && segments.get(1).is_some_and(|root| root.starts_with("Vec<"))
+                            } if crate::model::cast_instance_root(&op.kind)
+                                .is_some_and(|root| root.starts_with("Vec<"))
                         )
                 }),
             "index_storage null must narrow to the Vec/GcArray list repr"
@@ -37541,7 +37411,7 @@ mod tests {
     #[test]
     #[ignore]
     fn pyerror_new_narrows_null_object_fields() {
-        use crate::model::{CallTarget, LinkArg, OpKind};
+        use crate::model::{LinkArg, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../build/llbc/pyre-interpreter.ullbc"
@@ -37567,13 +37437,7 @@ mod tests {
             assert!(
                 graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                     op.result.as_ref() == Some(&value)
-                        && matches!(
-                            &op.kind,
-                            OpKind::Call {
-                                target: CallTarget::FunctionPath { segments },
-                                ..
-                            } if segments == &["__cast_instance_intrinsic", "PyObject"]
-                        )
+                        && crate::model::cast_instance_root(&op.kind) == Some("PyObject")
                 }),
                 "PyError::{field_name} null must retain the declared PyObject class"
             );
@@ -37625,7 +37489,8 @@ mod tests {
                                 OpKind::Call {
                                     target: CallTarget::FunctionPath { segments },
                                     ..
-                                } if segments == &["__cast_instance_intrinsic", "PyObject"]
+                                } if crate::model::cast_instance_root(&producer.kind)
+                                    == Some("PyObject")
                             )
                     }),
                 "PyError::{} projection write must retain the declared PyObject class",
@@ -37673,9 +37538,8 @@ mod tests {
                         OpKind::Call {
                             target: CallTarget::FunctionPath { segments },
                             ..
-                        } if segments.first().map(String::as_str)
-                            == Some("__cast_instance_intrinsic")
-                            && segments.last().is_some_and(|root| root.ends_with("DictStrategyRef"))
+                        } if crate::model::cast_instance_root(&op.kind)
+                            .is_some_and(|root| root.ends_with("DictStrategyRef"))
                     )
             }),
             "dstrategy assignment must retain the declared DictStrategyRef class"
@@ -38229,10 +38093,11 @@ mod tests {
                         target: CallTarget::FunctionPath { segments },
                         args,
                         result_ty: ValueType::Ref(Some(owner)),
-                    } if segments.first().map(String::as_str)
-                        == Some(crate::runtime_names::shims::CAST_INSTANCE)
+                    } if crate::model::cast_instance_root(&op.kind)
+                        == Some("dictmultiobject::DictStrategyRef")
                         && owner == "dictmultiobject::DictStrategyRef"
-                        && args.as_slice() == std::slice::from_ref(&raw))
+                        && args.first().and_then(crate::model::LinkArg::as_variable)
+                            == Some(&raw))
                 }),
             "a field-bearing prebuilt holder must enter annotation as its own instance"
         );

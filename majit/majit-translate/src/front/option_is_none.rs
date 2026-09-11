@@ -102,16 +102,7 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
             let narrowed = graph.alloc_value_var();
             ops.push(SpaceOperation {
                 result: Some(narrowed.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                            root.clone(),
-                        ],
-                    },
-                    args: crate::model::call_args(vec![null]),
-                    result_ty: result_ty.clone(),
-                },
+                kind: crate::model::cast_instance_call_result(root.clone(), null, result_ty.clone()),
             });
             narrowed
         } else {
