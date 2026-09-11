@@ -4564,7 +4564,11 @@ fn jit_ca_handle_guard_failure(
         // (`DeadFrameRefRoots` / `compute_gcmap`).
         let _deadframe_roots = unsafe {
             majit_metainterp::resume::DeadFrameRefRoots::enter(&raw_values, |index| {
-                exit_layout.is_traced_ref_slot(index)
+                // Slot 0 is the virtualizable (PyFrame). It is a GC
+                // object even when `exit_types` has not yet classified
+                // it; a CA bridge walk that forces `f_locals` reads it
+                // as `live_vable_frame_addr`.
+                index == 0 || exit_layout.is_traced_ref_slot(index)
             })
         };
         match trace_and_compile_from_bridge(&descr_arc, frame, &raw_values, &exit_layout, 0, false)

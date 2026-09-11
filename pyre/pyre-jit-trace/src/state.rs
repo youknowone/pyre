@@ -4453,16 +4453,26 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         if let Some(cached_ref) = expected_ref {
             if cached_ref != majit_ir::GcRef::NO_CONCRETE {
                 if let Some(struct_ptr) = concrete_gc_ptr(ctx, obj) {
+                    let struct_ptr =
+                        majit_gc::gc_current_object_address(struct_ptr as usize) as i64;
                     if let Some(majit_ir::Value::Ref(loaded)) =
                         ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
                     {
+                        // `getref_base()` is a GC pointer; a nursery
+                        // collection forwards it. The heapcache word is
+                        // a raw copy and is not rewritten, so compare
+                        // after `gc_current_object_address`.
+                        let loaded_now =
+                            majit_ir::GcRef(majit_gc::gc_current_object_address(loaded.0));
+                        let cached_now =
+                            majit_ir::GcRef(majit_gc::gc_current_object_address(cached_ref.0));
                         assert_eq!(
-                            loaded, cached_ref,
+                            loaded_now, cached_now,
                             "_opimpl_getfield_gc_any_pureornot sanity \
                              check (ref): loaded {:#x} != cached {:#x} \
                              (field_index={field_index}, field={field_name}, struct_ptr=\
                              {struct_ptr:#x})",
-                            loaded.0, cached_ref.0,
+                            loaded_now.0, cached_now.0,
                         );
                     }
                 }

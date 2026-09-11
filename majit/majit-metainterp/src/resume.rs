@@ -8124,7 +8124,11 @@ impl<'a> ResumeDataDirectReader<'a> {
             self.virtualizable_identity_tagged = None;
             self.virtualizable_identity_override = None;
         }
-        self.virtualizable_ptr = virtualizable;
+        self.virtualizable_ptr = if virtualizable == 0 {
+            0
+        } else {
+            majit_gc::gc_current_object_address(virtualizable as usize) as i64
+        };
         if self.virtualizable_root_base_depth.is_none() {
             self.virtualizable_root_base_depth =
                 Some(majit_gc::shadow_stack::resume_ref_roots_depth());

@@ -3899,7 +3899,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let live_frame = if ctx.fbw_mode.snapshot_sym.is_null() {
         0
     } else {
-        unsafe { (*ctx.fbw_mode.snapshot_sym).live_vable_frame_addr() }
+        // The symbol stores a raw address. A residual is a collection
+        // point (`push_roots` below), so a nursery frame may have been
+        // forwarded since the address was captured. RPython's live
+        // virtualizable is a GC pointer and is rewritten in place;
+        // follow the stub the same way `gc_current_object_address` does.
+        let raw = unsafe { (*ctx.fbw_mode.snapshot_sym).live_vable_frame_addr() };
+        if raw == 0 {
+            0
+        } else {
+            majit_gc::gc_current_object_address(raw)
+        }
     };
     // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
     // the outer walk's mirror and a sub-walk never advances it.
@@ -4394,7 +4404,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     ),
                     Err(exc) => (None, exc, true),
                 };
-                if ctx.session.borrow().framestack.is_empty() && !ctx.fbw_mode.inline_subwalk {
+                // Same non-bridge latch as the escape-flush commit above:
+                // a bridge walk never adopts this image (`run_perfn_walk`
+                // epilogue is skipped).
+                if ctx.session.borrow().framestack.is_empty()
+                    && !ctx.fbw_mode.inline_subwalk
+                    && !ctx.trace_ctx.is_bridge_trace
+                {
                     let jitcode = unsafe {
                         let sym = &*ctx.fbw_mode.snapshot_sym;
                         (!sym.jitcode().is_null())
