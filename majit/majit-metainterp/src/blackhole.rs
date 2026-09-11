@@ -10089,22 +10089,6 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // jit/assembler.rs` (cond_call / record_known_result).
     for (key, byte) in [
         (
-            "call_assembler_int_ext/P",
-            majit_translate::insns::BC_CALL_ASSEMBLER_INT,
-        ),
-        (
-            "call_assembler_ref_ext/P",
-            majit_translate::insns::BC_CALL_ASSEMBLER_REF,
-        ),
-        (
-            "call_assembler_float_ext/P",
-            majit_translate::insns::BC_CALL_ASSEMBLER_FLOAT,
-        ),
-        (
-            "call_assembler_void_ext/P",
-            majit_translate::insns::BC_CALL_ASSEMBLER_VOID,
-        ),
-        (
             "cond_call_void_ext/P",
             majit_translate::insns::BC_COND_CALL_VOID,
         ),
@@ -11574,7 +11558,9 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // pyre's nested-bytecode payload, distinct from the canonical
     // `dR`/`dIR`/`dIRF` arglists.
     builder.wire_handler("inline_call_nested_ext/P", handler_inline_call_nested_ext);
-    // P10 — pyre call_assembler / cond_call / record_known_result adapter wiring.
+    // Jitcode no longer emits CALL_ASSEMBLER; keep the handlers wired so a
+    // leftover byte still decodes. cond_call / record_known_result emit
+    // the canonical keys; ext handlers remain for leftover payloads.
     builder.wire_handler("call_assembler_int_ext/P", handler_call_assembler_int_ext);
     builder.wire_handler("call_assembler_ref_ext/P", handler_call_assembler_ref_ext);
     builder.wire_handler(
@@ -13704,8 +13690,9 @@ fn handler_call_assembler_void_ext(
 /// TODO: pyre `cond_call` / `record_known_result`
 /// adapters.
 ///
-/// `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
-/// (`jitcode/assembler.rs`) emit a pyre-only flat payload:
+/// `JitCodeBuilder` now emits the canonical `iiIRd` / `riIRd` layout.
+/// The `_ext` handlers below remain for any leftover `call_cond_like`
+/// payload:
 ///   `cond_call_*`:    `[first_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8]`
 ///   `cond_call_value`: `[value_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8, dst: u8]`
 ///   `record_known_result_*`: same shape as `cond_call_*` (no dst).

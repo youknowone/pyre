@@ -9114,7 +9114,150 @@ where
                     action => return action,
                 }
             }
-            // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──
+            // ── canonical conditional_call / record_known_result ──
+            // `rewrite_call(..., force_ir=True)`: lead + funcptr + I + R + d
+            // (`blackhole.rs` `handler_conditional_call_*` / `handler_record_known_result_*`).
+            jitcode::insns::BC_CONDITIONAL_CALL_IR_V
+            | jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I
+            | jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R
+            | jitcode::insns::BC_RECORD_KNOWN_RESULT_I_IR_V
+            | jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V => {
+                let (first_reg, target, args_i, args_r, calldescr, dst) = {
+                    let frame = self.frames.current_mut();
+                    let first_reg = frame.next_reg() as u16;
+                    let funcptr_reg = frame.next_reg() as u16;
+                    let count_i = frame.next_u8() as usize;
+                    let mut args_i = Vec::with_capacity(count_i);
+                    for _ in 0..count_i {
+                        args_i.push(JitCallArg::int(frame.next_reg() as u16));
+                    }
+                    let count_r = frame.next_u8() as usize;
+                    let mut args_r = Vec::with_capacity(count_r);
+                    for _ in 0..count_r {
+                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
+                    }
+                    let calldescr_idx = frame.next_u16();
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
+                        .expect("canonical cond/record descr is not BhDescr")
+                        .as_calldescr()
+                        .clone();
+                    let target = frame
+                        .jitcode
+                        .exec
+                        .call_descr_to_call_target
+                        .get(&calldescr_idx)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            let func =
+                                frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
+                                    panic!(
+                                        "canonical cond/record: funcptr slot {funcptr_reg} \
+                                     is uninitialized"
+                                    )
+                                });
+                            let func = func as *const ();
+                            JitCallTarget::new(func, func)
+                        });
+                    let dst = if matches!(
+                        bytecode,
+                        jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I
+                            | jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R
+                    ) {
+                        Some(frame.next_reg() as u16)
+                    } else {
+                        None
+                    };
+                    (first_reg, target, args_i, args_r, calldescr, dst)
+                };
+                let (args, concrete_args, arg_types, _raw_i, _raw_r, _raw_f) =
+                    self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &[]);
+                let trace_ptr = if target.trace_ptr.is_null() {
+                    target.concrete_ptr
+                } else {
+                    target.trace_ptr
+                };
+                let concrete_ptr = if target.concrete_ptr.is_null() {
+                    trace_ptr
+                } else {
+                    target.concrete_ptr
+                };
+                let slot = target.effect_info_slot;
+                match bytecode {
+                    jitcode::insns::BC_CONDITIONAL_CALL_IR_V => {
+                        let first_val =
+                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        ctx.cond_call_void_typed(first_val, trace_ptr, &args, &arg_types, slot);
+                        if first_val != 0 {
+                            call_void_function(concrete_ptr, &concrete_args);
+                        }
+                    }
+                    jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I => {
+                        let first_val =
+                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        let _ = ctx.cond_call_value_int_typed(
+                            first_val, trace_ptr, &args, &arg_types, slot,
+                        );
+                        let concrete_result = if first_val == 0 {
+                            call_int_function(concrete_ptr, &concrete_args)
+                        } else {
+                            first_val
+                        };
+                        if let Some(dst) = dst {
+                            self.frames.current_mut().int_values[dst as usize] =
+                                Some(concrete_result);
+                        }
+                    }
+                    jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R => {
+                        let first_val =
+                            self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
+                        let _ = ctx.cond_call_value_ref_typed(
+                            first_val, trace_ptr, &args, &arg_types, slot,
+                        );
+                        let concrete_result = if first_val == 0 {
+                            call_ref_function(concrete_ptr, &concrete_args)
+                        } else {
+                            first_val
+                        };
+                        if let Some(dst) = dst {
+                            self.frames.current_mut().ref_values[dst as usize] =
+                                Some(concrete_result);
+                        }
+                    }
+                    jitcode::insns::BC_RECORD_KNOWN_RESULT_I_IR_V => {
+                        let result_val =
+                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        ctx.profiler()
+                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
+                        ctx.record_known_result_typed(
+                            result_val,
+                            trace_ptr,
+                            &args,
+                            &arg_types,
+                            majit_ir::Type::Int,
+                            slot,
+                        );
+                    }
+                    jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V => {
+                        let result_val =
+                            self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
+                        ctx.profiler()
+                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
+                        ctx.record_known_result_typed(
+                            result_val,
+                            trace_ptr,
+                            &args,
+                            &arg_types,
+                            majit_ir::Type::Ref,
+                            slot,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // ── helper-side ext payload (no remaining emit; decode kept) ──
             jitcode::insns::BC_COND_CALL_VOID
             | jitcode::insns::BC_COND_CALL_VALUE_INT
             | jitcode::insns::BC_COND_CALL_VALUE_REF
