@@ -315,9 +315,9 @@ fn dispatch_inline_call_descrs_have_jitcode_entries() {
         .expect("dispatch lower must succeed for fixture");
 
     // Every Lowerable arm is force-inlined; `_ => break` is the default
-    // label, not a residual INLINE_CALL. Residual Nop/Halt/abort stubs,
-    // if any remain, must still be non-empty JitCode descrs — never
-    // fnaddr wrappers (`pyjitpl/dispatch.rs` `run_one_step`).
+    // label. Nop/Halt emit nothing. Leftover arm sub-JitCodes, if any
+    // remain, must still be non-empty JitCode descrs — never fnaddr
+    // wrappers (`pyjitpl/dispatch.rs` `run_one_step`).
     for d in dispatch.exec.descrs.iter() {
         if let majit_metainterp::jitcode::RuntimeBhDescr::JitCode(jc) = d {
             assert!(
