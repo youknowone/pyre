@@ -1405,6 +1405,30 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             fbw.push_str(&format!(" {key}={value}"));
         }
         eprintln!("{fbw}");
+        if let (Ok(len_fn), Ok(byte_fn)) = (
+            instance.get_typed_func::<(), u32>(&mut store, "pyre_jit_last_compile_err_len"),
+            instance.get_typed_func::<u32, u32>(&mut store, "pyre_jit_last_compile_err_byte"),
+        ) {
+            let len = len_fn.call(&mut store, ()).unwrap_or(0);
+            if len > 0 {
+                let mut bytes = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    bytes.push(byte_fn.call(&mut store, i).unwrap_or(0) as u8);
+                }
+                eprintln!(
+                    "[jit-stats] last_compile_err {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+        }
+        if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_bridge_diag") {
+            let cl_entered = diag.call(&mut store, 23).unwrap_or(0);
+            let cl_ok = diag.call(&mut store, 24).unwrap_or(0);
+            let cl_decl_unsupported = diag.call(&mut store, 25).unwrap_or(0);
+            eprintln!(
+                "[jit-stats] cl_diag entered={cl_entered} ok={cl_ok} decl_unsupported={cl_decl_unsupported}"
+            );
+        }
         eprintln!(
             "[jit-stats] loops_compiled={loops_compiled} \
              bridges_compiled={bridges_compiled} \
