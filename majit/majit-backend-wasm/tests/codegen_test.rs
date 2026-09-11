@@ -2967,7 +2967,7 @@ fn reemit_nulls_grown_label_homes_and_builds() {
 /// (`InputArgRef(128)` on attr_delete) after every real use was rewritten
 /// to the folded constant. That argument is the phi destination, not a
 /// read of a never-written local. A later producer past 128 used to make
-/// `unbound_pool_const_seeds` decline the whole module (`value[128]`).
+/// `unbound_pool_const_seeds` decline the whole module.
 #[test]
 fn label_arg_import_hole_is_not_an_unbound_read() {
     let inputargs = vec![
@@ -3064,7 +3064,7 @@ fn unbound_non_label_read_of_import_hole_is_declined() {
     };
     let msg = err.to_string();
     assert!(
-        msg.contains("value[128]"),
+        msg.contains("InputArgRef(128)") && msg.contains("read with no producing op and no"),
         "expected unbound 128 decline, got {msg}"
     );
 }
