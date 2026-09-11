@@ -419,6 +419,15 @@ pub struct CallAssemblerTarget {
     pub callee_frame_bytes: u32,
     pub callee_gcmap_ptr: i64,
     pub compiled_ptr: u64,
+    /// Callee Ref-home origin, in item-base bytes. Redirects may replace a
+    /// temporary callback with a differently laid-out loop, so this is
+    /// loaded with the other runtime snapshot fields.
+    pub home_slot_base: u32,
+    pub home_slots: u32,
+    /// Callee retains `_finish_gcmap` (`GUARD_NOT_FORCED_2`). The caller
+    /// pop footer must use the write-barrier helper when this is set,
+    /// even if the caller module itself has no GNF2.
+    pub has_guard_not_forced_2: u32,
 }
 
 /// Compiled loop targets keyed by their `JitCellToken` number. Unlike label
@@ -451,6 +460,9 @@ pub struct WasmCaRuntimeTarget {
     /// Current callee GC map.  It must change together with frame depth when
     /// `redirect_call_assembler` installs the real loop.
     pub callee_gcmap_ptr: i64,
+    pub home_slot_base: u32,
+    pub home_slots: u32,
+    pub has_guard_not_forced_2: u32,
 }
 
 /// Stable cell baked by callers.  A redirect publishes one pointer to an
@@ -458,14 +470,23 @@ pub struct WasmCaRuntimeTarget {
 /// function with the temporary callback's frame geometry under concurrent
 /// execution.  Old snapshots stay owned by the entry for as long as any caller
 /// can still hold the pointer it loaded.
+///
+/// `has_guard_not_forced_2` is not snapshot state: an out-of-line
+/// `GUARD_NOT_FORCED_2` bridge can attach while a CALL_ASSEMBLER is
+/// already inside the callee. The in-flight footer still holds the
+/// pre-call snapshot, so this flag lives on the cell and only goes
+/// 0 → 1.
 #[repr(C)]
 pub struct WasmCaDispatchEntry {
     pub target_ptr: AtomicU32,
+    pub has_guard_not_forced_2: AtomicU32,
     pub targets: std::sync::Mutex<Vec<Box<WasmCaRuntimeTarget>>>,
 }
 
 pub const WASM_CA_DISPATCH_TARGET_PTR_OFS: u64 =
     std::mem::offset_of!(WasmCaDispatchEntry, target_ptr) as u64;
+pub const WASM_CA_DISPATCH_HAS_GNF2_OFS: u64 =
+    std::mem::offset_of!(WasmCaDispatchEntry, has_guard_not_forced_2) as u64;
 pub const WASM_CA_TARGET_FUNC_HANDLE_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, func_handle) as u64;
 pub const WASM_CA_TARGET_COMPILED_PTR_OFS: u64 =
@@ -476,6 +497,12 @@ pub const WASM_CA_TARGET_DISPATCH_KEY_OFS_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, dispatch_key_ofs) as u64;
 pub const WASM_CA_TARGET_GCMAP_PTR_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, callee_gcmap_ptr) as u64;
+pub const WASM_CA_TARGET_HOME_SLOT_BASE_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, home_slot_base) as u64;
+pub const WASM_CA_TARGET_HOME_SLOTS_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, home_slots) as u64;
+pub const WASM_CA_TARGET_HAS_GNF2_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, has_guard_not_forced_2) as u64;
 
 /// `make_and_attach_done_descrs` gives every cpu one `DoneWithThisFrame*` per
 /// result kind plus one `ExitFrameWithExceptionDescrRef`, and
@@ -612,6 +639,13 @@ pub static WASM_CA_DISPATCH: parking_lot::Mutex<
     Option<std::collections::HashMap<u64, Box<WasmCaDispatchEntry>>>,
 > = parking_lot::Mutex::new(None);
 
+/// Compiled loops that already have a GNF2 bridge. Consulted under
+/// `WASM_CA_DISPATCH` so a redirect that publishes after `mark` but
+/// before the source guard cell is written still raises the new alias
+/// cell. Pointers are forgotten when that compiled loop is removed.
+static CA_GNF2_COMPILED_PTRS: parking_lot::Mutex<Option<std::collections::HashSet<u32>>> =
+    parking_lot::Mutex::new(None);
+
 /// Return the stable guest-memory address for `number`, creating a pending
 /// (zero-slot) entry when needed.
 pub fn ca_dispatch_slot(number: u64) -> u32 {
@@ -622,10 +656,104 @@ pub fn ca_dispatch_slot(number: u64) -> u32 {
         .or_insert_with(|| {
             Box::new(WasmCaDispatchEntry {
                 target_ptr: AtomicU32::new(0),
+                has_guard_not_forced_2: AtomicU32::new(0),
                 targets: std::sync::Mutex::new(Vec::new()),
             })
         });
     (&**entry as *const WasmCaDispatchEntry as usize) as u32
+}
+
+/// Raise the monotonic GNF2 flag on an existing dispatch cell.
+///
+/// Does not create an entry and does not publish a new snapshot. Call
+/// this before arming a newly compiled `GUARD_NOT_FORCED_2` bridge so
+/// an in-flight CALL_ASSEMBLER footer sees the flag before the callee
+/// can finish through that bridge.
+///
+/// When `number` already has a snapshot, every cell that still retains
+/// that compiled loop — current target or an older snapshot — is
+/// raised too. Redirected aliases keep their own cell, and in-flight
+/// callers may still hold a historical snapshot pointer, so marking
+/// only the replacement token or only `.last()` would leave those
+/// footers reading zero.
+pub fn ca_dispatch_mark_gnf2(number: u64) {
+    let table = WASM_CA_DISPATCH.lock();
+    let Some(table) = table.as_ref() else {
+        return;
+    };
+    let compiled_ptr = table.get(&number).and_then(|entry| {
+        entry
+            .targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .map(|target| target.compiled_ptr)
+    });
+    if let Some(compiled_ptr) = compiled_ptr.filter(|&ptr| ptr != 0) {
+        mark_gnf2_entries_for_compiled_ptr(table, compiled_ptr);
+    } else if let Some(entry) = table.get(&number) {
+        entry.has_guard_not_forced_2.store(1, Ordering::Release);
+    }
+}
+
+/// Raise the monotonic GNF2 flag on every dispatch cell that still
+/// retains a snapshot invoking `compiled_ptr`.
+pub fn ca_dispatch_mark_gnf2_for_compiled_ptr(compiled_ptr: u32) {
+    if compiled_ptr == 0 {
+        return;
+    }
+    let table = WASM_CA_DISPATCH.lock();
+    remember_gnf2_compiled_ptr(compiled_ptr);
+    if let Some(table) = table.as_ref() {
+        mark_gnf2_entries_for_compiled_ptr(table, compiled_ptr);
+    }
+}
+
+fn remember_gnf2_compiled_ptr(compiled_ptr: u32) {
+    if compiled_ptr != 0 {
+        CA_GNF2_COMPILED_PTRS
+            .lock()
+            .get_or_insert_with(Default::default)
+            .insert(compiled_ptr);
+    }
+}
+
+fn compiled_ptr_has_gnf2(compiled_ptr: u32) -> bool {
+    compiled_ptr != 0
+        && CA_GNF2_COMPILED_PTRS
+            .lock()
+            .as_ref()
+            .is_some_and(|set| set.contains(&compiled_ptr))
+}
+
+fn mark_gnf2_entries_for_compiled_ptr(
+    table: &std::collections::HashMap<u64, Box<WasmCaDispatchEntry>>,
+    compiled_ptr: u32,
+) {
+    remember_gnf2_compiled_ptr(compiled_ptr);
+    for entry in table.values() {
+        let aliases = entry
+            .targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|target| target.compiled_ptr == compiled_ptr);
+        if aliases {
+            entry.has_guard_not_forced_2.store(1, Ordering::Release);
+        }
+    }
+}
+
+/// Stamp `has_guard_not_forced_2` on every CALL_ASSEMBLER metadata
+/// alias that currently names `compiled_ptr`.
+pub fn mark_call_assembler_targets_gnf2_for_compiled_ptr(compiled_ptr: u32) {
+    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().as_mut() {
+        for target in targets.values_mut() {
+            if target.compiled_ptr as u32 == compiled_ptr {
+                target.has_guard_not_forced_2 = 1;
+            }
+        }
+    }
 }
 
 /// Publish an installed loop after its module has acquired a shared-table
@@ -638,20 +766,40 @@ pub fn ca_dispatch_publish(
     callee_frame_bytes: u32,
     dispatch_key_ofs: u32,
     callee_gcmap_ptr: i64,
+    home_slot_base: u32,
+    home_slots: u32,
+    has_guard_not_forced_2: u32,
 ) {
     let _ = ca_dispatch_slot(number);
     let table = WASM_CA_DISPATCH.lock();
-    let entry = table
+    let has_guard_not_forced_2 =
+        if has_guard_not_forced_2 != 0 || compiled_ptr_has_gnf2(compiled_ptr) {
+            1
+        } else {
+            0
+        };
+    let entries = table
         .as_ref()
-        .and_then(|table| table.get(&number))
+        .expect("CALL_ASSEMBLER dispatch table disappeared while publishing");
+    if has_guard_not_forced_2 != 0 && compiled_ptr != 0 {
+        mark_gnf2_entries_for_compiled_ptr(entries, compiled_ptr);
+    }
+    let entry = entries
+        .get(&number)
         .expect("CALL_ASSEMBLER dispatch entry disappeared while publishing");
-    let mut targets = entry.targets.lock().unwrap();
+    if has_guard_not_forced_2 != 0 {
+        entry.has_guard_not_forced_2.store(1, Ordering::Release);
+    }
+    let mut targets = entry.targets.lock().unwrap_or_else(|e| e.into_inner());
     if targets.last().is_some_and(|current| {
         current.func_handle == func_handle
             && current.compiled_ptr == compiled_ptr
             && current.callee_frame_bytes == callee_frame_bytes
             && current.dispatch_key_ofs == dispatch_key_ofs
             && current.callee_gcmap_ptr == callee_gcmap_ptr
+            && current.home_slot_base == home_slot_base
+            && current.home_slots == home_slots
+            && current.has_guard_not_forced_2 == has_guard_not_forced_2
     }) {
         return;
     }
@@ -661,6 +809,9 @@ pub fn ca_dispatch_publish(
         callee_frame_bytes,
         dispatch_key_ofs,
         callee_gcmap_ptr,
+        home_slot_base,
+        home_slots,
+        has_guard_not_forced_2,
     });
     let target_ptr = (&*target as *const WasmCaRuntimeTarget as usize) as u32;
     targets.push(target);
@@ -675,6 +826,9 @@ pub fn ca_dispatch_redirect(
     callee_frame_bytes: u32,
     dispatch_key_ofs: u32,
     callee_gcmap_ptr: i64,
+    home_slot_base: u32,
+    home_slots: u32,
+    has_guard_not_forced_2: u32,
 ) {
     ca_dispatch_publish(
         old_number,
@@ -683,6 +837,9 @@ pub fn ca_dispatch_redirect(
         callee_frame_bytes,
         dispatch_key_ofs,
         callee_gcmap_ptr,
+        home_slot_base,
+        home_slots,
+        has_guard_not_forced_2,
     );
 }
 
@@ -690,21 +847,56 @@ pub fn ca_dispatch_redirect(
 /// also retracts redirects into a dropped replacement loop, while preserving
 /// an old token whose entry has already been redirected elsewhere.
 pub fn ca_dispatch_remove_compiled_ptr(compiled_ptr: u32) {
-    if let Some(table) = WASM_CA_DISPATCH.lock().as_mut() {
+    let mut table = WASM_CA_DISPATCH.lock();
+    if let Some(table) = table.as_mut() {
         table.retain(|_, entry| {
             entry
                 .targets
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .last()
                 .is_none_or(|target| target.compiled_ptr != compiled_ptr)
         });
     }
+    if compiled_ptr != 0 {
+        if let Some(set) = CA_GNF2_COMPILED_PTRS.lock().as_mut() {
+            set.remove(&compiled_ptr);
+        }
+    }
 }
 
 pub fn ca_dispatch_remove(number: u64) {
-    if let Some(table) = WASM_CA_DISPATCH.lock().as_mut() {
-        table.remove(&number);
+    let mut table = WASM_CA_DISPATCH.lock();
+    let Some(table) = table.as_mut() else {
+        return;
+    };
+    let compiled_ptrs: Vec<u32> = table
+        .remove(&number)
+        .map(|entry| {
+            entry
+                .targets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|target| target.compiled_ptr)
+                .filter(|&ptr| ptr != 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    for compiled_ptr in compiled_ptrs {
+        let still_used = table.values().any(|entry| {
+            entry
+                .targets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|target| target.compiled_ptr == compiled_ptr)
+        });
+        if !still_used {
+            if let Some(set) = CA_GNF2_COMPILED_PTRS.lock().as_mut() {
+                set.remove(&compiled_ptr);
+            }
+        }
     }
 }
 

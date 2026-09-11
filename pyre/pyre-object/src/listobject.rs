@@ -55,33 +55,77 @@ impl ForkListLock {
 static LIST_LOCKS: LazyLock<Vec<ForkListLock>> =
     LazyLock::new(|| (0..256).map(|_| ForkListLock::new()).collect());
 
-type ListGuard = parking_lot::lock_api::ReentrantMutexGuard<
-    'static,
-    parking_lot::RawMutex,
-    parking_lot::RawThreadId,
-    (),
->;
+/// `rthread.py` `Lock`: the native synchronization object stays behind an
+/// opaque word, with distinct acquire/release boundaries. The Rust owner
+/// preserves `Lock.__exit__` on early return and unwind as well as success.
+/// It must not move to another thread: release consumes an acquisition made
+/// by the current thread, including one level of a recursive acquisition.
+struct ListGuard {
+    lock: usize,
+    not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
 
-/// Only the acquire itself is opaque to the tracer; the guard-holding bodies
-/// stay look-inside, the same split `w_dict_lock` uses. A `dont_look_inside`
-/// data function is excluded from the jitcode pipeline entirely — the
-/// codewriter roots jitdriver portals and reaches everything else through
-/// look-inside calls — so the tracer emits a residual call for the whole
-/// operation instead of specializing the strategy dispatch.
+impl Drop for ListGuard {
+    fn drop(&mut self) {
+        // SAFETY: only w_list_lock constructs this non-Send owner, from one
+        // successful acquisition of a process-lifetime LIST_LOCKS entry.
+        unsafe { w_list_lock_release(self.lock) };
+    }
+}
+
+/// Keep the ownership bracket opaque until generated Drop and helper-frame
+/// forward resume both preserve its release. In particular, a guard inside
+/// this bracket must not resume at the enclosing Python subscription and
+/// acquire again. The scalar acquire/release ABI below is necessary but is
+/// not, by itself, permission to admit this body into tracing.
 #[majit_macros::dont_look_inside]
 unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
+    ListGuard {
+        lock: w_list_lock_acquire(obj),
+        not_send: std::marker::PhantomData,
+    }
+}
+
+/// `rthread.py` `Lock.acquire`: acquire one recursion level and return its
+/// opaque owner. No parking_lot aggregate crosses this boundary.
+///
+/// # Safety
+/// `obj` must be a live list. The caller must release the returned handle
+/// exactly once on the acquiring thread, including on exception exits.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_list_lock_acquire(obj: PyObjectRef) -> usize {
     // A nursery list can move while its guard is held.  Stripe on its stable
     // class identity, not the movable instance address, so every operation on
     // one list continues to acquire the same lock after collection.
     let w_class = (*obj).w_class;
     let lock = LIST_LOCKS[(w_class as usize >> 4) & (LIST_LOCKS.len() - 1)].get();
-    if let Some(guard) = lock.try_lock() {
-        return guard;
-    }
-    let blocked = majit_gc::gc_sync::before_external_block();
-    let guard = lock.lock();
-    drop(blocked);
-    guard
+    acquire_list_lock_handle(lock)
+}
+
+fn acquire_list_lock_handle(lock: &'static parking_lot::ReentrantMutex<()>) -> usize {
+    let guard = if let Some(guard) = lock.try_lock() {
+        guard
+    } else {
+        let blocked = majit_gc::gc_sync::before_external_block();
+        let guard = lock.lock();
+        drop(blocked);
+        guard
+    };
+    // lock_api::ReentrantMutex::force_unlock explicitly supports a forgotten
+    // guard. Transfer exactly that obligation into the returned handle.
+    std::mem::forget(guard);
+    lock as *const parking_lot::ReentrantMutex<()> as usize
+}
+
+/// `rthread.py` `Lock.release`: discharge one acquisition, not every recursive
+/// level. The lock is process-owned; this does not free the synchronization
+/// object or change its identity.
+///
+/// # Safety
+/// `lock` must be an unreleased handle from w_list_lock_acquire on this thread.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub unsafe fn w_list_lock_release(lock: usize) {
+    unsafe { (&*(lock as *const parking_lot::ReentrantMutex<()>)).force_unlock() };
 }
 
 pub fn list_locks_after_fork_child() {
@@ -310,12 +354,15 @@ impl W_ListObject {
             ListStrategy::Empty | ListStrategy::Size => 0,
             ListStrategy::SimpleRange | ListStrategy::Range => unsafe { range_list_length(self) },
             ListStrategy::Object => self.length_relaxed(),
-            // Direct rlist `length` field reads keep this helper in the
-            // annotator's structural subset; the public `.len()` wrappers are
-            // host collection conveniences that translate as `__len__`.
-            ListStrategy::Integer => self.int_items.len(),
-            ListStrategy::IntOrFloat => self.int_items.len(),
-            ListStrategy::Float => self.float_items.len(),
+            // rlist.py `ll_length` is the `list.int_len` / `list.float_len`
+            // oopspec leaf.  Keep that call boundary: jtransform lowers the
+            // nested `int_items.len` / `float_items.len` path to one field read
+            // off the list owner.  Inlining the Rust field path instead first
+            // materialises the by-value storage struct as a GC Ref and then
+            // reads through it, which is neither an RPython getsubstruct nor a
+            // valid pointer.
+            ListStrategy::Integer | ListStrategy::IntOrFloat => ll_list_int_length(self),
+            ListStrategy::Float => ll_list_float_length(self),
             ListStrategy::Bytes => self.bytes_items.len(),
             ListStrategy::Ascii => self.ascii_items.len(),
         }
@@ -2966,28 +3013,26 @@ pub unsafe fn w_list_int_or_float_setitem(
     true
 }
 
-/// Get the length of a list.
+/// Get the length of a list: `W_ListObject.length()`, a strategy-dispatched
+/// field read (`listobject.py EmptyListStrategy.length` returns 0).
+///
+/// Read without the list's lock, the way `PyList_GET_SIZE` reads `ob_size`
+/// and the way the walked `w_list_*_inner` bodies already read it.  What
+/// makes that sound is the GIL (`majit-gc` `rgil`), which serialises every
+/// mutator against this read: the lock is a narrower scope inside it, not
+/// the thing keeping a strategy switch from being observed half-applied.
+/// The distinction matters because a half-applied switch is not merely a
+/// stale length — the two range strategies answer through `list.items`, and
+/// `switch_range_to_integer_strategy` nulls that pointer before it stores
+/// the new strategy.  With no lock there is no collection point, so `obj`
+/// needs no root here.  Taking the lock instead made the acquire an opaque
+/// residual (`w_list_lock` is `dont_look_inside`) on every traced
+/// `len(list)`, which is what kept the generic builtin descent out of `len`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
-    let _roots = crate::gc_roots::push_roots();
-    let root_base = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
-    let _list_guard = w_list_lock(obj);
-    let obj = crate::gc_roots::shadow_stack_get(root_base);
-    let list = &*(obj as *const W_ListObject);
-    match list.strategy {
-        // listobject.py EmptyListStrategy.length returns 0.
-        ListStrategy::Empty | ListStrategy::Size => 0,
-        ListStrategy::SimpleRange | ListStrategy::Range => range_list_length(list),
-        ListStrategy::Object => list.length_relaxed(),
-        ListStrategy::Integer => ll_list_int_length(list),
-        ListStrategy::IntOrFloat => list.int_items.len(),
-        ListStrategy::Float => list.float_items.len(),
-        ListStrategy::Bytes => list.bytes_items.len(),
-        ListStrategy::Ascii => list.ascii_items.len(),
-    }
+    (*(obj as *const W_ListObject)).live_len()
 }
 
 /// CPython-visible `PyListObject.allocated` under the list's mutation lock.
@@ -5005,6 +5050,53 @@ pub extern "C" fn jit_list_reverse(list: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::intobject::w_int_new;
+
+    #[test]
+    fn list_lock_handle_releases_one_recursive_level() {
+        static LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+        let outer = super::ListGuard {
+            lock: super::acquire_list_lock_handle(&LOCK),
+            not_send: std::marker::PhantomData,
+        };
+        let inner = super::ListGuard {
+            lock: super::acquire_list_lock_handle(&LOCK),
+            not_send: std::marker::PhantomData,
+        };
+        assert_eq!(outer.lock, inner.lock);
+        drop(inner);
+        assert!(LOCK.is_owned_by_current_thread());
+        assert!(
+            !std::thread::spawn(|| LOCK.try_lock().is_some())
+                .join()
+                .unwrap()
+        );
+        drop(outer);
+        assert!(!LOCK.is_owned_by_current_thread());
+        assert!(
+            std::thread::spawn(|| LOCK.try_lock().is_some())
+                .join()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn list_lock_handle_releases_on_unwind() {
+        static LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+        let result = std::panic::catch_unwind(|| {
+            let _guard = super::ListGuard {
+                lock: super::acquire_list_lock_handle(&LOCK),
+                not_send: std::marker::PhantomData,
+            };
+            panic!("exercise the exceptional release edge");
+        });
+        assert!(result.is_err());
+        assert!(!LOCK.is_owned_by_current_thread());
+        assert!(
+            std::thread::spawn(|| LOCK.try_lock().is_some())
+                .join()
+                .unwrap()
+        );
+    }
 
     #[test]
     fn strategy_class_names_follow_interp_magic_spellings() {

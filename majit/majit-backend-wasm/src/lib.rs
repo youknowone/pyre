@@ -781,9 +781,10 @@ fn guard_fail_args_advanced(
 
 use failguard::{
     CallAssemblerTarget, ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr,
-    WasmFrameData, ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot,
-    call_assembler_target, global_fail_descr, label_target, publish_call_assembler_target,
-    publish_label_target, register_fail_descrs, reserve_fail_descrs,
+    WasmFrameData, ca_dispatch_mark_gnf2, ca_dispatch_mark_gnf2_for_compiled_ptr,
+    ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot, call_assembler_target,
+    global_fail_descr, label_target, mark_call_assembler_targets_gnf2_for_compiled_ptr,
+    publish_call_assembler_target, publish_label_target, register_fail_descrs, reserve_fail_descrs,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
@@ -2032,8 +2033,9 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
 /// this callee's frame.
 pub extern "C" fn wasm_jit_ca_pop_frame(_items_base: i64) -> i64 {
     // `genop_finish` publishes `assembler._finish_gcmap` before the call
-    // footer drops the execution root.  A CA callee returns inside generated
-    // wasm, so its footer is this helper rather than `execute_token`.
+    // footer drops the execution root.  Traces without GUARD_NOT_FORCED_2
+    // now do that publish at FINISH and pop with `_call_footer_shadowstack`;
+    // this helper remains the GUARD_NOT_FORCED_2 footer.
     // `_reload_frame_if_necessary`: the deopt helper can collect after the
     // generated caller last refreshed its callee local. The shadow-stack root
     // is forwarded by that collection; the argument may still name old space.
@@ -3355,6 +3357,11 @@ impl WasmBackend {
         if let Some(mut target) = call_assembler_target(token.number) {
             target.func_handle = old_handle;
             target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
+            // Never clear a flag an out-of-line bridge already published:
+            // re-emission can omit that bridge's ops while the attached
+            // module still finishes through it.
+            target.has_guard_not_forced_2 |=
+                module_has_guard_not_forced_2(&inputs.ops, &inputs.inlined_bridges);
             ca_dispatch_publish(
                 token.number,
                 old_handle,
@@ -3362,6 +3369,9 @@ impl WasmBackend {
                 target.callee_frame_bytes,
                 target.dispatch_key_ofs as u32,
                 target.callee_gcmap_ptr,
+                target.home_slot_base,
+                target.home_slots,
+                target.has_guard_not_forced_2,
             );
             publish_call_assembler_target(token.number, target);
         }
@@ -3574,6 +3584,9 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
                 registered.callee_frame_bytes,
                 registered.dispatch_key_ofs as u32,
                 registered.callee_gcmap_ptr,
+                registered.home_slot_base,
+                registered.home_slots,
+                registered.has_guard_not_forced_2,
             );
             publish_call_assembler_target(target_token, registered.clone());
         }
@@ -3615,6 +3628,14 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
         }
     }
     (saw_ca && !resolved.is_empty()).then_some(resolved)
+}
+
+fn module_has_guard_not_forced_2(ops: &[Op], inlined_bridges: &[codegen::InlinedBridge]) -> u32 {
+    let is_gnf2 = |op: &Op| op.opcode == majit_ir::OpCode::GuardNotForced2;
+    (ops.iter().any(is_gnf2)
+        || inlined_bridges
+            .iter()
+            .any(|bridge| bridge.ops.iter().any(is_gnf2))) as u32
 }
 
 fn bridge_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
@@ -4235,6 +4256,7 @@ impl majit_backend::Backend for WasmBackend {
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
                 Err(err) => {
+                    diag_bump(25);
                     record_last_compile_err(&err);
                     return Err(err);
                 }
@@ -4432,6 +4454,7 @@ impl majit_backend::Backend for WasmBackend {
         // its finish index. Publish those mutable pieces before exposing the
         // immutable geometry metadata: previously compiled CALL_ASSEMBLER
         // modules load this stable entry at runtime.
+        let has_guard_not_forced_2 = module_has_guard_not_forced_2(ops, &[]);
         ca_dispatch_publish(
             token.number,
             compiled.eager_func_handle(),
@@ -4439,6 +4462,9 @@ impl majit_backend::Backend for WasmBackend {
             compiled.frame.ca_frame_bytes,
             compiled.frame.dispatch_key_ofs as u32,
             callee_gcmap_ptr,
+            compiled.frame.home_slot_base as u32,
+            compiled.frame.home_slots as u32,
+            has_guard_not_forced_2,
         );
         publish_call_assembler_target(
             token.number,
@@ -4450,6 +4476,9 @@ impl majit_backend::Backend for WasmBackend {
                 callee_frame_bytes: compiled.frame.ca_frame_bytes,
                 callee_gcmap_ptr,
                 compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
+                home_slot_base: compiled.frame.home_slot_base as u32,
+                home_slots: compiled.frame.home_slots as u32,
+                has_guard_not_forced_2,
             },
         );
         if let Some(targets) = ca_targets.as_ref() {
@@ -5395,6 +5424,42 @@ impl majit_backend::Backend for WasmBackend {
         } else {
             diag_bump(28);
         }
+        // Arm the GNF2 flag before the source guard cell becomes the
+        // new bridge. An out-of-line GNF2 bridge runs in the source
+        // loop's CA frame; a CALL_ASSEMBLER already inside the callee
+        // can finish through this cell as soon as it is written.
+        if ops
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2)
+        {
+            ca_dispatch_mark_gnf2(original_token.number);
+            let compiled_ptr = original_token
+                .compiled
+                .get()
+                .and_then(|compiled| compiled.downcast_ref::<CompiledWasmLoop>())
+                .map(|loop_| loop_ as *const CompiledWasmLoop as u32);
+            if let Some(compiled_ptr) = compiled_ptr.filter(|&ptr| ptr != 0) {
+                ca_dispatch_mark_gnf2_for_compiled_ptr(compiled_ptr);
+                mark_call_assembler_targets_gnf2_for_compiled_ptr(compiled_ptr);
+            }
+            if let Some(mut target) = call_assembler_target(original_token.number) {
+                if target.has_guard_not_forced_2 == 0 {
+                    target.has_guard_not_forced_2 = 1;
+                    ca_dispatch_publish(
+                        original_token.number,
+                        target.func_handle,
+                        target.compiled_ptr as u32,
+                        target.callee_frame_bytes,
+                        target.dispatch_key_ofs as u32,
+                        target.callee_gcmap_ptr,
+                        target.home_slot_base,
+                        target.home_slots,
+                        1,
+                    );
+                    publish_call_assembler_target(original_token.number, target);
+                }
+            }
+        }
         #[cfg(target_arch = "wasm32")]
         if source_cells_base != 0 && bridge_slot != 0 {
             let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
@@ -5879,6 +5944,9 @@ impl majit_backend::Backend for WasmBackend {
                 new_target.callee_frame_bytes,
                 new_target.dispatch_key_ofs as u32,
                 new_target.callee_gcmap_ptr,
+                new_target.home_slot_base,
+                new_target.home_slots,
+                new_target.has_guard_not_forced_2,
             );
             publish_call_assembler_target(new.number, new_target.clone());
         }
@@ -5919,6 +5987,9 @@ impl majit_backend::Backend for WasmBackend {
             new_target.callee_frame_bytes,
             new_target.dispatch_key_ofs as u32,
             new_target.callee_gcmap_ptr,
+            new_target.home_slot_base,
+            new_target.home_slots,
+            new_target.has_guard_not_forced_2,
         );
         transfer_call_assembler_target_activity(&old_target, &new_target);
         new_target.token_number = old.number;
@@ -6111,21 +6182,205 @@ mod tests {
         assert!(compiled.pending_wasm_bytes.borrow().is_some());
     }
 
+    struct DispatchCleanup {
+        numbers: Vec<u64>,
+        ptrs: Vec<u32>,
+    }
+
+    impl Drop for DispatchCleanup {
+        fn drop(&mut self) {
+            for number in &self.numbers {
+                failguard::ca_dispatch_remove(*number);
+            }
+            for ptr in &self.ptrs {
+                failguard::ca_dispatch_remove_compiled_ptr(*ptr);
+            }
+        }
+    }
+
     #[test]
     fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let token_number = 9_900_000;
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
+        let compiled_ptr = 1_000_022;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![token_number],
+            ptrs: vec![compiled_ptr],
+        };
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
             .as_ref()
             .and_then(|table| table.get(&token_number))
             .expect("published dispatch entry");
-        assert_eq!(entry.targets.lock().unwrap().len(), 1);
+        {
+            let targets = entry.targets.lock().unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].has_guard_not_forced_2, 0);
+        }
         drop(table);
-        failguard::ca_dispatch_remove(token_number);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 1);
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&token_number))
+            .expect("published dispatch entry");
+        {
+            let targets = entry.targets.lock().unwrap();
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[1].has_guard_not_forced_2, 1);
+        }
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        drop(table);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&token_number))
+            .expect("published dispatch entry");
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a later publish without GNF2 must not clear the cell flag"
+        );
+    }
+
+    #[test]
+    fn mark_gnf2_sets_the_cell_without_a_new_snapshot() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let token_number = 9_900_001;
+        let compiled_ptr = 1_000_023;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![token_number],
+            ptrs: vec![compiled_ptr],
+        };
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        failguard::ca_dispatch_mark_gnf2(token_number);
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&token_number))
+            .expect("published dispatch entry");
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        {
+            let targets = entry.targets.lock().unwrap();
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].has_guard_not_forced_2, 0);
+        }
+    }
+
+    #[test]
+    fn mark_gnf2_raises_redirected_alias_cells() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let old_number = 9_900_030;
+        let new_number = 9_900_031;
+        let old_ptr = 1_000_024;
+        let new_ptr = 1_000_025;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![old_number, new_number],
+            ptrs: vec![old_ptr, new_ptr],
+        };
+        ca_dispatch_publish(old_number, 1, old_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(new_number, 2, new_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_redirect(old_number, 2, new_ptr, 33, 44, 55, 0, 0, 0);
+        failguard::ca_dispatch_mark_gnf2(new_number);
+
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        for number in [old_number, new_number] {
+            let entry = table
+                .as_ref()
+                .and_then(|table| table.get(&number))
+                .expect("dispatch entry");
+            assert_eq!(
+                entry
+                    .has_guard_not_forced_2
+                    .load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "token {number} must see GNF2 after the replacement loop is marked"
+            );
+        }
+    }
+
+    #[test]
+    fn mark_gnf2_raises_cells_that_retain_a_historical_target() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let alias = 9_900_040;
+        let source = 9_900_041;
+        let source_ptr = 1_000_026;
+        let later_ptr = 1_000_027;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![alias, source],
+            ptrs: vec![source_ptr, later_ptr],
+        };
+        ca_dispatch_publish(alias, 1, source_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(source, 2, source_ptr, 33, 44, 55, 0, 0, 0);
+        // Second redirect replaces `.last()`; the S snapshot stays in
+        // `targets` for in-flight callers that already loaded it.
+        ca_dispatch_redirect(alias, 3, later_ptr, 33, 44, 55, 0, 0, 0);
+        failguard::ca_dispatch_mark_gnf2(source);
+
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&alias))
+            .expect("alias dispatch entry");
+        {
+            let targets = entry.targets.lock().unwrap();
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].compiled_ptr, source_ptr);
+            assert_eq!(targets[1].compiled_ptr, later_ptr);
+        }
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a cell that still retains S must rise even after a later redirect"
+        );
+    }
+
+    #[test]
+    fn publish_after_mark_raises_a_new_alias_cell() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let source = 9_900_050;
+        let alias = 9_900_051;
+        let compiled_ptr = 1_000_028;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![source, alias],
+            ptrs: vec![compiled_ptr],
+        };
+        ca_dispatch_publish(source, 2, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        failguard::ca_dispatch_mark_gnf2(source);
+        // Redirect-shaped publish with a stale zero flag, as if the
+        // CallAssemblerTarget clone was taken before the mark.
+        ca_dispatch_publish(alias, 2, compiled_ptr, 33, 44, 55, 0, 0, 0);
+
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&alias))
+            .expect("alias dispatch entry");
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a publish after mark must raise the new alias cell"
+        );
     }
 
     #[test]
@@ -6166,8 +6421,12 @@ mod tests {
         }
 
         let mut backend = WasmBackend::new();
-        let tmp = JitCellToken::new(9_900_001);
-        let real = JitCellToken::new(9_900_002);
+        let tmp = JitCellToken::new(9_900_060);
+        let real = JitCellToken::new(9_900_061);
+        let _cleanup = DispatchCleanup {
+            numbers: vec![tmp.number, real.number],
+            ptrs: Vec::new(),
+        };
         compile_with_depth(&mut backend, &tmp, 1);
         compile_with_depth(&mut backend, &real, 96);
 

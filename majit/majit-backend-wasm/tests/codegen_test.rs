@@ -726,6 +726,84 @@ fn same_as_does_not_alias_a_mutable_label_local() {
 }
 
 #[test]
+fn same_as_before_label_defines_a_fresh_label_arg() {
+    // Peeled header: preamble produces v1, SameAs copies it into the
+    // LABEL-arg box, fall-through then reads that box. Without the
+    // SameAs the backend declines (see the next test).
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        make_op(OpCode::SameAsI, &[OpRef::int_op(1)], OpRef::int_op(100)),
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(100))]),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(100), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
+    ];
+
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+}
+
+#[test]
+fn unbound_read_without_a_producer_declines() {
+    // A LABEL arg with no producer is a peeled-header live-in and is
+    // defined at the LABEL. A Finish that reads a never-written box
+    // is not; that local would stay the zero wasm initializes it to.
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(100))]),
+    ];
+
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let error = match codegen::build_wasm_module(&inputs) {
+        Ok(_) => panic!("a read with no producer and no pool entry must decline"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("read with no producing op and no"),
+        "unexpected decline: {error}"
+    );
+}
+
+#[test]
 fn unbound_pool_float_operand_declares_an_f64_local() {
     let folded_float = OpRef::float_op(7);
     let ops = vec![Op::new(OpCode::Finish, &[rb(folded_float)])];
@@ -2164,22 +2242,31 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         .0;
     validate_wasm(&bytes);
     let mut saw_nursery_free = false;
-    let mut saw_item_fill = false;
-    count_operators(&bytes, |op| {
-        if matches!(op, wasmparser::Operator::I32Const { value } if *value == nursery_free as i32) {
-            saw_nursery_free = true;
+    let mut last_i32 = None;
+    let mut fill_lengths = Vec::new();
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I32Const { value } => {
+            if *value == nursery_free as i32 {
+                saw_nursery_free = true;
+            }
+            last_i32 = Some(*value);
         }
-        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
-            saw_item_fill = true;
+        wasmparser::Operator::MemoryFill { .. } => {
+            fill_lengths.push(last_i32.expect("memory.fill without a preceding i32.const"));
         }
+        _ => {}
     });
     assert!(
         saw_nursery_free,
         "malloc_cond_varsize_frame must load nursery_free"
     );
+    // The CA arm may memory.fill the callee home range (length is
+    // `home_slots * SLOT_SIZE` at runtime). The bump itself must not
+    // refill `ca_frame_bytes`.
+    let frame = codegen::FrameGeometry::fixed();
     assert!(
-        !saw_item_fill,
-        "inline CA bump must not memory.fill the item area; the callee publishes jf_gcmap after nulling the frozen home region"
+        !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),
+        "inline CA bump must not memory.fill ca_frame_bytes; fills were {fill_lengths:?}"
     );
 }
 
@@ -2241,6 +2328,137 @@ fn entry_prologue_nulls_the_frozen_home_region() {
     assert!(
         !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),
         "must not refill ca_frame_bytes; fills were {fill_lengths:?}"
+    );
+}
+
+/// The CA pop footer must not bake the caller's `GUARD_NOT_FORCED_2`.
+/// After `redirect_call_assembler` the callee can differ, so the footer
+/// loads `WasmCaDispatchEntry.has_guard_not_forced_2` and keeps both the
+/// shadowstack `SUB` and the write-barrier helper. A leftover caller
+/// `GUARD_NOT_FORCED` must not change that shape. The flag lives on the
+/// dispatch cell so an in-flight pop sees a GNF2 bridge attached after
+/// the pre-call snapshot was loaded.
+#[test]
+fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
+    fn build(with_caller_gnf2: bool) -> Vec<u8> {
+        let token = 0x5a5a_u64;
+        let ca_pop_fn_ptr = 0x77_i64;
+        let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+        let call = make_op(
+            OpCode::CallAssemblerI,
+            &[OpRef::input_arg_int(0)],
+            OpRef::int_op(1),
+        );
+        call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
+            arg_types: vec![Type::Int],
+            result_type: Type::Int,
+            target_token: token,
+        }));
+        let mut ops = vec![call];
+        if with_caller_gnf2 {
+            ops.push(make_guard(
+                OpCode::GuardNotForced2,
+                &[],
+                &[OpRef::int_op(1)],
+            ));
+        }
+        ops.push(Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]));
+        let inputs = codegen::ModuleBuildInputs {
+            inputargs,
+            ops,
+            inlined_bridges: Vec::new(),
+            constants: indexmap::IndexMap::new(),
+            vtable_offset: Some(0),
+            classptr_to_typeid: HashMap::new(),
+            guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+            alloc: codegen::AllocHelpers::default(),
+            wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+            nursery: None,
+            invalidated_flag_addr: 0,
+            gc_table_base: 0,
+            fail_index_base: 0,
+            bridge_cells_base: 0,
+            bridge_entry_arity: None,
+            bridge_param_dispatch: false,
+            trace_entry_census: None,
+            inline_trip: None,
+            external_jump_slot: 0,
+            external_jump_wide_slot: 0,
+            external_jump_key: 0,
+            frame: codegen::FrameGeometry::fixed(),
+            ca: codegen::CaParams {
+                emit_ca: true,
+                targets: HashMap::from([(
+                    token,
+                    codegen::CaTarget {
+                        dispatch_entry: 1024,
+                    },
+                )]),
+                deopt_helper_slot: 1,
+                ca_alloc_fn_ptr: 2,
+                ca_pop_fn_ptr,
+                ca_reload_fn_ptr: 4,
+                ca_reload_caller_fn_ptr: 5,
+                inline: Some(codegen::CaInlineParams {
+                    nursery_free_addr: 0x1000,
+                    nursery_top_addr: 0x1008,
+                    jf_top_addr: 0x2000,
+                    jf_limit_addr: 0x2008,
+                    jitframe_tid: 7,
+                    large_threshold: 4096,
+                }),
+                ..codegen::CaParams::default()
+            },
+        };
+        codegen::build_wasm_module(&inputs)
+            .expect("inline CA pop should compile")
+            .0
+    }
+
+    fn mentions_pop_helper(bytes: &[u8]) -> bool {
+        let mut saw = false;
+        count_operators(bytes, |op| {
+            if matches!(op, wasmparser::Operator::I32Const { value } if *value == 0x77) {
+                saw = true;
+            }
+        });
+        saw
+    }
+
+    fn loads_callee_gnf2(bytes: &[u8]) -> bool {
+        let mut saw = false;
+        count_operators(bytes, |op| {
+            if matches!(
+                op,
+                wasmparser::Operator::I32Load { memarg }
+                    if memarg.offset == majit_backend_wasm::failguard::WASM_CA_DISPATCH_HAS_GNF2_OFS
+            ) {
+                saw = true;
+            }
+        });
+        saw
+    }
+
+    let without = build(false);
+    validate_wasm(&without);
+    assert!(
+        loads_callee_gnf2(&without),
+        "CA pop must load callee GUARD_NOT_FORCED_2 from the snapshot"
+    );
+    assert!(
+        mentions_pop_helper(&without),
+        "redirectable callee GNF2 keeps the write-barrier pop helper"
+    );
+
+    let with = build(true);
+    validate_wasm(&with);
+    assert!(
+        loads_callee_gnf2(&with),
+        "caller GUARD_NOT_FORCED_2 must not replace the snapshot load"
+    );
+    assert!(
+        mentions_pop_helper(&with),
+        "caller GUARD_NOT_FORCED_2 must not change the pop helper shape"
     );
 }
 
