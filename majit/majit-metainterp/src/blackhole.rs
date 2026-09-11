@@ -10080,14 +10080,27 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "inline_call_nested_ext/P".to_string(),
         majit_translate::insns::BC_INLINE_CALL,
     );
-    // P10 — pyre call_assembler / cond_call / record_known_result
-    // adapters.  The `_ext/P` suffix matches the inline_call adapter
-    // pattern so wire_bhimpl_handlers binds the right handler and
-    // strict dispatch resolves the byte without panic.  Producers:
-    // `pyjitpl/dispatch.rs` (call_assembler), `majit-macros/
-    // src/jit_interp/jitcode_lower` + `pyre/pyre-jit/src/
-    // jit/assembler.rs` (cond_call / record_known_result).
+    // Leftover `_ext/P` adapters. Jitcode no longer emits CALL_ASSEMBLER;
+    // the keys stay so a leftover byte still reaches `wire_handler`.
+    // cond/record emit the canonical keys registered below; these ext
+    // keys remain for leftover payloads.
     for (key, byte) in [
+        (
+            "call_assembler_int_ext/P",
+            majit_translate::insns::BC_CALL_ASSEMBLER_INT,
+        ),
+        (
+            "call_assembler_ref_ext/P",
+            majit_translate::insns::BC_CALL_ASSEMBLER_REF,
+        ),
+        (
+            "call_assembler_float_ext/P",
+            majit_translate::insns::BC_CALL_ASSEMBLER_FLOAT,
+        ),
+        (
+            "call_assembler_void_ext/P",
+            majit_translate::insns::BC_CALL_ASSEMBLER_VOID,
+        ),
         (
             "cond_call_void_ext/P",
             majit_translate::insns::BC_COND_CALL_VOID,
@@ -10553,6 +10566,22 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     insns.insert(
         "conditional_call_ir_v/iiIRd".to_string(),
         majit_translate::insns::BC_CONDITIONAL_CALL_IR_V,
+    );
+    insns.insert(
+        "conditional_call_value_ir_i/iiIRd>i".to_string(),
+        majit_translate::insns::BC_CONDITIONAL_CALL_VALUE_IR_I,
+    );
+    insns.insert(
+        "conditional_call_value_ir_r/riIRd>r".to_string(),
+        majit_translate::insns::BC_CONDITIONAL_CALL_VALUE_IR_R,
+    );
+    insns.insert(
+        "record_known_result_i_ir_v/iiIRd".to_string(),
+        majit_translate::insns::BC_RECORD_KNOWN_RESULT_I_IR_V,
+    );
+    insns.insert(
+        "record_known_result_r_ir_v/riIRd".to_string(),
+        majit_translate::insns::BC_RECORD_KNOWN_RESULT_R_IR_V,
     );
     insns.insert(
         "residual_call_ir_i/iIRd>i".to_string(),

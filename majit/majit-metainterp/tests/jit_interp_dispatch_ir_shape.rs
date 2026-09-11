@@ -152,8 +152,9 @@ fn dispatch_arm_subjitcode_lowers_state_field_write() {
         dispatch_jc.code
     );
     assert!(
-        sub_jitcodes.iter().all(|sub| !sub.code.contains(&BC_ABORT)),
-        "lowerable dispatch arms must not degenerate to abort sub-JitCodes"
+        !dispatch_jc.code.contains(&BC_ABORT),
+        "inlined lowerable dispatch arms must not degenerate to an in-frame abort; dispatch={:?}",
+        dispatch_jc.code
     );
 }
 
