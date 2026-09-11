@@ -14161,6 +14161,25 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 /// `dst_bank` selects where the SubReturn value lands: `'r'` writes to
 /// `registers_r[dst]` (paired with callee `ref_return/r`), `'i'`
 /// writes to `registers_i[dst]` (paired with callee `int_return/i`).
+///
+/// Inplace add/sub/mul/and/or/xor.  Inplace `//` / `%` stay off this
+/// emit: `acc //= 0` in a compiled-then-raise loop must remain a
+/// residual so the except bridge can blackhole (`exception_loop_warmup`).
+fn inplace_int_arith_tag(tag: i64) -> bool {
+    use pyre_interpreter::bytecode::BinaryOperator as B;
+    matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
+        Some(
+            B::InplaceAdd
+                | B::InplaceSubtract
+                | B::InplaceMultiply
+                | B::InplaceAnd
+                | B::InplaceOr
+                | B::InplaceXor
+        )
+    )
+}
+
 pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -14251,13 +14270,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body);
     let op_tag = match int_arg_concretes.first() {
         Some(ConcreteValue::Int(tag)) if is_binary_from_tag => Some(*tag),
-        Some(ConcreteValue::Int(tag))
-            if pyre_interpreter::runtime_ops::binary_op_tag_is_inplace(*tag) =>
-        {
-            Some(*tag)
-        }
+        Some(ConcreteValue::Int(tag)) if inplace_int_arith_tag(*tag) => Some(*tag),
         _ => super::specialize::binary_op_tag_for_helper_index(sub_index, &int_arg_concretes)
-            .filter(|&tag| pyre_interpreter::runtime_ops::binary_op_tag_is_inplace(tag)),
+            .filter(|&tag| inplace_int_arith_tag(tag)),
     };
     if dst_bank == 'r' && ref_args.len() == 2 && let Some(op_tag) = op_tag {
         let int_args_tag = int_args.first().copied().unwrap_or_else(|| ctx.trace_ctx.const_int(op_tag));
