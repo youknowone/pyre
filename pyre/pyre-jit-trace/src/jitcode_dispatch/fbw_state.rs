@@ -1544,6 +1544,9 @@ fn census_report_pending(outcome: super::ForiterInflightOutcome) {
 /// Report that the item the take handed out was pushed and the frame
 /// repositioned to its body pc — the one outcome that costs no iteration.
 pub fn fbw_foriter_report_delivered() {
+    // The delivered item owns the advanced cursor.  Drop the pre-advance
+    // snapshot so a later refuse cannot roll this consume back.
+    fbw_bridge_iter_journal_clear();
     census_report_pending(super::ForiterInflightOutcome::Delivered);
 }
 
@@ -1651,6 +1654,15 @@ pub fn fbw_foriter_inflight_take(
         || cell_store_len != 0
         || namespace_rolled_back
     {
+        // Same cursor restore as `fbw_foriter_report_refused_header`.
+        // A root walk's non-commit epilogue leaves the journal in place
+        // so a delivery can push the consumed item; refusing here
+        // without putting the cursor back loses that iteration
+        // (`fbw_foriter_item_dropped`).  The body of this consume has
+        // not run to its stores — the abort that reaches this refuse
+        // is `GotoIfNotValueNotConcrete` on the first body opcode —
+        // so re-consuming cannot double a committed acc update.
+        fbw_bridge_iter_journal_rollback();
         crate::trace::fbw_diag::record_foriter_item_dropped();
         if let Some((code_ptr, body_pc)) = key {
             super::census_record_foriter_inflight(
@@ -1665,7 +1677,7 @@ pub fn fbw_foriter_inflight_take(
                  body_effect={body_effect} store_journal_len={store_len} \
                  append_journal_len={append_len} unjournaled={unjournaled} \
                  namespace_rolled_back={namespace_rolled_back} \
-                 — keeping legacy drop-on-abort to avoid a double-apply (R1)",
+                 — restored the iterator cursor so resume re-consumes",
                 body_pc
             );
         }
