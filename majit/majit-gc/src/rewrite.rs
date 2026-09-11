@@ -47,21 +47,68 @@ fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
 /// numbering is untouched. Returns the rewritten ops and the
 /// `gcrefs_output_list` (rewrite.py:352) the caller turns into the
 /// per-loop table.
-/// rewrite.py `remove_constptr` sees the Const box after
-/// `get_box_replacement`. A folded InputArg/Op still carries
-/// `Forwarded::Const`; `const_value()` on the operand itself is
-/// then `None`, so follow the replacement before deciding the arg
-/// is not a ref constant.
-fn const_ref_operand(arg: &Operand) -> Option<(Operand, GcRef)> {
-    let replaced = if arg.const_value().is_some() {
-        arg.clone()
-    } else {
-        arg.get_box_replacement(false)
+/// rewrite.py `emit_op` operand rewrite: follow `_forwarded`, then
+/// `remove_constptr` on a non-null `ConstPtr`. A folded InputArg/Op
+/// still carries `Forwarded::Const`; `const_value()` on the operand
+/// itself is then `None`, so follow the replacement first.
+fn rewrite_operand(
+    operand: Operand,
+    gcrefs: &mut Vec<GcRef>,
+    gcrefs_map: &mut IndexMap<usize, u32>,
+    recently_loaded: &mut IndexMap<u32, Operand>,
+    next_pos: &mut u32,
+    out: &mut Vec<Op>,
+) -> Operand {
+    // rewrite.py `get_box_replacement(arg)` — `not_const=False`.
+    let replaced = operand.get_box_replacement(false);
+    intern_constptr_operand(
+        replaced.clone(),
+        gcrefs,
+        gcrefs_map,
+        recently_loaded,
+        next_pos,
+        out,
+    )
+    .unwrap_or(replaced)
+}
+
+fn intern_constptr_operand(
+    operand: Operand,
+    gcrefs: &mut Vec<GcRef>,
+    gcrefs_map: &mut IndexMap<usize, u32>,
+    recently_loaded: &mut IndexMap<u32, Operand>,
+    next_pos: &mut u32,
+    out: &mut Vec<Op>,
+) -> Option<Operand> {
+    // rewrite.py `bool(arg.value)` — null stays inline.
+    let Value::Ref(gcref) = operand.const_value()? else {
+        return None;
     };
-    match replaced.const_value() {
-        Some(Value::Ref(gcref)) => Some((replaced, gcref)),
-        _ => None,
+    if gcref.is_null() {
+        return None;
     }
+    // rewrite.py `_gcref_index`.
+    let index = *gcrefs_map.entry(gcref.0).or_insert_with(|| {
+        let index = gcrefs.len() as u32;
+        gcrefs.push(gcref);
+        index
+    });
+    // rewrite.py `remove_constptr`.
+    Some(match recently_loaded.get(&index) {
+        Some(load) => load.clone(),
+        None => {
+            let load_op = std::rc::Rc::new(mk_op(
+                OpCode::LoadFromGcTable,
+                &[Operand::const_from_value(Value::Int(index as i64))],
+            ));
+            load_op.pos.set(OpRef::ref_op(*next_pos));
+            *next_pos += 1;
+            out.push((*load_op).clone());
+            let load = Operand::from_bound_op(&load_op);
+            recently_loaded.insert(index, load.clone());
+            load
+        }
+    })
 }
 
 pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRef>) {
@@ -71,33 +118,6 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
     let mut gcrefs_map: IndexMap<usize, u32> = IndexMap::default();
     let mut recently_loaded: IndexMap<u32, Operand> = IndexMap::default();
     let mut out: Vec<Op> = Vec::with_capacity(ops.len());
-
-    let mut intern = |gcref: GcRef,
-                      recently_loaded: &mut IndexMap<u32, Operand>,
-                      out: &mut Vec<Op>,
-                      next_pos: &mut u32|
-     -> Operand {
-        let index = *gcrefs_map.entry(gcref.0).or_insert_with(|| {
-            let index = gcrefs.len() as u32;
-            gcrefs.push(gcref);
-            index
-        });
-        match recently_loaded.get(&index) {
-            Some(load) => load.clone(),
-            None => {
-                let load_op = std::rc::Rc::new(mk_op(
-                    OpCode::LoadFromGcTable,
-                    &[Operand::const_from_value(Value::Int(index as i64))],
-                ));
-                load_op.pos.set(OpRef::ref_op(*next_pos));
-                *next_pos += 1;
-                out.push((*load_op).clone());
-                let load = Operand::from_bound_op(&load_op);
-                recently_loaded.insert(index, load.clone());
-                load
-            }
-        }
-    };
 
     for op in ops {
         // rewrite.py:1005 — the per-basic-block CSE cache is dropped at
@@ -111,39 +131,39 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
         // rewrite.py:105 `keep` — JIT_DEBUG keeps its constants inline.
         if op.opcode != OpCode::JitDebug {
             for i in 0..op.num_args() {
-                // rewrite.py `bool(arg.value)` — null stays inline as a
-                // ConstPtr so `to_opref` is not a dead InputArgRef index.
-                let Some((replaced, gcref)) = const_ref_operand(&op.arg(i)) else {
-                    continue;
-                };
-                if gcref.is_null() {
-                    if !op.arg(i).is_constant() {
-                        op.setarg(i, replaced);
-                    }
-                    continue;
-                }
-                let load = intern(gcref, &mut recently_loaded, &mut out, &mut next_pos);
-                op.setarg(i, load);
+                op.setarg(
+                    i,
+                    rewrite_operand(
+                        op.arg(i),
+                        &mut gcrefs,
+                        &mut gcrefs_map,
+                        &mut recently_loaded,
+                        &mut next_pos,
+                        &mut out,
+                    ),
+                );
             }
-            if let Some(mut fail_args) = op.getfailargs() {
-                let mut changed = false;
-                for arg in fail_args.iter_mut() {
-                    let Some((replaced, gcref)) = const_ref_operand(arg) else {
-                        continue;
-                    };
-                    if gcref.is_null() {
-                        if !arg.is_constant() {
-                            *arg = replaced;
-                            changed = true;
-                        }
-                        continue;
-                    }
-                    *arg = intern(gcref, &mut recently_loaded, &mut out, &mut next_pos);
-                    changed = true;
-                }
-                if changed {
-                    op.setfailargs(fail_args);
-                }
+            // rewrite.py `emit_op`:
+            //   op.setfailargs([self.get_box_replacement(a, True) ...])
+            // `forget_optimization_info` only walks the compiled stream, so
+            // an off-stream producer a failarg still holds can keep its
+            // `_forwarded`. Follow that chain here, then intern a ConstPtr
+            // the same way args are interned.
+            if let Some(fail_args) = op.getfailargs() {
+                let rewritten: Vec<Operand> = fail_args
+                    .into_iter()
+                    .map(|arg| {
+                        rewrite_operand(
+                            arg,
+                            &mut gcrefs,
+                            &mut gcrefs_map,
+                            &mut recently_loaded,
+                            &mut next_pos,
+                            &mut out,
+                        )
+                    })
+                    .collect();
+                op.store_final_boxes(rewritten);
             }
         }
         out.push(op);
@@ -6466,5 +6486,40 @@ mod tests {
         // The reused value pins the whole prefix in place.
         assert_eq!(out.len(), 4);
         assert_eq!(out[0].opcode, OpCode::SaveExcClass);
+    }
+
+    #[test]
+    fn remove_ref_constants_follows_offstream_failarg_forwarding() {
+        use majit_ir::forwarding::ForwardingHost;
+
+        // Optimizer forwarded an off-stream producer (pos 10) onto a live
+        // loop value (pos 3). `forget_optimization_info` never sees the
+        // off-stream box, so `_forwarded` survives into the backend rewrite.
+        let live = Op::new(OpCode::IntAdd, &[ro(OpRef::int_op(1)), ro(OpRef::int_op(2))]);
+        live.pos.set(OpRef::int_op(3));
+        let live_rc = OpRc::new(live.clone());
+
+        let ghost = Op::new(OpCode::SameAsI, &[ro(OpRef::int_op(3))]);
+        ghost.pos.set(OpRef::int_op(10));
+        ghost.set_forwarded_op(&live_rc);
+
+        let cond = Op::new(OpCode::IntLt, &[ro(OpRef::int_op(3)), ro(OpRef::int_op(4))]);
+        cond.pos.set(OpRef::int_op(5));
+        let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(5))]);
+        guard.store_final_boxes(vec![Operand::from_bound_op(&OpRc::new(ghost))]);
+
+        let (out, _gcrefs) = remove_ref_constants(&[live, cond, guard], 11);
+        let rewritten_guard = out
+            .iter()
+            .rev()
+            .find(|op| op.opcode == OpCode::GuardTrue)
+            .expect("guard survives");
+        let fail_args = rewritten_guard.getfailargs().expect("guard failargs");
+        assert_eq!(fail_args.len(), 1);
+        assert_eq!(
+            fail_args[0].to_opref(),
+            OpRef::int_op(3),
+            "failarg must follow _forwarded onto the live producer"
+        );
     }
 }
