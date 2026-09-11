@@ -15664,6 +15664,95 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// FORMAT_SIMPLE (`f"{x}"` / empty-spec `format`) on an exact `int` or
+/// exact `str`: the same empty-spec fast path `format_w` takes, instead of
+/// the opaque `bh_format_simple_fn` residual.
+///
+/// `format_w` with an empty spec is identity for an exact `str` (`format(s,
+/// "") is s`) and `str(i)` for an exact `int`. The `str(i)` arm reuses
+/// [`try_walker_specialize_str_call`]'s `jit_int_str` emit so the two
+/// call sites share one helper. A bool, subclass, long, or anything with a
+/// Python `__format__` declines to the residual (SAFE); `FormatWithSpec`
+/// already inlines a Python `__format__` when a spec operand is present.
+pub(crate) fn try_walker_specialize_format_simple<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 1 {
+        return Ok(None);
+    }
+    let Some(concrete) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(concrete) {
+        return Ok(None);
+    }
+    let value = r_args[0];
+    if unsafe { pyre_object::is_exact_type(concrete, &pyre_object::STR_TYPE) } {
+        let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+        let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+        walker_guard_class(ctx, op.pc, value, str_type_addr)?;
+        walker_guard_exact_w_class(ctx, op.pc, value, str_typeobj)?;
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', value)?;
+        return Ok(Some(()));
+    }
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let int_value = unsafe {
+        if !std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE)
+            || !std::ptr::eq((*concrete).w_class, int_typeobj)
+        {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(concrete)
+    };
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::runtime_ops::format_value(concrete, pyre_object::PY_NULL)
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    let renders_the_same = unsafe {
+        pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE)
+            && pyre_object::w_str_get_value_opt(boxed_result)
+                == Some(pyre_object::unicodeobject::int_str_text(int_value).as_str())
+    };
+    if !renders_the_same {
+        return Ok(None);
+    }
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op.pc, value, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, value, int_typeobj)?;
+    let int_raw = walker_unbox_int_typed(
+        ctx,
+        op.pc,
+        value,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+    let helper = pyre_object::unicodeobject::jit_int_str as *const ();
+    let raw = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
+        helper,
+        &[int_raw],
+        &[majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        raw,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
+    Ok(Some(()))
+}
+
 /// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
 /// shape the meta-tracer produces upstream (intobject.py `_divmod` →
 /// `space.newtuple2(space.newint(z), space.newint(m))`) instead of the opaque
