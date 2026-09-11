@@ -1824,6 +1824,39 @@ fn leftover_inputarg_refs(
     leftover
 }
 
+/// Fit `lengths` so the items sum to `n_array_items`. Extra items land on
+/// the last array field; a short count zeros the tail. `n_arrays` is
+/// `vinfo.array_fields.len()` — grow a missing last slot rather than
+/// invent a field the descr walk cannot emit.
+fn fit_walk_lengths(lengths: &mut Vec<usize>, n_arrays: usize, n_array_items: usize) {
+    if n_arrays == 0 {
+        lengths.clear();
+        return;
+    }
+    if lengths.len() < n_arrays {
+        lengths.resize(n_arrays, 0);
+    }
+    let current: usize = lengths.iter().sum();
+    if current == n_array_items {
+        return;
+    }
+    if n_array_items >= current {
+        if let Some(last) = lengths.last_mut() {
+            *last += n_array_items - current;
+        }
+        return;
+    }
+    let mut remaining = n_array_items;
+    for len in lengths.iter_mut() {
+        if remaining >= *len {
+            remaining -= *len;
+        } else {
+            *len = remaining;
+            remaining = 0;
+        }
+    }
+}
+
 /// Types of the expanded virtualizable tail, in the same order
 /// `initialize_virtualizable` mints `InputArg(num_reds + i)`.
 fn expanded_vable_slot_types(
@@ -2086,8 +2119,28 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     );
     let present: rustc_hash::FxHashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
     let leftover = leftover_inputarg_refs(ops, &present);
-    let field_types = expanded_vable_slot_types(vinfo, vable_array_lengths);
-    let expanded_len = entry_prefix_len + field_types.len();
+    let mut walk_lengths = vable_array_lengths.to_vec();
+    let mut field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
+    let mut expanded_len = entry_prefix_len + field_types.len();
+    // `vable_array_lengths` is `vinfo.get_array_length` at some later
+    // read (or a finish-path re-read). The boxes
+    // `initialize_virtualizable` minted are `entry_field_oprefs`. A
+    // leftover-empty rebuild that trusts the baked length treats live
+    // virtualstate boxes as last_instr (binary_slice: in=24 baked=8)
+    // or leaves field slots as incoming NULLs (exception: in=18
+    // entry=13). Prefer the mint list when it covers the statics.
+    if !entry_field_oprefs.is_empty()
+        && entry_field_oprefs.len() >= vinfo.static_fields.len()
+    {
+        let n_array_items = entry_field_oprefs.len() - vinfo.static_fields.len();
+        fit_walk_lengths(
+            &mut walk_lengths,
+            vinfo.array_fields.len(),
+            n_array_items,
+        );
+        field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
+        expanded_len = entry_prefix_len + field_types.len();
+    }
     let mut field_raws: rustc_hash::FxHashSet<u32> = entry_field_oprefs
         .iter()
         .filter(|opref| opref.is_input_arg())
@@ -2129,6 +2182,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 && r.raw() == index_of_virtualizable as u32
         })
         .collect();
+    let mut long_tail_extras: Vec<InputArg> = Vec::new();
 
     // `compile.py:458 assert i == len(inputargs)` requires the expanded
     // list to be exactly prefix + statics + baked array items. Virtualstate
@@ -2149,12 +2203,39 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         // names a field slot; a leftover Ref that is not a field is the
         // virtualizable identity and rewrites onto the vable red.
         if leftover_fields.is_empty() && leftover_identity.is_empty() {
-            // Virtualstate already replaced the expanded tail with live
-            // LABEL boxes. Rebuilding to `expanded_len` drops those
-            // InputArgs from `inputargs` while they remain on JUMP —
-            // a frame lands in `range()` (`'frame' object is not an
-            // iterator`) and last_instr in a pointer slot (SIGSEGV).
-            return;
+            if inputargs.len() > expanded_len {
+                // Extra slots past the minted vable tail are live
+                // virtualstate boxes. Reload the minted fields via
+                // GETFIELD and keep the extras as additional entry
+                // args — leaving the field slots as incoming refs
+                // passes NULL into compiled exception handlers.
+                long_tail_extras = inputargs[expanded_len..]
+                    .iter()
+                    .map(InputArg::fresh_value_copy)
+                    .collect();
+                inputargs.truncate(expanded_len);
+            } else if inputargs.len() <= entry_prefix_len {
+                return;
+            } else {
+                // Shorter than the minted tail: emit GETFIELD for the
+                // boxes that are actually present. Inventing the missing
+                // array items reads past the live locals
+                // (last_instr-as-pointer); leaving the partial list as
+                // entry args keeps NULL refs in the compiled loop
+                // (exception-handler SIGSEGV).
+                let want = inputargs.len() - entry_prefix_len;
+                let n_static = vinfo.static_fields.len();
+                if want < n_static {
+                    return;
+                }
+                fit_walk_lengths(
+                    &mut walk_lengths,
+                    vinfo.array_fields.len(),
+                    want - n_static,
+                );
+                field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
+                expanded_len = entry_prefix_len + field_types.len();
+            }
         }
         if leftover_fields.is_empty() && inputargs.len() <= entry_prefix_len {
             let vable_rc = std::rc::Rc::new(inputargs[index_of_virtualizable].fresh_value_copy());
@@ -2274,6 +2355,14 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // see the SOUNDNESS INVARIANT on this function for what the reconstruction
     // below is allowed to assume about the array lengths it bakes in.
     inputargs.truncate(entry_prefix_len);
+    // Keep each extra's original InputArg index. Remapping them onto
+    // prefix-relative ids collides with the field slots this function
+    // just forwarded to GETFIELD (`InputArg(1)` the extra vs
+    // `InputArg(1)` last_instr) and `get_local_box_replacement` chains
+    // the extra onto the GETFIELD result.
+    for extra in long_tail_extras {
+        inputargs.push(extra);
+    }
 
     // compile.py:433-440 — GETFIELD_GC per static field.
     let static_descrs = vinfo.static_field_descrs();
@@ -2329,7 +2418,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         // this trace's GREENS, so a virtualizable with other lengths keys to
         // a different trace and never reaches this entry. See the SOUNDNESS
         // INVARIANT on this function.
-        let array_len = vable_array_lengths.get(ai).copied().unwrap_or(0);
+        let array_len = walk_lengths.get(ai).copied().unwrap_or(0);
         assert!(
             i + array_len <= expanded_inputargs.len(),
             "array {ai} length {array_len} would overrun inputargs (i={i}, len={})",
@@ -3586,17 +3675,152 @@ mod tests {
             &[],
         );
 
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert!(
+            ops.iter()
+                .filter(|op| op.opcode == OpCode::GetarrayitemRawR)
+                .count()
+                == 1,
+            "a short leftover-empty tail must GETARRAYITEM only the present slots"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_keeps_leftover_empty_extras_past_entry() {
+        // leftover-empty, inputargs = prefix + minted fields + 2 extras.
+        // GETFIELD the minted tail; extras stay as extra entry args.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 2),
+                rooted_inputarg_operand(Type::Int, 3),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_ref(2),
+            InputArg::new_int(3),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_ref(1)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+        );
+
         assert_eq!(
             inputargs,
             vec![
                 InputArg::new_ref(0),
-                InputArg::new_ref(1),
                 InputArg::new_ref(2),
+                InputArg::new_int(3),
             ]
         );
         assert!(
-            ops.iter().all(|op| op.opcode != OpCode::GetarrayitemRawR),
-            "a leftover-empty length mismatch must not rebuild live LABEL boxes as array items"
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcR),
+            "must GETFIELD the minted obj slot"
+        );
+        let label_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("label")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(label_args.len(), 4);
+        assert_eq!(label_args[0], OpRef::input_arg_ref(0));
+        assert!(
+            !label_args[1].is_input_arg(),
+            "minted obj must be a GETFIELD result, got {label_args:?}"
+        );
+        assert_eq!(label_args[2], OpRef::input_arg_ref(2));
+        assert_eq!(label_args[3], OpRef::input_arg_int(3));
+    }
+
+    #[test]
+    fn test_patch_new_loop_uses_entry_mints_not_stale_baked_length() {
+        // leftover-empty. Baked array length is 1 (expanded = prefix +
+        // last_instr + 1 item = 3) but `entry_field_oprefs` minted
+        // last_instr + 3 items and inputargs still holds that tail.
+        // Trusting the bake would long-tail from slot 3 and GETARRAYITEM
+        // once (binary_slice frame-as-iter). Walk the mint list.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            16,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(24));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Int, 1),
+                rooted_inputarg_operand(Type::Ref, 2),
+                rooted_inputarg_operand(Type::Ref, 3),
+                rooted_inputarg_operand(Type::Ref, 4),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_int(1),
+            InputArg::new_ref(2),
+            InputArg::new_ref(3),
+            InputArg::new_ref(4),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_ref(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_ref(4),
+        ];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.opcode == OpCode::GetarrayitemRawR)
+                .count(),
+            3,
+            "entry minted 3 array items; baked length 1 must not win"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
+            "must GETFIELD last_instr"
         );
     }
 
