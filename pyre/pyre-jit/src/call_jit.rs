@@ -3862,6 +3862,36 @@ pub fn trace_and_compile_from_bridge(
     if bridge_bail_stage() == 3 {
         return BridgeResolution::ResumeBlackhole;
     }
+    // pyjitpl.py handle_guard_failure: rebuild_from_resumedata + interpret()
+    // from the guard PC. The FBW walk below is the fallback when the resume
+    // cannot be seeded. A Finish from this walk is the compiled
+    // "return from main" shape — do not attach it.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        if let Some(pc) = driver.bridge_from_guard_resume_position(
+            descr_arc,
+            &mut jit_state,
+            &env,
+            raw_values,
+            resume_pc,
+            false,
+        ) {
+            let compiled = driver
+                .meta_interp()
+                .bridge_was_compiled(green_key, trace_id, fail_index);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-trace] interpret-from-resume key={} trace={} fail={} \
+                     resume_pc={} walk_pc={} compiled={}",
+                    green_key, trace_id, fail_index, resume_pc, pc, compiled
+                );
+            }
+            if compiled {
+                return BridgeResolution::CompiledContinue;
+            }
+            return BridgeResolution::ResumeBlackhole;
+        }
+    }
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
