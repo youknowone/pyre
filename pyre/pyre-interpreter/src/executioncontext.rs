@@ -2100,6 +2100,13 @@ pub trait ActionFlagOps {
     /// pypy/interpreter/executioncontext.py `ActionFlag.decrement_ticker`.
     fn decrement_ticker(&mut self, by: isize) -> isize;
 
+    /// interp_signal.py `SignalActionFlag.rearm_ticker` —
+    /// `p.c_value = -1`. `_raise_in_thread` calls this after writing the
+    /// EC-owned async-exception slot so `action_dispatcher` runs.
+    fn rearm_ticker(&mut self) {
+        self.reset_ticker(-1);
+    }
+
     /// Composition accessor: shared `AbstractActionFlag` state.
     fn abstract_flag(&self) -> &AbstractActionFlag;
     /// Composition accessor: shared `AbstractActionFlag` state.
@@ -2436,6 +2443,14 @@ impl ActionFlagOps for ActionFlag {
         }
         self._ticker
     }
+
+    fn rearm_ticker(&mut self) {
+        self.reset_ticker(-1);
+        // Compiled loops poll the eval-breaker word. On wasm the signal
+        // module never registers the ticker cell, so reset_ticker alone
+        // would leave that word unarmed.
+        arm_async_eval_breaker();
+    }
 }
 
 /// Stable reference to the process-owned `space.actionflag`.
@@ -2518,6 +2533,10 @@ impl ActionFlagOps for SpaceActionFlag {
 
     fn decrement_ticker(&mut self, by: isize) -> isize {
         self.inner_mut().decrement_ticker(by)
+    }
+
+    fn rearm_ticker(&mut self) {
+        self.inner_mut().rearm_ticker();
     }
 }
 
