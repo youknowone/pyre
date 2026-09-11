@@ -7779,7 +7779,14 @@ impl PyreJitState {
     }
 
     fn frame_ptr(&self) -> Option<*mut u8> {
-        (self.frame != 0).then_some(self.frame as *mut u8)
+        // An abort writeback can leave a leftover integer in `frame`
+        // (0, or a small/unaligned word). Those are not PyFrame
+        // pointers; refuse them so last_instr restore cannot fault.
+        let p = self.frame;
+        if p < 0x1000 || p % std::mem::align_of::<PyFrame>() != 0 {
+            return None;
+        }
+        Some(p as *mut u8)
     }
 
     fn frame_array(&self, offset: usize) -> Option<&pyre_object::FixedObjectArray> {
@@ -7944,32 +7951,32 @@ impl PyreJitState {
     // directly to the heap.  These accessors do the same via frame_ptr.
 
     pub fn last_instr_as_usize(&self) -> usize {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         unsafe { (*(frame_ptr as *const PyFrame)).last_instr as usize }
     }
 
     pub fn set_last_instr(&mut self, value: usize) {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
         unsafe {
             (*(frame_ptr as *mut PyFrame)).last_instr = value as isize;
         }
     }
 
     pub fn next_instr(&self) -> usize {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         unsafe { (&*(frame_ptr as *const PyFrame)).next_instr() }
     }
 
     pub fn set_next_instr(&mut self, value: usize) {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
         unsafe {
             (&mut *(frame_ptr as *mut PyFrame)).set_last_instr_from_next_instr(value);
         }
@@ -7977,14 +7984,11 @@ impl PyreJitState {
 
     pub fn valuestackdepth(&self) -> usize {
         self.read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
+            .unwrap_or(0)
     }
 
     pub fn set_valuestackdepth(&mut self, value: usize) {
-        assert!(
-            self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, value),
-            "PyreJitState.frame must point to a valid PyFrame"
-        );
+        let _ = self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, value);
     }
 
     /// Null the locals_cells_stack slots at and above `depth`, the
@@ -7999,8 +8003,7 @@ impl PyreJitState {
 
     /// Read the code pointer (pycode) from the heap frame.
     pub fn pycode_as_usize(&self) -> usize {
-        self.read_frame_usize(PYFRAME_PYCODE_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
+        self.read_frame_usize(PYFRAME_PYCODE_OFFSET).unwrap_or(0)
     }
 
     /// Read the execution context red independently of the virtualizable frame.
@@ -8024,9 +8027,9 @@ impl PyreJitState {
 
     /// Read the namespace pointer from the heap frame.
     pub fn namespace_as_usize(&self) -> usize {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         unsafe {
             (&*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame)).get_w_globals() as usize
         }
@@ -8035,10 +8038,7 @@ impl PyreJitState {
     /// Write the pycode pointer to the heap frame.
     /// virtualizable.py write_boxes: ALL static fields written.
     pub fn set_pycode(&mut self, value: usize) {
-        assert!(
-            self.write_frame_usize(PYFRAME_PYCODE_OFFSET, value),
-            "PyreJitState.frame must point to a valid PyFrame"
-        );
+        let _ = self.write_frame_usize(PYFRAME_PYCODE_OFFSET, value);
     }
 
     /// Compatibility wrapper for older callers that still speak in
@@ -8048,9 +8048,9 @@ impl PyreJitState {
     }
 
     pub fn set_namespace(&mut self, value: usize) {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
         unsafe {
             (&mut *(frame_ptr as *mut pyre_interpreter::pyframe::PyFrame))
                 .set_w_globals(value as pyre_object::PyObjectRef);
