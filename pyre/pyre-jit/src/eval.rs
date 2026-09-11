@@ -11309,9 +11309,7 @@ fn execute_assembler(
 /// Snapshot the live cursor of every `range_iterator` reachable from
 /// the frame's locals/stack. `snapshot_for_tracing` copies the pointer,
 /// not `current`/`remaining`.
-fn capture_range_iter_cursors(
-    frame: &PyFrame,
-) -> Vec<(pyre_object::PyObjectRef, i64, i64)> {
+fn capture_range_iter_cursors(frame: &PyFrame) -> Vec<(pyre_object::PyObjectRef, i64, i64)> {
     locals_w!(frame)
         .as_slice()
         .iter()
@@ -11467,6 +11465,11 @@ fn compile_and_run_once(
     // iterator stays advanced and the next FOR_ITER skips an item.
     let abort_snapshot = frame_root.frame().snapshot_for_tracing();
     let abort_range_iters = capture_range_iter_cursors(frame_root.frame());
+    // Portal interpret applies the same eager cell/namespace/list stores
+    // the FBW walker journals (`emit_namespace_cell_store_fold`,
+    // `journal_walker_namespace_write`). Reset so a prior walk's undo
+    // log cannot roll back this one, then commit or rollback below.
+    pyre_jit_trace::jitcode_dispatch::fbw_store_journal_reset();
     // pyjitpl.py `_compile_and_run_once`: `interpret()` on the seeded
     // portal framestack.
     let outcome = driver.jit_merge_point_keyed(
@@ -11534,22 +11537,37 @@ fn compile_and_run_once(
             panic!("interpret blackhole bailed on residual {name}");
         }
         if bh_pc != usize::MAX {
+            // Blackhole finished the aborted opcodes. Keep the walk's
+            // eager stores; the source-pc handoff must not replay them.
+            pyre_jit_trace::jitcode_dispatch::fbw_store_journal_commit();
             frame_root.frame().set_last_instr_from_next_instr(bh_pc);
             correct_resume_vsd(frame_root.frame(), bh_pc);
         } else {
             // Blackhole declined a residual and bailed. The opcode is
             // half-applied; rewind so replay is sound.
+            pyre_jit_trace::jitcode_dispatch::fbw_store_journal_rollback();
             frame_root
                 .frame()
                 .restore_resume_state_from(&abort_snapshot);
             restore_range_iter_cursors(&abort_range_iters);
         }
-    } else if outcome.is_none() && !driver.has_compiled_loop(green_key) {
-        // Abort arm did not stage a blackhole. Rewind so replay is sound.
+    } else if outcome.is_none() {
+        // interpret() compiled or aborted without a Jump/Finish
+        // payload. A function-entry walk that left `last_instr` mid-body
+        // would CRN into the interpreter at that pc (green key no longer
+        // matches the compiled entry) and finish the call by the wrong
+        // arm. Rewind to the pre-walk frame so portal re-entry runs the
+        // compiled token from its original pc, or the interpreter
+        // replays the opcode.
+        pyre_jit_trace::jitcode_dispatch::fbw_store_journal_rollback();
         frame_root
             .frame()
             .restore_resume_state_from(&abort_snapshot);
         restore_range_iter_cursors(&abort_range_iters);
+    } else {
+        // CloseLoop / Finish: the walk's eager stores are the region's
+        // result. Drop the undo log the same way FBW commits.
+        pyre_jit_trace::jitcode_dispatch::fbw_store_journal_commit();
     }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
