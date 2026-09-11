@@ -1917,6 +1917,43 @@ pub fn cast_instance_root(kind: &OpKind) -> Option<&str> {
     }
 }
 
+/// `cast_pointer(PTRTYPE, ptr)` marker (`lltype.py cast_pointer`).
+/// The target class is a trailing `ByteStr` Constant; the adapter
+/// interns it through the bookkeeper.
+pub fn cast_pointer_call(
+    root: impl Into<String>,
+    operand: crate::flowspace::model::Variable,
+) -> OpKind {
+    let root = root.into();
+    OpKind::Call {
+        target: CallTarget::function_path(["__cast_pointer"]),
+        args: vec![
+            LinkArg::from(operand),
+            LinkArg::from(ConstValue::byte_str(&root)),
+        ],
+        result_ty: ValueType::Ref(Some(root)),
+    }
+}
+
+/// The target-struct root of a [`cast_pointer_call`], if `kind` is one.
+pub fn cast_pointer_root(kind: &OpKind) -> Option<&str> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments },
+        args,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    if segments.as_slice() != ["__cast_pointer"] {
+        return None;
+    }
+    match args.get(1) {
+        Some(LinkArg::Const(c)) => c.value.as_pystr(),
+        _ => None,
+    }
+}
+
 /// [`cast_instance_root`] when `args[0]` is `operand`.
 pub fn cast_instance_of<'a>(
     kind: &'a OpKind,

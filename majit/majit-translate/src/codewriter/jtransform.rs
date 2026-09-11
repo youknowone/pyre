@@ -4870,8 +4870,7 @@ impl<'a> Transformer<'a> {
         // upstream `cast_pointer` op, see `cast_pointer_marker_op`)
         // folds back to the operand alias and emits no jitcode op.
         if let CallTarget::FunctionPath { segments } = target
-            && segments.len() == 2
-            && segments[0] == "__cast_pointer"
+            && segments.as_slice() == ["__cast_pointer"]
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
@@ -14659,15 +14658,11 @@ mod tests {
         let mut graph = FunctionGraph::new("cast_ptr_marker");
         let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let target = CallTarget::function_path(["__cast_pointer", "W_CastTarget"]);
+        let target = CallTarget::function_path(["__cast_pointer"]);
         let result_ty = ValueType::Ref(Some("W_CastTarget".into()));
         let op = SpaceOperation {
             result: Some(result_var),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![arg.clone()]),
-                result_ty: result_ty.clone(),
-            },
+            kind: crate::model::cast_pointer_call("W_CastTarget", arg.clone()),
         };
         let rewritten = transformer.rewrite_op_direct_call(
             &op,

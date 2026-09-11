@@ -917,11 +917,12 @@ fn class_roots(func: &SemanticFunction) -> std::collections::HashMap<u64, String
                     CallTarget::SyntheticTransparentCtor {
                         name, is_struct, ..
                     } if *is_struct => Some(name.clone()),
-                    // `__cast_pointer/<Root>` and
-                    // `__cast_instance_intrinsic/<Root>` carry the target
-                    // class in the path.
+                    // `__cast_pointer` / `__cast_instance_intrinsic`
+                    // carry the target class as a trailing ByteStr.
                     CallTarget::FunctionPath { segments } if is_representation_cast(segments) => {
-                        segments.get(1).cloned()
+                        crate::model::cast_pointer_root(&op.kind)
+                            .or_else(|| crate::model::cast_instance_root(&op.kind))
+                            .map(str::to_string)
                     }
                     _ => leaf_root(result_ty).map(str::to_string),
                 },
@@ -1198,13 +1199,7 @@ mod tests {
             let cast = Variable::named("cast");
             f.graph.block_mut(start).operations.push(SpaceOperation {
                 result: Some(cast.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_pointer".to_string(), receiver_root.to_string()],
-                    },
-                    args: crate::model::call_args(vec![hinted]),
-                    result_ty: ValueType::Ref(Some(receiver_root.to_string())),
-                },
+                kind: crate::model::cast_pointer_call(receiver_root, hinted),
             });
             cast
         } else {

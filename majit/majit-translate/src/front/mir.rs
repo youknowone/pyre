@@ -22675,21 +22675,14 @@ fn raw_ptr_typed_items_element(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, St
     Some((item_ty, format!("[{spelling}]")))
 }
 
-/// The `__cast_pointer/<Root>` marker call — front::mir's carrier for
+/// The `__cast_pointer` marker call — front::mir's carrier for
 /// the upstream `cast_pointer(PTRTYPE, ptr)` op (lltype.py).  The
-/// target class travels in the path; the flowspace adapter rebuilds the
-/// 2-arg upstream shape, and jtransform re-aliases the call to its
-/// operand (`rewrite_op_cast_pointer` → `same_as`,
-/// jtransform.py) so the jitcode shape stays identical to the
-/// plain alias lowering.
+/// target class is a trailing `ByteStr` Constant; the flowspace
+/// adapter interns it and rebuilds the 2-arg upstream shape.
+/// jtransform re-aliases the call to its operand
+/// (`rewrite_op_cast_pointer` → `same_as`).
 fn cast_pointer_marker_op(root: String, arg: Variable) -> OpKind {
-    OpKind::Call {
-        target: CallTarget::FunctionPath {
-            segments: vec!["__cast_pointer".to_string(), root.clone()],
-        },
-        args: crate::model::call_args(vec![arg]),
-        result_ty: ValueType::Ref(Some(root)),
-    }
+    crate::model::cast_pointer_call(root, arg)
 }
 
 /// Whether a Charon type node's top-level constructor is a MUTABLE reference,
@@ -31169,20 +31162,18 @@ mod tests {
         let op = cast_pointer_marker_op("W_CastTarget".to_string(), arg.clone());
         let OpKind::Call {
             target,
-            args,
             result_ty,
-        } = op
+            ..
+        } = &op
         else {
             panic!("marker must be an OpKind::Call");
         };
         assert_eq!(
             target,
-            CallTarget::FunctionPath {
-                segments: vec!["__cast_pointer".to_string(), "W_CastTarget".to_string()],
-            }
+            &CallTarget::function_path(["__cast_pointer"]),
         );
-        assert_eq!(args, vec![arg]);
-        assert_eq!(result_ty, ValueType::Ref(Some("W_CastTarget".to_string())));
+        assert_eq!(crate::model::cast_pointer_root(&op), Some("W_CastTarget"));
+        assert_eq!(result_ty, &ValueType::Ref(Some("W_CastTarget".to_string())));
     }
 
     /// Anchor [`Lowering::fold_size_const_global`] to the real lowered

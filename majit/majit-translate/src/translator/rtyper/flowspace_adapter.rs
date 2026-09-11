@@ -2144,17 +2144,20 @@ pub fn translate_op(
                             return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                         }
                     }
-                    // `__cast_pointer/<Root>` marker (`front::mir`
-                    // `cast_pointer_marker_op`) — pyre's carrier for the
+                    // `__cast_pointer` marker (`front::mir`
+                    // `cast_pointer_call`) — pyre's carrier for the
                     // upstream `cast_pointer(PTRTYPE, ptr)` downcast
-                    // (lltype.py).  Rebuild the 2-arg upstream shape
-                    // with the target class as the constant first
-                    // argument.  The class is interned by
-                    // qualname so every cast site shares one `HostObject`
-                    // Arc (`getdesc` dedups on Arc identity — fresh Arcs
-                    // would mint one ClassDesc per cast site).
-                    if segments.len() == 2 && segments[0] == "__cast_pointer" && arg_hls.len() == 1
-                    {
+                    // (lltype.py).  The root is a trailing ByteStr
+                    // Constant; intern it by qualname so every cast
+                    // site shares one `HostObject` Arc (`getdesc`
+                    // dedups on Arc identity).
+                    if segments.as_slice() == ["__cast_pointer"] {
+                        if arg_hls.len() != 2 {
+                            return Err(TyperError::message(format!(
+                                "__cast_pointer requires (operand, constant_root), got {}",
+                                arg_hls.len()
+                            )));
+                        }
                         let callable_host = HOST_ENV
                             .import_module("rpython.rtyper.lltypesystem.lltype")
                             .and_then(|m| m.module_get("cast_pointer"))
@@ -2163,17 +2166,29 @@ pub fn translate_op(
                                     "HOST_ENV lltype module must expose cast_pointer".to_string(),
                                 )
                             })?;
+                        let root = match &arg_hls[1] {
+                            Hlvalue::Constant(c) => c.value.as_pystr().ok_or_else(|| {
+                                TyperError::message(
+                                    "__cast_pointer root must be a constant string".to_string(),
+                                )
+                            })?,
+                            _ => {
+                                return Err(TyperError::message(
+                                    "__cast_pointer root must be a Constant".to_string(),
+                                ));
+                            }
+                        };
                         let class_host = call_registry
                             .bookkeeper()
-                            .intern_class_by_qualname(&segments[1]);
-                        let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+                            .intern_class_by_qualname(root);
+                        let mut call_args = Vec::with_capacity(3);
                         call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
                             callable_host,
                         ))));
                         call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
                             class_host,
                         ))));
-                        call_args.extend(arg_hls);
+                        call_args.push(arg_hls[0].clone());
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
                     // `__cast_instance_intrinsic` — front-end pointer-downcast
@@ -5998,11 +6013,11 @@ mod tests {
 
     #[test]
     fn translate_op_cast_pointer_marker_rebuilds_two_arg_upstream_call() {
-        // `__cast_pointer/<Root>` marker (front::mir
-        // `cast_pointer_marker_op`) reconstructs the upstream 2-arg
+        // `__cast_pointer` marker reconstructs the upstream 2-arg
         // `cast_pointer(PTRTYPE, ptr)` shape (lltype.py):
-        // constant callable + constant interned target class, then the
-        // pointer operand.
+        // constant callable + interned target class, then the
+        // pointer operand.  The frontend carries the root as a
+        // trailing ByteStr Constant.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 10);
@@ -6011,13 +6026,7 @@ mod tests {
         value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__cast_pointer".into(), "W_CastTarget".into()],
-                },
-                args: crate::model::call_args(vec![vars[1].clone()]),
-                result_ty: ValueType::Ref(Some("W_CastTarget".into())),
-            },
+            kind: crate::model::cast_pointer_call("W_CastTarget", vars[1].clone()),
         };
         let registry = empty_call_registry();
         let translated = translate_op(&op, &value_map, &registry)
