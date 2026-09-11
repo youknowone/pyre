@@ -11,6 +11,7 @@
 ///
 /// The residual-call trampoline scratch is stored separately at the static
 /// base returned by `jit_call_area_addr`.
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -45,6 +46,22 @@ pub(crate) const FORCE_TAKEN_BIT: i64 = 1 << 32;
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
 /// (al, ah, bl, bh, mid1).
 const UMULHI_SCRATCH: u32 = 5;
+
+thread_local! {
+    static FAILARG_CONST_TABLE: RefCell<HashMap<usize, (u32, u32)>> = RefCell::new(HashMap::new());
+}
+
+/// Bind the rewrite's gcref list so a ConstPtr failarg can rematerialize
+/// from the same table `LoadFromGcTable` uses. Empty `gcrefs` clears it.
+pub fn bind_failarg_const_table(gcrefs: &[majit_ir::GcRef], gc_table_base: u32) {
+    FAILARG_CONST_TABLE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        map.clear();
+        for (i, g) in gcrefs.iter().enumerate() {
+            map.insert(g.0, (gc_table_base, i as u32));
+        }
+    });
+}
 
 /// Dense wasm-local assignment for the sparse value-id namespace.
 struct ValueLocals {
@@ -10324,6 +10341,17 @@ fn emit_resolve_failarg(
     opref: OpRef,
     gc_table_slots: &HashMap<u32, (u32, i64)>,
 ) {
+    // rewrite.py leaves a ConstPtr failarg as a constant. Load it from
+    // the table on this path only — the collector forwards the slot —
+    // rather than baking the compile-time address as `i64.const`.
+    if let Some(g) = opref.as_const_ptr()
+        && !g.is_null()
+        && let Some((base, index)) =
+            FAILARG_CONST_TABLE.with(|cell| cell.borrow().get(&g.0).copied())
+    {
+        emit_gc_table_load(sink, base, i64::from(index));
+        return;
+    }
     if !opref.is_none()
         && !opref.is_constant()
         && let Some(&(base, index)) = gc_table_slots.get(&opref.raw())

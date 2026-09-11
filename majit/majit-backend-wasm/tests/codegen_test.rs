@@ -344,10 +344,7 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
         reemits <= bridges,
         "more owner re-emissions ({reemits}) than bridges to have merged:\n{stderr}"
     );
-    assert_eq!(
-        stat_value(&stderr, "compiles"),
-        loops + bridges + reemits
-    );
+    assert_eq!(stat_value(&stderr, "compiles"), loops + bridges + reemits);
     assert!(
         stat_value(&stderr, "jit_calls") < 100,
         "uniform-i64 blackhole helpers still reflected through the host:\n{stderr}"

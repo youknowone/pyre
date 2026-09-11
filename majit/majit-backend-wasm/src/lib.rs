@@ -2874,6 +2874,8 @@ impl WasmBackend {
         let next_pos = codegen::next_value_pos(inputargs, &ops);
         let (ops, gcrefs) = majit_gc::rewrite::remove_ref_constants(&ops, next_pos);
         let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+        let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
+        codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
         (ops, table)
     }
 
