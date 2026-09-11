@@ -2237,22 +2237,31 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         .0;
     validate_wasm(&bytes);
     let mut saw_nursery_free = false;
-    let mut saw_item_fill = false;
-    count_operators(&bytes, |op| {
-        if matches!(op, wasmparser::Operator::I32Const { value } if *value == nursery_free as i32) {
-            saw_nursery_free = true;
+    let mut last_i32 = None;
+    let mut fill_lengths = Vec::new();
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I32Const { value } => {
+            if *value == nursery_free as i32 {
+                saw_nursery_free = true;
+            }
+            last_i32 = Some(*value);
         }
-        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
-            saw_item_fill = true;
+        wasmparser::Operator::MemoryFill { .. } => {
+            fill_lengths.push(last_i32.expect("memory.fill without a preceding i32.const"));
         }
+        _ => {}
     });
     assert!(
         saw_nursery_free,
         "malloc_cond_varsize_frame must load nursery_free"
     );
+    // The CA arm may memory.fill the callee home range (length is
+    // `home_slots * SLOT_SIZE` at runtime). The bump itself must not
+    // refill `ca_frame_bytes`.
+    let frame = codegen::FrameGeometry::fixed();
     assert!(
-        !saw_item_fill,
-        "inline CA bump must not memory.fill the item area; the callee publishes jf_gcmap after nulling the frozen home region"
+        !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),
+        "inline CA bump must not memory.fill ca_frame_bytes; fills were {fill_lengths:?}"
     );
 }
 
