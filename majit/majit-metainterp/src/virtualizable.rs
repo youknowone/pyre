@@ -1645,11 +1645,7 @@ unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool
 
 /// Force a virtualizable: flush JIT-held values back to the heap.
 ///
-/// Token semantics:
-/// - TOKEN_NONE (0): not in JIT, nothing to do.
-/// - TOKEN_TRACING_RESCALL (prebuilt GCREF): tracing + residual call, just clear.
-/// - Any other non-zero value: active JIT frame pointer. Call `force_fn`
-///   with the frame pointer, which must clear the token itself.
+/// Delegates to `VirtualizableInfo::force_now` (`virtualizable.py force_now`).
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
@@ -2032,17 +2028,19 @@ mod tests {
 
     #[test]
     fn test_force_virtualizable_not_active() {
+        // virtualizable.py `force_now` — TOKEN_NONE is not TOKEN_TRACING_RESCALL,
+        // so the else arm runs and the helper is invoked with the NULL token.
         let info = VirtualizableInfo::new(0);
         let mut obj = vec![0u8; 8];
         let obj_ptr = obj.as_mut_ptr();
 
-        let mut forced = false;
+        let mut received = None;
         unsafe {
-            force_virtualizable(&info, obj_ptr, |_| {
-                forced = true;
+            force_virtualizable(&info, obj_ptr, |token| {
+                received = Some(token);
             });
         }
-        assert!(!forced, "should not force when token is zero");
+        assert_eq!(received, Some(0));
     }
 
     #[test]
