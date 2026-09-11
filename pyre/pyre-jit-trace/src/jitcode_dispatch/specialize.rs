@@ -20999,6 +20999,15 @@ pub(crate) fn try_walker_specialize_compare_op_str<Sym: WalkSym>(
 /// between two `a + b` sites would answer `(a + b) is (a + b)` True where
 /// every other implementation answers False — the same reason `jit_int_str`
 /// gives for its own effect class.
+///
+/// Not tagged `OS_STR_CONCAT` even though `STR_CONCAT_TARGETS` would:
+/// `vstring.py opt_call_stroruni_STR_CONCAT` virtualizes the call and
+/// `force_box` later emits `newstr` + `copystrcontent` at the RPython
+/// `rstr.STR` layout (`bh_copystrcontent` / `rewrite.py` basesize).  A
+/// walker `str + str` is a `W_UnicodeObject`; memcpy at those offsets
+/// is a SIGBUS.  Resume already rematerializes via
+/// `callinfo_for_oopspec(OS_STR_CONCAT)` → `jit_str_concat`; optimizer
+/// force has to speak the same object before the oopspec can land.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
