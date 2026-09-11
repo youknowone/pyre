@@ -3142,6 +3142,12 @@ impl WasmBackend {
                 // dependencies registered afterwards attach to a flag the merged
                 // code never loads and a mutated field leaves the fold in place.
                 owner.record_bridge_invalidation_flag(owner.invalidation_flag());
+                // `bridge_slots` no longer names these — they were removed
+                // above so re-emission cannot replay them. Retract their
+                // LABEL_TARGETS rows here; `reemit_loop` only sees slots
+                // that are still attached.
+                let retired: Vec<u32> = old_bridge_slots.iter().map(|&(_, slot)| slot).collect();
+                source_loop.retract_bridge_label_targets_for_slots(retired);
                 return true;
             }
             Err(error) => {
