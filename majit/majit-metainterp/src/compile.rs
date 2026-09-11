@@ -2179,14 +2179,11 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         .collect();
 
     // leftover-empty: `execute_assembler` passes only the red prefix
-    // (`warmstate.py`). Slots past that prefix that are still vable
-    // fields must be GETFIELD'd — `entry_field_oprefs` can be shorter
-    // than the live tail / baked `get_array_length` (exception: in=18
-    // entry=13 baked=16), and treating those slots as extra entry args
-    // leaves them uninitialized (cranelift GC interior in locals[11]).
-    // Slots past both the mint and the bake are not fields; they stay
-    // on LABEL/JUMP as leftover InputArgs and must not join
-    // `loop.inputargs` (`compile.py:431 inputargs[:num_red_args]`).
+    // (`warmstate.py`). GETFIELD the minted (or shorter present) tail.
+    // Growing that walk to a longer baked `get_array_length` treats live
+    // virtualstate boxes as last_instr (`'frame' object is not an
+    // iterator` in setuptools). Extra slots stay on LABEL/JUMP and must
+    // not join `loop.inputargs` (`compile.py:431 inputargs[:num_red_args]`).
     if leftover_fields.is_empty() && leftover_identity.is_empty() {
         let n_static = vinfo.static_fields.len();
         let present_fields = inputargs.len().saturating_sub(entry_prefix_len);
@@ -2199,19 +2196,16 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             } else {
                 baked_field_len
             };
-        let walk_fields = if present_fields < minted_fields {
-            present_fields
-        } else {
-            present_fields.min(baked_field_len.max(minted_fields))
-        };
+        // GETFIELD only the mint (or the shorter present prefix). Growing
+        // to `baked` when present > minted treats live virtualstate boxes
+        // as last_instr (`'frame' object is not an iterator` in
+        // setuptools entry points). Extra slots stay on LABEL/JUMP and
+        // must not join `loop.inputargs`.
+        let walk_fields = present_fields.min(minted_fields);
         if walk_fields < n_static {
             return;
         }
-        fit_walk_lengths(
-            &mut walk_lengths,
-            vinfo.array_fields.len(),
-            walk_fields - n_static,
-        );
+        fit_walk_lengths(&mut walk_lengths, vinfo.array_fields.len(), walk_fields - n_static);
         field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
         expanded_len = entry_prefix_len + field_types.len();
     }
@@ -3740,11 +3734,11 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_new_loop_getfields_baked_slots_past_a_short_mint() {
-        // leftover-empty. Entry minted last_instr + 1 item, but the live
-        // tail and baked length are last_instr + 3 items. Those extra
-        // slots are still vable fields (`execute_assembler` will not
-        // pass them); GETARRAYITEM all three.
+    fn test_patch_new_loop_does_not_getfield_past_the_mint() {
+        // leftover-empty. Entry minted last_instr + 1 item; the live tail
+        // and baked length are last_instr + 3 items. Growing the walk to
+        // the bake treats the extra live boxes as array items (frame-as
+        // iterator). GETARRAYITEM only the mint; extras stay on LABEL.
         let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
         vinfo.add_field("last_instr", Type::Int, 8);
         vinfo.add_embedded_array_field(
@@ -3795,9 +3789,19 @@ mod tests {
             ops.iter()
                 .filter(|op| op.opcode == OpCode::GetarrayitemRawR)
                 .count(),
-            3,
-            "baked/present 3 array items must be GETARRAYITEM, not extra entry args"
+            1,
+            "must GETARRAYITEM only the minted array item, not the baked tail"
         );
+        let label_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("label")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(label_args[3], OpRef::input_arg_ref(3));
+        assert_eq!(label_args[4], OpRef::input_arg_ref(4));
     }
 
     #[test]
