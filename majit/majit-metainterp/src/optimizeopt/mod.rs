@@ -7312,13 +7312,22 @@ impl OptContext {
         // non-Const position has no operand to bind and panics at
         // `Operand::from_opref` — the same contract the operand-union
         // `_args` model enforces (#9).
-        let final_operands: Vec<Operand> = liveboxes
-            .iter()
-            .map(|a| {
-                self.resolve_to_operand(*a)
-                    .unwrap_or_else(|| Operand::from_opref(*a))
-            })
-            .collect();
+        // optimizer.py:768-774: `assert box not in seen`. Two livebox
+        // positions can resolve to one InputArg after identity
+        // unification; RPython finish() would not emit that box twice.
+        // Keep the failarg arity (rd_locs) and punch a hole in the
+        // later slot.
+        let mut final_operands: Vec<Operand> = Vec::with_capacity(liveboxes.len());
+        for a in liveboxes.iter() {
+            let operand = self
+                .resolve_to_operand(*a)
+                .unwrap_or_else(|| Operand::from_opref(*a));
+            if !operand.is_none() && final_operands.iter().any(|seen| seen.same_box(&operand)) {
+                final_operands.push(Operand::none());
+            } else {
+                final_operands.push(operand);
+            }
+        }
         memo.recycle_ordered_liveboxes(liveboxes);
         let logical_rd_locs: majit_ir::RdLocs = final_operands
             .iter()
