@@ -744,6 +744,28 @@ fn unbound_pool_float_operand_declares_an_f64_local() {
     );
 }
 
+/// A peeled loop header names live-ins as InputArgs that are not portal
+/// inputargs and have no producing op. Those boxes are the LABEL's block
+/// parameters (`consider_label`); they must not trip unbound-pool decline.
+#[test]
+fn label_livein_inputarg_is_defined_at_the_label() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let live_in = OpRef::input_arg_int(101);
+    let ops = vec![
+        Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0)), rb(live_in)]),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(1)], &[live_in]),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(1)), rb(live_in)]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+}
+
 /// Count the direct `wasm_jit_write_barrier` table calls by their unique table
 /// target immediate.  The direct lowering places that `i32.const` immediately
 /// before its `call_indirect`.
@@ -8006,4 +8028,40 @@ fn inline_nursery_new_keeps_the_barrier_at_the_slow_path_join() {
     control.nursery = None;
     let (bytes, _, _) = codegen::build_wasm_module(&control).unwrap();
     assert_eq!(direct_write_barrier_call_count(&bytes, WB_TARGET as i32), 1);
+}
+
+/// `emit_force_arm` publishes a guard's fail arguments while the bracketed
+/// call is still on the stack. A constant among them has no home and no
+/// local; it is published as its literal, like `emit_guard_fail_args_spill`
+/// spills it.
+#[test]
+fn a_constant_fail_arg_in_a_force_bracket_is_published_as_a_literal() {
+    let call = make_op(
+        OpCode::CallMayForceI,
+        &[OpRef::const_int(42)],
+        OpRef::int_op(1),
+    );
+    call.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        vec![],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    ));
+    let guard = Op::new(OpCode::GuardNotForced, &[]);
+    guard.setfailargs(smallvec![
+        rb(OpRef::input_arg_ref(0)),
+        rb(OpRef::const_int(1)),
+        rb(OpRef::const_ptr(majit_ir::GcRef::NULL)),
+    ]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    let (bytes, guards) = build_module_default(
+        &[InputArg::from_type(Type::Ref, 0)],
+        &[call, guard, finish],
+        &indexmap::IndexMap::new(),
+    );
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
 }

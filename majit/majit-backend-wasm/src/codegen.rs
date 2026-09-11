@@ -10412,6 +10412,19 @@ fn unbound_pool_const_seeds(
         if r != OpRef::NONE && !r.is_constant() {
             defined.insert(r.raw());
         }
+        // `consider_label` / `LabelResumeData`: LABEL args are block
+        // parameters. A peeled header carries loop live-ins as InputArgs
+        // that are not portal inputargs and have no producing op in the
+        // stream — they are defined at the LABEL, not missing. Declining
+        // them made every peeled Python loop (`fib_loop`) fall back.
+        if op.opcode == OpCode::Label {
+            for a in op.getarglist() {
+                let r = a.to_opref();
+                if r != OpRef::NONE && !r.is_constant() {
+                    defined.insert(r.raw());
+                }
+            }
+        }
     }
     let mut seeds: Vec<(u32, i64)> = Vec::new();
     let mut unresolved: Vec<(OpRef, OpCode, bool)> = Vec::new();
