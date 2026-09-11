@@ -2619,11 +2619,16 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.i32_const(ca_alloc_fn_ptr as i32);
     sink.call_indirect(0, residual_type_base + 2);
     // The helper may have collected. Reload the caller ITEMS into local 0
-    // here so the bump path can leave local 0 untouched.
+    // only when a callee frame was actually pushed so the bump path can
+    // leave local 0 untouched. A zero return is OOM and does not push;
+    // reloading `top[-3 * WORD]` then would read before the outermost
+    // CA entry, before the later memory-error check can run.
     sink.i32_wrap_i64();
-    sink.local_set(alloc_scratch_local);
+    sink.local_tee(alloc_scratch_local);
+    sink.if_(BlockType::Empty);
     emit_ca_reload_caller(sink, inline.jf_top_addr);
     sink.local_set(0);
+    sink.end();
     sink.local_get(alloc_scratch_local);
     sink.i64_extend_i32_u();
     sink.else_();
