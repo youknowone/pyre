@@ -2130,15 +2130,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // virtualstate boxes as last_instr (binary_slice: in=24 baked=8)
     // or leaves field slots as incoming NULLs (exception: in=18
     // entry=13). Prefer the mint list when it covers the statics.
-    if !entry_field_oprefs.is_empty()
-        && entry_field_oprefs.len() >= vinfo.static_fields.len()
-    {
+    if !entry_field_oprefs.is_empty() && entry_field_oprefs.len() >= vinfo.static_fields.len() {
         let n_array_items = entry_field_oprefs.len() - vinfo.static_fields.len();
-        fit_walk_lengths(
-            &mut walk_lengths,
-            vinfo.array_fields.len(),
-            n_array_items,
-        );
+        fit_walk_lengths(&mut walk_lengths, vinfo.array_fields.len(), n_array_items);
         field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
         expanded_len = entry_prefix_len + field_types.len();
     }
@@ -2199,13 +2193,12 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         if present_fields == 0 {
             return;
         }
-        let minted_fields = if !entry_field_oprefs.is_empty()
-            && entry_field_oprefs.len() >= n_static
-        {
-            entry_field_oprefs.len()
-        } else {
-            baked_field_len
-        };
+        let minted_fields =
+            if !entry_field_oprefs.is_empty() && entry_field_oprefs.len() >= n_static {
+                entry_field_oprefs.len()
+            } else {
+                baked_field_len
+            };
         let walk_fields = if present_fields < minted_fields {
             present_fields
         } else {
@@ -3593,14 +3586,9 @@ mod tests {
                 rooted_inputarg_operand(Type::Int, 50),
             ],
         );
-        let get = Op::new(
-            OpCode::GetfieldGcR,
-            &[rooted_resop_operand(Type::Ref, 50)],
-        );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label, get]
-            .into_iter()
-            .map(std::rc::Rc::new)
-            .collect();
+        let get = Op::new(OpCode::GetfieldGcR, &[rooted_resop_operand(Type::Ref, 50)]);
+        let mut ops: Vec<majit_ir::OpRc> =
+            vec![label, get].into_iter().map(std::rc::Rc::new).collect();
         let mut inputargs = vec![InputArg::new_ref(0)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let entry_mints = vec![OpRef::input_arg_int(50)];
