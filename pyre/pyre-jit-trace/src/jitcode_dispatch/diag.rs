@@ -410,6 +410,8 @@ spec_folds! {
     FloatCall            => ("float_call",               "residual_call", "-"),
     StrCall              => ("str_call",                 "residual_call", "-"),
     FormatSimple         => ("format_simple",            "residual_call", "-"),
+    StrStartswith        => ("str_startswith",           "residual_call", "-"),
+    StrEndswith          => ("str_endswith",             "residual_call", "-"),
     BuiltinDivmod        => ("builtin_divmod",           "residual_call", "-"),
     SetAddMethod         => ("set_add_method",           "residual_call", "-"),
     StoreAttrDirect      => ("store_attr_direct",        "residual_call", "-"),

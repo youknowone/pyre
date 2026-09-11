@@ -7637,6 +7637,26 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrStartswith, || {
+            try_walker_specialize_str_prefix_match(ctx, code, op, &r_args, dst, dst_bank, true)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrEndswith, || {
+            try_walker_specialize_str_prefix_match(ctx, code, op, &r_args, dst, dst_bank, false)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
 
     // `divmod(a, b)` on two exact ints: inline the guarded
     // `OS_INT_PY_DIV` / `OS_INT_PY_MOD` pair into a virtual `Cls_ii`
