@@ -163,7 +163,10 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
                         )
                     })
                     .collect();
-                op.store_final_boxes(rewritten);
+                // `setfailargs`, not `store_final_boxes`: two failargs can
+                // forward onto one live producer, and the optimizer-stage
+                // uniqueness check would fire on the rewritten vector.
+                op.setfailargs(rewritten.into());
             }
         }
         out.push(op);
@@ -6495,7 +6498,10 @@ mod tests {
         // Optimizer forwarded an off-stream producer (pos 10) onto a live
         // loop value (pos 3). `forget_optimization_info` never sees the
         // off-stream box, so `_forwarded` survives into the backend rewrite.
-        let live = Op::new(OpCode::IntAdd, &[ro(OpRef::int_op(1)), ro(OpRef::int_op(2))]);
+        let live = Op::new(
+            OpCode::IntAdd,
+            &[ro(OpRef::int_op(1)), ro(OpRef::int_op(2))],
+        );
         live.pos.set(OpRef::int_op(3));
         let live_rc = OpRc::new(live.clone());
 

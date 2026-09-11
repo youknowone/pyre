@@ -10443,10 +10443,16 @@ fn unbound_pool_const_seeds(
         // that are not portal inputargs and have no producing op in the
         // stream — they are defined at the LABEL, not missing. Declining
         // them made every peeled Python loop (`fib_loop`) fall back.
+        //
+        // A folded constant under the same position is different: it has
+        // no producer *and* a constants-map entry. Marking it defined
+        // skipped the prologue seed, so the local stayed the zero wasm
+        // initializes it to. Seed those; only treat a LABEL arg as
+        // defined when the pool has nothing to materialize.
         if op.opcode == OpCode::Label {
             for a in op.getarglist() {
                 let r = a.to_opref();
-                if r != OpRef::NONE && !r.is_constant() {
+                if r != OpRef::NONE && !r.is_constant() && !constants.contains_key(&r.raw()) {
                     defined.insert(r.raw());
                 }
             }

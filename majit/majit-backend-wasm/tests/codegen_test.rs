@@ -766,6 +766,52 @@ fn label_livein_inputarg_is_defined_at_the_label() {
     assert_eq!(guards.len(), 1);
 }
 
+/// A LABEL live-in that is only a constants-map entry must still be seeded
+/// in the prologue. Treating every LABEL arg as defined skipped that store,
+/// so the local read as the zero wasm initializes it to.
+#[test]
+fn label_livein_pool_const_is_seeded_in_prologue() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let live_in = OpRef::input_arg_int(101);
+    let ops = vec![
+        Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0)), rb(live_in)]),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), live_in],
+            OpRef::int_op(1),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(1)], &[live_in]),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(1)), rb(live_in)]),
+    ];
+    let mut constants = indexmap::IndexMap::new();
+    constants.insert(live_in.raw(), 0x1111_2222_3333_4444);
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    const SEED: i64 = 0x1111_2222_3333_4444u64 as i64;
+    let mut saw_seed = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            let mut pending = false;
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I64Const { value } if value == SEED => pending = true,
+                    wasmparser::Operator::LocalSet { .. } if pending => {
+                        saw_seed = true;
+                        break;
+                    }
+                    _ => pending = false,
+                }
+            }
+        }
+    }
+    assert!(
+        saw_seed,
+        "prologue must materialize the LABEL live-in from the constants map"
+    );
+}
+
 /// Count the direct `wasm_jit_write_barrier` table calls by their unique table
 /// target immediate.  The direct lowering places that `i32.const` immediately
 /// before its `call_indirect`.
