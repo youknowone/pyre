@@ -4598,8 +4598,25 @@ impl OptContext {
         if addr <= 0x1000 {
             return false;
         }
-        let probe = 0usize;
-        (std::ptr::addr_of!(probe) as usize).abs_diff(addr) < 16 * 1024 * 1024
+        #[cfg(target_arch = "wasm32")]
+        {
+            // One linear memory holds the shadow stack, the data segment and
+            // the nursery within its first few tens of megabytes, so distance
+            // from a stack probe says nothing about residency. wasm-ld
+            // synthesizes the shadow stack's bounds when they are referenced.
+            unsafe extern "C" {
+                static __stack_low: u8;
+                static __stack_high: u8;
+            }
+            let low = std::ptr::addr_of!(__stack_low) as usize;
+            let high = std::ptr::addr_of!(__stack_high) as usize;
+            (low..high).contains(&addr)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let probe = 0usize;
+            (std::ptr::addr_of!(probe) as usize).abs_diff(addr) < 16 * 1024 * 1024
+        }
     }
 
     /// `optimizer.py make_equal_to(op, newop)` (line-by-line port):
