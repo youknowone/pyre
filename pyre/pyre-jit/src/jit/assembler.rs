@@ -2980,11 +2980,13 @@ mod tests {
 
     #[test]
     fn assemble_conditional_call_value_ir_r_keeps_ref_register_bank() {
+        let mut builder = JitCodeBuilder::default();
+        let fn_idx = builder.add_fn_ptr(0x7777usize as *const ());
         let mut ssarepr = SSARepr::new("cond_call_value_ir_r");
         ssarepr.insns.push(Insn::op_with_result(
             "conditional_call_value_ir_r",
             vec![
-                Operand::ConstInt(7),
+                Operand::ConstInt(i64::from(fn_idx)),
                 Operand::Register(Register::new(Kind::Ref, 1)),
                 Operand::Register(Register::new(Kind::Int, 0)),
                 Operand::Register(Register::new(Kind::Ref, 2)),
@@ -2994,7 +2996,7 @@ mod tests {
 
         let jitcode = assemble(
             &mut ssarepr,
-            JitCodeBuilder::default(),
+            builder,
             Some(NumRegs {
                 int: 1,
                 ref_: 5,
