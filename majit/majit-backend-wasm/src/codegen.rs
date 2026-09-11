@@ -10582,13 +10582,13 @@ fn unbound_pool_const_seeds(
         }
         match constants.get(&raw) {
             Some(&bits) => seeds.push((raw, bits)),
-            // No producer and no pool entry: a body read would load the
-            // zero wasm initializes the local to. Decline that (the
-            // interpreter runs it correctly). A failarg is only a
-            // snapshot slot — import_state can leave the same leftover
-            // hole on a guard after every real use was rewritten, and
-            // dynasm still compiles the loop.
-            None if failarg => {}
+            // No producer and no pool entry: the local would read as the
+            // zero wasm initializes it to, which is a wrong value, not a
+            // missing one. Decline the trace (the interpreter runs it
+            // correctly, unaccelerated) exactly as the unhandled-opcode
+            // arm does. Live failargs are spilled from that same local
+            // (`emit_guard_fail_args_spill`); accepting a hole here
+            // would resume with a zero instead of declining.
             None => unresolved.push((a, opcode, failarg)),
         }
     };
