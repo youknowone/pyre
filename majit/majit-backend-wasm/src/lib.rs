@@ -6180,12 +6180,33 @@ mod tests {
         assert!(compiled.pending_wasm_bytes.borrow().is_some());
     }
 
+    struct DispatchCleanup {
+        numbers: Vec<u64>,
+        ptrs: Vec<u32>,
+    }
+
+    impl Drop for DispatchCleanup {
+        fn drop(&mut self) {
+            for number in &self.numbers {
+                failguard::ca_dispatch_remove(*number);
+            }
+            for ptr in &self.ptrs {
+                failguard::ca_dispatch_remove_compiled_ptr(*ptr);
+            }
+        }
+    }
+
     #[test]
     fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let token_number = 9_900_000;
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 0);
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 0);
+        let compiled_ptr = 1_000_022;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![token_number],
+            ptrs: vec![compiled_ptr],
+        };
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
@@ -6198,7 +6219,7 @@ mod tests {
             assert_eq!(targets[0].has_guard_not_forced_2, 0);
         }
         drop(table);
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 1);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 1);
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
             .as_ref()
@@ -6216,7 +6237,7 @@ mod tests {
             1
         );
         drop(table);
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
             .as_ref()
@@ -6229,15 +6250,18 @@ mod tests {
             1,
             "a later publish without GNF2 must not clear the cell flag"
         );
-        drop(table);
-        failguard::ca_dispatch_remove(token_number);
     }
 
     #[test]
     fn mark_gnf2_sets_the_cell_without_a_new_snapshot() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let token_number = 9_900_001;
-        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55, 0, 0, 0);
+        let compiled_ptr = 1_000_023;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![token_number],
+            ptrs: vec![compiled_ptr],
+        };
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
         failguard::ca_dispatch_mark_gnf2(token_number);
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
@@ -6255,8 +6279,6 @@ mod tests {
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].has_guard_not_forced_2, 0);
         }
-        drop(table);
-        failguard::ca_dispatch_remove(token_number);
     }
 
     #[test]
@@ -6264,9 +6286,15 @@ mod tests {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let old_number = 9_900_030;
         let new_number = 9_900_031;
-        ca_dispatch_publish(old_number, 1, 22, 33, 44, 55, 0, 0, 0);
-        ca_dispatch_publish(new_number, 2, 99, 33, 44, 55, 0, 0, 0);
-        ca_dispatch_redirect(old_number, 2, 99, 33, 44, 55, 0, 0, 0);
+        let old_ptr = 1_000_024;
+        let new_ptr = 1_000_025;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![old_number, new_number],
+            ptrs: vec![old_ptr, new_ptr],
+        };
+        ca_dispatch_publish(old_number, 1, old_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(new_number, 2, new_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_redirect(old_number, 2, new_ptr, 33, 44, 55, 0, 0, 0);
         failguard::ca_dispatch_mark_gnf2(new_number);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
@@ -6283,11 +6311,6 @@ mod tests {
                 "token {number} must see GNF2 after the replacement loop is marked"
             );
         }
-        drop(table);
-        failguard::ca_dispatch_remove(old_number);
-        failguard::ca_dispatch_remove(new_number);
-        failguard::ca_dispatch_remove_compiled_ptr(22);
-        failguard::ca_dispatch_remove_compiled_ptr(99);
     }
 
     #[test]
@@ -6295,11 +6318,17 @@ mod tests {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let alias = 9_900_040;
         let source = 9_900_041;
-        ca_dispatch_publish(alias, 1, 99, 33, 44, 55, 0, 0, 0);
-        ca_dispatch_publish(source, 2, 99, 33, 44, 55, 0, 0, 0);
+        let source_ptr = 1_000_026;
+        let later_ptr = 1_000_027;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![alias, source],
+            ptrs: vec![source_ptr, later_ptr],
+        };
+        ca_dispatch_publish(alias, 1, source_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(source, 2, source_ptr, 33, 44, 55, 0, 0, 0);
         // Second redirect replaces `.last()`; the S snapshot stays in
         // `targets` for in-flight callers that already loaded it.
-        ca_dispatch_redirect(alias, 3, 77, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_redirect(alias, 3, later_ptr, 33, 44, 55, 0, 0, 0);
         failguard::ca_dispatch_mark_gnf2(source);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
@@ -6310,8 +6339,8 @@ mod tests {
         {
             let targets = entry.targets.lock().unwrap();
             assert_eq!(targets.len(), 2);
-            assert_eq!(targets[0].compiled_ptr, 99);
-            assert_eq!(targets[1].compiled_ptr, 77);
+            assert_eq!(targets[0].compiled_ptr, source_ptr);
+            assert_eq!(targets[1].compiled_ptr, later_ptr);
         }
         assert_eq!(
             entry
@@ -6320,11 +6349,6 @@ mod tests {
             1,
             "a cell that still retains S must rise even after a later redirect"
         );
-        drop(table);
-        failguard::ca_dispatch_remove(alias);
-        failguard::ca_dispatch_remove(source);
-        failguard::ca_dispatch_remove_compiled_ptr(99);
-        failguard::ca_dispatch_remove_compiled_ptr(77);
     }
 
     #[test]
@@ -6332,11 +6356,16 @@ mod tests {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let source = 9_900_050;
         let alias = 9_900_051;
-        ca_dispatch_publish(source, 2, 88, 33, 44, 55, 0, 0, 0);
+        let compiled_ptr = 1_000_028;
+        let _cleanup = DispatchCleanup {
+            numbers: vec![source, alias],
+            ptrs: vec![compiled_ptr],
+        };
+        ca_dispatch_publish(source, 2, compiled_ptr, 33, 44, 55, 0, 0, 0);
         failguard::ca_dispatch_mark_gnf2(source);
         // Redirect-shaped publish with a stale zero flag, as if the
         // CallAssemblerTarget clone was taken before the mark.
-        ca_dispatch_publish(alias, 2, 88, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(alias, 2, compiled_ptr, 33, 44, 55, 0, 0, 0);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
@@ -6350,10 +6379,6 @@ mod tests {
             1,
             "a publish after mark must raise the new alias cell"
         );
-        drop(table);
-        failguard::ca_dispatch_remove(source);
-        failguard::ca_dispatch_remove(alias);
-        failguard::ca_dispatch_remove_compiled_ptr(88);
     }
 
     #[test]
@@ -6394,8 +6419,12 @@ mod tests {
         }
 
         let mut backend = WasmBackend::new();
-        let tmp = JitCellToken::new(9_900_001);
-        let real = JitCellToken::new(9_900_002);
+        let tmp = JitCellToken::new(9_900_060);
+        let real = JitCellToken::new(9_900_061);
+        let _cleanup = DispatchCleanup {
+            numbers: vec![tmp.number, real.number],
+            ptrs: Vec::new(),
+        };
         compile_with_depth(&mut backend, &tmp, 1);
         compile_with_depth(&mut backend, &real, 96);
 

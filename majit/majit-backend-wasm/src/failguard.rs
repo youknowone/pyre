@@ -685,7 +685,7 @@ pub fn ca_dispatch_mark_gnf2(number: u64) {
         entry
             .targets
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .last()
             .map(|target| target.compiled_ptr)
     });
@@ -735,7 +735,7 @@ fn mark_gnf2_entries_for_compiled_ptr(
         let aliases = entry
             .targets
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|target| target.compiled_ptr == compiled_ptr);
         if aliases {
@@ -790,7 +790,7 @@ pub fn ca_dispatch_publish(
     if has_guard_not_forced_2 != 0 {
         entry.has_guard_not_forced_2.store(1, Ordering::Release);
     }
-    let mut targets = entry.targets.lock().unwrap();
+    let mut targets = entry.targets.lock().unwrap_or_else(|e| e.into_inner());
     if targets.last().is_some_and(|current| {
         current.func_handle == func_handle
             && current.compiled_ptr == compiled_ptr
@@ -853,7 +853,7 @@ pub fn ca_dispatch_remove_compiled_ptr(compiled_ptr: u32) {
             entry
                 .targets
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .last()
                 .is_none_or(|target| target.compiled_ptr != compiled_ptr)
         });
@@ -866,8 +866,37 @@ pub fn ca_dispatch_remove_compiled_ptr(compiled_ptr: u32) {
 }
 
 pub fn ca_dispatch_remove(number: u64) {
-    if let Some(table) = WASM_CA_DISPATCH.lock().as_mut() {
-        table.remove(&number);
+    let mut table = WASM_CA_DISPATCH.lock();
+    let Some(table) = table.as_mut() else {
+        return;
+    };
+    let compiled_ptrs: Vec<u32> = table
+        .remove(&number)
+        .map(|entry| {
+            entry
+                .targets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|target| target.compiled_ptr)
+                .filter(|&ptr| ptr != 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    for compiled_ptr in compiled_ptrs {
+        let still_used = table.values().any(|entry| {
+            entry
+                .targets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|target| target.compiled_ptr == compiled_ptr)
+        });
+        if !still_used {
+            if let Some(set) = CA_GNF2_COMPILED_PTRS.lock().as_mut() {
+                set.remove(&compiled_ptr);
+            }
+        }
     }
 }
 
