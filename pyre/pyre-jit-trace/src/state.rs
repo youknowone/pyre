@@ -11650,6 +11650,68 @@ impl JitState for PyreJitState {
         })
     }
 
+    fn jitcode_at_resume_index(
+        index: i32,
+    ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+        if index < 0 {
+            return None;
+        }
+        let index = index as usize;
+        if let Some(portal) = crate::jitcode_runtime::portal_metainterp_jitcode()
+            && portal.try_index() == Some(index)
+        {
+            return Some(portal);
+        }
+        crate::jitcode_runtime::get_jitcode_by_index(index).map(|canonical| {
+            std::sync::Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
+                (*canonical).clone(),
+            ))
+        })
+    }
+
+    /// pyjitpl.py `handle_guard_failure` → `interpret()` from the rebuilt
+    /// resume framestack. Generated `#[jit_interp]` states already forward
+    /// this to `trace_jitcode_at_resume_framestack`; the portal frontend
+    /// was still on the trait default (`None`), so every guard fell
+    /// through to FBW.
+    fn trace_from_guard_resume_position<R: majit_metainterp::JitCodeRuntime>(
+        ctx: &mut TraceCtx,
+        _sym: &mut Self::Sym,
+        frames: &[majit_metainterp::GuardResumeFrame],
+        outer_program_pc: usize,
+        runtime: &R,
+    ) -> Option<TraceAction> {
+        struct PortalResumeSym {
+            header_pc: usize,
+        }
+        impl majit_metainterp::JitCodeSym for PortalResumeSym {
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                self.header_pc
+            }
+        }
+        let mut portal_sym = PortalResumeSym {
+            header_pc: outer_program_pc,
+        };
+        let action = majit_metainterp::trace_jitcode_at_resume_framestack_allowing_residuals(
+            ctx,
+            &mut portal_sym,
+            frames,
+            outer_program_pc,
+            runtime,
+        );
+        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+            eprintln!(
+                "[bridgeB] portal resume walk action={action:?} frames={} header_pc={}",
+                frames.len(),
+                outer_program_pc
+            );
+        }
+        Some(action)
+    }
+
     /// pyjitpl.py get_procedure_token: compute green key for a PC.
     fn green_key_for_pc(&self, pc: usize) -> Option<u64> {
         let frame_ptr = self.frame as *const pyre_interpreter::pyframe::PyFrame;

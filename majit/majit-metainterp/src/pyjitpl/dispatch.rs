@@ -12405,6 +12405,39 @@ where
     {
         return TraceAction::Abort;
     }
+    run_resume_framestack(ctx, sym, frames, outer_program_pc, runtime)
+}
+
+/// Same walk as [`trace_jitcode_at_resume_framestack`], without the
+/// whole-body symbolic-residual gate. The portal JitCode can reach
+/// unbound helpers (`fill_user_function_args`, …) that the loop
+/// interpret already residual-calls; the gate would refuse every
+/// portal guard resume before the walk starts.
+pub fn trace_jitcode_at_resume_framestack_allowing_residuals<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    frames: &[crate::jit_state::GuardResumeFrame],
+    outer_program_pc: usize,
+    runtime: &R,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
+    run_resume_framestack(ctx, sym, frames, outer_program_pc, runtime)
+}
+
+fn run_resume_framestack<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    frames: &[crate::jit_state::GuardResumeFrame],
+    outer_program_pc: usize,
+    runtime: &R,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
     let mut standalone = StandaloneFrameStack::new();
     for (depth, resume_frame) in frames.iter().enumerate() {
         let mut frame = standalone.frames.take_frame(
