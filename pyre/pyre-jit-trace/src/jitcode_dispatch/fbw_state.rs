@@ -4139,11 +4139,37 @@ pub(crate) fn fbw_callee_body_replay_scan(
             if !target_fresh {
                 replay_poison!(poison, "SetarrayitemGcTargetNotFresh", d.pc, d.opname);
             }
+        } else if d.opname.starts_with("inline_call") {
+            // Flatten lowered BINARY_OP is `inline_call_ir_r`, not
+            // `residual_call`.  The residual exemption above never
+            // fires, so admit the same proven-numeric tags here.
+            match crate::jitcode_dispatch::residual_call::inline_call_specialized_plain_numeric_binop(
+                body_code,
+                &numeric_ref_regs,
+                &plain_int_ref_regs,
+                &d,
+                num_regs_i,
+                constants_i,
+                callee_descr_refs,
+            ) {
+                Some(SpecializedBinop::Numeric) => {
+                    dst_exact_numeric = true;
+                }
+                Some(SpecializedBinop::PlainInt) => {
+                    dst_exact_numeric = true;
+                    dst_exact_plain_int = true;
+                }
+                Some(SpecializedBinop::Compare) => {
+                    dst_exact_bool = true;
+                }
+                None => {
+                    replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                }
+            }
         } else if d.opname.starts_with("setinteriorfield_gc")
             || d.opname.starts_with("raw_store")
             || d.opname.starts_with("cond_call")
             || d.opname.starts_with("call_assembler")
-            || d.opname.starts_with("inline_call")
         {
             // Interior/raw stores and non-residual call forms cannot be proven
             // replay-safe from this single callee body.
