@@ -2052,19 +2052,39 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         .filter(|opref| opref.is_input_arg())
         .map(|opref| opref.raw())
         .collect();
-    for raw in entry_prefix_len as u32..expanded_len as u32 {
-        field_raws.insert(raw);
+    // Sequential prefix+offset ids are only the field boxes when
+    // `initialize_virtualizable` minted that dense tail (`has_expanded_tail`).
+    // The usual heap-read path mints fresh InputArgs at high ids
+    // (`vable_entry_oprefs`); filling the sequential range then classifies
+    // virtualstate body leftovers as field slots and, after rebuild, forwards
+    // `last_instr` onto a locals GETARRAYITEM (or a leftover local onto the
+    // frame). Tests that omit `entry_field_oprefs` still use the dense ids.
+    if field_raws.is_empty() {
+        for raw in entry_prefix_len as u32..expanded_len as u32 {
+            field_raws.insert(raw);
+        }
     }
     let leftover_fields: Vec<OpRef> = leftover
         .iter()
         .copied()
         .filter(|r| field_raws.contains(&r.raw()))
         .collect();
-    let leftover_identity: Vec<OpRef> = leftover
+    // compile.py `box.set_forwarded` on the virtualizable red — one box,
+    // `virtualizable_boxes[-1]`. Every leftover Ref that is not a field is
+    // *not* that red: virtualstate LABEL/JUMP/failargs keep their own
+    // InputArgRefs, and rewriting them all onto the frame puts `last_instr`
+    // in a pointer slot (SIGSEGV at locals_cells_stack_w) and the frame in
+    // an int local (`TypeError: 'frame' < 'int'`).
+    let leftover_identity_all: Vec<OpRef> = leftover
         .iter()
         .copied()
         .filter(|r| r.ty() == Some(Type::Ref) && !field_raws.contains(&r.raw()))
         .collect();
+    let leftover_identity: Vec<OpRef> = if leftover_identity_all.len() == 1 {
+        leftover_identity_all
+    } else {
+        Vec::new()
+    };
 
     // `compile.py:458 assert i == len(inputargs)` requires the expanded
     // list to be exactly prefix + statics + baked array items. Virtualstate
@@ -2132,12 +2152,23 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             );
         }
         for (offset, ty) in field_types.into_iter().enumerate() {
-            let idx = entry_field_oprefs
-                .get(offset)
-                .copied()
-                .filter(|opref| opref.is_input_arg())
-                .map(OpRef::raw)
-                .unwrap_or((entry_prefix_len + offset) as u32);
+            // Densify numbers surviving field slots 0..N. Those ids are
+            // what LABEL/JUMP/failargs still name. `vable_entry_oprefs`
+            // keeps the pre-densify mint (often 50+). Prefer the densified
+            // slot so `box.set_forwarded` hits the ops; still snap-forward
+            // the mint below when a leftover kept that id.
+            let dense_idx = entry_prefix_len + offset;
+            let idx = inputargs
+                .get(dense_idx)
+                .map(|ia| ia.index)
+                .or_else(|| {
+                    entry_field_oprefs
+                        .get(offset)
+                        .copied()
+                        .filter(|opref| opref.is_input_arg())
+                        .map(OpRef::raw)
+                })
+                .unwrap_or(dense_idx as u32);
             expanded.push(InputArg::from_type(ty, idx));
         }
         *inputargs = expanded;
@@ -3259,6 +3290,142 @@ mod tests {
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
             vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(0)]
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_does_not_rewrite_multiple_leftover_refs_as_identity() {
+        // Two leftover Refs after densify are virtualstate body args, not
+        // two copies of the vable red. compile.py forwards only
+        // `virtualizable_boxes[-1]`.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 98),
+                rooted_inputarg_operand(Type::Ref, 99),
+            ],
+        );
+        let jump = Op::new(
+            OpCode::Jump,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 98),
+                rooted_inputarg_operand(Type::Ref, 99),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, jump]
+            .into_iter()
+            .map(std::rc::Rc::new)
+            .collect();
+        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &[],
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            ops[0]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_ref(98),
+                OpRef::input_arg_ref(99),
+            ]
+        );
+        assert_eq!(
+            ops[1]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_ref(98),
+                OpRef::input_arg_ref(99),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_forwards_densified_field_slots_not_only_entry_mints() {
+        // Densify left last_instr as InputArg(2) on LABEL. The mint
+        // `vable_entry_oprefs` still names InputArg(50). Rebuild must
+        // forward 2 — the id the ops still use — or the backend treats
+        // InputArg(2) as a missing entry register (last_instr-as-pointer).
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("obj", Type::Ref, 16);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            24,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(32));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Int, 2),
+                rooted_inputarg_operand(Type::Ref, 3),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_int(50), OpRef::input_arg_ref(51)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[2],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        let label_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("label")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert!(
+            !label_args.iter().any(|r| r.is_input_arg() && r.raw() == 2),
+            "densified last_instr InputArg(2) must be forwarded to GETFIELD, got {label_args:?}"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
+            "must emit GETFIELD_GC_I for last_instr"
         );
     }
 
