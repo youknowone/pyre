@@ -2,28 +2,12 @@
 # so a pypy ratio compares two interpreters' startup rather than any generated
 # code, and reads whatever the host's process spawn cost happens to be that
 # run. The jitstats baselines gate it.
-# Caller locals that are live ACROSS the inlined call, exercised at a vable
-# escape inside an inline sub-walk.
-#
-# The escape is the `f_lasti` read on `_gf(1)`, the CALLER's frame, and both
-# halves are load-bearing.  The depth: `try_walker_specialize_sys_getframe`
-# answers depth 0 at the top walk level out of the portal virtualizable, so a
-# zero-argument call forces nothing and the baselines went to
-# `fbw_blackhole_adopted_multi_frame=0`; depth 1 names a frame the
-# specialization refuses, so the call stays residual.  The read: `getframe`
-# takes no virtualizable force of its own, `rvirtualizable.py
-# hook_access_field` places one at each REDIRECTED field access, and `f_lasti`
-# reads `last_instr` -- one of the five `virtualizable_gen.rs` declares.  A bare
-# call, or a read of `f_code` or `f_back`, escapes nothing.
-#
-# The multi-frame chain gives each level its own frame as the virtualizable, so
-# the walked frame's level writes its `setfield_vable` stores to the LIVE frame,
-# while the adopt's resume-state write targets the snapshot and the portal
-# epilogue then copies the snapshot's whole locals array back over the live
-# frame. Any such store the resume-state write does not cover would revert, and
-# `acc` and `tag` below are exactly the kind of caller local that would: both are
-# carried across every iteration, so a single reverted slot changes the printed
-# totals rather than merely perturbing timing.
+# Caller locals that are live ACROSS the inlined call, read from
+# `_gf(1).f_lasti` inside the callee.  That call now lands on the portal red
+# box and folds the CALL coordinate, so the loop compiles without a
+# virtualizable force.  `acc` and `tag` are carried across every iteration; a
+# compile that dropped or restored the wrong slot would change the printed
+# totals.
 import sys
 
 _gf = sys._getframe

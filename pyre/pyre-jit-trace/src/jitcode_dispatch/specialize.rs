@@ -2739,6 +2739,19 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     if unsafe { &*(concrete_obj as *const pyre_interpreter::PyFrame) }.frame_finished_execution() {
         return None;
     }
+    // Inside an inlined callee the portal is still executing: it sits at
+    // the CALL. `_getframe(1).f_lasti` / `f_lineno` on that frame owe
+    // that coordinate, not the callee's pc and not the heap `last_instr`
+    // a residual force would publish (three different values on
+    // `frame_caller_image_from_inlined_callee_regression`).
+    if let (Some(vable_box), Some(vable_ptr), Some(caller_py_pc)) = (
+        ctx.trace_ctx.standard_virtualizable_box(),
+        ctx.trace_ctx.standard_virtualizable_ptr(),
+        ctx.fbw_mode.inline_caller_py_pc,
+    ) && vable_ptr == concrete_obj as usize
+    {
+        return Some((vable_box, caller_py_pc));
+    }
     let (frame_box, frame_ptr) = walker_executing_frame_box(ctx)?;
     if frame_ptr != concrete_obj as usize {
         return None;
@@ -13226,78 +13239,6 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
 /// forced `f_backref` is null, or a hop whose result is hidden.
 /// Declines after emission rewind to the pre-specialization trace position and
 /// reset the heap cache before falling through.
-fn next_op_is_f_locals_for_getframe_result<Sym: WalkSym>(
-    code: &[u8],
-    op: &DecodedOp,
-    ctx: &WalkContext<'_, '_, Sym>,
-    getframe_dst: usize,
-) -> bool {
-    let Some(mut next) = crate::jitcode_runtime::decode_op_at(code, op.next_pc) else {
-        return false;
-    };
-    while next.opname == "live"
-        || next.opname.starts_with("setarrayitem_vable")
-        || next.opname.starts_with("setfield_vable")
-    {
-        let Some(after_bookkeeping) = crate::jitcode_runtime::decode_op_at(code, next.next_pc)
-        else {
-            return false;
-        };
-        next = after_bookkeeping;
-    }
-    let helper_kind = residual_call::residual_call_descr_index_in_body(code, &next)
-        .and_then(|index| ctx.descr_refs.at(index))
-        .and_then(|descr| {
-            descr
-                .as_call_descr()
-                .map(|call| call.get_extra_info().runtime_helper)
-        });
-    if next.key != "residual_call_ir_r/iIRd>r"
-        || helper_kind != Some(majit_ir::RuntimeHelperKind::LoadAttr)
-    {
-        return false;
-    }
-
-    // `iIRd>r`: funcbox, Int var-list, Ref var-list, descr, result.  The
-    // LoadAttr helper's lists are `[name_idx]` and `[obj, code]`.
-    let Some(&i_len_byte) = code.get(next.pc + 2) else {
-        return false;
-    };
-    let i_len = i_len_byte as usize;
-    if i_len != 1 {
-        return false;
-    }
-    let Some(&name_reg) = code.get(next.pc + 3) else {
-        return false;
-    };
-    let r_len_pc = next.pc + 3 + i_len;
-    if code.get(r_len_pc) != Some(&2) {
-        return false;
-    }
-    let (Some(&obj_reg), Some(&code_reg)) = (code.get(r_len_pc + 1), code.get(r_len_pc + 2)) else {
-        return false;
-    };
-    if obj_reg as usize != getframe_dst {
-        return false;
-    }
-    let (Some(name_op), Some(code_op)) = (
-        ctx.registers_i.get(name_reg as usize),
-        ctx.registers_r.get(code_reg as usize),
-    ) else {
-        return false;
-    };
-    let (Some(majit_ir::Value::Int(name_idx)), Some(majit_ir::Value::Ref(w_code))) = (
-        ctx.trace_ctx.box_value(name_op),
-        ctx.trace_ctx.box_value(code_op),
-    ) else {
-        return false;
-    };
-    if name_idx < 0 || w_code.as_usize() == 0 {
-        return false;
-    }
-    walker_load_name_from_code(w_code.as_usize(), name_idx as usize).as_deref() == Some("f_locals")
-}
-
 pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -13466,11 +13407,11 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // Until every app-level frame getter is lowered through its own red frame,
     // admitting an arbitrary positive-depth result would expose it to a
     // generic residual whose single live-coordinate slot cannot describe a
-    // nested caller chain.  The completed slice is the outer standard frame
-    // immediately consumed by `f_locals`: that getter is specialized below and
-    // its locals write-back names the same frame, so it crosses no such
-    // residual boundary.  Preflight its whole static shape before emitting any
-    // part of `_getframe`.
+    // nested caller chain.  The completed landing is the outer standard
+    // frame: `f_locals` write-back, `f_code`, `f_lasti` and `f_lineno` all
+    // name that same red box, so STORE_FAST of the getframe result no
+    // longer has to force the residual heap reader.  An intermediate
+    // inlined caller (not the portal) still declines here.
     if inline_level && depth_value > 0 {
         let standard_frame = final_concrete_frame as usize == standard_vable_ptr
             && unsafe { (*final_concrete_frame).ob_header.ob_type }
@@ -13486,7 +13427,6 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         if !standard_frame
             || unsafe { (*final_concrete_frame).ob_header.w_class } != w_type
             || unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) } == 0
-            || !next_op_is_f_locals_for_getframe_result(code, op, ctx, dst)
         {
             return Ok(None);
         }

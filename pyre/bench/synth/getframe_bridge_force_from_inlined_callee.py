@@ -14,37 +14,12 @@
 # Measured at zero on this shape as well: `repr(_gf(0).f_code)`, storing
 # `_gf(0)` into a module list, and `str(_gf(0).f_lasti)`.
 #
-# One frame down, depth 1 lands on the portal frame, and that is the whole
-# shape: `peek()` inlines into the rare arm and its `_gf(1)` is a `CallFn`
-# residual that hands `main`'s own virtualizable to Python, where the `f_lasti`
-# read forces it.  The read is the lever, not the call: `sys._getframe` takes no
-# virtualizable force of its own, and `rvirtualizable.py hook_access_field`
-# places one at each REDIRECTED field access -- `f_lasti` reads `last_instr`,
-# one of the five `virtualizable_gen.rs` declares.  The `f_code.co_name` `peek`
-# also reads is not a second one.
-#
-# Each clause is load-bearing:
-#   * the `for` loop compiles on the common arm;
-#   * `i % 97 == 0` is the rare arm, so its guard fails past
-#     `DEFAULT_TRACE_EAGERNESS` and `start_bridge_tracing` sets
-#     `ctx.is_bridge_trace` -- the walk over the rare arm is a bridge walk,
-#     which `PYRE_FBW_CENSUS=1` reports as
-#     `end=VableEscapedDuringResidualCall committed=true leg=2 bridge=true`;
-#   * `peek` is a Python callee, so the escape's blackhole terminal is
-#     MULTI-frame. A single-frame one is not reachable here for the reason
-#     above -- the escape needs a frame below the portal to be called from.
-#
-# The baseline pins what that produces: `fbw_blackhole_adopted_multi_frame=20`
-# with `fbw_rolled_back_with_effects=0` and `fbw_store_journal_rollback_failed=0`
-# -- the escape captured its image and resumed forward rather than rolling back
-# onto a legacy replay. Under `MAJIT_STATS=1` the same run reports
-# `fbw_escape_portal_only=20` and `fbw_force_by_portal=20`; those keys are not in
-# the baseline, and an absent key is UNGATED rather than zero.
-#
-# `loops_aborted=20` and `bridges_compiled=0` are the designed values, not a
-# regression to drive down: an escape ends the walk, so every bridge trace over
-# the rare arm is abandoned and the rare arm never gets compiled code. That is
-# what a forced escape on a bridge walk costs, and pinning it is the point.
+# One frame down, depth 1 lands on the portal frame: `peek()` inlines into
+# the rare arm and `_gf(1).f_lasti` now folds at the CALL the portal is
+# suspended at, so this shape no longer residualizes or forces.  The two
+# older siblings still document why a portal-level `_getframe` cannot be the
+# lever; this file keeps the inlined rare-arm shape and pins that the
+# printed totals stay the same once the fold compiles.
 #
 # The ceiling is a level record, not a fitted number. Locally this reads ~9.4x
 # on dynasm and ~11.2x on cranelift, both `~`-clamped so no gate is applied --
