@@ -4524,21 +4524,31 @@ impl OpcodeStepExecutor for PyFrame {
     ) -> Result<(), PyError> {
         // Stack: [value, expression, format_spec?] — format_spec present only
         // when the oparg low bit is set, else it defaults to the empty string.
-        let format_spec = if has_format_spec {
+        let _interp_roots = pyre_object::gc_roots::push_roots();
+        let format_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(if has_format_spec {
             self.pop()
         } else {
             pyre_object::w_str_new("")
-        };
-        let expression = self.pop();
-        let value = self.pop();
-        let conversion_obj = pyre_object::w_int_new(conversion as i64);
+        });
+        let expression_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(self.pop());
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(self.pop());
+        let conversion_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(conversion as i64));
         let anchor = FrameAnchor::new(self);
         let module = self.import_module("_template")?;
         let func = getattr_str(module, "_build_interpolation")?;
         let result = call_callable(
             self,
             func,
-            &[value, expression, conversion_obj, format_spec],
+            &[
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+                pyre_object::gc_roots::shadow_stack_get(expression_slot),
+                pyre_object::gc_roots::shadow_stack_get(conversion_slot),
+                pyre_object::gc_roots::shadow_stack_get(format_slot),
+            ],
         )?;
         Self::push_anchored(&anchor, result)
     }

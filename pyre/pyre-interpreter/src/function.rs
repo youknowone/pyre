@@ -3027,10 +3027,26 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if !w_name.is_null() && !unsafe { pyre_object::is_none(w_name) } {
         unsafe { function_set_name_obj(func, w_name) };
     }
-    let qualname = pyre_object::w_str_new(unsafe { (*code_ptr).qualname.as_ref() });
-    unsafe { function_set_qualname(func, qualname) };
+    let _qual_roots = pyre_object::gc_roots::push_roots();
+    let func_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(func);
+    let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(unsafe {
+        (*code_ptr).qualname.as_ref()
+    }));
+    unsafe {
+        function_set_qualname(
+            pyre_object::gc_roots::shadow_stack_get(func_slot),
+            pyre_object::gc_roots::shadow_stack_get(qualname_slot),
+        )
+    };
     if !w_argdefs.is_null() && !unsafe { pyre_object::is_none(w_argdefs) } {
-        unsafe { function_set_defaults(func, w_argdefs) };
+        unsafe {
+            function_set_defaults(
+                pyre_object::gc_roots::shadow_stack_get(func_slot),
+                w_argdefs,
+            )
+        };
     }
     if !w_kwdefaults.is_null() && !unsafe { pyre_object::is_none(w_kwdefaults) } {
         if !unsafe { pyre_object::is_dict(w_kwdefaults) } {
@@ -3038,9 +3054,14 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 "arg 6 (kwdefaults) must be None or dict",
             ));
         }
-        unsafe { function_set_kwdefaults(func, w_kwdefaults) };
+        unsafe {
+            function_set_kwdefaults(
+                pyre_object::gc_roots::shadow_stack_get(func_slot),
+                w_kwdefaults,
+            )
+        };
     }
-    Ok(func)
+    Ok(pyre_object::gc_roots::shadow_stack_get(func_slot))
 }
 
 /// PyPy-compatible static registry hook.

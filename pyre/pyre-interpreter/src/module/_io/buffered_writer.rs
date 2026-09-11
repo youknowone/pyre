@@ -159,8 +159,21 @@ impl W_BufferedWriter {
     }
 
     fn raw_seek(&mut self, pos: i64, whence: i64) -> Result<i64, crate::PyError> {
-        let result =
-            super::call_method_result(self.w_raw, "seek", &[w_int_new(pos), w_int_new(whence)])?;
+        let result = {
+            let _seek_roots = pyre_object::gc_roots::push_roots();
+            let pos_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(pos));
+            let whence_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(whence));
+            super::call_method_result(
+                self.w_raw,
+                "seek",
+                &[
+                    pyre_object::gc_roots::shadow_stack_get(pos_slot),
+                    pyre_object::gc_roots::shadow_stack_get(whence_slot),
+                ],
+            )?
+        };
         let pos = crate::baseobjspace::int_w(result)?;
         if pos < 0 {
             return Err(crate::PyError::os_error(

@@ -864,8 +864,9 @@ impl PyError {
         // young element (the filename or text string, or an uncached line/col
         // int), leaving its raw local pointing at the old address.
         let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ =
-            pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8(filename.to_wtf8_buf()));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
+            filename.to_wtf8_buf(),
+        ));
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
         let offset_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -876,7 +877,7 @@ impl PyError {
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(offset));
         let text_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(match text {
-            Some(t) => pyre_object::w_str_new(t),
+            Some(t) => pyre_object::w_str_new_managed(t),
             None => pyre_object::w_none(),
         });
         let end_lineno_slot = pyre_object::gc_roots::shadow_stack_len();

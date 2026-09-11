@@ -1275,10 +1275,9 @@ pub(super) fn ensure_linked() {
         let second_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(unsafe { pyobject::from_ref(second_filename) });
 
-        let mut arguments = vec![
-            pyre_object::w_int_new(code as i64),
-            pyre_object::w_str_new_managed(&message),
-        ];
+        let mut arguments = pyre_object::gc_roots::RootedItems::new();
+        arguments.push(pyre_object::w_int_new(code as i64));
+        arguments.push(pyre_object::w_str_new_managed(&message));
         let filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
         if !filename.is_null() {
             arguments.push(filename);
@@ -1290,7 +1289,7 @@ pub(super) fn ensure_linked() {
                 arguments.push(second);
             }
         }
-        let arguments = pyre_object::tupleobject::w_tuple_new(arguments);
+        let arguments = pyre_object::tupleobject::w_tuple_new(arguments.take());
         set_normalized(
             pyre_object::gc_roots::shadow_stack_get(class_slot),
             arguments,

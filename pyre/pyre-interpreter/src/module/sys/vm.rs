@@ -1226,9 +1226,12 @@ fn sys_get_asyncgen_hooks_impl(_args: &[PyObjectRef]) -> crate::PyResult {
             )
         }
     };
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(firstiter);
+    fields.push(finalizer);
     Ok(crate::_structseq::new_instance(
         asyncgen_hooks_type(),
-        vec![firstiter, finalizer],
+        fields.take(),
     ))
 }
 
@@ -1894,16 +1897,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "sys.version_info",
                 &["major", "minor", "micro", "releaselevel", "serial"],
             ));
-        let vi = crate::_structseq::new_instance(
-            version_info_type,
-            vec![
-                w_int_new(3),
-                w_int_new(14),
-                w_int_new(6),
-                w_str_new("final"),
-                w_int_new(0),
-            ],
-        );
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_int_new(3));
+        fields.push(w_int_new(14));
+        fields.push(w_int_new(6));
+        fields.push(w_str_new("final"));
+        fields.push(w_int_new(0));
+        let vi = crate::_structseq::new_instance(version_info_type, fields.take());
         module_ns_store(ns, "version_info", vi);
     }
     // PyPy exposes its implementation release independently from the Python
@@ -1916,16 +1916,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             &["major", "minor", "micro", "releaselevel", "serial"],
         );
         let parse_component = |value: &str| value.parse::<i64>().unwrap_or(0);
-        let vi = crate::_structseq::new_instance(
-            pyre_version_info_type,
-            vec![
-                w_int_new(parse_component(env!("CARGO_PKG_VERSION_MAJOR"))),
-                w_int_new(parse_component(env!("CARGO_PKG_VERSION_MINOR"))),
-                w_int_new(parse_component(env!("CARGO_PKG_VERSION_PATCH"))),
-                w_str_new("final"),
-                w_int_new(0),
-            ],
-        );
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_int_new(parse_component(env!("CARGO_PKG_VERSION_MAJOR"))));
+        fields.push(w_int_new(parse_component(env!("CARGO_PKG_VERSION_MINOR"))));
+        fields.push(w_int_new(parse_component(env!("CARGO_PKG_VERSION_PATCH"))));
+        fields.push(w_str_new("final"));
+        fields.push(w_int_new(0));
+        let vi = crate::_structseq::new_instance(pyre_version_info_type, fields.take());
         module_ns_store(ns, "pyre_version_info", vi);
     }
     // sys.modules — live dict synced with the import cache.
@@ -2079,40 +2076,57 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 &["gil", "thread_inherit_context", "context_aware_warnings"],
             ),
         );
+        let _flag_roots = pyre_object::gc_roots::push_roots();
+        let gil_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
+        let inherit_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+        let warn_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        // `initconfig.c PYCONFIG_SPEC` declares `parser_debug` BOOL
+        // while `verbose` is UINT, so `-dd` reports 1 here and 2
+        // there.  Both count in the config; only this one saturates.
+        fields.push(w_int_new(i64::from(crate::importing::debug_flag() != 0)));
+        // `-i` sets both.
+        fields.push(w_int_new(i64::from(crate::importing::inspect_flag())));
+        fields.push(w_int_new(i64::from(crate::importing::interactive_flag())));
+        fields.push(w_int_new(crate::importing::optimize_level()));
+        fields.push(w_int_new(i64::from(crate::importing::dont_write_bytecode_flag())));
+        fields.push(w_int_new(i64::from(crate::importing::no_user_site_flag())));
+        // `-S` (skip `import site`) is recorded by the launcher.
+        fields.push(w_int_new(i64::from(crate::importing::no_site_flag())));
+        fields.push(w_int_new(i64::from(crate::importing::ignore_environment_flag())));
+        fields.push(w_int_new(crate::importing::verbose_flag()));
+        fields.push(w_int_new(crate::importing::bytes_warning_flag()));
+        fields.push(w_int_new(i64::from(crate::importing::quiet_flag())));
+        fields.push(w_int_new(0)); // hash_randomization
+        fields.push(w_int_new(i64::from(crate::importing::isolated_flag())));
+        fields.push(w_bool_from(crate::importing::dev_mode_flag()));
+        fields.push(w_int_new(crate::importing::utf8_mode_flag()));
+        // sysmodule.c builds this one with `SetFlag` (PyLong_FromLong);
+        // only `dev_mode` and `safe_path` are PyBool_FromLong.
+        fields.push(w_int_new(i64::from(
+            crate::importing::warn_default_encoding_flag(),
+        )));
+        fields.push(w_bool_from(crate::importing::safe_path_flag()));
+        fields.push(w_int_new(
+            crate::module::sys::state::int_max_str_digits() as i64
+        ));
         let flags = crate::_structseq::new_instance_with_extra(
             flags_type,
-            vec![
-                // `initconfig.c PYCONFIG_SPEC` declares `parser_debug` BOOL
-                // while `verbose` is UINT, so `-dd` reports 1 here and 2
-                // there.  Both count in the config; only this one saturates.
-                w_int_new(i64::from(crate::importing::debug_flag() != 0)),
-                // `-i` sets both.
-                w_int_new(i64::from(crate::importing::inspect_flag())),
-                w_int_new(i64::from(crate::importing::interactive_flag())),
-                w_int_new(crate::importing::optimize_level()),
-                w_int_new(i64::from(crate::importing::dont_write_bytecode_flag())),
-                w_int_new(i64::from(crate::importing::no_user_site_flag())),
-                // `-S` (skip `import site`) is recorded by the launcher.
-                w_int_new(i64::from(crate::importing::no_site_flag())),
-                w_int_new(i64::from(crate::importing::ignore_environment_flag())),
-                w_int_new(crate::importing::verbose_flag()),
-                w_int_new(crate::importing::bytes_warning_flag()),
-                w_int_new(i64::from(crate::importing::quiet_flag())),
-                w_int_new(0), // hash_randomization
-                w_int_new(i64::from(crate::importing::isolated_flag())),
-                w_bool_from(crate::importing::dev_mode_flag()),
-                w_int_new(crate::importing::utf8_mode_flag()),
-                // sysmodule.c builds this one with `SetFlag` (PyLong_FromLong);
-                // only `dev_mode` and `safe_path` are PyBool_FromLong.
-                w_int_new(i64::from(crate::importing::warn_default_encoding_flag())),
-                w_bool_from(crate::importing::safe_path_flag()),
-                w_int_new(crate::module::sys::state::int_max_str_digits() as i64),
-            ],
+            fields.take(),
             vec![
                 // The interpreter holds a GIL, so `-X gil=0` is not available.
-                ("gil", w_int_new(1)),
-                ("thread_inherit_context", w_int_new(0)),
-                ("context_aware_warnings", w_int_new(0)),
+                ("gil", pyre_object::gc_roots::shadow_stack_get(gil_slot)),
+                (
+                    "thread_inherit_context",
+                    pyre_object::gc_roots::shadow_stack_get(inherit_slot),
+                ),
+                (
+                    "context_aware_warnings",
+                    pyre_object::gc_roots::shadow_stack_get(warn_slot),
+                ),
             ],
         );
         module_ns_store(ns, "flags", flags);
@@ -2174,29 +2188,45 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }) as PyObjectRef;
                 let (major, minor, build) =
                     version_ex_triple().unwrap_or((info.major, info.minor, info.build));
+                let _roots = pyre_object::gc_roots::push_roots();
+                let mut extra_slots: Vec<(&str, usize)> = Vec::new();
+                let mut put_extra = |name: &'static str, value: PyObjectRef| {
+                    extra_slots.push((name, pyre_object::gc_roots::shadow_stack_len()));
+                    let _ = pyre_object::gc_roots::pin_root(value);
+                };
+                put_extra(
+                    "service_pack_major",
+                    w_int_new(info.service_pack_major as i64),
+                );
+                put_extra(
+                    "service_pack_minor",
+                    w_int_new(info.service_pack_minor as i64),
+                );
+                put_extra("suite_mask", w_int_new(info.suite_mask as i64));
+                put_extra("product_type", w_int_new(info.product_type as i64));
+                let platform_version = {
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(w_int_new(info.major as i64));
+                    fields.push(w_int_new(info.minor as i64));
+                    fields.push(w_int_new(info.build as i64));
+                    pyre_object::w_tuple_new(fields.take())
+                };
+                put_extra("platform_version", platform_version);
+                drop(put_extra);
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(w_int_new(major as i64));
+                fields.push(w_int_new(minor as i64));
+                fields.push(w_int_new(build as i64));
+                fields.push(w_int_new(info.platform as i64));
+                fields.push(w_str_new_managed(&info.service_pack));
+                let extras: Vec<_> = extra_slots
+                    .into_iter()
+                    .map(|(name, slot)| (name, pyre_object::gc_roots::shadow_stack_get(slot)))
+                    .collect();
                 Ok(crate::_structseq::new_instance_with_extra(
                     cls,
-                    vec![
-                        w_int_new(major as i64),
-                        w_int_new(minor as i64),
-                        w_int_new(build as i64),
-                        w_int_new(info.platform as i64),
-                        w_str_new(&info.service_pack),
-                    ],
-                    vec![
-                        ("service_pack_major", w_int_new(info.service_pack_major as i64)),
-                        ("service_pack_minor", w_int_new(info.service_pack_minor as i64)),
-                        ("suite_mask", w_int_new(info.suite_mask as i64)),
-                        ("product_type", w_int_new(info.product_type as i64)),
-                        (
-                            "platform_version",
-                            pyre_object::w_tuple_new(vec![
-                                w_int_new(info.major as i64),
-                                w_int_new(info.minor as i64),
-                                w_int_new(info.build as i64),
-                            ]),
-                        ),
-                    ],
+                    fields.take(),
+                    extras,
                 ))
             },
             0,
@@ -2490,20 +2520,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "seed_bits", "cutoff",
             ],
         );
-        let value = crate::_structseq::new_instance(
-            ty,
-            vec![
-                w_int_new(64),
-                w_int_new((1i64 << 61) - 1),
-                w_int_new(314159),
-                w_int_new(0),
-                w_int_new(1000003),
-                w_str_new("siphash13"),
-                w_int_new(64),
-                w_int_new(128),
-                w_int_new(0),
-            ],
-        );
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_int_new(64));
+        fields.push(w_int_new((1i64 << 61) - 1));
+        fields.push(w_int_new(314159));
+        fields.push(w_int_new(0));
+        fields.push(w_int_new(1000003));
+        fields.push(w_str_new("siphash13"));
+        fields.push(w_int_new(64));
+        fields.push(w_int_new(128));
+        fields.push(w_int_new(0));
+        let value = crate::_structseq::new_instance(ty, fields.take());
         module_ns_store(ns, "hash_info", value);
     }
     {
@@ -2514,22 +2541,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "mant_dig", "epsilon", "radix", "rounds",
             ],
         );
-        let value = crate::_structseq::new_instance(
-            ty,
-            vec![
-                w_float_new(f64::MAX),
-                w_int_new(1024),
-                w_int_new(308),
-                w_float_new(f64::MIN_POSITIVE),
-                w_int_new(-1021),
-                w_int_new(-307),
-                w_int_new(15),
-                w_int_new(53),
-                w_float_new(f64::EPSILON),
-                w_int_new(2),
-                w_int_new(1),
-            ],
-        );
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_float_new(f64::MAX));
+        fields.push(w_int_new(1024));
+        fields.push(w_int_new(308));
+        fields.push(w_float_new(f64::MIN_POSITIVE));
+        fields.push(w_int_new(-1021));
+        fields.push(w_int_new(-307));
+        fields.push(w_int_new(15));
+        fields.push(w_int_new(53));
+        fields.push(w_float_new(f64::EPSILON));
+        fields.push(w_int_new(2));
+        fields.push(w_int_new(1));
+        let value = crate::_structseq::new_instance(ty, fields.take());
         module_ns_store(ns, "float_info", value);
     }
     // sysmodule.c — `sys.float_repr_style` is "short" wherever float repr
@@ -2540,14 +2564,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "sys.thread_info",
             &["name", "lock", "version"],
         );
-        let value = crate::_structseq::new_instance(
-            ty,
-            vec![
-                w_str_new(if cfg!(windows) { "nt" } else { "pthread" }),
-                if cfg!(windows) { w_none() } else { w_str_new("semaphore") },
-                w_none(),
-            ],
-        );
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_str_new(if cfg!(windows) { "nt" } else { "pthread" }));
+        fields.push(if cfg!(windows) {
+            w_none()
+        } else {
+            w_str_new("semaphore")
+        });
+        fields.push(w_none());
+        let value = crate::_structseq::new_instance(ty, fields.take());
         module_ns_store(ns, "thread_info", value);
     }
     {
@@ -2560,10 +2585,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "str_digits_check_threshold",
             ],
         );
-        let value = crate::_structseq::new_instance(
-            ty,
-            vec![w_int_new(30), w_int_new(4), w_int_new(4300), w_int_new(640)],
-        );
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_int_new(30));
+        fields.push(w_int_new(4));
+        fields.push(w_int_new(4300));
+        fields.push(w_int_new(640));
+        let value = crate::_structseq::new_instance(ty, fields.take());
         module_ns_store(ns, "int_info", value);
     }
     module_ns_store(ns, "hexversion", w_int_new(0x030e06f0));

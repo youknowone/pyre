@@ -19730,8 +19730,13 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // descriptors.  Our generic instance layout stores the corresponding
     // fields under private mapdict names so descriptor writes cannot be
     // shadowed by user attributes.
-    if !crate::baseobjspace::setdictvalue(self_obj, "__file_public_mode__", w_str_new(binary_mode))?
-        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closefd__", w_bool_from(closefd))?
+    let public_mode_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(binary_mode));
+    if !crate::baseobjspace::setdictvalue(
+        self_obj,
+        "__file_public_mode__",
+        pyre_object::gc_roots::shadow_stack_get(public_mode_slot),
+    )? || !crate::baseobjspace::setdictvalue(self_obj, "__file_closefd__", w_bool_from(closefd))?
         || !crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false))?
     {
         return Err(crate::PyError::runtime_error(

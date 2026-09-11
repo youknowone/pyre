@@ -105,10 +105,10 @@ fn get_once_registry() -> Result<PyObjectRef, PyError> {
 
 fn create_filter(category: PyObjectRef, action: &str, module: Option<&str>) -> PyObjectRef {
     let mut fields = pyre_object::gc_roots::RootedItems::new();
-    fields.push(w_str_new(action));
+    fields.push(w_str_new_managed(action));
     fields.push(w_none());
     fields.push(category);
-    fields.push(module.map(w_str_new).unwrap_or_else(w_none));
+    fields.push(module.map(w_str_new_managed).unwrap_or_else(w_none));
     fields.push(w_int_new(0));
     w_tuple_new(fields.take())
 }
@@ -1024,13 +1024,40 @@ crate::py_module! {
         "_release_lock" / 0 = lock_noop,
     },
     extra_init: |ns| {
-        let filters = w_list_new(vec![
-            create_filter(warning_class("DeprecationWarning"), "default", Some("__main__")),
-            create_filter(warning_class("DeprecationWarning"), "ignore", None),
-            create_filter(warning_class("PendingDeprecationWarning"), "ignore", None),
-            create_filter(warning_class("ImportWarning"), "ignore", None),
-            create_filter(warning_class("ResourceWarning"), "ignore", None),
-        ]);
+        let _filter_roots = pyre_object::gc_roots::push_roots();
+        let mut filter_slots = Vec::new();
+        let mut put_filter = |filter: PyObjectRef| {
+            filter_slots.push(pyre_object::gc_roots::shadow_stack_len());
+            let _ = pyre_object::gc_roots::pin_root(filter);
+        };
+        put_filter(create_filter(
+            warning_class("DeprecationWarning"),
+            "default",
+            Some("__main__"),
+        ));
+        put_filter(create_filter(
+            warning_class("DeprecationWarning"),
+            "ignore",
+            None,
+        ));
+        put_filter(create_filter(
+            warning_class("PendingDeprecationWarning"),
+            "ignore",
+            None,
+        ));
+        put_filter(create_filter(warning_class("ImportWarning"), "ignore", None));
+        put_filter(create_filter(
+            warning_class("ResourceWarning"),
+            "ignore",
+            None,
+        ));
+        drop(put_filter);
+        let filters = w_list_new(
+            filter_slots
+                .into_iter()
+                .map(pyre_object::gc_roots::shadow_stack_get)
+                .collect(),
+        );
         // `moduledef.py:18-22 setup_after_space_initialization` publishes the
         // State fields into the module dict.  Capture the namespace only once
         // every field is in place, so `state_is_readable` never reports a

@@ -41,7 +41,11 @@ pub fn warn_category(
     category_name: &str,
     stacklevel: i64,
 ) -> Result<(), crate::PyError> {
-    warn_category_w(pyre_object::w_str_new(msg), category_name, stacklevel)
+    warn_category_w(
+        pyre_object::w_str_new_managed(msg),
+        category_name,
+        stacklevel,
+    )
 }
 
 /// `PyErr_ResourceWarning(source, stacklevel, format, ...)` -- the same warning
@@ -60,7 +64,7 @@ pub fn warn_category_source(
 ) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let source_slot = crate::module::_warnings::pin_root_slot(source);
-    let msg_slot = crate::module::_warnings::pin_root_slot(pyre_object::w_str_new(msg));
+    let msg_slot = crate::module::_warnings::pin_root_slot(pyre_object::w_str_new_managed(msg));
     warn_category_w_source(
         pyre_object::gc_roots::shadow_stack_get(msg_slot),
         category_name,

@@ -276,16 +276,26 @@ fn scan_scalar(
             if is_float { "parse_float" } else { "parse_int" },
         )?;
         let number = unsafe { core::str::from_utf8_unchecked(&rest[..end]) };
-        let parsed =
-            crate::call::call_function_impl_result(parser, &[pyre_object::w_str_new(number)])?;
+        let _token_roots = pyre_object::gc_roots::push_roots();
+        let token_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(number));
+        let parsed = crate::call::call_function_impl_result(
+            parser,
+            &[pyre_object::gc_roots::shadow_stack_get(token_slot)],
+        )?;
         return Ok((parsed, index + end, byte_index + end));
     }
 
     for (token, len) in [("NaN", 3usize), ("Infinity", 8), ("-Infinity", 9)] {
         if rest.starts_with(token.as_bytes()) {
             let parser = crate::baseobjspace::getattr_str(self_obj, "parse_constant")?;
-            let parsed =
-                crate::call::call_function_impl_result(parser, &[pyre_object::w_str_new(token)])?;
+            let _token_roots = pyre_object::gc_roots::push_roots();
+            let token_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(token));
+            let parsed = crate::call::call_function_impl_result(
+                parser,
+                &[pyre_object::gc_roots::shadow_stack_get(token_slot)],
+            )?;
             return Ok((parsed, index + len, byte_index + len));
         }
     }
@@ -1049,7 +1059,7 @@ fn coerce_key(self_obj: PyObjectRef, key: PyObjectRef) -> Result<Option<PyObject
             return Ok(Some(key));
         }
         if pyre_object::is_bool(key) {
-            return Ok(Some(pyre_object::w_str_new(
+            return Ok(Some(pyre_object::w_str_new_managed(
                 if pyre_object::w_bool_get_value(key) {
                     "true"
                 } else {
@@ -1058,7 +1068,7 @@ fn coerce_key(self_obj: PyObjectRef, key: PyObjectRef) -> Result<Option<PyObject
             )));
         }
         if pyre_object::is_none(key) {
-            return Ok(Some(pyre_object::w_str_new("null")));
+            return Ok(Some(pyre_object::w_str_new_managed("null")));
         }
         if is_instance(key, &pyre_object::INT_TYPE) {
             return Ok(Some(base_repr(key, &pyre_object::INT_TYPE)?));

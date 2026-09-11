@@ -855,10 +855,10 @@ fn fill_user_function_args(
                 let slot = nparams + ki;
                 if roots.get(base + slot).is_null() {
                     let param_name = &code_ref.varnames[slot];
-                    let key = pyre_object::w_str_new(param_name);
-                    if let Some(val) =
-                        unsafe { pyre_object::w_dict_lookup(roots.get(kwdefaults_base), key) }
-                    {
+                    let key_slot = roots.pin_roots(&[pyre_object::w_str_new_managed(param_name)]);
+                    if let Some(val) = unsafe {
+                        pyre_object::w_dict_lookup(roots.get(kwdefaults_base), roots.get(key_slot))
+                    } {
                         roots.set(base + slot, val);
                     }
                 }
@@ -2698,8 +2698,15 @@ pub(crate) fn resolve_kwargs(
             let pi = n_pos_params + ki; // position in result
             if result[pi].is_null() {
                 let param_name = &code.varnames[skip_cls + pi];
-                let key = pyre_object::w_str_new(param_name);
-                if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
+                let _key_roots = pyre_object::gc_roots::push_roots();
+                let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(param_name));
+                if let Some(val) = unsafe {
+                    pyre_object::w_dict_lookup(
+                        kwdefaults,
+                        pyre_object::gc_roots::shadow_stack_get(key_slot),
+                    )
+                } {
                     result[pi] = val;
                 }
             }
@@ -3580,9 +3587,17 @@ fn call_with_kwargs_in_ctx_impl(
                         let slot = n_pos_params + ki;
                         if slot < result.len() && result[slot].is_null() {
                             let param_name = &code.varnames[slot];
-                            let key = pyre_object::w_str_new(param_name);
-                            if let Some(v) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) }
-                            {
+                            let _key_roots = pyre_object::gc_roots::push_roots();
+                            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(
+                                pyre_object::w_str_new_managed(param_name),
+                            );
+                            if let Some(v) = unsafe {
+                                pyre_object::w_dict_lookup(
+                                    kwdefaults,
+                                    pyre_object::gc_roots::shadow_stack_get(key_slot),
+                                )
+                            } {
                                 result[slot] = v;
                             }
                         }
@@ -5246,12 +5261,26 @@ fn build_class_inner(
                     call_with_kwargs_in_ctx(
                         take_last_exec_ctx(),
                         prepare,
-                        &[pyre_object::w_str_new(name), bases()],
+                        &[
+                            {
+                                let name_slot = pyre_object::gc_roots::shadow_stack_len();
+                                let _ = pyre_object::gc_roots::pin_root(
+                                    pyre_object::w_str_new_managed(name),
+                                );
+                                pyre_object::gc_roots::shadow_stack_get(name_slot)
+                            },
+                            bases(),
+                        ],
                         &prepare_kwds,
                     )?
                 } else {
                     clear_call_error();
-                    let r = crate::call_function(prepare, &[pyre_object::w_str_new(name), bases()]);
+                    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
+                    let r = crate::call_function(
+                        prepare,
+                        &[pyre_object::gc_roots::shadow_stack_get(name_slot), bases()],
+                    );
                     if r.is_null() {
                         // __prepare__ was found but raised during execution —
                         // propagate that exception rather than silently using
@@ -5741,7 +5770,8 @@ fn build_class_inner(
         // Pass the ORIGINAL bases (not w_effective_bases) — the metaclass
         // expects the user-declared bases. Default (object,) is added by
         // type.__new__ internally if needed.
-        let name_obj = pyre_object::w_str_new(name);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
         if let Some(root) = w_namespace_dict_root {
             w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(root);
         }
@@ -5750,12 +5780,32 @@ fn build_class_inner(
             // Only use kwargs path if there are actual extra kwargs
             let has_extra = unsafe { pyre_object::is_dict(kw) && pyre_object::w_dict_len(kw) > 0 };
             if has_extra {
-                call_metaclass_with_kwargs(w_metaclass, name_obj, bases(), w_namespace_dict, kw)
+                call_metaclass_with_kwargs(
+                    w_metaclass,
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
+                    bases(),
+                    w_namespace_dict,
+                    kw,
+                )
             } else {
-                crate::call_function(w_metaclass, &[name_obj, bases(), w_namespace_dict])
+                crate::call_function(
+                    w_metaclass,
+                    &[
+                        pyre_object::gc_roots::shadow_stack_get(name_slot),
+                        bases(),
+                        w_namespace_dict,
+                    ],
+                )
             }
         } else {
-            crate::call_function(w_metaclass, &[name_obj, bases(), w_namespace_dict])
+            crate::call_function(
+                w_metaclass,
+                &[
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
+                    bases(),
+                    w_namespace_dict,
+                ],
+            )
         };
         // If the metaclass call raised, propagate the original error rather
         // than silently producing a NULL class object.

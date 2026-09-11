@@ -4643,10 +4643,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     );
     // os.terminal_size — structseq (columns, lines).
     fn make_terminal_size(cols: i64, lines: i64) -> pyre_object::PyObjectRef {
-        crate::_structseq::new_instance(
-            terminal_size_seq_type(),
-            vec![pyre_object::w_int_new(cols), pyre_object::w_int_new(lines)],
-        )
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::w_int_new(cols));
+        fields.push(pyre_object::w_int_new(lines));
+        crate::_structseq::new_instance(terminal_size_seq_type(), fields.take())
     }
     crate::module_ns_store(ns, "terminal_size", terminal_size_seq_type());
     crate::module_ns_store(ns, "statvfs_result", statvfs_result_seq_type());
@@ -8507,15 +8507,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     if pid == 0 {
                         return Ok(pyre_object::w_none());
                     }
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_int_new(pid as i64));
+                    fields.push(pyre_object::w_int_new(uid as i64));
+                    fields.push(pyre_object::w_int_new(si.si_signo as i64));
+                    fields.push(pyre_object::w_int_new(status as i64));
+                    fields.push(pyre_object::w_int_new(si.si_code as i64));
                     Ok(crate::_structseq::new_instance(
                         waitid_result_seq_type(),
-                        vec![
-                            pyre_object::w_int_new(pid as i64),
-                            pyre_object::w_int_new(uid as i64),
-                            pyre_object::w_int_new(si.si_signo as i64),
-                            pyre_object::w_int_new(status as i64),
-                            pyre_object::w_int_new(si.si_code as i64),
-                        ],
+                        fields.take(),
                     ))
                 },
                 3,
@@ -9964,15 +9964,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |_| {
                     let t =
                         rustpython_host_env::time::process_times().map_err(|e| io_err(e, ""))?;
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_float_new(t.user));
+                    fields.push(pyre_object::w_float_new(t.system));
+                    fields.push(pyre_object::w_float_new(t.children_user));
+                    fields.push(pyre_object::w_float_new(t.children_system));
+                    fields.push(pyre_object::w_float_new(t.elapsed));
                     Ok(crate::_structseq::new_instance(
                         times_result_seq_type(),
-                        vec![
-                            pyre_object::w_float_new(t.user),
-                            pyre_object::w_float_new(t.system),
-                            pyre_object::w_float_new(t.children_user),
-                            pyre_object::w_float_new(t.children_system),
-                            pyre_object::w_float_new(t.elapsed),
-                        ],
+                        fields.take(),
                     ))
                 },
                 0,

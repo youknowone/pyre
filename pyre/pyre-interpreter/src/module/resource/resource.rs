@@ -51,27 +51,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     #[cfg(all(unix, feature = "host_env"))]
     fn make_struct_rusage(r: &rustpython_host_env::resource::RUsage) -> pyre_object::PyObjectRef {
         let tv_to_f = |tv: libc::timeval| tv.tv_sec as f64 + (tv.tv_usec as f64) * 1e-6;
-        crate::_structseq::new_instance(
-            struct_rusage_type(),
-            vec![
-                pyre_object::floatobject::w_float_new(tv_to_f(r.ru_utime)),
-                pyre_object::floatobject::w_float_new(tv_to_f(r.ru_stime)),
-                pyre_object::w_int_new(r.ru_maxrss),
-                pyre_object::w_int_new(r.ru_ixrss),
-                pyre_object::w_int_new(r.ru_idrss),
-                pyre_object::w_int_new(r.ru_isrss),
-                pyre_object::w_int_new(r.ru_minflt),
-                pyre_object::w_int_new(r.ru_majflt),
-                pyre_object::w_int_new(r.ru_nswap),
-                pyre_object::w_int_new(r.ru_inblock),
-                pyre_object::w_int_new(r.ru_oublock),
-                pyre_object::w_int_new(r.ru_msgsnd),
-                pyre_object::w_int_new(r.ru_msgrcv),
-                pyre_object::w_int_new(r.ru_nsignals),
-                pyre_object::w_int_new(r.ru_nvcsw),
-                pyre_object::w_int_new(r.ru_nivcsw),
-            ],
-        )
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(pyre_object::floatobject::w_float_new(tv_to_f(r.ru_utime)));
+        fields.push(pyre_object::floatobject::w_float_new(tv_to_f(r.ru_stime)));
+        fields.push(pyre_object::w_int_new(r.ru_maxrss));
+        fields.push(pyre_object::w_int_new(r.ru_ixrss));
+        fields.push(pyre_object::w_int_new(r.ru_idrss));
+        fields.push(pyre_object::w_int_new(r.ru_isrss));
+        fields.push(pyre_object::w_int_new(r.ru_minflt));
+        fields.push(pyre_object::w_int_new(r.ru_majflt));
+        fields.push(pyre_object::w_int_new(r.ru_nswap));
+        fields.push(pyre_object::w_int_new(r.ru_inblock));
+        fields.push(pyre_object::w_int_new(r.ru_oublock));
+        fields.push(pyre_object::w_int_new(r.ru_msgsnd));
+        fields.push(pyre_object::w_int_new(r.ru_msgrcv));
+        fields.push(pyre_object::w_int_new(r.ru_nsignals));
+        fields.push(pyre_object::w_int_new(r.ru_nvcsw));
+        fields.push(pyre_object::w_int_new(r.ru_nivcsw));
+        crate::_structseq::new_instance(struct_rusage_type(), fields.take())
     }
     crate::module_ns_store(
         ns,

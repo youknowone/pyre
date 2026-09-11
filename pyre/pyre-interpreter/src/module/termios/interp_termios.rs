@@ -70,34 +70,44 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
                 let ispeed = host_termios::cfgetispeed(&t);
                 let ospeed = host_termios::cfgetospeed(&t);
-                let cc_list = make_cc_bytes(&t.c_cc[..]);
+                let _roots = pyre_object::gc_roots::push_roots();
+                let cc_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(make_cc_bytes(&t.c_cc[..]));
                 // interp_termios.py:53 — in noncanonical mode VMIN/VTIME are
                 // single-byte counters, surfaced as ints rather than bytes.
                 if (t.c_lflag & libc::ICANON) == 0 {
                     let vmin = libc::VMIN;
                     let vtime = libc::VTIME;
+                    let vmin_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                        t.c_cc[vmin] as i64,
+                    ));
+                    let vtime_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                        t.c_cc[vtime] as i64,
+                    ));
                     unsafe {
                         pyre_object::w_list_setitem(
-                            cc_list,
+                            pyre_object::gc_roots::shadow_stack_get(cc_slot),
                             vmin as i64,
-                            pyre_object::w_int_new(t.c_cc[vmin] as i64),
+                            pyre_object::gc_roots::shadow_stack_get(vmin_slot),
                         );
                         pyre_object::w_list_setitem(
-                            cc_list,
+                            pyre_object::gc_roots::shadow_stack_get(cc_slot),
                             vtime as i64,
-                            pyre_object::w_int_new(t.c_cc[vtime] as i64),
+                            pyre_object::gc_roots::shadow_stack_get(vtime_slot),
                         );
                     }
                 }
-                Ok(pyre_object::w_list_new(vec![
-                    pyre_object::w_int_new(t.c_iflag as i64),
-                    pyre_object::w_int_new(t.c_oflag as i64),
-                    pyre_object::w_int_new(t.c_cflag as i64),
-                    pyre_object::w_int_new(t.c_lflag as i64),
-                    pyre_object::w_int_new(ispeed as i64),
-                    pyre_object::w_int_new(ospeed as i64),
-                    cc_list,
-                ]))
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(t.c_iflag as i64));
+                fields.push(pyre_object::w_int_new(t.c_oflag as i64));
+                fields.push(pyre_object::w_int_new(t.c_cflag as i64));
+                fields.push(pyre_object::w_int_new(t.c_lflag as i64));
+                fields.push(pyre_object::w_int_new(ispeed as i64));
+                fields.push(pyre_object::w_int_new(ospeed as i64));
+                fields.push(pyre_object::gc_roots::shadow_stack_get(cc_slot));
+                Ok(pyre_object::w_list_new(fields.take()))
             },
             1,
         ),
