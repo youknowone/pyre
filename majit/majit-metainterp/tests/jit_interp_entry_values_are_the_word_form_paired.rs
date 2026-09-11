@@ -5,9 +5,13 @@
 //! the two word buffers and zipping them, so the two forms are produced by
 //! different generated code and can drift apart: a field emitted in one order
 //! by one and another by the other, or a float carried as bits by one and as
-//! a value by the other. This pins them equal over every field kind the macro
-//! routes — int scalar, virt array (its identity slot), ref scalar, float
-//! scalar.
+//! a value by the other. This pins them equal.
+//!
+//! `virtualizable.py VirtualizableInfo.__init__` puts int/ref/float scalars
+//! on the same object as the virt array, so they are not independent
+//! JitDriver reds. The red block is the one identity; compiled entry
+//! reloads the statics with `GETFIELD` (`compile.py
+//! patch_new_loop_to_load_virtualizable_fields`).
 
 use majit_metainterp::virt_array::VirtArray;
 use majit_metainterp::{JitDriver, JitState};
@@ -91,15 +95,13 @@ fn the_entry_values_are_the_word_form_paired() {
         "the direct form and the paired word form must carry the same values in \
          the same order"
     );
-    // And the shape is the one the macro documents: int scalars, the one
-    // virtualizable identity, ref scalars, float scalars.
-    assert_eq!(out.len(), 4);
-    assert_eq!(out[0], majit_ir::Value::Int(-3));
+    // The red block is the virtualizable identity alone. `total`, `head`
+    // and `weight` ride on that object and are reloaded at compiled
+    // entry, not carried as reds.
+    assert_eq!(out.len(), 1);
     assert_eq!(
-        out[1],
+        out[0],
         majit_ir::Value::Ref(majit_ir::GcRef(&state as *const EveryKindState as usize))
     );
-    assert_eq!(out[2], majit_ir::Value::Ref(majit_ir::GcRef(state.head)));
-    assert_eq!(out[3], majit_ir::Value::Float(-0.75));
     let _ = cell.value;
 }
