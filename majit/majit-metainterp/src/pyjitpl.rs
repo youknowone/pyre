@@ -393,10 +393,7 @@ impl OptimizationInfoItem for OpRc {
             .into_iter()
             .chain(self.getfailargs().into_iter().flatten());
         for arg in producers {
-            if matches!(
-                arg,
-                majit_ir::operand::Operand::Op(_) | majit_ir::operand::Operand::InputArg(_)
-            ) {
+            if arg.is_bound() {
                 arg.clear_forwarded();
             }
         }
@@ -28830,13 +28827,19 @@ mod forget_optimization_info_tests {
                 Operand::const_from_value(Value::Int(2)),
             ],
         ));
-        recorded.pos.set(OpRef::int_op(3));
+        recorded.pos().set(OpRef::int_op(3));
         let emitted = OpRc::new((*recorded).clone());
         let guard = Op::new(OpCode::GuardTrue, &[Operand::from_bound_op(&recorded)]);
         guard.setfailargs(smallvec::smallvec![Operand::from_bound_op(&recorded)]);
         let guard = OpRc::new(guard);
         recorded.set_forwarded_const(Const::Int(3));
-        assert!(matches!(recorded.get_forwarded(), Forwarded::Const(_)));
+        assert!(
+            matches!(
+                recorded.get_forwarded(),
+                Forwarded::Const(_) | Forwarded::SmallConst(_) | Forwarded::SmallWide(_)
+            ),
+            "i32 ConstInt packs as SmallConst"
+        );
 
         forget_optimization_info(&[emitted, guard]);
 

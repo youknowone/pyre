@@ -7210,7 +7210,7 @@ fn build_function(
             // `inject_builtin_string_descrs` attaches the same ArrayDescr,
             // so the length word and item stride are the array path.
             OpCode::Strlen | OpCode::Unicodelen => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
@@ -7220,7 +7220,7 @@ fn build_function(
                 }
             }
             OpCode::Strgetitem | OpCode::Unicodegetitem => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // rewrite.py:299/311: STR `extra_item_after_alloc=1` is
                     // already in `basesize`; subtract it before the index.

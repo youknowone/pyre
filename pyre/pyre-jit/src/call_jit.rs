@@ -2796,7 +2796,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             rd_numb,
             rd_consts,
             &all_liveness,
-            deadframe,
+            deadframe.clone(),
             deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
             rd_virtuals_slice,      // rd_virtuals
             rd_guard_pendingfields, // rd_guard_pendingfields
@@ -4559,6 +4559,14 @@ fn jit_ca_handle_guard_failure(
         let raw_values: Vec<i64> = (0..n_fail_args)
             .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
             .collect();
+        // The copy is not a JITFRAME: `jitframe_trace` cannot update it.
+        // Root Ref slots for the same window `handle_fail` already covers
+        // (`DeadFrameRefRoots` / `compute_gcmap`).
+        let _deadframe_roots = unsafe {
+            majit_metainterp::resume::DeadFrameRefRoots::enter(&raw_values, |index| {
+                exit_layout.is_traced_ref_slot(index)
+            })
+        };
         match trace_and_compile_from_bridge(&descr_arc, frame, &raw_values, &exit_layout, 0, false)
         {
             BridgeResolution::CompiledContinue => true,
@@ -4816,6 +4824,11 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // Inert today (wasm host allocations never collect) but keeps the
             // carrier rooted at parity with dynasm if that invariant changes.
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
+            let _deadframe_roots = unsafe {
+                majit_metainterp::resume::DeadFrameRefRoots::enter(&raw_values, |index| {
+                    exit_layout.is_traced_ref_slot(index)
+                })
+            };
             let attempt = try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand);
             if attempt.terminal_declined {
                 // This target cannot reach compiled steady state: each CA

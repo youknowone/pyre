@@ -18,7 +18,8 @@
 //! declares the abstract contract for these accessors; all entries
 //! below match those signatures.
 
-use majit_ir::FailDescr;
+use majit_gc::shadow_stack::OwnerRootGuard;
+use majit_ir::{FailDescr, GcRef};
 
 use crate::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
 
@@ -99,6 +100,7 @@ pub unsafe fn get_int_value_direct(ptr: *const JitFrame, slot: usize) -> isize {
 /// `jf_frame[]`; nothing is copied into a host list.
 #[inline]
 pub unsafe fn get_int_value(ptr: *const JitFrame, descr: &dyn FailDescr, index: usize) -> i64 {
+    let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
     let slot = decode_rd_loc_slot(descr, index).unwrap_or(index);
     unsafe { get_int_value_direct(ptr, slot) as i64 }
 }
@@ -108,11 +110,14 @@ pub unsafe fn get_int_value(ptr: *const JitFrame, descr: &dyn FailDescr, index: 
 /// RPython's decoder calls `cpu.get_int_value` / `get_ref_value` on the
 /// deadframe. Tests that already hold a dense fail-arg list keep the
 /// slice arm; compiled guard failure uses the jitframe.
-#[derive(Clone, Copy)]
+///
+/// The jitframe arm holds an [`OwnerRootGuard`] so a collection during
+/// `blackhole_from_resumedata` updates the address; `get` re-reads the
+/// root and walks `jf_forward` (`jitframe_resolve`).
 pub enum FailArgSource<'a> {
     Slice(&'a [i64]),
     JitFrame {
-        ptr: *const JitFrame,
+        root: OwnerRootGuard,
         descr: &'a dyn FailDescr,
         n: usize,
     },
@@ -120,7 +125,12 @@ pub enum FailArgSource<'a> {
 
 impl<'a> FailArgSource<'a> {
     pub fn from_jitframe(ptr: *const JitFrame, descr: &'a dyn FailDescr, n: usize) -> Self {
-        Self::JitFrame { ptr, descr, n }
+        let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
+        Self::JitFrame {
+            root: OwnerRootGuard::new(GcRef(ptr as usize)),
+            descr,
+            n,
+        }
     }
 
     #[inline]
@@ -140,9 +150,10 @@ impl<'a> FailArgSource<'a> {
     pub fn get(&self, index: usize) -> i64 {
         match self {
             Self::Slice(s) => s[index],
-            Self::JitFrame { ptr, descr, n } => {
+            Self::JitFrame { root, descr, n } => {
                 debug_assert!(index < *n);
-                unsafe { get_int_value(*ptr, *descr, index) }
+                let ptr = root.get().0 as *const JitFrame;
+                unsafe { get_int_value(ptr, *descr, index) }
             }
         }
     }
@@ -150,6 +161,19 @@ impl<'a> FailArgSource<'a> {
     #[inline]
     pub fn first(&self) -> Option<i64> {
         (self.len() > 0).then(|| self.get(0))
+    }
+}
+
+impl Clone for FailArgSource<'_> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Slice(s) => Self::Slice(s),
+            Self::JitFrame { root, descr, n } => Self::JitFrame {
+                root: OwnerRootGuard::new(root.get()),
+                descr: *descr,
+                n: *n,
+            },
+        }
     }
 }
 
@@ -176,9 +200,9 @@ impl std::fmt::Debug for FailArgSource<'_> {
         let vals: Vec<i64> = (0..self.len()).map(|i| self.get(i)).collect();
         match self {
             Self::Slice(_) => f.debug_tuple("Slice").field(&vals).finish(),
-            Self::JitFrame { ptr, n, .. } => f
+            Self::JitFrame { root, n, .. } => f
                 .debug_struct("JitFrame")
-                .field("ptr", ptr)
+                .field("ptr", &(root.get().0 as *const JitFrame))
                 .field("n", n)
                 .field("vals", &vals)
                 .finish(),

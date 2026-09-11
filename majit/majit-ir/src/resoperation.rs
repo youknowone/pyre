@@ -1428,12 +1428,15 @@ pub struct VectorizationInfo {
 /// when the op is a guard (`GuardResOp` owns the field upstream).
 pub(crate) struct GuardExtra {
     /// Shared `_fail_args` list. `Rc<[Operand]>` is a fat pointer (16 B)
-    /// so GuardExtra stays in the 32-byte class; clone/stamp share the
-    /// slice instead of allocating another 4×16 or 6×16 payload.
+    /// so clone/stamp share the slice instead of allocating another
+    /// 4×16 or 6×16 payload.
     fail_args: Option<std::rc::Rc<[Operand]>>,
-    /// `-1` = unset. Four tags cover the usual failarg arity.
+    /// `-1` unset, `0..=4` inline in `types`, `-2` whole list in
+    /// [`FAIL_ARG_TYPES_OVERFLOW`]. A fat `Rc<[Type]>` would push
+    /// GuardExtra (and then BothPayload) into the 56-byte class.
     n_types: i8,
     types: [Type; 4],
+    overflow: u32,
     /// resoperation.py `GuardResOp.rd_resume_position` — `-1` unset.
     pub(crate) rd_resume_position: i32,
 }
@@ -1444,6 +1447,7 @@ impl GuardExtra {
             fail_args: None,
             n_types: -1,
             types: [Type::Void; 4],
+            overflow: 0,
             rd_resume_position: -1,
         }
     }
@@ -1473,24 +1477,27 @@ impl GuardExtra {
     }
 
     pub(crate) fn fail_arg_types(&self) -> Option<&[Type]> {
-        if self.n_types < 0 {
-            None
-        } else {
-            Some(&self.types[..self.n_types as usize])
+        match self.n_types {
+            n if n >= 0 => Some(&self.types[..n as usize]),
+            FAIL_ARG_TYPES_HEAP => Some(overflow_fail_arg_types(self.overflow)),
+            _ => None,
         }
     }
 
     pub(crate) fn set_fail_arg_types(&mut self, types: &[Type]) {
-        if types.len() > self.types.len() {
-            self.n_types = -1;
+        if types.len() <= FAIL_ARG_TYPES_INLINE {
+            self.types[..types.len()].copy_from_slice(types);
+            self.n_types = types.len() as i8;
+            self.overflow = 0;
             return;
         }
-        self.types[..types.len()].copy_from_slice(types);
-        self.n_types = types.len() as i8;
+        self.n_types = FAIL_ARG_TYPES_HEAP;
+        self.overflow = intern_fail_arg_types(types);
     }
 
     pub(crate) fn clear_fail_arg_types(&mut self) {
         self.n_types = -1;
+        self.overflow = 0;
     }
 }
 
@@ -1500,6 +1507,7 @@ impl Clone for GuardExtra {
             fail_args: self.fail_args.clone(),
             n_types: self.n_types,
             types: self.types,
+            overflow: self.overflow,
             rd_resume_position: self.rd_resume_position,
         }
     }
@@ -1627,6 +1635,32 @@ fn overflow_pos(idx: u32) -> OpRef {
 }
 
 static OVERFLOW_POS: std::sync::Mutex<Vec<OpRef>> = std::sync::Mutex::new(Vec::new());
+
+/// Full fail-arg type lists that do not fit in [`GuardExtra::types`].
+/// Entries are leaked slices so `fail_arg_types` can return them after
+/// the lock drops.
+static FAIL_ARG_TYPES_OVERFLOW: std::sync::Mutex<Vec<&'static [Type]>> =
+    std::sync::Mutex::new(Vec::new());
+
+const FAIL_ARG_TYPES_INLINE: usize = 4;
+const FAIL_ARG_TYPES_HEAP: i8 = -2;
+
+fn intern_fail_arg_types(types: &[Type]) -> u32 {
+    let leaked: &'static [Type] = Box::leak(types.to_vec().into_boxed_slice());
+    let mut slab = FAIL_ARG_TYPES_OVERFLOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let idx = u32::try_from(slab.len()).expect("fail-arg types overflow slab exhausted");
+    slab.push(leaked);
+    idx
+}
+
+fn overflow_fail_arg_types(idx: u32) -> &'static [Type] {
+    let slab = FAIL_ARG_TYPES_OVERFLOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    slab[idx as usize]
+}
 
 const STAMP_UNSET: u32 = 0;
 const STAMP_VOID: u32 = 1;
@@ -2221,9 +2255,10 @@ fn take_word(w: u64) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32) {
             (Some(descr_arc_from_bits(lo, hi)), None, 0, stamp)
         }
     } else {
-        let (d, e, f) = unsafe { decode_descr_extra(w as usize, FWD_TAG) };
-        let stamp = crate::forwarding::fwd_stamp(f);
-        (d, e, crate::forwarding::strip_fwd_stamp(f), stamp)
+        // Unboxed forwarded word: the payload is the whole u64, not
+        // `w as usize` (wasm32 truncates SmallConst).
+        let stamp = crate::forwarding::fwd_stamp(w);
+        (None, None, crate::forwarding::strip_fwd_stamp(w), stamp)
     }
 }
 
@@ -2241,6 +2276,9 @@ fn packed_forwarded_word(w: u64) -> u64 {
     }
     if is_thin_descr(w) {
         return thin_fwd_from_word(w);
+    }
+    if w & SLOT_BOX_BIT == 0 && !is_thin_descr(w) && !is_extra_inline(w) && !is_both_inline(w) {
+        return w;
     }
     let (lo, hi) = slot_bits(w);
     match hi {
@@ -2550,7 +2588,14 @@ impl DescrSlot {
                     *self.word.get() = ptr as u64 | SLOT_BOTH_BIT;
                 }
             }
-            (None, None, true) => self.set_bits(forwarded as usize, FWD_TAG),
+            (None, None, true) => {
+                // Keep the full u64. `set_bits(forwarded as usize, …)`
+                // drops SmallConst identity / high i32 bits on wasm32.
+                debug_assert_eq!(forwarded & SLOT_BOX_BIT, 0);
+                unsafe {
+                    *self.word.get() = forwarded;
+                }
+            }
             (Some(d), None, true) => match encode_thin_descr(d) {
                 Ok(thin) => self.write_thin_fwd(thin, forwarded),
                 Err(d) => {
@@ -5703,6 +5748,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarding::ForwardingHost;
 
     #[test]
     fn ordinary_op_does_not_embed_guard_failarg_inline_storage() {
@@ -5783,6 +5829,35 @@ mod tests {
         op.pos().set(OpRef::ConstInt(-7));
         assert_eq!(op.pos().get(), OpRef::ConstInt(-7));
         assert_eq!(op.num_args(), n);
+    }
+
+    #[test]
+    fn set_fail_arg_types_keeps_more_than_four_entries() {
+        let guard = Op::new(OpCode::GuardTrue, &[]);
+        let types = vec![
+            Type::Int,
+            Type::Ref,
+            Type::Float,
+            Type::Int,
+            Type::Ref,
+            Type::Float,
+        ];
+        guard.set_fail_arg_types(types.clone());
+        assert_eq!(guard.get_fail_arg_types(), Some(types));
+    }
+
+    #[test]
+    fn forwarded_smallconst_negative_int_survives_the_descr_slot() {
+        let op = Op::new(OpCode::SameAsI, &[]);
+        op.set_forwarded_const(crate::Const::from_value(Value::Int(-1)));
+        assert!(
+            matches!(
+                op.forwarded().borrow(),
+                crate::forwarding::Forwarded::SmallConst(_)
+            ),
+            "i32 ConstInt must pack as SmallConst"
+        );
+        assert_eq!(op.forwarded().borrow().const_value(), Some(Value::Int(-1)));
     }
 
     #[test]

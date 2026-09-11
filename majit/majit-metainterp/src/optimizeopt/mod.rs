@@ -4519,6 +4519,7 @@ impl OptContext {
                     Some(OpInfo::FloatConstInfo(*f))
                 }
                 majit_ir::forwarding::Forwarded::Const(_)
+                | majit_ir::forwarding::Forwarded::SmallConst(_)
                 | majit_ir::forwarding::Forwarded::SmallWide(_) => {
                     // optimizer.py `getinfo` parity for the Const
                     // terminal — Refs surface as `ConstPtrInfo`, Floats as
@@ -9684,6 +9685,34 @@ mod input_ops_index_tests {
             reserved.raw(),
             6,
             "SmallConst-forwarded position 5 must stay claimed"
+        );
+    }
+
+    #[test]
+    fn take_preamble_forwarded_opinfo_reads_smallconst() {
+        use majit_ir::forwarding::ForwardingHost;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 0, 0, 0);
+        let pos = OpRef::int_op(5);
+        let op = Op::new(OpCode::SameAsI, &[]);
+        op.pos().set(pos);
+        op.set_forwarded_const(majit_ir::Const::from_value(majit_ir::Value::Int(7)));
+        ctx.resop_refs.insert(pos, OpRc::new(op));
+        let info = ctx
+            .take_preamble_forwarded_opinfo(pos)
+            .expect("SmallConst must produce preamble IntBound info");
+        match info {
+            crate::optimizeopt::info::OpInfo::IntBound(ib) => {
+                assert_eq!(ib.borrow().lower, 7);
+                assert_eq!(ib.borrow().upper, 7);
+            }
+            other => panic!("expected IntBound, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                ctx.read_forwarded(pos),
+                None | Some(majit_ir::forwarding::Forwarded::None)
+            ),
+            "consumed SmallConst forwarding must be cleared"
         );
     }
 }
