@@ -5714,7 +5714,17 @@ impl Optimizer {
                     && let Some(resolved) =
                         ctx.get_box_replacement_not_const_operand(&fail_args[fa_idx])
                 {
-                    fail_args[fa_idx] = resolved;
+                    // optimizer.py:768-774: finish() must not hand
+                    // store_final_boxes the same box twice. Two fail_args
+                    // can forward to one InputArg after identity
+                    // unification; keep the later slot's original so the
+                    // list stays unique.
+                    let collides = fail_args.iter().enumerate().any(|(j, other)| {
+                        j != fa_idx && !other.is_none() && other.same_box(&resolved)
+                    });
+                    if !collides {
+                        fail_args[fa_idx] = resolved;
+                    }
                 }
             }
         }
