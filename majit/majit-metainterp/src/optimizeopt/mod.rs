@@ -7320,8 +7320,8 @@ impl OptContext {
         let mut final_operands: Vec<Operand> = Vec::with_capacity(liveboxes.len());
         for a in liveboxes.iter() {
             let operand = self
-                .resolve_to_operand(*a)
-                .unwrap_or_else(|| Operand::from_opref(*a));
+                .resolve_to_operand(a)
+                .unwrap_or_else(|| Operand::from_opref(a));
             if !operand.is_none() && final_operands.iter().any(|seen| seen.same_box(&operand)) {
                 final_operands.push(Operand::none());
             } else {
