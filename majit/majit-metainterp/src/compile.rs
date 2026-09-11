@@ -2205,7 +2205,11 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         if walk_fields < n_static {
             return;
         }
-        fit_walk_lengths(&mut walk_lengths, vinfo.array_fields.len(), walk_fields - n_static);
+        fit_walk_lengths(
+            &mut walk_lengths,
+            vinfo.array_fields.len(),
+            walk_fields - n_static,
+        );
         field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
         expanded_len = entry_prefix_len + field_types.len();
     }
