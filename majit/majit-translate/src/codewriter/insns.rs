@@ -620,8 +620,10 @@ pub const BC_RECORD_EXACT_CLASS: u8 = 201;
 // object header's class word.  Upstream's result is `Ptr(OBJECT_VTABLE)`;
 // pyre's `PyObject.ob_type` is read as a raw word in some graphs and as a
 // GC ref in others, and the guard keeps the bank of the read it replaced.
-pub const BC_GUARD_CLASS: u8 = 237;
-pub const BC_GUARD_CLASS_R: u8 = 238;
+// Distinct from `BC_REF_ISCONSTANT` (237) / `BC_REF_ISVIRTUAL` (238)
+// / `BC_INT_ISCONSTANT` (239).  `Assembler.insns` is 1:1.
+pub const BC_GUARD_CLASS: u8 = 240;
+pub const BC_GUARD_CLASS_R: u8 = 241;
 
 pub const MAX_HOST_CALL_ARITY: usize = 16;
 
