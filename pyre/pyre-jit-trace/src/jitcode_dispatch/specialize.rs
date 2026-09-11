@@ -9683,6 +9683,15 @@ fn binary_op_tag_for_helper_name(name: &str) -> Option<i64> {
         "and" | "and_" => B::And,
         "or" | "or_" => B::Or,
         "xor" => B::Xor,
+        "inplace_add" | "iadd" => B::InplaceAdd,
+        "inplace_sub" | "isub" => B::InplaceSubtract,
+        "inplace_mul" | "imul" => B::InplaceMultiply,
+        "inplace_floordiv" | "ifloordiv" => B::InplaceFloorDivide,
+        "inplace_mod" | "imod" => B::InplaceRemainder,
+        "inplace_truediv" | "itruediv" => B::InplaceTrueDivide,
+        "inplace_and" | "iand" => B::InplaceAnd,
+        "inplace_or" | "ior" => B::InplaceOr,
+        "inplace_xor" | "ixor" => B::InplaceXor,
         _ => return None,
     };
     pyre_interpreter::runtime_ops::binary_op_tag(op)

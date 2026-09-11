@@ -14243,14 +14243,24 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // `binary_value_from_tag`, so the residual_call BINARY_OP descent
     // gate is never consulted.  Run the same orthodox descent here
     // before residualizing the whole helper via fnaddr.
+    //
+    // Inplace tags (`a += i`) lower as a named `inplace_add` body, not
+    // `binary_value_from_tag`.  Without the I-list / helper-name tag
+    // those calls never reached `try_emit_exact_int_binop`.
     let is_binary_from_tag =
         super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body);
-    if is_binary_from_tag
-        && dst_bank == 'r'
-        && int_args.len() == 1
-        && ref_args.len() == 2
-        && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
-    {
+    let op_tag = match int_arg_concretes.first() {
+        Some(ConcreteValue::Int(tag)) if is_binary_from_tag => Some(*tag),
+        Some(ConcreteValue::Int(tag))
+            if pyre_interpreter::runtime_ops::binary_op_tag_is_inplace(*tag) =>
+        {
+            Some(*tag)
+        }
+        _ => super::specialize::binary_op_tag_for_helper_index(sub_index, &int_arg_concretes)
+            .filter(|&tag| pyre_interpreter::runtime_ops::binary_op_tag_is_inplace(tag)),
+    };
+    if dst_bank == 'r' && ref_args.len() == 2 && let Some(op_tag) = op_tag {
+        let int_args_tag = int_args.first().copied().unwrap_or_else(|| ctx.trace_ctx.const_int(op_tag));
         let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
         // Emit the machine-int body before descending `binary_value_from_tag`.
         // The descent walks `int_add_ovf`; a bridge InputArg for `total`
@@ -14275,7 +14285,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 ctx,
                 op.pc,
                 op_tag,
-                int_args[0],
+                int_args_tag,
                 &ref_args,
                 dst,
                 dst_bank,
