@@ -19850,9 +19850,12 @@ fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(current, Value::Int(concrete_current));
 
-    if ctx.trace_ctx.is_bridge_trace {
-        fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
-    }
+    // Journal on root walks too: a non-commit root abort leaves
+    // delivery as the only way to keep this item, and delivery
+    // refuses when a body-effect signal stands.  Without a cursor
+    // snapshot that refuse cannot restore, so the next FOR_ITER
+    // yields the following item (`fbw_foriter_item_dropped`).
+    fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
     fbw_foriter_inflight_capture(concrete_item_ptr, body);
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
@@ -20066,12 +20069,9 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(current, Value::Int(concrete_current));
 
-    if ctx.trace_ctx.is_bridge_trace {
-        // A bridge/retrace recording walk has no in-flight forward-delivery on
-        // abort, so journal the pre-advance cursor for restore if the walk does
-        // not commit (keeps the aborted recording side-effect neutral).
-        fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
-    }
+    // Same journal as the step-one shape: a root abort that then
+    // refuses in-flight delivery must be able to restore the cursor.
+    fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
     fbw_foriter_inflight_capture(concrete_item_ptr, body);
     // Range iteration stays at the C level, so the operand-stack mirror
     // remains valid and must receive the item produced by FOR_ITER.  Its
