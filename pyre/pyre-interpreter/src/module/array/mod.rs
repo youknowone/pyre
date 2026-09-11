@@ -2062,6 +2062,9 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
 
     if matches!(mformat, 18..=21) {
         let obj = array_descr_new(&[w_cls, args[1]])?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let encoding = match mformat {
             18 => "utf-16-le",
             19 => "utf-16-be",
@@ -2073,8 +2076,8 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
             "decode",
             &[pyre_object::w_str_new_managed(encoding)],
         )?;
-        array_fromunicode(obj, decoded)?;
-        return Ok(obj);
+        array_fromunicode(pyre_object::gc_roots::shadow_stack_get(obj_slot), decoded)?;
+        return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
     }
 
     let (source_size, signed, big_endian) = reconstructor_descriptor(mformat);

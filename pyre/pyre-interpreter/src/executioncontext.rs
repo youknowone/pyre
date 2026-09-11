@@ -300,9 +300,20 @@ pub fn app_profile_call(
     // executioncontext.py — `frame = jit.hint(frame, access_directly=False)`:
     // from here on, frame is just a normal w_object.
     let frame = majit_metainterp::jit::hint_no_access_directly(frame);
-    let frame_obj = wrap_trace_frame(frame);
-    let w_event = pyre_object::w_str_new(event);
-    crate::call::call_function_impl_result(w_callable, &[frame_obj, w_event, w_arg]).map(|_| ())
+    let _roots = pyre_object::gc_roots::push_roots();
+    let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(wrap_trace_frame(frame));
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_arg);
+    crate::call::call_function_impl_result(
+        w_callable,
+        &[
+            pyre_object::gc_roots::shadow_stack_get(frame_slot),
+            pyre_object::w_str_new(event),
+            pyre_object::gc_roots::shadow_stack_get(arg_slot),
+        ],
+    )
+    .map(|_| ())
 }
 
 /// pypy/interpreter/executioncontext.py:320 `self.profilefunc` — the
@@ -1650,7 +1661,11 @@ impl ExecutionContext {
                 // above put the same instance on the carrier, so the carrier
                 // reads it back.
                 let w_traceback = operr.get_w_traceback(space);
-                pyre_object::tupleobject::w_tuple_new(vec![w_type, w_value, w_traceback])
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(w_type);
+                fields.push(w_value);
+                fields.push(w_traceback);
+                pyre_object::tupleobject::w_tuple_new(fields.take())
             } else {
                 w_arg
             };
@@ -1690,11 +1705,18 @@ impl ExecutionContext {
                 // normal w_object.
                 let frame = majit_metainterp::jit::hint_no_access_directly(frame);
                 // executioncontext.py:382-385 space.call_function(w_callback, frame, w_event, w_arg)
-                let frame_obj = wrap_trace_frame(frame);
-                let w_event = pyre_object::w_str_new(event);
+                let _trace_roots = pyre_object::gc_roots::push_roots();
+                let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(wrap_trace_frame(frame));
+                let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_arg);
                 let call_result = crate::call::call_function_impl_result(
                     w_callback,
-                    &[frame_obj, w_event, w_arg],
+                    &[
+                        pyre_object::gc_roots::shadow_stack_get(frame_slot),
+                        pyre_object::w_str_new(event),
+                        pyre_object::gc_roots::shadow_stack_get(arg_slot),
+                    ],
                 );
                 // The callback received the live frame, so its
                 // `frame.f_trace = local` / `frame.f_lineno = N` setattrs

@@ -964,7 +964,13 @@ impl W_TextIOWrapper {
         }
         payload.state = STATE_OK;
         payload.publish_refs();
-        crate::baseobjspace::setdictvalue_native(obj, "name", w_str_new_managed(name));
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+        crate::baseobjspace::setdictvalue_native(
+            obj,
+            "name",
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+        );
         obj
     }
 

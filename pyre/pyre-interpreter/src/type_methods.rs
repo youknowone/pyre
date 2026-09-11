@@ -6424,7 +6424,13 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             fields.push(wtf8_slice_str(&s[i + sep.len()..]));
             Ok(w_tuple_new(fields.take()))
         }
-        None => Ok(w_tuple_new(vec![args[0], w_str_new(""), w_str_new("")])),
+        None => {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(args[0]);
+            fields.push(w_str_new(""));
+            fields.push(w_str_new(""));
+            Ok(w_tuple_new(fields.take()))
+        }
     }
 }
 
@@ -6450,7 +6456,13 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             fields.push(wtf8_slice_str(&s[i + sep.len()..]));
             Ok(w_tuple_new(fields.take()))
         }
-        None => Ok(w_tuple_new(vec![w_str_new(""), w_str_new(""), args[0]])),
+        None => {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_str_new(""));
+            fields.push(w_str_new(""));
+            fields.push(args[0]);
+            Ok(w_tuple_new(fields.take()))
+        }
     }
 }
 

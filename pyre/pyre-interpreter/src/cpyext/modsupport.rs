@@ -993,11 +993,12 @@ pub unsafe extern "C" fn PyModule_AddStringConstant(
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(module);
-    let value = pyre_object::w_str_new(&text);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(&text));
     store(
         pyre_object::gc_roots::shadow_stack_get(module_slot),
         &key,
-        value,
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
     );
     0
 }
@@ -1036,7 +1037,7 @@ pub unsafe extern "C" fn PyModule_New(name: *const c_char) -> *mut CPyObject {
         return std::ptr::null_mut();
     }
     let name = text_or_empty(name);
-    pyobject::make_ref(new_module(pyre_object::w_str_new(&name)))
+    pyobject::make_ref(new_module(pyre_object::w_str_new_managed(&name)))
 }
 
 /// `modsupport.py:PyModule_NewObject`.
@@ -1178,11 +1179,12 @@ pub unsafe extern "C" fn PyModule_SetDocString(
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(module);
-    let value = pyre_object::w_str_new(&text);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(&text));
     store(
         pyre_object::gc_roots::shadow_stack_get(module_slot),
         "__doc__",
-        value,
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
     );
     0
 }

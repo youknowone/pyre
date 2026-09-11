@@ -15230,7 +15230,9 @@ unsafe fn descr_member_name(obj: PyObjectRef) -> crate::PyResult {
         }
         if pyre_object::is_member(obj) {
             // typedef.py interp_attrproperty('name')
-            return Ok(pyre_object::w_str_new(pyre_object::w_member_get_name(obj)));
+            return Ok(pyre_object::w_str_new_managed(
+                pyre_object::w_member_get_name(obj),
+            ));
         }
         if crate::function::is_function_carrier(obj) {
             return Ok(crate::function::fget_func_name(obj));
@@ -16012,7 +16014,7 @@ fn init_builtin_code_type(ns: PyObjectRef) {
                 return Ok(pyre_object::w_none());
             }
             let name = unsafe { crate::builtin_code_name(code) };
-            Ok(pyre_object::w_str_new(name))
+            Ok(pyre_object::w_str_new_managed(name))
         },
         2,
     );
@@ -16788,9 +16790,7 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
         ),
         ("__name__", |args: &[PyObjectRef]| {
             let function = classmethod_descriptor_function(args[1], "__name__")?;
-            Ok(pyre_object::w_str_new(unsafe {
-                crate::function::function_get_name(function)
-            }))
+            Ok(unsafe { crate::function::fget_func_name(function) })
         }),
         ("__qualname__", |args: &[PyObjectRef]| {
             let function = classmethod_descriptor_function(args[1], "__qualname__")?;
@@ -25194,11 +25194,18 @@ pub(crate) fn unicode_decode_error(
     end: usize,
     reason: &str,
 ) -> crate::PyError {
-    let w_encoding = pyre_object::w_str_new(encoding);
-    let w_object = pyre_object::w_bytes_from_bytes(data);
-    let w_start = pyre_object::w_int_new(start as i64);
-    let w_end = pyre_object::w_int_new(end as i64);
-    let w_reason = pyre_object::w_str_new(reason);
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_str_new_managed(encoding));
+    fields.push(pyre_object::w_bytes_from_bytes(data));
+    fields.push(pyre_object::w_int_new(start as i64));
+    fields.push(pyre_object::w_int_new(end as i64));
+    fields.push(pyre_object::w_str_new_managed(reason));
+    let items = fields.take();
+    let w_encoding = items[0];
+    let w_object = items[1];
+    let w_start = items[2];
+    let w_end = items[3];
+    let w_reason = items[4];
     // Eager message for PyError.message; descr_str recomputes the same
     // text from the fields (display.rs unicode_decode_error_str).
     let msg = unicode_decode_error_msg(encoding, data, start, end, reason);
@@ -25213,9 +25220,7 @@ pub(crate) fn unicode_decode_error(
         pyre_object::interp_exceptions::w_exception_set_end(exc, w_end);
         pyre_object::interp_exceptions::w_exception_set_reason(exc, w_reason);
         // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
-        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
-            w_encoding, w_object, w_start, w_end, w_reason,
-        ]);
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(items);
         pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
         crate::PyError::from_exc_object(exc)
     }
@@ -25259,10 +25264,18 @@ pub(crate) fn unicode_encode_error(
     end: i64,
     reason: &str,
 ) -> crate::PyError {
-    let w_encoding = pyre_object::w_str_new(encoding);
-    let w_start = pyre_object::w_int_new(start);
-    let w_end = pyre_object::w_int_new(end);
-    let w_reason = pyre_object::w_str_new(reason);
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_str_new_managed(encoding));
+    fields.push(w_object);
+    fields.push(pyre_object::w_int_new(start));
+    fields.push(pyre_object::w_int_new(end));
+    fields.push(pyre_object::w_str_new_managed(reason));
+    let items = fields.take();
+    let w_encoding = items[0];
+    let w_object = items[1];
+    let w_start = items[2];
+    let w_end = items[3];
+    let w_reason = items[4];
     // PyPy stores the five fields/args here and formats them only from
     // `W_UnicodeEncodeError.descr_str`. `PyError::from_exc_object` follows
     // the same lazy display path, so do not precompute a parallel message.
@@ -25276,9 +25289,7 @@ pub(crate) fn unicode_encode_error(
         pyre_object::interp_exceptions::w_exception_set_end(exc, w_end);
         pyre_object::interp_exceptions::w_exception_set_reason(exc, w_reason);
         // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
-        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
-            w_encoding, w_object, w_start, w_end, w_reason,
-        ]);
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(items);
         pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
         crate::PyError::from_exc_object(exc)
     }
@@ -29410,7 +29421,7 @@ fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
     if code_ptr.is_null() {
         return Ok(w_str_new("<finished>"));
     }
-    Ok(w_str_new(unsafe { &(*code_ptr).obj_name }))
+    Ok(w_str_new_managed(unsafe { &(*code_ptr).obj_name }))
 }
 
 fn generator_getter_for(args: &[PyObjectRef], field: usize, kind: u8) -> crate::PyResult {

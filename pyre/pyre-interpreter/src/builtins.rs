@@ -1739,9 +1739,9 @@ fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
-        Ok(w_str_new(pyre_object::memoryview::w_memoryview_format_str(
-            mv,
-        )))
+        Ok(w_str_new_managed(
+            pyre_object::memoryview::w_memoryview_format_str(mv),
+        ))
     }
 }
 
@@ -19688,15 +19688,24 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         ));
     }
     let opener = bind_pos_or_kw(pos, kwargs, 4, "opener", "FileIO", 4)?.unwrap_or_else(w_none);
+    let _open_roots = pyre_object::gc_roots::push_roots();
+    let file_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(file);
+    let mode_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&raw_mode));
+    let closefd_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(closefd_obj);
+    let opener_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(opener);
     let opened = open_raw_file(&[
-        file,
-        w_str_new_managed(&raw_mode),
+        pyre_object::gc_roots::shadow_stack_get(file_slot),
+        pyre_object::gc_roots::shadow_stack_get(mode_slot),
         w_int_new(-1),
         w_none(),
         w_none(),
         w_none(),
-        closefd_obj,
-        opener,
+        pyre_object::gc_roots::shadow_stack_get(closefd_slot),
+        pyre_object::gc_roots::shadow_stack_get(opener_slot),
     ])?;
     let _roots = pyre_object::gc_roots::push_roots();
     let self_obj = pyre_object::gc_roots::pin_root(self_obj);
@@ -20607,11 +20616,18 @@ fn fd_bytes_to_obj(self_obj: PyObjectRef, data: Vec<u8>) -> Result<PyObjectRef, 
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
     } else {
         let (encoding, errors) = unsafe { stream_encoding_errors(self_obj) };
-        let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&data);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ =
+            pyre_object::gc_roots::pin_root(pyre_object::bytesobject::w_bytes_from_bytes(&data));
+        let enc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&encoding));
+        let err_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
         crate::typedef::bytes_method_decode(&[
-            w_bytes,
-            w_str_new_managed(&encoding),
-            w_str_new_managed(&errors),
+            pyre_object::gc_roots::shadow_stack_get(bytes_slot),
+            pyre_object::gc_roots::shadow_stack_get(enc_slot),
+            pyre_object::gc_roots::shadow_stack_get(err_slot),
         ])
     }
 }
@@ -21629,8 +21645,16 @@ fn builtin_open_impl(
                 w_bool_from(line_buffering),
             ],
         )?;
-        crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new_managed(&mode))?;
-        Ok(wrapper)
+        let wrapper_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(wrapper);
+        let mode_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&mode));
+        crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(wrapper_slot),
+            "mode",
+            pyre_object::gc_roots::shadow_stack_get(mode_slot),
+        )?;
+        Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot))
     })();
     let result = match outcome {
         Ok(object) => Ok(object),
