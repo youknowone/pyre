@@ -49,6 +49,13 @@ fn jitcode_may_force_effect_info() -> majit_ir::effectinfo::EffectInfo {
     crate::call_descr::default_effect_info()
 }
 
+/// Lead operand of `rewrite_call(..., force_ir=True)`: the condition /
+/// known-result / value register that sits before the funcptr.
+enum LeadReg {
+    Int(u16),
+    Ref(u16),
+}
+
 /// Byte width of one scalar of `ty` in memory — a struct field or an array
 /// item.
 ///
@@ -4791,28 +4798,9 @@ impl JitCodeBuilder {
             .insert(calldescr_idx, JitCallTarget::new(funcptr, funcptr));
     }
 
-    pub fn call_assembler_void_args(&mut self, target_idx: u16, arg_regs: &[u16]) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_assembler_void_typed_args(target_idx, &args);
-    }
-
-    pub fn call_assembler_void_typed_args(&mut self, target_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_assembler_void_like(jitcode::insns::BC_CALL_ASSEMBLER_VOID, target_idx, arg_regs);
-    }
-
-    pub fn call_assembler_int(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_assembler_int_typed(target_idx, &args, dst);
-    }
-
-    pub fn call_assembler_int_typed(&mut self, target_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_assembler_int_like(
-            jitcode::insns::BC_CALL_ASSEMBLER_INT,
-            target_idx,
-            arg_regs,
-            dst,
-        );
-    }
+    // `CALL_ASSEMBLER` is a trace IR op (`history.rs`, pyjitpl
+    // `do_recursive_call(assembler_call=True)`). Jitcode emits
+    // `recursive_call_*` (`jtransform.handle_recursive_call`).
 
     /// Pure sibling of
     /// [`Self::residual_call_int_canonical_via_target`].  Emits the
@@ -4884,22 +4872,28 @@ impl JitCodeBuilder {
     }
 
     // ── conditional_call / record_known_result (jtransform.py:1665-1688, 292-313) ──
+    //
+    // `rewrite_call(..., force_ir=True)` always emits `iiIRd` / `riIRd`
+    // (`condition`/`value` + funcptr + I list + R list + calldescr). The
+    // helper-side `fn_ptr_idx` is resolved here the same way
+    // `residual_call_*_canonical_via_target` resolves it: concrete_ptr
+    // goes in the int constants pool, and the `d` operand is a
+    // `BhCallDescr`.
 
     /// RPython: `conditional_call_ir_v(condition, funcptr, calldescr, [i], [r])`
-    /// Condition in cond_reg; if nonzero, call func with args. Result void.
-    /// `typed_args` carries per-argument kind (int/ref) — RPython make_three_lists parity.
     pub fn conditional_call_ir_v_typed_args(
         &mut self,
         fn_ptr_idx: u16,
         cond_reg: u16,
         typed_args: &[JitCallArg],
     ) {
-        self.touch_reg(cond_reg);
-        self.call_cond_like(
-            jitcode::insns::BC_COND_CALL_VOID,
+        self.emit_canonical_cond_or_record(
+            "conditional_call_ir_v/iiIRd",
+            LeadReg::Int(cond_reg),
             fn_ptr_idx,
-            cond_reg,
             typed_args,
+            majit_ir::value::Type::Void,
+            None,
         );
     }
 
@@ -4911,15 +4905,13 @@ impl JitCodeBuilder {
         typed_args: &[JitCallArg],
         dst: u16,
     ) {
-        self.touch_reg(value_reg);
-        self.touch_reg(dst);
-        self.call_cond_value_like(
-            jitcode::insns::BC_COND_CALL_VALUE_INT,
+        self.emit_canonical_cond_or_record(
+            "conditional_call_value_ir_i/iiIRd>i",
+            LeadReg::Int(value_reg),
             fn_ptr_idx,
-            value_reg,
             typed_args,
-            dst,
-            'i',
+            majit_ir::value::Type::Int,
+            Some((dst, 'i')),
         );
     }
 
@@ -4931,15 +4923,13 @@ impl JitCodeBuilder {
         typed_args: &[JitCallArg],
         dst: u16,
     ) {
-        self.touch_ref_reg(value_reg);
-        self.touch_ref_reg(dst);
-        self.call_cond_value_like(
-            jitcode::insns::BC_COND_CALL_VALUE_REF,
+        self.emit_canonical_cond_or_record(
+            "conditional_call_value_ir_r/riIRd>r",
+            LeadReg::Ref(value_reg),
             fn_ptr_idx,
-            value_reg,
             typed_args,
-            dst,
-            'r',
+            majit_ir::value::Type::Ref,
+            Some((dst, 'r')),
         );
     }
 
@@ -4950,12 +4940,13 @@ impl JitCodeBuilder {
         result_reg: u16,
         typed_args: &[JitCallArg],
     ) {
-        self.touch_reg(result_reg);
-        self.call_cond_like(
-            jitcode::insns::BC_RECORD_KNOWN_RESULT_INT,
+        self.emit_canonical_cond_or_record(
+            "record_known_result_i_ir_v/iiIRd",
+            LeadReg::Int(result_reg),
             fn_ptr_idx,
-            result_reg,
             typed_args,
+            majit_ir::value::Type::Int,
+            None,
         );
     }
 
@@ -4966,59 +4957,109 @@ impl JitCodeBuilder {
         result_reg: u16,
         typed_args: &[JitCallArg],
     ) {
-        self.touch_ref_reg(result_reg);
-        self.call_cond_like(
-            jitcode::insns::BC_RECORD_KNOWN_RESULT_REF,
+        self.emit_canonical_cond_or_record(
+            "record_known_result_r_ir_v/riIRd",
+            LeadReg::Ref(result_reg),
             fn_ptr_idx,
-            result_reg,
             typed_args,
+            majit_ir::value::Type::Ref,
+            None,
         );
     }
 
-    fn call_cond_like(&mut self, bc: u8, fn_ptr_idx: u16, first_reg: u16, args: &[JitCallArg]) {
-        self.start_instr(bc);
-        self.push_reg_u8(first_reg, "conditional_call first register");
-        self.push_u16(fn_ptr_idx);
-        let arg_count = args.len();
-        assert!(
-            arg_count < 256,
-            "conditional_call arg list length {arg_count} exceeds u8 byte encoding"
-        );
-        self.push_u8(arg_count as u8);
-        for arg in args {
-            self.push_u8(arg.kind as u8);
-        }
-        for arg in args {
-            self.push_reg_u8(arg.reg, "conditional_call argument");
-        }
-    }
-
-    fn call_cond_value_like(
+    fn emit_canonical_cond_or_record(
         &mut self,
-        bc: u8,
+        key: &'static str,
+        lead: LeadReg,
         fn_ptr_idx: u16,
-        value_reg: u16,
-        args: &[JitCallArg],
-        dst: u16,
-        result_kind: char,
+        typed_args: &[JitCallArg],
+        result_type: majit_ir::value::Type,
+        dst: Option<(u16, char)>,
     ) {
-        self.start_instr(bc);
-        self.push_reg_u8(value_reg, "conditional_call_value first register");
-        self.push_u16(fn_ptr_idx);
-        let arg_count = args.len();
+        let target = match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(target)) => *target.as_ref(),
+            other => {
+                panic!("{key}: descrs[{fn_ptr_idx}] expected RuntimeBhDescr::Call, got {other:?}")
+            }
+        };
         assert!(
-            arg_count < 256,
-            "conditional_call_value arg list length {arg_count} exceeds u8 byte encoding"
+            typed_args.iter().all(|arg| arg.kind != JitArgKind::Float),
+            "{key}: jtransform._rewrite_op_cond_call / record_known_result \
+             reject float arguments"
         );
-        self.push_u8(arg_count as u8);
-        for arg in args {
-            self.push_u8(arg.kind as u8);
+        match lead {
+            LeadReg::Int(reg) => self.touch_reg(reg),
+            LeadReg::Ref(reg) => self.touch_ref_reg(reg),
         }
-        for arg in args {
-            self.push_reg_u8(arg.reg, "conditional_call_value argument");
+        let mut int_regs = Vec::new();
+        let mut ref_regs = Vec::new();
+        let mut arg_classes = String::new();
+        for &arg in typed_args {
+            self.touch_call_arg(arg);
+            match arg.kind {
+                JitArgKind::Int => {
+                    int_regs.push(arg.reg);
+                    arg_classes.push('i');
+                }
+                JitArgKind::Ref => {
+                    ref_regs.push(arg.reg);
+                    arg_classes.push('r');
+                }
+                JitArgKind::Float => unreachable!("float args rejected above"),
+            }
         }
-        self.push_reg_u8(dst, "conditional_call_value result");
-        self.record_resulttype(result_kind);
+        if let Some((dst, _)) = dst {
+            match result_type {
+                majit_ir::value::Type::Int => self.touch_reg(dst),
+                majit_ir::value::Type::Ref => self.touch_ref_reg(dst),
+                majit_ir::value::Type::Float | majit_ir::value::Type::Void => {
+                    panic!("{key}: dst requires an int or ref result")
+                }
+            }
+        }
+
+        let effect_info = self.effect_info_for_target(fn_ptr_idx);
+        let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
+            arg_classes,
+            result_type,
+            effect_info,
+        );
+        let funcptr_const_idx = self.add_const_i(target.concrete_ptr as i64);
+        let calldescr_idx = self.add_call_descr(calldescr);
+
+        self.write_insn(key);
+        match lead {
+            LeadReg::Int(reg) => self.push_reg_u8(reg, "cond/record lead int"),
+            LeadReg::Ref(reg) => self.push_reg_u8(reg, "cond/record lead ref"),
+        }
+        let funcptr_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((funcptr_offset, ConstKind::Int, funcptr_const_idx));
+        assert!(
+            int_regs.len() <= u8::MAX as usize,
+            "{key}: int arg count {} overflows u8",
+            int_regs.len()
+        );
+        self.push_u8(int_regs.len() as u8);
+        for reg in int_regs {
+            self.push_reg_u8(reg, "cond/record int arg");
+        }
+        assert!(
+            ref_regs.len() <= u8::MAX as usize,
+            "{key}: ref arg count {} overflows u8",
+            ref_regs.len()
+        );
+        self.push_u8(ref_regs.len() as u8);
+        for reg in ref_regs {
+            self.push_reg_u8(reg, "cond/record ref arg");
+        }
+        self.push_u16(calldescr_idx);
+        if let Some((dst, kind)) = dst {
+            self.push_reg_u8(dst, "cond/record result");
+            self.record_resulttype(kind);
+        }
+        self.call_descr_to_call_target.insert(calldescr_idx, target);
     }
 
     /// RPython `blackhole.py` `bhimpl_int_copy(a) returns=i`.
@@ -5166,20 +5207,6 @@ impl JitCodeBuilder {
     // CALL_RELEASE_GIL_R, so emitting BC_CALL_RELEASE_GIL_REF would
     // record an IR op the optimizer/backend cannot consume.
 
-    pub fn call_assembler_ref(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_assembler_ref_typed(target_idx, &args, dst);
-    }
-
-    pub fn call_assembler_ref_typed(&mut self, target_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_assembler_ref_like(
-            jitcode::insns::BC_CALL_ASSEMBLER_REF,
-            target_idx,
-            arg_regs,
-            dst,
-        );
-    }
-
     pub fn load_const_f_value(&mut self, dst: u16, value: i64) {
         let const_idx = self.add_const_f(value);
         self.load_const_f(dst, const_idx);
@@ -5269,25 +5296,6 @@ impl JitCodeBuilder {
             arg_regs,
             dst,
             crate::call_descr::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-        );
-    }
-
-    pub fn call_assembler_float(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_assembler_float_typed(target_idx, &args, dst);
-    }
-
-    pub fn call_assembler_float_typed(
-        &mut self,
-        target_idx: u16,
-        arg_regs: &[JitCallArg],
-        dst: u16,
-    ) {
-        self.call_assembler_float_like(
-            jitcode::insns::BC_CALL_ASSEMBLER_FLOAT,
-            target_idx,
-            arg_regs,
-            dst,
         );
     }
 
@@ -6063,10 +6071,6 @@ impl JitCodeBuilder {
                 | i::BC_HINT_FORCE_VIRTUALIZABLE
                 | i::BC_JIT_MERGE_POINT
                 | i::BC_JIT_MERGE_POINT_C
-                | i::BC_CALL_ASSEMBLER_INT
-                | i::BC_CALL_ASSEMBLER_REF
-                | i::BC_CALL_ASSEMBLER_FLOAT
-                | i::BC_CALL_ASSEMBLER_VOID
                 | i::BC_RECURSIVE_CALL_INT
                 | i::BC_RECURSIVE_CALL_REF
                 | i::BC_RECURSIVE_CALL_FLOAT
@@ -6114,19 +6118,6 @@ impl JitCodeBuilder {
             self.push_u16(arg.reg);
         }
         self.record_resulttype('i');
-    }
-
-    fn call_assembler_void_like(&mut self, opcode: u8, target_idx: u16, arg_regs: &[JitCallArg]) {
-        for &arg in arg_regs {
-            self.touch_call_arg(arg);
-        }
-        self.start_instr(opcode);
-        self.push_u16(target_idx);
-        self.push_u16(arg_regs.len() as u16);
-        for &arg in arg_regs {
-            self.push_u8(arg.kind.encode());
-            self.push_reg_u8(arg.reg, "call_assembler_void argument");
-        }
     }
 
     fn push_label_ref(&mut self, label: u16) {
@@ -6282,50 +6273,6 @@ impl JitCodeBuilder {
         self.record_resulttype('r');
     }
 
-    fn call_assembler_int_like(
-        &mut self,
-        opcode: u8,
-        target_idx: u16,
-        arg_regs: &[JitCallArg],
-        dst: u16,
-    ) {
-        self.touch_reg(dst);
-        for &arg in arg_regs {
-            self.touch_call_arg(arg);
-        }
-        self.start_instr(opcode);
-        self.push_u16(target_idx);
-        self.push_reg_u8(dst, "call_assembler_int result");
-        self.push_u16(arg_regs.len() as u16);
-        for &arg in arg_regs {
-            self.push_u8(arg.kind.encode());
-            self.push_reg_u8(arg.reg, "call_assembler_int argument");
-        }
-        self.record_resulttype('i');
-    }
-
-    fn call_assembler_ref_like(
-        &mut self,
-        opcode: u8,
-        target_idx: u16,
-        arg_regs: &[JitCallArg],
-        dst: u16,
-    ) {
-        self.touch_ref_reg(dst);
-        for &arg in arg_regs {
-            self.touch_call_arg(arg);
-        }
-        self.start_instr(opcode);
-        self.push_u16(target_idx);
-        self.push_reg_u8(dst, "call_assembler_ref result");
-        self.push_u16(arg_regs.len() as u16);
-        for &arg in arg_regs {
-            self.push_u8(arg.kind.encode());
-            self.push_reg_u8(arg.reg, "call_assembler_ref argument");
-        }
-        self.record_resulttype('r');
-    }
-
     #[allow(dead_code)]
     fn call_float_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.touch_float_reg(dst);
@@ -6339,28 +6286,6 @@ impl JitCodeBuilder {
         for &arg in arg_regs {
             self.push_u8(arg.kind.encode());
             self.push_u16(arg.reg);
-        }
-        self.record_resulttype('f');
-    }
-
-    fn call_assembler_float_like(
-        &mut self,
-        opcode: u8,
-        target_idx: u16,
-        arg_regs: &[JitCallArg],
-        dst: u16,
-    ) {
-        self.touch_float_reg(dst);
-        for &arg in arg_regs {
-            self.touch_call_arg(arg);
-        }
-        self.start_instr(opcode);
-        self.push_u16(target_idx);
-        self.push_reg_u8(dst, "call_assembler_float result");
-        self.push_u16(arg_regs.len() as u16);
-        for &arg in arg_regs {
-            self.push_u8(arg.kind.encode());
-            self.push_reg_u8(arg.reg, "call_assembler_float argument");
         }
         self.record_resulttype('f');
     }
@@ -7664,14 +7589,43 @@ mod tests {
     #[test]
     fn typed_call_adapters_record_resulttypes_at_end_pc() {
         assert_resulttype_after(
-            |b| b.conditional_call_value_ir_i_typed_args(0, 1, &[], 2),
+            |b| {
+                let idx = b.add_fn_ptr(std::ptr::null());
+                b.conditional_call_value_ir_i_typed_args(idx, 1, &[], 2);
+            },
             'i',
         );
         assert_resulttype_after(
-            |b| b.conditional_call_value_ir_r_typed_args(0, 1, &[], 2),
+            |b| {
+                let idx = b.add_fn_ptr(std::ptr::null());
+                b.conditional_call_value_ir_r_typed_args(idx, 1, &[], 2);
+            },
             'r',
         );
-        assert_resulttype_after(|b| b.call_assembler_float_typed(0, &[], 1), 'f');
+    }
+
+    #[test]
+    fn conditional_call_ir_v_emits_canonical_iiird_bytes() {
+        let mut builder = JitCodeBuilder::new();
+        let idx = builder.add_fn_ptr(0x1111 as *const ());
+        builder.conditional_call_ir_v_typed_args(
+            idx,
+            0,
+            &[JitCallArg::int(1), JitCallArg::reference(0)],
+        );
+        let jitcode = builder.finish();
+        assert_eq!(
+            jitcode.code[0],
+            jitcode::insns::BC_CONDITIONAL_CALL_IR_V,
+            "helper-side cond_call must emit conditional_call_ir_v/iiIRd"
+        );
+        assert_ne!(jitcode.code[0], jitcode::insns::BC_COND_CALL_VOID);
+        // lead cond, funcptr-placeholder, I count=1, i1, R count=1, r0, descr u16
+        assert_eq!(jitcode.code[1], 0);
+        assert_eq!(jitcode.code[3], 1);
+        assert_eq!(jitcode.code[4], 1);
+        assert_eq!(jitcode.code[5], 1);
+        assert_eq!(jitcode.code[6], 0);
     }
 
     #[test]
@@ -7680,7 +7634,6 @@ mod tests {
             let idx = b.add_fn_ptr(std::ptr::null());
             b.residual_call_void_canonical_via_target(idx, &[]);
         });
-        assert_no_resulttype_after(|b| b.call_assembler_void_typed_args(0, &[]));
     }
 
     #[test]

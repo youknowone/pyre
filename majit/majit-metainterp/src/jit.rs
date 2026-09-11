@@ -969,7 +969,7 @@ pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const
 //
 // Rust: `conditional_call!(condition, func_path, arg1, arg2, ...)`
 //   → jitcode_lower intercepts macro → `__builder.conditional_call_ir_v_typed_args`
-//   → BC_COND_CALL_VOID JitCode bytecode
+//   → `conditional_call_ir_v/iiIRd` JitCode bytecode
 //
 // Use the `conditional_call!` macro in `#[jit_interp]` functions for the
 // JIT path. The plain function below is the non-JIT runtime helper —
