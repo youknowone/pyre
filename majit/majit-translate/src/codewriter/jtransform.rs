@@ -442,9 +442,7 @@ pub fn constant_fold_ll_issubclass_flowgraph(
     graph: &crate::flowspace::model::FunctionGraph,
     excmatch: Option<&crate::translator::rtyper::rtyper::LowLevelFunction>,
 ) {
-    use crate::flowspace::model::{
-        BlockRefExt, ConstValue, Constant, Hlvalue, SpaceOperation,
-    };
+    use crate::flowspace::model::{BlockRefExt, ConstValue, Constant, Hlvalue, SpaceOperation};
     use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
     let Some(excmatch) = excmatch else {
         return;
@@ -8773,16 +8771,14 @@ fn remap_op(
             target,
             args,
             result_ty,
-        } => {
-            OpKind::Call {
-                target: target.clone(),
-                args: args
-                    .iter()
-                    .map(|arg| arg.map_value(|var| remap_value(var, aliases)))
-                    .collect(),
-                result_ty: result_ty.clone(),
-            }
-        }
+        } => OpKind::Call {
+            target: target.clone(),
+            args: args
+                .iter()
+                .map(|arg| arg.map_value(|var| remap_value(var, aliases)))
+                .collect(),
+            result_ty: result_ty.clone(),
+        },
         OpKind::GuardTrue { cond } => OpKind::GuardTrue {
             cond: remap_value(cond, aliases),
         },
@@ -18665,12 +18661,13 @@ mod tests {
                     )
                 })
                 .count();
-            assert_eq!(casts, 1, "the Ref operand must become a Signed address: {ops:?}");
+            assert_eq!(
+                casts, 1,
+                "the Ref operand must become a Signed address: {ops:?}"
+            );
             assert!(
-                ops.iter().any(|op| matches!(
-                    &op.kind,
-                    OpKind::CallResidual { .. }
-                )),
+                ops.iter()
+                    .any(|op| matches!(&op.kind, OpKind::CallResidual { .. })),
                 "mod over ints is the C-trunc residual, not ptr_mod: {ops:?}"
             );
         }

@@ -209,12 +209,10 @@ fn rewire_one_from_size_align_site(
                     args,
                     ..
                 },
-        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => {
-            (
-                args[0].clone().into_variable(),
-                args[1].clone().into_variable(),
-            )
-        }
+        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => (
+            args[0].clone().into_variable(),
+            args[1].clone().into_variable(),
+        ),
         _ => {
             return Err(format!(
                 "{name}: block {p} last op is not the 2-arg Layout::from_size_align call"
@@ -435,12 +433,10 @@ fn rewire_one_from_size_align_expect_site(
                     args,
                     ..
                 },
-        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => {
-            (
-                args[0].clone().into_variable(),
-                args[1].clone().into_variable(),
-            )
-        }
+        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => (
+            args[0].clone().into_variable(),
+            args[1].clone().into_variable(),
+        ),
         _ => {
             return Err(format!(
                 "{name}: block {p} last op is not the 2-arg Layout::from_size_align call"

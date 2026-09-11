@@ -1041,9 +1041,7 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
     for b in &add_graph.blocks {
         for op in &b.operations {
             let OpKind::Call {
-                args,
-                result_ty,
-                ..
+                args, result_ty, ..
             } = &op.kind
             else {
                 continue;
@@ -1065,7 +1063,10 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
                 .iter()
                 .flat_map(|b| &b.operations)
                 .any(|p| {
-                    p.result.as_ref() == args.first().and_then(majit_translate::model::LinkArg::as_variable)
+                    p.result.as_ref()
+                        == args
+                            .first()
+                            .and_then(majit_translate::model::LinkArg::as_variable)
                         && matches!(p.kind, OpKind::ConstRefAddr(a) if a == CLASS_ADDR)
                 });
             if narrows_class_addr {

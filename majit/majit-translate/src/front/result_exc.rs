@@ -1597,7 +1597,14 @@ fn rewire_one_option_ok_or_else_try_site(
                 },
             });
     }
-    graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, vec![env.into_variable()]);
+    graph.set_branch(
+        a_id,
+        disc,
+        some_bb,
+        some_sources,
+        none_bb,
+        vec![env.into_variable()],
+    );
     Ok(())
 }
 

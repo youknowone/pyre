@@ -6522,10 +6522,7 @@ impl<'a> Lowering<'a> {
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                return Some((
-                    crate::model::cast_instance_call(root, arg.clone()),
-                    res,
-                ));
+                return Some((crate::model::cast_instance_call(root, arg.clone()), res));
             };
         let res = self
             .graph
@@ -9445,7 +9442,12 @@ impl<'a> Lowering<'a> {
                                     crate::runtime_names::shims::LL_ARRAYMOVE.to_string(),
                                 ],
                             },
-                            args: crate::model::call_args(vec![array, source_start, index, args[2].clone()]),
+                            args: crate::model::call_args(vec![
+                                array,
+                                source_start,
+                                index,
+                                args[2].clone(),
+                            ]),
                             result_ty: ValueType::Void,
                         },
                     });
@@ -10095,7 +10097,13 @@ impl<'a> Lowering<'a> {
                         let field_ty = clone_tyref(&referent.ty);
                         if let PlaceKind::Projection(inner, elem) = referent.kind {
                             let value = args[1].clone();
-                            self.emit_projection_write(mir_bb, *inner, elem, value.into(), &field_ty)?;
+                            self.emit_projection_write(
+                                mir_bb,
+                                *inner,
+                                elem,
+                                value.into(),
+                                &field_ty,
+                            )?;
                             // The store's result is an actual unit constant.
                             self.local_var[dest_local] = Some(self.emit_unit(bb_id));
                             let target_bb = self.block_id[target];
@@ -11660,10 +11668,7 @@ impl<'a> Lowering<'a> {
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(narrowed_receiver.clone()),
-                kind: crate::model::cast_instance_call(
-                    "RBigInt",
-                    args[0].clone().into_variable(),
-                ),
+                kind: crate::model::cast_instance_call("RBigInt", args[0].clone().into_variable()),
             });
             let mut narrowed_args = args.clone();
             narrowed_args[0] = narrowed_receiver.into();
@@ -21284,11 +21289,7 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
 /// `ptr_lt` / `ptr_mod` / `ptr_floordiv`. The RPython spelling is
 /// `lltype.cast_ptr_to_int` then the integer op (`rbuiltin.py
 /// rtype_cast_ptr_to_int`). Equality is excluded on purpose.
-fn int_binop_needs_ptr_to_int(
-    op: &str,
-    lhs: Option<&ValueType>,
-    rhs: Option<&ValueType>,
-) -> bool {
+fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&ValueType>) -> bool {
     matches!(op, "lt" | "le" | "gt" | "ge" | "mod" | "floordiv" | "div")
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
 }
@@ -23549,7 +23550,14 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
         // for it.
         let pointee = tyref_node(ty, llbc)
             .and_then(|node| strip_ty_wrappers(node, llbc))
-            .and_then(|node| node.get("Adt")?.get("generics")?.get("types")?.as_array()?.first().cloned())
+            .and_then(|node| {
+                node.get("Adt")?
+                    .get("generics")?
+                    .get("types")?
+                    .as_array()?
+                    .first()
+                    .cloned()
+            })
             .and_then(|arg| serde_json::from_value::<TyRef>(arg).ok())
             .map(|arg| tyref_to_ast_string(&arg, llbc));
         return match pointee {
@@ -26967,12 +26975,10 @@ fn navigate_single_arg_fmt_chain(
             target: CallTarget::FunctionPath { segments },
             args,
             ..
-        } if fmt_path_ends_with(segments, &["fmt", "format"]) => {
-            (
-                args.first()?.clone().into_variable(),
-                format_op.result.as_ref()?.clone(),
-            )
-        }
+        } if fmt_path_ends_with(segments, &["fmt", "format"]) => (
+            args.first()?.clone().into_variable(),
+            format_op.result.as_ref()?.clone(),
+        ),
         _ => return None,
     };
     let chain = extract_fmt_chain(graph, &fmt_args)?;
@@ -28566,11 +28572,10 @@ mod tests {
         DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
         checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
-        is_class_pytype_assoc_const, is_core_result_map_err_path, json_ty_is_thin_pointer_element,
-        json_ty_scalar_element_spelling, int_binop_needs_ptr_to_int, push_cast_ptr_to_int,
-        push_ptr_to_unsigned_cast, shaped_array_parts,
-        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
-        tyref_positional_aggregate_root, tyref_to_value_type,
+        int_binop_needs_ptr_to_int, is_class_pytype_assoc_const, is_core_result_map_err_path,
+        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, push_cast_ptr_to_int,
+        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
+        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_value_type,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -31161,17 +31166,12 @@ mod tests {
         let arg = crate::flowspace::model::Variable::new();
         let op = cast_pointer_marker_op("W_CastTarget".to_string(), arg.clone());
         let OpKind::Call {
-            target,
-            result_ty,
-            ..
+            target, result_ty, ..
         } = &op
         else {
             panic!("marker must be an OpKind::Call");
         };
-        assert_eq!(
-            target,
-            &CallTarget::function_path(["__cast_pointer"]),
-        );
+        assert_eq!(target, &CallTarget::function_path(["__cast_pointer"]),);
         assert_eq!(crate::model::cast_pointer_root(&op), Some("W_CastTarget"));
         assert_eq!(result_ty, &ValueType::Ref(Some("W_CastTarget".to_string())));
     }
@@ -33277,7 +33277,13 @@ mod tests {
             other => panic!("expected cast_ptr_to_int call, got {other:?}"),
         }
         assert_eq!(
-            graph.block(entry).operations.last().unwrap().result.as_ref(),
+            graph
+                .block(entry)
+                .operations
+                .last()
+                .unwrap()
+                .result
+                .as_ref(),
             Some(&signed)
         );
     }
@@ -36264,9 +36270,7 @@ mod tests {
                             target: CallTarget::FunctionPath { segments },
                             ..
                         },
-                    ) if crate::model::cast_instance_root(&op.kind) == Some(owner) => {
-                        Some(result)
-                    }
+                    ) if crate::model::cast_instance_root(&op.kind) == Some(owner) => Some(result),
                     _ => None,
                 })
                 .expect("typed raw allocation destination");

@@ -495,8 +495,9 @@ mod tests {
             globals,
         );
         unsafe {
-            let base_def = TypeDef::from_rawdict("FlagBase", vec![], IndexMap::new(), &INSTANCE_TYPE)
-                as *mut TypeDef;
+            let base_def =
+                TypeDef::from_rawdict("FlagBase", vec![], IndexMap::new(), &INSTANCE_TYPE)
+                    as *mut TypeDef;
             (*base_def).set_acceptable_as_base_class(true);
             (*base_def).text_signature = Some("(x, /)".into());
             let space = ObjSpace::new();

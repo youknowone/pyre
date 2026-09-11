@@ -205,7 +205,14 @@ fn rewire_one_checked_arith_uint_site(
                 ValueType::Unsigned,
             );
             // Unsigned carry: the wrapped sum is strictly below an addend.
-            let ovf = push_binop(graph, a_id, "uint_lt", sum.clone(), lhs.clone(), ValueType::Int);
+            let ovf = push_binop(
+                graph,
+                a_id,
+                "uint_lt",
+                sum.clone(),
+                lhs.clone(),
+                ValueType::Int,
+            );
             let disc = push_no_overflow_disc(graph, a_id, ovf);
             (sum, disc)
         }

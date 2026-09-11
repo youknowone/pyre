@@ -606,16 +606,21 @@ mod tests {
                 _ => None,
             })
             .expect("closure Args tuple payload write");
-        assert!(g.blocks.iter().flat_map(|block| &block.operations).any(|op| {
-            op.result.as_ref() == Some(&written)
-                && matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        ..
-                    } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
-                )
-        }));
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    op.result.as_ref() == Some(&written)
+                        && matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
+                        )
+                })
+        );
     }
 
     /// A call block whose last op is not the recorded result declines

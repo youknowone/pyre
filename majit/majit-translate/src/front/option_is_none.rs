@@ -102,7 +102,11 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
             let narrowed = graph.alloc_value_var();
             ops.push(SpaceOperation {
                 result: Some(narrowed.clone()),
-                kind: crate::model::cast_instance_call_result(root.clone(), null, result_ty.clone()),
+                kind: crate::model::cast_instance_call_result(
+                    root.clone(),
+                    null,
+                    result_ty.clone(),
+                ),
             });
             narrowed
         } else {

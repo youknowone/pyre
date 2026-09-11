@@ -8739,11 +8739,7 @@ mod tests {
         graph.set_goto(right, join, vec![right_args[0].clone()]);
         let raw = graph.push_op_var(join, OpKind::ConstRefNull, true).unwrap();
         let destination = graph
-            .push_op_var(
-                join,
-                crate::model::cast_instance_call("Payload", raw),
-                true,
-            )
+            .push_op_var(join, crate::model::cast_instance_call("Payload", raw), true)
             .unwrap();
         graph.push_op_var(
             join,
@@ -11267,7 +11263,9 @@ mod tests {
             "the cross-block dead header ctor must be swept: {kinds:#?}"
         );
         assert!(
-            !kinds.iter().any(|k| cast_instance_root(k) == Some("PyType")),
+            !kinds
+                .iter()
+                .any(|k| cast_instance_root(k) == Some("PyType")),
             "the dead PyType cast threaded across the block boundary must be swept"
         );
         assert!(
@@ -11277,7 +11275,9 @@ mod tests {
             "the live NewWithVtable must survive"
         );
         assert!(
-            kinds.iter().any(|k| cast_instance_root(k) == Some("PyObject")),
+            kinds
+                .iter()
+                .any(|k| cast_instance_root(k) == Some("PyObject")),
             "the live return cast must survive"
         );
         assert!(

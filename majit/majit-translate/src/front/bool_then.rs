@@ -287,7 +287,14 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     // construction ops before the call stay as A's tail.
     let a_id = graph.blocks[a].id;
     graph.blocks[a].operations.truncate(call_idx);
-    graph.set_branch(a_id, cond.into_variable(), then_bb, then_sources, else_bb, carried);
+    graph.set_branch(
+        a_id,
+        cond.into_variable(),
+        then_bb,
+        then_sources,
+        else_bb,
+        carried,
+    );
     Ok(())
 }
 

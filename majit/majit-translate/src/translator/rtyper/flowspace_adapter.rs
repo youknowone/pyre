@@ -2178,9 +2178,7 @@ pub fn translate_op(
                                 ));
                             }
                         };
-                        let class_host = call_registry
-                            .bookkeeper()
-                            .intern_class_by_qualname(root);
+                        let class_host = call_registry.bookkeeper().intern_class_by_qualname(root);
                         let mut call_args = Vec::with_capacity(3);
                         call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
                             callable_host,

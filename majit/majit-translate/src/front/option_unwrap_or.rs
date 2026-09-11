@@ -47,9 +47,7 @@
 
 use crate::flowspace::model::Variable;
 use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
-use crate::model::{
-    FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
-};
+use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `Option::unwrap_or(opt, default)` / `Result::unwrap_or(res,
 /// default)` call site captured during body lowering (`front::mir`

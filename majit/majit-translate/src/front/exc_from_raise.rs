@@ -86,7 +86,7 @@
 //!   opaque Call targets any more — that earlier deviation is removed
 //!   by the same change that introduced this module.
 
-use crate::flowspace::model::{ConstValue, Variable, HOST_ENV};
+use crate::flowspace::model::{ConstValue, HOST_ENV, Variable};
 use crate::model::{BlockId, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
 /// Close `block` with an `(etype, evalue)` Link to `exceptblock`

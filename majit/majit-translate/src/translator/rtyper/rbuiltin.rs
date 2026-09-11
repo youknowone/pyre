@@ -5022,13 +5022,9 @@ mod tests {
         hop.args_s.borrow_mut().push(SomeValue::Instance(
             crate::annotator::model::SomeInstance::new(None, false, Default::default()),
         ));
-        hop.args_r
-            .borrow_mut()
-            .push(Some(inst as Arc<dyn Repr>));
+        hop.args_r.borrow_mut().push(Some(inst as Arc<dyn Repr>));
         assert_eq!(
-            hop.args_r.borrow()[0]
-                .as_ref()
-                .map(|r| r.repr_class_id()),
+            hop.args_r.borrow()[0].as_ref().map(|r| r.repr_class_id()),
             Some(ReprClassId::InstanceRepr)
         );
 
@@ -5036,9 +5032,7 @@ mod tests {
             .unwrap()
             .expect("swap still emits cast_ptr_to_int");
         assert_eq!(
-            hop.args_r.borrow()[0]
-                .as_ref()
-                .map(|r| r.repr_class_id()),
+            hop.args_r.borrow()[0].as_ref().map(|r| r.repr_class_id()),
             Some(ReprClassId::PtrRepr),
             "the fallback relabels InstanceRepr to PtrRepr"
         );
