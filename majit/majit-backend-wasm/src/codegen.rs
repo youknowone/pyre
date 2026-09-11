@@ -10480,6 +10480,12 @@ fn unbound_pool_const_seeds(
         }
     };
     for op in ops {
+        // rewrite.py `keep` — JIT_DEBUG / DebugMergePoint keep their
+        // constants inline and never execute as values. An unbound
+        // remint sitting only on a debug op must not decline the trace.
+        if op.opcode.is_jit_debug() {
+            continue;
+        }
         for a in op.getarglist().iter() {
             consider(a.to_opref(), op.opcode, false, &mut seeds);
         }
