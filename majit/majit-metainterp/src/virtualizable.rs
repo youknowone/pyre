@@ -790,13 +790,25 @@ impl VirtualizableInfo {
 
     /// Force the virtualizable now.
     ///
-    /// If TOKEN_TRACING_RESCALL, just clear (tracing can reconstruct state).
-    /// If active JIT frame pointer, call `force_fn` to flush JIT state to heap.
-    /// If TOKEN_NONE, no-op.
+    /// virtualizable.py `force_now`:
+    /// ```python
+    /// token = virtualizable.vable_token
+    /// if token == TOKEN_TRACING_RESCALL:
+    ///     virtualizable.vable_token = TOKEN_NONE
+    /// else:
+    ///     ResumeGuardForcedDescr.force_now(cpu, token)
+    ///     assert virtualizable.vable_token == TOKEN_NONE
+    /// ```
+    ///
+    /// Callers (`clear_vable_token`, `force_virtualizable_if_necessary`)
+    /// enter only on a truthy token. TOKEN_NONE in the else arm is the
+    /// same as handing `cpu.force` a NULL GCREF.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn force_now(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
+        // Layout guard for `without_vable_token` test machines. Upstream
+        // `virtualizable.py force_now` always has the field.
         if !self.has_vable_token() {
             return;
         }
@@ -804,12 +816,15 @@ impl VirtualizableInfo {
             let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             let token = *token_ptr;
             if token == token_tracing_rescall() as usize {
-                // During tracing — just clear the marker
+                // virtualizable.py `force_now` — values are correct during tracing.
                 *token_ptr = 0;
-            } else if token != 0 {
-                // Active JIT frame — force it, then verify it cleared the token
+            } else {
+                // virtualizable.py `force_now` — ResumeGuardForcedDescr.force_now.
                 force_fn(token as u64);
-                assert_eq!(*token_ptr, 0, "force_fn should have cleared the token");
+                assert_eq!(
+                    *token_ptr, 0,
+                    "virtualizable.py force_now must leave TOKEN_NONE"
+                );
             }
         }
     }
@@ -919,12 +934,18 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn clear_vable_token(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
+        // virtualizable.py `clear_vable_token`:
+        //     if virtualizable.vable_token:
+        //         force_now(virtualizable)
+        //         assert not virtualizable.vable_token
         unsafe {
-            self.force_virtualizable_if_necessary(obj_ptr, force_fn);
-            assert!(
-                matches!(self.read_token(obj_ptr), VableToken::None),
-                "clear_vable_token must leave TOKEN_NONE"
-            );
+            if !matches!(self.read_token(obj_ptr), VableToken::None) {
+                self.force_now(obj_ptr, force_fn);
+                assert!(
+                    matches!(self.read_token(obj_ptr), VableToken::None),
+                    "virtualizable.py clear_vable_token must leave TOKEN_NONE"
+                );
+            }
         }
     }
 
@@ -2819,18 +2840,20 @@ mod tests {
 
     #[test]
     fn test_force_now_none() {
-        // force_now when token is NONE — no-op
+        // virtualizable.py `force_now` — TOKEN_NONE is not TOKEN_TRACING_RESCALL,
+        // so the else arm runs. Callers never enter with TOKEN_NONE; this
+        // documents the unguarded structure, not a production no-op.
         let info = VirtualizableInfo::new(0);
         let mut obj = vec![0u8; 8];
         let obj_ptr = obj.as_mut_ptr();
 
         unsafe {
-            let mut called = false;
-            info.force_now(obj_ptr, |_| {
-                called = true;
+            let mut received = None;
+            info.force_now(obj_ptr, |token| {
+                received = Some(token);
             });
 
-            assert!(!called, "force_fn should NOT be called for TOKEN_NONE");
+            assert_eq!(received, Some(0));
             assert_eq!(info.read_token(obj_ptr), VableToken::None);
         }
     }
