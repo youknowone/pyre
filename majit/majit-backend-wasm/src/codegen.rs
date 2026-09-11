@@ -7015,24 +7015,50 @@ fn build_function(
                 }
             }
 
-            // ── String/Unicode ops (direct memory access) ──
-            // strlen/strgetitem/unicodelen/unicodegetitem were lowered with a
-            // hardcoded layout (length as an 8-byte load of a 4-byte word field;
-            // item as a 1-byte, stride-1 read at a fixed offset) that is wrong for
-            // UNICODE (4-byte code units, stride 4) and folds garbage into a str
-            // length's high bits — a silent wrong value on wasm, where offset is
-            // valid linear memory and does not trap. pyre models strings/unicode
-            // as Array(Char) and routes these through the descr-driven
-            // GETARRAYITEM/ARRAYLEN paths, so no producer emits these ops (verified
-            // with PYRE_DUMP_PERFN_JITCODE: a str-subscript / len / compare / find
-            // hot loop traces to GETARRAYITEM, never STRGETITEM). Decline them
-            // (interpreter fallback) rather than ship a descr-driven lowering that
-            // no trace exercises — a valid but untestable path here.
-            OpCode::Strlen | OpCode::Unicodelen | OpCode::Strgetitem | OpCode::Unicodegetitem => {
-                return Err(BackendError::Unsupported(format!(
-                    "wasm codegen: string/unicode direct-memory op {:?} (no descr-driven layout)",
-                    op.opcode
-                )));
+            // rewrite.py fills these from `str_descr` / `unicode_descr`.
+            // `inject_builtin_string_descrs` attaches the same ArrayDescr,
+            // so the length word and item stride are the array path.
+            OpCode::Strlen | OpCode::Unicodelen => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i32_wrap_i64();
+                    let (len_offset, len_size) = array_len_layout_from_descr(op);
+                    emit_sized_int_load(&mut sink, len_offset, len_size, false);
+                    sink.local_set(value_types.local(vi));
+                }
+            }
+            OpCode::Strgetitem | OpCode::Unicodegetitem => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    // rewrite.py:299/311: STR `extra_item_after_alloc=1` is
+                    // already in `basesize`; subtract it before the index.
+                    let (base_size, item_size) = op
+                        .with_array_descr(|ad| {
+                            let item_size = ad.item_size() as u64;
+                            let base_size = if item_size == 1 {
+                                ad.base_size() as u64 - 1
+                            } else {
+                                ad.base_size() as u64
+                            };
+                            (base_size, item_size)
+                        })
+                        .unwrap_or_else(|| {
+                            missing_layout_descr("array descr (str/unicodegetitem)", op)
+                        });
+                    let disp = emit_scaled_index_addr(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
+                        item_size,
+                        base_size,
+                    );
+                    let (access_size, signed) = array_item_access_size_sign(op);
+                    emit_sized_int_load(&mut sink, disp, access_size, signed);
+                    sink.local_set(value_types.local(vi));
+                }
             }
 
             // ── GC rewrite memory ops ──
@@ -10412,6 +10438,25 @@ fn unbound_pool_const_seeds(
         if r != OpRef::NONE && !r.is_constant() {
             defined.insert(r.raw());
         }
+        // `consider_label` / `LabelResumeData`: LABEL args are block
+        // parameters. A peeled header carries loop live-ins as InputArgs
+        // that are not portal inputargs and have no producing op in the
+        // stream — they are defined at the LABEL, not missing. Declining
+        // them made every peeled Python loop (`fib_loop`) fall back.
+        //
+        // A folded constant under the same position is different: it has
+        // no producer *and* a constants-map entry. Marking it defined
+        // skipped the prologue seed, so the local stayed the zero wasm
+        // initializes it to. Seed those; only treat a LABEL arg as
+        // defined when the pool has nothing to materialize.
+        if op.opcode == OpCode::Label {
+            for a in op.getarglist() {
+                let r = a.to_opref();
+                if r != OpRef::NONE && !r.is_constant() && !constants.contains_key(&r.raw()) {
+                    defined.insert(r.raw());
+                }
+            }
+        }
     }
     let mut seeds: Vec<(u32, i64)> = Vec::new();
     let mut unresolved: Vec<(OpRef, OpCode, bool)> = Vec::new();
@@ -11178,7 +11223,7 @@ fn emit_force_arm(
     ));
     for (i, &arg_ref) in force_args.iter().enumerate() {
         sink.local_get(0);
-        if undefined == Some(arg_ref.raw()) {
+        if !arg_ref.is_constant() && undefined == Some(arg_ref.raw()) {
             sink.i64_const(0);
         } else if let Some(home) = ref_homes.home(arg_ref) {
             let ofs = frame.home_slot_base + home as u64 * SLOT_SIZE;

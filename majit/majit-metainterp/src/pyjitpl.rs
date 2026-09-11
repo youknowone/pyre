@@ -382,6 +382,23 @@ trait OptimizationInfoItem {
 impl OptimizationInfoItem for OpRc {
     fn clear_optimization_info(&self) {
         self.as_ref().clear_forwarded();
+        // An emitted op can still hold the box it was recorded with rather
+        // than the copy the optimizer emitted for that position, and a
+        // guard's checked box is made constant after the guard is emitted.
+        // Forget on the operands too, so no forwarding written during
+        // optimization outlives it.
+        let producers = self
+            .getarglist()
+            .into_iter()
+            .chain(self.getfailargs().into_iter().flatten());
+        for arg in producers {
+            if matches!(
+                arg,
+                majit_ir::operand::Operand::Op(_) | majit_ir::operand::Operand::InputArg(_)
+            ) {
+                arg.clear_forwarded();
+            }
+        }
     }
 }
 
@@ -28723,5 +28740,41 @@ mod closing_jump_fixes_label_slots_tests {
             OpCode::Jump,
             &[boxed(1), boxed(2)]
         )]));
+    }
+}
+
+#[cfg(test)]
+mod forget_optimization_info_tests {
+    use super::*;
+    use majit_ir::forwarding::{Forwarded, ForwardingHost};
+    use majit_ir::operand::Operand;
+    use majit_ir::resoperation::{Op, OpRc};
+    use majit_ir::{Const, OpCode, OpRef, Value};
+
+    /// The stream holds the copy `emit` made of a producer while a guard
+    /// recorded later still holds the original box at the same position;
+    /// `optimize_guard_value` makes that box constant after the guard is
+    /// emitted. Forgetting the stream alone would leave the box forwarding
+    /// into the backend.
+    #[test]
+    fn forget_optimization_info_clears_the_boxes_the_stream_operands_hold() {
+        let recorded = OpRc::new(Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::const_from_value(Value::Int(1)),
+                Operand::const_from_value(Value::Int(2)),
+            ],
+        ));
+        recorded.pos.set(OpRef::int_op(3));
+        let emitted = OpRc::new((*recorded).clone());
+        let guard = Op::new(OpCode::GuardTrue, &[Operand::from_bound_op(&recorded)]);
+        guard.setfailargs(smallvec::smallvec![Operand::from_bound_op(&recorded)]);
+        let guard = OpRc::new(guard);
+        recorded.set_forwarded_const(Const::Int(3));
+        assert!(matches!(recorded.get_forwarded(), Forwarded::Const(_)));
+
+        forget_optimization_info(&[emitted, guard]);
+
+        assert!(matches!(recorded.get_forwarded(), Forwarded::None));
     }
 }
