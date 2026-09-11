@@ -61,11 +61,18 @@ pub unsafe fn set_latest_descr(ptr: *mut JitFrame, descr: usize) {
 /// passed in, because the deadframe types that hold one are the callers.
 #[inline]
 pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> {
-    let pos = *descr.rd_locs().get(index)?;
-    if pos == 0xFFFF {
-        None
-    } else {
-        Some(pos as usize)
+    let locs = descr.rd_locs();
+    // Synthetic descrs never receive `write_failure_recovery_description`,
+    // so the table stays empty and the fail-arg index *is* the slot
+    // (`runner.rs` identity fallback). A stamped table uses `0xFFFF`
+    // for a numbering hole (`optimizeopt` `logical_rd_locs`); resume
+    // reconstructs those through TAGCONST/TAGVIRTUAL, not the jitframe.
+    if locs.is_empty() {
+        return Some(index);
+    }
+    match locs.get(index).copied() {
+        None | Some(0xFFFF) => None,
+        Some(pos) => Some(pos as usize),
     }
 }
 
@@ -101,8 +108,14 @@ pub unsafe fn get_int_value_direct(ptr: *const JitFrame, slot: usize) -> isize {
 #[inline]
 pub unsafe fn get_int_value(ptr: *const JitFrame, descr: &dyn FailDescr, index: usize) -> i64 {
     let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
-    let slot = decode_rd_loc_slot(descr, index).unwrap_or(index);
-    unsafe { get_int_value_direct(ptr, slot) as i64 }
+    // `_decode_pos` is only invoked for a live box. A 0xFFFF hole has
+    // no jitframe word — cranelift writes fail args densely and skips
+    // `None` holes, so treating the hole as `jf_frame[index]` reads
+    // uninitialized memory and hands it to residual calls as a pointer.
+    match decode_rd_loc_slot(descr, index) {
+        Some(slot) => unsafe { get_int_value_direct(ptr, slot) as i64 },
+        None => 0,
+    }
 }
 
 /// Fail-arg source for `resume.py` TAGBOX decode.
@@ -345,7 +358,10 @@ pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::FailArgSource;
+    use super::{FailArgSource, decode_rd_loc_slot, get_int_value, set_int_value};
+    use crate::jitframe::{JitFrame, alloc_off_gc_jitframe, free_off_gc_jitframe};
+    use crate::resume_guard_descr::make_resume_guard_descr_typed;
+    use majit_ir::Type;
 
     #[test]
     fn empty_slice_get_does_not_panic() {
@@ -355,5 +371,56 @@ mod tests {
         let src = FailArgSource::Slice(&[]);
         assert_eq!(src.get(0), 0);
         assert_eq!(src.len(), 0);
+    }
+
+    #[test]
+    fn get_int_value_reads_zero_for_ffff_hole() {
+        // optimizeopt `logical_rd_locs` stamps 0xFFFF on a None fail-arg.
+        // The slot is not written (`emit_guard_exit` skips None). Reading
+        // it as `jf_frame[index]` is how cranelift fed residual memmove a
+        // poison pointer on exception_reused_object_tb_not_doubled.
+        let descr = make_resume_guard_descr_typed(vec![Type::Int, Type::Ref, Type::Int]);
+        let fd = descr.as_fail_descr().expect("typed resume guard");
+        fd.set_rd_locs(vec![0, 0xFFFF, 2].into());
+        assert_eq!(decode_rd_loc_slot(fd, 0), Some(0));
+        assert_eq!(decode_rd_loc_slot(fd, 1), None);
+        assert_eq!(decode_rd_loc_slot(fd, 2), Some(2));
+
+        let frame = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
+        assert!(!frame.is_null());
+        unsafe {
+            for i in 0..4 {
+                set_int_value(frame, i, 0x4155_8127);
+            }
+            set_int_value(frame, 0, 11);
+            set_int_value(frame, 2, 22);
+            assert_eq!(get_int_value(frame, fd, 0), 11);
+            assert_eq!(
+                get_int_value(frame, fd, 1),
+                0,
+                "0xFFFF hole must not surface the unwritten slot"
+            );
+            assert_eq!(get_int_value(frame, fd, 2), 22);
+            free_off_gc_jitframe(frame);
+        }
+    }
+
+    #[test]
+    fn get_int_value_uses_identity_when_rd_locs_is_empty() {
+        let descr = make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
+        let fd = descr.as_fail_descr().expect("typed resume guard");
+        assert!(fd.rd_locs().is_empty());
+        assert_eq!(decode_rd_loc_slot(fd, 0), Some(0));
+        assert_eq!(decode_rd_loc_slot(fd, 1), Some(1));
+
+        let frame = alloc_off_gc_jitframe(JitFrame::alloc_size(2));
+        assert!(!frame.is_null());
+        unsafe {
+            set_int_value(frame, 0, 7);
+            set_int_value(frame, 1, 9);
+            assert_eq!(get_int_value(frame, fd, 0), 7);
+            assert_eq!(get_int_value(frame, fd, 1), 9);
+            free_off_gc_jitframe(frame);
+        }
     }
 }
