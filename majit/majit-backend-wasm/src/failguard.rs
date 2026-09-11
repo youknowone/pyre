@@ -639,6 +639,13 @@ pub static WASM_CA_DISPATCH: parking_lot::Mutex<
     Option<std::collections::HashMap<u64, Box<WasmCaDispatchEntry>>>,
 > = parking_lot::Mutex::new(None);
 
+/// Compiled loops that already have a GNF2 bridge. Consulted under
+/// `WASM_CA_DISPATCH` so a redirect that publishes after `mark` but
+/// before the source guard cell is written still raises the new alias
+/// cell. Pointers are forgotten when that compiled loop is removed.
+static CA_GNF2_COMPILED_PTRS: parking_lot::Mutex<Option<std::collections::HashSet<u32>>> =
+    parking_lot::Mutex::new(None);
+
 /// Return the stable guest-memory address for `number`, creating a pending
 /// (zero-slot) entry when needed.
 pub fn ca_dispatch_slot(number: u64) -> u32 {
@@ -692,16 +699,38 @@ pub fn ca_dispatch_mark_gnf2(number: u64) {
 /// Raise the monotonic GNF2 flag on every dispatch cell that still
 /// retains a snapshot invoking `compiled_ptr`.
 pub fn ca_dispatch_mark_gnf2_for_compiled_ptr(compiled_ptr: u32) {
+    if compiled_ptr == 0 {
+        return;
+    }
     let table = WASM_CA_DISPATCH.lock();
+    remember_gnf2_compiled_ptr(compiled_ptr);
     if let Some(table) = table.as_ref() {
         mark_gnf2_entries_for_compiled_ptr(table, compiled_ptr);
     }
+}
+
+fn remember_gnf2_compiled_ptr(compiled_ptr: u32) {
+    if compiled_ptr != 0 {
+        CA_GNF2_COMPILED_PTRS
+            .lock()
+            .get_or_insert_with(Default::default)
+            .insert(compiled_ptr);
+    }
+}
+
+fn compiled_ptr_has_gnf2(compiled_ptr: u32) -> bool {
+    compiled_ptr != 0
+        && CA_GNF2_COMPILED_PTRS
+            .lock()
+            .as_ref()
+            .is_some_and(|set| set.contains(&compiled_ptr))
 }
 
 fn mark_gnf2_entries_for_compiled_ptr(
     table: &std::collections::HashMap<u64, Box<WasmCaDispatchEntry>>,
     compiled_ptr: u32,
 ) {
+    remember_gnf2_compiled_ptr(compiled_ptr);
     for entry in table.values() {
         let aliases = entry
             .targets
@@ -743,9 +772,20 @@ pub fn ca_dispatch_publish(
 ) {
     let _ = ca_dispatch_slot(number);
     let table = WASM_CA_DISPATCH.lock();
-    let entry = table
+    let has_guard_not_forced_2 =
+        if has_guard_not_forced_2 != 0 || compiled_ptr_has_gnf2(compiled_ptr) {
+            1
+        } else {
+            0
+        };
+    let entries = table
         .as_ref()
-        .and_then(|table| table.get(&number))
+        .expect("CALL_ASSEMBLER dispatch table disappeared while publishing");
+    if has_guard_not_forced_2 != 0 && compiled_ptr != 0 {
+        mark_gnf2_entries_for_compiled_ptr(entries, compiled_ptr);
+    }
+    let entry = entries
+        .get(&number)
         .expect("CALL_ASSEMBLER dispatch entry disappeared while publishing");
     if has_guard_not_forced_2 != 0 {
         entry.has_guard_not_forced_2.store(1, Ordering::Release);
@@ -807,7 +847,8 @@ pub fn ca_dispatch_redirect(
 /// also retracts redirects into a dropped replacement loop, while preserving
 /// an old token whose entry has already been redirected elsewhere.
 pub fn ca_dispatch_remove_compiled_ptr(compiled_ptr: u32) {
-    if let Some(table) = WASM_CA_DISPATCH.lock().as_mut() {
+    let mut table = WASM_CA_DISPATCH.lock();
+    if let Some(table) = table.as_mut() {
         table.retain(|_, entry| {
             entry
                 .targets
@@ -816,6 +857,11 @@ pub fn ca_dispatch_remove_compiled_ptr(compiled_ptr: u32) {
                 .last()
                 .is_none_or(|target| target.compiled_ptr != compiled_ptr)
         });
+    }
+    if compiled_ptr != 0 {
+        if let Some(set) = CA_GNF2_COMPILED_PTRS.lock().as_mut() {
+            set.remove(&compiled_ptr);
+        }
     }
 }
 

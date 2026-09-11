@@ -6286,6 +6286,8 @@ mod tests {
         drop(table);
         failguard::ca_dispatch_remove(old_number);
         failguard::ca_dispatch_remove(new_number);
+        failguard::ca_dispatch_remove_compiled_ptr(22);
+        failguard::ca_dispatch_remove_compiled_ptr(99);
     }
 
     #[test]
@@ -6321,6 +6323,37 @@ mod tests {
         drop(table);
         failguard::ca_dispatch_remove(alias);
         failguard::ca_dispatch_remove(source);
+        failguard::ca_dispatch_remove_compiled_ptr(99);
+        failguard::ca_dispatch_remove_compiled_ptr(77);
+    }
+
+    #[test]
+    fn publish_after_mark_raises_a_new_alias_cell() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let source = 9_900_050;
+        let alias = 9_900_051;
+        ca_dispatch_publish(source, 2, 88, 33, 44, 55, 0, 0, 0);
+        failguard::ca_dispatch_mark_gnf2(source);
+        // Redirect-shaped publish with a stale zero flag, as if the
+        // CallAssemblerTarget clone was taken before the mark.
+        ca_dispatch_publish(alias, 2, 88, 33, 44, 55, 0, 0, 0);
+
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&alias))
+            .expect("alias dispatch entry");
+        assert_eq!(
+            entry
+                .has_guard_not_forced_2
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a publish after mark must raise the new alias cell"
+        );
+        drop(table);
+        failguard::ca_dispatch_remove(source);
+        failguard::ca_dispatch_remove(alias);
+        failguard::ca_dispatch_remove_compiled_ptr(88);
     }
 
     #[test]
