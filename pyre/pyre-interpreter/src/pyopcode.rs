@@ -2162,11 +2162,11 @@ pub fn code_instructions_len(code: &CodeObject) -> usize {
     code.instructions.len()
 }
 
-/// Read one packed two-byte code unit through a scalar residual call. The
-/// `CodeUnits::deref` slice stays inside the helper body and never crosses the
-/// two-phase residual ABI.
+/// Read one packed two-byte code unit. `co_code` is immutable, so a
+/// constant `(code, i)` folds to the word; the slice deref stays inside
+/// the helper when the args are not constant.
 #[inline]
-#[majit_macros::dont_look_inside]
+#[majit_macros::elidable_cannot_raise]
 pub fn code_unit_at(code: &CodeObject, i: usize) -> u16 {
     let unit = code.instructions[i];
     u16::from(u8::from(unit.op)) | (u16::from(u8::from(unit.arg)) << 8)

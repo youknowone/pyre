@@ -4255,6 +4255,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::code_instructions_len",
         code_instructions_len,
     );
+    // Elidable `w_code_get_ptr` is a residual CALL, not an inlined getfield.
+    // Bind it so interpret can execute the call during the walk.
+    upa1(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_get_ptr",
+        "pyre_interpreter::w_code_get_ptr",
+        crate::pycode::w_code_get_ptr,
+    );
 
     cpa2(
         &mut entries,

@@ -4901,8 +4901,8 @@ pub fn str_len_descr() -> DescrRef {
 static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     // `is_immutable` follows `pycode.py _immutable_fields_` per field.
-    // `co_firstlineno` is listed there; `co_name` and `hidden_applevel` are
-    // not, and `code_ptr` is the raw body pointer with no upstream slot.
+    // `co_code` is listed there; `code_ptr` is that bytecode body.
+    // `co_firstlineno` is listed; `co_name` and `hidden_applevel` are not.
     let field = |field_key: &str,
                  offset: usize,
                  field_size: usize,
@@ -4935,7 +4935,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             std::mem::size_of::<*const ()>(),
             Type::Int,
             ArrayFlag::Unsigned,
-            false,
+            true,
             false,
         ),
         // `pycode.py PyCode._immutable_fields_`: `w_globals?` is filled on
