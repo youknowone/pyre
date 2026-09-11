@@ -4329,7 +4329,8 @@ fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
         frame: codegen::FrameGeometry::compact(5, 3, 1),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
 
     let mut control_stack = Vec::new();
@@ -7991,7 +7992,7 @@ fn threadlocalref_get_lowers_through_the_tls_helper() {
         );
         inputs.inputargs = vec![InputArg::from_type(Type::Int, 0)];
         inputs.alloc.threadlocal_fn_ptr = 0x66;
-        let (bytes, _, _) =
+        let (bytes, _, _, _) =
             codegen::build_wasm_module(&inputs).expect("ThreadlocalrefGet should lower");
         validate_wasm(&bytes);
 
@@ -8511,7 +8512,8 @@ fn call_malloc_nursery_uses_one_inline_bump() {
 #[test]
 fn inline_nursery_new_zeros_its_payload() {
     let inputs = nursery_new_inputs(vec![plain_new(1, 53), finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     let mut fills = 0;
     count_operators(&bytes, |op| {
@@ -8564,7 +8566,7 @@ fn call_malloc_nursery_variants_lower() {
         OpRef::ref_op(1),
     );
     let inputs = nursery_new_inputs(vec![headerless, finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("headerless should lower");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("headerless should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
     assert!(const_immediates(&bytes).contains(&0x55));
@@ -8575,7 +8577,7 @@ fn call_malloc_nursery_variants_lower() {
         OpRef::ref_op(1),
     );
     let inputs = nursery_new_inputs(vec![headerless_odd, finish_int_arg0()], 53);
-    let (bytes, _, _) =
+    let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("unaligned headerless should lower");
     validate_wasm(&bytes);
     assert!(
@@ -8589,7 +8591,7 @@ fn call_malloc_nursery_variants_lower() {
         OpRef::ref_op(1),
     );
     let inputs = nursery_new_inputs(vec![frame, finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize frame should lower");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("varsize frame should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
     assert!(const_immediates(&bytes).contains(&0x11));
@@ -8609,7 +8611,7 @@ fn call_malloc_nursery_variants_lower() {
     );
     varsize.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 8, 53, Type::Int)));
     let inputs = nursery_new_inputs(vec![varsize, finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 0);
     assert!(const_immediates(&bytes).contains(&0x22));
@@ -8619,7 +8621,7 @@ fn call_malloc_nursery_variants_lower() {
 fn newstr_without_a_descr_injects_the_builtin_layout() {
     let newstr = make_op(OpCode::Newstr, &[OpRef::const_int(3)], OpRef::ref_op(1));
     let inputs = nursery_new_inputs(vec![newstr, finish_int_arg0()], 53);
-    let (bytes, _, _) =
+    let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("Newstr without descr should inject and lower");
     validate_wasm(&bytes);
     let immediates = const_immediates(&bytes);
