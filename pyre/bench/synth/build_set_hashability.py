@@ -1,4 +1,10 @@
 # pyre-check: max-pypy-ratio=105
+# pyre-check: jitstats-band=guard_failures=1
+# Ubuntu wasm reads 42 or 43 with loops_compiled=3 and bridges_compiled=0
+# unchanged (main #1780 and this branch). The trip count below already
+# stays off the major-collection crossing that used to move this counter;
+# the leftover ±1 is the same schedule-sensitive re-entry the native
+# backends still pin at 43.
 # BUILD_SET (the {...} set literal) hashes every element through
 # space.hash_w, so an unhashable element — a list, or an instance whose
 # __hash__ is None / raises / returns a non-int — raises instead of silently
