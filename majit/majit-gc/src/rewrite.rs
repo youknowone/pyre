@@ -72,6 +72,28 @@ fn rewrite_operand(
     .unwrap_or(replaced)
 }
 
+/// rewrite.py `_gcref_index` — put a non-null ConstPtr in the output
+/// table without emitting a load. Failargs stay constants
+/// (`emit_op` `get_box_replacement` only); the backend rematerializes
+/// them from this table on the deopt path.
+fn register_constptr(
+    operand: &Operand,
+    gcrefs: &mut Vec<GcRef>,
+    gcrefs_map: &mut IndexMap<usize, u32>,
+) {
+    let Some(Value::Ref(gcref)) = operand.const_value() else {
+        return;
+    };
+    if gcref.is_null() {
+        return;
+    }
+    gcrefs_map.entry(gcref.0).or_insert_with(|| {
+        let index = gcrefs.len() as u32;
+        gcrefs.push(gcref);
+        index
+    });
+}
+
 fn intern_constptr_operand(
     operand: Operand,
     gcrefs: &mut Vec<GcRef>,
@@ -145,22 +167,18 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
             }
             // rewrite.py `emit_op`:
             //   op.setfailargs([self.get_box_replacement(a, True) ...])
-            // `forget_optimization_info` only walks the compiled stream, so
-            // an off-stream producer a failarg still holds can keep its
-            // `_forwarded`. Follow that chain here, then intern a ConstPtr
-            // the same way args are interned.
+            // Follow `_forwarded` only. `remove_constptr` is the arg
+            // loop, not failargs: a ConstPtr failarg is materialized at
+            // deopt from the table, not loaded on every succeeding
+            // iteration. Still `_gcref_index` it so the moving collector
+            // can forward the slot the backend rematerializes.
             if let Some(fail_args) = op.getfailargs() {
                 let rewritten: Vec<Operand> = fail_args
                     .into_iter()
                     .map(|arg| {
-                        rewrite_operand(
-                            arg,
-                            &mut gcrefs,
-                            &mut gcrefs_map,
-                            &mut recently_loaded,
-                            &mut next_pos,
-                            &mut out,
-                        )
+                        let replaced = arg.get_box_replacement(false);
+                        register_constptr(&replaced, &mut gcrefs, &mut gcrefs_map);
+                        replaced
                     })
                     .collect();
                 // `setfailargs`, not `store_final_boxes`: two failargs can
@@ -6526,6 +6544,35 @@ mod tests {
             fail_args[0].to_opref(),
             OpRef::int_op(3),
             "failarg must follow _forwarded onto the live producer"
+        );
+    }
+
+    #[test]
+    fn remove_ref_constants_does_not_load_failarg_constptr_on_the_hot_path() {
+        // rewrite.py emit_op intern's only op args. A ConstPtr failarg
+        // stays a constant; the table still records it so deopt can
+        // rematerialize a forwarded address.
+        let cond = Op::new(OpCode::IntLt, &[ro(OpRef::int_op(1)), ro(OpRef::int_op(2))]);
+        cond.pos.set(OpRef::int_op(3));
+        let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(3))]);
+        guard.setfailargs(vec![Operand::const_from_value(Value::Ref(GcRef(0x1000)))].into());
+        let (out, gcrefs) = remove_ref_constants(&[cond, guard], 4);
+        assert_eq!(gcrefs, vec![GcRef(0x1000)]);
+        assert!(
+            out.iter().all(|op| op.opcode != OpCode::LoadFromGcTable),
+            "failarg ConstPtr must not emit a LoadFromGcTable in the stream"
+        );
+        let rewritten_guard = out
+            .iter()
+            .rev()
+            .find(|op| op.opcode == OpCode::GuardTrue)
+            .expect("guard survives");
+        let fail_args = rewritten_guard.getfailargs().expect("guard failargs");
+        assert_eq!(fail_args.len(), 1);
+        assert_eq!(
+            fail_args[0].const_value(),
+            Some(Value::Ref(GcRef(0x1000))),
+            "failarg stays a ConstPtr for deopt rematerialize"
         );
     }
 }

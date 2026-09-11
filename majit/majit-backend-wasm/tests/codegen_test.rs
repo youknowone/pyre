@@ -133,8 +133,10 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
 
 /// CALL_ASSEMBLER must not refill a frame. The inline bump leaves
 /// `jf_gcmap` unset; the callee prologue nulls the frozen home region
-/// and then publishes the map. The only expected `memory.fill` is that
-/// entry home clear.
+/// and then publishes the map. Expected `memory.fill`s are that entry
+/// home clear, and the nursery-payload zeros `emit_zero_bytes` writes
+/// for `New*` (`rewrite` no longer fills the whole nursery on wasm32
+/// reset).
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
     let lines: Vec<_> = stderr.lines().map(str::trim).collect();
@@ -148,8 +150,20 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3] == "i32.add"
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
+        // `emit_zero_bytes(base, HDR, n)`: payload after the header word.
+        let is_headered_payload = index >= 5
+            && lines[index - 5].starts_with("local.get ")
+            && lines[index - 4] == "i32.const 8"
+            && lines[index - 3] == "i32.add"
+            && lines[index - 2] == "i32.const 0"
+            && lines[index - 1].starts_with("i32.const ");
+        // `emit_zero_bytes(base, 0, n)`: headerless / whole-object zero.
+        let is_object_zero = index >= 3
+            && lines[index - 3].starts_with("local.get ")
+            && lines[index - 2] == "i32.const 0"
+            && lines[index - 1].starts_with("i32.const ");
         assert!(
-            is_entry_home_clear,
+            is_entry_home_clear || is_headered_payload || is_object_zero,
             "recursive CA filled a nursery frame on the bump path:\n{stderr}"
         );
     }
@@ -318,25 +332,19 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     assert_ran_ok("wasm fannkuch", &wasm_run);
     assert_same_stdout("wasm fannkuch", &wasm_run, &dynasm_run);
     // `compiles` is the host's module-compile tally: one per loop, one per
-    // bridge, and one more each time a region merged into its owner re-emits
-    // it. The first two follow from the committed
-    // `pyre/bench/fannkuch.wasm.jitstats` (`loops_compiled=6` +
-    // `bridges_compiled=24`) and are re-recorded alongside that baseline; the
-    // third is `reemit_ok` on this same stderr. Reading it rather than pinning
-    // a total keeps the tally an identity that a compile belonging to none of
-    // the three still breaks, and the bound below is what a merge count can
-    // never pass: a merge re-emits the owner once for a bridge it took.
-    const FANNKUCH_LOOPS: u64 = 6;
-    const FANNKUCH_BRIDGES: u64 = 24;
+    // accepted bridge, and one more each time a region merged into its owner
+    // re-emits it. Loops follow `cl_ok`; bridges follow `BRIDGE_OK` (entered
+    // minus declines), not the guest `bridges_compiled` snapshot. `reemit_ok`
+    // is the merge count. The identity breaks if a compile belongs to none of
+    // the three. A merge re-emits the owner once for a bridge it took.
+    let loops = stat_value(&stderr, "cl_ok");
+    let bridges = stat_value(&stderr, "BRIDGE_OK");
     let reemits = stat_value(&stderr, "reemit_ok");
     assert!(
-        reemits <= FANNKUCH_BRIDGES,
+        reemits <= bridges,
         "more owner re-emissions ({reemits}) than bridges to have merged:\n{stderr}"
     );
-    assert_eq!(
-        stat_value(&stderr, "compiles"),
-        FANNKUCH_LOOPS + FANNKUCH_BRIDGES + reemits
-    );
+    assert_eq!(stat_value(&stderr, "compiles"), loops + bridges + reemits);
     assert!(
         stat_value(&stderr, "jit_calls") < 100,
         "uniform-i64 blackhole helpers still reflected through the host:\n{stderr}"

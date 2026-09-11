@@ -772,6 +772,15 @@ DEFAULT_RESOURCE_MODULES = {
     # offline and in a fraction of the time.
     "test.test_venv",
     "test.test_zipimport",
+    # `is_resource_enabled` treats `use_resources is None` as "every resource
+    # is on". `DirectoryTestCase.test_files` then parse/unparses every
+    # `Lib/*.py` and `Lib/test/*.py` (600+ files) instead of the 10-file
+    # sample plus the grammar always-set. That arm is what `-u cpu` is for.
+    "test.test_unparse",
+    # Four `@requires_resource('cpu')` methods (float/Fraction sqrt rounding
+    # and the NormalDist/kde suites) are the only ones that blow the 300s
+    # module budget; the other ~400 cases finish in seconds.
+    "test.test_statistics",
 }
 
 
