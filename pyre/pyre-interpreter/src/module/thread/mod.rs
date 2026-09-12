@@ -753,14 +753,36 @@ pub(crate) fn after_fork_child() {
             }
         }
     }
-    let handles = std::mem::take(&mut *ACTIVE_HANDLES.lock());
-    for handle in handles {
-        if let Some(handle_obj) = W_ThreadHandle::from_obj(handle as PyObjectRef) {
-            if handle_obj.after_fork_reinit(ident) {
-                ACTIVE_HANDLES.lock().push(handle);
-            }
+    // `_PyThread_AfterFork` walks every started handle, including those
+    // whose OS thread has already exited.  `finish` drops a handle from
+    // ACTIVE_HANDLES once `done` is set, but SHUTDOWN_HANDLES still names
+    // every non-daemon handle until `_shutdown` joins it.  Reinit both
+    // so `is_done` / `join` never touch an inherited waiter table.
+    //
+    // Cast the stored address the way `_PyThread_AfterFork` casts a
+    // list node — a `from_obj` miss would leave the inherited mutex in
+    // place and the next `is_alive` / `join` would wait on a vanished
+    // thread.  Pin the addresses first: `Mutex::new` can allocate.
+    let mut pending = std::mem::take(&mut *ACTIVE_HANDLES.lock());
+    for &handle in SHUTDOWN_HANDLES.lock().iter() {
+        if !pending.contains(&handle) {
+            pending.push(handle);
         }
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    for &handle in &pending {
+        let _ = pyre_object::gc_roots::pin_root(handle as PyObjectRef);
+    }
+    for handle in pending {
+        if handle == 0 {
+            continue;
+        }
+        let handle_obj = unsafe { &*(handle as *const W_ThreadHandle) };
+        if handle_obj.after_fork_reinit(ident) {
+            ACTIVE_HANDLES.lock().push(handle);
+        }
+    }
+    drop(roots);
     SHUTDOWN_HANDLES.lock().clear();
     THREAD_COUNT.store(0, Ordering::SeqCst);
 }
@@ -1306,6 +1328,11 @@ pub use rlock_class::W_RLock;
 
 mod handle_class {
     use super::*;
+    // Same OS-backed pair as `W_Lock` / `GcSync`.  parking_lot's
+    // process-global waiter queue deadlocks in a fork child (`gc_sync`
+    // module comment on the STW pair); `_PyThread_AfterFork` replaces
+    // the pair with `ptr::write` and then `is_done` / `join` lock it.
+    use std::sync::{Condvar, Mutex};
 
     #[derive(Clone, Copy, Default)]
     pub(super) struct HandleState {
@@ -1340,11 +1367,11 @@ mod handle_class {
 
         #[getter]
         fn ident(&self) -> i64 {
-            self.state.lock().ident
+            lock_state(&self.state).ident
         }
 
         fn is_done(&self) -> bool {
-            self.state.lock().done
+            lock_state(&self.state).done
         }
 
         pub(super) fn join(
@@ -1375,7 +1402,7 @@ mod handle_class {
                     ));
                 }
             };
-            let mut state = self.state.lock();
+            let mut state = lock_state(&self.state);
             if !state.started {
                 return Err(crate::PyError::runtime_error("thread not started"));
             }
@@ -1392,7 +1419,10 @@ mod handle_class {
             match duration {
                 None => {
                     while !state.done {
-                        self.done.wait(&mut state);
+                        state = self
+                            .done
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
                 }
                 Some(timeout) => {
@@ -1402,7 +1432,12 @@ mod handle_class {
                         if now >= deadline {
                             break;
                         }
-                        if self.done.wait_for(&mut state, deadline - now).timed_out() {
+                        let (guard, timed_out) = self
+                            .done
+                            .wait_timeout(state, deadline - now)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state = guard;
+                        if timed_out.timed_out() {
                             break;
                         }
                     }
@@ -1412,7 +1447,7 @@ mod handle_class {
         }
 
         fn _set_done(&self) -> Result<(), crate::PyError> {
-            let mut state = self.state.lock();
+            let mut state = lock_state(&self.state);
             if !state.started {
                 return Err(crate::PyError::runtime_error("thread not started"));
             }
@@ -1439,21 +1474,24 @@ impl W_ThreadHandle {
         unsafe {
             // After fork only the calling thread exists.  Reading through
             // `get_mut` deliberately avoids acquiring the inherited mutex.
-            let mut state = *(*this).state.get_mut();
+            let mut state = *(*this)
+                .state
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let is_current = state.started && state.ident == current_ident;
             if state.started && !is_current {
                 state.done = true;
             }
             // Do not drop either inherited primitive: their waiter metadata
             // names threads which exist only in the parent process.
-            std::ptr::write(&mut (*this).state, Mutex::new(state));
-            std::ptr::write(&mut (*this).done, Condvar::new());
+            std::ptr::write(&mut (*this).state, std::sync::Mutex::new(state));
+            std::ptr::write(&mut (*this).done, std::sync::Condvar::new());
             is_current
         }
     }
 
     fn start(&self, ident: i64) -> Result<(), crate::PyError> {
-        let mut state = self.state.lock();
+        let mut state = lock_state(&self.state);
         if state.started {
             return Err(crate::PyError::runtime_error("thread already started"));
         }
@@ -1464,10 +1502,13 @@ impl W_ThreadHandle {
     }
 
     fn finish(&self) {
-        let mut state = self.state.lock();
+        let mut state = lock_state(&self.state);
         state.done = true;
         self.done.notify_all();
         let address = self as *const Self as usize;
+        // `_PyThread_AfterFork` still has to see a finished handle so
+        // the child can replace its inherited mutex.  Non-daemon
+        // handles remain in SHUTDOWN_HANDLES until `_shutdown`.
         ACTIVE_HANDLES.lock().retain(|handle| *handle != address);
     }
 }
@@ -2197,7 +2238,7 @@ fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         _ => W_ThreadHandle::allocate_stable(W_ThreadHandle::default()),
     };
     if let Some(handle_obj) = W_ThreadHandle::from_obj(handle) {
-        handle_obj.state.lock().daemon = daemon;
+        lock_state(&handle_obj.state).daemon = daemon;
     }
     spawn_thread(callable, Vec::new(), None, Some(handle))?;
     if !daemon {

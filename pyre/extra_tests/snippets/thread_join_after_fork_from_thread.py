@@ -2,6 +2,8 @@
 # ThreadJoinOnShutdown.test_3_join_in_forked_from_thread: a worker forks,
 # and the child joins the pre-fork main Thread.  That handle must already
 # be done or join waits forever (ubuntu dynasm suite TIMEOUT 300s).
+# The handle pair is the OS mutex/condvar `_PyThread_AfterFork` rewrites;
+# a parking_lot waiter inherited from the parent never wakes.
 import os
 import sys
 import threading
