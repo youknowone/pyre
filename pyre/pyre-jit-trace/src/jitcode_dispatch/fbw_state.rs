@@ -2634,11 +2634,14 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
                 hazardous_callee.map(|(_, why)| why).unwrap_or("false"),
             );
         }
-        return Err(fbw_decline_inline_callee(
-            ctx,
-            pc,
-            hazardous_callee.map(|(callee_code_key, _)| callee_code_key),
-        ));
+        // A self-recursive body that already unrolled one level residualizes
+        // its deeper CALL as `bh_call_fn`, not CALL_ASSEMBLER.  Aborting
+        // that residual discarded the enclosing function-entry trace
+        // (`selfrec_bridge_nontail_promote`: abort=1, bridges 4→3).  The
+        // wasm CA trampoline hazard is the CALL_ASSEMBLER fold, which is
+        // already exempt via `SELFREC_CA_FOLD_ACTIVE`.  Record the residual
+        // and keep the enclosing walk.
+        return Ok(());
     }
     Ok(())
 }
@@ -4312,6 +4315,18 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
                 })
         {
             return true;
+        }
+        // Flatten lowered BINARY to `inline_call_ir_r` of
+        // `binary_value_from_tag` (tag + two refs).  Without this the
+        // root-bridge self-rec admission (`bridge_rec_root_selfrec`)
+        // never sees a BinaryOp and the nested recursive CALL aborts
+        // the enclosing bridge (`selfrec_bridge_nontail_promote`).
+        if op.opname.starts_with("inline_call_ir_r") {
+            let i_len = body_code.get(op.pc + 3).copied().unwrap_or(0);
+            let r_len_pc = op.pc + 3 + 1 + i_len as usize;
+            if i_len == 1 && body_code.get(r_len_pc) == Some(&2) {
+                return true;
+            }
         }
         pc = op.next_pc;
     }

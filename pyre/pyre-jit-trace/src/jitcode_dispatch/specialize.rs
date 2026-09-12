@@ -21955,11 +21955,19 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     if !is_plain_int {
         return Ok(false);
     }
-    let Some(raw_int) = ctx
+    // A bridge walk resets the heapcache.  The boxed int is still a
+    // concrete exact int (`is_plain_int` above), so unbox it the same
+    // way `try_emit_exact_int_binop` does instead of residualizing
+    // `bh_store_name` (`inline_multiframe_branchy_carrier` odd arm).
+    let raw_int = match ctx
         .trace_ctx
         .heapcache_getfield_cached(value_opref, crate::descr::int_intval_descr().index())
-    else {
-        return Ok(false);
+    {
+        Some(raw) => raw,
+        None => {
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            walker_unbox_int(ctx, op_pc, value_opref, int_type_addr)?
+        }
     };
     // The eager concrete write needs the raw int the store applies; a
     // raw-int box with no concrete shadow declines to the residual.
