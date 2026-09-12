@@ -7062,11 +7062,23 @@ impl OptContext {
     }
 
     /// The second merge-point Ref red — Grain's live `Vm`.
+    ///
+    /// Only when the optimizer's inputargs are exactly the two portal
+    /// reds. An expanded virtualizable list puts a field (brainfuck's
+    /// tape pointer, pyre's next state slot) at index 1; treating that
+    /// as the Vm duplicates it into fail_args and leaves pending
+    /// fields untagged.
     fn declared_vm_red(&self) -> Option<OpRef> {
-        self.inputargs
-            .get(1)
-            .copied()
-            .filter(|opref| opref.ty() == Some(Type::Ref))
+        if let Some(vm) = self.bridge_vm_red {
+            return Some(vm);
+        }
+        if self.inputargs.len() == 2
+            && self.inputargs[0].ty() == Some(Type::Ref)
+            && self.inputargs[1].ty() == Some(Type::Ref)
+        {
+            return self.inputargs.get(1).copied();
+        }
+        None
     }
 
     /// Phase-1 name (`InputArg(1)`) or the Phase-2 host at `inputarg_base+1`.
@@ -7088,30 +7100,19 @@ impl OptContext {
         if op.opcode != OpCode::Jump {
             return;
         }
-        // `optimize_bridge` clears `building_bridge` before the
-        // jump_to_preamble send. The reminted Vm is still on the ctx.
-        let (slot, vm) = if let Some(vm) = self.bridge_vm_red {
-            (1usize, vm)
-        } else if self.building_bridge {
+        // Only the reminted parent-guard Vm. Treating `inputargs[1]` as
+        // the Vm on every interp duplicates a vable field (brainfuck's
+        // tape pointer, pyre's topframeref) into fail_args.
+        let Some(vm) = self.bridge_vm_red else {
             return;
-        } else {
-            let Some(idx) = self
-                .inputargs
-                .iter()
-                .position(|&ia| self.is_vm_red_name(ia))
-            else {
-                return;
-            };
-            (idx, self.inputargs[idx])
         };
-        if slot >= op.num_args() {
+        if op.num_args() <= 1 {
             return;
         }
-        let current = op.arg(slot).to_opref();
-        if current == vm || (!self.building_bridge && self.is_vm_red_name(current)) {
+        if op.arg(1).to_opref() == vm {
             return;
         }
-        op.setarg(slot, Operand::bound_from_opref(vm));
+        op.setarg(1, Operand::bound_from_opref(vm));
     }
 
     /// Number the assembled Vm inputarg, not a Phase-2 remap that import
@@ -7121,35 +7122,19 @@ impl OptContext {
         let Some(vm) = self.declared_vm_red() else {
             return;
         };
-        let mut present = false;
-        for boxref in &mut *boxes {
-            if self.is_vm_red_name(boxref.opref()) {
-                *boxref = crate::resume::SnapshotBox::typed(vm, Type::Ref);
-                present = true;
-            }
-        }
-        if present {
+        // Remap at most one Phase-2 host onto the assembled name.
+        // Stealing another live Ref (or rewriting every host) puts the
+        // same InputArg in two snapshot slots; `store_final_boxes`
+        // then panics on a duplicate failarg, and pending-field
+        // tagging never sees the stolen box.
+        if boxes.iter().any(|b| b.opref() == vm) {
             return;
         }
-        // Capture can leave a Scope / leftover box in a live ref
-        // register. Grain rR=[2, 0] snapshots the frame (r2) first;
-        // skipping only that slot still finds r0. Do not steal the
-        // frame red. If every Ref is the frame, append the Vm so
-        // recover is not the only livebox that names it.
-        let frame = self.inputargs.first().copied();
-        if let Some(slot) = boxes.iter_mut().find(|b| {
-            b.opref().ty().or(b.tp) == Some(Type::Ref)
-                && Some(b.opref()) != frame
-                && !self.is_vm_red_name(b.opref())
-        }) {
-            *slot = crate::resume::SnapshotBox::typed(vm, Type::Ref);
-            return;
-        }
-        if !boxes
-            .iter()
-            .any(|b| b.opref().ty().or(b.tp) == Some(Type::Ref) && self.is_vm_red_name(b.opref()))
+        if let Some(slot) = boxes
+            .iter_mut()
+            .find(|b| self.is_vm_red_name(b.opref()) && b.opref() != vm)
         {
-            boxes.push(crate::resume::SnapshotBox::typed(vm, Type::Ref));
+            *slot = crate::resume::SnapshotBox::typed(vm, Type::Ref);
         }
     }
 
@@ -10264,7 +10249,7 @@ mod boxref_forwarding_tests {
     }
 
     #[test]
-    fn pin_vm_red_steals_a_vable_inputarg_occupying_the_first_ref_slot() {
+    fn pin_vm_red_does_not_steal_an_unrelated_ref_slot() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         ctx.inputargs = vec![
             OpRef::input_arg_typed(0, Type::Ref),
@@ -10276,17 +10261,12 @@ mod boxref_forwarding_tests {
             crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(0, Type::Ref), Type::Ref),
         ];
         ctx.pin_vm_red_in_snapshot(&mut boxes);
-        assert_eq!(boxes[0].opref(), OpRef::input_arg_typed(2, Type::Int));
-        assert_eq!(
-            boxes[1].opref(),
-            OpRef::input_arg_typed(1, Type::Ref),
-            "the first Ref slot held a non-red box; it becomes the Vm red"
-        );
+        assert_eq!(boxes[1].opref(), OpRef::input_arg_typed(6, Type::Ref));
         assert_eq!(boxes[2].opref(), OpRef::input_arg_typed(0, Type::Ref));
     }
 
     #[test]
-    fn pin_vm_red_skips_the_frame_and_steals_the_next_ref() {
+    fn pin_vm_red_does_not_rewrite_a_scope_when_the_assembled_vm_is_absent() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         ctx.inputargs = vec![
             OpRef::input_arg_typed(0, Type::Ref),
@@ -10298,15 +10278,11 @@ mod boxref_forwarding_tests {
         ];
         ctx.pin_vm_red_in_snapshot(&mut boxes);
         assert_eq!(boxes[0].opref(), OpRef::input_arg_typed(0, Type::Ref));
-        assert_eq!(
-            boxes[1].opref(),
-            OpRef::input_arg_typed(1, Type::Ref),
-            "rR=[2,0] snapshots the frame first; r0 still becomes the Vm"
-        );
+        assert_eq!(boxes[1].opref(), OpRef::input_arg_typed(6, Type::Ref));
     }
 
     #[test]
-    fn pin_vm_red_jump_arg_puts_the_declared_red_back() {
+    fn pin_vm_red_jump_arg_without_a_reminted_vm_leaves_the_args() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         ctx.inputargs = vec![
             OpRef::input_arg_typed(0, Type::Ref),
@@ -10314,14 +10290,9 @@ mod boxref_forwarding_tests {
         ];
         let frame = Operand::bound_from_opref(OpRef::input_arg_typed(0, Type::Ref));
         let scope = Operand::bound_from_opref(OpRef::input_arg_typed(6, Type::Ref));
-        let op = Op::new(OpCode::Jump, &[frame, scope]);
+        let op = Op::new(OpCode::Jump, &[frame, scope.clone()]);
         ctx.pin_vm_red_jump_arg(&op);
-        assert_eq!(
-            op.arg(1).to_opref(),
-            OpRef::input_arg_typed(1, Type::Ref),
-            "JUMP arg 1 must write the Vm into the reserved home"
-        );
-        assert_eq!(op.arg(0).to_opref(), OpRef::input_arg_typed(0, Type::Ref));
+        assert_eq!(op.arg(1).to_opref(), scope.to_opref());
     }
 
     #[test]
