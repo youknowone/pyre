@@ -133,9 +133,9 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
 
 /// CALL_ASSEMBLER must not refill a frame on the bump path. The inline
 /// bump leaves `jf_gcmap` unset. Expected `memory.fill`s are the entry
-/// home clear, `emit_zero_bytes` New* payload zeros, and the CA caller
-/// nulling the callee home range from the dispatch snapshot before
-/// publishing that snapshot's gcmap.
+/// home clear of marked slots, `emit_zero_bytes` New* payload zeros,
+/// and the CA caller nulling the callee home range from the dispatch
+/// snapshot before publishing that snapshot's gcmap.
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
     let home_base = format!(
@@ -169,7 +169,6 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3].starts_with("local.get ")
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
-        // dest = cfp + target.home_slot_base, size = home_slots * SLOT_SIZE.
         let is_ca_callee_home_null = index >= 8
             && lines[index - 1] == "i32.mul"
             && lines[index - 2] == "i32.const 8"
@@ -2301,9 +2300,9 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         saw_nursery_free,
         "malloc_cond_varsize_frame must load nursery_free"
     );
-    // The CA arm may memory.fill the callee home range (length is
-    // `home_slots * SLOT_SIZE` at runtime). The bump itself must not
-    // refill `ca_frame_bytes`.
+    // The CA arm no longer memory.fills the frozen home range; the
+    // callee key-0 prologue nulls only marked slots. The bump itself
+    // must not refill `ca_frame_bytes`.
     let frame = codegen::FrameGeometry::fixed();
     assert!(
         !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),
@@ -2311,11 +2310,11 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     );
 }
 
-/// Key-0 nulls the frozen home region before `jf_gcmap` is published.
-/// Recycled nursery bytes in unused padding must not be live when the
-/// map goes up (`invalid type_id` from an oldgen type-3 JitFrame).
+/// Key-0 nulls only the homes `build_home_gcmap` marks. Frozen
+/// chain-padding is unmarked, so a 128-slot fill on every
+/// CALL_ASSEMBLER is wasted work (`fib_recursive`).
 #[test]
-fn entry_prologue_nulls_the_frozen_home_region() {
+fn entry_prologue_does_not_null_unmarked_home_padding() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))])];
     let frame = codegen::FrameGeometry::compact(64, 128, 2);
@@ -2362,8 +2361,8 @@ fn entry_prologue_nulls_the_frozen_home_region() {
         _ => {}
     });
     assert!(
-        fill_lengths.contains(&home_fill_bytes),
-        "key-0 must memory.fill the whole frozen home region ({home_fill_bytes} bytes); fills were {fill_lengths:?}"
+        !fill_lengths.contains(&home_fill_bytes),
+        "key-0 must not memory.fill unmarked frozen padding ({home_fill_bytes} bytes); fills were {fill_lengths:?}"
     );
     assert!(
         !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),

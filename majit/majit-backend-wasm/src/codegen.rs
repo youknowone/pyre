@@ -3005,12 +3005,12 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.i32_shr_u();
     sink.i64_extend_i32_u();
     emit_word_store(sink, JF_FRAME_OFS as u64);
-    // Leave `jf_gcmap` null. The callee key-0 prologue nulls the whole
-    // frozen home region (live homes plus chain padding) and then
-    // publishes the map — the same moment PyPy's assembler writes
-    // `_finish_gcmap` / the live gcmap, once those slots are valid or
-    // null. Filling `ca_frame_bytes` here on every recursive bump is
-    // what made `recursion_past_unroll_bound_from_loop` 4.9x dynasm.
+    // Leave `jf_gcmap` null. The callee key-0 prologue nulls the homes
+    // `build_home_gcmap` marks and then publishes — the same moment
+    // PyPy's assembler writes `_finish_gcmap` / the live gcmap, once
+    // those slots are valid or null. Filling `ca_frame_bytes` here on
+    // every recursive bump is what made
+    // `recursion_past_unroll_bound_from_loop` 4.9x dynasm.
     sink.local_get(alloc_scratch_local);
     sink.i64_const(0);
     emit_word_store(sink, JF_GCMAP_OFS as u64);
@@ -6025,27 +6025,26 @@ fn build_function(
     // prefix and the LABEL-capture tail, not reserved chain-padding.
     // The nursery bump leaves `jf_gcmap` null and does not fill items, so
     // unused marked homes still hold recycled nursery bytes; those must
-    // be null before the map is published. A resume dispatch branches
-    // past this code, preserving captures written when the source loop
-    // first crossed the LABEL, and publishes in the resume loader.
-    // A home the input loop fills below needs no null first: its store follows
-    // immediately and nothing between the two allocates, so no collection can
-    // read the slot while it is stale. Homes no input fills keep their clear
-    // because store-on-def writes them only later.
-    // The loop below fills `entry_inputargs`, not every arg of the merged
-    // stream: an appended region's live-ins are stored by the guard-fail branch
-    // that reaches the region, which is nowhere near this entry. Marking those
-    // homes filled here would skip their clear and leave the collector reading
-    // an uninitialised slot.
-    let mut input_filled_home = vec![false; ref_homes.len()];
-    for ia in entry_inputargs {
-        if let Some(h) = ref_homes.home_id(ia.index) {
-            input_filled_home[h as usize] = true;
-        }
-    }
-    emit_null_home_slots(&mut sink, frame, 0..frame.home_slots as u64, |h| {
-        (h as usize) >= input_filled_home.len() || !input_filled_home[h as usize]
-    });
+    // be null before the map is published. Unmarked reserved padding is
+    // invisible to `jitframe_trace` and must not be cleared on every
+    // CALL_ASSEMBLER — that 128-slot fill is what still bound
+    // `fib_recursive`. A resume dispatch branches past this code,
+    // preserving captures written when the source loop first crossed
+    // the LABEL, and publishes in the resume loader.
+    // Null every slot the map about to be published marks. Skipping
+    // input-filled homes left recycled nursery words in a marked slot
+    // when the later store used a different home than `home_id` named
+    // (`recursive_call_frame_relocation` then copied an invalid
+    // type_id). The extra store per input Ref is lost in the noise
+    // next to the CALL_ASSEMBLER itself.
+    emit_null_home_slots(&mut sink, frame, 0..used_ordinary as u64, |_| true);
+    let label_base = frame.ordinary_home_slots() as u64;
+    emit_null_home_slots(
+        &mut sink,
+        frame,
+        label_base..label_base + used_labels as u64,
+        |_| true,
+    );
 
     // Load inputs from frame into locals, and store Ref inputs to their homes.
     // The input value lives at the frame slot its producer wrote it to: the
@@ -9009,13 +9008,13 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     sink.i64_store(mem64(FRAME_SLOT_BASE + arg_index as u64 * SLOT_SIZE));
                 }
-                // Homes are still recycled nursery bytes. Null the *callee*
-                // home range from the dispatch snapshot before installing
-                // that snapshot's gcmap. The caller module's FrameGeometry
-                // can disagree after `redirect_call_assembler`.
-                // No call sits between the input stores and this map, so a
-                // Ref argument cannot be collected while the map is still
-                // null. x86 writes the map at the first safepoint instead.
+                // Homes are still recycled nursery bytes. Null the callee
+                // home range from the dispatch snapshot and publish that
+                // snapshot's gcmap before `call_indirect`. A minor
+                // collection can fire in the callee
+                // (`recursive_call_frame_relocation`) while this frame is
+                // already on the shadow stack. Key-0 still skips unmarked
+                // frozen padding.
                 sink.local_get(ca_target_local);
                 sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HOME_SLOTS_OFS));
                 sink.if_(BlockType::Empty);

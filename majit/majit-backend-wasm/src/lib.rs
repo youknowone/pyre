@@ -4627,7 +4627,7 @@ impl majit_backend::Backend for WasmBackend {
                     .find(|(target_token, _)| *target_token == token.number)
                     .map(|(_, target)| target.callee_gcmap_ptr)
             })
-            .unwrap_or_else(|| Box::leak(build_callee_gcmap(compiled.frame)).as_ptr() as i64);
+            .unwrap_or(home_gcmap_ptr as i64);
         // The module has now acquired its host-appended shared-table slot and
         // its finish index. Publish those mutable pieces before exposing the
         // immutable geometry metadata: previously compiled CALL_ASSEMBLER
