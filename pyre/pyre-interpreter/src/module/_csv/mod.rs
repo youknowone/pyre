@@ -1077,9 +1077,11 @@ fn writer_writerow_impl(
     }
 
     rec.push_str(&cfg.lineterminator);
+    let rec_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(rec));
     crate::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(write_slot),
-        &[pyre_object::w_str_from_wtf8_managed(rec)],
+        &[pyre_object::gc_roots::shadow_stack_get(rec_slot)],
     )
 }
 

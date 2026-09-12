@@ -494,9 +494,10 @@ pub(crate) fn show_warning(
         && let Ok(write) = crate::baseobjspace::getattr_str(stderr, "write")
     {
         let write_slot = pin_root_slot(write);
+        let line_slot = pin_root_slot(pyre_object::w_str_from_wtf8_managed(line));
         crate::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(write_slot),
-            &[pyre_object::w_str_from_wtf8_managed(line)],
+            &[pyre_object::gc_roots::shadow_stack_get(line_slot)],
         )?;
         let source_line = pyre_object::gc_roots::shadow_stack_get(source_line_slot);
         let source_line = if source_line.is_null() || unsafe { is_none(source_line) } {

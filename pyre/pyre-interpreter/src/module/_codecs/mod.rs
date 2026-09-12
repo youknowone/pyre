@@ -441,10 +441,11 @@ fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             }
             let mut replacement = Wtf8Buf::new();
             replacement.push(CodePoint::from_u32(code).unwrap());
-            Ok(codec_result(
-                w_str_from_wtf8_managed(replacement),
-                w_int_new((exc.start + byte_len) as i64),
-            ))
+            let _roots = gc_roots::push_roots();
+            let repl_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(w_str_from_wtf8_managed(replacement));
+            let pos = w_int_new((exc.start + byte_len) as i64);
+            Ok(codec_result(gc_roots::shadow_stack_get(repl_slot), pos))
         }
         _ => Err(crate::PyError::type_error(
             "don't know how to handle exception in error callback",
@@ -486,10 +487,11 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if consumed == 0 {
                 return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
             }
-            Ok(codec_result(
-                w_str_from_wtf8_managed(replacement),
-                w_int_new((exc.start + consumed) as i64),
-            ))
+            let _roots = gc_roots::push_roots();
+            let repl_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(w_str_from_wtf8_managed(replacement));
+            let pos = w_int_new((exc.start + consumed) as i64);
+            Ok(codec_result(gc_roots::shadow_stack_get(repl_slot), pos))
         }
         _ => Err(crate::PyError::type_error(
             "don't know how to handle exception in error callback",

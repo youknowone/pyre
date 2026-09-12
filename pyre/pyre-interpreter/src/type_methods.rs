@@ -3234,8 +3234,20 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
     if let Some(meth) = unsafe { crate::baseobjspace::lookup(val, "__format__") }
         && (unsafe { is_instance(val) } || !unsafe { is_shared_builtin_format(val, meth) })
     {
-        let spec_obj = pyre_object::w_str_from_wtf8_managed(spec.to_wtf8_buf());
-        return call_format_dispatch(val, meth, spec_obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let val_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(val);
+        let meth_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(meth);
+        let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
+            spec.to_wtf8_buf(),
+        ));
+        return call_format_dispatch(
+            pyre_object::gc_roots::shadow_stack_get(val_slot),
+            pyre_object::gc_roots::shadow_stack_get(meth_slot),
+            pyre_object::gc_roots::shadow_stack_get(spec_slot),
+        );
     }
     if spec.is_empty() {
         // Empty spec collapses to `str(value)`, preserved in WTF-8 so a

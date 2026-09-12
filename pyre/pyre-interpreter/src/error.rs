@@ -2064,14 +2064,19 @@ impl PyError {
         hook_fields.push(w_type);
         hook_fields.push(w_value);
         hook_fields.push(w_tb);
+        // Pin the object before the managed first-line mint; the structseq
+        // field order is type, value, traceback, line, object.
+        hook_fields.push(w_object);
         hook_fields.push(if first_line.is_empty() {
             pyre_object::w_none()
         } else {
             pyre_object::w_str_from_wtf8_managed(first_line.clone())
         });
-        hook_fields.push(w_object);
-        let hook_args =
-            crate::_structseq::new_instance(unraisable_hook_args_type(), hook_fields.take());
+        let live = hook_fields.take();
+        let hook_args = crate::_structseq::new_instance(
+            unraisable_hook_args_type(),
+            vec![live[0], live[1], live[2], live[4], live[3]],
+        );
         if let Some(sys_mod) = crate::importing::get_interpreter_sys_module()
             && let Ok(w_hook) = crate::baseobjspace::getattr_str(sys_mod, "unraisablehook")
             && !w_hook.is_null()

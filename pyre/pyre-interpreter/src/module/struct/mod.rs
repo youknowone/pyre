@@ -1582,11 +1582,20 @@ crate::py_module! {
     functions: {
         // `iter_unpack(fmt, buffer)` — an iterator over the records.
         "iter_unpack" / 2 = |args| {
-            let fmt = format_to_string(args[0])?;
-            let size = parse_format(&fmt)?.calcsize()?;
             let _roots = pyre_object::gc_roots::push_roots();
-            let w_fmt = pyre_object::gc_roots::pin_root(w_str_new_managed(&fmt));
-            make_unpack_iter(w_fmt, size, args[1])
+            let fmt_obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(args[0]);
+            let buf_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(args[1]);
+            let fmt = format_to_string(pyre_object::gc_roots::shadow_stack_get(fmt_obj_slot))?;
+            let size = parse_format(&fmt)?.calcsize()?;
+            let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&fmt));
+            make_unpack_iter(
+                pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+                size,
+                pyre_object::gc_roots::shadow_stack_get(buf_slot),
+            )
         },
     },
     extra_init: |ns| {

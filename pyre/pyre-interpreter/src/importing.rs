@@ -4334,7 +4334,8 @@ pub fn appleveldef_install_seeded(
     }
     let w_app_globals = unsafe { (*ctx).fresh_module_globals() };
     let _root = pyre_object::gc_roots::push_roots();
-    let w_app_globals = pyre_object::gc_roots::pin_root(w_app_globals);
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_app_globals);
     // `gateway.py build_applevel_dict` binds the owning module's name into the
     // namespace before the source runs, so a `def` or a `class` in it answers
     // `__module__` with the module it belongs to rather than `None` for a
@@ -4343,15 +4344,23 @@ pub fn appleveldef_install_seeded(
     // name, or `"<parent>.<child>"` for a submodule.  A source that must be
     // seen under a different name -- the public spelling of an accelerator it
     // backs -- rebinds `__name__` itself, and that assignment runs later.
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(modname));
     unsafe {
         pyre_object::w_dict_setitem_str(
-            w_app_globals,
+            pyre_object::gc_roots::shadow_stack_get(globals_slot),
             "__name__",
-            pyre_object::w_str_new_managed(modname),
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
         )
     };
     for &(name, value) in seed {
-        unsafe { pyre_object::w_dict_setitem_str(w_app_globals, name, value) };
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                name,
+                value,
+            )
+        };
     }
     // `gateway.py ApplevelClass.hidden_applevel = True`, which
     // `build_applevel_dict` passes to `space.exec_` and the compiler carries as
@@ -4363,6 +4372,7 @@ pub fn appleveldef_install_seeded(
     // built in, and what it holds is an extension module on CPython — so none
     // of these frames are the running program's.
     let w_code = crate::pycode::box_code_object_with_hidden_applevel(code, true);
+    let w_app_globals = pyre_object::gc_roots::shadow_stack_get(globals_slot);
     let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
     // The source is a module body, so what it raises is the program's to see:
@@ -4372,7 +4382,12 @@ pub fn appleveldef_install_seeded(
     // name the file never binds -- stay panics.
     frame.run_with_jit()?;
     for &name in names {
-        match unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) } {
+        match unsafe {
+            pyre_object::w_dict_getitem_str(
+                pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                name,
+            )
+        } {
             Some(val) => ns.store(name, val),
             None => panic!("appleveldef `{filename}`: name `{name}` not bound by source"),
         }
