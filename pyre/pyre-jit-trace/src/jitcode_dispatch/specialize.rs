@@ -416,6 +416,12 @@ pub(crate) fn walker_guard_int_div_domain_if_exact<Sym: WalkSym>(
     }
     let la = unsafe { pyre_object::w_int_get_value(lhs_obj) };
     let rb = unsafe { pyre_object::w_int_get_value(rhs_obj) };
+    // `acc //= 0` on an except bridge: `int_eq(0, 0)` is ConstInt(1) and
+    // `GUARD_FALSE` of that is `InvalidLoop` ("proven to always fail").
+    // The raise is the domain check; do not emit it as a never-taken guard.
+    if rb == 0 {
+        return Ok(());
+    }
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr)?;
     let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr)?;
