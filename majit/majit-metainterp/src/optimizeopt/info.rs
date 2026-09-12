@@ -142,7 +142,8 @@ pub use majit_ir::ptr_info::reasonable_array_index;
 pub use majit_ir::ptr_info::{PtrInfo, StrPtrInfo};
 
 pub use majit_ir::ptr_info::{
-    StringConstantAllocator, StringContentResolver, StringLengthResolver,
+    CachedFieldList, StringConstantAllocator, StringContentResolver, StringLengthResolver,
+    VirtualFieldList,
 };
 
 /// Result of `OptContext::ensure_ptr_info_arg0(op)` — direct line-by-line
@@ -1261,7 +1262,7 @@ fn force_box_impl(
             // instead of MUST_ALIAS-eliding it against the preserved value.
             let preserved = PtrInfo::Struct(StructPtrInfo {
                 descr: vinfo.descr.clone(),
-                fields: Vec::new(),
+                fields: CachedFieldList::new(),
                 last_guard_pos: -1,
             });
             let mut new_op = Op::new(OpCode::New, &[]);

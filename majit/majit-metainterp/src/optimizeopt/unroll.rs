@@ -8598,11 +8598,11 @@ mod tests {
         ];
         let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
             .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
+            .map(|op| majit_ir::OpRc::new(op.clone()))
             .collect();
         let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
             .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
+            .map(|op| majit_ir::OpRc::new(op.clone()))
             .collect();
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
         let src = ctx.materialize_operand_at(OpRef::int_op(3));
@@ -8667,11 +8667,11 @@ mod tests {
         )];
         let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
             .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
+            .map(|op| majit_ir::OpRc::new(op.clone()))
             .collect();
         let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
             .iter()
-            .map(|op| std::rc::Rc::new(op.clone()))
+            .map(|op| majit_ir::OpRc::new(op.clone()))
             .collect();
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
         let src = ctx.materialize_operand_at(OpRef::input_arg_int(100));

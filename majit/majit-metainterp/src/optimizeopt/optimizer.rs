@@ -827,7 +827,7 @@ impl Optimizer {
                 fields,
                 field_descrs,
             } => {
-                let mut imported_fields = Vec::new();
+                let mut imported_fields = majit_ir::ptr_info::VirtualFieldList::new();
                 for (field_idx, field_info) in fields {
                     let field_ref = Self::import_virtual_state_value(field_info, ctx);
                     // ob_type (offset 0) class pointers — the exporter at
@@ -890,7 +890,7 @@ impl Optimizer {
                 fields,
                 field_descrs,
             } => {
-                let mut imported_fields = Vec::new();
+                let mut imported_fields = majit_ir::ptr_info::VirtualFieldList::new();
                 for (field_idx, field_info) in fields {
                     let field_ref = Self::import_virtual_state_value(field_info, ctx);
                     imported_fields.push((*field_idx, ctx.materialize_operand_at(field_ref)));
@@ -1206,7 +1206,7 @@ impl Optimizer {
             match &entry.kind {
                 ImportedVirtualKind::Instance { known_class } => {
                     if let Some(b) = &head_box {
-                        let fields: Vec<(u32, Operand)> = entry
+                        let fields: majit_ir::ptr_info::VirtualFieldList = entry
                             .fields
                             .iter()
                             .map(|(i, r)| (*i, ctx.materialize_operand_at(*r)))
@@ -1228,7 +1228,7 @@ impl Optimizer {
                 }
                 ImportedVirtualKind::Struct => {
                     if let Some(b) = &head_box {
-                        let fields: Vec<(u32, Operand)> = entry
+                        let fields: majit_ir::ptr_info::VirtualFieldList = entry
                             .fields
                             .iter()
                             .map(|(i, r)| (*i, ctx.materialize_operand_at(*r)))
@@ -1313,7 +1313,7 @@ impl Optimizer {
                 // unconditionally — a bare position resolves to `None` and
                 // would silently drop the imported virtual-ness.
                 let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
-                let imported_fields: Vec<(u32, Operand)> = fields
+                let imported_fields: majit_ir::ptr_info::VirtualFieldList = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
                         let field_ref = Self::import_virtual_state_from_label_args_recurse(
@@ -7639,7 +7639,7 @@ mod tests {
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(1, rooted_resop_operand(Type::Int, 11))],
+                fields: vec![(1, rooted_resop_operand(Type::Int, 11))].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -7652,7 +7652,7 @@ mod tests {
             &b20,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: Vec::new(),
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -7704,7 +7704,7 @@ mod tests {
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(0, field_value)],
+                fields: vec![(0, field_value)].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),

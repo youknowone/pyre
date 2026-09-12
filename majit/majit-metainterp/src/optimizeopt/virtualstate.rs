@@ -3443,7 +3443,7 @@ mod tests {
             &struct_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: test_descr(21),
-                fields: vec![(0, Operand::None), (1, written_box)],
+                fields: vec![(0, Operand::None), (1, written_box)].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3485,7 +3485,7 @@ mod tests {
             &b11,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![],
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3521,7 +3521,7 @@ mod tests {
             &b21,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![],
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3673,7 +3673,7 @@ mod tests {
             &outer_a_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(0, inner_field_op.clone())],
+                fields: vec![(0, inner_field_op.clone())].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3682,7 +3682,7 @@ mod tests {
             &outer_b_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![(0, inner_field_op.clone())],
+                fields: vec![(0, inner_field_op.clone())].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3756,7 +3756,7 @@ mod tests {
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![(0, Operand::None), (8, field_value_op.clone())],
+                fields: vec![(0, Operand::None), (8, field_value_op.clone())].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3815,7 +3815,7 @@ mod tests {
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![],
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3857,7 +3857,7 @@ mod tests {
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![],
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),

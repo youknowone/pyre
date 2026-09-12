@@ -6378,7 +6378,9 @@ impl OptContext {
     /// `_get_info`/`_get_array_info` half is `const_infos.entry(...)`
     /// (RPython: `optheap.const_infos[ref]`).
     fn copy_fields_to_const(&mut self, source: OpRef, gcref: majit_ir::GcRef) {
-        use crate::optimizeopt::info::{ArrayPtrInfo, FieldEntry, PtrInfo, StructPtrInfo};
+        use crate::optimizeopt::info::{
+            ArrayPtrInfo, CachedFieldList, FieldEntry, PtrInfo, StructPtrInfo,
+        };
         // `source` is always chain-walked by the caller (`make_constant`),
         // so peek's chain
         // walk is a no-op — owned PtrInfo clone here matches the prior
@@ -6399,7 +6401,7 @@ impl OptContext {
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
-                        fields: Vec::new(),
+                        fields: CachedFieldList::new(),
 
                         last_guard_pos: -1,
                     })
@@ -6414,7 +6416,7 @@ impl OptContext {
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
-                        fields: Vec::new(),
+                        fields: CachedFieldList::new(),
 
                         last_guard_pos: -1,
                     })
@@ -6425,7 +6427,7 @@ impl OptContext {
             }
             PtrInfo::Virtual(v) if !v.fields.is_empty() => {
                 let descr = v.descr.clone();
-                let fields: Vec<(u32, FieldEntry)> = v
+                let fields: CachedFieldList = v
                     .fields
                     .iter()
                     .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
@@ -6433,7 +6435,7 @@ impl OptContext {
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
-                        fields: Vec::new(),
+                        fields: CachedFieldList::new(),
 
                         last_guard_pos: -1,
                     })
@@ -6444,7 +6446,7 @@ impl OptContext {
             }
             PtrInfo::VirtualStruct(v) if !v.fields.is_empty() => {
                 let descr = v.descr.clone();
-                let fields: Vec<(u32, FieldEntry)> = v
+                let fields: CachedFieldList = v
                     .fields
                     .iter()
                     .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
@@ -6452,7 +6454,7 @@ impl OptContext {
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
-                        fields: Vec::new(),
+                        fields: CachedFieldList::new(),
 
                         last_guard_pos: -1,
                     })
@@ -10289,7 +10291,7 @@ mod boxref_forwarding_tests {
             descr: std::sync::Arc::new(DummySizeDescr),
             known_class: None,
             ob_type_descr: None,
-            fields: Vec::new(),
+            fields: Default::default(),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
@@ -11840,7 +11842,7 @@ mod opt_box_env_tests {
                 descr: Arc::new(DummySizeDescr),
                 known_class: Some(0x1234),
                 ob_type_descr: None,
-                fields: Vec::new(),
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),

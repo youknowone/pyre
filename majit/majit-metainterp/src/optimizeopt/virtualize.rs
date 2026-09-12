@@ -400,7 +400,7 @@ impl OptVirtualize {
             descr,
             known_class,
             ob_type_descr: None,
-            fields: Vec::new(),
+            fields: majit_ir::ptr_info::VirtualFieldList::new(),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
@@ -418,7 +418,7 @@ impl OptVirtualize {
         let descr = op.getdescr().expect("NEW needs descr");
         let vinfo = VirtualStructInfo {
             descr,
-            fields: Vec::new(),
+            fields: majit_ir::ptr_info::VirtualFieldList::new(),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
@@ -1634,7 +1634,7 @@ impl OptVirtualize {
         // virtualize.py: make_virtual(c_cls, newop, vref_descr)
         // → InstancePtrInfo(descr, known_class, is_virtual=True)
         let known_class = Some(crate::virtualref::JIT_VIRTUAL_REF_VTABLE as i64);
-        let fields = vec![
+        let fields = majit_ir::ptr_info::VirtualFieldList::from_iter([
             (
                 VREF_VIRTUAL_TOKEN_FIELD_INDEX,
                 ctx.materialize_operand_at(token_ref),
@@ -1643,7 +1643,7 @@ impl OptVirtualize {
                 VREF_FORCED_FIELD_INDEX,
                 ctx.materialize_operand_at(null_ref),
             ),
-        ];
+        ]);
         // info.py:175-188 stores no fielddescr side-list; the SizeDescr
         // (VRefSizeDescr.all_fielddescrs) is the authoritative view.
         let vinfo = VirtualInfo {
@@ -2594,7 +2594,7 @@ fn field_slot_identifies(descr: &DescrRef, field_idx: u32, field: &dyn FieldDesc
         .is_some_and(|slot| slot_holds_field(slot.as_ref(), field))
 }
 
-fn set_field(fields: &mut Vec<(u32, Operand)>, field_idx: u32, value: Operand) {
+fn set_field(fields: &mut majit_ir::ptr_info::VirtualFieldList, field_idx: u32, value: Operand) {
     for entry in fields.iter_mut() {
         if entry.0 == field_idx {
             entry.1 = value.clone();
