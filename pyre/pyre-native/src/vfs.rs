@@ -117,7 +117,6 @@ mod tests {
             "encodings/__init__.py",
             "encodings/aliases.py",
             "encodings/utf_8.py",
-            "importlib/_bootstrap.py",
             "ipaddress.py",
             "random.py",
             "pathlib/__init__.py",
