@@ -15615,14 +15615,45 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
 
     // --- emit the specialized IR (walker-native) ---
     walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
-    let arg_op = r_args[2];
+    walker_emit_jit_int_str(ctx, op.pc, r_args[2], boxed_result, dst)?;
+    Ok(Some(()))
+}
+
+/// Guard exact `int`, unbox, and emit `jit_int_str` + `GuardNoException`.
+/// Shared by [`try_walker_specialize_str_call`] and the FORMAT_SIMPLE int arm.
+///
+/// `EF_CAN_RAISE`, matching the helper's `#[dont_look_inside]` and NOT
+/// an elidable effect.  `descr_repr` (intobject.py) splits the render
+/// from the wrapper — `str(self.intval)` is the `@jit.elidable`
+/// `ll_int2dec` and `space.newutf8(res, len(res))` is a plain
+/// allocation — while this helper performs both in one call.  Recording
+/// the pair pure let the pure pass share one call between two `str(i)`
+/// sites on the same operand, and `is_w` gives a `str` of `_len() > 1`
+/// storage identity, so a compiled loop answered `str(i) is str(i)`
+/// True where the interpreter, pypy3 and CPython all answer False.
+/// Recovering the elidable half needs the render and the wrapper split
+/// into two ops, the shape `emit_box_long_inline` already gives the
+/// bigint arms.
+///
+/// The read/write sets stay empty: the call allocates and touches no
+/// field the trace has cached.  Concrete is set before the guard: the
+/// guard captures a resume snapshot, and a `raw` with no value yet is
+/// recorded into it without one.
+fn walker_emit_jit_int_str<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    boxed_result: pyre_object::PyObjectRef,
+    dst: usize,
+) -> Result<(), DispatchError> {
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op.pc, arg_op, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op.pc, arg_op, int_typeobj)?;
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    walker_guard_class(ctx, op_pc, operand, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, operand, int_typeobj)?;
     let int_raw = walker_unbox_int_typed(
         ctx,
-        op.pc,
-        arg_op,
+        op_pc,
+        operand,
         int_type_addr,
         crate::descr::int_intval_descr(),
     )?;
@@ -15633,35 +15664,18 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
         &[int_raw],
         &[majit_ir::Type::Int],
         majit_ir::Type::Ref,
-        // `EF_CAN_RAISE`, matching the helper's `#[dont_look_inside]` and NOT
-        // an elidable effect.  `descr_repr` (intobject.py) splits the render
-        // from the wrapper — `str(self.intval)` is the `@jit.elidable`
-        // `ll_int2dec` and `space.newutf8(res, len(res))` is a plain
-        // allocation — while this helper performs both in one call.  Recording
-        // the pair pure let the pure pass share one call between two `str(i)`
-        // sites on the same operand, and `is_w` gives a `str` of `_len() > 1`
-        // storage identity, so a compiled loop answered `str(i) is str(i)`
-        // True where the interpreter, pypy3 and CPython all answer False.
-        // Recovering the elidable half needs the render and the wrapper split
-        // into two ops, the shape `emit_box_long_inline` already gives the
-        // bigint arms.
-        //
-        // The read/write sets stay empty: the call allocates and touches no
-        // field the trace has cached.
         majit_ir::EffectInfo::const_new(
             majit_ir::ExtraEffect::CanRaise,
             majit_ir::OopSpecIndex::None,
         ),
     );
-    // Concrete before the guard: the guard captures a resume snapshot, and a
-    // `raw` with no value yet is recorded into it without one.
     ctx.trace_ctx.set_opref_concrete(
         raw,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
     );
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
-    Ok(Some(()))
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', raw)?;
+    Ok(())
 }
 
 /// FORMAT_SIMPLE (`f"{x}"` / empty-spec `format`) on an exact `int` or
@@ -15669,11 +15683,11 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
 /// the opaque `bh_format_simple_fn` residual.
 ///
 /// `format_w` with an empty spec is identity for an exact `str` (`format(s,
-/// "") is s`) and `str(i)` for an exact `int`. The `str(i)` arm reuses
-/// [`try_walker_specialize_str_call`]'s `jit_int_str` emit so the two
-/// call sites share one helper. A bool, subclass, long, or anything with a
-/// Python `__format__` declines to the residual (SAFE); `FormatWithSpec`
-/// already inlines a Python `__format__` when a spec operand is present.
+/// "") is s`) and `str(i)` for an exact `int`. The `str(i)` arm goes through
+/// [`walker_emit_jit_int_str`], the same emit [`try_walker_specialize_str_call`]
+/// uses. A bool, subclass, long, or anything with a Python `__format__`
+/// declines to the residual (SAFE); `FormatWithSpec` already inlines a
+/// Python `__format__` when a spec operand is present.
 pub(crate) fn try_walker_specialize_format_simple<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -15722,34 +15736,7 @@ pub(crate) fn try_walker_specialize_format_simple<Sym: WalkSym>(
     if !renders_the_same {
         return Ok(None);
     }
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op.pc, value, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op.pc, value, int_typeobj)?;
-    let int_raw = walker_unbox_int_typed(
-        ctx,
-        op.pc,
-        value,
-        int_type_addr,
-        crate::descr::int_intval_descr(),
-    )?;
-    let helper = pyre_object::unicodeobject::jit_int_str as *const ();
-    let raw = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallR,
-        helper,
-        &[int_raw],
-        &[majit_ir::Type::Int],
-        majit_ir::Type::Ref,
-        majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::CanRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        raw,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
-    );
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
+    walker_emit_jit_int_str(ctx, op.pc, value, boxed_result, dst)?;
     Ok(Some(()))
 }
 
