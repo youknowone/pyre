@@ -977,8 +977,25 @@ impl OptHeap {
             .fielddescr()
             .as_field_descr()
             .is_some_and(|f| f.is_w_class());
-        if struct_ptr != qmutdescr.struct_ptr() && !shared_w_class_watcher {
-            return false;
+        if struct_ptr != qmutdescr.struct_ptr() {
+            if !shared_w_class_watcher {
+                return false;
+            }
+            // Same watcher, different object: accept only when this
+            // object's class still matches the folded constant. Otherwise
+            // a polymorphic replacement would keep A's class on B.
+            let Some(constantfieldbox) = qmutdescr.constantfieldbox() else {
+                return false;
+            };
+            let Some(currentbox) = ctx
+                .get_runtime_field(obj, qmutdescr.fielddescr())
+                .and_then(|r| r.inline_const_to_value())
+            else {
+                return false;
+            };
+            if currentbox != constantfieldbox {
+                return false;
+            }
         }
         if !qmutdescr.qmut().is_current() {
             return false;
