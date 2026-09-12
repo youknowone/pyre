@@ -2320,8 +2320,9 @@ fn call_callable_with_mode(
     if unsafe { pyre_object::is_type(callable) } && args.len() == 1 {
         let value = call_type_one_arg(execution_context, callable, args[0]);
         if value.is_null() {
-            return Err(take_call_error()
-                .unwrap_or_else(|| PyError::type_error("constructor failed")));
+            return Err(
+                take_call_error().unwrap_or_else(|| PyError::type_error("constructor failed"))
+            );
         }
         return Ok(value);
     }
@@ -2364,12 +2365,7 @@ pub fn call_type_one_arg(
     w_type: PyObjectRef,
     w_arg: PyObjectRef,
 ) -> PyObjectRef {
-    match type_descr_call_with_mode(
-        execution_context,
-        w_type,
-        &[w_arg],
-        CallMode::Plain,
-    ) {
+    match type_descr_call_with_mode(execution_context, w_type, &[w_arg], CallMode::Plain) {
         Ok(value) => value,
         Err(err) => {
             set_call_error(err);

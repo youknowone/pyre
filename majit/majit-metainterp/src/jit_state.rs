@@ -567,9 +567,7 @@ pub trait JitState: Sized {
     /// section. Those live in the process-global build-time table, not
     /// in `staticdata.jitcodes`, until a `#[jit_interp]` frontend
     /// registers its dispatch JitCode. The default is "no other table".
-    fn jitcode_at_resume_index(
-        _index: i32,
-    ) -> Option<std::sync::Arc<crate::jitcode::JitCode>> {
+    fn jitcode_at_resume_index(_index: i32) -> Option<std::sync::Arc<crate::jitcode::JitCode>> {
         None
     }
 

@@ -3375,7 +3375,8 @@ impl TraceCtx {
         if shadow_data_len < static_count {
             return;
         }
-        let shadow_prefix: Vec<majit_ir::Value> = values.iter().take(static_count).copied().collect();
+        let shadow_prefix: Vec<majit_ir::Value> =
+            values.iter().take(static_count).copied().collect();
         let field_meta: Vec<(majit_ir::Type, String)> = info
             .static_fields
             .iter()
@@ -4002,7 +4003,11 @@ impl TraceCtx {
         else {
             return;
         };
-        let Some(shadow) = self.virtualizable_values.as_ref().and_then(|v| v.get(vsd_idx)).copied()
+        let Some(shadow) = self
+            .virtualizable_values
+            .as_ref()
+            .and_then(|v| v.get(vsd_idx))
+            .copied()
         else {
             return;
         };
@@ -5120,9 +5125,10 @@ impl TraceCtx {
                 Some(Value::Ref(r)) => r.0 as i64,
                 _ => 0,
             };
-            if let (Some(info), Some(heap_ptr)) =
-                (self.virtualizable_info.as_ref(), self.virtualizable_heap_ptr)
-                && heap != 0
+            if let (Some(info), Some(heap_ptr)) = (
+                self.virtualizable_info.as_ref(),
+                self.virtualizable_heap_ptr,
+            ) && heap != 0
                 && heap as usize == heap_ptr as usize
                 && let Some(idx) = info.static_field_by_descr(&fielddescr)
             {

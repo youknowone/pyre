@@ -4593,12 +4593,7 @@ where
                         }
                         _ => majit_ir::Value::Int(concrete),
                     };
-                    ctx.sync_shadow_if_vable_heap_store(
-                        struct_ptr,
-                        offset,
-                        value_opref,
-                        shadow,
-                    );
+                    ctx.sync_shadow_if_vable_heap_store(struct_ptr, offset, value_opref, shadow);
                 }
             }
             jitcode::insns::BC_RAW_STORE_I => {
