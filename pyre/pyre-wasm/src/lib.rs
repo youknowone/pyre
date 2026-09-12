@@ -156,13 +156,12 @@ mod residual_host {
     /// The generic path below must reflect the callee's wasm type in the host:
     /// an `r` argument may be a real `i32` pointer, a void descriptor may name
     /// a word-returning target, and guessing either signature traps at a wasm
-    /// `call_indirect`.  These targets are different: each word-returning entry
-    /// is declared as an explicit `pub extern "C" fn(i64, ...) -> i64` wrapper,
-    /// while the one true-void initializer is matched separately at arity zero.
-    /// The CPU function table stores those exact function addresses. Comparing
-    /// the table index (`fn as usize` on wasm32) therefore proves both the
-    /// callee identity and its ABI. Calling the named function directly matches
-    /// the native blackhole dispatch while avoiding a guest -> host -> guest
+    /// `call_indirect`.  These targets are different: every one is declared as
+    /// an explicit `pub extern "C" fn(i64, ...) -> i64` wrapper, and the CPU
+    /// function table stores those exact function addresses.  Comparing the
+    /// table index (`fn as usize` on wasm32) therefore proves both the callee
+    /// identity and its ABI.  Calling the named wrapper directly matches the
+    /// native blackhole dispatch while avoiding a guest -> host -> guest
     /// reflection round-trip.
     ///
     /// Keep this an exact-function allow-list, not a signature inference: the
@@ -175,13 +174,6 @@ mod residual_host {
     /// remaining crossing arrives on this path (`src=host`) rather than from a
     /// compiled trace; these are its heaviest callees.
     fn direct_uniform_i64_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
-        if args.is_empty()
-            && func_ptr == pyre_object::pyobject::ensure_object_subclass_ranges_initialized as usize
-        {
-            pyre_object::pyobject::ensure_object_subclass_ranges_initialized();
-            return Some(0);
-        }
-
         macro_rules! uniform_i64_allow_list {
             ($( [$($arg:ident),*] => $callee:path ),* $(,)?) => {
                 match args {
