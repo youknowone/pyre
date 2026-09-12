@@ -3376,18 +3376,25 @@ impl TraceCtx {
             return;
         }
         let shadow_prefix: Vec<majit_ir::Value> = values.iter().take(static_count).copied().collect();
-        let field_types: Vec<majit_ir::Type> = info
+        let field_meta: Vec<(majit_ir::Type, String)> = info
             .static_fields
             .iter()
             .take(static_count)
-            .map(|f| f.field_type)
+            .map(|f| (f.field_type, f.name.clone()))
             .collect();
-        let mut flush: Vec<(usize, majit_ir::Value)> = Vec::new();
-        for (i, (ty, value)) in field_types.iter().zip(shadow_prefix.iter()).enumerate() {
+        for (i, ((ty, name), value)) in field_meta.iter().zip(shadow_prefix.iter()).enumerate() {
             let bits = unsafe { info.read_field(heap_ptr, i) };
             let heap = crate::pyjitpl::heap_value_for_pub(*ty, bits);
-            if *value != heap {
-                flush.push((i, *value));
+            if *value != heap && name != "last_instr" && name != "valuestackdepth" {
+                // last_instr: SETFIELD_VABLE owns the shadow; the
+                // portal passes it to dispatch as a word.
+                // valuestackdepth: dispatch's `frame.push` writes the
+                // heap; the shadow is refreshed after that residual.
+                debug_assert_eq!(
+                    *value, heap,
+                    "virtualizable static {name} diverged from the \
+                     shadow: a vable write did not update virtualizable_boxes",
+                );
             }
         }
         let mut cursor = static_count;
@@ -3408,12 +3415,6 @@ impl TraceCtx {
                      shadow: a vable write did not update virtualizable_boxes",
                 );
                 cursor += 1;
-            }
-        }
-        for (i, shadow) in flush {
-            let bits = value_to_raw_bits(shadow);
-            unsafe {
-                info.write_field(heap_ptr as *mut u8, i, bits);
             }
         }
     }
@@ -3975,6 +3976,69 @@ impl TraceCtx {
             }
         }
         false
+    }
+
+    /// After `dispatch_exception_handler` (`dont_look_inside_cannot_raise`)
+    /// `frame.push`es the caught exception, the heap vsd/stack have moved
+    /// and the vable shadow has not. Copy only those slots. A full
+    /// [`Self::load_fields_from_virtualizable`] also reloads `last_instr`
+    /// from the heap (often 0) and runs after every cannot_raise CallI
+    /// whose last_instr shadow is newer than the heap.
+    pub fn reload_vable_stack_if_heap_moved(&mut self) {
+        let (Some(info), Some(ptr)) = (
+            self.virtualizable_info().cloned(),
+            self.standard_virtualizable_ptr(),
+        ) else {
+            return;
+        };
+        if ptr == 0 {
+            return;
+        }
+        let heap_ptr = ptr as *const u8;
+        let Some(vsd_idx) = info
+            .static_fields
+            .iter()
+            .position(|f| f.name == "valuestackdepth")
+        else {
+            return;
+        };
+        let Some(shadow) = self.virtualizable_values.as_ref().and_then(|v| v.get(vsd_idx)).copied()
+        else {
+            return;
+        };
+        let bits = unsafe { info.read_field(heap_ptr, vsd_idx) };
+        let heap = crate::pyjitpl::heap_value_for_pub(info.static_fields[vsd_idx].field_type, bits);
+        if shadow == heap {
+            return;
+        }
+        let vsd_box = self.const_int(bits);
+        self.set_virtualizable_entry_at(vsd_idx, vsd_box, heap);
+        let lengths = self
+            .virtualizable_array_lengths()
+            .map(|lengths| lengths.to_vec())
+            .unwrap_or_default();
+        let mut cursor = info.num_static_extra_boxes;
+        for (a_idx, &length) in lengths.iter().enumerate() {
+            if a_idx >= info.array_fields.len() {
+                break;
+            }
+            let ty = info.array_fields[a_idx].item_type;
+            for item_idx in 0..length {
+                let item_bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
+                let item_val = crate::pyjitpl::heap_value_for_pub(ty, item_bits);
+                let item_box = match ty {
+                    majit_ir::Type::Int => self.const_int(item_bits),
+                    majit_ir::Type::Ref => self.const_ref(item_bits),
+                    majit_ir::Type::Float => self.const_float(item_bits),
+                    majit_ir::Type::Void => {
+                        cursor += 1;
+                        continue;
+                    }
+                };
+                self.set_virtualizable_entry_at(cursor, item_box, item_val);
+                cursor += 1;
+            }
+        }
     }
 
     pub fn load_fields_from_virtualizable(
