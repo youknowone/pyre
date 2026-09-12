@@ -3853,12 +3853,10 @@ fn call_assembler_guard_failure_inner(
     // into garbage-frame territory.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let guard_exc = grab_exc_value_from_jf_ptr(frame_ptr as usize);
-        let savedata = get_savedata_from_jf_ptr(frame_ptr as usize);
         if let Some(result) = bh_fn(
             fail_descr_ptr as usize,
             frame_ptr as *mut majit_backend::jitframe::JitFrame,
             guard_exc,
-            savedata,
         ) {
             // warmspot.py:988-996: DoneWithThisFrame{Int,Ref,Float} returns
             // e.result as-is. warmspot.py:982: ContinueRunningNormally
