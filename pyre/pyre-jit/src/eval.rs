@@ -482,6 +482,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.w_name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.w_qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut t.w_doc as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // `name` points at a GC-managed leaf storage box (`String`, off-GC storage
     // epic S5) for a mortal heap type; forward the field slot so a major GC greys
     // the box, and the box tid's drop glue reclaims the buffer on sweep. An
@@ -11140,7 +11141,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
-            raw_values,
+            majit_backend::FailArgSource::from(raw_values),
             Some(&storage.rd_pendingfields),
             Some(&storage.rd_virtuals),
             Some(exit_layout.exit_types.as_slice()),
@@ -16735,7 +16736,7 @@ mod tests {
                 .expect("branch guard should be recorded")
                 .clone();
             assert_eq!(guard.opcode, OpCode::GuardTrue);
-            let snapshot_id = guard.rd_resume_position.get();
+            let snapshot_id = guard.rd_resume_position();
             assert!(
                 snapshot_id >= 0,
                 "branch guard must carry rd_resume_position pointing at its captured snapshot",
@@ -16875,7 +16876,7 @@ mod tests {
             .expect("guard op should be present")
             .clone();
         assert_eq!(guard.opcode, OpCode::GuardTrue);
-        let snapshot_id = guard.rd_resume_position.get();
+        let snapshot_id = guard.rd_resume_position();
         assert!(
             snapshot_id >= 0,
             "guard must carry rd_resume_position pointing at its captured snapshot",

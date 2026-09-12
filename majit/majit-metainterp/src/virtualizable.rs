@@ -553,6 +553,13 @@ impl VirtualizableInfo {
     /// rooted Ref slot that points at the object; old virtualizables need their
     /// young array fields exposed explicitly.
     pub fn push_resume_ref_roots_for_value(&self, value: i64) {
+        // `without_vable_token` machines are stack-resident state fields
+        // with no heap array pointer fields. The type-id / `gc_owns_object`
+        // probes below only exist to expose those arrays on an *old*
+        // virtualizable; skip them when the machine cannot have one.
+        if !self.has_vable_token() {
+            return;
+        }
         let Some(parent) = &self.parent_descr else {
             return;
         };
@@ -3034,6 +3041,10 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         VirtualizableInfo::push_resume_ref_roots_for_value(self, value);
     }
 
+    fn has_vable_token(&self) -> bool {
+        VirtualizableInfo::has_vable_token(self)
+    }
+
     fn push_resume_ref_roots_for_registers(&self, registers_r: &[i64]) {
         VirtualizableInfo::push_resume_ref_roots_for_registers(self, registers_r);
     }
@@ -3557,6 +3568,14 @@ mod bh_clear_vable_token_inert_token_protocol {
         unsafe { bh_clear_vable_token(&info, p) };
         assert_eq!(probe.first, 0xDEAD_BEEF, "offset-0 field must be untouched");
         assert_eq!(probe.token, 0x1234, "unrelated word must be untouched");
+    }
+
+    #[test]
+    fn resume_ref_root_probe_skips_without_vable_token() {
+        let info = VirtualizableInfo::without_vable_token();
+        // A no-token machine has no heap array fields. The probe must
+        // return without treating the payload as a GC object.
+        info.push_resume_ref_roots_for_value(0x10);
     }
 
     // A real GC virtualizable keeps `token_offset > 0` (offset 0 is its type

@@ -65,7 +65,7 @@ pub struct BridgeData {
     /// `CompiledLoop::fail_descr_cells`).  Each cell pins the strong
     /// refcount the JIT-baked `jf_descr` address relies on for
     /// `Arc::from_raw` recovery (`majit_ir::recover_fail_descr_cell`).
-    pub fail_descr_cells: Box<[Arc<majit_ir::FailDescrCell>]>,
+    pub fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]>,
     /// Number of input arguments the bridge expects.
     /// Set to parent guard's fail_arg count (not optimizer-reduced count)
     /// so execute_bridge passes all parent outputs and indices align.

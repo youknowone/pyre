@@ -37,7 +37,7 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArg], ops: &mut Vec<Op>)
     let produced: std::collections::HashSet<u32> = ops
         .iter()
         .filter_map(|op| {
-            let r = op.pos.get();
+            let r = op.pos().get();
             (!r.is_none() && !r.is_constant()).then_some(r.raw())
         })
         .chain(inputargs.iter().map(|ia| ia.index))
@@ -74,9 +74,9 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArg], ops: &mut Vec<Op>)
             matches!(
                 op.opcode,
                 OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcF
-            ) && op.pos.get() != OpRef::NONE
-                && !op.pos.get().is_constant()
-                && op.pos.get().raw() == raw
+            ) && op.pos().get() != OpRef::NONE
+                && !op.pos().get().is_constant()
+                && op.pos().get().raw() == raw
         }) else {
             continue;
         };
@@ -112,7 +112,7 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArg], ops: &mut Vec<Op>)
             OpCode::GetarrayitemGcF => Type::Float,
             _ => Type::Ref,
         };
-        load.pos.set(OpRef::op_typed(raw, result_ty));
+        load.pos().set(OpRef::op_typed(raw, result_ty));
         loads.push(load);
     }
     if !loads.is_empty() {
@@ -209,7 +209,7 @@ impl ValueLocals {
             );
         }
         for op in ops {
-            let result = op.pos.get();
+            let result = op.pos().get();
             if result != OpRef::NONE && !result.is_constant() {
                 Self::mark(
                     &mut by_id,
@@ -289,7 +289,7 @@ impl ValueLocals {
             ) {
                 continue;
             }
-            let result = op.pos.get();
+            let result = op.pos().get();
             let source = op.arg(0).to_opref();
             if result == OpRef::NONE
                 || result.is_constant()
@@ -431,7 +431,8 @@ pub struct FrameGeometry {
     /// resume-at-LABEL live-ins.  Ordinary per-trace Ref homes grow upward
     /// from `home_slot_base`; these captures grow from the frozen boundary and
     /// therefore survive execution of a chained bridge, whose own home map may
-    /// use the low slots.  The whole home region remains covered by jf_gcmap.
+    /// use the low slots.  The published `jf_gcmap` marks the used ordinary
+    /// prefix plus these captures, not the unused reserved tail.
     pub label_ref_slots: usize,
     /// Start of the GUARD_NOT_FORCED(_2) failarg spill area. It contains one
     /// i64 slot per value slot and is disjoint from exits, dispatch, homes and
@@ -1254,7 +1255,7 @@ impl RefValues {
             }
         }
         for op in ops {
-            let r = op.pos.get();
+            let r = op.pos().get();
             if r != OpRef::NONE && !r.is_constant() && op.result_type() == Type::Ref {
                 Self::mark(&mut by_id, r.raw());
             }
@@ -1319,7 +1320,7 @@ impl RefHomes {
             }
         }
         for op in ops {
-            let r = op.pos.get();
+            let r = op.pos().get();
             if r != OpRef::NONE
                 && !r.is_constant()
                 && op.result_type() == Type::Ref
@@ -1478,7 +1479,7 @@ impl LabelResumeData {
             }
         }
         for op in ops {
-            let r = op.pos.get();
+            let r = op.pos().get();
             if r != OpRef::NONE
                 && !r.is_constant()
                 && let Some(v) = has_producer.get_mut(r.raw() as usize)
@@ -1555,7 +1556,7 @@ impl LabelResumeData {
                 }
             }
             for op in &ops[..label_pos] {
-                let r = op.pos.get();
+                let r = op.pos().get();
                 if r != OpRef::NONE
                     && !r.is_constant()
                     && let Some(v) = defined_before.get_mut(r.raw() as usize)
@@ -1614,7 +1615,7 @@ impl LabelResumeData {
                         }
                     }
                 }
-                let r = op.pos.get();
+                let r = op.pos().get();
                 if r != OpRef::NONE
                     && !r.is_constant()
                     && let Some(v) = available.get_mut(r.raw() as usize)
@@ -1720,6 +1721,41 @@ pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
 /// Number of high GC-rooted homes reserved exclusively for LABEL live-ins.
 pub fn label_ref_capture_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     LabelResumeData::collect(inputargs, ops).ref_slots
+}
+
+/// Mark the homes this module initializes: the used ordinary prefix and the
+/// LABEL-capture tail. Frozen geometry reserves extra ordinary slots so a
+/// later bridge can fit; those unused reserved words stay unmarked so
+/// recycled nursery bytes are not traced. assembler.py writes `jf_gcmap`
+/// for live slots only.
+pub(crate) fn build_home_gcmap(
+    frame: FrameGeometry,
+    used_ordinary: usize,
+    used_labels: usize,
+) -> Box<[usize]> {
+    let sign = std::mem::size_of::<isize>();
+    let bits_per_word = std::mem::size_of::<usize>() * 8;
+    let ordinary = used_ordinary.min(frame.ordinary_home_slots());
+    let label_base = frame.ordinary_home_slots();
+    let label_n = used_labels.min(frame.label_ref_slots);
+    if ordinary == 0 && label_n == 0 {
+        // One empty data word: a non-null jf_gcmap that traces nothing.
+        return vec![1usize, 0usize].into_boxed_slice();
+    }
+    let last_h = if label_n == 0 {
+        ordinary.saturating_sub(1)
+    } else {
+        label_base + label_n - 1
+    };
+    let last_index = (frame.home_slot_base as usize + last_h * 8) / sign;
+    let num_words = last_index / bits_per_word + 1;
+    let mut buf = vec![0usize; 1 + num_words];
+    buf[0] = num_words;
+    for h in (0..ordinary).chain(label_base..label_base + label_n) {
+        let index = (frame.home_slot_base as usize + h * 8) / sign;
+        buf[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
+    }
+    buf.into_boxed_slice()
 }
 
 /// First free value position — one past the highest id any value reference in
@@ -1837,7 +1873,7 @@ fn same_as_forwardings(ops: &[Op], num_vars: u32) -> Vec<Option<OpRef>> {
         if !matches!(op.opcode, OpCode::SameAsI | OpCode::SameAsR) {
             continue;
         }
-        let result = op.pos.get();
+        let result = op.pos().get();
         if result == OpRef::NONE || result.is_constant() {
             continue;
         }
@@ -1949,7 +1985,7 @@ impl KnownArrayLengths {
                 if let Some(length) = const_operand_value(constants, op.arg(0).to_opref())
                     && let Ok(length) = usize::try_from(length)
                 {
-                    self.0.insert(op.pos.get(), length);
+                    self.0.insert(op.pos().get(), length);
                 }
             }
             _ => {}
@@ -2317,7 +2353,7 @@ impl HomeLiveness {
             .max()
             .unwrap_or(0);
         for op in ops {
-            let r = op.pos.get();
+            let r = op.pos().get();
             if r != OpRef::NONE && !r.is_constant() {
                 n = n.max(r.raw() as usize + 1);
             }
@@ -2328,7 +2364,7 @@ impl HomeLiveness {
             def_pos[ia.index as usize] = -1;
         }
         for (i, op) in ops.iter().enumerate() {
-            let r = op.pos.get();
+            let r = op.pos().get();
             if r != OpRef::NONE && !r.is_constant() && (r.raw() as usize) < n {
                 let d = &mut def_pos[r.raw() as usize];
                 *d = (*d).min(i as i32);
@@ -2339,7 +2375,11 @@ impl HomeLiveness {
                     continue;
                 }
                 last_use[a.raw() as usize] = i as i32;
-                if op.opcode == OpCode::Label {
+                // A LABEL arg is a phi def (`consider_label`). A
+                // producerless RefOp is a residual virtualizable slot,
+                // not a phi: dating it here would hide the unwritten
+                // local from the post-collection reload.
+                if op.opcode == OpCode::Label && !matches!(a, OpRef::RefOp(_)) {
                     let d = &mut def_pos[a.raw() as usize];
                     *d = (*d).min(i as i32);
                 }
@@ -2590,6 +2630,142 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_add();
 }
 
+/// Publish `build_home_gcmap` on the live frame (`local 0` is the items
+/// base). `ptr == 0` is the test path that never installs a map.
+///
+/// Ordinary homes and LABEL captures grow independently, so the live map
+/// and this module's map can be incomparable. With a residual type family
+/// the store is their bitwise union (`wasm_jit_union_gcmap`). Without one
+/// (host tests) the store is still monotonic: publish this map only when
+/// it covers every live bit.
+fn emit_publish_home_gcmap(
+    sink: &mut PeepSink<'_, '_>,
+    ptr: i64,
+    map: &[usize],
+    old_local: u32,
+    idx_local: u32,
+    residual_type_base: Option<u32>,
+) {
+    if ptr == 0 || map.len() < 2 {
+        return;
+    }
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_GCMAP_OFS, SIZEOFSIGNED};
+    let word = std::mem::size_of::<usize>() as u32;
+    let n_new = map[0];
+    let new_words = &map[1..];
+    let emit_hdr = |sink: &mut PeepSink<'_, '_>| {
+        sink.local_get(0);
+        sink.i32_const(FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+    };
+    let load_usize = |sink: &mut PeepSink<'_, '_>, offset: u64| {
+        if word == 4 {
+            sink.i32_load(memarg(offset, 2));
+        } else {
+            sink.i64_load(memarg(offset, 3));
+        }
+    };
+    let const_usize = |sink: &mut PeepSink<'_, '_>, value: usize| {
+        if word == 4 {
+            sink.i32_const(value as i32);
+        } else {
+            sink.i64_const(value as i64);
+        }
+    };
+    let publish = |sink: &mut PeepSink<'_, '_>| {
+        emit_hdr(sink);
+        sink.i64_const(ptr);
+        emit_word_store(sink, JF_GCMAP_OFS as u64);
+    };
+    emit_hdr(sink);
+    if SIZEOFSIGNED == 4 {
+        sink.i32_load(memarg(JF_GCMAP_OFS as u64, 2));
+    } else {
+        sink.i64_load(memarg(JF_GCMAP_OFS as u64, 3));
+        sink.i32_wrap_i64();
+    }
+    sink.local_tee(old_local);
+    sink.i32_eqz();
+    sink.if_(BlockType::Empty);
+    publish(sink);
+    sink.else_();
+    if let Some(base) = residual_type_base {
+        // `(i64, i64) -> i64` at `residual_type_base + 2`.
+        let union_fn = crate::wasm_jit_union_gcmap as *const () as usize as i64;
+        emit_hdr(sink);
+        sink.local_get(old_local);
+        sink.i64_extend_i32_u();
+        sink.i64_const(ptr);
+        sink.i32_const(union_fn as i32);
+        sink.call_indirect(0, base + 2);
+        emit_word_store(sink, JF_GCMAP_OFS as u64);
+        sink.end();
+        return;
+    }
+    // Host-test fallback: no residual type family. Cover-check each live
+    // word against this module's map; leftover bits keep the live map.
+    sink.block(BlockType::Empty); // $keep
+    sink.block(BlockType::Empty); // $publish_ok
+    for (i, &new_word) in new_words.iter().enumerate() {
+        sink.local_get(old_local);
+        load_usize(sink, 0);
+        if word == 8 {
+            sink.i32_wrap_i64();
+        }
+        sink.i32_const(i as i32);
+        sink.i32_gt_u();
+        sink.if_(BlockType::Empty);
+        sink.local_get(old_local);
+        load_usize(sink, (1 + i as u32) as u64 * word as u64);
+        const_usize(sink, !new_word);
+        if word == 4 {
+            sink.i32_and();
+        } else {
+            sink.i64_and();
+            sink.i64_eqz();
+            sink.i32_eqz();
+        }
+        sink.br_if(2);
+        sink.end();
+    }
+    sink.i32_const(n_new as i32);
+    sink.local_set(idx_local);
+    sink.loop_(BlockType::Empty);
+    sink.local_get(idx_local);
+    sink.local_get(old_local);
+    load_usize(sink, 0);
+    if word == 8 {
+        sink.i32_wrap_i64();
+    }
+    sink.i32_lt_u();
+    sink.i32_eqz();
+    sink.br_if(1);
+    sink.local_get(old_local);
+    sink.local_get(idx_local);
+    sink.i32_const(1);
+    sink.i32_add();
+    sink.i32_const(word.trailing_zeros() as i32);
+    sink.i32_shl();
+    sink.i32_add();
+    load_usize(sink, 0);
+    if word == 8 {
+        sink.i64_eqz();
+        sink.i32_eqz();
+    }
+    sink.br_if(2);
+    sink.local_get(idx_local);
+    sink.i32_const(1);
+    sink.i32_add();
+    sink.local_set(idx_local);
+    sink.br(0);
+    sink.end();
+    sink.br(0);
+    sink.end();
+    publish(sink);
+    sink.end();
+    sink.end();
+}
+
 fn emit_word_store(sink: &mut PeepSink<'_, '_>, offset: u64) {
     if majit_backend::jitframe::SIZEOFSIGNED == 4 {
         sink.i32_wrap_i64();
@@ -2818,7 +2994,9 @@ fn emit_ca_malloc_cond_varsize_frame(
         emit_word_store(sink, ofs as u64);
     }
     // rewrite.rs after `gen_malloc_nursery_varsize_frame`: write
-    // `jf_frame` length and `jf_gcmap`.
+    // `jf_frame` length. Leave `jf_gcmap` null — assembler.py publishes
+    // the map at safepoints once homes are live. The callee entry stores
+    // `home_gcmap_ptr` after its home/input stores.
     sink.local_get(alloc_scratch_local);
     sink.local_get(ca_target_local);
     sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
@@ -3512,11 +3690,11 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
 
     let mut fail_index = 0u32;
     for op in ops {
-        if op.pos.get() != OpRef::NONE
-            && !op.pos.get().is_constant()
-            && op.pos.get().raw() + 1 > max_var
+        if op.pos().get() != OpRef::NONE
+            && !op.pos().get().is_constant()
+            && op.pos().get().raw() + 1 > max_var
         {
-            max_var = op.pos.get().raw() + 1;
+            max_var = op.pos().get().raw() + 1;
         }
         // Every value an op reads occupies a local, whether or not the trace
         // also contains an op that produces it: constant folding and the short
@@ -3741,9 +3919,33 @@ pub struct CaParams {
     /// Active-GC state for the direct CA-only inline allocation/frame path.
     /// `None` retains the helpers (including under gc_stress).
     pub inline: Option<CaInlineParams>,
-    /// Per-loop `jf_gcmap` installed at key-0 entry after homes are nulled.
-    /// Zero leaves the map the allocator (or `execute_token`) already stored.
-    pub entry_gcmap_ptr: i64,
+    /// `build_home_gcmap` pointer published after the fresh-entry home/input
+    /// stores, and again on each keyed LABEL resume after those slots are
+    /// already valid or newly marked ones have been nulled. Used only when
+    /// [`Self::compute_home_gcmap`] is false. Zero leaves `jf_gcmap` unset
+    /// in the generated module (tests). assembler.py writes `jf_gcmap` at
+    /// safepoints once those slots are live.
+    pub home_gcmap_ptr: i64,
+    /// When set, leak a map from this module's `RefHomes` and LABEL captures
+    /// (raised to the `home_gcmap_min_*` floors) instead of
+    /// [`Self::home_gcmap_ptr`]. Re-emission and out-of-line bridges need
+    /// the floors so a later keyed tail-call cannot drop the source loop's
+    /// already-initialized homes.
+    pub compute_home_gcmap: bool,
+    pub home_gcmap_min_ordinary: usize,
+    pub home_gcmap_min_labels: usize,
+    /// True when `home_gcmap_min_*` is a previous publication's floor
+    /// (re-emission or a bridge that must cover the source loop). False
+    /// on a first compile, where min=0 must not wipe live homes on keyed
+    /// resume. Distinguishes a 0→N merge from an initial compile.
+    pub home_gcmap_has_prior: bool,
+    /// True only when a re-emitted module must null newly marked LABEL
+    /// homes for a keyed caller whose map did not include them. Re-emission
+    /// itself leaves this false and drops stale owner attachments when
+    /// the LABEL tail grows; key-0 still clears the full used-label range.
+    /// A compiled bridge with more captures than its source also leaves
+    /// this false: it writes those slots on the first crossing.
+    pub home_gcmap_null_grown_labels: bool,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -3975,7 +4177,7 @@ fn new_inline_nursery_member(
     na: &NurseryAllocParams,
     constants: &indexmap::IndexMap<u32, i64>,
 ) -> Option<(usize, u32)> {
-    let result_id = op.pos.get().raw();
+    let result_id = op.pos().get().raw();
     if OpRef::raw_is_constant(result_id) {
         return None;
     }
@@ -4157,7 +4359,7 @@ pub struct AllocHelpers {
     pub fmod_fn_ptr: i64,
 }
 
-type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize);
+type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize, usize);
 
 /// Counts entries into an out-of-line bridge module and calls out once there
 /// have been enough of them to pay for merging that bridge into its owner.
@@ -4416,7 +4618,7 @@ fn value_id_end(inputargs: &[InputArg], ops: &[Op]) -> u32 {
         }
     }
     for op in ops {
-        widen(op.pos.get(), &mut end);
+        widen(op.pos().get(), &mut end);
         for a in op.getarglist().iter() {
             widen(a.to_opref(), &mut end);
         }
@@ -4483,7 +4685,7 @@ fn rebase_region_value_ids(
     // moved reference is rebound to a synthetic producer carrying the new id.
     let ops: Vec<Op> = bridge.ops.to_vec();
     for op in &ops {
-        op.pos.set(shift(op.pos.get()));
+        op.pos().set(shift(op.pos().get()));
         for (i, arg) in op.getarglist().iter().enumerate() {
             let before = arg.to_opref();
             let after = shift(before);
@@ -4605,7 +4807,7 @@ pub fn build_wasm_module(
             merged_inputargs.extend(bridge.inputargs.iter().map(InputArg::fresh_value_copy));
             for op in &bridge.ops {
                 if op.opcode == OpCode::LoadFromGcTable {
-                    gc_table_bases.insert(op.pos.get().raw(), bridge.gc_table_base);
+                    gc_table_bases.insert(op.pos().get().raw(), bridge.gc_table_base);
                 }
             }
             merged_ops.extend(bridge.ops.iter().cloned());
@@ -4915,6 +5117,17 @@ pub fn build_wasm_module(
         } else {
             scanned
         }
+    };
+    // `emit_publish_home_gcmap` `call_indirect`s `wasm_jit_union_gcmap`
+    // at `residual_type_base + 2`. A reload-only census is arity 0, a
+    // write-barrier-only census arity 1; either leaves that slot missing
+    // or pointing at a later incompatible type.
+    let residual_max_arity = if (ca.compute_home_gcmap || ca.home_gcmap_ptr != 0)
+        && let Some(max) = residual_max_arity
+    {
+        Some(max.max(2))
+    } else {
+        residual_max_arity
     };
     // Typed float residual calls use their descr's faithful wasm ABI instead
     // of the uniform i64 helper family. Preserve first-use order so a given
@@ -5237,7 +5450,8 @@ pub fn build_wasm_module(
     }
     module.section(&codes);
 
-    Ok((module.finish(), guards, num_ref_homes))
+    let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
+    Ok((module.finish(), guards, num_ref_homes, used_labels))
 }
 
 fn build_label_param_shim(wide_func_idx: u32) -> Function {
@@ -5563,6 +5777,8 @@ fn build_function(
     // it and branch back into the dispatch; without it the key is consumed
     // straight off the frame load.
     let resume_key_local = trace_entry_key_local + u32::from(trace_entry_needs_key_local);
+    let gcmap_old_local = resume_key_local + u32::from(resume_dispatch);
+    let gcmap_idx_local = gcmap_old_local + 1;
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
@@ -5627,7 +5843,8 @@ fn build_function(
         base_i32_locals
             + extra_alloc_i32
             + u32::from(trace_entry_needs_key_local)
-            + u32::from(resume_dispatch),
+            + u32::from(resume_dispatch)
+            + 2,
         ValType::I32,
     ));
     let mut func = Function::new(locals);
@@ -5644,6 +5861,51 @@ fn build_function(
         }
         sink.local_set(value_types.local(raw));
     }
+
+    // Build the map now; publish it only after the slots it marks are
+    // null or written (`push_gcmap` at a live safepoint). Key-0 does
+    // that after the entry stores. A keyed LABEL resume branches past
+    // those stores, so it publishes in the resume loader after the
+    // grown-slot null below.
+    let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
+    let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
+    let publish_map = build_home_gcmap(frame, used_ordinary, used_labels);
+    let publish_ptr = if ca.compute_home_gcmap {
+        // A first compile has no prior map. A re-emission or bridge may
+        // grow past a previous floor of zero, so `min > 0` is not the
+        // signal — `has_prior` is.
+        if ca.home_gcmap_has_prior && used_ordinary > ca.home_gcmap_min_ordinary {
+            emit_null_home_slots(
+                &mut sink,
+                frame,
+                ca.home_gcmap_min_ordinary as u64..used_ordinary as u64,
+                |_| true,
+            );
+        }
+        // Re-emission may mark a longer LABEL tail than the previous
+        // publication. Those new slots are region-only captures the live
+        // frame never stored; null them before the widened map is
+        // published. Previously published captures stay: a bridge that
+        // grew past its source writes them on the first crossing, and a
+        // later keyed tail-call restores from those slots. Key-0 still
+        // clears the full used-label range below.
+        if ca.home_gcmap_has_prior
+            && ca.home_gcmap_null_grown_labels
+            && used_labels > ca.home_gcmap_min_labels
+        {
+            let label_base = frame.ordinary_home_slots() as u64;
+            emit_null_home_slots(
+                &mut sink,
+                frame,
+                label_base + ca.home_gcmap_min_labels as u64..label_base + used_labels as u64,
+                |_| true,
+            );
+        }
+        Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
+            as usize as i64
+    } else {
+        ca.home_gcmap_ptr
+    };
 
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
     // preamble runs once on entry, the LABEL is the loop-back target, and
@@ -5759,13 +6021,13 @@ fn build_function(
         emit_trace_entry_census(&mut sink, census, bridge_slot_local, None);
     }
 
-    // Fresh entry owns key 0. `build_home_gcmap` marks every frozen home,
-    // including the chain-padding slots a later bridge may use and the high
-    // LABEL-capture homes. The nursery bump leaves `jf_gcmap` null and does
-    // not fill items, so unused padding still holds recycled nursery bytes;
-    // those must be null before the map is published. A resume dispatch
-    // branches past this code, preserving captures written when the source
-    // loop first crossed the LABEL.
+    // Fresh entry owns key 0. `build_home_gcmap` marks the used ordinary
+    // prefix and the LABEL-capture tail, not reserved chain-padding.
+    // The nursery bump leaves `jf_gcmap` null and does not fill items, so
+    // unused marked homes still hold recycled nursery bytes; those must
+    // be null before the map is published. A resume dispatch branches
+    // past this code, preserving captures written when the source loop
+    // first crossed the LABEL, and publishes in the resume loader.
     // A home the input loop fills below needs no null first: its store follows
     // immediately and nothing between the two allocates, so no collection can
     // read the slot while it is stale. Homes no input fills keep their clear
@@ -5820,20 +6082,16 @@ fn build_function(
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
         }
     }
-    if ca.entry_gcmap_ptr != 0 {
-        // Frozen homes are now null or the entry Refs. Publish the map
-        // the allocator left unset so a later collection can walk them.
-        sink.local_get(0);
-        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-        sink.i32_sub();
-        sink.i64_const(ca.entry_gcmap_ptr);
-        if majit_backend::jitframe::SIZEOFSIGNED == 4 {
-            sink.i32_wrap_i64();
-            sink.i32_store(memarg(majit_backend::jitframe::JF_GCMAP_OFS as u64, 2));
-        } else {
-            sink.i64_store(memarg(majit_backend::jitframe::JF_GCMAP_OFS as u64, 3));
-        }
-    }
+    // assembler.py `push_gcmap`: the map goes up once the slots it marks
+    // are live or null. Keyed resume publishes in the loader instead.
+    emit_publish_home_gcmap(
+        &mut sink,
+        publish_ptr,
+        &publish_map,
+        gcmap_old_local,
+        gcmap_idx_local,
+        residual_type_base,
+    );
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
     if let Some((probe, type_idx)) = inline_trip {
@@ -5916,6 +6174,18 @@ fn build_function(
             }
             sink.br(1); // segment done -> past_loader_j, over the resume loader
             sink.end(); // end C_j (the br_table lands here for key j+1)
+            // Keyed resume skipped the key-0 stores. Grown slots were
+            // nulled before `br_table`; remaining marked homes already
+            // hold the previous module's values. Publish before the
+            // loader stores, matching `push_gcmap` at a live safepoint.
+            emit_publish_home_gcmap(
+                &mut sink,
+                publish_ptr,
+                &publish_map,
+                gcmap_old_local,
+                gcmap_idx_local,
+                residual_type_base,
+            );
             // Resume loader: a loop-closing bridge wrote each label arg into
             // frame slot i (positionally, matching the in-loop JUMP move);
             // load them into the label-arg locals and refresh their Ref
@@ -6062,7 +6332,7 @@ fn build_function(
             match next_op_can_accept_cc(
                 ops,
                 op_idx,
-                op.pos.get(),
+                op.pos().get(),
                 &liveness,
                 label_resume,
                 ref_homes,
@@ -6656,7 +6926,7 @@ fn build_function(
                 guard_idx += 1;
                 // Success path: capture the caught exception into the result
                 // var, then clear both slots.
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     sink.i32_const(exc_value_addr);
                     sink.i64_load(mem64(0));
@@ -6767,7 +7037,7 @@ fn build_function(
             // compare path mints it as `int_between(-1, i2 >> 48, 1)`, so a
             // trace can carry it.
             OpCode::IntBetween => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
@@ -6788,7 +7058,7 @@ fn build_function(
             // through the shared table, staying guest-side rather than
             // declining the whole trace or crossing the host trampoline.
             OpCode::FloatMod => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let sig = (vec![ValType::F64, ValType::F64], Some(ValType::F64));
                     let type_idx = typed_residual_type_indices.get(&sig).ok_or_else(|| {
@@ -6807,7 +7077,7 @@ fn build_function(
             // ── Extended integer ops ──
             OpCode::IntSignext => {
                 // int_signext(val, num_bytes): sign-extend from num_bytes width
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let arg1 = op.arg(1).to_opref();
                     if let Some(num_bytes) = const_operand_value(constants, arg1) {
@@ -6849,7 +7119,7 @@ fn build_function(
             }
             OpCode::IntForceGeZero => {
                 // max(val, 0)
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     // `select` answers with the FIRST value when its condition
@@ -6867,7 +7137,7 @@ fn build_function(
 
             // ── Float floor/mod ──
             OpCode::FloatFloorDiv => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
@@ -6879,7 +7149,7 @@ fn build_function(
 
             // ── Float/Int conversions ──
             OpCode::CastFloatToInt => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_trunc_sat_f64_s();
@@ -6887,7 +7157,7 @@ fn build_function(
                 }
             }
             OpCode::CastIntToFloat => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_convert_i64_s();
@@ -6895,14 +7165,14 @@ fn build_function(
                 }
             }
             OpCode::ConvertFloatBytesToLonglong => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::ConvertLonglongBytesToFloat => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_reinterpret_i64();
@@ -6910,7 +7180,7 @@ fn build_function(
                 }
             }
             OpCode::CastFloatToSinglefloat => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f32_demote_f64();
@@ -6920,7 +7190,7 @@ fn build_function(
                 }
             }
             OpCode::CastSinglefloatToFloat => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
@@ -6945,7 +7215,7 @@ fn build_function(
                 // `i64.extend_i32_s` is a no-op for a real heap pointer (top bit
                 // clear on a <2GB linear memory), so this is the width-correct
                 // lowering for both tagged and boxed operands.
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
@@ -6954,7 +7224,7 @@ fn build_function(
                 }
             }
             OpCode::CastIntToPtr | OpCode::CastOpaquePtr => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.local_set(value_types.local(vi));
@@ -6972,7 +7242,7 @@ fn build_function(
 
             // ── SameAs (forwarding) ──
             OpCode::SameAsI | OpCode::SameAsR => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let source = op.arg(0).to_opref();
                     if source.is_none()
@@ -6985,7 +7255,7 @@ fn build_function(
                 }
             }
             OpCode::SameAsF => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let source = op.arg(0).to_opref();
                     if source.is_none()
@@ -7000,7 +7270,7 @@ fn build_function(
 
             // ── Field access (direct memory operations) ──
             OpCode::GetfieldGcI | OpCode::GetfieldRawI => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr (i64)
                     sink.i32_wrap_i64(); // convert to i32 address
@@ -7011,7 +7281,7 @@ fn build_function(
                 }
             }
             OpCode::GetfieldGcR | OpCode::GetfieldRawR => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
@@ -7054,7 +7324,7 @@ fn build_function(
 
             // ── Float field access ──
             OpCode::GetfieldGcF | OpCode::GetfieldRawF => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
@@ -7070,7 +7340,7 @@ fn build_function(
 
             // ── Array access ──
             OpCode::ArraylenGc => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // array ptr
                     sink.i32_wrap_i64();
@@ -7083,7 +7353,7 @@ fn build_function(
                 }
             }
             OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcPureI | OpCode::GetarrayitemRawI => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let base_size = emit_array_addr(&mut sink, constants, value_types, op);
                     let (item_size, signed) = array_item_access_size_sign(op);
@@ -7092,7 +7362,7 @@ fn build_function(
                 }
             }
             OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcPureR | OpCode::GetarrayitemRawR => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let base_size = emit_array_addr(&mut sink, constants, value_types, op);
                     let (item_size, signed) = array_item_access_size_sign(op);
@@ -7101,7 +7371,7 @@ fn build_function(
                 }
             }
             OpCode::GetarrayitemGcF | OpCode::GetarrayitemGcPureF | OpCode::GetarrayitemRawF => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let base_size = emit_array_addr(&mut sink, constants, value_types, op);
                     sink.f64_load(mem64(base_size));
@@ -7146,7 +7416,7 @@ fn build_function(
             OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
             | OpCode::GetinteriorfieldGcF => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let field = unpack_interior_field(op);
                     let base = emit_scaled_index_addr(
@@ -7210,7 +7480,7 @@ fn build_function(
             // `inject_builtin_string_descrs` attaches the same ArrayDescr,
             // so the length word and item stride are the array path.
             OpCode::Strlen | OpCode::Unicodelen => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
@@ -7220,7 +7490,7 @@ fn build_function(
                 }
             }
             OpCode::Strgetitem | OpCode::Unicodegetitem => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // rewrite.py:299/311: STR `extra_item_after_alloc=1` is
                     // already in `basesize`; subtract it before the index.
@@ -7257,7 +7527,7 @@ fn build_function(
             // operands. Supporting them here lets wasm consume the same
             // `GcRewriterImpl` output as the native backends.
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     if op.num_args() < 5 {
                         return Err(BackendError::Unsupported(format!(
@@ -7282,7 +7552,7 @@ fn build_function(
                 }
             }
             OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     if op.num_args() < 3 {
                         return Err(BackendError::Unsupported(format!(
@@ -7345,7 +7615,7 @@ fn build_function(
 
             // ── Raw memory access ──
             OpCode::RawLoadI | OpCode::RawLoadF => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let offset = emit_raw_addr(&mut sink, constants, value_types, op);
                     if op.opcode == OpCode::RawLoadF {
@@ -7375,7 +7645,7 @@ fn build_function(
                 // The result is the caught exception the resumed handler reads,
                 // so it must be written even though the slots themselves are
                 // shared with the host: skipping the op leaves the local null.
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     sink.i32_const(crate::jit_exc_value_addr() as i32);
                     sink.i64_load(mem64(0));
@@ -7391,7 +7661,7 @@ fn build_function(
             OpCode::SaveExcClass => {
                 // x86/assembler.py genop_save_exc_class:
                 //   MOV resloc, [pos_exception]
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     sink.i32_const(crate::jit_exc_type_addr() as i32);
                     sink.i64_load(mem64(0));
@@ -7524,7 +7794,7 @@ fn build_function(
                 // `do_conditional_call` asserts the callee forces no virtual or
                 // virtualizable, so unlike the CALL arm this needs no force
                 // bracket.
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let has_result = !OpRef::raw_is_constant(vi);
                 let cond = op.arg(0).to_opref();
                 let func = op.arg(1).to_opref();
@@ -7912,7 +8182,7 @@ fn build_function(
             }
 
             OpCode::Newstr | OpCode::Newunicode => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let Some(base) = residual_type_base else {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: Newstr/Newunicode needs a residual alloc helper".into(),
@@ -7945,7 +8215,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -8047,7 +8317,7 @@ fn build_function(
 
             // ── Misc ops ──
             OpCode::NurseryPtrIncrement => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
@@ -8061,7 +8331,7 @@ fn build_function(
             // `wasm_jit_alloc(0, payload)` — tid is written afterwards by
             // `gen_initialize_tid`.
             OpCode::CallMallocNursery => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
                 let bump_size = size_const.and_then(|size| u32::try_from(size).ok());
                 let payload =
@@ -8153,7 +8423,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -8180,7 +8450,7 @@ fn build_function(
                 // when the nursery cannot hold the request.
             }
             OpCode::CallMallocNurseryHeaderless => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
                 let bump_size = size_const.and_then(aligned_varsize_frame_bump);
                 let Some(base) = residual_type_base else {
@@ -8258,7 +8528,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -8281,12 +8551,12 @@ fn build_function(
                         frame,
                     );
                 }
-                remember_nursery_wb(&mut wb_applied, op.pos.get(), &same_as_forwardings);
+                remember_nursery_wb(&mut wb_applied, op.pos().get(), &same_as_forwardings);
             }
             OpCode::CallMallocNurseryVarsize => {
                 // The arity-5 array helper can return old-gen, so this arm
                 // does not seed `wb_applied` — same reason as `NewArray`.
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let Some(base) = residual_type_base else {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: CallMallocNurseryVarsize needs a residual alloc helper"
@@ -8320,7 +8590,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -8343,7 +8613,7 @@ fn build_function(
                 );
             }
             OpCode::CallMallocNurseryVarsizeFrame => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
                 let bump_size = size_const.and_then(aligned_varsize_frame_bump);
                 let payload =
@@ -8435,7 +8705,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -8540,7 +8810,7 @@ fn build_function(
                 // allocation, so `base + index*WORD` is an ordinary linear-memory
                 // address; the collector forwards the slot in place, so the load
                 // reads the reference at its current address.
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let index = resolve_const_bits(constants, op.arg(0).to_opref());
                     let base = gc_table_bases.get(&vi).copied().unwrap_or(gc_table_base);
@@ -8549,7 +8819,7 @@ fn build_function(
                 }
             }
             OpCode::ThreadlocalrefGet => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let Some(base) = residual_type_base.filter(|_| alloc.threadlocal_fn_ptr != 0)
                     else {
@@ -8567,7 +8837,7 @@ fn build_function(
             // base + (index << shift) + base_offset. Keep the calculation in
             // the IR's i64 address carrier; memory ops wrap only when loading.
             OpCode::LoadEffectiveAddress => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                     emit_resolve(&mut sink, constants, value_types, op.arg(3).to_opref());
@@ -8608,7 +8878,7 @@ fn build_function(
                     op_idx,
                     guard_idx,
                 );
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let descr = op
                     .getdescr()
                     .expect("CALL_ASSEMBLER op must carry a descriptor");
@@ -8993,7 +9263,7 @@ fn build_function(
                     op_idx,
                     guard_idx,
                 );
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let can_collect = call_can_collect(op);
 
                 // pyjitpl.py `direct_call_release_gil` records CALL_RELEASE_GIL_*
@@ -9235,7 +9505,7 @@ fn build_function(
             // `jit_call` trampoline to the `wasm_jit_alloc` helper, then write
             // the vtable / length fields with pointer-width (i32) stores.
             OpCode::New | OpCode::NewWithVtable => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 // llmodel.py:778-782: size, type_id, vtable from the size descr.
                 let descr = op.getdescr();
                 let sd = descr.as_ref().and_then(|d| d.as_size_descr());
@@ -9473,7 +9743,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -9548,7 +9818,7 @@ fn build_function(
                 // the first store emits the barrier, later stores CSE it.
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let descr = op.getdescr();
                 let ad = descr
                     .as_ref()
@@ -9996,7 +10266,7 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    op.pos.get(),
+                    op.pos().get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -10031,7 +10301,7 @@ fn build_function(
 
             // ── Misc ──
             OpCode::ForceToken => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     // `FORCE_TOKEN/0/r` — "nowadays, returns the jitframe".
                     // The token is what the SETFIELD_GC that follows parks in
@@ -10062,7 +10332,7 @@ fn build_function(
 
             // Float operations
             OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
@@ -10085,7 +10355,7 @@ fn build_function(
                 }
             }
             OpCode::FloatNeg => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_neg();
@@ -10093,7 +10363,7 @@ fn build_function(
                 }
             }
             OpCode::FloatAbs => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.f64_abs();
@@ -10127,7 +10397,7 @@ fn build_function(
                 // arms above, where the reason it owes no code is written down;
                 // a side-effecting op put there is dropped in silence, which is
                 // what `CondCallN` was.
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     return Err(BackendError::Unsupported(format!(
                         "wasm codegen: unhandled opcode {:?}",
@@ -10143,7 +10413,7 @@ fn build_function(
         // keys Ref-typed value ids, so non-Ref / void / constant ops are
         // skipped. Each value-producing arm is operand-stack-neutral, so this
         // appended store is balanced.
-        let result = op.pos.get();
+        let result = op.pos().get();
         if let Some(h) = ref_homes.home(result) {
             sink.local_get(0);
             sink.local_get(value_types.local(result.raw()));
@@ -10590,7 +10860,7 @@ fn gc_table_failarg_slots(
     for op in ops {
         match op.opcode {
             OpCode::LoadFromGcTable => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let index = resolve_const_bits(constants, op.arg(0).to_opref());
                     let base = gc_table_bases.get(&vi).copied().unwrap_or(gc_table_base);
@@ -10598,7 +10868,7 @@ fn gc_table_failarg_slots(
                 }
             }
             OpCode::SameAsI | OpCode::SameAsR | OpCode::CastOpaquePtr => {
-                let vi = op.pos.get().raw();
+                let vi = op.pos().get().raw();
                 let src = op.arg(0).to_opref();
                 if !OpRef::raw_is_constant(vi)
                     && !src.is_none()
@@ -10680,7 +10950,7 @@ fn unbound_pool_const_seeds(
     use std::collections::HashSet;
     let mut defined: HashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
     for op in ops {
-        let r = op.pos.get();
+        let r = op.pos().get();
         if r != OpRef::NONE && !r.is_constant() {
             defined.insert(r.raw());
         }
@@ -10777,7 +11047,7 @@ fn unbound_pool_const_seeds(
                     OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
                 )
             })
-            .map(|op| op.pos.get())
+            .map(|op| op.pos().get())
             .collect();
         let in_idx: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
         return Err(BackendError::Unsupported(format!(
@@ -11451,7 +11721,7 @@ fn emit_force_bracket_before_call(
         frame,
         next_op,
         exit_index(next_op, guard_idx),
-        Some(ops[op_idx].pos.get().raw()),
+        Some(ops[op_idx].pos().get().raw()),
     );
 }
 
@@ -11793,7 +12063,7 @@ fn emit_binop(
     op: &Op,
     binop: BinOp,
 ) {
-    let vi = op.pos.get().raw();
+    let vi = op.pos().get().raw();
     if OpRef::raw_is_constant(vi) {
         return;
     }
@@ -11816,7 +12086,7 @@ fn emit_umulhi(
     op: &Op,
     value_local_count: u32,
 ) {
-    let vi = op.pos.get().raw();
+    let vi = op.pos().get().raw();
     if OpRef::raw_is_constant(vi) {
         return;
     }
@@ -11990,7 +12260,7 @@ fn emit_ovf_binop(
     ovf_flag_local: u32,
     fused_guard: Option<OpCode>,
 ) -> OvfFlag {
-    let vi = op.pos.get().raw();
+    let vi = op.pos().get().raw();
     if OpRef::raw_is_constant(vi) {
         return OvfFlag::Absent;
     }
@@ -12342,7 +12612,7 @@ fn emit_cond(
     op: &Op,
     kind: CondKind,
 ) {
-    let vi = op.pos.get().raw();
+    let vi = op.pos().get().raw();
     if OpRef::raw_is_constant(vi) {
         return;
     }
@@ -12361,7 +12631,7 @@ fn emit_unary_vi(
     prefix: impl FnOnce(&mut PeepSink<'_, '_>),
     suffix: impl FnOnce(&mut PeepSink<'_, '_>),
 ) {
-    let vi = op.pos.get().raw();
+    let vi = op.pos().get().raw();
     if !OpRef::raw_is_constant(vi) {
         prefix(sink);
         emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
@@ -12390,7 +12660,7 @@ mod tests {
             OpCode::IntAdd,
             &[rb(OpRef::int_op(50)), rb(OpRef::const_int(1))],
         );
-        add.pos.set(OpRef::int_op(200));
+        add.pos().set(OpRef::int_op(200));
         let ops = vec![
             Op::new(
                 OpCode::Label,

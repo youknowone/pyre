@@ -38,7 +38,7 @@ pub(crate) fn emit_rpython_str_find_char(
         result: Some(result.clone()),
         kind: OpKind::Call {
             target: CallTarget::method("find", None),
-            args: args.to_vec(),
+            args: crate::model::call_args(args.iter().cloned()),
             result_ty: ValueType::Int,
         },
     });

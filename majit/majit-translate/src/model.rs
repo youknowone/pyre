@@ -1071,7 +1071,9 @@ pub enum OpKind {
     },
     Call {
         target: CallTarget,
-        args: Vec<crate::flowspace::model::Variable>,
+        /// Mixed Variable | Constant, matching
+        /// `flowspace/model.py SpaceOperation.args`.
+        args: Vec<LinkArg>,
         result_ty: ValueType,
     },
     GuardTrue {
@@ -1776,6 +1778,22 @@ impl LinkArg {
         }
     }
 
+    /// The Variable arm. Constants panic — call sites that have not
+    /// yet grown a Constant case use this while `Call.args` migrates
+    /// to the mixed `SpaceOperation.args` shape.
+    pub fn expect_variable(&self) -> &crate::flowspace::model::Variable {
+        self.as_variable()
+            .expect("Call.args entry is a Constant; handle LinkArg::Const")
+    }
+
+    /// Owned Variable arm.
+    pub fn into_variable(self) -> crate::flowspace::model::Variable {
+        match self {
+            Self::Value(var) => var,
+            Self::Const(_) => panic!("Call.args entry is a Constant; handle LinkArg::Const"),
+        }
+    }
+
     /// Remap the backing `Variable` of a `LinkArg::Value` through
     /// `remap`, leaving a `LinkArg::Const` literal untouched.  Mirrors
     /// the `remap_link_arg` closure in
@@ -1806,6 +1824,146 @@ impl From<crate::flowspace::model::Constant> for LinkArg {
     fn from(c: crate::flowspace::model::Constant) -> Self {
         Self::Const(c)
     }
+}
+
+impl std::ops::Deref for LinkArg {
+    type Target = crate::flowspace::model::Variable;
+    fn deref(&self) -> &Self::Target {
+        self.expect_variable()
+    }
+}
+
+impl PartialEq<crate::flowspace::model::Variable> for LinkArg {
+    fn eq(&self, other: &crate::flowspace::model::Variable) -> bool {
+        self.as_variable() == Some(other)
+    }
+}
+
+impl PartialEq<LinkArg> for crate::flowspace::model::Variable {
+    fn eq(&self, other: &LinkArg) -> bool {
+        other == self
+    }
+}
+
+impl From<crate::flowspace::model::Variable> for LinkArg {
+    /// RPython `SpaceOperation.args` is a mixed list of Variable /
+    /// Constant (`flowspace/model.py SpaceOperation.__init__`).
+    fn from(v: crate::flowspace::model::Variable) -> Self {
+        Self::Value(v)
+    }
+}
+
+/// Collect call operands into the mixed `SpaceOperation.args` shape.
+pub fn call_args(
+    vars: impl IntoIterator<Item = crate::flowspace::model::Variable>,
+) -> Vec<LinkArg> {
+    vars.into_iter().map(LinkArg::from).collect()
+}
+
+/// Project Variable operands out of mixed call args.
+/// Constants are skipped — RPython `isinstance(a, Variable)` filter.
+pub fn call_arg_vars(args: &[LinkArg]) -> Vec<crate::flowspace::model::Variable> {
+    args.iter()
+        .filter_map(LinkArg::as_variable)
+        .cloned()
+        .collect()
+}
+
+/// `simple_call(__cast_instance_intrinsic, operand, const(root))`.
+///
+/// The root is a trailing `ByteStr` Constant —
+/// `annotator/builtin.rs cast_instance_intrinsic` reads `args[1]`.
+pub fn cast_instance_call(
+    root: impl Into<String>,
+    operand: crate::flowspace::model::Variable,
+) -> OpKind {
+    let root = root.into();
+    cast_instance_call_result(root.clone(), operand, ValueType::Ref(Some(root)))
+}
+
+/// Same as [`cast_instance_call`] with an explicit result type.
+/// Niche-null string payloads use `ValueType::Str` rather than `Ref`.
+pub fn cast_instance_call_result(
+    root: impl Into<String>,
+    operand: crate::flowspace::model::Variable,
+    result_ty: ValueType,
+) -> OpKind {
+    OpKind::Call {
+        target: CallTarget::function_path([crate::runtime_names::shims::CAST_INSTANCE]),
+        args: vec![
+            LinkArg::from(operand),
+            LinkArg::from(ConstValue::byte_str(root.into())),
+        ],
+        result_ty,
+    }
+}
+
+/// The target-struct root of a [`cast_instance_call`], if `kind` is one.
+pub fn cast_instance_root(kind: &OpKind) -> Option<&str> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments },
+        args,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    if segments.as_slice() != [crate::runtime_names::shims::CAST_INSTANCE] {
+        return None;
+    }
+    match args.get(1) {
+        Some(LinkArg::Const(c)) => c.value.as_pystr(),
+        _ => None,
+    }
+}
+
+/// `cast_pointer(PTRTYPE, ptr)` marker (`lltype.py cast_pointer`).
+/// The target class is a trailing `ByteStr` Constant; the adapter
+/// interns it through the bookkeeper.
+pub fn cast_pointer_call(
+    root: impl Into<String>,
+    operand: crate::flowspace::model::Variable,
+) -> OpKind {
+    let root = root.into();
+    OpKind::Call {
+        target: CallTarget::function_path(["__cast_pointer"]),
+        args: vec![
+            LinkArg::from(operand),
+            LinkArg::from(ConstValue::byte_str(&root)),
+        ],
+        result_ty: ValueType::Ref(Some(root)),
+    }
+}
+
+/// The target-struct root of a [`cast_pointer_call`], if `kind` is one.
+pub fn cast_pointer_root(kind: &OpKind) -> Option<&str> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments },
+        args,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    if segments.as_slice() != ["__cast_pointer"] {
+        return None;
+    }
+    match args.get(1) {
+        Some(LinkArg::Const(c)) => c.value.as_pystr(),
+        _ => None,
+    }
+}
+
+/// [`cast_instance_root`] when `args[0]` is `operand`.
+pub fn cast_instance_of<'a>(
+    kind: &'a OpKind,
+    operand: &crate::flowspace::model::Variable,
+) -> Option<&'a str> {
+    let root = cast_instance_root(kind)?;
+    let OpKind::Call { args, .. } = kind else {
+        return None;
+    };
+    (args.first().and_then(LinkArg::as_variable) == Some(operand)).then_some(root)
 }
 
 /// A basic block in the control flow graph.
@@ -3415,22 +3573,8 @@ pub fn lower_struct_ptr_writes(
                 continue;
             };
             let destination_owner = block.operations[..oi].iter().find_map(|candidate| {
-                match (&candidate.result, &candidate.kind) {
-                    (
-                        Some(result),
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
-                            args,
-                            ..
-                        },
-                    ) if result == destination
-                        && args.len() == 1
-                        && segments.first().map(String::as_str)
-                            == Some("__cast_instance_intrinsic")
-                        && segments.len() == 2 =>
-                    {
-                        Some(segments[1].as_str())
-                    }
+                match candidate.result.as_ref() {
+                    Some(result) if result == destination => cast_instance_root(&candidate.kind),
                     _ => None,
                 }
             });
@@ -3538,7 +3682,7 @@ pub fn lower_struct_ptr_writes(
             rewrites.push(Rewrite {
                 block: bi,
                 op: oi,
-                destination: destination.clone(),
+                destination: destination.clone().into_variable(),
                 stores: ordered_stores,
                 result: op.result.clone(),
             });
@@ -3963,9 +4107,9 @@ pub fn fuse_boxing_alloc(
         } = &producer.kind
             && segments.first().map(String::as_str)
                 == Some(crate::runtime_names::shims::CAST_INSTANCE)
-            && args.len() == 1
+            && let Some(operand) = args.first().and_then(LinkArg::as_variable)
         {
-            return resolve_addr(graph, &args[0], depth - 1, terminal);
+            return resolve_addr(graph, operand, depth - 1, terminal);
         }
         terminal(graph, &producer.kind, depth)
     }
@@ -4648,7 +4792,7 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
 
         let block = &mut graph.blocks[bi];
         if let OpKind::Call { args, .. } = &mut block.operations[oi].kind {
-            args[1] = remap(&aggregate);
+            args[1] = remap(&aggregate).into();
         }
         moved += cloned.len();
         block.operations.splice(oi..oi, cloned);
@@ -4839,13 +4983,13 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             args,
             ..
         } => {
-            // `__cast_instance_intrinsic[<root>]` — the front-end pointer-downcast
-            // narrow (`front::mir`), always a single-operand reinterpret.
+            // `__cast_instance_intrinsic` — the front-end pointer-downcast
+            // narrow (`cast_instance_call`: operand + const(root)).
             // Pin the arity so an unrelated multi-arg path that happens to
             // share the synthetic marker leaf is never swept as a cast.
             let is_cast = segments.first().map(String::as_str)
                 == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                && args.len() == 1;
+                && args.len() == 2;
             // The same single-argument runtime helper recognized by
             // `get_instantiate_arg_addr`; its result feeds only the class word
             // removed with the dead header. Restrict the owner so an unrelated
@@ -6574,7 +6718,7 @@ impl FunctionGraph {
             result: Some(res.clone()),
             kind: OpKind::Call {
                 target: CallTarget::function_path(["core", "ptr", "null_mut"]),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
             },
         });
@@ -6845,6 +6989,25 @@ impl FunctionGraph {
             self.name,
         );
         let link = Link::from_variables(self, args, target, None);
+        self.set_control_flow_metadata(block, None, vec![link]);
+    }
+
+    /// Close `block` with a single Goto whose `Link.args` keep mixed
+    /// Variable|Constant operands — `flowspace/model.py Link`.
+    pub fn set_goto_mixed(&mut self, block: BlockId, target: BlockId, args: Vec<LinkArg>) {
+        let target_inputarg_count = self.block(target).inputargs.len();
+        assert_eq!(
+            args.len(),
+            target_inputarg_count,
+            "set_goto_mixed: args.len() ({}) != target.inputargs.len() ({}) — \
+             block {:?} → target {:?} on graph {:?}",
+            args.len(),
+            target_inputarg_count,
+            block,
+            target,
+            self.name,
+        );
+        let link = Link::new_mixed(args, target, None);
         self.set_control_flow_metadata(block, None, vec![link]);
     }
 
@@ -8366,7 +8529,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("Tuple"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("Tuple".into())),
                 },
                 true,
@@ -8424,7 +8587,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("Tuple"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("Tuple".into())),
                 },
                 true,
@@ -8476,7 +8639,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("Payload"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("Payload".into())),
                 },
                 true,
@@ -8506,13 +8669,7 @@ mod tests {
         let destination = graph
             .push_op_var(
                 write_block,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".into(), "Payload".into()],
-                    },
-                    args: vec![raw],
-                    result_ty: ValueType::Ref(Some("Payload".into())),
-                },
+                crate::model::cast_instance_call("Payload", raw),
                 true,
             )
             .unwrap();
@@ -8522,7 +8679,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                 },
-                args: vec![destination, carried[0].clone()],
+                args: crate::model::call_args(vec![destination, carried[0].clone()]),
                 result_ty: ValueType::Void,
             },
             false,
@@ -8556,7 +8713,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("Payload"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("Payload".into())),
                 },
                 true,
@@ -8601,17 +8758,7 @@ mod tests {
         graph.set_goto(right, join, vec![right_args[0].clone()]);
         let raw = graph.push_op_var(join, OpKind::ConstRefNull, true).unwrap();
         let destination = graph
-            .push_op_var(
-                join,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".into(), "Payload".into()],
-                    },
-                    args: vec![raw],
-                    result_ty: ValueType::Ref(Some("Payload".into())),
-                },
-                true,
-            )
+            .push_op_var(join, crate::model::cast_instance_call("Payload", raw), true)
             .unwrap();
         graph.push_op_var(
             join,
@@ -8619,7 +8766,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                 },
-                args: vec![destination, joined[0].clone()],
+                args: crate::model::call_args(vec![destination, joined[0].clone()]),
                 result_ty: ValueType::Void,
             },
             false,
@@ -8776,7 +8923,7 @@ mod tests {
                             "get_instantiate".into(),
                         ],
                     },
-                    args: vec![instantiate_arg],
+                    args: crate::model::call_args(vec![instantiate_arg]),
                     result_ty: ValueType::Ref(Some("object".into())),
                 },
                 true,
@@ -8787,7 +8934,7 @@ mod tests {
                 blk,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("PyObject"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("PyObject".into())),
                 },
                 true,
@@ -8828,7 +8975,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
                 },
                 true,
@@ -8877,7 +9024,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                     },
-                    args: vec![agg.clone()],
+                    args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
                 },
                 true,
@@ -9007,7 +9154,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("W_ComplexObject"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("W_ComplexObject".into())),
                 },
                 true,
@@ -9058,7 +9205,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                     },
-                    args: vec![agg.clone()],
+                    args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ComplexObject".into())),
                 },
                 true,
@@ -9108,7 +9255,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("SomeOtherStruct"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("SomeOtherStruct".into())),
                 },
                 true,
@@ -9125,7 +9272,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                     },
-                    args: vec![agg.clone()],
+                    args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("SomeOtherStruct".into())),
                 },
                 true,
@@ -9170,7 +9317,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                         },
-                        args,
+                        args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
                     },
                     true,
@@ -9217,7 +9364,7 @@ mod tests {
                     entry,
                     OpKind::Call {
                         target: CallTarget::synthetic_transparent_ctor("PyObject"),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some("PyObject".into())),
                     },
                     true,
@@ -9238,7 +9385,7 @@ mod tests {
                     entry,
                     OpKind::Call {
                         target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some("W_FloatObject".into())),
                     },
                     true,
@@ -9383,7 +9530,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                         },
-                        args,
+                        args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
                     },
                     true,
@@ -9410,7 +9557,7 @@ mod tests {
                     blk,
                     OpKind::Call {
                         target: CallTarget::synthetic_transparent_ctor(name),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some(name.into())),
                     },
                     true,
@@ -9426,12 +9573,9 @@ mod tests {
             let ty = graph
                 .push_op_var(entry, OpKind::ConstRefAddr(FLOAT_TYPE_ADDR), true)
                 .unwrap();
-            call(
-                graph,
-                entry,
-                &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
-                vec![ty],
-            )
+            graph
+                .push_op_var(entry, cast_instance_call("PyType", ty), true)
+                .unwrap()
         };
         let ob_type = cast(&mut graph);
         let w_class_cast = cast(&mut graph);
@@ -9513,7 +9657,7 @@ mod tests {
                         .map(|s| s.to_string())
                         .collect(),
                 },
-                args: vec![gc_args[1].clone(), gc_args[0].clone()],
+                args: crate::model::call_args(vec![gc_args[1].clone(), gc_args[0].clone()]),
                 result_ty: ValueType::Void,
             },
             false,
@@ -9576,7 +9720,7 @@ mod tests {
                     .map(String::as_str)
                     .eq(["core", "ptr", "write"]) =>
                 {
-                    Some(args[1].clone())
+                    Some(args[1].clone().into_variable())
                 }
                 _ => None,
             })
@@ -9652,7 +9796,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                         },
-                        args,
+                        args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
                     },
                     true,
@@ -9679,7 +9823,7 @@ mod tests {
                     blk,
                     OpKind::Call {
                         target: CallTarget::synthetic_transparent_ctor(name),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some(name.into())),
                     },
                     true,
@@ -9698,12 +9842,9 @@ mod tests {
                 let ty = graph
                     .push_op_var(entry, OpKind::ConstRefAddr(addr), true)
                     .unwrap();
-                call(
-                    graph,
-                    entry,
-                    &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
-                    vec![ty],
-                )
+                graph
+                    .push_op_var(entry, cast_instance_call("PyType", ty), true)
+                    .unwrap()
             };
             let ob_type = cast(&mut graph, FLOAT_TYPE_ADDR);
             let w_class_cast = cast(&mut graph, FLOAT_TYPE_ADDR);
@@ -9821,12 +9962,9 @@ mod tests {
             let other = graph
                 .push_op_var(blk, OpKind::ConstRefAddr(OTHER_TYPE_ADDR), true)
                 .unwrap();
-            let cast = call(
-                graph,
-                blk,
-                &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
-                vec![other],
-            );
+            let cast = graph
+                .push_op_var(blk, cast_instance_call("PyType", other), true)
+                .unwrap();
             graph.push_op_var(blk, field(header, "ob_type", "PyObject", &cast), false);
         };
 
@@ -9918,7 +10056,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                         },
-                        args,
+                        args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
                     },
                     true,
@@ -9945,7 +10083,7 @@ mod tests {
                     blk,
                     OpKind::Call {
                         target: CallTarget::synthetic_transparent_ctor(name),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some(name.into())),
                     },
                     true,
@@ -9958,12 +10096,9 @@ mod tests {
                 let ty = graph
                     .push_op_var(blk, OpKind::ConstRefAddr(addr), true)
                     .unwrap();
-                call(
-                    graph,
-                    blk,
-                    &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
-                    vec![ty],
-                )
+                graph
+                    .push_op_var(blk, cast_instance_call("PyType", ty), true)
+                    .unwrap()
             };
             let ob_type = cast(graph);
             let w_class_cast = cast(graph);
@@ -10115,13 +10250,7 @@ mod tests {
         // constants; the dual-gate seeds them from the constant table, so they
         // do not diverge.)
         type Var = crate::flowspace::model::Variable;
-        let cast_instance = |to: &str, arg: &Var| OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec![crate::runtime_names::shims::CAST_INSTANCE.into(), to.into()],
-            },
-            args: vec![arg.clone()],
-            result_ty: ValueType::Ref(Some(to.into())),
-        };
+        let cast_instance = |to: &str, arg: &Var| crate::model::cast_instance_call(to, arg.clone());
         let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
             base: base.clone(),
             field: FieldDescriptor {
@@ -10165,7 +10294,7 @@ mod tests {
                             "get_instantiate".into(),
                         ],
                     },
-                    args: vec![w_class_cast],
+                    args: crate::model::call_args(vec![w_class_cast]),
                     result_ty: ValueType::Ref(Some("object".into())),
                 },
                 true,
@@ -10177,7 +10306,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("PyObject"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("PyObject".into())),
                 },
                 true,
@@ -10199,7 +10328,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
                 },
                 true,
@@ -10226,7 +10355,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                     },
-                    args: vec![agg.clone()],
+                    args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
                 },
                 true,
@@ -10259,12 +10388,8 @@ mod tests {
             ops.iter().map(|o| &o.kind).collect::<Vec<_>>()
         );
         assert!(
-            !ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                        && segments.get(1).map(String::as_str) == Some("PyType")
-            )),
+            !ops.iter()
+                .any(|op| cast_instance_root(&op.kind) == Some("PyType")),
             "the dead ob_type/w_class header casts must be swept"
         );
         assert!(
@@ -10288,12 +10413,8 @@ mod tests {
             "NewWithVtable must survive carrying the captured type pointer"
         );
         assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                        && segments.get(1).map(String::as_str) == Some("PyObject")
-            )),
+            ops.iter()
+                .any(|op| cast_instance_root(&op.kind) == Some("PyObject")),
             "the live return cast must survive"
         );
         let _ = ret;
@@ -10322,7 +10443,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("W_SetObject"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("W_SetObject".into())),
                 },
                 true,
@@ -10377,7 +10498,7 @@ mod tests {
                             "malloc".into(),
                         ],
                     },
-                    args: vec![agg.clone()],
+                    args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_SetObject".into())),
                 },
                 true,
@@ -10486,7 +10607,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                         },
-                        args,
+                        args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
                     },
                     true,
@@ -10519,7 +10640,7 @@ mod tests {
                     entry,
                     OpKind::Call {
                         target: CallTarget::synthetic_transparent_ctor(header_owner),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some(header_owner.into())),
                     },
                     true,
@@ -10569,7 +10690,7 @@ mod tests {
                     entry,
                     OpKind::Call {
                         target: CallTarget::synthetic_transparent_ctor("W_IntObject"),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some("W_IntObject".into())),
                     },
                     true,
@@ -10745,7 +10866,7 @@ mod tests {
                     entry,
                     OpKind::Call {
                         target: CallTarget::synthetic_transparent_ctor("TypeOnlyHeader"),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some("TypeOnlyHeader".into())),
                     },
                     true,
@@ -10775,7 +10896,7 @@ mod tests {
                                         .map(|s| (*s).to_string())
                                         .collect(),
                                     },
-                                    args: vec![base],
+                                    args: crate::model::call_args(vec![base]),
                                     result_ty: ValueType::Ref(Some("object".into())),
                                 },
                                 true,
@@ -10796,7 +10917,7 @@ mod tests {
                     entry,
                     OpKind::Call {
                         target: CallTarget::synthetic_transparent_ctor("W_IntObject"),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some("W_IntObject".into())),
                     },
                     true,
@@ -10818,7 +10939,7 @@ mod tests {
                                 .map(|s| (*s).to_string())
                                 .collect(),
                         },
-                        args: vec![agg],
+                        args: crate::model::call_args(vec![agg]),
                         result_ty: ValueType::Ref(Some("W_IntObject".into())),
                     },
                     true,
@@ -10977,16 +11098,7 @@ mod tests {
         let p = graph
             .push_op_var(
                 entry,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.into(),
-                            "W_FloatObject".into(),
-                        ],
-                    },
-                    args: vec![obj.clone()],
-                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
-                },
+                crate::model::cast_instance_call("W_FloatObject", obj.clone()),
                 true,
             )
             .unwrap();
@@ -10997,7 +11109,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("PyObject"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("PyObject".into())),
                 },
                 true,
@@ -11039,16 +11151,7 @@ mod tests {
         // target inputarg is itself unread, then `prune_dead_phis` reclaims
         // the dangling inputarg / link arg / address constant.
         type Var = crate::flowspace::model::Variable;
-        let cast_pytype = |arg: &Var| OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec![
-                    crate::runtime_names::shims::CAST_INSTANCE.into(),
-                    "PyType".into(),
-                ],
-            },
-            args: vec![arg.clone()],
-            result_ty: ValueType::Ref(Some("PyType".into())),
-        };
+        let cast_pytype = |arg: &Var| crate::model::cast_instance_call("PyType", arg.clone());
         let field = |base: &Var, name: &str, value: &Var| OpKind::FieldWrite {
             base: base.clone(),
             field: FieldDescriptor {
@@ -11083,7 +11186,7 @@ mod tests {
                     "get_instantiate".into(),
                 ],
             },
-            args: vec![arg.clone()],
+            args: crate::model::call_args(vec![arg.clone()]),
             result_ty: ValueType::Ref(Some("object".into())),
         };
         let ty_addr1 = graph
@@ -11141,7 +11244,7 @@ mod tests {
                 blk,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("PyObject"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("PyObject".into())),
                 },
                 true,
@@ -11153,16 +11256,7 @@ mod tests {
         let ret = graph
             .push_op_var(
                 blk,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.into(),
-                            "PyObject".into(),
-                        ],
-                    },
-                    args: vec![boxed.clone()],
-                    result_ty: ValueType::Ref(Some("PyObject".into())),
-                },
+                crate::model::cast_instance_call("PyObject", boxed.clone()),
                 true,
             )
             .unwrap();
@@ -11188,12 +11282,9 @@ mod tests {
             "the cross-block dead header ctor must be swept: {kinds:#?}"
         );
         assert!(
-            !kinds.iter().any(|k| matches!(
-                k,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                        && segments.get(1).map(String::as_str) == Some("PyType")
-            )),
+            !kinds
+                .iter()
+                .any(|k| cast_instance_root(k) == Some("PyType")),
             "the dead PyType cast threaded across the block boundary must be swept"
         );
         assert!(
@@ -11203,11 +11294,9 @@ mod tests {
             "the live NewWithVtable must survive"
         );
         assert!(
-            kinds.iter().any(|k| matches!(
-                k,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.get(1).map(String::as_str) == Some("PyObject")
-            )),
+            kinds
+                .iter()
+                .any(|k| cast_instance_root(k) == Some("PyObject")),
             "the live return cast must survive"
         );
         assert!(
@@ -11258,7 +11347,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["boxed".into(), "Box".into(), "new_uninit".into()],
             },
-            args: vec![],
+            args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(Some("Box".into())),
         };
         let mut graph = FunctionGraph::new("test");
@@ -11275,7 +11364,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("Array"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("Array".into())),
                 },
                 true,
@@ -12045,7 +12134,7 @@ mod tests {
                 join,
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_ctor("Box"),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("Box".into())),
                 },
                 true,

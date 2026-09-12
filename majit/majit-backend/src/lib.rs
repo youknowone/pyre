@@ -103,6 +103,7 @@ pub use finish_descrs::{
     get_or_attach_done_with_this_frame_descr_multi, make_and_attach_done_descrs,
 };
 pub use jitframe::JitFrameInfo;
+pub use llmodel::{FailArgSource, get_int_value, get_int_value_direct};
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
     BridgeDispatchCells, ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK,

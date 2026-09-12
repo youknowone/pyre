@@ -7,7 +7,6 @@
 use smallvec::SmallVec;
 
 use crate::descr::DescrRef;
-use crate::forwarding::Forwarded;
 use crate::operand::Operand;
 use crate::value::{GcRef, Type, Value};
 
@@ -1244,10 +1243,163 @@ pub trait BoxEnv {
 /// the same `Rc<Op>` and reads/writes `forwarded`/`descr`/...  through
 /// the interior-mutable slots.
 ///
-/// This alias is the shared-identity handle for trace `Op` storage.
-/// Most sites traffic in `OpRc`; the remaining `Vec<Op>` sites keep the
-/// legacy clone-on-copy shape until they are migrated.
-pub type OpRc = std::rc::Rc<Op>;
+/// Shared-identity handle for trace `Op` storage.
+///
+/// `cls()` / `emit_op` mint through [`OpRc::new`]. The handle is a
+/// one-word refcount (no `Weak`) in reserved chunks so first mint
+/// leaves the 48-byte `RcBox<Op>` class. Clone is a count bump; the
+/// last drop returns the slot to the chunk free list.
+pub struct OpRc {
+    ptr: std::ptr::NonNull<OpInner>,
+}
+
+#[repr(C)]
+struct OpInner {
+    strong: std::cell::Cell<usize>,
+    value: Op,
+}
+
+const OP_INNER_CHUNK: usize = 1024;
+
+struct OpInnerHeap {
+    chunks: Vec<(*mut OpInner, usize)>,
+    free: Vec<std::ptr::NonNull<OpInner>>,
+}
+
+unsafe impl Send for OpInnerHeap {}
+unsafe impl Sync for OpInnerHeap {}
+
+static OP_INNER_HEAP: std::sync::Mutex<OpInnerHeap> = std::sync::Mutex::new(OpInnerHeap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn alloc_op_inner() -> std::ptr::NonNull<OpInner> {
+    let mut heap = OP_INNER_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < OP_INNER_CHUNK
+    {
+        let p = unsafe { std::ptr::NonNull::new_unchecked((*base).add(*used)) };
+        *used += 1;
+        return p;
+    }
+    let layout = std::alloc::Layout::array::<OpInner>(OP_INNER_CHUNK).expect("OpInner chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut OpInner };
+    assert!(!base.is_null(), "OpInner chunk alloc failed");
+    heap.chunks.push((base, 1));
+    unsafe { std::ptr::NonNull::new_unchecked(base) }
+}
+
+fn free_op_inner(p: std::ptr::NonNull<OpInner>) {
+    OP_INNER_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+impl OpRc {
+    pub fn new(op: Op) -> Self {
+        let ptr = alloc_op_inner();
+        unsafe {
+            ptr.as_ptr().write(OpInner {
+                strong: std::cell::Cell::new(1),
+                value: op,
+            });
+        }
+        OpRc { ptr }
+    }
+
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr == other.ptr
+    }
+
+    pub fn as_ptr(this: &Self) -> *const Op {
+        unsafe { std::ptr::addr_of!((*this.ptr.as_ptr()).value) }
+    }
+
+    pub fn strong_count(this: &Self) -> usize {
+        unsafe { this.ptr.as_ref().strong.get() }
+    }
+
+    pub fn into_raw(this: Self) -> *const Op {
+        let p = Self::as_ptr(&this);
+        std::mem::forget(this);
+        p
+    }
+
+    pub unsafe fn from_raw(value: *const Op) -> Self {
+        let offset = std::mem::offset_of!(OpInner, value);
+        let inner = (value as usize).wrapping_sub(offset) as *mut OpInner;
+        OpRc {
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(inner) },
+        }
+    }
+
+    pub unsafe fn increment_strong_count(value: *const Op) {
+        let rc = unsafe { Self::from_raw(value) };
+        let extra = rc.clone();
+        std::mem::forget(rc);
+        std::mem::forget(extra);
+    }
+}
+
+impl Clone for OpRc {
+    fn clone(&self) -> Self {
+        let inner = unsafe { self.ptr.as_ref() };
+        inner.strong.set(inner.strong.get() + 1);
+        OpRc { ptr: self.ptr }
+    }
+}
+
+impl Drop for OpRc {
+    fn drop(&mut self) {
+        let inner = unsafe { self.ptr.as_ref() };
+        let n = inner.strong.get() - 1;
+        if n == 0 {
+            unsafe {
+                std::ptr::drop_in_place(&mut (*self.ptr.as_ptr()).value);
+            }
+            free_op_inner(self.ptr);
+        } else {
+            inner.strong.set(n);
+        }
+    }
+}
+
+impl std::ops::Deref for OpRc {
+    type Target = Op;
+    fn deref(&self) -> &Op {
+        unsafe { &self.ptr.as_ref().value }
+    }
+}
+
+impl AsRef<Op> for OpRc {
+    fn as_ref(&self) -> &Op {
+        self
+    }
+}
+
+impl std::borrow::Borrow<Op> for OpRc {
+    fn borrow(&self) -> &Op {
+        self
+    }
+}
+
+impl std::fmt::Debug for OpRc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl From<Op> for OpRc {
+    fn from(op: Op) -> Self {
+        OpRc::new(op)
+    }
+}
 
 /// A single IR operation.
 ///
@@ -1271,30 +1423,1841 @@ pub struct VectorizationInfo {
     pub count: i16,
 }
 
-/// `resoperation.py GuardResOp` extras — `_fail_args` and the pyre
-/// `fail_arg_types` cache. Allocated only when the op is a guard.
-#[derive(Clone, Debug)]
+/// `resoperation.py GuardResOp` extras — `_fail_args`, the pyre
+/// `fail_arg_types` cache, and `rd_resume_position`. Allocated only
+/// when the op is a guard (`GuardResOp` owns the field upstream).
 pub(crate) struct GuardExtra {
-    pub(crate) fail_args: Option<Vec<Operand>>,
-    pub(crate) fail_arg_types: Option<Vec<Type>>,
+    /// Shared `_fail_args` list. `Rc<[Operand]>` is a fat pointer (16 B)
+    /// so clone/stamp share the slice instead of allocating another
+    /// 4×16 or 6×16 payload.
+    fail_args: Option<std::rc::Rc<[Operand]>>,
+    /// `-1` unset, `0..=4` inline in `types`, `-2` whole list in
+    /// [`FAIL_ARG_TYPES_OVERFLOW`]. A fat `Rc<[Type]>` would push
+    /// GuardExtra (and then BothPayload) into the 56-byte class.
+    n_types: i8,
+    types: [Type; 4],
+    overflow: u32,
+    /// resoperation.py `GuardResOp.rd_resume_position` — `-1` unset.
+    pub(crate) rd_resume_position: i32,
+}
+
+impl GuardExtra {
+    fn new() -> Self {
+        GuardExtra {
+            fail_args: None,
+            n_types: -1,
+            types: [Type::Void; 4],
+            overflow: 0,
+            rd_resume_position: -1,
+        }
+    }
+
+    pub(crate) fn fail_args(&self) -> Option<&[Operand]> {
+        self.fail_args.as_deref()
+    }
+
+    pub(crate) fn fail_args_rc(&self) -> Option<std::rc::Rc<[Operand]>> {
+        self.fail_args.clone()
+    }
+
+    pub(crate) fn fail_args_mut(&mut self) -> Option<&mut [Operand]> {
+        self.fail_args.as_mut().map(std::rc::Rc::make_mut)
+    }
+
+    pub(crate) fn set_fail_args(&mut self, args: impl IntoIterator<Item = Operand>) {
+        self.fail_args = Some(std::rc::Rc::from_iter(args));
+    }
+
+    pub(crate) fn set_fail_args_rc(&mut self, args: std::rc::Rc<[Operand]>) {
+        self.fail_args = Some(args);
+    }
+
+    pub(crate) fn clear_fail_args(&mut self) {
+        self.fail_args = None;
+    }
+
+    pub(crate) fn fail_arg_types(&self) -> Option<&[Type]> {
+        match self.n_types {
+            n if n >= 0 => Some(&self.types[..n as usize]),
+            FAIL_ARG_TYPES_HEAP => Some(overflow_fail_arg_types(self.overflow)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_fail_arg_types(&mut self, types: &[Type]) {
+        if types.len() <= FAIL_ARG_TYPES_INLINE {
+            self.types[..types.len()].copy_from_slice(types);
+            self.n_types = types.len() as i8;
+            self.overflow = 0;
+            return;
+        }
+        self.n_types = FAIL_ARG_TYPES_HEAP;
+        self.overflow = intern_fail_arg_types(types);
+    }
+
+    pub(crate) fn clear_fail_arg_types(&mut self) {
+        self.n_types = -1;
+        self.overflow = 0;
+    }
+}
+
+impl Clone for GuardExtra {
+    fn clone(&self) -> Self {
+        GuardExtra {
+            fail_args: self.fail_args.clone(),
+            n_types: self.n_types,
+            types: self.types,
+            overflow: self.overflow,
+            rd_resume_position: self.rd_resume_position,
+        }
+    }
+}
+
+impl std::fmt::Debug for GuardExtra {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardExtra")
+            .field("fail_args", &self.fail_args())
+            .field("fail_arg_types", &self.fail_arg_types())
+            .field("rd_resume_position", &self.rd_resume_position)
+            .finish()
+    }
+}
+
+/// Packed `AbstractResOp` position. `Op.pos` is a result-op / input-arg /
+/// void-op / None index — never an inline `Const*` (`resoperation.py`
+/// `position`). Packing the 16-byte `OpRef` enum into a `u64` keeps the
+/// `Rc<Op>` box out of the 192-byte size class.
+#[derive(Debug)]
+pub struct OpPos(std::cell::Cell<u64>);
+
+impl OpPos {
+    #[inline]
+    pub fn new(r: OpRef) -> Self {
+        OpPos(std::cell::Cell::new(pack_op_pos(r)))
+    }
+
+    #[inline]
+    pub fn get(&self) -> OpRef {
+        unpack_op_pos(self.0.get())
+    }
+
+    #[inline]
+    pub fn set(&self, r: OpRef) {
+        self.0.set(pack_op_pos(r));
+    }
+}
+
+/// Packed `Op.pos` view. Tag lives in bits 28-31 of [`Op::pos_payload`]
+/// so [`Op::arg_len`] can be a full `u8` — JUMP reds include every
+/// virtualizable array cell (`VirtArray`) and exceed a 4-bit count.
+pub struct OpPosRef<'a> {
+    payload: &'a std::cell::Cell<u32>,
+}
+
+const POS_TAG_SHIFT: u32 = 28;
+const POS_PAYLOAD_MASK: u32 = (1 << POS_TAG_SHIFT) - 1;
+
+impl OpPosRef<'_> {
+    #[inline]
+    pub fn get(&self) -> OpRef {
+        let packed = self.payload.get();
+        let tag = (packed >> POS_TAG_SHIFT) as u8;
+        let payload = packed & POS_PAYLOAD_MASK;
+        unpack_op_pos(((tag as u64) << 32) | u64::from(payload))
+    }
+
+    #[inline]
+    pub fn set(&self, r: OpRef) {
+        let packed = pack_op_pos(r);
+        let mut tag = (packed >> 32) as u8;
+        let mut payload = packed as u32;
+        if payload > POS_PAYLOAD_MASK {
+            tag = 15;
+            payload = intern_overflow_pos(r);
+            debug_assert!(payload <= POS_PAYLOAD_MASK);
+        }
+        debug_assert!(tag < 16);
+        self.payload.set(((tag as u32) << POS_TAG_SHIFT) | payload);
+    }
+}
+
+fn pack_op_pos(r: OpRef) -> u64 {
+    let (tag, payload): (u8, u32) = match r {
+        OpRef::None => (0, 0),
+        OpRef::IntOp(x) => (1, x),
+        OpRef::FloatOp(x) => (2, x),
+        OpRef::RefOp(x) => (3, x),
+        OpRef::VoidOp(x) => (4, x),
+        OpRef::InputArgInt(x) => (5, x),
+        OpRef::InputArgFloat(x) => (6, x),
+        OpRef::InputArgRef(x) => (7, x),
+        OpRef::TempVar(x) => (8, x),
+        // shortpreamble SameAs / heap-const boxes stamp `pos` with the
+        // constant result identity (`heap.pos().set(ConstInt(7))`).
+        OpRef::ConstInt(v) => match i32::try_from(v) {
+            Ok(v32) => (9, v32 as u32),
+            Err(_) => (15, intern_overflow_pos(r)),
+        },
+        OpRef::ConstFloat(_) | OpRef::ConstPtr(_) => (15, intern_overflow_pos(r)),
+    };
+    ((tag as u64) << 32) | u64::from(payload)
+}
+
+fn unpack_op_pos(packed: u64) -> OpRef {
+    let tag = (packed >> 32) as u8;
+    let payload = packed as u32;
+    match tag {
+        0 => OpRef::None,
+        1 => OpRef::IntOp(payload),
+        2 => OpRef::FloatOp(payload),
+        3 => OpRef::RefOp(payload),
+        4 => OpRef::VoidOp(payload),
+        5 => OpRef::InputArgInt(payload),
+        6 => OpRef::InputArgFloat(payload),
+        7 => OpRef::InputArgRef(payload),
+        8 => OpRef::TempVar(payload),
+        9 => OpRef::ConstInt(payload as i32 as i64),
+        15 => overflow_pos(payload),
+        other => panic!("corrupt Op.pos tag {other}"),
+    }
+}
+
+fn intern_overflow_pos(r: OpRef) -> u32 {
+    let mut slab = OVERFLOW_POS.lock().unwrap_or_else(|e| e.into_inner());
+    let idx = u32::try_from(slab.len()).expect("Op.pos overflow slab exhausted");
+    slab.push(r);
+    idx
+}
+
+fn overflow_pos(idx: u32) -> OpRef {
+    let slab = OVERFLOW_POS.lock().unwrap_or_else(|e| e.into_inner());
+    slab[idx as usize]
+}
+
+static OVERFLOW_POS: std::sync::Mutex<Vec<OpRef>> = std::sync::Mutex::new(Vec::new());
+
+/// Full fail-arg type lists that do not fit in [`GuardExtra::types`].
+/// Entries are leaked slices so `fail_arg_types` can return them after
+/// the lock drops.
+static FAIL_ARG_TYPES_OVERFLOW: std::sync::Mutex<Vec<&'static [Type]>> =
+    std::sync::Mutex::new(Vec::new());
+
+const FAIL_ARG_TYPES_INLINE: usize = 4;
+const FAIL_ARG_TYPES_HEAP: i8 = -2;
+
+fn intern_fail_arg_types(types: &[Type]) -> u32 {
+    let leaked: &'static [Type] = Box::leak(types.to_vec().into_boxed_slice());
+    let mut slab = FAIL_ARG_TYPES_OVERFLOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let idx = u32::try_from(slab.len()).expect("fail-arg types overflow slab exhausted");
+    slab.push(leaked);
+    idx
+}
+
+fn overflow_fail_arg_types(idx: u32) -> &'static [Type] {
+    let slab = FAIL_ARG_TYPES_OVERFLOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    slab[idx as usize]
+}
+
+const STAMP_UNSET: u32 = 0;
+const STAMP_VOID: u32 = 1;
+const STAMP_INT: u32 = 2;
+const STAMP_WIDE: u32 = 3;
+
+fn pack_stamp(v: crate::value::Value) -> u32 {
+    match v {
+        crate::value::Value::Void => STAMP_VOID,
+        crate::value::Value::Int(i) if i >= -(1 << 29) && i < (1 << 29) => {
+            STAMP_INT | ((i as u32) << 2)
+        }
+        other => {
+            let id = crate::operand::fresh_wide(other);
+            debug_assert!(id < (1 << 30), "FrontendOp stamp slab id exceeds 30 bits");
+            STAMP_WIDE | ((id as u32) << 2)
+        }
+    }
+}
+
+fn unpack_stamp(stamp: u32) -> Option<crate::value::Value> {
+    match stamp {
+        STAMP_UNSET => None,
+        STAMP_VOID => Some(crate::value::Value::Void),
+        s if s & 3 == STAMP_INT => Some(crate::value::Value::Int(((s as i32) >> 2) as i64)),
+        s if s & 3 == STAMP_WIDE => Some(crate::operand::wide_value((s >> 2) as u64)),
+        other => panic!("corrupt Op.stamp {other}"),
+    }
+}
+
+/// Inline operand capacity. Two `Operand`s are 16 B so `Op` is 32 B
+/// and `Rc<Op>` leaves the 64-byte class. Recorded SETFIELD / GETFIELD
+/// / INT_* are 1–2 args; rewrite `GC_STORE` (four args) heap-grows 32 B
+/// instead of keeping a fourth slot on every op.
+pub type OpArgVec = SmallVec<[Operand; 4]>;
+
+const ARG_INLINE: usize = 2;
+/// Extra-arg slab holds four `Operand`s (32 B). Lengths 3–4 use it;
+/// longer lists still heap-grow a `Vec`.
+const ARG_SLAB: usize = 4;
+const ARG_SLAB_BIT: usize = 1 << (usize::BITS - 1);
+const ARG_OVERFLOW_BIT: usize = 1 << (usize::BITS - 2);
+const ARG_SLAB_CHUNK: usize = 2048;
+/// `N_aryOp._args` has no length cap (`resoperation.py numargs`).
+/// `Op.arg_len` stays a `u8` so `Op` remains 32 B; 255 means the
+/// true count sits in the heap prefix (a JUMP of a long VirtArray).
+const ARG_LEN_STORED_MAX: u8 = 254;
+const ARG_LEN_OVERFLOW: u8 = 255;
+
+fn overflow_header_size() -> usize {
+    std::mem::size_of::<usize>().max(std::mem::align_of::<Operand>())
+}
+
+unsafe fn overflow_len(ptr: *mut Operand) -> usize {
+    unsafe {
+        ptr.cast::<u8>()
+            .sub(overflow_header_size())
+            .cast::<usize>()
+            .read()
+    }
+}
+
+fn store_arg_len(n: usize) -> u8 {
+    if n <= ARG_LEN_STORED_MAX as usize {
+        n as u8
+    } else {
+        ARG_LEN_OVERFLOW
+    }
+}
+
+struct Arg32Heap {
+    chunks: Vec<(*mut Operand, usize)>,
+    free: Vec<*mut Operand>,
+}
+
+unsafe impl Send for Arg32Heap {}
+unsafe impl Sync for Arg32Heap {}
+
+static ARG32_HEAP: std::sync::Mutex<Arg32Heap> = std::sync::Mutex::new(Arg32Heap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn alloc_arg32() -> *mut Operand {
+    let mut heap = ARG32_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < ARG_SLAB_CHUNK
+    {
+        let p = unsafe { (*base).add(*used * ARG_SLAB) };
+        *used += 1;
+        return p;
+    }
+    let layout = std::alloc::Layout::array::<Operand>(ARG_SLAB_CHUNK * ARG_SLAB)
+        .expect("32-byte arg slot chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut Operand };
+    assert!(!base.is_null(), "32-byte arg slot chunk alloc failed");
+    heap.chunks.push((base, 1));
+    base
+}
+
+fn free_arg32(p: *mut Operand) {
+    ARG32_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+/// Packed `N_aryOp._args`. Two `Operand`s are 16 B; the length lives on
+/// [`Op::arg_len`]. Three-or-more args heap-grow.
+#[repr(C)]
+struct ArgHeap {
+    ptr: *mut Operand,
+    cap: usize,
+}
+
+#[repr(C)]
+union ArgData {
+    inline: std::mem::ManuallyDrop<[std::mem::MaybeUninit<Operand>; ARG_INLINE]>,
+    heap: std::mem::ManuallyDrop<ArgHeap>,
+}
+
+fn live_arg_len(stored: u8, data: &ArgData) -> usize {
+    if stored < ARG_LEN_OVERFLOW {
+        stored as usize
+    } else {
+        unsafe { overflow_len(data.heap.ptr) }
+    }
+}
+
+/// Construction-time arg lengths. Nested `ArgSlot::new` (an operand
+/// that itself mints an `Op`) must not clobber the outer `op!` length.
+thread_local! {
+    static ARG_LEN_STACK: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn push_arg_len(len: u8) {
+    ARG_LEN_STACK.with(|s| s.borrow_mut().push(len));
+}
+
+fn pop_arg_len() -> u8 {
+    ARG_LEN_STACK.with(|s| s.borrow_mut().pop().unwrap_or(0))
+}
+
+/// `N_aryOp._args` slot. Length is [`Op`]'s `arg_len`; this is the
+/// two-operand union. `UnsafeCell` matches RPython's unrestricted
+/// `op._args[i] = ...` on a shared ResOp.
+pub struct ArgSlot(std::cell::UnsafeCell<ArgData>);
+
+impl ArgSlot {
+    pub fn new(v: OpArgVec) -> Self {
+        let len = store_arg_len(v.len());
+        push_arg_len(len);
+        ArgSlot(std::cell::UnsafeCell::new(Self::pack_data(v)))
+    }
+
+    fn pack_data(v: OpArgVec) -> ArgData {
+        let len_us = v.len();
+        if len_us <= ARG_INLINE {
+            let mut inline: [std::mem::MaybeUninit<Operand>; ARG_INLINE] =
+                unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+            for (i, arg) in v.into_iter().enumerate() {
+                inline[i].write(arg);
+            }
+            ArgData {
+                inline: std::mem::ManuallyDrop::new(inline),
+            }
+        } else if len_us <= ARG_SLAB {
+            // 3–4 args: 32 B payload from the reserved slot slab so
+            // GC_STORE's extra pair does not mint the 32-byte class.
+            let ptr = alloc_arg32();
+            for (i, arg) in v.into_iter().enumerate() {
+                unsafe {
+                    ptr.add(i).write(arg);
+                }
+            }
+            ArgData {
+                heap: std::mem::ManuallyDrop::new(ArgHeap {
+                    ptr,
+                    cap: ARG_SLAB | ARG_SLAB_BIT,
+                }),
+            }
+        } else if len_us <= ARG_LEN_STORED_MAX as usize {
+            let mut vec = v.into_vec();
+            let heap = ArgHeap {
+                ptr: vec.as_mut_ptr(),
+                cap: vec.capacity(),
+            };
+            std::mem::forget(vec);
+            ArgData {
+                heap: std::mem::ManuallyDrop::new(heap),
+            }
+        } else {
+            // `resoperation.py N_aryOp._args` is an uncapped list.
+            // Prefix the allocation with the true length so `arg_len`
+            // can stay a `u8` (255 = overflow).
+            let header = overflow_header_size();
+            let layout = std::alloc::Layout::from_size_align(
+                header + std::mem::size_of::<Operand>() * len_us,
+                std::mem::align_of::<Operand>(),
+            )
+            .expect("N_aryOp overflow arg heap");
+            let base = unsafe { std::alloc::alloc(layout) };
+            assert!(!base.is_null(), "N_aryOp overflow arg heap");
+            unsafe {
+                base.cast::<usize>().write(len_us);
+                let ptr = base.add(header).cast::<Operand>();
+                for (i, arg) in v.into_iter().enumerate() {
+                    ptr.add(i).write(arg);
+                }
+                ArgData {
+                    heap: std::mem::ManuallyDrop::new(ArgHeap {
+                        ptr,
+                        cap: ARG_OVERFLOW_BIT,
+                    }),
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn borrow(&self, len: u8) -> &[Operand] {
+        unsafe {
+            let data = &*self.0.get();
+            let n = live_arg_len(len, data);
+            if n <= ARG_INLINE {
+                std::slice::from_raw_parts((*data.inline).as_ptr().cast::<Operand>(), n)
+            } else {
+                std::slice::from_raw_parts(data.heap.ptr, n)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn borrow_mut(&self, len: u8) -> &mut [Operand] {
+        unsafe {
+            let data = &mut *self.0.get();
+            let n = live_arg_len(len, data);
+            if n <= ARG_INLINE {
+                std::slice::from_raw_parts_mut((*data.inline).as_mut_ptr().cast::<Operand>(), n)
+            } else {
+                std::slice::from_raw_parts_mut(data.heap.ptr, n)
+            }
+        }
+    }
+
+    pub fn clone_vec(&self, len: u8) -> OpArgVec {
+        self.borrow(len).iter().cloned().collect()
+    }
+
+    pub fn replace(&self, old_len: u8, v: OpArgVec) -> u8 {
+        let new_len = store_arg_len(v.len());
+        unsafe {
+            let data = &mut *self.0.get();
+            drop_arg_data(data, old_len);
+            std::ptr::write(data, Self::pack_data(v));
+        }
+        new_len
+    }
+
+    pub fn take_last_len() -> u8 {
+        pop_arg_len()
+    }
+}
+
+unsafe fn drop_arg_data(data: &mut ArgData, len: u8) {
+    unsafe {
+        let n = live_arg_len(len, data);
+        if n <= ARG_INLINE {
+            for slot in (*data.inline).iter_mut().take(n) {
+                slot.assume_init_drop();
+            }
+        } else {
+            let heap = std::mem::ManuallyDrop::take(&mut data.heap);
+            if heap.cap & ARG_SLAB_BIT != 0 {
+                for i in 0..n {
+                    heap.ptr.add(i).drop_in_place();
+                }
+                free_arg32(heap.ptr);
+            } else if heap.cap & ARG_OVERFLOW_BIT != 0 {
+                for i in 0..n {
+                    heap.ptr.add(i).drop_in_place();
+                }
+                let header = overflow_header_size();
+                let base = heap.ptr.cast::<u8>().sub(header);
+                let layout = std::alloc::Layout::from_size_align(
+                    header + std::mem::size_of::<Operand>() * n,
+                    std::mem::align_of::<Operand>(),
+                )
+                .expect("N_aryOp overflow arg heap");
+                std::alloc::dealloc(base, layout);
+            } else {
+                let _ = Vec::from_raw_parts(heap.ptr, n, heap.cap);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ArgSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ArgSlot")
+    }
+}
+
+/// Packed `_descr` + `extra` (16 B). RPython keeps the attributes
+/// separate; this is storage only so `Rc<Op>` leaves the 160-byte class.
+///
+/// `(lo, hi)` encoding:
+/// - `(0, 0)` — neither
+/// - `(data, vtable)` with `hi > 2` — descr only (`Arc<dyn Descr>`)
+/// - `(box, 1)` — extra only
+/// - `(box, 2)` — `Box<(Option<DescrRef>, OpKindExtra)>`
+const EXTRA_TAG: usize = 1;
+const BOTH_TAG: usize = 2;
+const FWD_TAG: usize = 3;
+const DESCR_FWD_TAG: usize = 4;
+const EXTRA_FWD_TAG: usize = 5;
+const BOTH_FWD_TAG: usize = 6;
+const SLOT_TAG_MAX: usize = BOTH_FWD_TAG;
+
+struct BothPayload {
+    /// Always present in this arm (`write_parts` `(Some, Some, false)`).
+    /// Not `Option` — that made the box 56 B on the regex and/or leaf.
+    descr: DescrRef,
+    extra: OpKindExtra,
+}
+
+struct DescrFwd {
+    descr: DescrRef,
+    forwarded: u64,
+}
+
+struct ExtraFwd {
+    extra: OpKindExtra,
+    forwarded: u64,
+}
+
+struct BothFwd {
+    descr: Option<DescrRef>,
+    extra: OpKindExtra,
+    forwarded: u64,
+}
+
+/// Heap pair for descr / extra / stamp. Forwarded-only stays in the
+/// 8 B slot word so int-bound `set_forwarded` does not mint a box.
+struct DescrWords {
+    lo: usize,
+    hi: usize,
+    stamp: u32,
+}
+
+/// Descr + `_forwarded` without extra/stamp. Thin descr is 8 B and
+/// the packed forwarded word is 8 B, so the pair is 16 B — not a
+/// 24 B `DescrFwd` plus a 24 B `DescrWords`.
+struct ThinFwd {
+    thin: u64,
+    forwarded: u64,
+}
+
+/// Stamp plus the previous slot word (empty / thin descr / extra /
+/// both / inline forwarded). 16 B so `set_stamp_word` leaves the
+/// 24-byte `DescrWords` class.
+struct ThinStamp {
+    inner: u64,
+    stamp: u32,
+}
+
+/// 16 B ThinFwd / ThinStamp slots come from reserved chunks so compile
+/// restamp does not mint the 16-byte malloc class.
+const SLOT16: usize = 16;
+const SLOT16_CHUNK: usize = 4096;
+
+struct Slot16Heap {
+    chunks: Vec<(*mut u8, usize)>,
+    free: Vec<*mut u8>,
+}
+
+unsafe impl Send for Slot16Heap {}
+unsafe impl Sync for Slot16Heap {}
+
+static SLOT16_HEAP: std::sync::Mutex<Slot16Heap> = std::sync::Mutex::new(Slot16Heap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn alloc_slot16() -> *mut u8 {
+    let mut heap = SLOT16_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < SLOT16_CHUNK
+    {
+        let p = unsafe { (*base).add(*used * SLOT16) };
+        *used += 1;
+        return p;
+    }
+    let layout = std::alloc::Layout::from_size_align(SLOT16_CHUNK * SLOT16, SLOT16)
+        .expect("16-byte slot chunk layout");
+    let base = unsafe { std::alloc::alloc(layout) };
+    assert!(!base.is_null(), "16-byte slot chunk alloc failed");
+    heap.chunks.push((base, 1));
+    base
+}
+
+fn free_slot16(p: *mut u8) {
+    SLOT16_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+fn alloc_thin_fwd(thin: u64, forwarded: u64) -> *mut ThinFwd {
+    let p = alloc_slot16() as *mut ThinFwd;
+    unsafe {
+        p.write(ThinFwd { thin, forwarded });
+    }
+    p
+}
+
+fn free_thin_fwd(p: *mut ThinFwd) -> ThinFwd {
+    let value = unsafe { p.read() };
+    free_slot16(p as *mut u8);
+    value
+}
+
+fn alloc_thin_stamp(inner: u64, stamp: u32) -> *mut ThinStamp {
+    let p = alloc_slot16() as *mut ThinStamp;
+    unsafe {
+        p.write(ThinStamp { inner, stamp });
+    }
+    p
+}
+
+fn free_thin_stamp(p: *mut ThinStamp) -> ThinStamp {
+    let value = unsafe { p.read() };
+    free_slot16(p as *mut u8);
+    value
+}
+
+/// High bit marks a [`DescrWords`] or [`ThinFwd`] box. Heap pointers
+/// are 48-bit; `pack_forwarded` SmallConst ids would need bit 28 of
+/// the id to collide (256M mints).
+///
+/// Tags live in a `u64` word so wasm32 (`usize` = 32) can still
+/// compile and pack the same layout.
+const SLOT_BOX_BIT: u64 = 1u64 << 63;
+/// Boxed [`ThinFwd`]. Distinct from [`THIN_DESCR_BIT`] (62) and the
+/// box bit (63). Heap pointers do not set bit 61.
+const SLOT_THIN_FWD_BIT: u64 = 1u64 << 61;
+/// Extra-only `Box<OpKindExtra>` pointer, no `DescrWords` wrapper.
+const SLOT_EXTRA_BIT: u64 = 1u64 << 60;
+/// `Box<BothPayload>` pointer, no `DescrWords` wrapper.
+const SLOT_BOTH_BIT: u64 = 1u64 << 59;
+/// Boxed [`ThinStamp`]. Aligned heap pointer plus bit 58; `pack_forwarded`
+/// SmallConst has low 3 bits = 3, so it cannot collide.
+const SLOT_STAMP_BOX_BIT: u64 = 1u64 << 58;
+/// Stamp-only in the slot word: bits 48-62 = 0x7FFE, stamp in 0-31.
+/// Heap pointers leave bits 48-63 clear. SmallConst would need id
+/// `0x7FFE << 13` (256M) to collide.
+const SLOT_STAMP_INLINE_TAG: u64 = 0x7FFE << 48;
+/// Descr-only (no extra / stamp / forwarded) is a thin word: data
+/// pointer in bits 0-47, interned vtable id in 48-55, this flag at 62.
+/// Distinct from `pack_forwarded` SmallConst (low 3 bits = 3).
+const THIN_DESCR_BIT: u64 = 1u64 << 62;
+const THIN_DESCR_ID_SHIFT: u32 = 48;
+const THIN_DESCR_PTR_MASK: u64 = (1u64 << 48) - 1;
+/// Small `_resint` stamps ride in bits 56-61 of a thin descr word so
+/// `marked`/`empty` GETFIELD (0/1) does not mint a 16 B `ThinStamp`.
+/// `pack_stamp(Int(i))` for `i` in `0..=15` fits.
+const THIN_STAMP_SHIFT: u32 = 56;
+const THIN_STAMP_MASK: u64 = 0x3f;
+/// Wider stamps intern `(vtable_id, stamp)` and set bit 61 plus a 13-bit
+/// id in bits 48-60. Bit 61 on a thin descr (no `SLOT_BOX_BIT`) cannot
+/// collide with `ThinFwd` (which also sets bit 63).
+const THIN_STAMPED_BIT: u64 = 1u64 << 61;
+const THIN_STAMPED_ID_SHIFT: u32 = 48;
+const THIN_STAMPED_ID_MASK: u64 = 0x1fff;
+
+#[derive(Clone, Copy)]
+struct ThinStamped {
+    vtable: u8,
+    stamp: u32,
+    /// Non-zero: descr data lives here and word bits 0-47 are a tag-stripped
+    /// forwarded payload. Zero: stamp intern only; descr data stays in the word.
+    data: usize,
+    /// `pack_forwarded` low-3-bit tag restored onto bits 0-47. Unused when
+    /// `data == 0`.
+    fwd_tag: u8,
+}
+
+static THIN_STAMPED: std::sync::Mutex<Vec<ThinStamped>> = std::sync::Mutex::new(Vec::new());
+
+static DESCR_VTABLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn intern_descr_vtable(vtable: usize) -> Option<u8> {
+    let mut v = DESCR_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = v.iter().position(|&x| x == vtable) {
+        return u8::try_from(i).ok();
+    }
+    if v.len() >= 256 {
+        return None;
+    }
+    v.push(vtable);
+    u8::try_from(v.len() - 1).ok()
+}
+
+fn descr_vtable_at(id: u8) -> usize {
+    let v = DESCR_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
+    v[id as usize]
+}
+
+fn is_thin_descr(w: u64) -> bool {
+    w & SLOT_BOX_BIT == 0 && w & THIN_DESCR_BIT != 0 && w & 7 == 0 && !is_stamp_inline(w)
+}
+
+fn is_thin_fwd_box(w: u64) -> bool {
+    w & SLOT_BOX_BIT != 0 && w & SLOT_THIN_FWD_BIT != 0
+}
+
+fn is_extra_inline(w: u64) -> bool {
+    w & SLOT_BOX_BIT == 0 && w & SLOT_EXTRA_BIT != 0 && w & THIN_DESCR_BIT == 0 && w & 7 == 0
+}
+
+fn is_both_inline(w: u64) -> bool {
+    w & SLOT_BOX_BIT == 0 && w & SLOT_BOTH_BIT != 0 && w & THIN_DESCR_BIT == 0 && w & 7 == 0
+}
+
+fn is_stamp_box(w: u64) -> bool {
+    w & SLOT_BOX_BIT == 0 && w & SLOT_STAMP_BOX_BIT != 0 && w & THIN_DESCR_BIT == 0 && w & 7 == 0
+}
+
+fn thin_stamped_at(w: u64) -> Option<ThinStamped> {
+    if w & THIN_STAMPED_BIT == 0 {
+        return None;
+    }
+    let id = ((w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK) as usize;
+    let v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
+    v.get(id).copied()
+}
+
+fn thin_stamp(w: u64) -> u32 {
+    if let Some(e) = thin_stamped_at(w) {
+        return e.stamp;
+    }
+    ((w >> THIN_STAMP_SHIFT) & THIN_STAMP_MASK) as u32
+}
+
+fn thin_data_ptr(w: u64) -> usize {
+    match thin_stamped_at(w) {
+        Some(e) if e.data != 0 => e.data,
+        _ => (w & THIN_DESCR_PTR_MASK) as usize,
+    }
+}
+
+fn thin_fwd_from_word(w: u64) -> u64 {
+    match thin_stamped_at(w) {
+        Some(e) if e.data != 0 => (w & THIN_DESCR_PTR_MASK) | u64::from(e.fwd_tag),
+        _ => 0,
+    }
+}
+
+fn thin_with_stamp(thin: u64, stamp: u32) -> Option<u64> {
+    let data = thin & THIN_DESCR_PTR_MASK;
+    let vtable_id = thin_vtable_id(thin);
+    if stamp == 0 {
+        return Some(data | (u64::from(vtable_id) << THIN_DESCR_ID_SHIFT) | THIN_DESCR_BIT);
+    }
+    if stamp < 64 && stamp & (1 << 5) == 0 {
+        // Bit 5 would set THIN_STAMPED_BIT (61); those values intern.
+        return Some(
+            data | (u64::from(vtable_id) << THIN_DESCR_ID_SHIFT)
+                | (u64::from(stamp) << THIN_STAMP_SHIFT)
+                | THIN_DESCR_BIT,
+        );
+    }
+    intern_thin_stamped(vtable_id, stamp, 0, 0)
+        .map(|id| data | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT)
+}
+
+fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Option<u64> {
+    let mut v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = v.iter().position(|e| {
+        e.vtable == vtable && e.stamp == stamp && e.data == data && e.fwd_tag == fwd_tag
+    }) {
+        return Some(i as u64);
+    }
+    if v.len() as u64 >= THIN_STAMPED_ID_MASK + 1 {
+        return None;
+    }
+    v.push(ThinStamped {
+        vtable,
+        stamp,
+        data,
+        fwd_tag,
+    });
+    Some((v.len() - 1) as u64)
+}
+
+fn thin_with_forwarded(thin: u64, packed: u64) -> Option<u64> {
+    // SmallConst / SmallWide use bits 48+ for identity; they do not fit
+    // in the thin word's 48-bit payload. Pointer-tagged forwarded does.
+    if packed == 0 || matches!(packed & 7, 3 | 4) {
+        return None;
+    }
+    let data = thin_data_ptr(thin);
+    let tag = (packed & 7) as u8;
+    let id = intern_thin_stamped(thin_vtable_id(thin), thin_stamp(thin), data, tag)?;
+    let fwd = packed & THIN_DESCR_PTR_MASK & !7;
+    Some(fwd | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT)
+}
+
+fn is_stamp_inline(w: u64) -> bool {
+    (w & !0xFFFF_FFFF) == SLOT_STAMP_INLINE_TAG
+}
+
+fn tagged_ptr(w: u64) -> usize {
+    (w & THIN_DESCR_PTR_MASK) as usize
+}
+
+fn box_payload(w: u64) -> usize {
+    (w & !SLOT_BOX_BIT & !SLOT_THIN_FWD_BIT) as usize
+}
+
+fn take_word(w: u64) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32) {
+    if w == 0 {
+        (None, None, 0, 0)
+    } else if is_stamp_inline(w) {
+        (None, None, 0, w as u32)
+    } else if is_stamp_box(w) {
+        let p = free_thin_stamp(tagged_ptr(w) as *mut ThinStamp);
+        let (d, e, f, _) = take_word(p.inner);
+        (d, e, f, p.stamp)
+    } else if is_extra_inline(w) {
+        let extra = unsafe { Box::from_raw(tagged_ptr(w) as *mut OpKindExtra) };
+        (None, Some(extra), 0, 0)
+    } else if is_both_inline(w) {
+        let both = unsafe { Box::from_raw(tagged_ptr(w) as *mut BothPayload) };
+        (Some(both.descr), Some(Box::new(both.extra)), 0, 0)
+    } else if is_thin_fwd_box(w) {
+        let p = free_thin_fwd(box_payload(w) as *mut ThinFwd);
+        let (lo, hi) = thin_to_lo_hi(p.thin);
+        (
+            Some(descr_arc_from_bits(lo, hi)),
+            None,
+            p.forwarded,
+            thin_stamp(p.thin),
+        )
+    } else if w & SLOT_BOX_BIT != 0 {
+        let p = unsafe { Box::from_raw(box_payload(w) as *mut DescrWords) };
+        let (d, e, f) = unsafe { decode_descr_extra(p.lo, p.hi) };
+        (d, e, f, p.stamp)
+    } else if is_thin_descr(w) {
+        let (lo, hi) = thin_to_lo_hi(w);
+        let stamp = thin_stamp(w);
+        let fwd = thin_fwd_from_word(w);
+        if fwd != 0 {
+            (Some(descr_arc_clone_from_bits(lo, hi)), None, fwd, stamp)
+        } else {
+            (Some(descr_arc_from_bits(lo, hi)), None, 0, stamp)
+        }
+    } else {
+        // Unboxed forwarded word: the payload is the whole u64, not
+        // `w as usize` (wasm32 truncates SmallConst).
+        let stamp = crate::forwarding::fwd_stamp(w);
+        (None, None, crate::forwarding::strip_fwd_stamp(w), stamp)
+    }
+}
+
+fn packed_forwarded_word(w: u64) -> u64 {
+    if is_stamp_inline(w) {
+        return 0;
+    }
+    if is_stamp_box(w) {
+        let p = tagged_ptr(w) as *const ThinStamp;
+        return packed_forwarded_word(unsafe { (*p).inner });
+    }
+    if is_thin_fwd_box(w) {
+        let p = box_payload(w) as *const ThinFwd;
+        return unsafe { (*p).forwarded };
+    }
+    if is_thin_descr(w) {
+        return thin_fwd_from_word(w);
+    }
+    if w & SLOT_BOX_BIT == 0 && !is_thin_descr(w) && !is_extra_inline(w) && !is_both_inline(w) {
+        return w;
+    }
+    let (lo, hi) = slot_bits(w);
+    match hi {
+        FWD_TAG => lo as u64,
+        DESCR_FWD_TAG => unsafe { (*(lo as *const DescrFwd)).forwarded },
+        EXTRA_FWD_TAG => unsafe { (*(lo as *const ExtraFwd)).forwarded },
+        BOTH_FWD_TAG => unsafe { (*(lo as *const BothFwd)).forwarded },
+        _ => 0,
+    }
+}
+
+fn slot_bits(w: u64) -> (usize, usize) {
+    if w == 0 {
+        (0, 0)
+    } else if is_thin_fwd_box(w) {
+        let p = box_payload(w) as *const ThinFwd;
+        thin_to_lo_hi(unsafe { (*p).thin })
+    } else if w & SLOT_BOX_BIT != 0 {
+        let p = box_payload(w) as *const DescrWords;
+        unsafe { ((*p).lo, (*p).hi) }
+    } else if is_thin_descr(w) {
+        thin_to_lo_hi(w)
+    } else if is_extra_inline(w) {
+        (tagged_ptr(w), EXTRA_TAG)
+    } else if is_both_inline(w) {
+        (tagged_ptr(w), BOTH_TAG)
+    } else if is_stamp_box(w) {
+        let p = tagged_ptr(w) as *const ThinStamp;
+        slot_bits(unsafe { (*p).inner })
+    } else if is_stamp_inline(w) {
+        (0, 0)
+    } else {
+        (w as usize, FWD_TAG)
+    }
+}
+
+fn encode_thin_descr(d: DescrRef) -> Result<u64, DescrRef> {
+    let raw = std::sync::Arc::into_raw(d);
+    let (data, vtable): (*const u8, *const u8) = unsafe { std::mem::transmute(raw) };
+    let data = data as u64;
+    let vtable = vtable as usize;
+    debug_assert_eq!(data & !THIN_DESCR_PTR_MASK, 0);
+    debug_assert_eq!(data & 7, 0);
+    match intern_descr_vtable(vtable) {
+        Some(id) => Ok(data | (u64::from(id) << THIN_DESCR_ID_SHIFT) | THIN_DESCR_BIT),
+        None => Err(unsafe { std::sync::Arc::from_raw(raw) }),
+    }
+}
+
+fn thin_vtable_id(w: u64) -> u8 {
+    if let Some(e) = thin_stamped_at(w) {
+        e.vtable
+    } else {
+        ((w >> THIN_DESCR_ID_SHIFT) & 0xff) as u8
+    }
+}
+
+fn thin_to_lo_hi(w: u64) -> (usize, usize) {
+    (thin_data_ptr(w), descr_vtable_at(thin_vtable_id(w)))
+}
+
+/// `ResOpWithDescr._descr` slot. One tagged word: empty, inline
+/// `_forwarded`, or a box for descr/extra/stamp.
+pub struct DescrSlot {
+    word: std::cell::UnsafeCell<u64>,
+}
+
+impl DescrSlot {
+    pub fn new(v: Option<DescrRef>) -> Self {
+        Self::from_parts(v, None)
+    }
+
+    fn from_parts(descr: Option<DescrRef>, extra: Option<Box<OpKindExtra>>) -> Self {
+        Self::from_parts_full(descr, extra, 0)
+    }
+
+    fn from_parts_full(
+        descr: Option<DescrRef>,
+        extra: Option<Box<OpKindExtra>>,
+        forwarded: u64,
+    ) -> Self {
+        let slot = DescrSlot {
+            word: std::cell::UnsafeCell::new(0),
+        };
+        slot.write_parts(descr, extra, forwarded);
+        slot
+    }
+
+    fn word(&self) -> u64 {
+        unsafe { *self.word.get() }
+    }
+
+    fn bits(&self) -> (usize, usize) {
+        slot_bits(self.word())
+    }
+
+    fn stamp_word(&self) -> u32 {
+        let w = self.word();
+        if is_stamp_inline(w) {
+            w as u32
+        } else if is_stamp_box(w) {
+            let p = tagged_ptr(w) as *const ThinStamp;
+            unsafe { (*p).stamp }
+        } else if is_thin_fwd_box(w) {
+            let p = box_payload(w) as *const ThinFwd;
+            thin_stamp(unsafe { (*p).thin })
+        } else if w & SLOT_BOX_BIT != 0 {
+            let p = box_payload(w) as *const DescrWords;
+            unsafe { (*p).stamp }
+        } else if is_thin_descr(w) {
+            thin_stamp(w)
+        } else {
+            crate::forwarding::fwd_stamp(w as u64)
+        }
+    }
+
+    fn set_stamp_word(&self, stamp: u32) {
+        let w = self.word();
+        if is_stamp_box(w) {
+            let p = tagged_ptr(w) as *mut ThinStamp;
+            if stamp == 0 {
+                let inner = free_thin_stamp(p).inner;
+                unsafe {
+                    *self.word.get() = inner;
+                }
+            } else {
+                unsafe {
+                    (*p).stamp = stamp;
+                }
+            }
+            return;
+        }
+        if is_thin_fwd_box(w) {
+            let p = box_payload(w) as *mut ThinFwd;
+            if let Some(thin) = thin_with_stamp(unsafe { (*p).thin }, stamp) {
+                unsafe {
+                    (*p).thin = thin;
+                }
+                return;
+            }
+            if stamp == 0 {
+                return;
+            }
+            // Keep the ThinFwd box; wrap it in ThinStamp (16 B) instead
+            // of promoting to a 24 B DescrWords + DescrFwd.
+            unsafe {
+                *self.word.get() = 0;
+            }
+            let boxed = alloc_thin_stamp(w, stamp);
+            debug_assert_eq!(boxed as usize & 7, 0);
+            debug_assert_eq!(boxed as u64 & !THIN_DESCR_PTR_MASK, 0);
+            unsafe {
+                *self.word.get() = boxed as u64 | SLOT_STAMP_BOX_BIT;
+            }
+            return;
+        }
+        if w & SLOT_BOX_BIT != 0 {
+            let p = box_payload(w) as *mut DescrWords;
+            unsafe {
+                (*p).stamp = stamp;
+            }
+            return;
+        }
+        if stamp == 0 {
+            if is_stamp_inline(w) {
+                unsafe {
+                    *self.word.get() = 0;
+                }
+            } else if crate::forwarding::fwd_stamp(w as u64) != 0 {
+                unsafe {
+                    *self.word.get() = crate::forwarding::strip_fwd_stamp(w);
+                }
+            }
+            return;
+        }
+        if w == 0 || is_stamp_inline(w) {
+            unsafe {
+                *self.word.get() = SLOT_STAMP_INLINE_TAG | u64::from(stamp);
+            }
+            return;
+        }
+        if is_thin_descr(w) {
+            if thin_fwd_from_word(w) != 0 {
+                if let Some(id) = intern_thin_stamped(
+                    thin_vtable_id(w),
+                    stamp,
+                    thin_data_ptr(w),
+                    thin_stamped_at(w).map(|e| e.fwd_tag).unwrap_or(0),
+                ) {
+                    let fwd = w & THIN_DESCR_PTR_MASK;
+                    unsafe {
+                        *self.word.get() =
+                            fwd | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT;
+                    }
+                    return;
+                }
+            } else if let Some(thin) = thin_with_stamp(w, stamp) {
+                unsafe {
+                    *self.word.get() = thin;
+                }
+                return;
+            }
+        }
+        if let Some(packed) = crate::forwarding::try_pack_fwd_stamp(w as u64, stamp) {
+            unsafe {
+                *self.word.get() = packed;
+            }
+            return;
+        }
+        // Thin descr / extra / both / inline forwarded: 16 B ThinStamp,
+        // not a 24 B DescrWords.
+        unsafe {
+            *self.word.get() = 0;
+        }
+        let boxed = alloc_thin_stamp(w, stamp);
+        debug_assert_eq!(boxed as usize & 7, 0);
+        debug_assert_eq!(boxed as u64 & !THIN_DESCR_PTR_MASK, 0);
+        unsafe {
+            *self.word.get() = boxed as u64 | SLOT_STAMP_BOX_BIT;
+        }
+    }
+
+    fn write_thin_fwd(&self, thin: u64, forwarded: u64) {
+        debug_assert_eq!(self.word(), 0);
+        if forwarded == 0 {
+            unsafe {
+                *self.word.get() = thin;
+            }
+            return;
+        }
+        if let Some(w) = thin_with_forwarded(thin, forwarded) {
+            unsafe {
+                *self.word.get() = w;
+            }
+            return;
+        }
+        let boxed = alloc_thin_fwd(thin, forwarded);
+        unsafe {
+            *self.word.get() = boxed as u64 | SLOT_BOX_BIT | SLOT_THIN_FWD_BIT;
+        }
+    }
+
+    fn set_bits(&self, lo: usize, hi: usize) {
+        self.set_bits_with_stamp(lo, hi, 0);
+    }
+
+    fn set_bits_with_stamp(&self, lo: usize, hi: usize, stamp: u32) {
+        // Callers write onto an empty slot (`take_parts` / `new`).
+        // Overwriting a live box here would leak descr/extra.
+        debug_assert_eq!(self.word(), 0);
+        if lo == 0 && hi == 0 && stamp == 0 {
+            return;
+        }
+        if hi == FWD_TAG && stamp == 0 {
+            debug_assert_eq!(lo as u64 & SLOT_BOX_BIT, 0);
+            unsafe {
+                *self.word.get() = lo as u64;
+            }
+            return;
+        }
+        let boxed = Box::into_raw(Box::new(DescrWords { lo, hi, stamp }));
+        unsafe {
+            *self.word.get() = boxed as u64 | SLOT_BOX_BIT;
+        }
+    }
+
+    fn write_parts(
+        &self,
+        descr: Option<DescrRef>,
+        extra: Option<Box<OpKindExtra>>,
+        forwarded: u64,
+    ) {
+        let has_fwd = forwarded != 0;
+        match (descr, extra, has_fwd) {
+            (None, None, false) => self.set_bits(0, 0),
+            (Some(d), None, false) => match encode_thin_descr(d) {
+                Ok(thin) => {
+                    debug_assert_eq!(self.word(), 0);
+                    unsafe {
+                        *self.word.get() = thin;
+                    }
+                }
+                Err(d) => {
+                    let (lo, hi) = descr_arc_to_bits(d);
+                    debug_assert!(hi > SLOT_TAG_MAX, "descr vtable collides with extra tags");
+                    self.set_bits(lo, hi);
+                }
+            },
+            (None, Some(e), false) => {
+                let ptr = Box::into_raw(e) as usize;
+                debug_assert_eq!(self.word(), 0);
+                debug_assert_eq!(ptr as u64 & !THIN_DESCR_PTR_MASK, 0);
+                debug_assert_eq!(ptr & 7, 0);
+                unsafe {
+                    *self.word.get() = ptr as u64 | SLOT_EXTRA_BIT;
+                }
+            }
+            (Some(d), Some(e), false) => {
+                let ptr = Box::into_raw(Box::new(BothPayload {
+                    descr: d,
+                    extra: *e,
+                })) as usize;
+                debug_assert_eq!(self.word(), 0);
+                debug_assert_eq!(ptr as u64 & !THIN_DESCR_PTR_MASK, 0);
+                debug_assert_eq!(ptr & 7, 0);
+                unsafe {
+                    *self.word.get() = ptr as u64 | SLOT_BOTH_BIT;
+                }
+            }
+            (None, None, true) => {
+                // Keep the full u64. `set_bits(forwarded as usize, …)`
+                // drops SmallConst identity / high i32 bits on wasm32.
+                debug_assert_eq!(forwarded & SLOT_BOX_BIT, 0);
+                unsafe {
+                    *self.word.get() = forwarded;
+                }
+            }
+            (Some(d), None, true) => match encode_thin_descr(d) {
+                Ok(thin) => self.write_thin_fwd(thin, forwarded),
+                Err(d) => {
+                    let ptr = Box::into_raw(Box::new(DescrFwd {
+                        descr: d,
+                        forwarded,
+                    }));
+                    self.set_bits(ptr as usize, DESCR_FWD_TAG);
+                }
+            },
+            (None, Some(e), true) => {
+                let ptr = Box::into_raw(Box::new(ExtraFwd {
+                    extra: *e,
+                    forwarded,
+                }));
+                self.set_bits(ptr as usize, EXTRA_FWD_TAG);
+            }
+            (Some(d), Some(e), true) => {
+                let ptr = Box::into_raw(Box::new(BothFwd {
+                    descr: Some(d),
+                    extra: *e,
+                    forwarded,
+                }));
+                self.set_bits(ptr as usize, BOTH_FWD_TAG);
+            }
+        }
+    }
+
+    fn take_parts(&self) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64) {
+        let (d, e, f, _stamp) = self.take_parts_full();
+        (d, e, f)
+    }
+
+    fn take_parts_full(&self) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32) {
+        let w = self.word();
+        unsafe {
+            *self.word.get() = 0;
+        }
+        take_word(w)
+    }
+
+    fn packed_forwarded(&self) -> u64 {
+        packed_forwarded_word(self.word())
+    }
+
+    fn set_packed_forwarded(&self, packed: u64) {
+        let w = self.word();
+        if is_stamp_inline(w) {
+            let stamp = w as u32;
+            unsafe {
+                *self.word.get() = 0;
+            }
+            self.set_packed_forwarded(packed);
+            if stamp != 0 {
+                self.set_stamp_word(stamp);
+            }
+            return;
+        }
+        if is_stamp_box(w) {
+            // Keep the ThinStamp box; rewrite only its inner word.
+            // Unwrapping and `set_stamp_word` minted a second 16 B box
+            // on every descr-bearing `set_forwarded`.
+            let p = tagged_ptr(w) as *mut ThinStamp;
+            let inner = unsafe { (*p).inner };
+            unsafe {
+                *self.word.get() = inner;
+            }
+            self.set_packed_forwarded(packed);
+            let new_inner = self.word();
+            unsafe {
+                (*p).inner = new_inner;
+                *self.word.get() = w;
+            }
+            return;
+        }
+        if is_thin_fwd_box(w) {
+            let p = box_payload(w) as *mut ThinFwd;
+            unsafe {
+                let old = (*p).forwarded;
+                if packed == 0 {
+                    let thin = free_thin_fwd(p).thin;
+                    crate::forwarding::drop_packed_forwarded(old);
+                    *self.word.get() = thin;
+                } else {
+                    (*p).forwarded = packed;
+                    crate::forwarding::drop_packed_forwarded(old);
+                }
+            }
+            return;
+        }
+        if w & SLOT_BOX_BIT != 0 {
+            // Mutate the existing DescrWords. Do not take/rebox: that
+            // minted a second 24 B on every descr-bearing set_forwarded.
+            let p = box_payload(w) as *mut DescrWords;
+            unsafe {
+                match (*p).hi {
+                    FWD_TAG => {
+                        crate::forwarding::drop_packed_forwarded((*p).lo as u64);
+                        if packed == 0 {
+                            (*p).lo = 0;
+                            (*p).hi = 0;
+                        } else {
+                            (*p).lo = packed as usize;
+                        }
+                    }
+                    EXTRA_FWD_TAG => {
+                        let slot = &mut *((*p).lo as *mut ExtraFwd);
+                        let old = slot.forwarded;
+                        slot.forwarded = packed;
+                        crate::forwarding::drop_packed_forwarded(old);
+                    }
+                    BOTH_FWD_TAG => {
+                        let slot = &mut *((*p).lo as *mut BothFwd);
+                        let old = slot.forwarded;
+                        slot.forwarded = packed;
+                        crate::forwarding::drop_packed_forwarded(old);
+                    }
+                    DESCR_FWD_TAG => {
+                        let slot = &mut *((*p).lo as *mut DescrFwd);
+                        let old = slot.forwarded;
+                        slot.forwarded = packed;
+                        crate::forwarding::drop_packed_forwarded(old);
+                    }
+                    EXTRA_TAG => {
+                        let extra = Box::from_raw((*p).lo as *mut OpKindExtra);
+                        (*p).lo = Box::into_raw(Box::new(ExtraFwd {
+                            extra: *extra,
+                            forwarded: packed,
+                        })) as usize;
+                        (*p).hi = EXTRA_FWD_TAG;
+                    }
+                    BOTH_TAG => {
+                        let both = Box::from_raw((*p).lo as *mut BothPayload);
+                        (*p).lo = Box::into_raw(Box::new(BothFwd {
+                            descr: Some(both.descr),
+                            extra: both.extra,
+                            forwarded: packed,
+                        })) as usize;
+                        (*p).hi = BOTH_FWD_TAG;
+                    }
+                    0 if (*p).lo == 0 => {
+                        if packed != 0 {
+                            (*p).lo = packed as usize;
+                            (*p).hi = FWD_TAG;
+                        }
+                    }
+                    _ => {
+                        let descr = descr_arc_from_bits((*p).lo, (*p).hi);
+                        (*p).lo = Box::into_raw(Box::new(DescrFwd {
+                            descr,
+                            forwarded: packed,
+                        })) as usize;
+                        (*p).hi = DESCR_FWD_TAG;
+                    }
+                }
+            }
+            return;
+        }
+        if is_thin_descr(w) {
+            let old = thin_fwd_from_word(w);
+            if packed == 0 {
+                if old != 0 {
+                    crate::forwarding::drop_packed_forwarded(old);
+                    let (lo, hi) = thin_to_lo_hi(w);
+                    let stamp = thin_stamp(w);
+                    let descr = descr_arc_clone_from_bits(lo, hi);
+                    unsafe {
+                        *self.word.get() = 0;
+                    }
+                    self.write_parts(Some(descr), None, 0);
+                    if stamp != 0 {
+                        self.set_stamp_word(stamp);
+                    }
+                }
+                return;
+            }
+            if let Some(nw) = thin_with_forwarded(w, packed) {
+                crate::forwarding::drop_packed_forwarded(old);
+                unsafe {
+                    *self.word.get() = nw;
+                }
+                return;
+            }
+            let (lo, hi) = thin_to_lo_hi(w);
+            let stamp = thin_stamp(w);
+            let descr = descr_arc_clone_from_bits(lo, hi);
+            crate::forwarding::drop_packed_forwarded(old);
+            unsafe {
+                *self.word.get() = 0;
+            }
+            self.write_parts(Some(descr), None, packed);
+            if stamp != 0 {
+                self.set_stamp_word(stamp);
+            }
+            return;
+        }
+        if is_extra_inline(w) {
+            let extra = unsafe { Box::from_raw(tagged_ptr(w) as *mut OpKindExtra) };
+            unsafe {
+                *self.word.get() = 0;
+            }
+            self.write_parts(None, Some(extra), packed);
+            return;
+        }
+        if is_both_inline(w) {
+            let both = unsafe { Box::from_raw(tagged_ptr(w) as *mut BothPayload) };
+            unsafe {
+                *self.word.get() = 0;
+            }
+            self.write_parts(Some(both.descr), Some(Box::new(both.extra)), packed);
+            return;
+        }
+        let stamp = if w != 0 {
+            crate::forwarding::fwd_stamp(w as u64)
+        } else {
+            0
+        };
+        if w != 0 {
+            crate::forwarding::drop_packed_forwarded(w as u64);
+        }
+        debug_assert_eq!(packed & SLOT_BOX_BIT, 0);
+        let packed = crate::forwarding::try_pack_fwd_stamp(packed, stamp).unwrap_or(packed);
+        unsafe {
+            *self.word.get() = packed;
+        }
+        if stamp != 0 && crate::forwarding::fwd_stamp(packed) == 0 {
+            self.set_stamp_word(stamp);
+        }
+    }
+
+    pub fn borrow(&self) -> Option<DescrRef> {
+        let (lo, hi) = self.bits();
+        unsafe { peek_descr(lo, hi) }
+    }
+
+    pub fn set_descr(&self, v: Option<DescrRef>) {
+        let (_, extra, fwd, stamp) = self.take_parts_full();
+        self.write_parts(v, extra, fwd);
+        if stamp != 0 {
+            self.set_stamp_word(stamp);
+        }
+    }
+
+    pub(crate) fn extra_ref(&self) -> Option<&OpKindExtra> {
+        let (lo, hi) = self.bits();
+        unsafe { peek_extra(lo, hi) }
+    }
+
+    pub(crate) fn extra_mut(&self) -> Option<&mut OpKindExtra> {
+        let (lo, hi) = self.bits();
+        unsafe { peek_extra_mut(lo, hi) }
+    }
+
+    pub(crate) fn extra_replace(&self, extra: Option<Box<OpKindExtra>>) {
+        let (descr, old, fwd, stamp) = self.take_parts_full();
+        drop(old);
+        self.write_parts(descr, extra, fwd);
+        if stamp != 0 {
+            self.set_stamp_word(stamp);
+        }
+    }
+
+    pub(crate) fn extra_clone_box(&self) -> Option<Box<OpKindExtra>> {
+        self.extra_ref().map(|e| Box::new(e.clone()))
+    }
+}
+
+unsafe fn decode_descr_extra(
+    lo: usize,
+    hi: usize,
+) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64) {
+    unsafe {
+        if lo == 0 && hi == 0 {
+            (None, None, 0)
+        } else if hi == EXTRA_TAG {
+            (None, Some(Box::from_raw(lo as *mut OpKindExtra)), 0)
+        } else if hi == BOTH_TAG {
+            let both = Box::from_raw(lo as *mut BothPayload);
+            (Some(both.descr), Some(Box::new(both.extra)), 0)
+        } else if hi == FWD_TAG {
+            (None, None, lo as u64)
+        } else if hi == DESCR_FWD_TAG {
+            let p = Box::from_raw(lo as *mut DescrFwd);
+            (Some(p.descr), None, p.forwarded)
+        } else if hi == EXTRA_FWD_TAG {
+            let p = Box::from_raw(lo as *mut ExtraFwd);
+            (None, Some(Box::new(p.extra)), p.forwarded)
+        } else if hi == BOTH_FWD_TAG {
+            let p = Box::from_raw(lo as *mut BothFwd);
+            (p.descr, Some(Box::new(p.extra)), p.forwarded)
+        } else {
+            (Some(descr_arc_from_bits(lo, hi)), None, 0)
+        }
+    }
+}
+
+unsafe fn peek_descr(lo: usize, hi: usize) -> Option<DescrRef> {
+    unsafe {
+        if lo == 0 && hi == 0 {
+            None
+        } else if hi == EXTRA_TAG || hi == FWD_TAG || hi == EXTRA_FWD_TAG {
+            None
+        } else if hi == BOTH_TAG {
+            Some((*(lo as *const BothPayload)).descr.clone())
+        } else if hi == DESCR_FWD_TAG {
+            Some((*(lo as *const DescrFwd)).descr.clone())
+        } else if hi == BOTH_FWD_TAG {
+            (*(lo as *const BothFwd)).descr.clone()
+        } else {
+            Some(descr_arc_clone_from_bits(lo, hi))
+        }
+    }
+}
+
+fn descr_arc_to_bits(d: DescrRef) -> (usize, usize) {
+    let raw = std::sync::Arc::into_raw(d);
+    let (data, vtable): (*const u8, *const u8) = unsafe { std::mem::transmute(raw) };
+    (data as usize, vtable as usize)
+}
+
+fn descr_arc_from_bits(lo: usize, hi: usize) -> DescrRef {
+    let raw: *const dyn crate::descr::Descr =
+        unsafe { std::mem::transmute((lo as *const u8, hi as *const u8)) };
+    unsafe { std::sync::Arc::from_raw(raw) }
+}
+
+fn descr_arc_clone_from_bits(lo: usize, hi: usize) -> DescrRef {
+    let raw: *const dyn crate::descr::Descr =
+        unsafe { std::mem::transmute((lo as *const u8, hi as *const u8)) };
+    unsafe {
+        std::sync::Arc::increment_strong_count(raw);
+        std::sync::Arc::from_raw(raw)
+    }
+}
+
+unsafe fn peek_extra<'a>(lo: usize, hi: usize) -> Option<&'a OpKindExtra> {
+    unsafe {
+        if hi == EXTRA_TAG {
+            Some(&*(lo as *const OpKindExtra))
+        } else if hi == BOTH_TAG {
+            Some(&(*(lo as *const BothPayload)).extra)
+        } else if hi == EXTRA_FWD_TAG {
+            Some(&(*(lo as *const ExtraFwd)).extra)
+        } else if hi == BOTH_FWD_TAG {
+            Some(&(*(lo as *const BothFwd)).extra)
+        } else {
+            None
+        }
+    }
+}
+
+unsafe fn peek_extra_mut<'a>(lo: usize, hi: usize) -> Option<&'a mut OpKindExtra> {
+    unsafe {
+        if hi == EXTRA_TAG {
+            Some(&mut *(lo as *mut OpKindExtra))
+        } else if hi == BOTH_TAG {
+            Some(&mut (*(lo as *mut BothPayload)).extra)
+        } else if hi == EXTRA_FWD_TAG {
+            Some(&mut (*(lo as *mut ExtraFwd)).extra)
+        } else if hi == BOTH_FWD_TAG {
+            Some(&mut (*(lo as *mut BothFwd)).extra)
+        } else {
+            None
+        }
+    }
+}
+
+impl Clone for DescrSlot {
+    fn clone(&self) -> Self {
+        let (d, e) = (self.borrow(), self.extra_clone_box());
+        Self::from_parts(d, e)
+    }
+}
+
+impl Drop for DescrSlot {
+    fn drop(&mut self) {
+        let (descr, extra, fwd) = self.take_parts();
+        drop(descr);
+        drop(extra);
+        crate::forwarding::drop_packed_forwarded(fwd);
+    }
+}
+
+impl std::fmt::Debug for DescrSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DescrSlot")
+            .field("descr", &self.borrow())
+            .field("extra", &self.extra_ref())
+            .finish()
+    }
+}
+
+/// Guard / vector extras. Same packed storage as [`DescrSlot`]; the
+/// field stays so existing `Op { extra: ExtraSlot::new(...) }` literals
+/// still type-check. The bits live on `descr`.
+pub(crate) struct ExtraSlot;
+
+impl ExtraSlot {
+    pub(crate) fn new(_v: Option<Box<OpKindExtra>>) -> Self {
+        ExtraSlot
+    }
+}
+
+impl Clone for ExtraSlot {
+    fn clone(&self) -> Self {
+        ExtraSlot
+    }
+}
+
+impl std::fmt::Debug for ExtraSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExtraSlot")
+    }
+}
+
+/// Packed `_forwarded` word (8 B). Decode is [`Forwarded`] on the stack
+/// so `Rc<Op>` leaves the 144-byte class. `InputArg` still owns this
+/// field; `Op` stores the same word on [`DescrSlot`].
+pub struct ForwardedSlot(std::cell::UnsafeCell<u64>);
+
+/// `_forwarded` view over [`DescrSlot`] so `Op` has no extra word.
+pub struct ForwardedView<'a> {
+    slot: &'a DescrSlot,
+}
+
+impl ForwardedView<'_> {
+    #[inline]
+    pub fn borrow(&self) -> crate::forwarding::Forwarded {
+        crate::forwarding::unpack_forwarded(self.slot.packed_forwarded())
+    }
+
+    #[inline]
+    pub fn set(&self, v: crate::forwarding::Forwarded) {
+        self.slot
+            .set_packed_forwarded(crate::forwarding::pack_forwarded(v));
+    }
+
+    #[inline]
+    pub fn borrow_mut(&self) -> ForwardedViewMut<'_> {
+        ForwardedViewMut {
+            slot: self.slot,
+            view: self.borrow(),
+        }
+    }
+}
+
+/// Decoded `_forwarded` that writes back onto [`DescrSlot`] on drop.
+pub struct ForwardedViewMut<'a> {
+    slot: &'a DescrSlot,
+    view: crate::forwarding::Forwarded,
+}
+
+impl std::ops::Deref for ForwardedViewMut<'_> {
+    type Target = crate::forwarding::Forwarded;
+    fn deref(&self) -> &crate::forwarding::Forwarded {
+        &self.view
+    }
+}
+
+impl std::ops::DerefMut for ForwardedViewMut<'_> {
+    fn deref_mut(&mut self) -> &mut crate::forwarding::Forwarded {
+        &mut self.view
+    }
+}
+
+impl Drop for ForwardedViewMut<'_> {
+    fn drop(&mut self) {
+        let view = std::mem::replace(&mut self.view, crate::forwarding::Forwarded::None);
+        self.slot
+            .set_packed_forwarded(crate::forwarding::pack_forwarded(view));
+    }
+}
+
+impl ForwardedSlot {
+    pub fn new(v: crate::forwarding::Forwarded) -> Self {
+        ForwardedSlot(std::cell::UnsafeCell::new(
+            crate::forwarding::pack_forwarded(v),
+        ))
+    }
+
+    #[inline]
+    pub fn borrow(&self) -> crate::forwarding::Forwarded {
+        crate::forwarding::unpack_forwarded(unsafe { *self.0.get() })
+    }
+
+    #[inline]
+    pub fn set(&self, v: crate::forwarding::Forwarded) {
+        let old = unsafe { *self.0.get() };
+        unsafe {
+            *self.0.get() = crate::forwarding::pack_forwarded(v);
+        }
+        crate::forwarding::drop_packed_forwarded(old);
+    }
+
+    #[inline]
+    pub fn borrow_mut(&self) -> ForwardedMutGuard<'_> {
+        ForwardedMutGuard {
+            slot: self,
+            view: self.borrow(),
+        }
+    }
+}
+
+impl Drop for ForwardedSlot {
+    fn drop(&mut self) {
+        crate::forwarding::drop_packed_forwarded(*self.0.get_mut());
+    }
+}
+
+impl std::fmt::Debug for ForwardedSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.borrow(), f)
+    }
+}
+
+/// Decoded `_forwarded` that writes back on drop.
+pub struct ForwardedMutGuard<'a> {
+    slot: &'a ForwardedSlot,
+    view: crate::forwarding::Forwarded,
+}
+
+impl std::ops::Deref for ForwardedMutGuard<'_> {
+    type Target = crate::forwarding::Forwarded;
+    fn deref(&self) -> &crate::forwarding::Forwarded {
+        &self.view
+    }
+}
+
+impl std::ops::DerefMut for ForwardedMutGuard<'_> {
+    fn deref_mut(&mut self) -> &mut crate::forwarding::Forwarded {
+        &mut self.view
+    }
+}
+
+impl Drop for ForwardedMutGuard<'_> {
+    fn drop(&mut self) {
+        let view = std::mem::replace(&mut self.view, crate::forwarding::Forwarded::None);
+        self.slot.set(view);
+    }
 }
 
 /// `resoperation.py` subclass payload: `GuardResOp` / `VectorOp` /
 /// `VectorGuardOp`. Stored behind `Op.extra` so `PlainResOp` stays slim.
 #[derive(Clone, Debug)]
+pub(crate) struct VectorGuardExtra {
+    pub guard: GuardExtra,
+    pub vec: VectorizationInfo,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum OpKindExtra {
     Guard(GuardExtra),
     Vector(VectorizationInfo),
-    VectorGuard {
-        guard: GuardExtra,
-        vec: VectorizationInfo,
-    },
+    /// Boxed so `OpKindExtra` stays Guard-sized; inlined VectorGuard
+    /// made `BothPayload` 56 B on the regex and/or leaf.
+    VectorGuard(Box<VectorGuardExtra>),
+}
+
+impl OpKindExtra {
+    fn guard_ref(&self) -> Option<&GuardExtra> {
+        match self {
+            OpKindExtra::Guard(g) => Some(g),
+            OpKindExtra::VectorGuard(vg) => Some(&vg.guard),
+            OpKindExtra::Vector(_) => None,
+        }
+    }
+
+    fn guard_mut(&mut self) -> Option<&mut GuardExtra> {
+        match self {
+            OpKindExtra::Guard(g) => Some(g),
+            OpKindExtra::VectorGuard(vg) => Some(&mut vg.guard),
+            OpKindExtra::Vector(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Op {
     pub opcode: OpCode,
-    /// `resoperation.py AbstractResOp` operand list. `RefCell` so
+    /// resoperation.py `opclasses[opnum].type` parity (Box.type intrinsic).
+    /// Mirrors RPython's `op.type` class attribute set by `optypes[opnum]`
+    /// (`resoperation.py` `optypes[opnum]`). Populated at construction from
+    /// `opcode.result_type()`. Replaces side-table `value_types: HashMap<u32, Type>`.
+    pub type_: Type,
+    /// `N_aryOp._args` length. A full `u8` so JUMP can carry a
+    /// virtualizable array's cells (braininterp tape is 128 in tests).
+    pub(crate) arg_len: std::cell::Cell<u8>,
+    /// Packed `OpRef` payload. Tag lives in bits 28-31.
+    pos_payload: std::cell::Cell<u32>,
+    /// `resoperation.py AbstractResOp` operand list. `ArgSlot` so
     /// `setarg` / `initarglist` can mutate through a shared `Op` reached
     /// via `Rc<Op>` — RPython writes
     /// `op._args[i] = ...` on the same Python object the trace list,
@@ -1306,56 +3269,17 @@ pub struct Op {
     /// [`Operand`] directly. Every source binds its producer, so an unbound
     /// position-only operand is never stored — that would be a #9 contract
     /// violation.
-    pub args: std::cell::RefCell<SmallVec<[Operand; 3]>>,
-    /// `resoperation.py ResOpWithDescr._descr` parity.  `RefCell`
-    /// so the optimizer can stamp a descr onto a shared `Op` reached
-    /// through `Rc<Op>`: RPython's
-    /// `op.setdescr(...)` writes through the same slot every observer
-    /// sees.
-    pub descr: std::cell::RefCell<Option<DescrRef>>,
-    /// Index of this op in the trace (set by the trace builder). `Cell`
-    /// so the position can be patched via `&Op` once the op is shared
-    /// (the trace-iterator finalizer and unroll's resume-position
-    /// retargeting both mutate `pos` after construction).
-    pub pos: std::cell::Cell<OpRef>,
-    /// resoperation.py `opclasses[opnum].type` parity (Box.type intrinsic).
-    /// Mirrors RPython's `op.type` class attribute set by `optypes[opnum]`
-    /// (`resoperation.py:1597`). Populated at construction from
-    /// `opcode.result_type()`. Replaces side-table `value_types: HashMap<u32, Type>`.
-    pub type_: Type,
-    /// resoperation.py: GuardResOp.rd_resume_position — index of the
-    /// guard in the trace for resume data lookup. Set by unroll when
-    /// creating extra guards from short preamble / virtual state.
-    /// -1 means unset. `Cell` so that mutators reachable via `&Op` (the
-    /// shared-trace identity model from `Vec<Rc<Op>>`) can update the
-    /// slot without requiring `&mut Op`.
-    ///
-    /// Lives on every `Op` (4 bytes) rather than in [`OpKindExtra`]:
-    /// resume-position reads are on the hot optimizer path and RPython
-    /// stores the field on `GuardResOp` only, but a side box here would
-    /// allocate on every recorded guard just to hold an i32.
-    pub rd_resume_position: std::cell::Cell<i32>,
+    pub args: ArgSlot,
+    /// `resoperation.py ResOpWithDescr._descr` parity. Shared-`Op`
+    /// writes go through [`DescrSlot`] the way RPython assigns
+    /// `op._descr` on the same ResOp every observer sees.
+    pub descr: DescrSlot,
     /// `resoperation.py` subclass extras: `GuardResOp._fail_args`,
-    /// `fail_arg_types`, and `VectorOp`/`VectorGuardOp` vector shape.
-    /// `PlainResOp` / `ResOpWithDescr` leave this `None` so ordinary
-    /// ops do not embed those fields.
-    pub(crate) extra: std::cell::RefCell<Option<Box<OpKindExtra>>>,
-
-    /// `resoperation.py AbstractResOpOrInputArg._forwarded` parity
-    /// slot — the canonical forwarding host for a bound ResOp box.
-    /// `Forwarded::None` until a writer sets it; `set_forwarded_*`
-    /// on a bound box routes here, and `get_forwarded` reads it back.
-    pub forwarded: std::cell::RefCell<crate::forwarding::Forwarded>,
-
-    /// `resoperation.py IntOp._resint` / `:582 FloatOp._resfloat` /
-    /// `:612 RefOp._resref` parity (`history.py *FrontendOp(pos,
-    /// value)`) — the concrete runtime value stamped onto this op
-    /// identity at execute-time. The canonical per-identity concrete
-    /// carrier for a bound ResOp box; the `get_value`/`set_value`
-    /// accessors route here. `None` until a writer stamps it (trace-time
-    /// `set_opref_concrete`); residual calls / guards keep it `None`
-    /// until blackhole runs them.
-    pub value: std::cell::Cell<Option<crate::value::Value>>,
+    /// `fail_arg_types`, `rd_resume_position`, and `VectorOp` /
+    /// `VectorGuardOp` vector shape. `PlainResOp` / `ResOpWithDescr`
+    /// leave this `None` so ordinary ops do not embed those fields.
+    #[allow(dead_code)]
+    pub(crate) extra: ExtraSlot,
 }
 
 impl Clone for Op {
@@ -1366,17 +3290,29 @@ impl Clone for Op {
     /// (`resoperation.py __init__`). Preserve identity-shared
     /// forwarding via `Rc::clone` on `OpRc` instead.
     fn clone(&self) -> Self {
-        Op {
-            opcode: self.opcode,
-            args: std::cell::RefCell::new(self.args.borrow().clone()),
-            descr: std::cell::RefCell::new(self.descr.borrow().clone()),
-            pos: std::cell::Cell::new(self.pos.get()),
-            type_: self.type_,
-            rd_resume_position: std::cell::Cell::new(self.rd_resume_position.get()),
-            extra: std::cell::RefCell::new(self.extra.borrow().clone()),
-            forwarded: std::cell::RefCell::new(Forwarded::None),
-            value: std::cell::Cell::new(None),
+        let stamp = self.descr.stamp_word();
+        let descr = DescrSlot::from_parts(self.descr.borrow(), self.descr.extra_clone_box());
+        if stamp != 0 {
+            descr.set_stamp_word(stamp);
         }
+        let op = Op {
+            opcode: self.opcode,
+            type_: self.type_,
+            arg_len: std::cell::Cell::new(self.arg_len.get()),
+            pos_payload: std::cell::Cell::new(0),
+            args: ArgSlot::new(self.args.clone_vec(self.arg_len_value())),
+            descr,
+            extra: ExtraSlot::new(None),
+        };
+        op.pos().set(self.pos().get());
+        let _ = pop_arg_len();
+        op
+    }
+}
+
+impl Drop for Op {
+    fn drop(&mut self) {
+        unsafe { drop_arg_data(&mut *self.args.0.get(), self.arg_len_value()) }
     }
 }
 
@@ -1483,7 +3419,7 @@ impl Op {
     /// long-lived op graphs must expose the actual mutable slots to the GC
     /// walker instead of copying the pointer values aside.
     pub fn walk_const_ptr_refs_mut(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        for arg in self.args.borrow().iter() {
+        for arg in self.args_slice().iter() {
             arg.walk_const_ptr_refs(visitor);
         }
         if let Some(fail_args) = self.guard_fail_args() {
@@ -1494,35 +3430,67 @@ impl Op {
     }
 
     pub fn new(opcode: OpCode, args: &[Operand]) -> Self {
-        Op {
+        let collected: OpArgVec = args.iter().cloned().collect();
+        let arg_len = store_arg_len(collected.len());
+        let op = Op {
             opcode,
-            args: std::cell::RefCell::new(args.iter().cloned().collect()),
-            descr: std::cell::RefCell::new(None),
-            pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
-            rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
-            forwarded: std::cell::RefCell::new(Forwarded::None),
-            value: std::cell::Cell::new(None),
-        }
+            arg_len: std::cell::Cell::new(arg_len),
+            pos_payload: std::cell::Cell::new(0),
+            args: ArgSlot::new(collected),
+            descr: DescrSlot::new(None),
+            extra: ExtraSlot::new(None),
+        };
+        let _ = pop_arg_len();
+        op
     }
 
     pub fn with_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Self {
-        Op {
+        let collected: OpArgVec = args.iter().cloned().collect();
+        let arg_len = store_arg_len(collected.len());
+        let op = Op {
             opcode,
-            args: std::cell::RefCell::new(args.iter().cloned().collect()),
-            descr: std::cell::RefCell::new(Some(descr)),
-            pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
-            rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
-            forwarded: std::cell::RefCell::new(Forwarded::None),
-            value: std::cell::Cell::new(None),
+            arg_len: std::cell::Cell::new(arg_len),
+            pos_payload: std::cell::Cell::new(0),
+            args: ArgSlot::new(collected),
+            descr: DescrSlot::new(Some(descr)),
+            extra: ExtraSlot::new(None),
+        };
+        let _ = pop_arg_len();
+        op
+    }
+
+    #[inline]
+    pub fn args_slice(&self) -> &[Operand] {
+        self.args.borrow(self.arg_len_value())
+    }
+
+    #[inline]
+    pub fn args_slice_mut(&self) -> &mut [Operand] {
+        self.args.borrow_mut(self.arg_len_value())
+    }
+
+    #[inline]
+    pub(crate) fn arg_len_value(&self) -> u8 {
+        self.arg_len.get()
+    }
+
+    #[inline]
+    pub(crate) fn set_arg_len_value(&self, n: u8) {
+        self.arg_len.set(n);
+    }
+
+    /// Packed `op.pos` view. Tag lives in [`Self::pos_payload`] bits 28-31.
+    #[inline]
+    pub fn pos(&self) -> OpPosRef<'_> {
+        OpPosRef {
+            payload: &self.pos_payload,
         }
     }
 
     pub fn arg(&self, idx: usize) -> Operand {
-        self.args.borrow()[idx].clone()
+        self.args_slice()[idx].clone()
     }
 
     /// True iff argument `idx` is a live-tracking bound operand
@@ -1531,11 +3499,11 @@ impl Op {
     /// position-remap passes skip these — they auto-track a renumbered
     /// producer and need no rewrite.
     pub fn arg_is_bound(&self, idx: usize) -> bool {
-        self.args.borrow()[idx].is_bound()
+        self.args_slice()[idx].is_bound()
     }
 
     pub fn num_args(&self) -> usize {
-        self.args.borrow().len()
+        unsafe { live_arg_len(self.arg_len_value(), &*self.args.0.get()) }
     }
 
     pub fn result_type(&self) -> Type {
@@ -1546,13 +3514,45 @@ impl Op {
     /// (`history.py *FrontendOp.getint()` for the `_resint`/
     /// `_resfloat`/`_resref` slot). `None` until a writer stamps it.
     pub fn get_value(&self) -> Option<crate::value::Value> {
-        self.value.get()
+        unpack_stamp(self.descr.stamp_word())
     }
 
     /// Stamp the concrete runtime value on this op identity
     /// (`history.py *FrontendOp(pos, value)`).
     pub fn set_value(&self, v: crate::value::Value) {
-        self.value.set(Some(v));
+        self.descr.set_stamp_word(pack_stamp(v));
+    }
+
+    /// `_forwarded` view. The packed word lives on [`DescrSlot`] so `Op`
+    /// stays in 32 B.
+    pub fn forwarded(&self) -> ForwardedView<'_> {
+        ForwardedView { slot: &self.descr }
+    }
+
+    /// resoperation.py `GuardResOp.rd_resume_position`. `-1` when the
+    /// op is not a guard or the slot is unset.
+    #[inline]
+    pub fn rd_resume_position(&self) -> i32 {
+        match self.descr.extra_ref() {
+            Some(extra) => extra
+                .guard_ref()
+                .map(|g| g.rd_resume_position)
+                .unwrap_or(-1),
+            _ => -1,
+        }
+    }
+
+    /// resoperation.py `guard.rd_resume_position = pos`. Lives on
+    /// `GuardResOp` extra, not on every `PlainResOp`.
+    #[inline]
+    pub fn set_rd_resume_position(&self, pos: i32) {
+        if pos < 0 {
+            if let Some(mut g) = self.try_guard_extra_mut() {
+                g.rd_resume_position = -1;
+            }
+            return;
+        }
+        self.ensure_guard_extra().rd_resume_position = pos;
     }
 
     /// resoperation.py AbstractResOp.copy_and_change +
@@ -1573,31 +3573,36 @@ impl Op {
         args: Option<&[Operand]>,
         descr: Option<Option<DescrRef>>,
     ) -> Op {
-        let new_args: SmallVec<[Operand; 3]> = match args {
+        let new_args: OpArgVec = match args {
             Some(a) => a.iter().cloned().collect(),
-            None => self.args.borrow().clone(),
+            None => self.args.clone_vec(self.arg_len_value()),
         };
         let new_descr = match descr {
             Some(d) => d,
-            None => self.descr.borrow().clone(),
+            None => self.descr.borrow(),
         };
+        let new_len = store_arg_len(new_args.len());
+        let stamp = self.descr.stamp_word();
+        let descr = DescrSlot::from_parts(new_descr, self.descr.extra_clone_box());
+        if stamp != 0 {
+            descr.set_stamp_word(stamp);
+        }
         let newop = Op {
             opcode,
-            args: std::cell::RefCell::new(new_args),
-            descr: std::cell::RefCell::new(new_descr),
-            pos: std::cell::Cell::new(self.pos.get()),
             type_: opcode.result_type(),
-            rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(self.extra.borrow().clone()),
-            forwarded: std::cell::RefCell::new(Forwarded::None),
-            value: std::cell::Cell::new(None),
+            arg_len: std::cell::Cell::new(new_len),
+            pos_payload: std::cell::Cell::new(0),
+            args: ArgSlot::new(new_args),
+            descr,
+            extra: ExtraSlot::new(None),
         };
+        newop.pos().set(self.pos().get());
+        let _ = pop_arg_len();
         // resoperation.py GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
         //   newop.rd_resume_position = self.rd_resume_position
-        if opcode.is_guard() || self.opcode.is_guard() {
-            newop.rd_resume_position.set(self.rd_resume_position.get());
-        } else {
+        // Extra clone already carries fail_args and rd_resume_position.
+        if !opcode.is_guard() && !self.opcode.is_guard() {
             newop.strip_guard_extra();
         }
         newop
@@ -1647,103 +3652,105 @@ impl Op {
                 }
             }
         }
-        self.setfailargs(boxes.into());
+        self.ensure_guard_extra()
+            .set_fail_args_rc(std::rc::Rc::from(boxes));
     }
 
-    pub fn guard_fail_args(&self) -> Option<std::cell::Ref<'_, [Operand]>> {
-        std::cell::Ref::filter_map(self.extra.borrow(), |extra| match extra.as_deref() {
-            Some(OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. }) => {
-                g.fail_args.as_deref()
+    pub fn guard_fail_args(&self) -> Option<&[Operand]> {
+        self.descr
+            .extra_ref()
+            .and_then(OpKindExtra::guard_ref)
+            .and_then(GuardExtra::fail_args)
+    }
+
+    /// Walk fail-arg `OpRef`s without cloning the live list.
+    pub fn visit_failarg_oprefs(&self, mut visit: impl FnMut(OpRef)) {
+        if let Some(fa) = self.guard_fail_args() {
+            for a in fa.iter() {
+                visit(a.to_opref());
             }
-            _ => None,
-        })
-        .ok()
+        }
     }
 
     pub(crate) fn strip_guard_extra(&self) {
-        let mut extra = self.extra.borrow_mut();
-        match extra.as_deref() {
-            Some(OpKindExtra::VectorGuard { vec, .. }) => {
-                *extra = Some(Box::new(OpKindExtra::Vector(vec.clone())));
+        match self.descr.extra_ref() {
+            Some(OpKindExtra::VectorGuard(vg)) => {
+                let vec = vg.vec.clone();
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::Vector(vec))));
             }
             Some(OpKindExtra::Guard(_)) => {
-                *extra = None;
+                self.descr.extra_replace(None);
             }
             _ => {}
         }
     }
 
-    pub(crate) fn try_guard_extra_mut(&self) -> Option<std::cell::RefMut<'_, GuardExtra>> {
-        std::cell::RefMut::filter_map(self.extra.borrow_mut(), |extra| match extra.as_mut() {
-            Some(b) => match b.as_mut() {
-                OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. } => Some(g),
-                OpKindExtra::Vector(_) => None,
-            },
-            None => None,
-        })
-        .ok()
+    pub(crate) fn try_guard_extra(&self) -> Option<&GuardExtra> {
+        self.descr.extra_ref().and_then(OpKindExtra::guard_ref)
     }
 
-    pub(crate) fn ensure_guard_extra(&self) -> std::cell::RefMut<'_, GuardExtra> {
-        {
-            let mut extra = self.extra.borrow_mut();
-            match extra.as_deref() {
-                Some(OpKindExtra::Guard(_) | OpKindExtra::VectorGuard { .. }) => {}
-                Some(OpKindExtra::Vector(v)) => {
-                    let vec = v.clone();
-                    *extra = Some(Box::new(OpKindExtra::VectorGuard {
-                        guard: GuardExtra {
-                            fail_args: None,
-                            fail_arg_types: None,
+    pub(crate) fn try_guard_extra_mut(&self) -> Option<&mut GuardExtra> {
+        self.descr.extra_mut().and_then(OpKindExtra::guard_mut)
+    }
+
+    pub(crate) fn ensure_guard_extra(&self) -> &mut GuardExtra {
+        match self.descr.extra_ref() {
+            Some(OpKindExtra::Guard(_) | OpKindExtra::VectorGuard(_)) => {}
+            Some(OpKindExtra::Vector(v)) => {
+                let vec = v.clone();
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard(Box::new(
+                        VectorGuardExtra {
+                            guard: GuardExtra::new(),
+                            vec,
                         },
-                        vec,
-                    }));
-                }
-                None => {
-                    *extra = Some(Box::new(OpKindExtra::Guard(GuardExtra {
-                        fail_args: None,
-                        fail_arg_types: None,
-                    })));
-                }
+                    )))));
+            }
+            None => {
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::Guard(GuardExtra::new()))));
             }
         }
-        std::cell::RefMut::map(self.extra.borrow_mut(), |extra| {
-            match extra.as_mut().expect("ensure_guard_extra").as_mut() {
-                OpKindExtra::Guard(g) | OpKindExtra::VectorGuard { guard: g, .. } => g,
-                OpKindExtra::Vector(_) => unreachable!("ensure_guard_extra upgraded Vector"),
-            }
-        })
+        self.descr
+            .extra_mut()
+            .and_then(OpKindExtra::guard_mut)
+            .expect("ensure_guard_extra")
     }
 
     pub(crate) fn vecinfo_slot(&self) -> Option<VectorizationInfo> {
-        match self.extra.borrow().as_deref() {
-            Some(OpKindExtra::Vector(v) | OpKindExtra::VectorGuard { vec: v, .. }) => {
-                Some(v.clone())
-            }
+        match self.descr.extra_ref() {
+            Some(OpKindExtra::Vector(v)) => Some(v.clone()),
+            Some(OpKindExtra::VectorGuard(vg)) => Some(vg.vec.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn set_vecinfo_slot(&self, info: VectorizationInfo) {
-        let mut extra = self.extra.borrow_mut();
-        match extra.as_deref_mut() {
+        match self.descr.extra_mut() {
             Some(OpKindExtra::Vector(v)) => *v = info,
-            Some(OpKindExtra::VectorGuard { vec, .. }) => *vec = info,
+            Some(OpKindExtra::VectorGuard(vg)) => vg.vec = info,
             Some(OpKindExtra::Guard(g)) => {
                 let guard = g.clone();
-                *extra = Some(Box::new(OpKindExtra::VectorGuard { guard, vec: info }));
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard(Box::new(
+                        VectorGuardExtra { guard, vec: info },
+                    )))));
             }
-            None => *extra = Some(Box::new(OpKindExtra::Vector(info))),
+            None => self
+                .descr
+                .extra_replace(Some(Box::new(OpKindExtra::Vector(info)))),
         }
     }
 
     pub(crate) fn clear_vecinfo_slot(&self) {
-        let mut extra = self.extra.borrow_mut();
-        match extra.as_deref() {
-            Some(OpKindExtra::VectorGuard { guard, .. }) => {
-                *extra = Some(Box::new(OpKindExtra::Guard(guard.clone())));
+        match self.descr.extra_ref() {
+            Some(OpKindExtra::VectorGuard(vg)) => {
+                let guard = vg.guard.clone();
+                self.descr
+                    .extra_replace(Some(Box::new(OpKindExtra::Guard(guard))));
             }
-            Some(OpKindExtra::Vector(_)) => *extra = None,
+            Some(OpKindExtra::Vector(_)) => self.descr.extra_replace(None),
             _ => {}
         }
     }
@@ -1778,7 +3785,7 @@ impl std::fmt::Display for Op {
                 write_arg(f, arg)?;
             }
             write!(f, ")")?;
-            if let Some(fa) = self.getfailargs() {
+            if let Some(fa) = self.guard_fail_args() {
                 write!(f, " [")?;
                 for (i, arg) in fa.iter().enumerate() {
                     if i > 0 {
@@ -1790,7 +3797,7 @@ impl std::fmt::Display for Op {
             }
             Ok(())
         } else if self.result_type() != Type::Void {
-            write!(f, "v{} = {:?}(", self.pos.get().raw(), self.opcode)?;
+            write!(f, "v{} = {:?}(", self.pos().get().raw(), self.opcode)?;
             for (i, arg) in self.getarglist().iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
@@ -1875,7 +3882,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
         if op.opcode.is_guard() {
             write!(out, "{:?}(", op.opcode).unwrap();
         } else if op.type_ != Type::Void {
-            write!(out, "v{} = {:?}(", op.pos.get().raw(), op.opcode).unwrap();
+            write!(out, "v{} = {:?}(", op.pos().get().raw(), op.opcode).unwrap();
         } else {
             write!(out, "{:?}(", op.opcode).unwrap();
         }
@@ -1893,7 +3900,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
                 write!(out, " descr=<{repr}>").unwrap();
             }
         }
-        if let Some(fa) = op.getfailargs() {
+        if let Some(fa) = op.guard_fail_args() {
             write!(out, " [").unwrap();
             for (i, arg) in fa.iter().enumerate() {
                 if i > 0 {
@@ -3813,6 +5820,7 @@ static OPNAME: [&str; OPCODE_COUNT] = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarding::ForwardingHost;
 
     #[test]
     fn ordinary_op_does_not_embed_guard_failarg_inline_storage() {
@@ -3823,23 +5831,291 @@ mod tests {
         // reached, not merely under the old size, or half a regression passes.
         #[cfg(target_pointer_width = "64")]
         {
+            let op = std::mem::size_of::<Op>();
+            let rc_box = op + 2 * std::mem::size_of::<usize>();
             assert!(
-                std::mem::size_of::<Op>() <= 192,
-                "Op grew to {} bytes",
-                std::mem::size_of::<Op>()
+                op <= 32,
+                "Op grew to {op} bytes (RcBox ~{rc_box}); keep the Op payload at 32 B"
+            );
+            let inner = std::mem::size_of::<OpInner>();
+            assert!(
+                inner <= 40,
+                "OpInner grew to {inner} B; OpRc::new must stay out of the 48-byte class"
+            );
+            let extra = std::mem::size_of::<GuardExtra>();
+            assert!(
+                extra <= 32,
+                "GuardExtra grew to {extra} bytes; keep Box<GuardExtra> out of the 56-byte class"
+            );
+            let kind = std::mem::size_of::<OpKindExtra>();
+            let both = std::mem::size_of::<BothPayload>();
+            assert!(
+                kind <= 40,
+                "OpKindExtra grew to {kind} B; VectorGuard must stay boxed"
+            );
+            assert!(
+                both < 56,
+                "BothPayload grew to {both} B; descr+extra must leave the 56-byte class"
+            );
+            assert!(
+                std::mem::size_of::<ArgSlot>() <= 16,
+                "ArgSlot grew; two inline operands must stay in 16 B"
+            );
+            assert!(
+                std::mem::size_of::<ForwardedSlot>() <= 8,
+                "ForwardedSlot grew; packed word must stay 8 B"
+            );
+            assert!(
+                std::mem::size_of::<DescrSlot>() <= 8,
+                "DescrSlot grew; forwarded-only must stay an 8 B word"
+            );
+            assert!(
+                std::mem::size_of::<ThinFwd>() <= 16,
+                "ThinFwd grew to {} B; descr+forwarded must stay out of the 24-byte class",
+                std::mem::size_of::<ThinFwd>()
+            );
+            assert!(
+                std::mem::size_of::<ThinStamp>() <= 16,
+                "ThinStamp grew to {} B; set_stamp_word must stay out of the 24-byte class",
+                std::mem::size_of::<ThinStamp>()
             );
         }
     }
 
+    #[test]
+    fn jump_keeps_more_than_fifteen_args() {
+        // VirtArray JUMP reds (braininterp tape is 128 in tests) used
+        // to truncate at the pos-tag nibble on `arg_len`, so `num_args`
+        // became `n & 15` and the heap `ArgHeap.cap` was read as arg1.
+        let n = 130usize;
+        let args: Vec<crate::operand::Operand> = (0..n)
+            .map(|i| crate::operand::Operand::from_opref(OpRef::const_int(i as i64)))
+            .collect();
+        let op = Op::new(OpCode::Jump, &args);
+        op.pos().set(OpRef::VoidOp(143));
+        assert_eq!(op.num_args(), n);
+        assert_eq!(op.pos().get(), OpRef::VoidOp(143));
+        assert_eq!(op.arg(0).const_int(), Some(0));
+        assert_eq!(op.arg(1).const_int(), Some(1));
+        assert_eq!(op.arg(n - 1).const_int(), Some((n - 1) as i64));
+        op.pos().set(OpRef::ConstInt(-7));
+        assert_eq!(op.pos().get(), OpRef::ConstInt(-7));
+        assert_eq!(op.num_args(), n);
+    }
+
+    #[test]
+    fn jump_keeps_more_than_two_hundred_fifty_five_args() {
+        // `resoperation.py N_aryOp._args` is an uncapped list. A
+        // virtualizable array longer than 254 cells (the u8 store)
+        // still has to round-trip as JUMP reds so numbering can
+        // TagOverflow / giveup instead of panicking at construction.
+        let n = 300usize;
+        let args: Vec<crate::operand::Operand> = (0..n)
+            .map(|i| crate::operand::Operand::from_opref(OpRef::const_int(i as i64)))
+            .collect();
+        let op = Op::new(OpCode::Jump, &args);
+        assert_eq!(op.num_args(), n);
+        assert_eq!(op.arg(0).const_int(), Some(0));
+        assert_eq!(op.arg(254).const_int(), Some(254));
+        assert_eq!(op.arg(n - 1).const_int(), Some((n - 1) as i64));
+        let clone = op.clone();
+        assert_eq!(clone.num_args(), n);
+        assert_eq!(clone.arg(n - 1).const_int(), Some((n - 1) as i64));
+    }
+
+    #[test]
+    fn set_fail_arg_types_keeps_more_than_four_entries() {
+        let guard = Op::new(OpCode::GuardTrue, &[]);
+        let types = vec![
+            Type::Int,
+            Type::Ref,
+            Type::Float,
+            Type::Int,
+            Type::Ref,
+            Type::Float,
+        ];
+        guard.set_fail_arg_types(types.clone());
+        assert_eq!(guard.get_fail_arg_types(), Some(types));
+    }
+
+    #[test]
+    fn forwarded_smallconst_negative_int_survives_the_descr_slot() {
+        let op = Op::new(OpCode::SameAsI, &[]);
+        op.set_forwarded_const(crate::Const::from_value(Value::Int(-1)));
+        assert!(
+            matches!(
+                op.forwarded().borrow(),
+                crate::forwarding::Forwarded::SmallConst(_)
+            ),
+            "i32 ConstInt must pack as SmallConst"
+        );
+        assert_eq!(op.forwarded().borrow().const_value(), Some(Value::Int(-1)));
+    }
+
+    #[test]
+    fn descr_plus_forwarded_roundtrips_without_dropping_descr() {
+        let descr = crate::make_loop_target_descr(1, false);
+        let op = Op::with_descr(OpCode::Label, &[], descr.clone());
+        assert!(op.has_descr());
+        op.forwarded()
+            .set(crate::forwarding::Forwarded::from_const_value(
+                crate::value::Value::Int(7),
+            ));
+        assert!(op.has_descr());
+        assert_eq!(
+            op.forwarded().borrow().const_value(),
+            Some(crate::value::Value::Int(7))
+        );
+        op.forwarded().set(crate::forwarding::Forwarded::None);
+        assert!(op.has_descr());
+        assert!(op.getdescr().is_some());
+    }
+
+    #[test]
+    fn descr_forwarded_and_stamp_roundtrip_together() {
+        let descr = crate::make_loop_target_descr(2, false);
+        let op = Op::with_descr(OpCode::Label, &[], descr);
+        op.forwarded()
+            .set(crate::forwarding::Forwarded::from_const_value(
+                crate::value::Value::Int(3),
+            ));
+        op.set_value(crate::value::Value::Int(9));
+        assert!(op.has_descr());
+        assert_eq!(
+            op.forwarded().borrow().const_value(),
+            Some(crate::value::Value::Int(3))
+        );
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(9)));
+        op.set_value(crate::value::Value::Int(11));
+        assert!(op.has_descr());
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(11)));
+    }
+
+    #[test]
+    fn stamp_roundtrips_on_an_ordinary_op() {
+        let op = Op::new(OpCode::IntAdd, &[]);
+        assert!(op.get_value().is_none());
+        op.set_value(crate::value::Value::Int(42));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(42)));
+        op.set_value(crate::value::Value::Int(-7));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(-7)));
+    }
+
+    #[test]
+    fn small_stamp_on_intbound_forwarded_stays_in_the_word() {
+        let op = Op::new(OpCode::IntAdd, &[]);
+        op.set_value(crate::value::Value::Int(1));
+        op.forwarded().set(crate::forwarding::Forwarded::Info(
+            crate::op_info::OpInfo::int_bound(crate::intbound::IntBound::from_constant(7)),
+        ));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(1)));
+        assert!(matches!(
+            op.forwarded().borrow(),
+            crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
+        ));
+        op.set_value(crate::value::Value::Int(0));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(0)));
+        assert!(matches!(
+            op.forwarded().borrow(),
+            crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
+        ));
+    }
+
+    #[test]
+    fn descr_intbound_and_stamp_share_the_thin_word() {
+        let descr = crate::make_loop_target_descr(4, false);
+        let op = Op::with_descr(OpCode::GetfieldGcI, &[], descr);
+        op.set_value(crate::value::Value::Int(1));
+        op.forwarded().set(crate::forwarding::Forwarded::Info(
+            crate::op_info::OpInfo::int_bound(crate::intbound::IntBound::from_constant(7)),
+        ));
+        assert!(op.has_descr());
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(1)));
+        assert!(matches!(
+            op.forwarded().borrow(),
+            crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
+        ));
+        op.set_value(crate::value::Value::Int(0));
+        assert!(op.has_descr());
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(0)));
+        assert!(matches!(
+            op.forwarded().borrow(),
+            crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
+        ));
+    }
+
+    #[test]
+    fn small_stamp_then_smallconst_forwarded_stays_in_the_word() {
+        let op = Op::new(OpCode::IntAdd, &[]);
+        op.set_value(crate::value::Value::Int(1));
+        op.forwarded()
+            .set(crate::forwarding::Forwarded::from_const_value(
+                crate::value::Value::Int(9),
+            ));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(1)));
+        assert_eq!(
+            op.forwarded().borrow().const_value(),
+            Some(crate::value::Value::Int(9))
+        );
+        op.set_value(crate::value::Value::Int(0));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(0)));
+        assert_eq!(
+            op.forwarded().borrow().const_value(),
+            Some(crate::value::Value::Int(9))
+        );
+    }
+
+    #[test]
+    fn small_stamp_on_a_descr_op_stays_in_the_thin_word() {
+        let descr = crate::make_loop_target_descr(3, false);
+        let op = Op::with_descr(OpCode::GetfieldGcI, &[], descr);
+        op.set_value(crate::value::Value::Int(0));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(0)));
+        assert!(op.has_descr());
+        op.set_value(crate::value::Value::Int(1));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(1)));
+        assert!(op.has_descr());
+        op.set_value(crate::value::Value::Int(15));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(15)));
+        assert!(op.has_descr());
+        op.set_value(crate::value::Value::Int(16));
+        assert_eq!(op.get_value(), Some(crate::value::Value::Int(16)));
+        assert!(op.has_descr());
+    }
+
+    #[test]
+    fn op_pos_roundtrips_result_and_small_const() {
+        let op = Op::new(OpCode::IntAdd, &[]);
+        op.pos().set(OpRef::int_op(42));
+        assert_eq!(op.pos().get(), OpRef::int_op(42));
+        op.pos().set(OpRef::NONE);
+        assert_eq!(op.pos().get(), OpRef::NONE);
+        op.pos().set(OpRef::const_int(7));
+        assert_eq!(op.pos().get(), OpRef::const_int(7));
+        op.pos().set(OpRef::input_arg_ref(3));
+        assert_eq!(op.pos().get(), OpRef::input_arg_ref(3));
+    }
+
     macro_rules! op {
-        ($($field:tt)*) => {{
+        (
+            opcode: $opcode:expr,
+            args: $args:expr,
+            descr: $descr:expr,
+            pos: $pos:expr,
+            extra: $extra:expr $(,)?
+        ) => {{
             let mut __op = Op {
-                $($field)*
+                opcode: $opcode,
                 type_: Type::Void,
-                forwarded: std::cell::RefCell::new(crate::forwarding::Forwarded::None),
-                value: std::cell::Cell::new(None),
+                arg_len: std::cell::Cell::new(0),
+                pos_payload: std::cell::Cell::new(0),
+                args: $args,
+                descr: $descr,
+                extra: $extra,
             };
             __op.type_ = __op.opcode.result_type();
+            __op.set_arg_len_value(ArgSlot::take_last_len());
+            __op.pos().set($pos.get());
             __op
         }};
     }
@@ -4920,27 +7196,24 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(3)),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(3)),
+            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(4)),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(4)),
+            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::NONE),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::NONE),
+            extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -4955,11 +7228,10 @@ mod tests {
     fn test_op_display_int_result() {
         let op = op! {
             opcode: OpCode::IntAdd,
-            args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-            descr: std::cell::RefCell::new(None),
-            pos: std::cell::Cell::new(OpRef::int_op(6)),
-            rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+            args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
+            descr: DescrSlot::new(None),
+            pos: OpPos::new(OpRef::int_op(6)),
+            extra: ExtraSlot::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "v6 = IntAdd(v1, v2)");
@@ -4969,11 +7241,10 @@ mod tests {
     fn test_op_display_void() {
         let op = op! {
             opcode: OpCode::SetfieldGc,
-            args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-            descr: std::cell::RefCell::new(None),
-            pos: std::cell::Cell::new(OpRef::NONE),
-            rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+            args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
+            descr: DescrSlot::new(None),
+            pos: OpPos::new(OpRef::NONE),
+            extra: ExtraSlot::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "SetfieldGc(v0, v1)");
@@ -4983,12 +7254,11 @@ mod tests {
     fn test_op_display_guard_with_fail_args() {
         let op = op! {
             opcode: OpCode::GuardTrue,
-            args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-            descr: std::cell::RefCell::new(None),
-            pos: std::cell::Cell::new(OpRef::NONE),
+            args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
+            descr: DescrSlot::new(None),
+            pos: OpPos::new(OpRef::NONE),
             // FAIL_ARGS applied below
-            rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+            extra: ExtraSlot::new(None),
         };
         op.setfailargs(
             vec![
@@ -5005,11 +7275,10 @@ mod tests {
     fn test_op_display_guard_without_fail_args() {
         let op = op! {
             opcode: OpCode::GuardTrue,
-            args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-            descr: std::cell::RefCell::new(None),
-            pos: std::cell::Cell::new(OpRef::NONE),
-            rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+            args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
+            descr: DescrSlot::new(None),
+            pos: OpPos::new(OpRef::NONE),
+            extra: ExtraSlot::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0)");
@@ -5019,11 +7288,10 @@ mod tests {
     fn test_format_trace_constants_rendered_with_values() {
         let ops = vec![op! {
             opcode: OpCode::IntAdd,
-            args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-            descr: std::cell::RefCell::new(None),
-            pos: std::cell::Cell::new(OpRef::int_op(1)),
-            rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+            args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
+            descr: DescrSlot::new(None),
+            pos: OpPos::new(OpRef::int_op(1)),
+            extra: ExtraSlot::new(None),
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 42);
@@ -5037,20 +7305,18 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(1)),
-                rd_resume_position: std::cell::Cell::new(-1),
-                extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(1)),
+                extra: ExtraSlot::new(None),
             },
             {
                 let op = op! {
                     opcode: OpCode::GuardTrue,
-                    args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-                    descr: std::cell::RefCell::new(None),
-                    pos: std::cell::Cell::new(OpRef::NONE),
-                    rd_resume_position: std::cell::Cell::new(-1),
-                    extra: std::cell::RefCell::new(None),
+                    args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
+                    descr: DescrSlot::new(None),
+                    pos: OpPos::new(OpRef::NONE),
+                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![
@@ -5063,11 +7329,10 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Finish,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::NONE),
-                rd_resume_position: std::cell::Cell::new(-1),
-                extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::NONE),
+                extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -5081,11 +7346,10 @@ mod tests {
         let ops = vec![{
             let op = op! {
                 opcode: OpCode::GuardTrue,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::NONE),
-                rd_resume_position: std::cell::Cell::new(-1),
-                extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::NONE),
+                extra: ExtraSlot::new(None),
             };
             op.setfailargs(
                 vec![
@@ -5119,35 +7383,31 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::Label,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::NONE),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::NONE),
+            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(3)),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(3)),
+            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(4)),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(4)),
+            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::NONE),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::NONE),
+            extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -5173,28 +7433,25 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntSub,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(1)),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(1)),
+            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntGt,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_001)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(2)),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_001)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(2)),
+            extra: ExtraSlot::new(None),
             },
             {
                 let op = op! {
                     opcode: OpCode::GuardTrue,
-                    args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                    descr: std::cell::RefCell::new(None),
-                    pos: std::cell::Cell::new(OpRef::NONE),
-                    rd_resume_position: std::cell::Cell::new(-1),
-                    extra: std::cell::RefCell::new(None),
+                    args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
+                    descr: DescrSlot::new(None),
+                    pos: OpPos::new(OpRef::NONE),
+                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![
@@ -5207,11 +7464,10 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Finish,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::NONE),
-                rd_resume_position: std::cell::Cell::new(-1),
-                extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::NONE),
+                extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -5234,11 +7490,10 @@ mod tests {
         ));
         let ops = vec![op! {
             opcode: OpCode::DebugMergePoint,
-            args: std::cell::RefCell::new(smallvec::smallvec![]),
-            descr: std::cell::RefCell::new(Some(descr)),
-            pos: std::cell::Cell::new(OpRef::NONE),
-            rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+            args: ArgSlot::new(smallvec::smallvec![]),
+            descr: DescrSlot::new(Some(descr)),
+            pos: OpPos::new(OpRef::NONE),
+            extra: ExtraSlot::new(None),
         }];
         let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
@@ -5263,36 +7518,32 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::Label,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::NONE),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::NONE),
+            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(2)),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(2)),
+            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntLt,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 2), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(3)),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 2), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(3)),
+            extra: ExtraSlot::new(None),
             },
             {
                 let op = op! {
                     opcode: OpCode::GuardTrue,
-                    args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
-                    descr: std::cell::RefCell::new(None),
-                    pos: std::cell::Cell::new(OpRef::NONE),
-                    rd_resume_position: std::cell::Cell::new(-1),
-                    extra: std::cell::RefCell::new(None),
+                    args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
+                    descr: DescrSlot::new(None),
+                    pos: OpPos::new(OpRef::NONE),
+                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![
@@ -5305,19 +7556,17 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntSub,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_001)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::int_op(4)),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_001)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::int_op(4)),
+            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
-                args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
-                descr: std::cell::RefCell::new(None),
-                pos: std::cell::Cell::new(OpRef::NONE),
-                rd_resume_position: std::cell::Cell::new(-1),
-            extra: std::cell::RefCell::new(None),
+                args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
+                descr: DescrSlot::new(None),
+                pos: OpPos::new(OpRef::NONE),
+            extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -5344,11 +7593,10 @@ mod tests {
             {
                 let op = op! {
                     opcode: OpCode::GuardTrue,
-                    args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
-                    descr: std::cell::RefCell::new(None),
-                    pos: std::cell::Cell::new(OpRef::NONE),
-                    rd_resume_position: std::cell::Cell::new(-1),
-                    extra: std::cell::RefCell::new(None),
+                    args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
+                    descr: DescrSlot::new(None),
+                    pos: OpPos::new(OpRef::NONE),
+                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![crate::forwarding::test_support::bound_resop_operand(
@@ -5362,11 +7610,10 @@ mod tests {
             {
                 let op = op! {
                     opcode: OpCode::GuardFalse,
-                    args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
-                    descr: std::cell::RefCell::new(None),
-                    pos: std::cell::Cell::new(OpRef::NONE),
-                    rd_resume_position: std::cell::Cell::new(-1),
-                    extra: std::cell::RefCell::new(None),
+                    args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
+                    descr: DescrSlot::new(None),
+                    pos: OpPos::new(OpRef::NONE),
+                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![

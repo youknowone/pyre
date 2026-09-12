@@ -121,14 +121,17 @@ pub fn set_instantiate(tp: &PyType, w_typeobject: PyObjectRef) {
 /// Returns the W_TypeObject (for `w_class`), or null if not yet initialized
 /// (bootstrap phase before `init_typeobjects()`).
 ///
-/// `rclass.py` OBJECT_VTABLE marks every field immutable; `instantiate`
-/// is a pointer slot written once by `set_instantiate` before any
-/// bytecode runs. A plain word load is the getfield the translator
-/// already emits for that slot — `AtomicPtr::load(Acquire)` would stay
-/// a residual and keep `is_plain_int1` off IntegerListStrategy.
+/// `rclass.py` OBJECT_VTABLE marks every field immutable; upstream fills
+/// `instantiate` at translation time.  Pyre also writes it from module
+/// initializers (`set_instantiate` in mmap/_cffi_backend/posix), which run
+/// under the GIL like every reader, so the GIL is the synchronizer and a
+/// Relaxed load suffices.  Relaxed keeps the read a plain word load in the
+/// generated jitcode — `Acquire` would make the frontend decline the graph
+/// and leave every caller with a residual call, keeping `is_plain_int1`
+/// off IntegerListStrategy.
 #[inline]
 pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
-    unsafe { *(&tp.instantiate as *const AtomicPtr<PyObject> as *const PyObjectRef) }
+    tp.instantiate.load(Ordering::Relaxed)
 }
 
 /// True when `obj`'s Python class is exactly the builtin type for its

@@ -105,11 +105,29 @@ pub type BhOpcodeHandler =
 /// Named (not a closure) so `unwired_opnames()` can compare fn pointers
 /// reliably — closures get a fresh anonymous type per call site.
 fn unwired_handler_placeholder(
-    _bh: &mut BlackholeInterpreter,
+    bh: &mut BlackholeInterpreter,
     _code: &[u8],
     _position: usize,
 ) -> Result<usize, DispatchError> {
-    panic!("missing bhimpl for opcode (use wire_handler to register)")
+    // Grain never installs MiniMark. A walk that inlined a helper
+    // (`malformed`) and aborted leaves the blackhole on that helper
+    // body; those Charon-lowered opcodes are not in this table.
+    // Leave to the portal merge point rather than panic. Hosts that
+    // registered a MemoryError provider still fail loud.
+    if majit_backend::memory_error_singleton_ref() == 0 {
+        return Err(DispatchError::LeaveFrame);
+    }
+    panic!(
+        "dispatch_step: unwired opcode pos={} entry={} table_len={} \
+         jitcode={:?} index={:?} startpoint={} — extend the builder's \
+         setup_insns to cover this opname",
+        bh.last_opcode_position,
+        bh.entry_position,
+        bh.dispatch_table.len(),
+        bh.jitcode.name,
+        bh.jitcode.try_index(),
+        bh.jitcode.is_valid_startpoint(bh.last_opcode_position),
+    )
 }
 
 /// Return type of a blackhole frame.
@@ -584,7 +602,10 @@ impl Default for BlackholeInterpreter {
             virtualizable_info: std::ptr::null(),
             jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
             virtualizable_stack_base: 0,
-            dispatch_table: std::sync::Arc::new(Vec::new()),
+            dispatch_table: std::sync::Arc::new(vec![
+                unwired_handler_placeholder as BhOpcodeHandler;
+                256
+            ]),
             inline_callee_scratch: None,
             native_inline_args_i_scratch: Vec::new(),
             native_inline_args_r_scratch: Vec::new(),
@@ -808,9 +829,24 @@ impl BlackholeInterpreter {
     /// Allocates registers sized to hold both working regs and constants,
     /// then copies constants into the upper portion of each register array.
     pub fn setposition(&mut self, jitcode: std::sync::Arc<JitCode>, position: usize) {
-        self.init_register_files_from_runtime_jitcode(&jitcode);
-        // RPython: descrs are shared on the builder (setup_descrs).
-        self.jitcode = jitcode;
+        self.setposition_ref(&jitcode, position);
+    }
+
+    /// `setposition` without taking the `Arc`. A 4–7 frame `shift` resume
+    /// reseats the same helper; skip the clone and the constant walk when
+    /// the banks are already that jitcode's.
+    #[inline]
+    pub fn setposition_ref(&mut self, jitcode: &std::sync::Arc<JitCode>, position: usize) {
+        // `copy_constants` is idempotent for one jitcode. Working regs are
+        // filled by `consume_one_section` from liveness.
+        let already = std::sync::Arc::ptr_eq(&self.jitcode, jitcode)
+            && self.registers_i.len() >= jitcode.num_regs_and_consts_i()
+            && self.registers_r.len() >= jitcode.num_regs_and_consts_r()
+            && self.registers_f.len() >= jitcode.num_regs_and_consts_f();
+        if !already {
+            self.init_register_files_from_runtime_jitcode(jitcode);
+            self.jitcode = std::sync::Arc::clone(jitcode);
+        }
         self.reset_position_state(position);
         if crate::bh_debug_enabled() {
             eprintln!(
@@ -911,6 +947,7 @@ impl BlackholeInterpreter {
     ///
     /// The working registers occupy `0 .. num_regs_i`; everything above is the
     /// jitcode's constant table, which no write may reach.
+    #[inline(always)]
     pub fn setarg_i(&mut self, index: usize, value: i64) {
         // `init_register_file_from_i64s` lays the jitcode's integer constants
         // out at `num_regs_i ..`, so a write at or above that bound replaces a
@@ -926,12 +963,14 @@ impl BlackholeInterpreter {
     /// Same constant-table bound as [`Self::setarg_i`]: a write at or past
     /// `num_regs_r` replaces a jitcode constant the instruction stream still
     /// reads as one.
+    #[inline(always)]
     pub fn setarg_r(&mut self, index: usize, value: i64) {
         debug_assert_constant_slot_untouched(index, self.jitcode.num_regs_r(), "setarg_r");
         self.registers_r[index] = value;
     }
 
     /// Set a float register value.
+    #[inline(always)]
     pub fn setarg_f(&mut self, index: usize, value: i64) {
         debug_assert_constant_slot_untouched(index, self.jitcode.num_regs_f(), "setarg_f");
         self.registers_f[index] = value;
@@ -1662,6 +1701,29 @@ impl BlackholeInterpreter {
         }
     }
 
+    /// Whether `run` must walk the caller chain to install register /
+    /// virtualizable roots. False when every frame is already registered
+    /// and no heap virtualizable (`has_vable_token`) is attached.
+    fn chain_needs_run_rooting(&self) -> bool {
+        let mut frame = Some(self);
+        while let Some(f) = frame {
+            if !f.rooted {
+                return true;
+            }
+            if !f.virtualizable_info.is_null() {
+                // SAFETY: `virtualizable_info` is the process-owned
+                // `VirtualizableInfo` `seed_deopt_vinfo_ptr` / the
+                // portal stamped; it outlives the drive.
+                let vinfo = unsafe { &*f.virtualizable_info };
+                if vinfo.has_vable_token() {
+                    return true;
+                }
+            }
+            frame = f.nextblackholeinterp.as_deref();
+        }
+        false
+    }
+
     /// Execute the dispatch loop on the current jitcode.
     ///
     /// RPython: `BlackholeInterpreter.run()` catches `LeaveFrame` and breaks,
@@ -1670,6 +1732,16 @@ impl BlackholeInterpreter {
     /// jitexc.ContinueRunningNormally propagates through run→_run_forever).
     pub fn run(&mut self) -> BhRunOutcome {
         let _bh_phase = majit_gc::BhProbePhase::enter("blackhole");
+        // Pooled interpreters are registered for life (`acquire_interp`).
+        // `seed_deopt_vinfo_ptr` still stamps a no-token state-field
+        // `VirtualizableInfo` on every regex frame, and the vable register
+        // scan below then walks the whole chain on every `run()` — O(frames²)
+        // `gc_owns_object` probes per character, against a vtype that is
+        // never a `NodeRec`. Skip that walk when every frame is already
+        // rooted and no heap virtualizable is present.
+        if !self.chain_needs_run_rooting() {
+            return self.run_after_rooting();
+        }
         // Root this frame's register bank AND every pending caller frame
         // reachable through `nextblackholeinterp`.  RPython keeps the whole
         // blackhole interpreter chain transitively GC-traced from the head for
@@ -1738,10 +1810,103 @@ impl BlackholeInterpreter {
                 current = frame.nextblackholeinterp.as_deref_mut();
             }
         }
-        let result = self.run_inner();
+        let result = self.run_after_rooting();
         majit_gc::shadow_stack::pop_resume_ref_roots_to(vable_roots_depth);
         majit_gc::shadow_stack::pop_bh_regs_to(bh_depth);
         result
+    }
+
+    /// Native-finish only at a node-entry PC. The regex leaf resumes at
+    /// mid-`shift` pc 210; probing `fnaddr` there was a TLS startpoint
+    /// walk on every frame of every character.
+    fn run_after_rooting(&mut self) -> BhRunOutcome {
+        if self.position == 0 {
+            if let Some(outcome) = self.try_native_finish_at_node_entry() {
+                return outcome;
+            }
+        }
+        self.run_inner()
+    }
+
+    /// `bhimpl_inline_call_*` for a frame whose resume PC is still the
+    /// helper entry: the remaining body is the whole callee, so one
+    /// `fnaddr` call answers it.
+    fn try_native_finish_at_node_entry(&mut self) -> Option<BhRunOutcome> {
+        if !is_callable_fnaddr(self.jitcode.fnaddr) {
+            return None;
+        }
+        if !native_entry_args_intact(&self.jitcode, self.position) {
+            return None;
+        }
+        let fnaddr = self.jitcode.fnaddr;
+        let (result_type, arg_ptr, arg_len, calldescr) = {
+            let body = self.jitcode.try_body()?;
+            (
+                body.calldescr.result_type,
+                body.calldescr.arg_classes.as_ptr(),
+                body.calldescr.arg_classes.len(),
+                &body.calldescr as *const majit_translate::jitcode::BhCallDescr,
+            )
+        };
+        let mut args_i = smallvec::SmallVec::<[i64; 4]>::new();
+        let mut args_r = smallvec::SmallVec::<[i64; 4]>::new();
+        let mut args_f = smallvec::SmallVec::<[i64; 2]>::new();
+        let (mut ni, mut nr, mut nf) = (0usize, 0usize, 0usize);
+        // SAFETY: `self.jitcode` owns the body for the life of this frame.
+        for i in 0..arg_len {
+            let ch = unsafe { *arg_ptr.add(i) };
+            match ch {
+                b'i' => {
+                    args_i.push(*self.registers_i.get(ni)?);
+                    ni += 1;
+                }
+                b'r' => {
+                    args_r.push(*self.registers_r.get(nr)?);
+                    nr += 1;
+                }
+                b'f' => {
+                    args_f.push(*self.registers_f.get(nf)?);
+                    nf += 1;
+                }
+                _ => return None,
+            }
+        }
+        BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(args_r.as_mut_slice());
+        }
+        let outcome = match result_type {
+            'i' => {
+                let result = self.bhimpl_inline_call_irf_i(
+                    fnaddr,
+                    &args_i,
+                    &args_r,
+                    &args_f,
+                    // SAFETY: `self.jitcode` owns the body for the life of this frame.
+                    unsafe { &*calldescr },
+                );
+                match check_residual_call_exception_after(self, self.position) {
+                    Ok(()) => {
+                        self.tmpreg_i = result;
+                        self.return_type = BhReturnType::Int;
+                        Some(BhRunOutcome::LeaveFrame)
+                    }
+                    Err(DispatchError::LeaveFrame) => Some(BhRunOutcome::LeaveFrame),
+                    Err(DispatchError::ContinueRunningNormally(args)) => {
+                        Some(BhRunOutcome::ContinueRunningNormally(args))
+                    }
+                    Err(DispatchError::RaiseException { exc, .. }) => {
+                        self.got_exception = true;
+                        self.exception_last_value = exc;
+                        Some(BhRunOutcome::Exception)
+                    }
+                }
+            }
+            _ => None,
+        };
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(args_root_depth);
+        outcome
     }
 
     fn run_inner(&mut self) -> BhRunOutcome {
@@ -1779,32 +1944,257 @@ impl BlackholeInterpreter {
         // DIFFERENT interpreter — `copy_data_from_miframe` and the resume
         // reader before `run`, and `handler_inline_call_nested_ext` on the
         // callee — so no handler re-seats the frame it is dispatching in.
-        let jitcode_arc = std::sync::Arc::clone(&self.jitcode);
-        let code: &[u8] = &jitcode_arc.code;
+        // Bind the code slice without an `Arc` clone: `self.jitcode` already
+        // owns the bytes for the whole loop.
+        let code: &[u8] = {
+            let slice = self.jitcode.code.as_slice();
+            // SAFETY: `self.jitcode` is not reseated while this loop runs
+            // (see above). The slice is only read.
+            unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) }
+        };
+        // `blackhole.py` `dispatch_loop` keeps `position` as a loop local
+        // and increments it past the opcode before the inlined handler
+        // (`opcode = ord(code[position]); position += 1`).
+        let mut position = self.position;
+        let live_hook_absent = LIVE_MARKER_HOOK.get().is_none();
+        // SAFETY: `self.jitcode` / `registers_*` are not reseated by an
+        // inlined handler. INLINE_CALL and the function-pointer fallback
+        // refresh the register pointers below.
+        let exec_descrs: &[crate::jitcode::RuntimeBhDescr] = unsafe {
+            let slice = self.jitcode.exec.descrs.as_slice();
+            std::slice::from_raw_parts(slice.as_ptr(), slice.len())
+        };
+        let mut regs_i = self.registers_i.as_mut_ptr();
+        let mut regs_r = self.registers_r.as_mut_ptr();
         loop {
-            if self.position >= code.len() {
+            if position >= code.len() {
+                self.position = position;
                 if trace {
                     eprintln!(
                         "[bh-trace] finished at pos={} reg0={}",
-                        self.position,
+                        position,
                         self.registers_i.first().copied().unwrap_or(-1)
                     );
                 }
                 return BhRunOutcome::EndOfCode;
             }
-            let pos_before = self.position;
-            self.last_opcode_position = pos_before;
             if check_startpoints && let Some(startpoints) = self.jitcode.startpoints.as_ref() {
                 assert!(
-                    startpoints.contains(&pos_before),
-                    "run_inner: position {pos_before} is in the middle of an instruction \
+                    startpoints.contains(&position),
+                    "run_inner: position {position} is in the middle of an instruction \
                      (jitcode {:?} index {:?})",
                     self.jitcode.name,
                     self.jitcode.try_index(),
                 );
             }
-            let opcode = code[self.position];
-            self.position += 1;
+            // SAFETY: `position < code.len()` just held.
+            let opcode = unsafe { *code.get_unchecked(position) };
+            let pos_before = position;
+            position += 1;
+            // The remaining `shift` epilogue at pc 210 is `-live-`,
+            // `goto/L`, `goto_if_not`, `int_copy`, getfield/setfield of
+            // `left`/`right`/`marked`/`empty`, `int_eq`/`int_add`,
+            // `int_return`, and one native INLINE_CALL.
+            // RPython's translated `dispatch_loop` inlines those
+            // `_get_method` bodies; the function-pointer table is the
+            // untranslated form. Do not restart `fnaddr` from this
+            // mid-node PC.
+            if !trace {
+                match opcode {
+                    jitcode::insns::BC_LIVE if live_hook_absent => {
+                        position += majit_translate::liveness::OFFSET_SIZE;
+                        continue;
+                    }
+                    jitcode::insns::BC_JUMP => {
+                        // SAFETY: well-formed `goto/L` carries two operand bytes.
+                        position = unsafe { bh_code_u16(code, position) };
+                        continue;
+                    }
+                    jitcode::insns::BC_GOTO_IF_NOT | jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
+                        // `if mark` / `if old_left` lower to
+                        // `goto_if_not_int_is_true`; `bhimpl_goto_if_not_int_is_true`
+                        // is `bhimpl_goto_if_not`.
+                        // SAFETY: operand bytes and the named int register exist.
+                        let a = unsafe { *regs_i.add(*code.get_unchecked(position) as usize) };
+                        let target = unsafe { bh_code_u16(code, position + 1) };
+                        position = bhimpl_goto_if_not(a, target, position + 3);
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_IS_TRUE => {
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 1) as usize) =
+                                bhimpl_int_is_true(a);
+                        }
+                        position += 2;
+                        continue;
+                    }
+                    jitcode::insns::BC_MOVE_I => {
+                        unsafe {
+                            let src = *regs_i.add(*code.get_unchecked(position) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 1) as usize) = src;
+                        }
+                        position += 2;
+                        continue;
+                    }
+                    jitcode::insns::BC_MOVE_I_C => {
+                        unsafe {
+                            let src = *code.get_unchecked(position) as i8 as i64;
+                            *regs_i.add(*code.get_unchecked(position + 1) as usize) = src;
+                        }
+                        position += 2;
+                        continue;
+                    }
+                    jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_I_PURE => {
+                        unsafe {
+                            let struct_ptr = *regs_r.add(*code.get_unchecked(position) as usize);
+                            let (descr, pos) =
+                                read_descr_fast(exec_descrs, self, code, position + 1);
+                            let dest = *code.get_unchecked(pos) as usize;
+                            *regs_i.add(dest) = bh_load_int_field(struct_ptr, descr);
+                            position = pos + 1;
+                        }
+                        continue;
+                    }
+                    jitcode::insns::BC_GETFIELD_GC_R | jitcode::insns::BC_GETFIELD_GC_R_PURE => {
+                        unsafe {
+                            let struct_ptr = *regs_r.add(*code.get_unchecked(position) as usize);
+                            let (descr, pos) =
+                                read_descr_fast(exec_descrs, self, code, position + 1);
+                            let dest = *code.get_unchecked(pos) as usize;
+                            *regs_r.add(dest) = bh_load_ref_field(struct_ptr, descr);
+                            position = pos + 1;
+                        }
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_EQ => {
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 2) as usize) =
+                                bhimpl_int_eq(a, b);
+                        }
+                        position += 3;
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_NE => {
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 2) as usize) =
+                                bhimpl_int_ne(a, b);
+                        }
+                        position += 3;
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_LT => {
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 2) as usize) =
+                                bhimpl_int_lt(a, b);
+                        }
+                        position += 3;
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_ADD => {
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            *regs_i.add(*code.get_unchecked(position + 2) as usize) =
+                                bhimpl_int_add(a, b);
+                        }
+                        position += 3;
+                        continue;
+                    }
+                    jitcode::insns::BC_GOTO_IF_NOT_INT_EQ => {
+                        unsafe {
+                            let a = *regs_i.add(*code.get_unchecked(position) as usize);
+                            let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            let target = bh_code_u16(code, position + 2);
+                            position = if a == b { position + 4 } else { target };
+                        }
+                        continue;
+                    }
+                    jitcode::insns::BC_SETFIELD_GC_I => {
+                        unsafe {
+                            let struct_ptr = *regs_r.add(*code.get_unchecked(position) as usize);
+                            let value = *regs_i.add(*code.get_unchecked(position + 1) as usize);
+                            let (descr, pos) =
+                                read_descr_fast(exec_descrs, self, code, position + 2);
+                            bh_store_int_field(struct_ptr, value, descr);
+                            position = pos;
+                        }
+                        continue;
+                    }
+                    jitcode::insns::BC_SETFIELD_GC_I_C => {
+                        unsafe {
+                            let struct_ptr = *regs_r.add(*code.get_unchecked(position) as usize);
+                            let value = *code.get_unchecked(position + 1) as i8 as i64;
+                            let (descr, pos) =
+                                read_descr_fast(exec_descrs, self, code, position + 2);
+                            bh_store_int_field(struct_ptr, value, descr);
+                            position = pos;
+                        }
+                        continue;
+                    }
+                    jitcode::insns::BC_INT_RETURN => {
+                        self.tmpreg_i =
+                            unsafe { *regs_i.add(*code.get_unchecked(position) as usize) };
+                        self.return_type = BhReturnType::Int;
+                        self.position = position + 1;
+                        return BhRunOutcome::LeaveFrame;
+                    }
+                    jitcode::insns::BC_INT_RETURN_C => {
+                        self.tmpreg_i = unsafe { *code.get_unchecked(position) as i8 as i64 };
+                        self.return_type = BhReturnType::Int;
+                        self.position = position + 1;
+                        return BhRunOutcome::LeaveFrame;
+                    }
+                    jitcode::insns::BC_INLINE_CALL => {
+                        self.position = pos_before;
+                        self.last_opcode_position = pos_before;
+                        match handler_inline_call_nested_ext(self, code, position) {
+                            Ok(new_pos) => {
+                                position = new_pos;
+                                regs_i = self.registers_i.as_mut_ptr();
+                                regs_r = self.registers_r.as_mut_ptr();
+                                continue;
+                            }
+                            Err(DispatchError::LeaveFrame) => {
+                                return BhRunOutcome::LeaveFrame;
+                            }
+                            Err(DispatchError::ContinueRunningNormally(args)) => {
+                                return BhRunOutcome::ContinueRunningNormally(args);
+                            }
+                            Err(DispatchError::RaiseException {
+                                exc,
+                                resume_position,
+                                ..
+                            }) => {
+                                // dispatch_step writes resume_position
+                                // before re-raising so catch_exception
+                                // sees the post-op cursor.
+                                self.position = resume_position;
+                                if self.handle_exception_in_frame(exc) {
+                                    position = self.position;
+                                    regs_i = self.registers_i.as_mut_ptr();
+                                    regs_r = self.registers_r.as_mut_ptr();
+                                    continue;
+                                }
+                                self.got_exception = true;
+                                self.exception_last_value = exc;
+                                return BhRunOutcome::Exception;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Fallback: position is already past the opcode, matching
+            // `dispatch_loop` / `dispatch_step`.
+            self.position = position;
+            self.last_opcode_position = pos_before;
             if trace {
                 eprintln!(
                     "[bh-trace] pos={} op={} reg0={} reg1={}",
@@ -1815,7 +2205,11 @@ impl BlackholeInterpreter {
                 );
             }
             match self.dispatch_step(opcode, code) {
-                Ok(()) => {}
+                Ok(()) => {
+                    position = self.position;
+                    regs_i = self.registers_i.as_mut_ptr();
+                    regs_r = self.registers_r.as_mut_ptr();
+                }
                 Err(DispatchError::LeaveFrame) => {
                     if trace {
                         eprintln!(
@@ -1846,6 +2240,9 @@ impl BlackholeInterpreter {
                     }
                     if self.handle_exception_in_frame(exc) {
                         // Handler found, continue execution at handler target
+                        position = self.position;
+                        regs_i = self.registers_i.as_mut_ptr();
+                        regs_r = self.registers_r.as_mut_ptr();
                         continue;
                     }
                     // No handler: propagate exception via got_exception flag
@@ -1876,47 +2273,11 @@ impl BlackholeInterpreter {
     /// and return the post-operand position; we then store it back into
     /// `self.position`.
     fn dispatch_step(&mut self, opcode: u8, code: &[u8]) -> Result<(), DispatchError> {
-        let placeholder_addr = unwired_handler_placeholder as *const () as usize;
-        let table_handler = self
-            .dispatch_table
-            .get(opcode as usize)
-            .copied()
-            .filter(|h| (*h as *const () as usize) != placeholder_addr);
-        let Some(handler) = table_handler else {
-            // RPython parity (`blackhole.py setup_insns`
-            // resolving every key via `_get_method`): a missing handler
-            // is `AttributeError` at builder-construction time.  pyre
-            // hits this branch only when a builder has not registered
-            // every BC_* it intends to emit.
-            // The jitcode NAME is not an identity — `__new__` names one jitcode
-            // per class — and a byte that is unwired here is just as likely to
-            // be an operand the frame was resumed in the middle of as an opname
-            // the builder forgot.  Report the index and whether the position is
-            // a recorded instruction boundary so the two read apart.  `entry`
-            // separates the two further: equal to `pos` means the frame was
-            // `setposition`ed straight onto this byte and dispatched with no
-            // prior step, so nothing walked it forward from a valid boundary.
-            //
-            // Grain never installs MiniMark. A walk that inlined a helper
-            // (`malformed`) and aborted leaves the blackhole on that helper
-            // body; those Charon-lowered opcodes are not in this table.
-            // Leave to the portal merge point rather than panic. Hosts that
-            // registered a MemoryError provider still fail loud.
-            if majit_backend::memory_error_singleton_ref() == 0 {
-                return Err(DispatchError::LeaveFrame);
-            }
-            panic!(
-                "dispatch_step: unwired opcode={opcode:#x} pos={} entry={} \
-                 table_len={} jitcode={:?} index={:?} startpoint={} — extend the \
-                 builder's setup_insns to cover this opname",
-                self.last_opcode_position,
-                self.entry_position,
-                self.dispatch_table.len(),
-                self.jitcode.name,
-                self.jitcode.try_index(),
-                self.jitcode.is_valid_startpoint(self.last_opcode_position),
-            );
-        };
+        // `blackhole.py dispatch_loop`: `self.dispatch_table[opcode_byte](...)`.
+        // The table is 256 slots (`setup_insns`), so a u8 index cannot miss.
+        // Unwired bytes are the placeholder, which LeaveFrames on Grain and
+        // panics when a MemoryError provider is registered.
+        let handler = self.dispatch_table[opcode as usize];
         match handler(self, code, self.position) {
             Ok(new_pos) => {
                 self.position = new_pos;
@@ -2413,7 +2774,10 @@ impl BlackholeInterpBuilder {
             op_rvmprof_code: majit_translate::insns::BC_ABSENT,
             // blackhole.py `EMPTY_LIST_I = [] # shared`.
             descrs: EMPTY_DESCR_TABLE,
-            dispatch_table: std::sync::Arc::new(Vec::new()),
+            dispatch_table: std::sync::Arc::new(vec![
+                unwired_handler_placeholder as BhOpcodeHandler;
+                256
+            ]),
             jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
         }
     }
@@ -2474,27 +2838,11 @@ impl BlackholeInterpBuilder {
         assert!(insns.len() <= 256, "too many instructions!");
         // RPython blackhole.py:68-71: build reverse table.
         //
-        // TODO: RPython sizes `_insns` by `len(insns)`
-        // because every opname is dynamically numbered `0..len-1`
-        // (`Assembler.insns.setdefault(key, len(self.insns))`), so the
-        // length and the maximum byte coincide.  Pyre's canonical-routing
-        // (`majit-translate::insns::insn_byte_opt`) pins canonical keys
-        // to fixed `BC_*` bytes (sparse, up to 168) and pushes
-        // translator-only keys past `CANONICAL_BYTE_CEILING`, so the
-        // byte space is sparse and `len(insns) < max_byte + 1`.  Size
-        // the reverse table by `max_byte + 1` instead so a byte read at
-        // dispatch time does not index past the end.  Empty slots in
-        // the gaps stay as `String::new()` and surface as the
-        // unwired-handler placeholder if dispatched against — same
-        // behaviour RPython relies on for unregistered opcodes.
-        // Empty `insns` → empty reverse table (RPython parity:
-        // `[None] * len(insns)` with `len == 0`).  Non-empty → size to
-        // `max_byte + 1` so a byte read at dispatch time does not
-        // index past the end.
-        let table_len = match insns.values().copied().max() {
-            Some(max_byte) => (max_byte as usize) + 1,
-            None => 0,
-        };
+        // RPython sizes `_insns` by `len(insns)` because the assembler
+        // numbers densely `0..n-1`. Pyre's `BC_*` bytes are sparse, so a
+        // u8 opcode indexes a 256-slot table. Empty gaps stay `String::new()`
+        // and the unwired placeholder (LeaveFrame on Grain).
+        let table_len = 256;
         self._insns = vec![String::new(); table_len];
         for (key, &value) in insns {
             // `blackhole.py` `assert self._insns[value] is None`:
@@ -2764,12 +3112,16 @@ impl BlackholeInterpBuilder {
         //   self.op_live = builder.op_live
         bh.op_live = self.op_live;
         // RPython blackhole.py: self.dispatch_loop = builder.dispatch_loop
-        bh.dispatch_table = std::sync::Arc::clone(&self.dispatch_table);
+        if !std::sync::Arc::ptr_eq(&bh.dispatch_table, &self.dispatch_table) {
+            bh.dispatch_table = std::sync::Arc::clone(&self.dispatch_table);
+        }
         // blackhole.py:250 `self.builder = builder` — upstream keeps the
         // back-reference and reads `self.builder.metainterp_sd.jitdrivers_sd`
         // on demand (:1079, :1096).  The pool owns the interpreters here, so
         // hand each one the builder's snapshot instead.
-        bh.jitdrivers_sd = std::sync::Arc::clone(&self.jitdrivers_sd);
+        if !std::sync::Arc::ptr_eq(&bh.jitdrivers_sd, &self.jitdrivers_sd) {
+            bh.jitdrivers_sd = std::sync::Arc::clone(&self.jitdrivers_sd);
+        }
         bh
     }
 
@@ -4237,6 +4589,45 @@ mod tests {
             let _ = convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
         }
 
+        #[test]
+        fn rooted_state_field_chain_skips_run_rooting() {
+            let mut builder = build_test_bh_builder();
+            let bh = builder.acquire_interp();
+            assert!(bh.rooted);
+            assert!(bh.virtualizable_info.is_null());
+            assert!(!bh.chain_needs_run_rooting());
+        }
+
+        #[test]
+        fn acquire_interp_reuses_the_builder_dispatch_table() {
+            let mut builder = build_test_bh_builder();
+            let first = builder.acquire_interp();
+            let table = std::sync::Arc::clone(&first.dispatch_table);
+            builder.release_interp(first);
+            let reused = builder.acquire_interp();
+            assert!(
+                std::sync::Arc::ptr_eq(&reused.dispatch_table, &table),
+                "a pooled interp already holds this builder's dispatch table"
+            );
+        }
+
+        #[test]
+        fn setposition_ref_does_not_clone_an_already_seated_jitcode() {
+            let mut b = JitCodeBuilder::default();
+            b.int_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition_ref(&jitcode, 0);
+            let before = std::sync::Arc::strong_count(&jitcode);
+            bh.setposition_ref(&jitcode, 0);
+            assert_eq!(
+                std::sync::Arc::strong_count(&jitcode),
+                before,
+                "reseating the same helper must not clone the Arc"
+            );
+        }
+
         /// `_setup_return_value_i` reads `code[position-1]`, the single
         /// result register `inline_call_typed` now closes on.
         #[test]
@@ -4350,6 +4741,28 @@ mod tests {
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], 42);
+        }
+
+        #[test]
+        fn dispatch_loop_int_eq_then_int_return() {
+            // Translated `dispatch_loop` increments past the opcode first.
+            // `int_eq` + `int_return` is the shift-epilogue exit.
+            let mut b = JitCodeBuilder::default();
+            b.load_const_i_value(0, 3);
+            b.load_const_i_value(1, 3);
+            b.record_binop_i(2, OpCode::IntEq, 0, 1);
+            b.int_return(2);
+            let jitcode = b.finish();
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            match bh.run() {
+                BhRunOutcome::LeaveFrame => {}
+                other => panic!("expected LeaveFrame, got {other:?}"),
+            }
+            assert_eq!(bh.tmpreg_i, 1);
+            assert_eq!(bh.return_type, BhReturnType::Int);
         }
 
         #[test]
@@ -8336,8 +8749,101 @@ fn handler_unreachable(
 // These call `cpu.bh_getfield_gc_i(struct_ptr, descr)` etc.
 // The 'd' argcode is a 2-byte descriptor index into `bh.descrs`.
 // In pyre, descrs[index] resolves to a field offset (usize).
+//
+// The default `Backend` impl is a raw load/store at that offset
+// (`llmodel.py read_int_at_mem`). Going through `bh.cpu()` is two
+// virtual calls per field on a path the regex leaf interprets for
+// the rest of `shift`. Same bytes, no vtable.
+
+#[inline(always)]
+fn bh_load_int_field(struct_ptr: i64, descr: &BhDescr) -> i64 {
+    let (offset, size, sign) = descr.unpack_fielddescr_size();
+    let addr = (struct_ptr as usize).wrapping_add(offset);
+    // SAFETY: `struct_ptr` is the GC object the resume reader seeded;
+    // `offset`/`size` come from the field descriptor.
+    unsafe {
+        match (size, sign) {
+            (1, true) => (addr as *const i8).read_unaligned() as i64,
+            (1, false) => (addr as *const u8).read_unaligned() as i64,
+            (2, true) => (addr as *const i16).read_unaligned() as i64,
+            (2, false) => (addr as *const u16).read_unaligned() as i64,
+            (4, true) => (addr as *const i32).read_unaligned() as i64,
+            (4, false) => (addr as *const u32).read_unaligned() as i64,
+            (8, _) => (addr as *const i64).read_unaligned(),
+            other => panic!("bh_load_int_field: unsupported (size, signed) = {other:?}"),
+        }
+    }
+}
+
+#[inline(always)]
+fn bh_store_int_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
+    let (offset, size, _sign) = descr.unpack_fielddescr_size();
+    unsafe { majit_backend::llmodel::write_int_at_mem(struct_ptr as usize, offset, size, value) }
+}
+
+#[inline(always)]
+fn bh_load_ref_field(struct_ptr: i64, descr: &BhDescr) -> i64 {
+    let offset = descr.as_offset();
+    let addr = (struct_ptr as usize).wrapping_add(offset);
+    unsafe { (addr as *const usize).read_unaligned() as i64 }
+}
+
+#[inline(always)]
+fn bh_store_ref_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
+    let offset = descr.as_offset();
+    majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
+    unsafe {
+        majit_backend::llmodel::write_ref_at_mem(struct_ptr as usize, offset, value as usize);
+    }
+    // dynasm `bh_setfield_gc_r` / cranelift `write_barrier_if_managed`:
+    // skip the header walk when the base is a reconstructed unmanaged
+    // object. `gc_write_barrier` alone does not do that check.
+    if majit_gc::gc_owns_object(struct_ptr as usize) {
+        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+    }
+}
+
+#[inline(always)]
+fn bh_load_float_field(struct_ptr: i64, descr: &BhDescr) -> f64 {
+    let offset = descr.as_offset();
+    let addr = (struct_ptr as usize).wrapping_add(offset);
+    unsafe { (addr as *const f64).read_unaligned() }
+}
+
+#[inline(always)]
+fn bh_store_float_field(struct_ptr: i64, value: f64, descr: &BhDescr) {
+    let offset = descr.as_offset();
+    unsafe { majit_backend::llmodel::write_float_at_mem(struct_ptr as usize, offset, value) }
+}
 
 // CPU-dependent field and array operations
+/// Two-byte little-endian operand. Translated `dispatch_loop` reads
+/// `ord(code[position]) | (ord(code[position+1]) << 8)` with no check.
+#[inline(always)]
+unsafe fn bh_code_u16(code: &[u8], pos: usize) -> usize {
+    unsafe { (*code.get_unchecked(pos) as usize) | ((*code.get_unchecked(pos + 1) as usize) << 8) }
+}
+
+/// `d` argcode against the jitcode's own descr pool, then the builder table.
+/// RPython is `self.descrs[index]`; the runtime jitcode pool is that list
+/// for a `JitCodeBuilder` helper.
+#[inline(always)]
+unsafe fn read_descr_fast<'a>(
+    exec_descrs: &'a [crate::jitcode::RuntimeBhDescr],
+    bh: &'a BlackholeInterpreter,
+    code: &[u8],
+    pos: usize,
+) -> (&'a BhDescr, usize) {
+    let descr_idx = unsafe { bh_code_u16(code, pos) };
+    if descr_idx < exec_descrs.len() {
+        let descr = unsafe { exec_descrs.get_unchecked(descr_idx) }
+            .as_bh_descr()
+            .unwrap_or_else(|| panic!("d-arg descrs[{descr_idx}] is not a BhDescr entry"));
+        return (descr, pos + 2);
+    }
+    read_descr(bh, code, pos)
+}
+
 /// RPython `blackhole.py:150-157`: read a 2-byte descriptor index from
 /// bytecode and return `(descr_object, new_position)`.
 ///
@@ -8581,9 +9087,7 @@ fn handler_getfield_gc_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    let result = cpu.bh_getfield_gc_i(struct_ptr, descr);
-    bh.registers_i[code[pos] as usize] = result;
+    bh.registers_i[code[pos] as usize] = bh_load_int_field(struct_ptr, descr);
     Ok(pos + 1)
 }
 fn handler_getfield_gc_r(
@@ -8593,9 +9097,7 @@ fn handler_getfield_gc_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
-    bh.registers_r[code[pos] as usize] = result.0 as i64;
+    bh.registers_r[code[pos] as usize] = bh_load_ref_field(struct_ptr, descr);
     Ok(pos + 1)
 }
 fn handler_getfield_gc_f(
@@ -8605,9 +9107,7 @@ fn handler_getfield_gc_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
-    bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
+    bh.registers_f[code[pos] as usize] = bh_load_float_field(struct_ptr, descr).to_bits() as i64;
     Ok(pos + 1)
 }
 // bhimpl_setfield_gc_i: @arguments("cpu", "r", "i", "d")
@@ -8619,8 +9119,7 @@ fn handler_setfield_gc_i(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
+    bh_store_int_field(struct_ptr, value, descr);
     Ok(pos)
 }
 // `setfield_gc_i/rcd` — USE_C_FORM short value (`assembler.py`):
@@ -8635,8 +9134,7 @@ fn handler_setfield_gc_i_c(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = code[position + 1] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
+    bh_store_int_field(struct_ptr, value, descr);
     Ok(pos)
 }
 fn handler_setfield_gc_r(
@@ -8647,8 +9145,7 @@ fn handler_setfield_gc_r(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
+    bh_store_ref_field(struct_ptr, value, descr);
     Ok(pos)
 }
 fn handler_setfield_gc_f(
@@ -8659,8 +9156,7 @@ fn handler_setfield_gc_f(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_f(struct_ptr, value, descr);
+    bh_store_float_field(struct_ptr, value, descr);
     Ok(pos)
 }
 
@@ -12552,6 +13048,92 @@ pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
     fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)
 }
 
+/// True when `position` is still a node-entry of this helper: no child
+/// `INLINE_CALL` and no `SETFIELD` have run, and the param slots (`r0`,
+/// `i0`, `i1`) have not been overwritten. Restarting `fnaddr` with those
+/// slots is then the same as interpreting the rest of this frame.
+///
+/// A mid-`shift` Sequence/Alternative PC (left child already stored)
+/// returns false — re-running the helper would reread `old_left` from
+/// the current-character marks.
+///
+/// `run_after_rooting` only asks this at pc 0. Mid-tree resumes (regex
+/// leaf pc 210) skip the probe; the first unsafe PC is cached for the
+/// leftover-opcode / Char-19/28 tests that still call this directly.
+pub fn native_entry_args_intact(jitcode: &JitCode, position: usize) -> bool {
+    if position == 0 {
+        return true;
+    }
+    if jitcode.startpoints.is_none() {
+        return false;
+    }
+    position <= cached_first_unsafe_native_entry_pc(jitcode)
+}
+
+fn opcode_clobbers_native_entry_args(code: &[u8], pc: usize) -> bool {
+    let Some(&op) = code.get(pc) else {
+        return false;
+    };
+    match op {
+        jitcode::insns::BC_INLINE_CALL
+        | jitcode::insns::BC_SETFIELD_GC_I
+        | jitcode::insns::BC_SETFIELD_GC_R
+        | jitcode::insns::BC_SETFIELD_GC_F => true,
+        jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_R => {
+            let dest = code.get(pc + 4).copied().unwrap_or(0xff);
+            dest == 0 || (op == jitcode::insns::BC_GETFIELD_GC_I && dest == 1)
+        }
+        jitcode::insns::BC_MOVE_I | jitcode::insns::BC_MOVE_I_C => {
+            let dest = code.get(pc + 2).copied().unwrap_or(0xff);
+            dest == 0 || dest == 1
+        }
+        jitcode::insns::BC_INT_EQ => {
+            let dest = code.get(pc + 3).copied().unwrap_or(0xff);
+            dest == 0 || dest == 1
+        }
+        _ => false,
+    }
+}
+
+/// Smallest startpoint whose opcode clobbers a native-entry param slot.
+/// `native_entry_args_intact(p)` is then `p == 0 || p <= this`.
+fn first_unsafe_native_entry_pc(jitcode: &JitCode) -> usize {
+    let Some(starts) = jitcode.startpoints.as_ref() else {
+        return 0;
+    };
+    let code = jitcode.code.as_slice();
+    let mut first = usize::MAX;
+    for &pc in starts {
+        if opcode_clobbers_native_entry_args(code, pc) {
+            first = first.min(pc);
+        }
+    }
+    first
+}
+
+thread_local! {
+    /// One-entry cache of [`first_unsafe_native_entry_pc`]. The regex
+    /// deopt chain reseats the same `shift` helper on every frame.
+    static NATIVE_ENTRY_UNSAFE_PC: std::cell::Cell<Option<(usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cached_first_unsafe_native_entry_pc(jitcode: &JitCode) -> usize {
+    let ptr = jitcode as *const JitCode as usize;
+    let nstarts = jitcode.startpoints.as_ref().map_or(0, |s| s.len());
+    NATIVE_ENTRY_UNSAFE_PC.with(|cell| {
+        if let Some((cached_ptr, cached_n, limit)) = cell.get()
+            && cached_ptr == ptr
+            && cached_n == nstarts
+        {
+            return limit;
+        }
+        let limit = first_unsafe_native_entry_pc(jitcode);
+        cell.set(Some((ptr, nstarts, limit)));
+        limit
+    })
+}
+
 /// Refuse to call an unresolved `inline_call_*` target when its jitcode
 /// body is not available to interpret either.
 ///
@@ -13307,6 +13889,51 @@ fn handler_inline_call_nested_ext(
     // blackhole.py:150-157 `j` argcode resolves via `descrs[idx]`
     // asserted to be a JitCode entry; pyre's helper-side
     // `RuntimeBhDescr::JitCode(Arc<JitCode>)` is the analogous slot.
+    // Borrow the descrs slot only long enough to read `fnaddr` / `calldescr`
+    // (or to clone the Arc for the interpret fallback). Holding `&entry`
+    // across `inline_call_native` would alias `bh`.
+    let native = {
+        let entry = bh.jitcode.exec.descrs.get(sub_idx).unwrap_or_else(|| {
+            panic!(
+                "BC_INLINE_CALL: descrs[{sub_idx}] is absent \
+                 (runtime pool has {} items)",
+                bh.jitcode.exec.descrs.len()
+            )
+        });
+        // `bhimpl_inline_call_*` does not interpret a
+        // callee.  It runs `cpu.bh_call_X(adr2int(jitcode.fnaddr), args_i, args_r,
+        // args_f, jitcode.calldescr)`, so a whole callee subtree — a recursive tree
+        // walk included — executes as compiled code in ONE call.  Upstream's
+        // blackhole never byte-interprets a callee, and the ten canonical
+        // `inline_call_*` handlers in this file are the same thing for the bytes a
+        // build-time jitcode emits.
+        //
+        // `JitCodeBuilder::set_native_entry` stages that pair for a
+        // `#[jit_inline]` helper: the Rust function the macro re-emits IS the
+        // program the body was lowered from, so calling it answers what running
+        // the bytes answers.  Where it did not stage one — a `match`-arm fragment,
+        // which is a shape upstream does not have, or a body carrying an opcode
+        // whose operand comes from this interpreter rather than from the heap
+        // (`JitCodeBuilder::native_entry_denied`) — `fnaddr` is 0 and the nested
+        // interpreter below runs it, which is where every callee went before.
+        if let Some(sub) = entry.as_jitcode_exec()
+            && is_callable_fnaddr(sub.fnaddr)
+            && let Some(body) = sub.try_body()
+        {
+            Some((
+                sub.fnaddr,
+                &body.calldescr as *const majit_translate::jitcode::BhCallDescr,
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some((fnaddr, calldescr)) = native {
+        // SAFETY: `calldescr` lives in the JitCode Arc stored in this
+        // frame's descrs table. `inline_call_native` does not rebuild it.
+        return inline_call_native(bh, code, p, num_args, fnaddr, unsafe { &*calldescr });
+    }
+
     let sub_jitcode = bh
         .jitcode
         .exec
@@ -13319,30 +13946,7 @@ fn handler_inline_call_nested_ext(
                  (runtime pool has {} items)",
                 bh.jitcode.exec.descrs.len()
             )
-        })
-        .clone();
-
-    // `bhimpl_inline_call_*` (blackhole.py:1278-1319) does not interpret a
-    // callee.  It runs `cpu.bh_call_X(adr2int(jitcode.fnaddr), args_i, args_r,
-    // args_f, jitcode.calldescr)`, so a whole callee subtree — a recursive tree
-    // walk included — executes as compiled code in ONE call.  Upstream's
-    // blackhole never byte-interprets a callee, and the ten canonical
-    // `inline_call_*` handlers in this file are the same thing for the bytes a
-    // build-time jitcode emits.
-    //
-    // `JitCodeBuilder::set_native_entry` stages that pair for a
-    // `#[jit_inline]` helper: the Rust function the macro re-emits IS the
-    // program the body was lowered from, so calling it answers what running
-    // the bytes answers.  Where it did not stage one — a `match`-arm fragment,
-    // which is a shape upstream does not have, or a body carrying an opcode
-    // whose operand comes from this interpreter rather than from the heap
-    // (`JitCodeBuilder::native_entry_denied`) — `fnaddr` is 0 and the nested
-    // interpreter below runs it, which is where every callee went before.
-    if is_callable_fnaddr(sub_jitcode.fnaddr)
-        && let Some(body) = sub_jitcode.try_body()
-    {
-        return inline_call_native(bh, code, p, num_args, sub_jitcode.fnaddr, &body.calldescr);
-    }
+        });
 
     // The callee frame is seated before the argument triples are decoded so
     // each one can be copied where it is read, with no list in between.  The
@@ -13502,6 +14106,13 @@ fn inline_call_native(
     calldescr: &majit_translate::jitcode::BhCallDescr,
 ) -> Result<usize, DispatchError> {
     let mut p = p;
+    // Translated `bhimpl_inline_call_*` becomes a direct C call of the
+    // known `calldescr` signature. `shift` is `rii -> i`; skip the
+    // `collect_call_args` / dispatch-table walk that the generic stub
+    // pays on every child of every character.
+    if num_args == 3 && calldescr.arg_classes == "rii" && calldescr.result_type == 'i' {
+        return inline_call_native_rii(bh, code, p, fnaddr);
+    }
     // `descr.py create_call_stub` places arguments by declaration position,
     // and `collect_call_args` recovers that position by walking `arg_classes`
     // and taking the next value from the matching per-kind list.  So the lists
@@ -13621,6 +14232,51 @@ fn inline_call_native(
 /// callsites that thread a local cursor instead of mutating
 /// `self.position`.  `NO_RETURN_REG` encodes the "no caller destination"
 /// sentinel.
+/// `shift(n, c, mark)`: one Ref then two Ints, result Int.
+/// Same placement as `inline_call_native` (`callee_dst` is the dense
+/// per-kind index) and the same `extern "C" fn(i64, i64, i64)` ABI
+/// `bh_call_i_dispatch` uses for three integer-class arguments.
+fn inline_call_native_rii(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    mut p: usize,
+    fnaddr: i64,
+) -> Result<usize, DispatchError> {
+    let mut r0 = 0i64;
+    let mut i0 = 0i64;
+    let mut i1 = 0i64;
+    for _ in 0..3 {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let caller_src = jitcode::read_reg(code, &mut p) as usize;
+        let callee_dst = jitcode::read_reg(code, &mut p) as usize;
+        match kind {
+            JitArgKind::Ref => r0 = bh.registers_r[caller_src],
+            JitArgKind::Int if callee_dst == 0 => i0 = bh.registers_i[caller_src],
+            JitArgKind::Int => i1 = bh.registers_i[caller_src],
+            JitArgKind::Float => {
+                unreachable!("rii calldescr has no float argument");
+            }
+        }
+    }
+    let dest = decode_return_slot_at(code, &mut p);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut r0));
+    }
+    let result = unsafe {
+        let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(fnaddr as usize);
+        f(r0, i0, i1)
+    };
+    let outcome = check_residual_call_exception_after(bh, p);
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(args_root_depth);
+    outcome?;
+    if let Some(dst) = dest {
+        bh.registers_i[dst] = result;
+    }
+    Ok(p)
+}
+
 fn decode_return_slot_at(code: &[u8], cursor: &mut usize) -> Option<usize> {
     let dst = jitcode::read_reg(code, cursor) as usize;
     if dst == jitcode::NO_RETURN_REG as usize {

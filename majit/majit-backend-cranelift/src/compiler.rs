@@ -633,7 +633,7 @@ struct RegisteredLoopTarget {
     /// the cells together so a stale baked address never outlives its
     /// cell.  Position-aligned with `fail_descrs` (singleton finish
     /// emissions still get a wrapping cell so position equality holds).
-    fail_descr_cells: Box<[Arc<majit_ir::FailDescrCell>]>,
+    fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]>,
     num_inputs: usize,
     /// Reserved frame slots after the dense output region: GC ref roots plus
     /// demoted non-ref homes.  Frame depth is `max_output_slots + num_ref_roots`.
@@ -684,7 +684,7 @@ struct LoopTargetEntry {
         dead_code,
         reason = "keeps baked fail-descr cells alive for parity with loop-code entries"
     )]
-    fail_descr_cells: Box<[Arc<majit_ir::FailDescrCell>]>,
+    fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]>,
     #[expect(
         dead_code,
         reason = "loop-code entries retain input arity for the external-JUMP path"
@@ -2155,7 +2155,8 @@ static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::
 /// stub staged into `jf_guard_exc`, handed to the blackhole resume per
 /// `blackhole.py _prepare_resume_from_failure`.  `0` = no pending
 /// exception.
-type CallAssemblerBlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>;
+type CallAssemblerBlackholeFn =
+    fn(usize, *mut majit_backend::jitframe::JitFrame, i64) -> Option<i64>;
 static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<CallAssemblerBlackholeFn> = OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
@@ -2173,8 +2174,9 @@ pub fn register_call_assembler_blackhole(f: CallAssemblerBlackholeFn) {
 /// receives the descr directly; the C-ABI delivers the same shape via
 /// `descr_addr` (recovered to `Arc<dyn FailDescr>` by the receiver)
 /// instead of a surrogate `(green_key, trace_id, fail_index)` triple.
-static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(*const i64, usize, usize, i64, bool) -> bool> =
-    OnceLock::new();
+static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<
+    fn(*mut majit_backend::jitframe::JitFrame, usize, i64, bool) -> bool,
+> = OnceLock::new();
 
 /// On-demand resume callback: pyre-jit registers this to
 /// drive `ResumeDataDirectReader` from the failed descr's `rd_numb` /
@@ -2244,7 +2246,7 @@ fn rebuild_state_after_failure_dispatch(
     // cell and bake its address; the cell stays alive through the
     // callback, and the recovery bumps the refcount.
     let cell = majit_ir::FailDescrCell::wrap(fail_descr.clone());
-    let descr_addr = Arc::as_ptr(&cell) as *const () as usize;
+    let descr_addr = majit_ir::FailDescrCell::thin_ptr(&cell);
     let _ = (fail_arg_types, bridge_num_inputs); // walker path removed
     let ok = cb(descr_addr, outputs, fail_arg_types, bridge_num_inputs);
     drop(cell);
@@ -2534,7 +2536,9 @@ pub fn prologue_probe_addr() -> Option<usize> {
     PROLOGUE_PROBE_ADDR.get().copied()
 }
 
-pub fn register_call_assembler_bridge(f: fn(*const i64, usize, usize, i64, bool) -> bool) {
+pub fn register_call_assembler_bridge(
+    f: fn(*mut majit_backend::jitframe::JitFrame, usize, i64, bool) -> bool,
+) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
 
@@ -2998,33 +3002,25 @@ fn call_assembler_finish_or_blackhole_deadframe(frame: DeadFrame) -> Option<i64>
     // and bake that cell's address.  The recovery inside the BH call
     // bumps the strong refcount before returning, so the local cell can
     // safely drop after BH completes.
-    let (is_finish, fail_descr_arc, fail_arg_types) = {
+    let (is_finish, fail_descr_arc, frame_ptr) = {
         let jf = frame.as_jitframe()?;
         let fail_descr = jf.fail_descr.to_arc();
         let fd = as_fd(&fail_descr);
         let is_finish = fd.is_finish();
-        let fail_arg_types = fd.fail_arg_types().to_vec();
-        (is_finish, fail_descr, fail_arg_types)
+        let frame_ptr = jf.jf_gcref().0 as *mut majit_backend::jitframe::JitFrame;
+        (is_finish, fail_descr, frame_ptr)
     };
     if is_finish {
         return finish_result_from_deadframe(&frame).ok();
     }
 
-    let raw_values = raw_values_from_deadframe_typed(&frame, &fail_arg_types).ok()?;
     let guard_exc = grab_exc_value_from_deadframe(&frame)
         .map(|g| g.0 as i64)
         .unwrap_or(0);
     let blackhole = CALL_ASSEMBLER_BLACKHOLE_FN.get()?;
     let cell = majit_ir::FailDescrCell::wrap(fail_descr_arc);
-    let descr_addr = Arc::as_ptr(&cell) as *const () as usize;
-    let result = blackhole(
-        descr_addr,
-        raw_values.as_ptr(),
-        raw_values.len(),
-        raw_values.as_ptr(),
-        raw_values.len(),
-        guard_exc,
-    );
+    let descr_addr = majit_ir::FailDescrCell::thin_ptr(&cell);
+    let result = blackhole(descr_addr, frame_ptr, guard_exc);
     drop(cell);
     result
 }
@@ -3093,10 +3089,7 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     // `Arc::from_raw` against the cell, with the strong refcount
     // held by the owning `CompiledLoop::fail_descr_cells` for the
     // life of the executing JIT code.
-    let fail_descr = {
-        let cell = unsafe { majit_ir::recover_fail_descr_cell(jf_force_descr as usize) };
-        cell.descr.clone()
-    };
+    let fail_descr = unsafe { majit_ir::recover_fail_descr_cell(jf_force_descr as usize) };
     // `llmodel.py force` returns the resolved frame itself.  The frame
     // is the one the compiled run is executing in — still on the JF shadow
     // stack, inside the residual call that armed `jf_force_descr` — so this
@@ -3723,10 +3716,7 @@ fn call_assembler_guard_failure_inner(
     // `FailDescrCell` thin pointer; recovery is a pure
     // `Arc::from_raw` (`recover_fail_descr_cell`).  Strong refcount
     // lives on the callee `CompiledLoop::fail_descr_cells`.
-    let fail_descr_owned = {
-        let cell = unsafe { majit_ir::recover_fail_descr_cell(fail_descr_ptr as usize) };
-        cell.descr.clone()
-    };
+    let fail_descr_owned = unsafe { majit_ir::recover_fail_descr_cell(fail_descr_ptr as usize) };
     let fail_descr_ref: &dyn FailDescr = as_fd(&fail_descr_owned);
 
     // Fast path: read the attached bridge directly from the fail_descr
@@ -3773,11 +3763,16 @@ fn call_assembler_guard_failure_inner(
     // compile bridge. The bridge is attached to fail_descr for fast
     // dispatch on subsequent guard failures.  Skipped on giveup (None).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
-        let raw_num = fail_descr.fail_arg_types().len();
-        if bridge_fn(outputs_ptr, raw_num, fail_descr_ptr as usize, 0, false) {
-            // compile.py:704-716 / dynasm parity: the hook traces and
-            // attaches the bridge; the current occurrence still resumes
-            // through blackhole instead of re-entering the new bridge.
+        if bridge_fn(
+            frame_ptr as *mut majit_backend::jitframe::JitFrame,
+            fail_descr_ptr as usize,
+            0,
+            false,
+        ) {
+            // compile.py `_trace_and_compile_from_bridge` / dynasm
+            // parity: the hook traces and attaches the bridge; the
+            // current occurrence still resumes through blackhole
+            // instead of re-entering the new bridge.
         }
     }
     let _ = owning_jct;
@@ -3809,14 +3804,10 @@ fn call_assembler_guard_failure_inner(
     // (call_jit.rs), which previously drove the force_fn fallback
     // into garbage-frame territory.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let raw_num = fail_descr.fail_arg_types().len();
         let guard_exc = grab_exc_value_from_jf_ptr(frame_ptr as usize);
         if let Some(result) = bh_fn(
             fail_descr_ptr as usize,
-            outputs_ptr,
-            raw_num,
-            outputs_ptr,
-            raw_num,
+            frame_ptr as *mut majit_backend::jitframe::JitFrame,
             guard_exc,
         ) {
             // warmspot.py:988-996: DoneWithThisFrame{Int,Ref,Float} returns
@@ -3953,10 +3944,10 @@ fn call_assembler_shim_inner(
         // address recovery silently.
         let bh_cell;
         let descr_addr = if let Some(cell) = target.fail_descr_cells.get(fail_index as usize) {
-            Arc::as_ptr(cell) as *const () as usize
+            majit_ir::FailDescrCell::thin_ptr(cell)
         } else if let Some(fail_descr_arc) = target.fail_descrs.get(fail_index as usize) {
             bh_cell = majit_ir::FailDescrCell::wrap(fail_descr_arc.clone());
-            Arc::as_ptr(&bh_cell) as *const () as usize
+            majit_ir::FailDescrCell::thin_ptr(&bh_cell)
         } else {
             panic!(
                 "call_assembler BH dispatch: fail_index {} out of range \
@@ -3969,14 +3960,11 @@ fn call_assembler_shim_inner(
         let guard_exc = grab_exc_value_from_deadframe(&frame)
             .map(|g| g.0 as i64)
             .unwrap_or(0);
-        if let Some(result) = bh_fn(
-            descr_addr,
-            bh_outputs.as_ptr(),
-            num_outputs,
-            raw_outputs.as_ptr(),
-            raw_num,
-            guard_exc,
-        ) {
+        let frame_ptr = frame
+            .as_jitframe()
+            .map(|jf| jf.jf_gcref().0 as *mut majit_backend::jitframe::JitFrame)
+            .unwrap_or(std::ptr::null_mut());
+        if let Some(result) = bh_fn(descr_addr, frame_ptr, guard_exc) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
                 *outcome.add(1) = 0;
@@ -4793,10 +4781,10 @@ fn checked_cl_type_for_size(
 }
 
 fn op_var_index(op: &Op, op_idx: usize, num_inputs: usize) -> usize {
-    if op.pos.get().is_none() {
+    if op.pos().get().is_none() {
         num_inputs + op_idx
     } else {
-        op.pos.get().raw() as usize
+        op.pos().get().raw() as usize
     }
 }
 
@@ -5145,8 +5133,8 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> IndexSet<u32> {
         known.insert(input.index);
     }
     for op in ops {
-        if op.result_type() != Type::Void && !op.pos.get().is_none() {
-            known.insert(op.pos.get().raw());
+        if op.result_type() != Type::Void && !op.pos().get().is_none() {
+            known.insert(op.pos().get().raw());
         }
     }
     known
@@ -5212,11 +5200,11 @@ fn build_type_overrides(
             // resolves by raw u32 (variant-blind) so a typed `IntOp(n)`
             // still finds the inputarg at slot n. Synthetic ops without
             // `.pos` cannot collide with an inputarg slot anyway.
-            if op.pos.get().is_none() {
+            if op.pos().get().is_none() {
                 continue;
             }
-            let var_idx = op.pos.get().raw();
-            if let Some(ia_type) = type_index.inputarg_type(op.pos.get())
+            let var_idx = op.pos().get().raw();
+            if let Some(ia_type) = type_index.inputarg_type(op.pos().get())
                 && ia_type != result_type
             {
                 op_def_positions.insert(var_idx, op_idx);
@@ -5379,7 +5367,7 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
         let mut redefined: IndexSet<u32> = IndexSet::new();
         for op in ops.iter().skip(label_idx + 1) {
             if op.result_type() != Type::Void {
-                let result = op.pos.get();
+                let result = op.pos().get();
                 if !result.is_none() && result.inline_const_bits().is_none() {
                     redefined.insert(result.raw());
                 }
@@ -5711,12 +5699,12 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
         .map(|(op_idx, op)| {
             let normalized = op.clone();
             let rt = normalized.result_type();
-            if rt != Type::Void && normalized.pos.get().is_none() {
+            if rt != Type::Void && normalized.pos().get().is_none() {
                 // op_typed mints the typed Int/Float/Ref variant
                 // (resoperation.py AbstractResOp + IntOp/FloatOp/
                 // RefOp mixins) — the Void branch is filtered above.
                 normalized
-                    .pos
+                    .pos()
                     .set(OpRef::op_typed(num_inputs + op_idx as u32, rt));
             }
             normalized
@@ -7669,7 +7657,7 @@ struct CompiledLoop {
     fail_descrs: Box<[DescrRef]>,
     /// Position-aligned `FailDescrCell` wrappers (see
     /// `RegisteredLoopTarget::fail_descr_cells`).
-    fail_descr_cells: Box<[Arc<majit_ir::FailDescrCell>]>,
+    fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]>,
     terminal_exit_layouts: UnsafeCell<Vec<TerminalExitLayout>>,
     num_inputs: usize,
     num_ref_roots: usize,
@@ -8047,8 +8035,7 @@ fn find_fail_descr_by_ptr(
     {
         return Some(propagate.clone());
     }
-    let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_ptr) };
-    Some(cell.descr.clone())
+    Some(unsafe { majit_ir::recover_fail_descr_cell(descr_ptr) })
 }
 
 /// The entry arguments, in whichever form the caller already holds them.
@@ -9761,7 +9748,7 @@ impl CraneliftBackend {
         // Pre-scan
         let force_tokens = build_force_token_set(inputargs, ops);
         let mut fail_descrs: Vec<DescrRef> = Vec::new();
-        let mut fail_descr_cells: Vec<Arc<majit_ir::FailDescrCell>> = Vec::new();
+        let mut fail_descr_cells: Vec<Box<majit_ir::FailDescrCell>> = Vec::new();
         let mut guard_infos: Vec<GuardInfo> = Vec::new();
         let mut max_output_slots: usize = 0;
         let attached_descrs = self.attached_descr_ptrs();
@@ -9814,7 +9801,7 @@ impl CraneliftBackend {
         for info in &mut guard_infos {
             match ops[info.source_op_index].opcode {
                 OpCode::GuardNotForced2 => {
-                    let rd_locs: Vec<u16> = info
+                    let rd_locs: majit_ir::RdLocs = info
                         .fail_arg_refs
                         .iter()
                         .enumerate()
@@ -16092,8 +16079,7 @@ impl CraneliftBackend {
         // The runtime lookup is position-based via
         // `find_fail_descr_in_fail_descrs` rather than descr-internal.
         let fail_descrs: Box<[DescrRef]> = fail_descrs.into_boxed_slice();
-        let fail_descr_cells: Box<[Arc<majit_ir::FailDescrCell>]> =
-            fail_descr_cells.into_boxed_slice();
+        let fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]> = fail_descr_cells.into();
         // history.py:470-499 / x86/regalloc.py:1397 / x86/assembler.py:990-993
         // parity: set TargetToken._ll_loop_code on every Label in this
         // function, and register the entry in LOOP_TARGET_REGISTRY so that
@@ -16348,7 +16334,7 @@ fn collect_guards(
     inputargs: &[InputArg],
     counter_slot: Option<usize>,
     fail_descrs: &mut Vec<DescrRef>,
-    fail_descr_cells: &mut Vec<Arc<majit_ir::FailDescrCell>>,
+    fail_descr_cells: &mut Vec<Box<majit_ir::FailDescrCell>>,
     guard_infos: &mut Vec<GuardInfo>,
     max_output_slots: &mut usize,
     trace_id: u64,
@@ -17077,7 +17063,7 @@ fn collect_guards(
             // (`majit_ir::recover_fail_descr_cell`) at the guard-fail
             // C-ABI boundary.  Strong refcount lives on
             // `CompiledLoop::fail_descr_cells` (this push site below).
-            Arc::as_ptr(&cell) as *const () as i64
+            majit_ir::FailDescrCell::thin_ptr(&cell) as i64
         };
         // Pre-compute the per-emission bridge cache cell
         // addresses while we still have a typed `&dyn FailDescr` handle.
@@ -18274,8 +18260,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // refcount bump; the strong reference is pinned by the
         // owning `CompiledLoop::fail_descr_cells` for the life of
         // the executing JIT code (`model.py`).
-        let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_addr) };
-        cell.descr.clone()
+        unsafe { majit_ir::recover_fail_descr_cell(descr_addr) }
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
@@ -18990,8 +18975,8 @@ mod tests {
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::new(opcode, &bx);
-        o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
-        std::rc::Rc::new(o)
+        o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
+        OpRc::new(o)
     }
 
     fn compile_eval_breaker_poll_trace(
@@ -19005,22 +18990,17 @@ mod tests {
             0,
             majit_ir::make_array_descr_signed(0, 8, Type::Int, true),
         );
-        let armed = std::rc::Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
-        armed.pos.set(OpRef::int_op(1));
+        let armed = OpRc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
+        armed.pos().set(OpRef::int_op(1));
         let guard = Op::new(OpCode::GuardFalse, &[Operand::from_bound_op(&armed)]);
-        guard.pos.set(OpRef::void_op(2));
+        guard.pos().set(OpRef::void_op(2));
         guard.set_fail_arg_types(vec![]);
         guard.setfailargs(vec![].into());
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(3));
+        finish.pos().set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
-        let ops = [
-            word,
-            armed,
-            std::rc::Rc::new(guard),
-            std::rc::Rc::new(finish),
-        ];
+        let ops = [word, armed, OpRc::new(guard), OpRc::new(finish)];
         let token = JitCellToken::new(trace_id);
         backend
             .compile_loop(&[], &ops, &token)
@@ -19060,8 +19040,8 @@ mod tests {
     ) -> majit_ir::OpRc {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::with_descr(opcode, &bx, descr);
-        o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
-        std::rc::Rc::new(o)
+        o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
+        OpRc::new(o)
     }
 
     /// Test helper: synthesise a `ResumeGuardDescr` with `trace_id`
@@ -20648,14 +20628,14 @@ mod tests {
         // Two fail args, and it holds: this exit is never taken, it only makes
         // the trace's value area two slots wide.
         let wide = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(4))]);
-        wide.pos.set(OpRef::NONE);
+        wide.pos().set(OpRef::NONE);
         wide.set_fail_arg_types(vec![Type::Int, Type::Int]);
         wide.setfailargs(vec![rb(OpRef::int_op(2)), rb(OpRef::int_op(3))].into());
         let guard = Op::new(
             OpCode::GuardValue,
             &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
         );
-        guard.pos.set(OpRef::NONE);
+        guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![Type::Int]);
         guard.setfailargs(vec![rb(OpRef::int_op(2))].into());
         let ops = [
@@ -20666,8 +20646,8 @@ mod tests {
             mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(101)], 2),
             mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(103)], 3),
             mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(104)], 4),
-            std::rc::Rc::new(wide),
-            std::rc::Rc::new(guard),
+            OpRc::new(wide),
+            OpRc::new(guard),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
@@ -26398,7 +26378,7 @@ mod tests {
         let str0 = OpRef::ref_op(0);
         let op = |oc, args: &[OpRef]| {
             let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
-            std::rc::Rc::new(Op::new(oc, &bx))
+            OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
             op(OpCode::Newstr, &[OpRef::int_op(100)]),
@@ -26450,7 +26430,7 @@ mod tests {
         let dst = OpRef::ref_op(3);
         let op = |oc, args: &[OpRef]| {
             let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
-            std::rc::Rc::new(Op::new(oc, &bx))
+            OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
             op(OpCode::Newstr, &[OpRef::int_op(100)]),
@@ -26504,7 +26484,7 @@ mod tests {
         let buf = OpRef::ref_op(0);
         let op = |oc, args: &[OpRef]| {
             let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
-            std::rc::Rc::new(Op::new(oc, &bx))
+            OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
             op(OpCode::Newunicode, &[OpRef::int_op(100)]),
@@ -26538,7 +26518,7 @@ mod tests {
         let inputargs = vec![InputArg::new_ref(0)];
         let op = |oc, args: &[OpRef]| {
             let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
-            std::rc::Rc::new(Op::new(oc, &bx))
+            OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
             op(OpCode::Label, &[OpRef::input_arg_ref(0)]),
@@ -26584,7 +26564,7 @@ mod tests {
         let inputargs = vec![InputArg::new_ref(0)];
         let op = |oc, args: &[OpRef]| {
             let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
-            std::rc::Rc::new(Op::new(oc, &bx))
+            OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
             op(OpCode::Label, &[OpRef::input_arg_ref(0)]),
@@ -27019,7 +26999,7 @@ mod tests {
 
         // Build a guard with explicit fail_args so we can inspect them.
         let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_op.pos.set(OpRef::int_op(OpRef::NONE.raw()));
+        guard_op.pos().set(OpRef::int_op(OpRef::NONE.raw()));
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(0)),
             rb(OpRef::input_arg_int(1)),
@@ -27031,7 +27011,7 @@ mod tests {
                 &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            std::rc::Rc::new(guard_op),
+            OpRc::new(guard_op),
             mk_op(
                 OpCode::IntAdd,
                 &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
@@ -27071,7 +27051,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
+        guard_inv.pos().set(OpRef::int_op(OpRef::NONE.raw()));
         guard_inv.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -27080,7 +27060,7 @@ mod tests {
                 &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ), // i = i + 1
-            std::rc::Rc::new(guard_inv), // guard_not_invalidated
+            OpRc::new(guard_inv), // guard_not_invalidated
             mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2), // i < 1000000
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
@@ -27121,11 +27101,11 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
+        guard_inv.pos().set(OpRef::int_op(OpRef::NONE.raw()));
         guard_inv.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            std::rc::Rc::new(guard_inv),
+            OpRc::new(guard_inv),
             mk_op(
                 OpCode::Finish,
                 &[OpRef::input_arg_int(0)],

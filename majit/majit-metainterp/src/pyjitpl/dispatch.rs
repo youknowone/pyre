@@ -1517,11 +1517,36 @@ pub struct StandaloneFrameStack {
     pub frames: MIFrameStack,
 }
 
+// `MetaInterp.free_frames_list` for standalone walks that have no
+// `MetaInterp`. The metainterp is the current thread's execution
+// context; this list is the same pool that attribute would hold.
+std::thread_local! {
+    static STANDALONE_FREE_FRAMES: std::cell::RefCell<Vec<MIFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl StandaloneFrameStack {
     pub fn new() -> Self {
-        Self {
-            frames: MIFrameStack::empty(),
+        let mut frames = MIFrameStack::empty();
+        STANDALONE_FREE_FRAMES.with(|free| {
+            frames.restore_free_frames(std::mem::take(&mut *free.borrow_mut()));
+        });
+        Self { frames }
+    }
+}
+
+impl Drop for StandaloneFrameStack {
+    fn drop(&mut self) {
+        while let Some(frame) = self.frames.pop() {
+            self.frames.recycle_frame(frame);
         }
+        let parked = self.frames.take_free_frames();
+        if parked.is_empty() {
+            return;
+        }
+        STANDALONE_FREE_FRAMES.with(|free| {
+            free.borrow_mut().extend(parked);
+        });
     }
 }
 
@@ -10759,7 +10784,9 @@ where
     }
     let jitcode_arc = Arc::new(jitcode.clone());
     let mut standalone = StandaloneFrameStack::new();
-    let mut frame = MIFrame::setup(jitcode_arc, pc, None, Some(ctx));
+    let mut frame = standalone
+        .frames
+        .take_frame(jitcode_arc, pc, None, Some(ctx));
     // `setup_call` (`pyjitpl/frame.rs`) resets `frame.pc = 0` on the
     // newly-constructed callee frame; preserve the outer interpreter
     // pc on the machine so `run_to_end`'s portal-pc anchor reflects
@@ -10951,7 +10978,7 @@ where
     }
     let mut standalone = StandaloneFrameStack::new();
     for (depth, resume_frame) in frames.iter().enumerate() {
-        let mut frame = MIFrame::setup(
+        let mut frame = standalone.frames.take_frame(
             resume_frame.jitcode.clone(),
             resume_frame.pc,
             None,
@@ -11067,15 +11094,15 @@ where
         .iter()
         .map(|&(opref, value)| (JitArgKind::Ref, opref, value))
         .collect();
+    let mut standalone = StandaloneFrameStack::new();
     let frame = setup_frame_from_merge_point(
         ctx,
+        &mut standalone.frames,
         Arc::new(jitcode.clone()),
         header_pc,
         &green_args,
         &red_args,
     );
-
-    let mut standalone = StandaloneFrameStack::new();
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(header_pc);
@@ -11113,6 +11140,7 @@ fn seed_register(frame: &mut MIFrame, kind: JitArgKind, reg: usize, opref: OpRef
 /// one-green-ref setup, preserving declaration order within each i/r/f bank.
 pub fn setup_frame_from_merge_point(
     ctx: &mut TraceCtx,
+    frames: &mut MIFrameStack,
     jitcode_arc: Arc<JitCode>,
     header_pc: usize,
     green_args: &[(JitArgKind, i64)],
@@ -11134,7 +11162,7 @@ pub fn setup_frame_from_merge_point(
             }
         }
     }
-    let mut frame = MIFrame::setup(jitcode_arc, header_pc, None, Some(ctx));
+    let mut frame = frames.take_frame(jitcode_arc, header_pc, None, Some(ctx));
     for (bank, kind) in [JitArgKind::Int, JitArgKind::Ref, JitArgKind::Float]
         .into_iter()
         .enumerate()
@@ -12329,8 +12357,10 @@ mod tests {
         let red_i = OpRef::input_arg_typed(0, Type::Int);
         let red_r = OpRef::input_arg_typed(1, Type::Ref);
         let red_f = OpRef::input_arg_typed(2, Type::Float);
+        let mut frames = MIFrameStack::empty();
         let frame = setup_frame_from_merge_point(
             &mut ctx,
+            &mut frames,
             jitcode,
             header_pc,
             &[
@@ -12674,7 +12704,7 @@ mod tests {
         );
         let call_op = call_ops[0];
         assert_eq!(
-            call_op.args.borrow().len(),
+            call_op.num_args(),
             2,
             "fresh reds in extract_live order: stackpos, &state",
         );
@@ -12694,7 +12724,7 @@ mod tests {
         // caller's return register.
         assert_eq!(
             finish_args[0],
-            call_op.pos.get(),
+            call_op.pos().get(),
             "the recursive CALL_ASSEMBLER result must be wired into the caller's return register",
         );
     }
@@ -12891,7 +12921,7 @@ mod tests {
         assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
         assert_eq!(
             finish_args[0],
-            call_ops[0].pos.get(),
+            call_ops[0].pos().get(),
             "the recursive CALL_ASSEMBLER[Ref] result must be wired into the caller's ref return register",
         );
     }
@@ -12957,7 +12987,7 @@ mod tests {
         assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
         assert_eq!(
             finish_args[0],
-            call_ops[0].pos.get(),
+            call_ops[0].pos().get(),
             "the recursive CALL_ASSEMBLER[Float] result must be wired into the caller's float return register",
         );
     }
@@ -13212,7 +13242,7 @@ mod tests {
         assert_eq!(finish_args.len(), 1);
         assert_eq!(
             finish_args[0],
-            ops[call].pos.get(),
+            ops[call].pos().get(),
             "the finish value must be the recursive CALL_ASSEMBLER result",
         );
     }
@@ -13455,7 +13485,7 @@ mod tests {
             .rev()
             .find(|op| op.opcode == OpCode::GuardValue)
             .expect("a non-constant vable array index must promote");
-        let resume = guard.rd_resume_position.get();
+        let resume = guard.rd_resume_position();
         assert!(
             resume >= 0,
             "the promote guard must carry a resume position",
@@ -13553,7 +13583,7 @@ mod tests {
         // `UNSTAMPED_JITCODE_INDEX` until the dispatch layer re-stamps it, and
         // resume decoding sizes the frame from that coordinate.
         for (i, guard) in guards.iter().enumerate() {
-            let resume = guard.rd_resume_position.get();
+            let resume = guard.rd_resume_position();
             assert!(
                 resume >= 0,
                 "guard {i} ({:?}) was left without a resume position",
@@ -13591,7 +13621,7 @@ mod tests {
             .ops()
             .iter()
             .filter(|op| op.opcode.is_guard())
-            .map(|op| op.rd_resume_position.get())
+            .map(|op| op.rd_resume_position())
             .collect();
         assert_eq!(guards, vec![5, 7]);
         // Past the end is a no-op, not a panic or a mis-stamp.
@@ -13600,7 +13630,7 @@ mod tests {
             .ops()
             .iter()
             .filter(|op| op.opcode.is_guard())
-            .map(|op| op.rd_resume_position.get())
+            .map(|op| op.rd_resume_position())
             .collect();
         assert_eq!(guards, vec![5, 7]);
     }
@@ -13670,11 +13700,11 @@ mod tests {
         );
 
         // The New (sbox) result feeds BOTH SetfieldGc records as arg 0.
-        let new_pos = recorder.ops()[0].pos.get().raw();
+        let new_pos = recorder.ops()[0].pos().get().raw();
         assert_eq!(recorder.ops()[1].arg(0).position(), Some(new_pos));
         assert_eq!(recorder.ops()[3].arg(0).position(), Some(new_pos));
         // The NewArrayClear (abox) result feeds the items SetfieldGc as arg 1.
-        let arr_pos = recorder.ops()[2].pos.get().raw();
+        let arr_pos = recorder.ops()[2].pos().get().raw();
         assert_eq!(recorder.ops()[3].arg(1).position(), Some(arr_pos));
 
         // The recorded field descrs carry the resolved byte offsets.
@@ -14493,7 +14523,7 @@ mod tests {
         );
         assert_eq!(guards[0].opcode, OpCode::GuardException);
         assert_eq!(
-            guards[0].rd_resume_position.get(),
+            guards[0].rd_resume_position(),
             0,
             "GuardException should carry the captured snapshot id",
         );
@@ -15944,7 +15974,7 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardFalse)
             .expect("BC_GOTO_IF_NOT_INT_LT must record a GuardFalse op");
         assert_eq!(
-            guard.rd_resume_position.get(),
+            guard.rd_resume_position(),
             0,
             "guard's rd_resume_position must point at the captured snapshot",
         );
@@ -15997,7 +16027,7 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardFalse)
             .expect("guard recorded");
         assert_eq!(
-            guard.rd_resume_position.get(),
+            guard.rd_resume_position(),
             0,
             "non-state-field guard must carry its frame snapshot",
         );

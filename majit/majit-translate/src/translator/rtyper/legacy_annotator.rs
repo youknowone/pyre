@@ -448,7 +448,7 @@ fn kind_char_to_value_type(kind: char) -> ValueType {
 
 fn infer_call_result_type(
     target: &crate::model::CallTarget,
-    _args: &[crate::flowspace::model::Variable],
+    _args: &[crate::model::LinkArg],
 ) -> ValueType {
     if crate::call::is_int_arithmetic_target(target) {
         return ValueType::Int;
@@ -548,7 +548,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::function_path(["w_int_add"]),
-                    args: vec![a_var.clone(), b_var.clone()],
+                    args: crate::model::call_args(vec![a_var.clone(), b_var.clone()]),
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -573,7 +573,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::function_path(["crate", "math", "w_int_add"]),
-                    args: vec![a_var, b_var],
+                    args: crate::model::call_args(vec![a_var, b_var]),
                     result_ty: ValueType::Unknown,
                 },
                 true,

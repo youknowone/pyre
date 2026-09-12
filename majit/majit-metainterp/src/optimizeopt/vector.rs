@@ -529,7 +529,7 @@ impl PackSet {
                 OpCode::RawLoadI | OpCode::RawLoadF | OpCode::RawStore
             ))
             && packed.num_args() >= 2
-            && packed.arg(1).to_opref() == inquestion.pos.get()
+            && packed.arg(1).to_opref() == inquestion.pos().get()
         {
             return true;
         }
@@ -589,7 +589,7 @@ impl PackSet {
 
         // vector.py:782-787: dependency only because of the scalar?
         for dep in &graph.nodes[lnode].adjacent_list {
-            if dep.to_idx == rnode && !dep.because_of(left.pos.get()) {
+            if dep.to_idx == rnode && !dep.because_of(left.pos().get()) {
                 return None;
             }
         }
@@ -597,10 +597,10 @@ impl PackSet {
         // vector.py:789: scalar = left.getarg(index)  (original accumulator variable)
         // vector.py:793-796: other args must align with origin pack
         let other_index = (index + 1) % 2;
-        let origin_left_pos = graph.nodes[origin_pack.members[0]].op().pos.get();
+        let origin_left_pos = graph.nodes[origin_pack.members[0]].op().pos().get();
         let origin_right_pos = graph.nodes[*origin_pack.members.last().unwrap()]
             .op()
-            .pos
+            .pos()
             .get();
 
         if left.getarglist().get(other_index).map(|b| b.to_opref()) != Some(origin_left_pos) {
@@ -635,7 +635,7 @@ impl PackSet {
     /// is the result of left (the accumulator variable).
     fn getaccumulator_variable(left: &Op, right: &Op) -> (Option<OpRef>, i32) {
         for (i, arg) in right.getarglist().iter().enumerate() {
-            if arg.to_opref() == left.pos.get() {
+            if arg.to_opref() == left.pos().get() {
                 return (Some(arg.to_opref()), i as i32);
             }
         }
@@ -690,11 +690,7 @@ impl VectorLoop {
     /// canonical producer box for its value; the buffer then carries
     /// producer identity (see `operations` field doc).
     pub fn new(label: Op, operations: Vec<Op>, jump: Op) -> Self {
-        Self::new_rc(
-            label,
-            operations.into_iter().map(std::rc::Rc::new).collect(),
-            jump,
-        )
+        Self::new_rc(label, operations.into_iter().map(OpRc::new).collect(), jump)
     }
 
     /// `new` variant taking already-`OpRc`-wrapped operations, so the
@@ -755,7 +751,7 @@ impl VectorLoop {
     /// op.set_forwarded(None)`), clearing the scheduler's forwarded store.
     pub fn teardown_vectorization(&self, state: &mut VecScheduleState) {
         for op in &self.operations {
-            state.clear_op_forwarded_vecinfo(op.pos.get());
+            state.clear_op_forwarded_vecinfo(op.pos().get());
         }
     }
 
@@ -844,9 +840,9 @@ impl VectorLoop {
         // `Op.vecinfo`; mirror `teardown_vectorization`.
         if !label {
             for op in &oplist {
-                state.clear_op_forwarded_vecinfo(op.pos.get());
+                state.clear_op_forwarded_vecinfo(op.pos().get());
             }
-            state.clear_op_forwarded_vecinfo(self.jump.pos.get());
+            state.clear_op_forwarded_vecinfo(self.jump.pos().get());
         }
         // vector.py:91
         oplist.extend(self.operations.iter().map(|op| (**op).clone()));
@@ -862,9 +858,9 @@ impl VectorLoop {
             let mut newop = (**op).clone();
             renamer.rename(&mut newop);
             if newop.opcode.result_type() != majit_ir::Type::Void {
-                renamer.start_renaming(op.pos.get(), newop.pos.get());
+                renamer.start_renaming(op.pos().get(), newop.pos().get());
             }
-            prefix.push(std::rc::Rc::new(newop));
+            prefix.push(OpRc::new(newop));
         }
         let prefix_label = self.prefix_label.as_ref().map(|pl| {
             let mut newpl = pl.clone();
@@ -876,9 +872,9 @@ impl VectorLoop {
             let mut newop = (**op).clone();
             renamer.rename(&mut newop);
             if newop.opcode.result_type() != majit_ir::Type::Void {
-                renamer.start_renaming(op.pos.get(), newop.pos.get());
+                renamer.start_renaming(op.pos().get(), newop.pos().get());
             }
-            operations.push(std::rc::Rc::new(newop));
+            operations.push(OpRc::new(newop));
         }
         let mut jump = self.jump.clone();
         renamer.rename(&mut jump);
@@ -1253,7 +1249,7 @@ impl VectorizingOptimizer {
         let start_pos = loop_
             .operations
             .iter()
-            .map(|op| op.pos.get().raw())
+            .map(|op| op.pos().get().raw())
             .max()
             .unwrap_or(0)
             + 1;
@@ -1314,7 +1310,7 @@ impl VectorizingOptimizer {
                     continue;
                 }
                 sched_state.accumulation.insert(
-                    op.pos.get(),
+                    op.pos().get(),
                     AccumEntry {
                         seed,
                         operator,
@@ -1339,10 +1335,8 @@ impl VectorizingOptimizer {
 
             let vec_create =
                 sched_state.create_vec_op(OpCode::VecI, &[], datatype, bytesize, signed, count);
-            let zero_vec = vec_create.pos.get();
-            sched_state
-                .invariant_oplist
-                .push(std::rc::Rc::new(vec_create));
+            let zero_vec = vec_create.pos().get();
+            sched_state.invariant_oplist.push(OpRc::new(vec_create));
 
             let xor_op = sched_state.create_vec_op(
                 OpCode::VecIntXor,
@@ -1352,8 +1346,8 @@ impl VectorizingOptimizer {
                 signed,
                 count,
             );
-            let zeroed_vec = xor_op.pos.get();
-            sched_state.invariant_oplist.push(std::rc::Rc::new(xor_op));
+            let zeroed_vec = xor_op.pos().get();
+            sched_state.invariant_oplist.push(OpRc::new(xor_op));
 
             // VEC_PACK_I args are [vector, scalar, index, count]; index/count
             // are inline ConstInt (history.py), not pool indices.
@@ -1367,8 +1361,8 @@ impl VectorizingOptimizer {
                 signed,
                 count,
             );
-            let seed_vec = pack_op.pos.get();
-            sched_state.invariant_oplist.push(std::rc::Rc::new(pack_op));
+            let seed_vec = pack_op.pos().get();
+            sched_state.invariant_oplist.push(OpRc::new(pack_op));
 
             sched_state.accumulation.insert(
                 seed,
@@ -1417,7 +1411,7 @@ impl VectorizingOptimizer {
                         // result is used as a scalar (e.g. carried by the jump).
                         // The renamed op becomes the new canonical producer box
                         // at this slot, so later consumers bind to this `Rc`.
-                        loop_.operations[member_idx] = std::rc::Rc::new(member_op);
+                        loop_.operations[member_idx] = OpRc::new(member_op);
                     }
                     turn_into_vector(&mut sched_state, pack, &loop_.operations);
                 }
@@ -1429,7 +1423,7 @@ impl VectorizingOptimizer {
                 // Bind the renamed / unpacked args to their producer boxes in
                 // the already-emitted oplist (no position-only mint).
                 sched_state.rebind_op_args(&scalar_op);
-                seen.insert(scalar_op.pos.get());
+                seen.insert(scalar_op.pos().get());
                 sched_state.append_to_oplist(scalar_op);
             }
         }
@@ -1468,7 +1462,7 @@ impl VectorizingOptimizer {
             gso.propagate_all_forward(&loop_.operations_as_ops(), info, &gso_label_args, user_code);
         // The guard-strengthened body is a fresh op list; wrap each into the
         // canonical producer `OpRc` as it re-enters the buffer.
-        loop_.operations = strengthened.into_iter().map(std::rc::Rc::new).collect();
+        loop_.operations = strengthened.into_iter().map(OpRc::new).collect();
 
         // vector.py: re-schedule the trace to drop pure operations left
         // dead by guard strengthening (graph = DependencyGraph(loop);
@@ -1484,7 +1478,7 @@ impl VectorizingOptimizer {
         // `set_forwarded(None)` reset so post-vectorize passes don't see
         // stale VectorizationInfo; the permanent `Op.vecinfo` is preserved.
         for op in &loop_.align_operations {
-            sched_state.clear_op_forwarded_vecinfo(op.pos.get());
+            sched_state.clear_op_forwarded_vecinfo(op.pos().get());
         }
 
         // vector.py `finally: loop.teardown_vectorization()`. The
@@ -1544,8 +1538,8 @@ impl VectorizingOptimizer {
         // returns the bound Operand on a hit (Some) and None on a miss; the miss
         // arm keeps `orig`'s live-producer Operand. No `from_opref`, so no
         // position-only fabrication / panic on a live producer.
-        if let Some(fail_args) = copied_op.getfailargs() {
-            let renamed: smallvec::SmallVec<[Operand; 3]> = fail_args
+        if let Some(fail_args) = copied_op.guard_fail_args() {
+            let renamed: smallvec::SmallVec<[Operand; 4]> = fail_args
                 .iter()
                 .map(|orig| {
                     renamer
@@ -1658,7 +1652,7 @@ impl VectorizingOptimizer {
                 let Some(r_op) = graph.nodes[r_dep].getoperation() else {
                     continue;
                 };
-                let dep_opref = l_op.pos.get();
+                let dep_opref = l_op.pos().get();
                 let left_args = graph.nodes[left_idx].op().getarglist();
                 if !left_args.iter().any(|a| a.to_opref() == dep_opref) {
                     continue;
@@ -1686,7 +1680,7 @@ impl VectorizingOptimizer {
         debug_assert!(pack.members.len() == 2);
         let left_idx = pack.members[0];
         let right_idx = *pack.members.last().unwrap();
-        let left_opref = graph.nodes[left_idx].op().pos.get();
+        let left_opref = graph.nodes[left_idx].op().pos().get();
 
         // vector.py:446-447: for ldep in pack.leftmost(node=True).provides()
         let l_users: Vec<usize> = graph.nodes[left_idx].users.clone();
@@ -1878,7 +1872,7 @@ impl VectorizingOptimizer {
             };
             guard_op.setdescr(descr);
         }
-        guard_op.setfailargs(loop_.label.getarglist());
+        guard_op.setfailargs(loop_.label.getarglist().into_iter().collect());
     }
 
     /// Attempt to vectorize the buffered loop body (Optimization trait path).
@@ -1906,10 +1900,10 @@ impl VectorizingOptimizer {
         let start_pos = ctx
             .new_operations
             .iter()
-            .map(|op| op.pos.get())
-            .chain(std::iter::once(loop_.label.pos.get()))
-            .chain(loop_.operations.iter().map(|op| op.pos.get()))
-            .chain(std::iter::once(loop_.jump.pos.get()))
+            .map(|op| op.pos().get())
+            .chain(std::iter::once(loop_.label.pos().get()))
+            .chain(loop_.operations.iter().map(|op| op.pos().get()))
+            .chain(std::iter::once(loop_.jump.pos().get()))
             .filter(|pos| !pos.is_none())
             .map(|pos| pos.raw())
             .max()
@@ -1981,7 +1975,7 @@ impl VectorizingOptimizer {
                     continue;
                 }
                 sched_state.accumulation.insert(
-                    op.pos.get(),
+                    op.pos().get(),
                     AccumEntry {
                         seed,
                         operator,
@@ -2006,10 +2000,8 @@ impl VectorizingOptimizer {
 
             let vec_create =
                 sched_state.create_vec_op(OpCode::VecI, &[], datatype, bytesize, signed, count);
-            let zero_vec = vec_create.pos.get();
-            sched_state
-                .invariant_oplist
-                .push(std::rc::Rc::new(vec_create));
+            let zero_vec = vec_create.pos().get();
+            sched_state.invariant_oplist.push(OpRc::new(vec_create));
 
             let xor_op = sched_state.create_vec_op(
                 OpCode::VecIntXor,
@@ -2019,8 +2011,8 @@ impl VectorizingOptimizer {
                 signed,
                 count,
             );
-            let zeroed_vec = xor_op.pos.get();
-            sched_state.invariant_oplist.push(std::rc::Rc::new(xor_op));
+            let zeroed_vec = xor_op.pos().get();
+            sched_state.invariant_oplist.push(OpRc::new(xor_op));
 
             // vector.py:866-869: pack the seed scalar into position 0
             let zero_const = OpRef::const_int(0);
@@ -2033,8 +2025,8 @@ impl VectorizingOptimizer {
                 signed,
                 count,
             );
-            let seed_vec = pack_op.pos.get();
-            sched_state.invariant_oplist.push(std::rc::Rc::new(pack_op));
+            let seed_vec = pack_op.pos().get();
+            sched_state.invariant_oplist.push(OpRc::new(pack_op));
 
             sched_state.accumulation.insert(
                 seed,
@@ -2083,7 +2075,7 @@ impl VectorizingOptimizer {
                         // result is used as a scalar (e.g. carried by the jump).
                         // The renamed op becomes the new canonical producer box
                         // at this slot, so later consumers bind to this `Rc`.
-                        loop_.operations[member_idx] = std::rc::Rc::new(member_op);
+                        loop_.operations[member_idx] = OpRc::new(member_op);
                     }
                     turn_into_vector(&mut sched_state, pack, &loop_.operations);
                 }
@@ -2095,7 +2087,7 @@ impl VectorizingOptimizer {
                 // Bind the renamed / unpacked args to their producer boxes in
                 // the already-emitted oplist (no position-only mint).
                 sched_state.rebind_op_args(&scalar_op);
-                seen.insert(scalar_op.pos.get());
+                seen.insert(scalar_op.pos().get());
                 sched_state.append_to_oplist(scalar_op);
             }
         }
@@ -2240,7 +2232,7 @@ impl VectorLoop {
             }
             if !renamed.is_constant()
                 && !renamed.is_none()
-                && let Some(rc) = original_body.iter().find(|op| op.pos.get() == renamed)
+                && let Some(rc) = original_body.iter().find(|op| op.pos().get() == renamed)
             {
                 return Operand::from_bound_op(rc);
             }
@@ -2253,7 +2245,7 @@ impl VectorLoop {
 
         let base_offset = original_body
             .iter()
-            .map(|op| op.pos.get().raw())
+            .map(|op| op.pos().get().raw())
             .max()
             .unwrap_or(0)
             + 1;
@@ -2278,11 +2270,11 @@ impl VectorLoop {
                 let mut copied_op = copy_resop(op);
 
                 // vector.py:307-310: new result box → rename mapping
-                let new_pos = op.pos.get().with_raw(op.pos.get().raw() + offset);
-                if !op.pos.get().is_none() {
-                    renamer.start_renaming(op.pos.get(), new_pos);
+                let new_pos = op.pos().get().with_raw(op.pos().get().raw() + offset);
+                if !op.pos().get().is_none() {
+                    renamer.start_renaming(op.pos().get(), new_pos);
                 }
-                copied_op.pos.set(new_pos);
+                copied_op.pos().set(new_pos);
 
                 // vector.py:312-315: rename args
                 for i in 0..copied_op.num_args() {
@@ -2301,9 +2293,9 @@ impl VectorLoop {
                 // The copied op becomes the canonical producer box for its
                 // (renamed) result position; register it before pushing so
                 // later ops in this body bind to it.
-                let rc: OpRc = std::rc::Rc::new(copied_op);
+                let rc: OpRc = OpRc::new(copied_op);
                 if !new_pos.is_none() {
-                    produced.insert(new_pos, std::rc::Rc::clone(&rc));
+                    produced.insert(new_pos, rc.clone());
                 }
                 unrolled.push(rc);
             }
@@ -2361,8 +2353,7 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
     if !op.opcode.is_guard() {
         return;
     }
-    if let Some(fa) = op.getfailargs() {
-        let mut new_fa = fa.clone();
+    if let Some(mut new_fa) = op.getfailargs() {
         for (fi, arg) in new_fa.iter_mut().enumerate() {
             if arg.is_none() {
                 continue;
@@ -2616,7 +2607,7 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos
+            op.pos()
                 .set(OpRef::op_typed(base + i as u32, op.result_type()));
         }
     }
@@ -2642,7 +2633,7 @@ mod tests {
             Op::new(OpCode::Jump, &[bx(OpRef::int_op(3))]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
+            op.pos().set(OpRef::op_typed(i as u32, op.result_type()));
         }
         let vloop = VectorLoop::from_trace(&ops).unwrap();
         assert_eq!(vloop.body_len(), 2); // IntAdd + IntMul
@@ -2688,7 +2679,7 @@ mod tests {
             .expect("mark_guard must attach a loop-version descr");
         assert!(descr.is_loop_version());
         let failargs = vloop.operations[0]
-            .getfailargs()
+            .guard_fail_args()
             .expect("mark_guard must attach label failargs");
         assert_eq!(failargs.len(), 2);
         assert_eq!(failargs[0].to_opref(), OpRef::input_arg_int(0));
@@ -2766,10 +2757,10 @@ mod tests {
         // Simulate accumulate_prepare (vector.rs run_optimization / try_vectorize):
         // three invariant ops — zero vector, xor-zero, pack seed into lane 0.
         let vc = st.create_vec_op(OpCode::VecI, &[], 'i', 8, true, 2);
-        let vc_ref = vc.pos.get();
-        st.invariant_oplist.push(std::rc::Rc::new(vc));
+        let vc_ref = vc.pos().get();
+        st.invariant_oplist.push(OpRc::new(vc));
         let xor = st.create_vec_op(OpCode::VecIntXor, &[vc_ref, vc_ref], 'i', 8, true, 2);
-        st.invariant_oplist.push(std::rc::Rc::new(xor));
+        st.invariant_oplist.push(OpRc::new(xor));
         let pack = st.create_vec_op(
             OpCode::VecPackI,
             &[
@@ -2783,14 +2774,14 @@ mod tests {
             true,
             2,
         );
-        let seed_vec = pack.pos.get();
-        st.invariant_oplist.push(std::rc::Rc::new(pack));
+        let seed_vec = pack.pos().get();
+        st.invariant_oplist.push(OpRc::new(pack));
         // expand() (schedule.py) registers the splat vector here.
         st.invariant_vector_vars.insert(seed_vec);
 
         // The scheduled body lives in oplist; the base post_schedule
         // (schedule.py:116) moves it into loop_.operations.
-        st.oplist = body.iter().cloned().map(std::rc::Rc::new).collect();
+        st.oplist = body.iter().cloned().map(OpRc::new).collect();
 
         let mut seen: IndexSet<OpRef> = vloop
             .label
@@ -2849,7 +2840,7 @@ mod tests {
         let mut vloop = VectorLoop::new(label, body.clone(), jump);
 
         let mut st = VecScheduleState::new(100);
-        st.oplist = body.iter().cloned().map(std::rc::Rc::new).collect();
+        st.oplist = body.iter().cloned().map(OpRc::new).collect();
         let mut seen: IndexSet<OpRef> = vloop
             .label
             .getarglist()
@@ -2969,8 +2960,8 @@ mod tests {
             // turn_into_vector emits the vector op into the oplist and maps each
             // packed scalar to a lane via setvector_of_box.
             let vecop = st.create_vec_op(OpCode::VecIntAdd, &[], 'i', 8, true, 2);
-            let vec_ref = vecop.pos.get();
-            st.oplist.push(std::rc::Rc::new(vecop));
+            let vec_ref = vecop.pos().get();
+            st.oplist.push(OpRc::new(vecop));
             st.setvector_of_box(member_ref, 0, vec_ref);
 
             // seen seeded as the scheduling loop leaves it: always the label
@@ -3211,12 +3202,12 @@ mod tests {
 
         let before: Vec<(OpCode, u32)> = assembled
             .iter()
-            .map(|op| (op.opcode, op.pos.get().raw()))
+            .map(|op| (op.opcode, op.pos().get().raw()))
             .collect();
         let out = apply_loop_vectorization(assembled, 16, 0, false);
         let after: Vec<(OpCode, u32)> = out
             .iter()
-            .map(|op| (op.opcode, op.pos.get().raw()))
+            .map(|op| (op.opcode, op.pos().get().raw()))
             .collect();
 
         // No array access → NotAVectorizeableLoop → trace returned verbatim.
@@ -3288,7 +3279,7 @@ mod tests {
         // Prefix is preserved verbatim: start_label then the pos-1 IntAdd.
         assert_eq!(out[0].opcode, OpCode::Label);
         assert_eq!(out[1].opcode, OpCode::IntAdd);
-        assert_eq!(out[1].pos.get().raw(), 1, "prefix op keeps its position");
+        assert_eq!(out[1].pos().get().raw(), 1, "prefix op keeps its position");
         // The loop part vectorized.
         assert!(
             out.iter().any(|op| op.opcode == OpCode::VecLoadI),
@@ -3315,9 +3306,9 @@ mod tests {
         for op in &out {
             if matches!(op.opcode, OpCode::VecLoadI | OpCode::VecIntAdd) {
                 assert!(
-                    op.pos.get().raw() > 1,
+                    op.pos().get().raw() > 1,
                     "vectorized op position {} must clear the prefix",
-                    op.pos.get().raw()
+                    op.pos().get().raw()
                 );
             }
         }
@@ -4000,7 +3991,7 @@ mod tests {
         ];
         let mut positioned = ops;
         for (i, op) in positioned.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
+            op.pos().set(OpRef::op_typed(i as u32, op.result_type()));
         }
         let analysis = GuardAnalysis::analyze(&positioned);
         assert_eq!(analysis.hoistable.len(), 1);
@@ -4034,17 +4025,17 @@ mod tests {
             OpCode::Label,
             &[bx(OpRef::input_arg_int(100)), bx(OpRef::input_arg_int(101))],
         );
-        label.pos.set(OpRef::op_typed(0, majit_ir::Type::Void));
+        label.pos().set(OpRef::op_typed(0, majit_ir::Type::Void));
         let mut body_op = Op::new(
             OpCode::IntAdd,
             &[bx(OpRef::input_arg_int(100)), bx(OpRef::input_arg_int(101))],
         );
-        body_op.pos.set(OpRef::int_op(1));
+        body_op.pos().set(OpRef::int_op(1));
         let mut jump = Op::new(
             OpCode::Jump,
             &[bx(OpRef::int_op(1)), bx(OpRef::input_arg_int(101))],
         );
-        jump.pos.set(OpRef::op_typed(2, majit_ir::Type::Void));
+        jump.pos().set(OpRef::op_typed(2, majit_ir::Type::Void));
 
         let mut vloop = VectorLoop::new(label, vec![body_op], jump);
         assert_eq!(vloop.body_len(), 1);

@@ -209,9 +209,10 @@ fn rewire_one_from_size_align_site(
                     args,
                     ..
                 },
-        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => {
-            (args[0].clone(), args[1].clone())
-        }
+        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => (
+            args[0].clone().into_variable(),
+            args[1].clone().into_variable(),
+        ),
         _ => {
             return Err(format!(
                 "{name}: block {p} last op is not the 2-arg Layout::from_size_align call"
@@ -402,7 +403,7 @@ fn rewire_one_from_size_align_expect_site(
             && receiver_root.as_deref() == Some("Result")
             && args.len() == 2 =>
         {
-            args[0].clone()
+            args[0].clone().into_variable()
         }
         _ => {
             return Err(format!(
@@ -432,9 +433,10 @@ fn rewire_one_from_size_align_expect_site(
                     args,
                     ..
                 },
-        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => {
-            (args[0].clone(), args[1].clone())
-        }
+        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => (
+            args[0].clone().into_variable(),
+            args[1].clone().into_variable(),
+        ),
         _ => {
             return Err(format!(
                 "{name}: block {p} last op is not the 2-arg Layout::from_size_align call"
@@ -648,7 +650,7 @@ mod tests {
                 p,
                 OpKind::Call {
                     target: fsa_target(),
-                    args: vec![size, align],
+                    args: crate::model::call_args(vec![size, align]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -661,7 +663,7 @@ mod tests {
                 q,
                 OpKind::Call {
                     target: ok_target(),
-                    args: vec![q_args[0].clone()],
+                    args: crate::model::call_args(vec![q_args[0].clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -794,7 +796,7 @@ mod tests {
                 p,
                 OpKind::Call {
                     target: fsa_target(),
-                    args: vec![size, align],
+                    args: crate::model::call_args(vec![size, align]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -806,7 +808,7 @@ mod tests {
                 q,
                 OpKind::Call {
                     target: ok_target(),
-                    args: vec![fsa.clone()],
+                    args: crate::model::call_args(vec![fsa.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -842,7 +844,7 @@ mod tests {
                 p,
                 OpKind::Call {
                     target: fsa_target(),
-                    args: vec![size, align],
+                    args: crate::model::call_args(vec![size, align]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -855,7 +857,7 @@ mod tests {
                 q,
                 OpKind::Call {
                     target: expect_target(),
-                    args: vec![fsa.clone(), msg],
+                    args: crate::model::call_args(vec![fsa.clone(), msg]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -965,7 +967,7 @@ mod tests {
                 p,
                 OpKind::Call {
                     target: fsa_target(),
-                    args: vec![size, align],
+                    args: crate::model::call_args(vec![size, align]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -978,7 +980,7 @@ mod tests {
                 q,
                 OpKind::Call {
                     target: expect_target(),
-                    args: vec![fsa.clone(), msg],
+                    args: crate::model::call_args(vec![fsa.clone(), msg]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,

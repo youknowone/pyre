@@ -254,7 +254,11 @@ fn rewire_one_checked_arith_site(
                 .ok_or_else(|| format!("{name}: checked_* call path is empty"))?;
             let ovf = checked_arith_ovf_opname(leaf)
                 .ok_or_else(|| format!("{name}: call leaf {leaf} is not a checked_* arith op"))?;
-            (args[0].clone(), args[1].clone(), ovf)
+            (
+                args[0].clone().into_variable(),
+                args[1].clone().into_variable(),
+                ovf,
+            )
         }
         other => {
             return Err(format!(
@@ -624,7 +628,7 @@ fn rewire_checked_arith_ok_or_else(
     let err_value = crate::front::option_closure_select::emit_call_once(
         graph,
         graph.blocks[c].id,
-        env,
+        env.into_variable(),
         None,
         &site.call_once_owner,
         site.err_payload_ty.clone(),
@@ -734,7 +738,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: checked_target(),
-                    args: vec![va.clone(), vb.clone()],
+                    args: crate::model::call_args(vec![va.clone(), vb.clone()]),
                     result_ty: ValueType::Ref(Some("core::option::Option".into())),
                 },
                 true,
@@ -853,7 +857,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: checked_target(),
-                    args: vec![lhs.clone(), rhs.clone()],
+                    args: crate::model::call_args(vec![lhs.clone(), rhs.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -881,7 +885,7 @@ mod tests {
                 c,
                 OpKind::Call {
                     target: CallTarget::method("ok_or_else", Some("Option".into())),
-                    args: vec![opt_c, env],
+                    args: crate::model::call_args(vec![opt_c, env]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -967,7 +971,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: checked_target(),
-                    args: vec![va, vb],
+                    args: crate::model::call_args(vec![va, vb]),
                     result_ty: ValueType::Ref(Some("core::option::Option".into())),
                 },
                 true,

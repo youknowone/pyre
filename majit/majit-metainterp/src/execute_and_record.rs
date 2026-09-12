@@ -203,16 +203,26 @@ impl TraceCtx {
         args: &[OpRef],
         descr: Option<&DescrRef>,
     ) -> Option<Value> {
-        let vals: Vec<Value> = args
-            .iter()
-            .map(|a| {
-                a.inline_const_to_value()
-                    .expect("_all_constants held for every argument")
-            })
-            .collect();
-        crate::executor::execute_nonspec_const(cpu, opnum, &vals, descr, opnum.result_type())
-            .ok()
-            .flatten()
+        // `executor.execute` takes the boxes; this funnel is record_op0/1/2/3
+        // so arity is at most 3. A `Vec<Value>` here is 16 B per 1-arg fold
+        // (`INT_IS_TRUE`) and 32 B per 2-arg fold — the leftover 16 B
+        // `execute_and_record` mother. Keep the values on the stack.
+        debug_assert!(args.len() <= 3, "execute_and_record fold arity");
+        let mut storage = [Value::Void; 3];
+        for (slot, arg) in storage.iter_mut().zip(args.iter()) {
+            *slot = arg
+                .inline_const_to_value()
+                .expect("_all_constants held for every argument");
+        }
+        crate::executor::execute_nonspec_const(
+            cpu,
+            opnum,
+            &storage[..args.len()],
+            descr,
+            opnum.result_type(),
+        )
+        .ok()
+        .flatten()
     }
 }
 
@@ -266,6 +276,23 @@ mod tests {
         );
         assert_eq!(op, OpRef::ConstInt(5));
         assert_eq!(ctx.num_ops(), before, "a fold records nothing");
+    }
+
+    #[test]
+    fn a_one_arg_constant_pure_op_folds_without_a_value_vec() {
+        let mut ctx = fresh_ctx();
+        let cpu = crate::cpu::default_cpu();
+        let before = ctx.num_ops();
+        let op = ctx.execute_and_record(
+            Some(cpu.as_ref()),
+            OpCode::IntIsTrue,
+            None,
+            &[OpRef::ConstInt(7)],
+            Some(Value::Int(1)),
+            0,
+        );
+        assert_eq!(op, OpRef::ConstInt(1));
+        assert_eq!(ctx.num_ops(), before, "INT_IS_TRUE of a Const folds");
     }
 
     #[test]

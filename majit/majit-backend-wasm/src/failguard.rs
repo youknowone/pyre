@@ -367,6 +367,40 @@ mod tests {
         drop(frame);
         assert_eq!(roots.load(Ordering::SeqCst), before);
     }
+
+    fn dummy_label_target(func_handle: u32) -> super::LabelTarget {
+        super::LabelTarget {
+            func_handle,
+            wide_slot: 0,
+            key: 0,
+            num_args: 0,
+            resume_safe: true,
+            requires_own_frame: false,
+            is_last_label: true,
+            frame: crate::codegen::FrameGeometry::fixed(),
+        }
+    }
+
+    #[test]
+    fn retract_label_target_keeps_a_replacement_handle() {
+        let id = 0x7e71_ac10_usize;
+        super::publish_label_target(id, dummy_label_target(7));
+        super::retract_label_target_if_handle(id, 7);
+        assert!(super::label_target(id).is_none());
+
+        super::publish_label_target(id, dummy_label_target(9));
+        super::retract_label_target_if_handle(id, 7);
+        assert_eq!(super::label_target(id).map(|t| t.func_handle), Some(9));
+        super::retract_label_target_if_handle(id, 9);
+        assert!(super::label_target(id).is_none());
+    }
+
+    #[test]
+    fn retarget_slots_skips_the_owner_and_zero() {
+        // Native has no host table; the helper must still ignore the
+        // owner's own slot and a missing handle without panicking.
+        super::retarget_slots_to_module([0, 4, 4], 4, b"\0asm");
+    }
 }
 
 /// A resumable `LABEL` of a compiled loop, published in `LABEL_TARGETS` so a
@@ -1040,6 +1074,64 @@ pub fn publish_label_target(descr_id: usize, target: LabelTarget) {
         .insert(descr_id, target);
 }
 
+/// Retract a published label if it still names `func_handle`.
+/// Same handle guard as [`CompiledWasmLoop::drop`]: a later publish that
+/// re-stamped the same descr onto a different slot keeps the replacement.
+pub fn retract_label_target_if_handle(descr_id: usize, func_handle: u32) {
+    if descr_id == 0 || func_handle == 0 {
+        return;
+    }
+    let mut reg = LABEL_TARGETS.lock();
+    if let Some(map) = reg.as_mut()
+        && let Some(t) = map.get(&descr_id)
+        && t.func_handle == func_handle
+    {
+        map.remove(&descr_id);
+        crate::BRIDGE_DIAG[22].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn write_bridge_cell(base: u32, fail_index: u32, slot: u32) {
+    #[cfg(target_arch = "wasm32")]
+    if base != 0 {
+        let cell = (base as usize + fail_index as usize * 4) as *mut u32;
+        unsafe { core::ptr::write(cell, slot) };
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (base, fail_index, slot);
+}
+
+pub(crate) fn write_bridge_cell_aliases(primary: u32, retained: u32, fail_index: u32, slot: u32) {
+    write_bridge_cell(primary, fail_index, slot);
+    if retained != 0 && retained != primary {
+        write_bridge_cell(retained, fail_index, slot);
+    }
+}
+
+/// Point retired table slots at `wasm_bytes` so a caller that baked
+/// `return_call_indirect(slot)` enters the replacement module.
+/// `assembler.py` `patch_jump_for_descr` rewrites the jump; wasm
+/// modules are immutable, so the slot is the patch site
+/// (`glue::replace_module` also rewrites the reserved wide half).
+pub(crate) fn retarget_slots_to_module(
+    slots: impl IntoIterator<Item = u32>,
+    owner_handle: u32,
+    wasm_bytes: &[u8],
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        for slot in slots {
+            if slot != 0 && slot != owner_handle {
+                let _ = crate::glue::replace_module(slot, wasm_bytes);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (slots, owner_handle, wasm_bytes);
+    }
+}
+
 /// Guard-dispatch metadata of a bridge chained onto a loop, kept on the
 /// source loop's `CompiledWasmLoop.chained_trace_meta` keyed by the bridge's
 /// backend `trace_id`. Lets `compile_bridge` chain a NESTED sub-bridge onto a
@@ -1051,6 +1143,11 @@ pub struct ChainedTraceMeta {
     /// Base address of the bridge's per-guard bridge-slot cell array
     /// (`CompiledWasmLoop::bridge_cells_base` analog); `0` = no dispatch.
     pub cells_base: u32,
+    /// Cell array baked into a retained standalone copy of this bridge
+    /// after it was inlined. `reemit_loop` points `cells_base` at the
+    /// merged-region slice; inbound JUMPs still run the old module, which
+    /// reads this alias. `0` = no retained copy.
+    pub retained_cells_base: u32,
     /// Cell count = the bridge's own guard count.
     pub num_cells: usize,
     /// Per-guard, per-fail-arg induction-advance flags
@@ -1061,6 +1158,13 @@ pub struct ChainedTraceMeta {
     pub guard_fail_arg_counts: Vec<usize>,
     /// Whether this trace's guard epilogue has typed parameter dispatch arms.
     pub bridge_param_dispatch: bool,
+    /// Ordinary Ref homes this bridge published. After the bridge is
+    /// inlined, this is the merged stream's extent — `RefHomes::collect`
+    /// reassigns across that stream, so the standalone count is too short.
+    /// A nested sub-bridge floors its map to this.
+    pub num_ref_homes: usize,
+    /// LABEL-capture homes this bridge published.
+    pub used_label_homes: usize,
 }
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
@@ -1103,20 +1207,31 @@ pub struct CompiledWasmLoop {
     /// Number of Ref-typed values given a home slot in the frame's Ref-home
     /// region (`codegen::HOME_SLOT_BASE`). `execute_token` sizes the host
     /// frame to include this region and registers each home slot as a GC root.
-    pub num_ref_homes: usize,
+    pub num_ref_homes: Cell<usize>,
+    /// LABEL-capture homes this loop actually initialized. Frozen geometry
+    /// may reserve more; a later bridge's published map must still cover
+    /// these so a keyed tail-call cannot drop them. `Cell` so `reemit_loop`
+    /// can raise it when a merge publishes a wider capture tail.
+    pub used_label_homes: Cell<usize>,
     /// Geometry frozen when this token was first compiled. Every bridge
     /// chained onto it is emitted against this exact layout.
     pub frame: crate::codegen::FrameGeometry,
     /// Per-loop `jf_gcmap` for the Ref-home region.  Like RPython's assembler
     /// gcmap allocation, this remains valid after `execute_token` returns: a
     /// virtualizable token can keep that JITFRAME alive and force it later.
-    pub home_gcmap_ptr: usize,
+    /// `Cell` so `reemit_loop` can replace it when a merge widens RefHomes.
+    pub home_gcmap_ptr: Cell<usize>,
     /// Base address (shared linear memory) of this loop's per-guard bridge-slot
     /// cell array — one i32 per `fail_index`, `0` = no bridge. The trace's
     /// epilogue reads `cells[fail_index]` and `compile_bridge` writes a bridge's
     /// table slot here. `0` when the trace has no in-module dispatch (native, or
     /// a guardless / straight-line trace).
     pub bridge_cells_base: Cell<u32>,
+    /// Cell array of a retained pre-growth owner module. When the LABEL
+    /// tail grows, the replacement is installed at a new table slot and
+    /// this stays the array the old module still reads. `0` until that
+    /// split. `compile_bridge` writes both aliases.
+    pub retained_owner_cells_base: Cell<u32>,
     /// Byte length of the module this loop was last emitted as, own ops and
     /// every merged region together. A merge re-emits the whole owner, so this
     /// is what the next merge charges cranelift, and
@@ -1196,7 +1311,8 @@ pub struct CompiledWasmLoop {
     pub reemitted: Cell<bool>,
     /// `(descr identity, table slot)` for every label published by a bridge
     /// chained onto this loop. The bridge module lives as long as its source
-    /// loop, so `Drop` retracts entries that still name that bridge's slot.
+    /// loop, so `Drop` and `retract_bridge_label_targets_for_slots` retract
+    /// entries that still name that bridge's slot.
     pub bridge_owned_label_targets: RefCell<Vec<(usize, u32)>>,
     /// Set when `compile_bridge` accepts a self-recursive `CallAssemblerR`
     /// bridge (`PYRE_WASM_CA`) for this loop. While set, `compile_bridge`
@@ -1241,6 +1357,30 @@ impl CompiledWasmLoop {
             .asmmemmgr_gcreftracers
             .lock()
             .push(tracer);
+    }
+
+    /// Retract `LABEL_TARGETS` rows and `bridge_owned_label_targets`
+    /// entries whose table slot is being retired. A frame-entry bridge
+    /// that published a LABEL can still be selected by a later JUMP
+    /// after its guard cell is cleared; that immutable module still
+    /// carries the pre-growth home map.
+    pub(crate) fn retract_bridge_label_targets_for_slots(
+        &self,
+        slots: impl IntoIterator<Item = u32>,
+    ) {
+        let retired: Vec<u32> = slots.into_iter().filter(|&slot| slot != 0).collect();
+        if retired.is_empty() {
+            return;
+        }
+        let owned = self.bridge_owned_label_targets.borrow().clone();
+        for (id, slot) in owned {
+            if retired.contains(&slot) {
+                retract_label_target_if_handle(id, slot);
+            }
+        }
+        self.bridge_owned_label_targets
+            .borrow_mut()
+            .retain(|(_, slot)| !retired.contains(slot));
     }
 
     /// Materialize a lazily-installed root trace.  The wasm host is
@@ -1289,23 +1429,12 @@ impl Drop for CompiledWasmLoop {
         // `func_handle`: a recompile that re-stamped the same descr onto its
         // replacement loop has already overwritten the entry, which must
         // survive the old loop's drop.
-        let mut reg = LABEL_TARGETS.lock();
-        if let Some(map) = reg.as_mut() {
-            for (id, func_handle) in self
-                .label_descrs
-                .iter()
-                .copied()
-                .map(|id| (id, self.func_handle.get()))
-                .chain(self.bridge_owned_label_targets.get_mut().iter().copied())
-            {
-                if id != 0
-                    && let Some(t) = map.get(&id)
-                    && t.func_handle == func_handle
-                {
-                    map.remove(&id);
-                    crate::BRIDGE_DIAG[22].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+        let handle = self.func_handle.get();
+        for id in self.label_descrs.iter().copied() {
+            retract_label_target_if_handle(id, handle);
+        }
+        for (id, slot) in self.bridge_owned_label_targets.get_mut().iter().copied() {
+            retract_label_target_if_handle(id, slot);
         }
     }
 }

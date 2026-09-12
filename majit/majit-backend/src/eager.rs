@@ -36,7 +36,7 @@
 //!         Operand::from_bound_inputarg(&x),
 //!         Operand::from_opref(OpRef::const_int(1)),
 //!     ]));
-//!     add.pos.set(OpRef::int_op(1));
+//!     add.pos().set(OpRef::int_op(1));
 //!     let finish = OpRc::new(Op::with_descr(OpCode::Finish,
 //!         &[Operand::from_bound_op(&add)],
 //!         make_finish_descr(0, vec![Type::Int])));

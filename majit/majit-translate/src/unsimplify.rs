@@ -270,7 +270,7 @@ fn jit_merge_point_receiver(op: &SpaceOperation) -> Option<&Variable> {
     let receiver_root = target.receiver_root()?;
     let driver_roots = [receiver_root.to_string()];
     (jit_marker_key_from_target(target, &driver_roots) == Some(JitMarkerKey::JitMergePoint))
-        .then(|| args.first())
+        .then(|| args.first().and_then(|a| a.as_variable()))
         .flatten()
 }
 
@@ -463,7 +463,7 @@ pub(crate) fn split_block(
         ExitSwitch::LastException => ExitSwitch::LastException,
         ExitSwitch::Fused { opname, args } => ExitSwitch::Fused {
             opname,
-            args: args
+            args: crate::model::call_args(args)
                 .iter()
                 .map(|var| {
                     get_new_name(
@@ -760,7 +760,7 @@ mod tests {
                 result: Some(result.clone()),
                 kind: OpKind::Call {
                     target: crate::model::CallTarget::function_path(["consume_void"]),
-                    args: vec![omitted_void],
+                    args: crate::model::call_args(vec![omitted_void]),
                     result_ty: ValueType::Void,
                 },
             }],
@@ -797,7 +797,7 @@ mod tests {
                 "jit_merge_point",
                 Some("PyPyJitDriver".into()),
             ),
-            args: vec![receiver.clone()],
+            args: crate::model::call_args(vec![receiver.clone()]),
             result_ty: ValueType::Void,
         };
         let mut graph = graph_with_ops(
@@ -841,7 +841,7 @@ mod tests {
     fn split_with_forcelink_rematerializes_nullary_marker_receiver() {
         assert_split_rematerializes_marker_receiver(OpKind::Call {
             target: crate::model::CallTarget::function_path(["pyre_jit", "eval", "pypyjitdriver"]),
-            args: vec![],
+            args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(Some("PyPyJitDriver".into())),
         });
     }
@@ -867,7 +867,7 @@ mod tests {
                             "eval",
                             "pypyjitdriver",
                         ]),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some("PyPyJitDriver".into())),
                     },
                 },
@@ -882,7 +882,7 @@ mod tests {
                             "jit_merge_point",
                             Some("PyPyJitDriver".into()),
                         ),
-                        args: vec![receiver],
+                        args: crate::model::call_args(vec![receiver]),
                         result_ty: ValueType::Void,
                     },
                 },

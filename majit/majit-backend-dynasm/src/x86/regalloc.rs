@@ -330,7 +330,7 @@ impl<'a> RegAlloc<'a> {
             &self.constants,
             &mut self.pending_moves,
         );
-        self.perform(i, vec![loc], Some(loc), output);
+        self.perform(i, [loc], Some(loc), output);
     }
 
     /// x86/regalloc.py `consider_int_is_true` / `consider_int_is_zero`.
@@ -349,7 +349,7 @@ impl<'a> RegAlloc<'a> {
         let argloc = self.loc(arg, Type::Int);
         let ops_ref: &[OpRc] = self.operations;
         let resloc = self.force_allocate_reg_or_cc(dst, ops_ref, i);
-        self.perform(i, vec![argloc], Some(resloc), output);
+        self.perform(i, [argloc], Some(resloc), output);
     }
 
     /// x86/regalloc.py `consider_uint_mul_high` — emits `MUL src`,
@@ -376,7 +376,7 @@ impl<'a> RegAlloc<'a> {
         // and it can only coincide with eax when arg1 IS arg2 (the
         // swap above already pinned arg2 to eax).
         assert!(
-            !matches!(l1, Loc::Immed(_)),
+            !matches!(l1, Loc::Immed(_) | Loc::ImmedFloat(_)),
             "consider_uint_mul_high_j2: l1 must be a register/frame, got immediate {l1:?}"
         );
         assert!(
@@ -407,6 +407,6 @@ impl<'a> RegAlloc<'a> {
             &mut self.longevity,
             &mut self.fm,
         );
-        self.perform(i, vec![l1], Some(Loc::Reg(EDX)), output);
+        self.perform(i, [l1], Some(Loc::Reg(EDX)), output);
     }
 }

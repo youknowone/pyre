@@ -708,7 +708,7 @@ mod tests {
         }
 
         let descr = Arc::new(DoneWithThisFrameDescrMulti::new(vec![Type::Int, Type::Int]));
-        descr.set_rd_locs(vec![24, 2]);
+        descr.set_rd_locs(vec![24, 2].into());
         let descr_ref: DescrRef = descr;
         let deadframe = JitFrameDeadFrame::new(
             GcRef(frame as usize),

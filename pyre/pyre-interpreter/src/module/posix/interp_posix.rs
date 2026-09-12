@@ -6371,15 +6371,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "expected a 'posix.ScandirIterator' object",
             ))
         });
-        // `W_ScandirIterator.next_w` exhausts through `fail` → `_close`.
-        // `_finalize_` is then a no-op (`if not self.dirp: return`).  The
-        // prompt-finalization census treats a still-registered finalizer as
-        // a reason to collect the whole heap on `gen.close()`, so the
-        // exhausted iterator needs the same `may_ignore_finalizer` as
-        // `scandir_iter_mark_closed`.
-        if matches!(&result, Err(e) if e.matches_stop_iteration()) {
-            crate::executioncontext::may_ignore_finalizer(self_obj);
-        }
         result
     }
 

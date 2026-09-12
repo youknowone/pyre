@@ -47,9 +47,7 @@
 
 use crate::flowspace::model::Variable;
 use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
-use crate::model::{
-    CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
-};
+use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `Option::unwrap_or(opt, default)` / `Result::unwrap_or(res,
 /// default)` call site captured during body lowering (`front::mir`
@@ -139,23 +137,17 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     // The cast is jitcode-identity (`cast_pointer` → `same_as`); carry it into
     // each arm so B keeps receiving a narrowed value.  `out_var` is the value
     // block B actually consumes for the select result.
-    let (cast, out_var): (Option<(Vec<String>, ValueType)>, Variable) = if call_idx == last_idx {
+    let (cast, out_var): (Option<(String, ValueType)>, Variable) = if call_idx == last_idx {
         (None, site.result_var.clone())
     } else if call_idx == last_idx - 1 {
         let tail = &graph.blocks[a].operations[last_idx];
-        match (&tail.kind, tail.result.clone()) {
-            (
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    args,
-                    result_ty,
-                },
-                Some(narrowed),
-            ) if segments.first().map(String::as_str)
-                == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                && args.as_slice() == std::slice::from_ref(&site.result_var) =>
+        match tail.result.clone() {
+            Some(narrowed)
+                if let Some(root) =
+                    crate::model::cast_instance_of(&tail.kind, &site.result_var)
+                    && let OpKind::Call { result_ty, .. } = &tail.kind =>
             {
-                (Some((segments.clone(), result_ty.clone())), narrowed)
+                (Some((root.to_string(), result_ty.clone())), narrowed)
             }
             _ => {
                 return Err(format!(
@@ -215,11 +207,11 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     // below from `payload_on_disc_true`.
     let mut payload_sources = carried.clone();
     if !payload_sources.contains(&opt) {
-        payload_sources.push(opt.clone());
+        payload_sources.push(opt.clone().into_variable());
     }
     let mut default_sources = carried.clone();
     if !default_sources.contains(&default) {
-        default_sources.push(default.clone());
+        default_sources.push(default.clone().into_variable());
     }
     let (payload_bb, payload_inputs) = graph.create_block_with_arg_vars(payload_sources.len());
     let (default_bb, default_inputs) = graph.create_block_with_arg_vars(default_sources.len());
@@ -303,7 +295,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
                 op: "ne".to_string(),
-                lhs: opt.clone(),
+                lhs: opt.clone().into_variable(),
                 rhs: nullc,
                 result_ty: ValueType::Int,
             },
@@ -316,7 +308,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
                 op: "ne".to_string(),
-                lhs: opt.clone(),
+                lhs: opt.clone().into_variable(),
                 rhs: none,
                 result_ty: ValueType::Int,
             },
@@ -325,7 +317,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::FieldRead {
-                base: opt.clone(),
+                base: opt.clone().into_variable(),
                 field: FieldDescriptor {
                     name: "__discriminant".to_string(),
                     owner_root: Some(site.enum_owner.clone()),
@@ -354,22 +346,16 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
 pub(crate) fn emit_narrow(
     graph: &mut FunctionGraph,
     bb: crate::model::BlockId,
-    cast: &Option<(Vec<String>, ValueType)>,
+    cast: &Option<(String, ValueType)>,
     raw: Variable,
 ) -> Variable {
-    let Some((segments, result_ty)) = cast else {
+    let Some((root, result_ty)) = cast else {
         return raw;
     };
     let narrowed = graph.alloc_value_var();
     graph.block_mut(bb).operations.push(SpaceOperation {
         result: Some(narrowed.clone()),
-        kind: OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: segments.clone(),
-            },
-            args: vec![raw],
-            result_ty: result_ty.clone(),
-        },
+        kind: crate::model::cast_instance_call_result(root.clone(), raw, result_ty.clone()),
     });
     narrowed
 }
@@ -440,7 +426,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt.clone(), default.clone()],
+                    args: crate::model::call_args(vec![opt.clone(), default.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -514,7 +500,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt.clone(), default.clone()],
+                    args: crate::model::call_args(vec![opt.clone(), default.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -525,16 +511,7 @@ mod tests {
         let narrowed = g
             .push_op_var(
                 a,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.into(),
-                            "PyObject".into(),
-                        ],
-                    },
-                    args: vec![result.clone()],
-                    result_ty: ValueType::Ref(Some("PyObject".into())),
-                },
+                crate::model::cast_instance_call("PyObject", result.clone()),
                 true,
             )
             .unwrap();
@@ -591,7 +568,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: result_target(),
-                    args: vec![res.clone(), default.clone()],
+                    args: crate::model::call_args(vec![res.clone(), default.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -640,7 +617,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt, default],
+                    args: crate::model::call_args(vec![opt, default]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -677,7 +654,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt.clone(), default.clone()],
+                    args: crate::model::call_args(vec![opt.clone(), default.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -747,7 +724,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_or_target(),
-                    args: vec![opt, default],
+                    args: crate::model::call_args(vec![opt, default]),
                     result_ty: ValueType::Int,
                 },
                 true,

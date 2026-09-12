@@ -200,7 +200,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     // args.
     let mut then_sources = carried.clone();
     if !then_sources.contains(&env) {
-        then_sources.push(env.clone());
+        then_sources.push(env.clone().into_variable());
     }
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, else_inputs) = graph.create_block_with_arg_vars(carried.len());
@@ -229,7 +229,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
                 result: Some(payload.clone()),
                 kind: OpKind::Call {
                     target: CallTarget::method("call_once", Some(call_once_owner.clone())),
-                    args: vec![env_in_then, unit],
+                    args: crate::model::call_args(vec![env_in_then, unit]),
                     result_ty: site.payload_ty.clone(),
                 },
             });
@@ -287,7 +287,14 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     // construction ops before the call stay as A's tail.
     let a_id = graph.blocks[a].id;
     graph.blocks[a].operations.truncate(call_idx);
-    graph.set_branch(a_id, cond, then_bb, then_sources, else_bb, carried);
+    graph.set_branch(
+        a_id,
+        cond.into_variable(),
+        then_bb,
+        then_sources,
+        else_bb,
+        carried,
+    );
     Ok(())
 }
 

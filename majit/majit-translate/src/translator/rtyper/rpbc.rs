@@ -441,7 +441,7 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
             graph,
             block_id,
             oi,
-            receiver_var,
+            receiver_var.into_variable(),
             trait_root.clone(),
             method_name.clone(),
         );
@@ -473,7 +473,7 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
             result,
             kind: OpKind::IndirectCall {
                 funcptr: funcptr_var,
-                args,
+                args: crate::model::call_arg_vars(&args),
                 graphs,
                 family_key: None,
                 result_ty,
@@ -838,7 +838,7 @@ pub(crate) mod tests {
             graph.startblock,
             OpKind::Call {
                 target: crate::model::CallTarget::indirect("Handler", "run"),
-                args: vec![receiver_var],
+                args: crate::model::call_args(vec![receiver_var]),
                 result_ty: ValueType::Void,
             },
             true,
@@ -1032,7 +1032,7 @@ pub(crate) mod tests {
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::indirect("Storage", "pop"),
-                    args: vec![receiver],
+                    args: crate::model::call_args(vec![receiver]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -1094,7 +1094,7 @@ pub(crate) mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::method("bar", Some("Foo".to_string())),
-                args: vec![receiver_var],
+                args: crate::model::call_args(vec![receiver_var]),
                 result_ty: ValueType::Void,
             },
             true,

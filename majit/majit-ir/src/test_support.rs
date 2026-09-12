@@ -98,7 +98,7 @@ impl Trace {
             Some(descr) => Op::with_descr(opcode, &args, descr),
             None => Op::new(opcode, &args),
         };
-        op.pos.set(opref);
+        op.pos().set(opref);
         if let Some(fail_args) = fail_args {
             op.setfailargs(self.bind_operands(fail_args).into_iter().collect());
         }
@@ -133,7 +133,7 @@ impl Trace {
             .ops
             .get(op_index)
             .expect("operation operand must name a recorded operation");
-        assert_eq!(op.pos.get(), opref, "operation operand type must match");
+        assert_eq!(op.pos().get(), opref, "operation operand type must match");
         Operand::from_bound_op(op)
     }
 }

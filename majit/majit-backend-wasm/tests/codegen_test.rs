@@ -9,7 +9,7 @@ use std::process::Command;
 
 use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRef, RuntimeHelperKind, Type};
+use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRc, OpRef, RuntimeHelperKind, Type};
 use smallvec::smallvec;
 use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store, Table, TableType, Val, ValType};
 
@@ -486,7 +486,7 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
 fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
     let op = Op::new(opcode, &bx);
-    op.pos.set(pos);
+    op.pos().set(pos);
     op
 }
 
@@ -495,12 +495,7 @@ use majit_ir::forwarding::bound_operand_from_opref as rb;
 fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
     let op = Op::new(opcode, &bx);
-    op.setfailargs(smallvec![rb(fail_args[0]); 0]);
-    let mut fa: smallvec::SmallVec<[Operand; 3]> = smallvec::SmallVec::new();
-    for &a in fail_args {
-        fa.push(rb(a));
-    }
-    op.setfailargs(fa);
+    op.setfailargs(fail_args.iter().copied().map(rb).collect());
     op
 }
 
@@ -580,7 +575,7 @@ fn build_module_with_ca(
         frame,
         ca,
     };
-    let (bytes, guards, _) =
+    let (bytes, guards, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     (bytes, guards)
 }
@@ -688,7 +683,7 @@ fn sparse_value_ids_declare_only_addressable_value_locals() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 3 + 6 + 1,
+        inputargs.len() as u32 + 3 + 6 + 3,
         "two input values and three sparse ids, plus fixed i64 and i32 locals"
     );
 }
@@ -714,7 +709,7 @@ fn same_as_reuses_its_source_local() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 1 + 6 + 1,
+        inputargs.len() as u32 + 1 + 6 + 3,
         "SameAsI shares input 0's local; only IntAdd allocates a result local"
     );
 }
@@ -741,7 +736,7 @@ fn same_as_does_not_alias_a_mutable_label_local() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 2 + 6 + 1,
+        inputargs.len() as u32 + 2 + 6 + 3,
         "SameAs must not share the phi local that JUMP rebinds"
     );
 }
@@ -1003,7 +998,8 @@ fn build_module_with_write_barrier_target(
         frame: codegen::FrameGeometry::compact(5, 2, 0),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     bytes
 }
 
@@ -1631,7 +1627,7 @@ fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, guards, _) =
+    let (bytes, guards, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     assert_eq!(guards[0].fail_index, FAIL_INDEX_BASE);
 
@@ -1706,7 +1702,7 @@ fn test_empty_trace() {
 /// slots.  Every inline-region repro drives the module exactly this way and
 /// differs only in the exit index it expects.
 fn run_inline_region_trace(inputs: &codegen::ModuleBuildInputs) -> (i64, i64, i64, i64) {
-    let (bytes, _, _) = codegen::build_wasm_module(inputs).expect("non-header region merges");
+    let (bytes, _, _, _) = codegen::build_wasm_module(inputs).expect("non-header region merges");
     validate_wasm(&bytes);
 
     let engine = Engine::default();
@@ -1784,7 +1780,7 @@ fn a_deferred_merge_trips_once_at_its_threshold() {
         dispatch_cell_index: CELL_INDEX,
     });
 
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("the armed module builds");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("the armed module builds");
     validate_wasm(&bytes);
 
     let engine = Engine::default();
@@ -2067,7 +2063,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             frame: codegen::FrameGeometry::fixed(),
             ca,
         };
-        codegen::build_wasm_module(&inputs).map(|(bytes, _, _)| bytes)
+        codegen::build_wasm_module(&inputs).map(|(bytes, _, _, _)| bytes)
     }
 
     /// The region the decline arms use, with `opcode` producing its one value.
@@ -2315,10 +2311,9 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     );
 }
 
-/// `build_home_gcmap` marks every frozen home, not just this trace's live
-/// Ref homes. Recycled nursery bytes in the unused padding must be nulled
-/// before that map is published, or a later minor walk treats them as
-/// young objects (`invalid type_id` from an oldgen type-3 JitFrame).
+/// Key-0 nulls the frozen home region before `jf_gcmap` is published.
+/// Recycled nursery bytes in unused padding must not be live when the
+/// map goes up (`invalid type_id` from an oldgen type-3 JitFrame).
 #[test]
 fn entry_prologue_nulls_the_frozen_home_region() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
@@ -2349,7 +2344,7 @@ fn entry_prologue_nulls_the_frozen_home_region() {
         external_jump_key: 0,
         frame,
         ca: codegen::CaParams {
-            entry_gcmap_ptr: 0x1000,
+            home_gcmap_ptr: 0x1000,
             ..codegen::CaParams::default()
         },
     };
@@ -2646,7 +2641,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             frame: codegen::FrameGeometry::fixed(),
             ca: codegen::CaParams::default(),
         };
-        codegen::build_wasm_module(&inputs).map(|(bytes, _, _)| bytes)
+        codegen::build_wasm_module(&inputs).map(|(bytes, _, _, _)| bytes)
     }
 
     let colliding = build(2);
@@ -2841,6 +2836,305 @@ fn label_ref_phi_without_a_producer_declines() {
     assert!(
         error.to_string().contains("no producing op"),
         "unexpected decline: {error}"
+    );
+}
+
+#[test]
+fn compute_home_gcmap_simple_loop_is_valid() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let const_1 = OpRef::const_int(1);
+    let const_100 = OpRef::const_int(100);
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(1), OpRef::input_arg_int(0)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), const_100],
+            OpRef::int_op(4),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(4)],
+            &[OpRef::int_op(3), OpRef::int_op(2)],
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(2))]),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.compute_home_gcmap = true;
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("compute_home_gcmap loop should build");
+    validate_wasm(&bytes);
+}
+
+#[test]
+fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let const_1 = OpRef::const_int(1);
+    let const_100 = OpRef::const_int(100);
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(1), OpRef::input_arg_int(0)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), const_100],
+            OpRef::int_op(4),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(4)],
+            &[OpRef::int_op(3), OpRef::int_op(2)],
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(2))]),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.compute_home_gcmap = true;
+    ca.ca_reload_fn_ptr = 1;
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants,
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs)
+        .expect("reload-only residual family must declare arity 2 for union");
+    validate_wasm(&bytes);
+}
+
+/// A re-emission that grew the LABEL-capture tail must still build when
+/// asked to null only the newly marked slots before publishing.
+#[test]
+fn reemit_nulls_grown_label_homes_and_builds() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let ops = vec![
+        Op::new(OpCode::Label, &[rb(OpRef::input_arg_ref(0))]),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::const_int(1)],
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::input_arg_ref(0))]),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.compute_home_gcmap = true;
+    ca.home_gcmap_has_prior = true;
+    ca.home_gcmap_null_grown_labels = true;
+    ca.home_gcmap_min_labels = 0;
+    let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, used_labels) =
+        codegen::build_wasm_module(&inputs).expect("re-emission grown LABEL tail should build");
+    validate_wasm(&bytes);
+    assert!(used_labels >= 1);
+}
+
+/// A peeled loop's start LABEL can still name an import_state source
+/// (`InputArgRef(128)` on attr_delete) after every real use was rewritten
+/// to the folded constant. That argument is the phi destination, not a
+/// read of a never-written local. A later producer past 128 used to make
+/// `unbound_pool_const_seeds` decline the whole module.
+#[test]
+fn label_arg_import_hole_is_not_an_unbound_read() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let const_1 = OpRef::const_int(1);
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_ref(128))],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(200),
+        ),
+        Op::new(
+            OpCode::Jump,
+            &[rb(OpRef::int_op(200)), rb(OpRef::input_arg_int(1))],
+        ),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.compute_home_gcmap = true;
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs)
+        .expect("stale LABEL import hole must not decline the module");
+    validate_wasm(&bytes);
+}
+
+/// A real read of an unbound hole (not a LABEL phi name) is still declined.
+#[test]
+fn unbound_non_label_read_of_import_hole_is_declined() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(0), OpRef::input_arg_ref(128)],
+        OpRef::int_op(200),
+    )];
+    let err = match codegen::build_wasm_module(&codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(16, 8, 0),
+        ca: codegen::CaParams::default(),
+    }) {
+        Err(err) => err,
+        Ok(_) => panic!("a real read of the hole must still decline"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("InputArgRef(128)") && msg.contains("read with no producing op and no"),
+        "expected unbound 128 decline, got {msg}"
     );
 }
 
@@ -3075,7 +3369,7 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).unwrap();
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).unwrap();
 
     validate_wasm(&bytes);
     assert_eq!(
@@ -3608,7 +3902,7 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, guards, _) =
+    let (bytes, guards, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
 
     validate_wasm(&bytes);
@@ -3649,7 +3943,7 @@ fn test_exception_guards() {
         // GuardException(expected_type) — caught value bound to int_op(1).
         {
             let op = Op::new(OpCode::GuardException, &[rb(OpRef::input_arg_int(0))]);
-            op.pos.set(OpRef::int_op(1));
+            op.pos().set(OpRef::int_op(1));
             op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
             op
         },
@@ -3991,7 +4285,8 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
 
     let mut control_stack = Vec::new();
@@ -4103,7 +4398,8 @@ fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
         frame: codegen::FrameGeometry::compact(5, 3, 1),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
 
     let mut control_stack = Vec::new();
@@ -4437,7 +4733,7 @@ fn build_external_jump_module(
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, guards, _) =
+    let (bytes, guards, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     (bytes, guards)
 }
@@ -4655,7 +4951,7 @@ fn build_owner_with_region_closing_at(
             constants: indexmap::IndexMap::new(),
         }],
     );
-    codegen::build_wasm_module(&inputs).map(|(bytes, _, _)| bytes)
+    codegen::build_wasm_module(&inputs).map(|(bytes, _, _, _)| bytes)
 }
 
 /// A region closing at the loop HEADER `br`s to the `loop`, the long-standing
@@ -4931,7 +5227,7 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
             frame: codegen::FrameGeometry::fixed(),
             ca: codegen::CaParams::default(),
         };
-        let (bytes, _, _) =
+        let (bytes, _, _, _) =
             codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
         validate_wasm(&bytes);
         const_immediates(&bytes)
@@ -4980,25 +5276,25 @@ impl majit_ir::descr::FailDescr for HostFailDescr {
 /// A two-input loop whose single LABEL sits at the entry, so
 /// `stamp_and_publish_label_targets` publishes it as a re-enterable target and
 /// a bridge closing onto `label_descr` resolves in-module.
-fn host_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::rc::Rc<Op>> {
-    let label = std::rc::Rc::new(Op::new(
+fn host_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<OpRc> {
+    let label = OpRc::new(Op::new(
         OpCode::Label,
         &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
     ));
     label.setdescr(label_descr.clone());
-    let advance = std::rc::Rc::new(make_op(
+    let advance = OpRc::new(make_op(
         OpCode::IntAdd,
         &[OpRef::input_arg_int(0), OpRef::const_int(1)],
         OpRef::int_op(2),
     ));
-    let guard = std::rc::Rc::new(make_guard(
+    let guard = OpRc::new(make_guard(
         OpCode::GuardTrue,
         &[OpRef::int_op(2)],
         &[OpRef::int_op(2), OpRef::input_arg_int(1)],
     ));
     // Bind the JUMP to the real producer, not to a synthetic stand-in: the
     // loop-carried advance is read off the arg's producing opcode.
-    let jump = std::rc::Rc::new(Op::new(
+    let jump = OpRc::new(Op::new(
         OpCode::Jump,
         &[
             Operand::from_bound_op(&advance),
@@ -5011,13 +5307,13 @@ fn host_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::
 
 /// A loop-closing bridge for the loop above: it advances one loop-carried
 /// value and jumps back onto the owner's published label.
-fn host_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::rc::Rc<Op>> {
-    let advance = std::rc::Rc::new(make_op(
+fn host_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<OpRc> {
+    let advance = OpRc::new(make_op(
         OpCode::IntAdd,
         &[OpRef::input_arg_int(40), OpRef::const_int(1)],
         OpRef::int_op(42),
     ));
-    let jump = std::rc::Rc::new(Op::new(
+    let jump = OpRc::new(Op::new(
         OpCode::Jump,
         &[
             Operand::from_bound_op(&advance),
@@ -5981,7 +6277,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("permuting region merges");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("permuting region merges");
     validate_wasm(&bytes);
 
     let engine = Engine::default();
@@ -6187,7 +6483,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         );
         return;
     }
-    let (bytes, _, _) = built.expect("header region merges");
+    let (bytes, _, _, _) = built.expect("header region merges");
     validate_wasm(&bytes);
 
     let engine = Engine::default();
@@ -6509,7 +6805,8 @@ fn build_module_with_barrier_helpers(
         frame: codegen::FrameGeometry::compact(6, 3, 0),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("write barrier module compiles");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("write barrier module compiles");
     validate_wasm(&bytes);
     bytes
 }
@@ -7764,7 +8061,7 @@ fn threadlocalref_get_lowers_through_the_tls_helper() {
         );
         inputs.inputargs = vec![InputArg::from_type(Type::Int, 0)];
         inputs.alloc.threadlocal_fn_ptr = 0x66;
-        let (bytes, _, _) =
+        let (bytes, _, _, _) =
             codegen::build_wasm_module(&inputs).expect("ThreadlocalrefGet should lower");
         validate_wasm(&bytes);
 
@@ -7897,7 +8194,7 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
         large_threshold: 4096,
         plain_tids: [53].into_iter().collect(),
     });
-    let (bytes, _, homes) = codegen::build_wasm_module(&inputs).unwrap();
+    let (bytes, _, homes, _) = codegen::build_wasm_module(&inputs).unwrap();
     assert_eq!(
         homes, 2,
         "the first two objects cross a subsequent allocation"
@@ -8062,7 +8359,8 @@ fn consecutive_new_ops_share_one_nursery_bump() {
         vec![plain_new(1, 53), plain_new(2, 53), finish_int_arg0()],
         53,
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
@@ -8081,7 +8379,8 @@ fn news_that_fill_the_nursery_threshold_keep_separate_bumps() {
         ],
         53,
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
@@ -8115,7 +8414,8 @@ fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
         gc_table_base: 0,
         constants: indexmap::IndexMap::new(),
     }];
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
@@ -8142,7 +8442,8 @@ fn collecting_op_between_news_keeps_separate_nursery_bumps() {
         vec![plain_new(1, 53), call, plain_new(2, 53), finish_int_arg0()],
         53,
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
@@ -8173,7 +8474,8 @@ fn setfield_between_news_keeps_one_nursery_bump() {
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_int(1))]);
     inputs.ops[3] = finish;
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
@@ -8195,7 +8497,8 @@ fn new_and_const_newarray_share_one_nursery_bump() {
     if let Some(na) = inputs.nursery.as_mut() {
         na.plain_tids.insert(55);
     }
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
@@ -8214,7 +8517,8 @@ fn consecutive_const_newarrays_share_one_nursery_bump() {
         ],
         55,
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
@@ -8247,7 +8551,8 @@ fn runtime_newarray_flushes_the_nursery_batch() {
     if let Some(na) = inputs.nursery.as_mut() {
         na.plain_tids.insert(55);
     }
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
@@ -8267,7 +8572,8 @@ fn call_malloc_nursery(result: u32, size: i64) -> Op {
 #[test]
 fn call_malloc_nursery_uses_one_inline_bump() {
     let inputs = nursery_new_inputs(vec![call_malloc_nursery(1, 32), finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
 }
@@ -8275,7 +8581,8 @@ fn call_malloc_nursery_uses_one_inline_bump() {
 #[test]
 fn inline_nursery_new_zeros_its_payload() {
     let inputs = nursery_new_inputs(vec![plain_new(1, 53), finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     let mut fills = 0;
     count_operators(&bytes, |op| {
@@ -8300,7 +8607,8 @@ fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
         vec![call_malloc_nursery(1, 72), incr, finish_int_arg0()],
         53,
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
@@ -8327,7 +8635,7 @@ fn call_malloc_nursery_variants_lower() {
         OpRef::ref_op(1),
     );
     let inputs = nursery_new_inputs(vec![headerless, finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("headerless should lower");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("headerless should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
     assert!(const_immediates(&bytes).contains(&0x55));
@@ -8338,7 +8646,7 @@ fn call_malloc_nursery_variants_lower() {
         OpRef::ref_op(1),
     );
     let inputs = nursery_new_inputs(vec![headerless_odd, finish_int_arg0()], 53);
-    let (bytes, _, _) =
+    let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("unaligned headerless should lower");
     validate_wasm(&bytes);
     assert!(
@@ -8352,7 +8660,7 @@ fn call_malloc_nursery_variants_lower() {
         OpRef::ref_op(1),
     );
     let inputs = nursery_new_inputs(vec![frame, finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize frame should lower");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("varsize frame should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
     assert!(const_immediates(&bytes).contains(&0x11));
@@ -8372,7 +8680,7 @@ fn call_malloc_nursery_variants_lower() {
     );
     varsize.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 8, 53, Type::Int)));
     let inputs = nursery_new_inputs(vec![varsize, finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 0);
     assert!(const_immediates(&bytes).contains(&0x22));
@@ -8382,7 +8690,7 @@ fn call_malloc_nursery_variants_lower() {
 fn newstr_without_a_descr_injects_the_builtin_layout() {
     let newstr = make_op(OpCode::Newstr, &[OpRef::const_int(3)], OpRef::ref_op(1));
     let inputs = nursery_new_inputs(vec![newstr, finish_int_arg0()], 53);
-    let (bytes, _, _) =
+    let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("Newstr without descr should inject and lower");
     validate_wasm(&bytes);
     let immediates = const_immediates(&bytes);
@@ -8453,7 +8761,8 @@ fn inline_nursery_new_keeps_the_barrier_at_the_slow_path_join() {
         frame: codegen::FrameGeometry::compact(5, 2, 0),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
@@ -8462,7 +8771,7 @@ fn inline_nursery_new_keeps_the_barrier_at_the_slow_path_join() {
     );
     let mut control = inputs;
     control.nursery = None;
-    let (bytes, _, _) = codegen::build_wasm_module(&control).unwrap();
+    let (bytes, _, _, _) = codegen::build_wasm_module(&control).unwrap();
     assert_eq!(direct_write_barrier_call_count(&bytes, WB_TARGET as i32), 1);
 }
 

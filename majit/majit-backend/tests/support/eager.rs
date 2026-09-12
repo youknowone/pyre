@@ -26,7 +26,7 @@ fn backend() -> Box<dyn Backend> {
 
 fn op(opcode: OpCode, args: &[Operand], pos: u32) -> OpRc {
     let op = Op::new(opcode, args);
-    op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
+    op.pos().set(OpRef::op_typed(pos, opcode.result_type()));
     OpRc::new(op)
 }
 
@@ -265,7 +265,7 @@ fn host_function_runs_only_on_explicit_execution() {
         ],
         descr,
     ));
-    call.pos.set(OpRef::int_op(1));
+    call.pos().set(OpRef::int_op(1));
     let operations = vec![
         call.clone(),
         finish(&[Operand::from_bound_op(&call)], vec![Type::Int]),

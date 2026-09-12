@@ -425,7 +425,7 @@ fn range_builtin_call(result: Variable, start: Variable, end: Variable) -> Space
             target: CallTarget::FunctionPath {
                 segments: vec![crate::runtime_names::shims::RANGE.to_string()],
             },
-            args: vec![start, end],
+            args: crate::model::call_args(vec![start, end]),
             result_ty: ValueType::Ref(None),
         },
     }
@@ -441,7 +441,7 @@ fn slice_iter_call(result: Variable, container: Variable) -> SpaceOperation {
             target: CallTarget::FunctionPath {
                 segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
             },
-            args: vec![container],
+            args: crate::model::call_args(vec![container]),
             result_ty: ValueType::Ref(None),
         },
     }
@@ -543,7 +543,7 @@ mod tests {
                 h,
                 OpKind::Call {
                     target: CallTarget::method("next", Some("Range".to_string())),
-                    args: vec![it.clone()],
+                    args: crate::model::call_args(vec![it.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -615,7 +615,7 @@ mod tests {
                 h,
                 OpKind::Call {
                     target: CallTarget::method("next", Some("Range".to_string())),
-                    args: vec![it.clone()],
+                    args: crate::model::call_args(vec![it.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -693,7 +693,7 @@ mod tests {
                 h,
                 OpKind::Call {
                     target: CallTarget::method("next", Some("Range".to_string())),
-                    args: vec![it.clone()],
+                    args: crate::model::call_args(vec![it.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,

@@ -8108,7 +8108,8 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
 
 /// PyPy `typeobject.py descr__doc` with Python 3.14's `type`
 /// docstring. Heap types read and descriptor-bind only their own `__doc__`;
-/// builtin types expose the doc stored in their native type namespace.
+/// builtin types return `W_TypeObject.w_doc` when TypeCache has published
+/// it, otherwise the namespace `__doc__` entry.
 pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
     unsafe {
         if std::ptr::eq(obj, crate::typedef::w_type()) {
@@ -8131,6 +8132,13 @@ pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
             crate::typedef::gettypeobject(&pyre_object::function::METHOD_TYPE),
         ) {
             return Ok(w_str_new(crate::typedef::METHOD_DOC));
+        }
+        if !w_type_is_cpython_heaptype(obj) {
+            // typeobject.py descr__doc: `if not w_type.is_heaptype(): return w_type.w_doc`.
+            let w_doc = w_type_get_w_doc(obj);
+            if !w_doc.is_null() {
+                return Ok(w_doc);
+            }
         }
         let Some(value) = crate::type_dict_lookup(obj, "__doc__") else {
             return Ok(w_none());

@@ -2700,9 +2700,11 @@ pub(crate) unsafe fn stamp_builtin_owner(func: PyObjectRef, type_name: &str) {
 ///
 /// # Safety
 /// `ns` must be a valid, live `W_DictObject`; `type_obj` a valid type.
-pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
+/// `typeobject.py ensure_static_new` — stamp the type onto its `__new__`
+/// carrier. Runs for every built type (`ensure_common_attributes`), including
+/// derived declarations whose function-metadata pass is skipped.
+pub(crate) unsafe fn ensure_static_new(ns: PyObjectRef, type_obj: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
-    let save_point = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
     let type_obj = pyre_object::gc_roots::pin_root(type_obj);
     if let Some(w_new) = pyre_object::w_dict_getitem_str(ns, "__new__") {
@@ -2723,6 +2725,14 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
             }
         }
     }
+}
+
+pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    let type_obj = pyre_object::gc_roots::pin_root(type_obj);
+    unsafe { ensure_static_new(ns, type_obj) };
     // TypeCache.build's post-initialization function metadata pass. Getsets
     // have already been copied for the allocated owner before initialization.
     let keys: Vec<String> = pyre_object::w_dict_items(ns)
@@ -2926,7 +2936,17 @@ pub(crate) fn init_builtin_typeobject(
     let ns = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
     unsafe {
         if pyre_object::w_dict_getitem_str(ns, "__doc__").is_none() {
-            pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", pyre_object::w_none());
+            // `ensure_common_attributes`: `dict_w.setdefault('__doc__', w_self.w_doc)`.
+            let w_doc = pyre_object::w_type_get_w_doc(type_obj);
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__doc__",
+                if w_doc.is_null() {
+                    pyre_object::w_none()
+                } else {
+                    w_doc
+                },
+            );
         }
         let ns = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
         if pyre_object::w_dict_getitem_str(ns, "__eq__").is_some()

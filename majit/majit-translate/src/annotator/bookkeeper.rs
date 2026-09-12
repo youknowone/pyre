@@ -4871,7 +4871,7 @@ mod tests {
                             crate::model::OpKind::Call {
                                 target: crate::model::CallTarget::FunctionPath { segments },
                                 ..
-                            } if segments == &[crate::runtime_names::shims::CAST_INSTANCE, "PyObject"]
+                            } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
                         )
                 }),
             "the tuple writer must preserve the source PyObject class"

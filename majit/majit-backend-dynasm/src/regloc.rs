@@ -88,10 +88,12 @@ impl RawEbpLoc {
 }
 
 /// regloc.py FrameLoc — frame slot location (position-aware RawEbpLoc).
+/// `position` is a jitframe slot index; `u32` keeps [`Loc`] in 16 B so
+/// `vec![loc]` does not mint the 24-byte class on every consider_*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLoc {
     pub ebp_loc: RawEbpLoc,
-    pub position: usize,
+    pub position: u32,
 }
 
 impl FrameLoc {
@@ -101,7 +103,7 @@ impl FrameLoc {
                 value: ebp_offset,
                 is_float,
             },
-            position,
+            position: u32::try_from(position).expect("frame slot fits u32"),
         }
     }
 
@@ -109,30 +111,21 @@ impl FrameLoc {
         true
     }
     pub fn get_position(&self) -> usize {
-        self.position
+        self.position as usize
     }
 }
 
-/// regloc.py ImmedLoc — immediate integer value.
+/// regloc.py ImmedLoc — immediate integer (or float-bit) value.
+/// Float-ness lives on [`Loc`] (`Immed` / `ImmedFloat`) so the payload
+/// stays 8 B and [`Loc`] stays 16 B.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImmedLoc {
     pub value: i64,
-    pub is_float: bool,
 }
 
 impl ImmedLoc {
     pub fn new(value: i64) -> Self {
-        ImmedLoc {
-            value,
-            is_float: false,
-        }
-    }
-
-    pub fn new_float(value: i64) -> Self {
-        ImmedLoc {
-            value,
-            is_float: true,
-        }
+        ImmedLoc { value }
     }
 
     pub fn location_code(&self) -> LocationCode {
@@ -156,7 +149,29 @@ pub enum Loc {
     Ebp(RawEbpLoc),
     Frame(FrameLoc),
     Immed(ImmedLoc),
+    ImmedFloat(ImmedLoc),
     Addr(AddressLoc),
+}
+
+impl Loc {
+    #[inline]
+    pub fn immed(value: i64) -> Self {
+        Loc::Immed(ImmedLoc { value })
+    }
+
+    #[inline]
+    pub fn immed_float(value: i64) -> Self {
+        Loc::ImmedFloat(ImmedLoc { value })
+    }
+
+    #[inline]
+    pub fn as_immed(&self) -> Option<(i64, bool)> {
+        match self {
+            Loc::Immed(i) => Some((i.value, false)),
+            Loc::ImmedFloat(i) => Some((i.value, true)),
+            _ => None,
+        }
+    }
 }
 
 /// Matches either spelling of a frame-pointer location, binding its
@@ -190,7 +205,7 @@ impl Loc {
         matches!(self, Loc::Frame(_) | Loc::Ebp(_))
     }
     pub fn is_immed(&self) -> bool {
-        matches!(self, Loc::Immed(_))
+        matches!(self, Loc::Immed(_) | Loc::ImmedFloat(_))
     }
 
     pub fn as_reg(&self) -> Option<RegLoc> {
@@ -260,3 +275,17 @@ pub const X86_64_SCRATCH_REG_2: RegLoc = R12;
 pub const X86_64_XMM_SCRATCH_REG: RegLoc = XMM5;
 #[cfg(not(target_os = "windows"))]
 pub const X86_64_XMM_SCRATCH_REG: RegLoc = XMM15;
+
+#[cfg(test)]
+mod loc_size_tests {
+    #[test]
+    fn loc_leaves_the_24_byte_class() {
+        assert!(
+            std::mem::size_of::<super::Loc>() <= 16,
+            "Loc is {} B; vec![loc] must stay out of the 24-byte class",
+            std::mem::size_of::<super::Loc>()
+        );
+        assert!(std::mem::size_of::<super::FrameLoc>() <= 12);
+        assert!(std::mem::size_of::<super::ImmedLoc>() <= 8);
+    }
+}

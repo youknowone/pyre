@@ -11,6 +11,7 @@
 ///   redirect_call_assembler — assembler.py:1138
 use crate::regloc::ebp_loc_pat;
 use indexmap::IndexMap;
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 // aarch64/assembler.py parity: aarch64-only backend.
@@ -21,7 +22,9 @@ pub(crate) type Assembler = dynasmrt::VecAssembler<dynasmrt::aarch64::Aarch64Rel
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
-use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type};
+use majit_ir::{
+    FailDescr, FailDescrStore, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
+};
 
 use crate::arch::*;
 use crate::codebuf;
@@ -116,13 +119,17 @@ fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
             is_float: e.is_float,
         },
         Loc::Frame(f) => TargetArgLoc::Frame {
-            position: f.position,
+            position: f.get_position(),
             ebp_offset: f.ebp_loc.value,
             is_float: f.ebp_loc.is_float,
         },
         Loc::Immed(i) => TargetArgLoc::Immed {
             value: i.value,
-            is_float: i.is_float,
+            is_float: false,
+        },
+        Loc::ImmedFloat(i) => TargetArgLoc::Immed {
+            value: i.value,
+            is_float: true,
         },
         Loc::Addr(a) => TargetArgLoc::Addr {
             base: a.base,
@@ -151,7 +158,11 @@ fn loc_from_target_argloc(loc: &TargetArgLoc) -> Loc {
             is_float,
         } => Loc::Frame(crate::regloc::FrameLoc::new(position, ebp_offset, is_float)),
         TargetArgLoc::Immed { value, is_float } => {
-            Loc::Immed(crate::regloc::ImmedLoc { value, is_float })
+            if is_float {
+                Loc::immed_float(value)
+            } else {
+                Loc::immed(value)
+            }
         }
         TargetArgLoc::Addr {
             base,
@@ -201,8 +212,8 @@ fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
         Loc::Reg(reg) => Some(
             reg_position_in_jitframe(*reg).expect("deadframe slot: register is not managed") as u16,
         ),
-        Loc::Frame(frame) => Some((frame.position + JITFRAME_FIXED_SIZE) as u16),
-        Loc::Immed(_) | Loc::Ebp(_) | Loc::Addr(_) => None,
+        Loc::Frame(frame) => Some((frame.get_position() + JITFRAME_FIXED_SIZE) as u16),
+        Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::Ebp(_) | Loc::Addr(_) => None,
     }
 }
 
@@ -472,7 +483,7 @@ pub struct AssemblerARM64<'a> {
     /// reallocs the in-flight JITFRAME large enough before the `br`.
     jump_target_frame_depth: usize,
     /// Fail descriptors built during assembly.
-    fail_descrs: Vec<std::sync::Arc<majit_ir::FailDescrCell>>,
+    fail_descrs: FailDescrStore,
     /// trace_id for this compilation.
     trace_id: u64,
     /// header_pc (green_key) for this compilation.
@@ -592,7 +603,7 @@ pub struct AssemblerARM64<'a> {
     /// fat-pointer mismatch a bare `Arc<dyn Descr>` ptr would cause.
     /// The same cell is consumed by `append_guard_token_with_faillocs`
     /// so jf_force_descr and jf_descr resolve to the same identity.
-    pending_force_cell: Option<std::sync::Arc<majit_ir::FailDescrCell>>,
+    pending_force_cell: Option<usize>,
     /// `compile.py:665-674` + `pyjitpl.py:2283`: construction-time
     /// snapshot of the six descr pointers attached to the owning cpu
     /// instance.  Retained for constructor signature stability across
@@ -633,11 +644,11 @@ struct GuardToken {
     /// Dynamic label that the guard's Jcc jumps to — bound in
     /// write_pending_failure_recoveries to the recovery stub.
     fail_label: DynamicLabel,
-    /// The fail descriptor cell for this guard.  `Arc::as_ptr(&fail_descr)`
-    /// is the thin pointer baked into `jf_descr`; the same cell instance is
-    /// stored on `Asm::fail_descrs` so registration on the owning CLT keeps
-    /// it alive while the recovery stub references its address.
-    fail_descr: std::sync::Arc<majit_ir::FailDescrCell>,
+    /// Descr for stub bookkeeping (`set_adr_jump_offset`).
+    fail_descr: majit_ir::DescrRef,
+    /// [`FailDescrCell::thin_ptr`] baked into `jf_descr`. The cell lives
+    /// on `Asm::fail_descrs` so the address stays valid.
+    fail_cell_ptr: usize,
     /// Constants to store in frame during recovery.
     /// Each entry: (frame_slot_index, constant_value).
     const_stores: Vec<(usize, i64)>,
@@ -662,11 +673,30 @@ struct GuardToken {
 /// walk needs survive it as this.
 struct RecoveryStub {
     /// `tok.faildescr`.
-    fail_descr: std::sync::Arc<majit_ir::FailDescrCell>,
+    fail_descr: majit_ir::DescrRef,
     /// `tok.pos_recovery_stub`.
     pos_recovery_stub: usize,
     /// `tok.offset`, present only for `GUARD_NOT_INVALIDATED`.
     pos_jump_offset: Option<usize>,
+}
+
+fn fail_cell_capacity(ra_ops: &[RegAllocOp], ops: &[OpRc]) -> usize {
+    let mut n = 0;
+    for ra in ra_ops {
+        match ra {
+            RegAllocOp::PerformGuard { .. } | RegAllocOp::PerformGuard1 { .. } => n += 1,
+            RegAllocOp::Perform { op_index, .. }
+            | RegAllocOp::Perform1 { op_index, .. }
+            | RegAllocOp::PerformDiscard { op_index, .. }
+            | RegAllocOp::PerformDiscardGcStore { op_index, .. } => {
+                if ops[*op_index].opcode == OpCode::Finish {
+                    n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    n
 }
 
 /// Compiled output from assemble_loop/assemble_bridge.
@@ -680,7 +710,7 @@ pub struct CompiledCode {
     /// contract (compile.py record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at conversion
     /// from the in-progress `AssemblerARM64.fail_descrs` Vec.
-    pub fail_descrs: Box<[std::sync::Arc<majit_ir::FailDescrCell>]>,
+    pub fail_descrs: std::sync::Arc<FailDescrStore>,
     /// Input argument types.
     pub input_types: Vec<Type>,
     /// `compile.py` parity: `Arc` clone of the owning cpu's
@@ -761,7 +791,7 @@ impl<'a> AssemblerARM64<'a> {
             frame_depth: JITFRAME_FIXED_SIZE,
             frame_depth_to_patch: Vec::new(),
             jump_target_frame_depth: 0,
-            fail_descrs: Vec::new(),
+            fail_descrs: FailDescrStore::default(),
             trace_id,
             header_pc,
             input_types: Vec::new(),
@@ -1017,7 +1047,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp(scratch, f.ebp_loc.value);
                 scratch
             }
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 self.emit_mov_imm64(scratch as u32, i.value);
                 scratch
             }
@@ -1033,7 +1063,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Range mirrors `check_imm_box` (`0 <= v < DEFAULT_IMM_SIZE` = 4096).
     fn addsub_imm12(loc: &Loc) -> Option<i64> {
         match loc {
-            Loc::Immed(i) if (0..4096).contains(&i.value) => Some(i.value),
+            Loc::Immed(i) | Loc::ImmedFloat(i) if (0..4096).contains(&i.value) => Some(i.value),
             _ => None,
         }
     }
@@ -1113,7 +1143,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp(16, f.ebp_loc.value);
                 16
             }
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 self.emit_mov_imm64(16, i.value);
                 16
             }
@@ -1122,7 +1152,7 @@ impl<'a> AssemblerARM64<'a> {
         // `opassembler.py`'s `emit_int_comp_op` takes `CMP_ri` when the
         // right-hand side is an immediate; `codebuilder.py`'s `CMP_ri` holds
         // a 12-bit unsigned field, so anything wider still needs a register.
-        if let Loc::Immed(i) = loc1
+        if let Loc::Immed(i) | Loc::ImmedFloat(i) = loc1
             && let Ok(imm) = u32::try_from(i.value)
             && imm <= MAX_CMP_IMM12
         {
@@ -1139,7 +1169,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp(17, f.ebp_loc.value);
                 17
             }
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 self.emit_mov_imm64(17, i.value);
                 17
             }
@@ -1156,7 +1186,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_ldr_fp(16, f.ebp_loc.value);
                 16
             }
-            Loc::Immed(i) => {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 self.emit_mov_imm64(16, i.value);
                 16
             }
@@ -1259,7 +1289,7 @@ impl<'a> AssemblerARM64<'a> {
             Loc::Reg(r) if r.value == 0 && !r.is_xmm => {
                 // already in rax/x0
             }
-            Loc::Immed(imm) => {
+            Loc::Immed(imm) | Loc::ImmedFloat(imm) => {
                 self.emit_mov_imm64(0, imm.value);
             }
             _ => self.regalloc_mov(&loc, &rax),
@@ -1298,7 +1328,7 @@ impl<'a> AssemblerARM64<'a> {
             let mut max_abs_slot = JITFRAME_FIXED_SIZE;
             for (ia, loc) in inputargs.iter().zip(input_locs.iter()) {
                 if let Loc::Frame(floc) = loc {
-                    let abs_slot = JITFRAME_FIXED_SIZE + floc.position;
+                    let abs_slot = JITFRAME_FIXED_SIZE + floc.get_position();
                     self.opref_to_slot.insert(ia.opref(), abs_slot);
                     if abs_slot + 1 > max_abs_slot {
                         max_abs_slot = abs_slot + 1;
@@ -1784,7 +1814,7 @@ impl<'a> AssemblerARM64<'a> {
                     }
                 }
                 Some(Loc::Frame(f)) => {
-                    gcmap_set_bit(gcmap, f.position + JITFRAME_FIXED_SIZE);
+                    gcmap_set_bit(gcmap, f.get_position() + JITFRAME_FIXED_SIZE);
                 }
                 None => {}
                 Some(other) => panic!(
@@ -1904,7 +1934,7 @@ impl<'a> AssemblerARM64<'a> {
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
-            fail_descrs: self.fail_descrs.into_boxed_slice(),
+            fail_descrs: std::sync::Arc::new(self.fail_descrs),
             input_types: self.input_types,
             cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
@@ -2056,7 +2086,7 @@ impl<'a> AssemblerARM64<'a> {
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
-            fail_descrs: self.fail_descrs.into_boxed_slice(),
+            fail_descrs: std::sync::Arc::new(self.fail_descrs),
             input_types: self.input_types,
             cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
@@ -2130,6 +2160,7 @@ impl<'a> AssemblerARM64<'a> {
         }
         // assembler.py:374 walk_operations — get allocation decisions.
         let ra_ops = ra.walk_operations();
+        self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(&ra_ops, ops));
         // ra.get_final_frame_depth() returns a USER-position count; convert
         // to absolute by adding JITFRAME_FIXED_SIZE before comparing.
         let frame_slot_depth =
@@ -2155,7 +2186,7 @@ impl<'a> AssemblerARM64<'a> {
         for (&opref, lifetime) in ra.longevity.lifetimes_iter() {
             if let Some(floc) = lifetime.current_frame_loc {
                 self.opref_to_slot
-                    .insert(opref, JITFRAME_FIXED_SIZE + floc.position);
+                    .insert(opref, JITFRAME_FIXED_SIZE + floc.get_position());
             }
         }
         // frame_slot_depth is already absolute (see calculation above).
@@ -2232,12 +2263,33 @@ impl<'a> AssemblerARM64<'a> {
                     );
                     self.pending_malloc_nursery_gcmap = None;
                 }
+                RegAllocOp::Perform1 {
+                    op_index,
+                    loc,
+                    result_loc,
+                    gcmap,
+                } => {
+                    let op = &ops[*op_index];
+                    let locs = [*loc];
+                    self.pending_malloc_nursery_gcmap = *gcmap;
+                    self.regalloc_perform(
+                        op,
+                        *op_index,
+                        &locs,
+                        result_loc.as_ref(),
+                        fail_index,
+                        ops,
+                    );
+                    self.pending_malloc_nursery_gcmap = None;
+                }
                 RegAllocOp::PerformGuard {
                     op_index,
                     arglocs,
                     result_loc,
-                    faillocs,
+                    faillocs_start,
+                    faillocs_len,
                 } => {
+                    let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
                     let op = &ops[*op_index];
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -2274,32 +2326,57 @@ impl<'a> AssemblerARM64<'a> {
                     );
                     fail_index += 1;
                 }
-                RegAllocOp::PerformDiscard { op_index, arglocs } => {
+                RegAllocOp::PerformGuard1 {
+                    op_index,
+                    loc,
+                    result_loc,
+                    faillocs_start,
+                    faillocs_len,
+                } => {
+                    let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
                     let op = &ops[*op_index];
-                    if crate::majit_log_enabled() {
-                        let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
-                        eprintln!(
-                            "[dynasm] discard[{}]: {:?} args=[{}]",
-                            op_index,
-                            op.opcode,
-                            al.join(", ")
-                        );
-                    }
-                    // A result-less op still emits code — the stores that
-                    // advance a loop's mutable state are all discards — so it
-                    // opens its own span too.
-                    if crate::majit_dump_enabled() {
-                        eprintln!(
-                            "[dynasm] @{:#06x} op[{}] {:?}",
-                            self.mc.offset().0,
-                            op_index,
-                            op.opcode
-                        );
-                    }
-                    self.regalloc_perform(op, *op_index, arglocs, None, fail_index, ops);
+                    let locs = [*loc];
+                    self.regalloc_perform_guard(
+                        op,
+                        *op_index,
+                        &locs,
+                        result_loc.as_ref(),
+                        faillocs,
+                        fail_index,
+                    );
+                    fail_index += 1;
+                }
+                RegAllocOp::PerformDiscard { op_index, arglocs } => {
+                    self.emit_discard(*op_index, arglocs, fail_index, ops);
+                    let op = &ops[*op_index];
                     if op.opcode.is_guard() || op.opcode == OpCode::Finish {
                         fail_index += 1;
                     }
+                }
+                RegAllocOp::PerformDiscardGcStore {
+                    op_index,
+                    value,
+                    base,
+                    ofs,
+                    size,
+                } => {
+                    let locs = [*value, *base, *ofs, Loc::immed(*size)];
+                    self.emit_discard(*op_index, &locs, fail_index, ops);
+                    let op = &ops[*op_index];
+                    if op.opcode.is_guard() || op.opcode == OpCode::Finish {
+                        fail_index += 1;
+                    }
+                }
+                RegAllocOp::PerformGcLoad {
+                    op_index,
+                    base,
+                    ofs,
+                    res,
+                    nsize,
+                } => {
+                    let op = &ops[*op_index];
+                    let locs = [*base, *ofs, *res, Loc::immed(*nsize)];
+                    self.regalloc_perform(op, *op_index, &locs, Some(res), fail_index, ops);
                 }
             }
         }
@@ -2327,6 +2404,28 @@ impl<'a> AssemblerARM64<'a> {
         self.frame_depth = self.frame_depth.max(self.jump_target_frame_depth);
 
         Ok(())
+    }
+
+    fn emit_discard(&mut self, op_index: usize, arglocs: &[Loc], fail_index: u32, ops: &[OpRc]) {
+        let op = &ops[op_index];
+        if crate::majit_log_enabled() {
+            let al: Vec<String> = arglocs.iter().map(|l| format!("{l:?}")).collect();
+            eprintln!(
+                "[dynasm] discard[{}]: {:?} args=[{}]",
+                op_index,
+                op.opcode,
+                al.join(", ")
+            );
+        }
+        if crate::majit_dump_enabled() {
+            eprintln!(
+                "[dynasm] @{:#06x} op[{}] {:?}",
+                self.mc.offset().0,
+                op_index,
+                op.opcode
+            );
+        }
+        self.regalloc_perform(op, op_index, arglocs, None, fail_index, ops);
     }
 
     /// assembler.py:326 regalloc_perform — emit code for a non-guard op.
@@ -2478,8 +2577,8 @@ impl<'a> AssemblerARM64<'a> {
                 // arithmetic ops, where no condition follows the operands.
                 let mut opcode = op.opcode;
                 if arglocs.len() >= 2 {
-                    let (cmp0, cmp1) = if matches!(arglocs[0], Loc::Immed(_))
-                        && !matches!(arglocs[1], Loc::Immed(_))
+                    let (cmp0, cmp1) = if matches!(arglocs[0], Loc::Immed(_) | Loc::ImmedFloat(_))
+                        && !matches!(arglocs[1], Loc::Immed(_) | Loc::ImmedFloat(_))
                         && let Some(reflexed) = opcode.bool_reflex()
                     {
                         opcode = reflexed;
@@ -2697,7 +2796,8 @@ impl<'a> AssemblerARM64<'a> {
             // gc_table root walker forwards the slot in place, so each load
             // observes the relocated object.
             OpCode::LoadFromGcTable => {
-                let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc)
+                let (Some(Loc::Immed(idx) | Loc::ImmedFloat(idx)), Some(Loc::Reg(dst))) =
+                    (arglocs.first(), result_loc)
                 else {
                     panic!(
                         "LoadFromGcTable expects [Immed(index)] and a register result, \
@@ -2945,7 +3045,7 @@ impl<'a> AssemblerARM64<'a> {
                         },
                     };
                     let nsize = match arglocs.get(3) {
-                        Some(Loc::Immed(i)) => i.value,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                         _ => op
                             .with_array_descr(|ad| {
                                 let s = ad.item_size() as i64;
@@ -2957,7 +3057,7 @@ impl<'a> AssemblerARM64<'a> {
                         Some(Loc::Reg(base)) => {
                             self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
                         }
-                        Some(Loc::Immed(base_i)) => {
+                        Some(Loc::Immed(base_i) | Loc::ImmedFloat(base_i)) => {
                             self.emit_mov_imm64(16, base_i.value);
                             let base = RegLoc {
                                 value: 16,
@@ -2993,7 +3093,7 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 let val_reg = match value_loc {
                     Loc::Reg(r) => *r,
-                    Loc::Immed(i) => {
+                    Loc::Immed(i) | Loc::ImmedFloat(i) => {
                         self.emit_mov_imm64(16, i.value);
                         crate::regloc::RegLoc::new(16, false)
                     }
@@ -3009,13 +3109,13 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 // aarch64/opassembler.py:367: scale = get_scale(size_loc.value)
                 let size = match size_loc {
-                    Loc::Immed(i) => i.value.unsigned_abs() as usize,
+                    Loc::Immed(i) | Loc::ImmedFloat(i) => i.value.unsigned_abs() as usize,
                     other => panic!(
                         "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
                     ),
                 };
                 if crate::majit_log_enabled()
-                    && let Loc::Immed(i) = ofs_loc
+                    && let Loc::Immed(i) | Loc::ImmedFloat(i) = ofs_loc
                 {
                     let input0_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE);
                     let input1_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE + 1);
@@ -3037,7 +3137,7 @@ impl<'a> AssemblerARM64<'a> {
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
                 {
                     let nsize = match arglocs.get(3) {
-                        Some(Loc::Immed(i)) => i.value,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                         _ => op
                             .with_array_descr(|ad| {
                                 let s = ad.item_size() as i64;
@@ -3051,7 +3151,7 @@ impl<'a> AssemblerARM64<'a> {
                     // offset immediate so the emitter handles the full
                     // range via the check_imm_arg / materialize fallback.
                     let ofs = match arglocs.get(4) {
-                        Some(Loc::Immed(i)) => i.value,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                         _ => 0,
                     };
                     self.emit_op_gcload_indexed_regalloc(base, index, res, ofs, nsize);
@@ -3064,14 +3164,14 @@ impl<'a> AssemblerARM64<'a> {
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
                 {
                     let size = match arglocs.get(3) {
-                        Some(Loc::Immed(i)) => i.value.unsigned_abs() as usize,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value.unsigned_abs() as usize,
                         _ => 8,
                     };
                     // aarch64/opassembler.py:385-392 keeps `ofs_loc.value`
                     // at the Signed word width; large displacements folded
                     // in via `_try_use_older_box` must not be truncated.
                     let ofs = match arglocs.get(4) {
-                        Some(Loc::Immed(i)) => i.value,
+                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                         _ => 0,
                     };
                     // aarch64/opassembler.py:385-392: combine ofs into ip0 = index + ofs.
@@ -3096,7 +3196,7 @@ impl<'a> AssemblerARM64<'a> {
                     };
                     let val_reg = match value_loc {
                         Loc::Reg(r) => *r,
-                        Loc::Immed(i) => {
+                        Loc::Immed(i) | Loc::ImmedFloat(i) => {
                             self.emit_mov_imm64(17, i.value);
                             crate::regloc::RegLoc::new(17, false)
                         }
@@ -3290,8 +3390,7 @@ impl<'a> AssemblerARM64<'a> {
                 // and `handle_fail_exit_frame_with_exception` match by
                 // ptr-equality on the singleton, so the cell only carries
                 // the keep-alive identity for `clt.asmmemmgr_gcreftracers`.
-                self.fail_descrs
-                    .push(majit_ir::FailDescrCell::wrap(descr.clone()));
+                self.fail_descrs.push(descr.clone());
             }
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
@@ -3539,7 +3638,7 @@ impl<'a> AssemblerARM64<'a> {
                 let base_size = base_size as i64;
                 let type_id = type_id as i64;
                 let itemsize = match arglocs.get(1) {
-                    Some(Loc::Immed(i)) => i.value,
+                    Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                     _ => 8,
                 };
                 // aarch64/assembler.py `malloc_cond_varsize`: x0 is the
@@ -3572,7 +3671,9 @@ impl<'a> AssemblerARM64<'a> {
                             debug_assert_ne!(len_r.value, 1);
                             dynasm!(self.mc ; .arch aarch64 ; mov x1, X(len_r.value));
                         }
-                        Some(Loc::Immed(len_i)) => self.emit_mov_imm64(1, len_i.value),
+                        Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
+                            self.emit_mov_imm64(1, len_i.value)
+                        }
                         Some(Loc::Frame(len_f)) => self.emit_ldr_fp(1, len_f.ebp_loc.value),
                         Some(Loc::Ebp(len_e)) => self.emit_ldr_fp(1, len_e.value),
                         other => {
@@ -3649,7 +3750,7 @@ impl<'a> AssemblerARM64<'a> {
                     Some(Loc::Reg(len_r)) => {
                         dynasm!(self.mc ; .arch aarch64 ; mov x2, X(len_r.value));
                     }
-                    Some(Loc::Immed(len_i)) => {
+                    Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
                         self.emit_mov_imm64(2, len_i.value);
                     }
                     Some(Loc::Frame(len_f)) => {
@@ -4007,14 +4108,11 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(self.mc ; .arch aarch64 ; ldr x16, [X(obj.value), ofs]);
                 self.regalloc_mov(class_loc, &Loc::Reg(crate::regloc::RegLoc::new(17, false)));
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
-            } else if let Loc::Immed(i) = class_loc {
+            } else if let Loc::Immed(i) | Loc::ImmedFloat(i) = class_loc {
                 let expected_typeid = self
                     .lookup_typeid_from_classptr(i.value as usize)
                     .expect("GuardClass: missing typeid for classptr");
-                self._cmp_guard_gc_type(
-                    &Loc::Reg(*obj),
-                    &Loc::Immed(crate::regloc::ImmedLoc::new(expected_typeid as i64)),
-                );
+                self._cmp_guard_gc_type(&Loc::Reg(*obj), &Loc::immed(expected_typeid as i64));
             }
         }
     }
@@ -4061,7 +4159,7 @@ impl<'a> AssemblerARM64<'a> {
                     ; cmp x16, x17
                 );
             }
-            Loc::Immed(expected) => {
+            Loc::Immed(expected) | Loc::ImmedFloat(expected) => {
                 self.emit_mov_imm64(17, expected.value);
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
             }
@@ -4095,7 +4193,9 @@ impl<'a> AssemblerARM64<'a> {
     /// aarch64/opassembler.py `emit_op_guard_subclass`.
     fn emit_guard_subclass(&mut self, obj_loc: &Loc, class_loc: &Loc) {
         let info = self.require_guard_gc_type_info("GUARD_SUBCLASS");
-        let (Loc::Reg(obj), Loc::Immed(classptr)) = (obj_loc, class_loc) else {
+        let (Loc::Reg(obj), Loc::Immed(classptr) | Loc::ImmedFloat(classptr)) =
+            (obj_loc, class_loc)
+        else {
             panic!(
                 "GUARD_SUBCLASS expects [Reg object, Immed classptr] \
                  like aarch64/opassembler.py:667"
@@ -4150,7 +4250,7 @@ impl<'a> AssemblerARM64<'a> {
                     ; cmp x16, x17
                 );
             }
-            Loc::Immed(expected) => {
+            Loc::Immed(expected) | Loc::ImmedFloat(expected) => {
                 self.emit_mov_imm64(17, expected.value);
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
             }
@@ -4454,7 +4554,6 @@ impl<'a> AssemblerARM64<'a> {
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
-        let fail_arg_types = self.infer_fail_arg_types(op, Some(op_index));
         // assembler.py _store_force_index parity:
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
         // (stored in pending_force_descr), reuse it — same Arc, same ptr
@@ -4484,17 +4583,20 @@ impl<'a> AssemblerARM64<'a> {
             // (`guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), ...)`)
             // reads back through the descr, so a stale empty list would
             // under-report `Type::Ref` slots and miss live roots.
-            if let Some(fd) = d.as_fail_descr()
-                && fd.fail_arg_types() != fail_arg_types.as_slice()
-            {
-                fd.set_fail_arg_types(fail_arg_types);
+            //
+            // Do not `infer_fail_arg_types().to_vec()` just to compare:
+            // the descr already holds the list on the compiled path.
+            if let Some(fd) = d.as_fail_descr() {
+                self.ensure_fail_arg_types(op, Some(op_index), fd);
             }
             d
         } else {
             // Test scaffold: tests synthesise guard ops without op.descr.
             // Mint a fresh metainterp ResumeGuardDescr to carry the
             // codegen-time identity (fail_index / trace_id / fail_arg_types).
-            let fresh = majit_backend::make_resume_guard_descr_typed(fail_arg_types);
+            let fresh = majit_backend::make_resume_guard_descr_typed(
+                self.infer_fail_arg_types(op, Some(op_index)).into_vec(),
+            );
             if let Some(fd) = fresh.as_fail_descr() {
                 fd.set_fail_index_per_trace(fail_index);
                 fd.set_trace_id(self.trace_id);
@@ -4508,7 +4610,7 @@ impl<'a> AssemblerARM64<'a> {
                 fail_index,
                 op_index,
                 op.opcode,
-                op.getfailargs(),
+                op.guard_fail_args(),
                 descr_fd.fail_arg_types(),
                 faillocs
             );
@@ -4520,11 +4622,11 @@ impl<'a> AssemblerARM64<'a> {
         // the slot into rd_locs so the deopt path reads it via PyPy's
         // stack-position decode (`llmodel.py:422-424`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
-        let rd_locs: Vec<u16> = faillocs
+        let rd_locs: majit_ir::RdLocs = faillocs
             .iter()
             .map(|fl| match fl {
                 None => 0xFFFF,
-                Some(Loc::Immed(i)) => {
+                Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => {
                     let slot = self.frame_depth;
                     self.frame_depth += 1;
                     const_stores.push((slot, i.value));
@@ -4584,13 +4686,14 @@ impl<'a> AssemblerARM64<'a> {
         // when this guard is paired with a CALL_ASSEMBLER's force-store —
         // jf_force_descr and jf_descr then resolve to the same cell, and
         // `fail_descrs[fail_index]` carries exactly one entry per guard.
-        let cell = self
+        let fail_cell_ptr = self
             .pending_force_cell
             .take()
-            .unwrap_or_else(|| majit_ir::FailDescrCell::wrap(descr.clone()));
+            .unwrap_or_else(|| self.fail_descrs.push(descr.clone()));
         self.pending_guard_tokens.push(GuardToken {
             fail_label,
-            fail_descr: cell.clone(),
+            fail_descr: descr.clone(),
+            fail_cell_ptr,
             const_stores,
             gcmap,
             pos_jump_offset: None,
@@ -4602,7 +4705,6 @@ impl<'a> AssemblerARM64<'a> {
         if op.opcode == OpCode::GuardNotForced2 {
             self.finish_gcmap = Some(gcmap);
         }
-        self.fail_descrs.push(cell);
     }
 
     /// aarch64/assembler.py `store_force_descr`: GUARD_NOT_FORCED_2 arms
@@ -4633,7 +4735,7 @@ impl<'a> AssemblerARM64<'a> {
             self.emit_mov_imm64(16, value);
             dynasm!(self.mc ; .arch aarch64 ; str X(16), [x29, ofs as u32]);
         }
-        let descr_ptr = Arc::as_ptr(&token.fail_descr) as *const () as i64;
+        let descr_ptr = token.fail_cell_ptr as i64;
         self.emit_mov_imm64(16, descr_ptr);
         dynasm!(self.mc ; .arch aarch64
             ; str X(16), [x29, JF_FORCE_DESCR_OFS as u32]
@@ -4735,7 +4837,7 @@ impl<'a> AssemblerARM64<'a> {
             );
         }
 
-        let descr_ptr = Arc::as_ptr(&guard_token.fail_descr) as *const () as i64;
+        let descr_ptr = guard_token.fail_cell_ptr as i64;
         self.emit_mov_imm64(0, descr_ptr);
         dynasm!(self.mc ; .arch aarch64
             ; str x0, [x29, JF_DESCR_OFS as u32]
@@ -4953,7 +5055,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; add x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_SUB: result = arg0 - arg1
@@ -4964,7 +5066,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; sub x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_MUL: result = arg0 * arg1
@@ -4975,7 +5077,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mul x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_AND: result = arg0 & arg1
@@ -4986,7 +5088,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; and x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_OR: result = arg0 | arg1
@@ -4997,7 +5099,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; orr x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_XOR: result = arg0 ^ arg1
@@ -5008,7 +5110,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; eor x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_NEG: result = -arg0
@@ -5018,7 +5120,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; neg x0, x0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_INVERT: result = ~arg0
@@ -5028,7 +5130,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; mvn x0, x0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_LSHIFT: result = arg0 << arg1
@@ -5039,7 +5141,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; lsl x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_RSHIFT: result = arg0 >> arg1 (arithmetic/signed)
@@ -5050,7 +5152,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; asr x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// UINT_RSHIFT: result = arg0 >> arg1 (logical/unsigned)
@@ -5061,7 +5163,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; lsr x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     // ----------------------------------------------------------------
@@ -5075,7 +5177,7 @@ impl<'a> AssemblerARM64<'a> {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; adds x0, x0, x1);
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
         self.guard_success_cc = Some(CC_NO);
     }
 
@@ -5085,7 +5187,7 @@ impl<'a> AssemblerARM64<'a> {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
         dynasm!(self.mc ; .arch aarch64 ; subs x0, x0, x1);
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
         self.guard_success_cc = Some(CC_NO);
     }
 
@@ -5105,7 +5207,7 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x3, x4
             ; mov x0, x2
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
         self.guard_success_cc = Some(CC_E);
     }
 
@@ -5146,8 +5248,8 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x0, 0
         );
         self.guard_success_cc = Some(CC_NE);
-        if !op.pos.get().is_none() {
-            self.emit_setcc_to_result(CC_NE, op.pos.get());
+        if !op.pos().get().is_none() {
+            self.emit_setcc_to_result(CC_NE, op.pos().get());
         }
     }
 
@@ -5159,8 +5261,8 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x0, 0
         );
         self.guard_success_cc = Some(CC_E);
-        if !op.pos.get().is_none() {
-            self.emit_setcc_to_result(CC_E, op.pos.get());
+        if !op.pos().get().is_none() {
+            self.emit_setcc_to_result(CC_E, op.pos().get());
         }
     }
 
@@ -5249,10 +5351,24 @@ impl<'a> AssemblerARM64<'a> {
 
     /// Infer fail_arg_types from `op.type_` (via `opref_type`) or
     /// `op.fail_arg_types`.
-    fn infer_fail_arg_types(&self, op: &Op, op_index: Option<usize>) -> Vec<Type> {
+    /// Refresh descr types only when they disagree. Compare against a
+    /// stack `SmallVec` so the compiled path (`store_final_boxes_in_guard`
+    /// already wrote the list) does not `to_vec()` a 32 B copy per guard.
+    fn ensure_fail_arg_types(&self, op: &Op, op_index: Option<usize>, fd: &dyn FailDescr) {
+        let inferred = self.infer_fail_arg_types(op, op_index);
+        if fd.fail_arg_types() != inferred.as_slice() {
+            fd.set_fail_arg_types(inferred.into_vec());
+        }
+    }
+
+    fn infer_fail_arg_types(&self, op: &Op, op_index: Option<usize>) -> SmallVec<[Type; 8]> {
         if (op.opcode == OpCode::Finish || op.opcode == OpCode::Jump)
-            && let Some(descr_types) = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec())
-            && !descr_types.is_empty()
+            && let Some(descr_types) = op
+                .with_fail_descr(|fd| {
+                    let dt = fd.fail_arg_types();
+                    (!dt.is_empty()).then(|| SmallVec::from_slice(dt))
+                })
+                .flatten()
         {
             return descr_types;
         }
@@ -5265,19 +5381,19 @@ impl<'a> AssemblerARM64<'a> {
             // op.fail_arg_types only for sharing-path guards
             // (optimizeopt/mod.rs) where op.descr=None.
             let dt = fd.fail_arg_types();
-            let expected_len = op.getfailargs().map(|fa| fa.len()).unwrap_or(0);
+            let expected_len = op.guard_fail_args().map(|fa| fa.len()).unwrap_or(0);
             if dt.len() == expected_len && !dt.is_empty() {
-                return dt.to_vec();
+                return SmallVec::from_slice(dt);
             }
         }
         if let Some(ts) = op.get_fail_arg_types() {
             let expected_len = if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
                 op.num_args()
             } else {
-                op.getfailargs().map(|fa| fa.len()).unwrap_or(0)
+                op.guard_fail_args().map(|fa| fa.len()).unwrap_or(0)
             };
             if ts.len() == expected_len {
-                ts.to_vec()
+                SmallVec::from_slice(&ts)
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
                 op.getarglist()
                     .iter()
@@ -5293,7 +5409,7 @@ impl<'a> AssemblerARM64<'a> {
                             })
                     })
                     .collect()
-            } else if let Some(fa) = op.getfailargs() {
+            } else if let Some(fa) = op.guard_fail_args() {
                 fa.iter()
                     .map(|opref| {
                         if opref.is_none() {
@@ -5322,7 +5438,7 @@ impl<'a> AssemblerARM64<'a> {
                     })
                     .collect()
             } else {
-                Vec::new()
+                SmallVec::new()
             }
         } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
             // Finish/Jump carry no failargs; their result kind comes from
@@ -5347,7 +5463,7 @@ impl<'a> AssemblerARM64<'a> {
                         })
                 })
                 .collect()
-        } else if let Some(fa) = op.getfailargs() {
+        } else if let Some(fa) = op.guard_fail_args() {
             fa.iter()
                 .map(|opref| {
                     if opref.is_none() {
@@ -5368,7 +5484,7 @@ impl<'a> AssemblerARM64<'a> {
                 })
                 .collect()
         } else {
-            Vec::new()
+            SmallVec::new()
         }
     }
 
@@ -5400,7 +5516,6 @@ impl<'a> AssemblerARM64<'a> {
         // Pre-allocate the fail descr for the next GUARD_NOT_FORCED.
         // The full metadata (faillocs, rd_numb, etc.) will be filled in
         // when the guard is actually emitted in append_guard_token_with_faillocs.
-        let fail_arg_types = self.infer_fail_arg_types(next_op, Some(next_idx));
         // Pre-allocated GuardNotForced descr — ResumeGuardDescr family.
         // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
         // here so `append_guard_token_with_faillocs` does not need a second
@@ -5416,15 +5531,16 @@ impl<'a> AssemblerARM64<'a> {
             // Same staleness guard as the main guard-emission path: keep
             // descriptor `fail_arg_types` in sync with the inferred list
             // so downstream GC-map / rd_locs readers see the right Ref
-            // slots.
-            if let Some(fd) = d.as_fail_descr()
-                && fd.fail_arg_types() != fail_arg_types.as_slice()
-            {
-                fd.set_fail_arg_types(fail_arg_types);
+            // slots. Do not `to_vec()` the descr's own list to compare.
+            if let Some(fd) = d.as_fail_descr() {
+                self.ensure_fail_arg_types(next_op, Some(next_idx), fd);
             }
             d
         } else {
-            let fresh = majit_backend::make_resume_guard_descr_typed(fail_arg_types);
+            let fresh = majit_backend::make_resume_guard_descr_typed(
+                self.infer_fail_arg_types(next_op, Some(next_idx))
+                    .into_vec(),
+            );
             if let Some(fd) = fresh.as_fail_descr() {
                 fd.set_fail_index_per_trace(fail_index);
                 fd.set_trace_id(self.trace_id);
@@ -5437,10 +5553,9 @@ impl<'a> AssemblerARM64<'a> {
         // here (not the bare `Arc<dyn Descr>` fat-pointer data half) and
         // hand the cell off to `append_guard_token_with_faillocs` so the
         // inline guard-exit path bakes the same identity into jf_descr.
-        let cell = majit_ir::FailDescrCell::wrap(descr.clone());
-        let descr_ptr = Arc::as_ptr(&cell) as *const () as i64;
+        let descr_ptr = self.fail_descrs.push(descr.clone()) as i64;
         self.pending_force_descr = Some(descr);
-        self.pending_force_cell = Some(cell);
+        self.pending_force_cell = Some(descr_ptr as usize);
 
         // x86/assembler.py:2210-2222: store descr to jf_force_descr,
         // zero jf_descr.
@@ -5539,8 +5654,7 @@ impl<'a> AssemblerARM64<'a> {
 
         // Singleton: jf_descr bakes the cpu-attached `global_descr_ptr`,
         // not the cell pointer (see OpCode::Finish comment above).
-        self.fail_descrs
-            .push(majit_ir::FailDescrCell::wrap(descr.clone()));
+        self.fail_descrs.push(descr.clone());
     }
 
     // ----------------------------------------------------------------
@@ -5606,7 +5720,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fadd d0, d0, d1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_SUB: result = arg0 - arg1
@@ -5617,7 +5731,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fsub d0, d0, d1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_MUL: result = arg0 * arg1
@@ -5628,7 +5742,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fmul d0, d0, d1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_TRUEDIV: result = arg0 / arg1
@@ -5639,7 +5753,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fdiv d0, d0, d1
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// FLOAT_NEG: result = -arg0
@@ -5651,7 +5765,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fneg d0, d0
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
@@ -5661,7 +5775,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; scvtf d0, x0
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// CAST_FLOAT_TO_INT: result = (i64)arg0 (truncation)
@@ -5671,7 +5785,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fcvtzs x0, d0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     // ----------------------------------------------------------------
@@ -5686,7 +5800,7 @@ impl<'a> AssemblerARM64<'a> {
 
     fn argloc_imm(arglocs: &[Loc], index: usize) -> i64 {
         match arglocs.get(index) {
-            Some(Loc::Immed(i)) => i.value,
+            Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
             _ => 0,
         }
     }
@@ -5736,7 +5850,8 @@ impl<'a> AssemblerARM64<'a> {
             let is_float = match arg {
                 Loc::Frame(f) => f.ebp_loc.is_float,
                 Loc::Reg(r) => r.is_xmm,
-                Loc::Immed(im) => im.is_float,
+                Loc::Immed(_) => false,
+                Loc::ImmedFloat(_) => true,
                 _ => false,
             };
             let abi_idx = if is_float {
@@ -5774,7 +5889,10 @@ impl<'a> AssemblerARM64<'a> {
                     non_float_dst.push(Loc::Reg(crate::regloc::RegLoc::new(abi_idx, false)));
                 }
                 Loc::Immed(im) => {
-                    immed_args.push((abi_idx, im.value, im.is_float));
+                    immed_args.push((abi_idx, im.value, false));
+                }
+                Loc::ImmedFloat(im) => {
+                    immed_args.push((abi_idx, im.value, true));
                 }
                 // See the x86 twin: Reg/Frame/Immed is the whole range the
                 // regalloc produces, and silently skipping anything else
@@ -5806,7 +5924,7 @@ impl<'a> AssemblerARM64<'a> {
                         self.emit_ldr_fp(16, f.ebp_loc.value);
                         dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, offset]);
                     }
-                    Loc::Immed(im) => {
+                    Loc::Immed(im) | Loc::ImmedFloat(im) => {
                         self.emit_mov_imm64(16, im.value);
                         dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, offset]);
                     }
@@ -5838,7 +5956,7 @@ impl<'a> AssemblerARM64<'a> {
             // Unlike x86, which always ends in `call rax`, this arm is the
             // only place a `blr` is emitted — an unhandled fnloc spelling
             // would emit no call at all and fall through with a stale x0.
-            let Some(Loc::Immed(i)) = fnloc else {
+            let Some(Loc::Immed(i) | Loc::ImmedFloat(i)) = fnloc else {
                 panic!("unsupported AArch64 call target {fnloc:?}");
             };
             let val = i.value;
@@ -5905,11 +6023,11 @@ impl<'a> AssemblerARM64<'a> {
             self.reload_frame_if_necessary();
             self.pop_gcmap();
         }
-        if !op.pos.get().is_none() {
+        if !op.pos().get().is_none() {
             if op.opcode.result_type() == Type::Float {
-                self.store_d0_to_result(op.pos.get());
+                self.store_d0_to_result(op.pos().get());
             } else {
-                self.store_rax_to_result(op.pos.get());
+                self.store_rax_to_result(op.pos().get());
             }
         }
         if std::env::var("MAJIT_TRACE_CALL_DIAG")
@@ -5918,7 +6036,7 @@ impl<'a> AssemblerARM64<'a> {
             == Some(self.trace_id)
         {
             self.emit_push_all_volatile_regs();
-            self.emit_mov_imm64(0, op.pos.get().raw() as i64);
+            self.emit_mov_imm64(0, op.pos().get().raw() as i64);
             dynasm!(self.mc ; .arch aarch64 ; mov x1, x29);
             self.emit_mov_imm64(
                 2,
@@ -6011,8 +6129,8 @@ impl<'a> AssemblerARM64<'a> {
         let nreg = self.load_loc_to_reg(&next_loc, 14);
         dynasm!(self.mc ; .arch aarch64 ; str X(nreg), [x17, 8]); // next @ base+8
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x17); // result = base
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
         dynasm!(self.mc ; .arch aarch64 ; b =>done);
 
@@ -6406,7 +6524,7 @@ impl<'a> AssemblerARM64<'a> {
                 // `- GcHeader::SIZE` bias the register form applies with
                 // `sub x30, x30, ...`: the base addresses the payload while the
                 // card bytes sit before the header.
-                Some(Loc::Immed(loc_index)) => {
+                Some(Loc::Immed(loc_index) | Loc::ImmedFloat(loc_index)) => {
                     let byte_index = loc_index.value >> wb.jit_wb_card_page_shift;
                     let byte_ofs = !(byte_index >> 3) - majit_gc::header::GcHeader::SIZE as i64;
                     let byte_val = (1_i64 << (byte_index & 7)) as u32;
@@ -6769,8 +6887,8 @@ impl<'a> AssemblerARM64<'a> {
         self.emit_mov_imm64(2, Self::new_alloc_fn_addr());
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
         self.inline_memzero(obj_size);
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -6799,8 +6917,8 @@ impl<'a> AssemblerARM64<'a> {
             self.emit_mov_imm64(1, w_class);
             dynasm!(self.mc ; .arch aarch64 ; str x1, [x0, w_class_offset as u32]);
         }
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -6854,7 +6972,7 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(this.mc ; .arch aarch64 ; mov x17, X(src));
             }
             Loc::Frame(frame) => this.emit_ldr_fp(17, frame.ebp_loc.value),
-            Loc::Immed(imm) => this.emit_mov_imm64(17, imm.value),
+            Loc::Immed(imm) | Loc::ImmedFloat(imm) => this.emit_mov_imm64(17, imm.value),
             other => panic!(
                 "genop_restore_exception: unhandled operand {other:?} — x17 still \
             holds the previously loaded operand, which the store below writes"
@@ -6880,7 +6998,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; umulh x0, x0, x1
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
@@ -6899,7 +7017,7 @@ impl<'a> AssemblerARM64<'a> {
                 ; asr x0, x0, sh32
             );
         }
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     // ================================================================
@@ -6913,7 +7031,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64
             ; fabs d0, d0
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     /// CAST_FLOAT_TO_SINGLEFLOAT: f64 → f32 (bits in lower 32 of i64)
@@ -6924,7 +7042,7 @@ impl<'a> AssemblerARM64<'a> {
             ; fcvt s0, d0
             ; fmov w0, s0
         );
-        self.store_rax_to_result(op.pos.get());
+        self.store_rax_to_result(op.pos().get());
     }
 
     /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
@@ -6935,7 +7053,7 @@ impl<'a> AssemblerARM64<'a> {
             ; fmov s0, w0
             ; fcvt d0, s0
         );
-        self.store_d0_to_result(op.pos.get());
+        self.store_d0_to_result(op.pos().get());
     }
 
     // ================================================================
@@ -7067,7 +7185,7 @@ impl<'a> AssemblerARM64<'a> {
             Loc::Reg(r) if !r.is_xmm => {
                 dynasm!(self.mc ; .arch aarch64 ; mov x16, X(r.value));
             }
-            Loc::Immed(imm) => {
+            Loc::Immed(imm) | Loc::ImmedFloat(imm) => {
                 self.emit_mov_imm64(16, imm.value);
             }
             Loc::Frame(f) if !f.ebp_loc.is_float => {
@@ -7100,8 +7218,8 @@ impl<'a> AssemblerARM64<'a> {
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
 
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -7170,8 +7288,8 @@ impl<'a> AssemblerARM64<'a> {
             ; blr x8
             ; ldp x29, x30, [sp], #16
         );
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -7221,8 +7339,8 @@ impl<'a> AssemblerARM64<'a> {
             ; str x1, [x0, 8]                    // store length at offset 8
         );
 
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
         }
     }
 
@@ -7239,7 +7357,7 @@ impl<'a> AssemblerARM64<'a> {
         else {
             panic!("ZERO_ARRAY expects five regalloc locations, got {arglocs:?}");
         };
-        if matches!(size_loc, Loc::Immed(i) if i.value == 0) {
+        if matches!(size_loc, Loc::Immed(i) | Loc::ImmedFloat(i) if i.value == 0) {
             return;
         }
         let (base_size, item_size) = op
@@ -7253,10 +7371,10 @@ impl<'a> AssemblerARM64<'a> {
         // op: a non-constant scale is an invariant break the emitter cannot
         // encode, and failing loud declines the trace instead of silently
         // scaling by one.
-        let Loc::Immed(scale_start) = scale_start_loc else {
+        let (Loc::Immed(scale_start) | Loc::ImmedFloat(scale_start)) = scale_start_loc else {
             panic!("ZERO_ARRAY scale_start must be an immediate, got {scale_start_loc:?}");
         };
-        let Loc::Immed(scale_size) = scale_size_loc else {
+        let (Loc::Immed(scale_size) | Loc::ImmedFloat(scale_size)) = scale_size_loc else {
             panic!("ZERO_ARRAY scale_size must be an immediate, got {scale_size_loc:?}");
         };
         let (scale_start, scale_size) = (scale_start.value, scale_size.value);
@@ -7264,7 +7382,7 @@ impl<'a> AssemblerARM64<'a> {
         // aarch64/opassembler.py:755-839: first compute the byte destination
         // in ip0/x16.  ip0/ip1 are never managed by regalloc.
         self.regalloc_mov(base_loc, &Loc::Reg(crate::aarch64::registers::X16));
-        if let Loc::Immed(start) = start_loc {
+        if let Loc::Immed(start) | Loc::ImmedFloat(start) = start_loc {
             let byte_offset = base_size + start.value * scale_start;
             if byte_offset != 0 {
                 if (0..4096).contains(&byte_offset) {
@@ -7303,14 +7421,14 @@ impl<'a> AssemblerARM64<'a> {
         } else {
             8
         };
-        let constant_start = matches!(start_loc, Loc::Immed(_));
+        let constant_start = matches!(start_loc, Loc::Immed(_) | Loc::ImmedFloat(_));
         let limit = if natural_size < 8 && constant_start {
             8
         } else {
             natural_size
         };
         let constant_bytes = match size_loc {
-            Loc::Immed(size) => Some(size.value * scale_size),
+            Loc::Immed(size) | Loc::ImmedFloat(size) => Some(size.value * scale_size),
             _ => None,
         };
 
@@ -7319,7 +7437,7 @@ impl<'a> AssemblerARM64<'a> {
             // For a constant byte start, group naturally aligned runs into
             // eight-byte stores exactly as upstream does.
             let start_byte = match start_loc {
-                Loc::Immed(start) => start.value * scale_start,
+                Loc::Immed(start) | Loc::ImmedFloat(start) => start.value * scale_start,
                 _ => -1,
             };
             let mut next_group = -1;
@@ -7399,7 +7517,6 @@ fn flush_icache(addr: *const u8, len: usize) {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -7408,7 +7525,7 @@ mod tests {
     use majit_ir::forwarding::bound_operand_from_opref;
     use majit_ir::operand::Operand;
     use majit_ir::{
-        GcRef, InputArg, Op, OpCode, OpRef, Type, Value, make_array_descr_signed,
+        GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_array_descr_signed,
         make_loop_target_descr,
     };
 
@@ -7423,20 +7540,20 @@ mod tests {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
 
-        let malloc = Rc::new(Op::new(
+        let malloc = OpRc::new(Op::new(
             OpCode::CallMallocNursery,
             &[Operand::from_opref(OpRef::const_int(32))],
         ));
-        malloc.pos.set(OpRef::ref_op(0));
+        malloc.pos().set(OpRef::ref_op(0));
 
         let finish = Op::new(OpCode::Finish, &[Operand::from_bound_op(&malloc)]);
-        finish.pos.set(OpRef::void_op(1));
+        finish.pos().set(OpRef::void_op(1));
         finish.set_fail_arg_types(vec![Type::Ref]);
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(517);
         backend
-            .compile_loop(&[], &[malloc, Rc::new(finish)], &token)
+            .compile_loop(&[], &[malloc, OpRc::new(finish)], &token)
             .expect("compile register-resident nursery result trace");
 
         let compiled = token
@@ -7452,8 +7569,8 @@ mod tests {
         );
     }
 
-    fn eval_breaker_poll_ops(word_addr: usize, first_pos: u32) -> (Rc<Op>, Rc<Op>, Rc<Op>) {
-        let word = Rc::new(Op::with_descr(
+    fn eval_breaker_poll_ops(word_addr: usize, first_pos: u32) -> (OpRc, OpRc, OpRc) {
+        let word = OpRc::new(Op::with_descr(
             OpCode::RawLoadI,
             &[
                 Operand::from_opref(OpRef::const_int(word_addr as i64)),
@@ -7461,14 +7578,14 @@ mod tests {
             ],
             make_array_descr_signed(0, 8, Type::Int, true),
         ));
-        word.pos.set(OpRef::int_op(first_pos));
-        let armed = Rc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
-        armed.pos.set(OpRef::int_op(first_pos + 1));
-        let guard = Rc::new(Op::new(
+        word.pos().set(OpRef::int_op(first_pos));
+        let armed = OpRc::new(Op::new(OpCode::IntIsTrue, &[Operand::from_bound_op(&word)]));
+        armed.pos().set(OpRef::int_op(first_pos + 1));
+        let guard = OpRc::new(Op::new(
             OpCode::GuardFalse,
             &[Operand::from_bound_op(&armed)],
         ));
-        guard.pos.set(OpRef::void_op(first_pos + 2));
+        guard.pos().set(OpRef::void_op(first_pos + 2));
         guard.set_fail_arg_types(vec![]);
         guard.setfailargs(vec![].into());
         (word, armed, guard)
@@ -7485,11 +7602,11 @@ mod tests {
         let (word, armed, guard) = eval_breaker_poll_ops(word_addr, 0);
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(3));
+        finish.pos().set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
-        let ops = vec![word, armed, guard, Rc::new(finish)];
+        let ops = vec![word, armed, guard, OpRc::new(finish)];
         backend
             .compile_loop(&[], &ops, &token)
             .expect("compile eval-breaker poll IR");
@@ -7544,13 +7661,13 @@ mod tests {
         // external entry address used by the source trace's closing JUMP.
         let target_descr = make_loop_target_descr(520, false);
         let label = Op::new(OpCode::Label, &[]);
-        label.pos.set(OpRef::void_op(0));
+        label.pos().set(OpRef::void_op(0));
         label.setdescr(target_descr.clone());
 
         let (word, armed, guard) = eval_breaker_poll_ops(word_addr, 1);
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(4));
+        finish.pos().set(OpRef::void_op(4));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
@@ -7558,7 +7675,7 @@ mod tests {
         backend
             .compile_loop(
                 &[],
-                &[Rc::new(label), word, armed, guard, Rc::new(finish)],
+                &[OpRc::new(label), word, armed, guard, OpRc::new(finish)],
                 &target_token,
             )
             .expect("compile cross-trace bitmask target");
@@ -7568,11 +7685,11 @@ mod tests {
         // Enter the target loop body through an external branch. The ordinary
         // IR poll must still load the same constant-address word.
         let jump = Op::new(OpCode::Jump, &[]);
-        jump.pos.set(OpRef::void_op(0));
+        jump.pos().set(OpRef::void_op(0));
         jump.setdescr(target_descr);
         let source_token = JitCellToken::new(521);
         backend
-            .compile_loop(&[], &[Rc::new(jump)], &source_token)
+            .compile_loop(&[], &[OpRc::new(jump)], &source_token)
             .expect("compile external JUMP source");
 
         let frame = backend.execute_token(&target_token, &[]);
@@ -7610,18 +7727,18 @@ mod tests {
             backend.attach_default_test_descrs();
             let target_descr = make_loop_target_descr(522, false);
             let label = Op::new(OpCode::Label, &[]);
-            label.pos.set(OpRef::void_op(0));
+            label.pos().set(OpRef::void_op(0));
             label.setdescr(target_descr.clone());
             let (word, armed, guard) =
                 eval_breaker_poll_ops(Arc::as_ptr(&worker_test_word) as usize, 1);
             let jump = Op::new(OpCode::Jump, &[]);
-            jump.pos.set(OpRef::void_op(4));
+            jump.pos().set(OpRef::void_op(4));
             jump.setdescr(target_descr);
             let token = JitCellToken::new(522);
             backend
                 .compile_loop(
                     &[],
-                    &[Rc::new(label), word, armed, guard, Rc::new(jump)],
+                    &[OpRc::new(label), word, armed, guard, OpRc::new(jump)],
                     &token,
                 )
                 .expect("compile polling loop on worker");
@@ -7743,16 +7860,16 @@ mod tests {
                 index_operand,
             ],
         );
-        barrier.pos.set(OpRef::void_op(2));
+        barrier.pos().set(OpRef::void_op(2));
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(3));
+        finish.pos().set(OpRef::void_op(3));
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(trace_id);
         backend
-            .compile_loop(&inputargs, &[Rc::new(barrier), Rc::new(finish)], &token)
+            .compile_loop(&inputargs, &[OpRc::new(barrier), OpRc::new(finish)], &token)
             .expect("compile COND_CALL_GC_WB_ARRAY trace");
         let frame = backend.execute_token(&token, &values);
         assert!(
@@ -7893,7 +8010,7 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                     self.emit_ldr_fp(d.value, ofs);
                 }
             }
-            (Loc::Immed(i), Loc::Reg(d)) => {
+            (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(d)) => {
                 if d.is_xmm {
                     self.emit_mov_imm64(16, i.value); // x16 = scratch
                     dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(16));
@@ -7901,7 +8018,7 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                     self.emit_mov_imm64(d.value as u32, i.value);
                 }
             }
-            (Loc::Immed(i), ebp_loc_pat!(e)) => {
+            (Loc::Immed(i) | Loc::ImmedFloat(i), ebp_loc_pat!(e)) => {
                 let ofs = e.value;
                 self.emit_mov_imm64(16, i.value);
                 self.emit_str_fp(16, ofs);
