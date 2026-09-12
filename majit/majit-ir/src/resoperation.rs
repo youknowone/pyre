@@ -1301,6 +1301,123 @@ fn free_op_inner(p: std::ptr::NonNull<OpInner>) {
         .push(p);
 }
 
+/// `GuardResOp` extra lives on the ResOperation in the nursery upstream.
+/// Chunked slots keep `Box<OpKindExtra>` (32–40 B) off the process
+/// allocator on the regex `and`/`or` leaf.
+const EXTRA_CHUNK: usize = 1024;
+
+struct ExtraHeap {
+    chunks: Vec<(*mut OpKindExtra, usize)>,
+    free: Vec<*mut OpKindExtra>,
+}
+
+unsafe impl Send for ExtraHeap {}
+unsafe impl Sync for ExtraHeap {}
+
+static EXTRA_HEAP: std::sync::Mutex<ExtraHeap> = std::sync::Mutex::new(ExtraHeap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn extra_slot() -> *mut OpKindExtra {
+    let mut heap = EXTRA_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < EXTRA_CHUNK
+    {
+        let p = unsafe { (*base).add(*used) };
+        *used += 1;
+        return p;
+    }
+    let layout = std::alloc::Layout::array::<OpKindExtra>(EXTRA_CHUNK).expect("OpKindExtra chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut OpKindExtra };
+    assert!(!base.is_null(), "OpKindExtra chunk alloc failed");
+    heap.chunks.push((base, 1));
+    base
+}
+
+fn alloc_extra(e: OpKindExtra) -> *mut OpKindExtra {
+    let p = extra_slot();
+    unsafe {
+        p.write(e);
+    }
+    p
+}
+
+fn release_extra_slot(p: *mut OpKindExtra) {
+    EXTRA_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+fn drop_extra(p: *mut OpKindExtra) {
+    unsafe {
+        p.drop_in_place();
+    }
+    release_extra_slot(p);
+}
+
+const BOTH_CHUNK: usize = 1024;
+
+struct BothHeap {
+    chunks: Vec<(*mut BothPayload, usize)>,
+    free: Vec<*mut BothPayload>,
+}
+
+unsafe impl Send for BothHeap {}
+unsafe impl Sync for BothHeap {}
+
+static BOTH_HEAP: std::sync::Mutex<BothHeap> = std::sync::Mutex::new(BothHeap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn both_slot() -> *mut BothPayload {
+    let mut heap = BOTH_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < BOTH_CHUNK
+    {
+        let p = unsafe { (*base).add(*used) };
+        *used += 1;
+        return p;
+    }
+    let layout = std::alloc::Layout::array::<BothPayload>(BOTH_CHUNK).expect("BothPayload chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut BothPayload };
+    assert!(!base.is_null(), "BothPayload chunk alloc failed");
+    heap.chunks.push((base, 1));
+    base
+}
+
+fn alloc_both(b: BothPayload) -> *mut BothPayload {
+    let p = both_slot();
+    unsafe {
+        p.write(b);
+    }
+    p
+}
+
+fn release_both_slot(p: *mut BothPayload) {
+    BOTH_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+fn drop_both(p: *mut BothPayload) {
+    unsafe {
+        p.drop_in_place();
+    }
+    release_both_slot(p);
+}
+
 impl OpRc {
     pub fn new(op: Op) -> Self {
         let ptr = alloc_op_inner();
@@ -2289,7 +2406,7 @@ fn box_payload(w: u64) -> usize {
     (w & !SLOT_BOX_BIT & !SLOT_THIN_FWD_BIT) as usize
 }
 
-fn take_word(w: u64) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32) {
+fn take_word(w: u64) -> (Option<DescrRef>, Option<OpKindExtra>, u64, u32) {
     if w == 0 {
         (None, None, 0, 0)
     } else if is_stamp_inline(w) {
@@ -2299,11 +2416,15 @@ fn take_word(w: u64) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32) {
         let (d, e, f, _) = take_word(p.inner);
         (d, e, f, p.stamp)
     } else if is_extra_inline(w) {
-        let extra = unsafe { Box::from_raw(tagged_ptr(w) as *mut OpKindExtra) };
+        let p = tagged_ptr(w) as *mut OpKindExtra;
+        let extra = unsafe { p.read() };
+        release_extra_slot(p);
         (None, Some(extra), 0, 0)
     } else if is_both_inline(w) {
-        let both = unsafe { Box::from_raw(tagged_ptr(w) as *mut BothPayload) };
-        (Some(both.descr), Some(Box::new(both.extra)), 0, 0)
+        let p = tagged_ptr(w) as *mut BothPayload;
+        let both = unsafe { p.read() };
+        release_both_slot(p);
+        (Some(both.descr), Some(both.extra), 0, 0)
     } else if is_thin_fwd_box(w) {
         let p = free_thin_fwd(box_payload(w) as *mut ThinFwd);
         let (lo, hi) = thin_to_lo_hi(p.thin);
@@ -2348,11 +2469,11 @@ fn drop_packed_word(w: u64) {
         return;
     }
     if is_extra_inline(w) {
-        drop(unsafe { Box::from_raw(tagged_ptr(w) as *mut OpKindExtra) });
+        drop_extra(tagged_ptr(w) as *mut OpKindExtra);
         return;
     }
     if is_both_inline(w) {
-        drop(unsafe { Box::from_raw(tagged_ptr(w) as *mut BothPayload) });
+        drop_both(tagged_ptr(w) as *mut BothPayload);
         return;
     }
     if is_thin_fwd_box(w) {
@@ -2378,8 +2499,8 @@ fn drop_packed_word(w: u64) {
 unsafe fn drop_descr_extra(lo: usize, hi: usize) {
     unsafe {
         match hi {
-            EXTRA_TAG => drop(Box::from_raw(lo as *mut OpKindExtra)),
-            BOTH_TAG => drop(Box::from_raw(lo as *mut BothPayload)),
+            EXTRA_TAG => drop_extra(lo as *mut OpKindExtra),
+            BOTH_TAG => drop_both(lo as *mut BothPayload),
             FWD_TAG => crate::forwarding::drop_packed_forwarded(lo as u64),
             DESCR_FWD_TAG => {
                 let p = Box::from_raw(lo as *mut DescrFwd);
@@ -2488,13 +2609,13 @@ impl DescrSlot {
         Self::from_parts(v, None)
     }
 
-    fn from_parts(descr: Option<DescrRef>, extra: Option<Box<OpKindExtra>>) -> Self {
+    fn from_parts(descr: Option<DescrRef>, extra: Option<OpKindExtra>) -> Self {
         Self::from_parts_full(descr, extra, 0)
     }
 
     fn from_parts_full(
         descr: Option<DescrRef>,
-        extra: Option<Box<OpKindExtra>>,
+        extra: Option<OpKindExtra>,
         forwarded: u64,
     ) -> Self {
         let slot = DescrSlot {
@@ -2682,12 +2803,7 @@ impl DescrSlot {
         }
     }
 
-    fn write_parts(
-        &self,
-        descr: Option<DescrRef>,
-        extra: Option<Box<OpKindExtra>>,
-        forwarded: u64,
-    ) {
+    fn write_parts(&self, descr: Option<DescrRef>, extra: Option<OpKindExtra>, forwarded: u64) {
         let has_fwd = forwarded != 0;
         match (descr, extra, has_fwd) {
             (None, None, false) => self.set_bits(0, 0),
@@ -2705,7 +2821,7 @@ impl DescrSlot {
                 }
             },
             (None, Some(e), false) => {
-                let ptr = Box::into_raw(e) as usize;
+                let ptr = alloc_extra(e) as usize;
                 debug_assert_eq!(self.word(), 0);
                 debug_assert_eq!(ptr as u64 & !THIN_DESCR_PTR_MASK, 0);
                 debug_assert_eq!(ptr & 7, 0);
@@ -2714,10 +2830,7 @@ impl DescrSlot {
                 }
             }
             (Some(d), Some(e), false) => {
-                let ptr = Box::into_raw(Box::new(BothPayload {
-                    descr: d,
-                    extra: *e,
-                })) as usize;
+                let ptr = alloc_both(BothPayload { descr: d, extra: e }) as usize;
                 debug_assert_eq!(self.word(), 0);
                 debug_assert_eq!(ptr as u64 & !THIN_DESCR_PTR_MASK, 0);
                 debug_assert_eq!(ptr & 7, 0);
@@ -2745,7 +2858,7 @@ impl DescrSlot {
             },
             (None, Some(e), true) => {
                 let ptr = Box::into_raw(Box::new(ExtraFwd {
-                    extra: *e,
+                    extra: e,
                     forwarded,
                 }));
                 self.set_bits(ptr as usize, EXTRA_FWD_TAG);
@@ -2753,7 +2866,7 @@ impl DescrSlot {
             (Some(d), Some(e), true) => {
                 let ptr = Box::into_raw(Box::new(BothFwd {
                     descr: Some(d),
-                    extra: *e,
+                    extra: e,
                     forwarded,
                 }));
                 self.set_bits(ptr as usize, BOTH_FWD_TAG);
@@ -2761,12 +2874,12 @@ impl DescrSlot {
         }
     }
 
-    fn take_parts(&self) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64) {
+    fn take_parts(&self) -> (Option<DescrRef>, Option<OpKindExtra>, u64) {
         let (d, e, f, _stamp) = self.take_parts_full();
         (d, e, f)
     }
 
-    fn take_parts_full(&self) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32) {
+    fn take_parts_full(&self) -> (Option<DescrRef>, Option<OpKindExtra>, u64, u32) {
         let w = self.word();
         unsafe {
             *self.word.get() = 0;
@@ -2863,9 +2976,11 @@ impl DescrSlot {
                         if packed == 0 {
                             return;
                         }
-                        let extra = Box::from_raw((*p).lo as *mut OpKindExtra);
+                        let ep = (*p).lo as *mut OpKindExtra;
+                        let extra = ep.read();
+                        release_extra_slot(ep);
                         (*p).lo = Box::into_raw(Box::new(ExtraFwd {
-                            extra: *extra,
+                            extra,
                             forwarded: packed,
                         })) as usize;
                         (*p).hi = EXTRA_FWD_TAG;
@@ -2874,7 +2989,9 @@ impl DescrSlot {
                         if packed == 0 {
                             return;
                         }
-                        let both = Box::from_raw((*p).lo as *mut BothPayload);
+                        let bp = (*p).lo as *mut BothPayload;
+                        let both = bp.read();
+                        release_both_slot(bp);
                         (*p).lo = Box::into_raw(Box::new(BothFwd {
                             descr: Some(both.descr),
                             extra: both.extra,
@@ -2942,7 +3059,9 @@ impl DescrSlot {
             return;
         }
         if is_extra_inline(w) {
-            let extra = unsafe { Box::from_raw(tagged_ptr(w) as *mut OpKindExtra) };
+            let p = tagged_ptr(w) as *mut OpKindExtra;
+            let extra = unsafe { p.read() };
+            release_extra_slot(p);
             unsafe {
                 *self.word.get() = 0;
             }
@@ -2950,11 +3069,13 @@ impl DescrSlot {
             return;
         }
         if is_both_inline(w) {
-            let both = unsafe { Box::from_raw(tagged_ptr(w) as *mut BothPayload) };
+            let p = tagged_ptr(w) as *mut BothPayload;
+            let both = unsafe { p.read() };
+            release_both_slot(p);
             unsafe {
                 *self.word.get() = 0;
             }
-            self.write_parts(Some(both.descr), Some(Box::new(both.extra)), packed);
+            self.write_parts(Some(both.descr), Some(both.extra), packed);
             return;
         }
         let stamp = if w != 0 {
@@ -2998,7 +3119,7 @@ impl DescrSlot {
         unsafe { peek_extra_mut(lo, hi) }
     }
 
-    pub(crate) fn extra_replace(&self, extra: Option<Box<OpKindExtra>>) {
+    pub(crate) fn extra_replace(&self, extra: Option<OpKindExtra>) {
         let (descr, old, fwd, stamp) = self.take_parts_full();
         drop(old);
         self.write_parts(descr, extra, fwd);
@@ -3007,23 +3128,25 @@ impl DescrSlot {
         }
     }
 
-    pub(crate) fn extra_clone_box(&self) -> Option<Box<OpKindExtra>> {
-        self.extra_ref().map(|e| Box::new(e.clone()))
+    pub(crate) fn extra_clone_box(&self) -> Option<OpKindExtra> {
+        self.extra_ref().cloned()
     }
 }
 
-unsafe fn decode_descr_extra(
-    lo: usize,
-    hi: usize,
-) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64) {
+unsafe fn decode_descr_extra(lo: usize, hi: usize) -> (Option<DescrRef>, Option<OpKindExtra>, u64) {
     unsafe {
         if lo == 0 && hi == 0 {
             (None, None, 0)
         } else if hi == EXTRA_TAG {
-            (None, Some(Box::from_raw(lo as *mut OpKindExtra)), 0)
+            let p = lo as *mut OpKindExtra;
+            let extra = p.read();
+            release_extra_slot(p);
+            (None, Some(extra), 0)
         } else if hi == BOTH_TAG {
-            let both = Box::from_raw(lo as *mut BothPayload);
-            (Some(both.descr), Some(Box::new(both.extra)), 0)
+            let p = lo as *mut BothPayload;
+            let both = p.read();
+            release_both_slot(p);
+            (Some(both.descr), Some(both.extra), 0)
         } else if hi == FWD_TAG {
             (None, None, lo as u64)
         } else if hi == DESCR_FWD_TAG {
@@ -3031,10 +3154,10 @@ unsafe fn decode_descr_extra(
             (Some(p.descr), None, p.forwarded)
         } else if hi == EXTRA_FWD_TAG {
             let p = Box::from_raw(lo as *mut ExtraFwd);
-            (None, Some(Box::new(p.extra)), p.forwarded)
+            (None, Some(p.extra), p.forwarded)
         } else if hi == BOTH_FWD_TAG {
             let p = Box::from_raw(lo as *mut BothFwd);
-            (p.descr, Some(Box::new(p.extra)), p.forwarded)
+            (p.descr, Some(p.extra), p.forwarded)
         } else {
             (Some(descr_arc_from_bits(lo, hi)), None, 0)
         }
@@ -3144,7 +3267,7 @@ impl std::fmt::Debug for DescrSlot {
 pub(crate) struct ExtraSlot;
 
 impl ExtraSlot {
-    pub(crate) fn new(_v: Option<Box<OpKindExtra>>) -> Self {
+    pub(crate) fn new(_v: Option<OpKindExtra>) -> Self {
         ExtraSlot
     }
 }
@@ -3754,8 +3877,7 @@ impl Op {
         match self.descr.extra_ref() {
             Some(OpKindExtra::VectorGuard(vg)) => {
                 let vec = vg.vec.clone();
-                self.descr
-                    .extra_replace(Some(Box::new(OpKindExtra::Vector(vec))));
+                self.descr.extra_replace(Some(OpKindExtra::Vector(vec)));
             }
             Some(OpKindExtra::Guard(_)) => {
                 self.descr.extra_replace(None);
@@ -3778,16 +3900,14 @@ impl Op {
             Some(OpKindExtra::Vector(v)) => {
                 let vec = v.clone();
                 self.descr
-                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard(Box::new(
-                        VectorGuardExtra {
-                            guard: GuardExtra::new(),
-                            vec,
-                        },
-                    )))));
+                    .extra_replace(Some(OpKindExtra::VectorGuard(Box::new(VectorGuardExtra {
+                        guard: GuardExtra::new(),
+                        vec,
+                    }))));
             }
             None => {
                 self.descr
-                    .extra_replace(Some(Box::new(OpKindExtra::Guard(GuardExtra::new()))));
+                    .extra_replace(Some(OpKindExtra::Guard(GuardExtra::new())));
             }
         }
         self.descr
@@ -3811,13 +3931,12 @@ impl Op {
             Some(OpKindExtra::Guard(g)) => {
                 let guard = g.clone();
                 self.descr
-                    .extra_replace(Some(Box::new(OpKindExtra::VectorGuard(Box::new(
-                        VectorGuardExtra { guard, vec: info },
-                    )))));
+                    .extra_replace(Some(OpKindExtra::VectorGuard(Box::new(VectorGuardExtra {
+                        guard,
+                        vec: info,
+                    }))));
             }
-            None => self
-                .descr
-                .extra_replace(Some(Box::new(OpKindExtra::Vector(info)))),
+            None => self.descr.extra_replace(Some(OpKindExtra::Vector(info))),
         }
     }
 
@@ -3825,8 +3944,7 @@ impl Op {
         match self.descr.extra_ref() {
             Some(OpKindExtra::VectorGuard(vg)) => {
                 let guard = vg.guard.clone();
-                self.descr
-                    .extra_replace(Some(Box::new(OpKindExtra::Guard(guard))));
+                self.descr.extra_replace(Some(OpKindExtra::Guard(guard)));
             }
             Some(OpKindExtra::Vector(_)) => self.descr.extra_replace(None),
             _ => {}
