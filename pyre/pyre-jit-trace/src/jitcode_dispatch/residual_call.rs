@@ -8110,13 +8110,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
-        // `_record_helper_varargs` counts RECORDED_OPS as it records; a
-        // may-force call takes `history.record_nospec` and counts nothing.
-        if profiled_call {
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
-        }
 
         // `MIFrame.execute_varargs(pure=True)` parity: for
         // `CallPure*` whose every argbox carries a known `box_value`,
@@ -8135,6 +8128,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             patch_pos,
             recorded,
         );
+        // `_record_helper_varargs` counts RECORDED_OPS as it records; a
+        // may-force call takes `history.record_nospec` and counts nothing.
+        // An all-const pure fold cuts the call back out (`record_result_of_call_pure`),
+        // so only a standing call op is a recorded op.
+        if profiled_call && recorded.inline_const_to_value().is_none() {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
 
         // pyjitpl.py `_opimpl_residual_call{1,2,3}` parity
         // for the remaining shapes.  PyPy
@@ -9731,13 +9733,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
-        // `_record_helper_varargs` counts RECORDED_OPS as it records; a
-        // may-force call takes `history.record_nospec` and counts nothing.
-        if profiled_call {
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
-        }
 
         // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
@@ -9750,6 +9745,12 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             patch_pos,
             recorded,
         );
+        // See `dispatch_residual_call_iRd_kind`: count only a standing call.
+        if profiled_call && recorded.inline_const_to_value().is_none() {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
 
         // Non-elidable concrete-execute parity — see
         // `dispatch_residual_call_iRd_kind` for the full citation.
@@ -10024,13 +10025,6 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
-        // `_record_helper_varargs` counts RECORDED_OPS as it records; a
-        // may-force call takes `history.record_nospec` and counts nothing.
-        if profiled_call {
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
-        }
 
         // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
@@ -10043,6 +10037,12 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             patch_pos,
             recorded,
         );
+        // See `dispatch_residual_call_iRd_kind`: count only a standing call.
+        if profiled_call && recorded.inline_const_to_value().is_none() {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
         // `boxes3`-shaped may-force residual (`CallMayForce{R,I,F,N}`):
         // execute concretely under the authoritative walk and stamp the
         // result, identically to the `iRd` / `iIRd` siblings.
