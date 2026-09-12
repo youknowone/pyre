@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=22
+# pyre-check: max-pypy-ratio=11
 # Every traceback node keeps the line its frame was executing, including for
 # a frame the JIT compiled and exited with an uncaught exception.
 #

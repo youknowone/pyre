@@ -4980,10 +4980,25 @@ pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     }
 }
 
-/// True iff `callable` is the builtin `len` function object — a
-/// builtin-code function whose code wraps [`__majit_wrap_builtin_len`].  The JIT
-/// walker uses this to recognize a `len(x)` residual it can lower to the
-/// container's inline length read.
+/// True iff `callable` is `BaseException.__reduce__` — the builtin whose
+/// code wraps [`base_exception_reduce`].  Subclasses inherit this through
+/// the MRO; `ImportError` / `OSError` install their own and do not match.
+pub fn is_builtin_base_exception_reduce_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(
+            crate::gateway::builtin_code_get(code),
+            base_exception_reduce as crate::gateway::BuiltinCodeFn,
+        )
+    }
+}
+
 pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
     unsafe {
         if callable.is_null() || !crate::is_function(callable) {

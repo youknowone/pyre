@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=116
+# pyre-check: max-pypy-ratio=22
+# Local dynasm check.py reads ~11x; 22 is twice that. 116 was the N=40000
+# blanket from the first synth sweep.
 # An exception escaping a compiled frame that holds a try block it does NOT
 # match must keep the CALLER's traceback node:
 #
@@ -19,7 +21,7 @@
 # `d_while_nonmatching` cover the other two cleanup shapes that reach the same
 # RERAISE, and `d_no_mid` pins that neither an inlined intermediate frame nor
 # a compiled exception-edge bridge is needed to trigger it.
-N = 40000
+N = 400000
 
 
 def names(e):

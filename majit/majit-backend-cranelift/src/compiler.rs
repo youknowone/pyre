@@ -7759,7 +7759,7 @@ pub(crate) fn fail_descr_bridge_ref(fd: &dyn FailDescr) -> Option<Arc<BridgeData
     }
 }
 
-/// `compile.py:attach_bridge` / `assembler.py:987 patch_jump_for_descr`
+/// `x86/assembler.py patch_jump_for_descr` / `aarch64/assembler.py patch_trace`
 /// parity — atomic-store the bridge `Arc` raw pointer into the
 /// meta-side dispatch cell, and publish `(code_ptr, frame_depth)`
 /// into the cache cells that `emit_attached_bridge_dispatch` baked

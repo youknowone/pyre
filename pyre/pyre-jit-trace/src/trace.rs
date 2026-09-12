@@ -1957,6 +1957,23 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
 ) -> TraceAction {
+    // `_prepare_exception_resumption` (`pyjitpl.py`): the grab
+    // `trace_and_compile_from_bridge` published is the standing exception
+    // this drain's innermost sub-walk reads as `sym.last_exc_value`.  The
+    // live-frame walk seeds through `seed_standing_exception_for_walk`;
+    // this path never calls that function.
+    let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+    if bh_exc != 0 {
+        let exc = bh_exc as pyre_object::PyObjectRef;
+        if !exc.is_null() && unsafe { pyre_object::is_exception(exc) } {
+            let exc_box = ctx.const_ref(exc as i64);
+            sym.set_current_exc_value(exc);
+            sym.set_current_exc_box(exc_box);
+            sym.set_last_exc_value(exc);
+            sym.set_last_exc_box(exc_box);
+            sym.set_class_of_last_exc_is_const(true);
+        }
+    }
     let entry_depth = ctx.virtualref_boxes_len();
     let pre_virtualref_boxes = ctx.snapshot_virtualref_boxes();
     let pre_pos = ctx.get_trace_position();

@@ -1,5 +1,8 @@
-# pyre-check: max-pypy-ratio=118
+# pyre-check: max-pypy-ratio=3.5
 # pyre-check: skip-cpython
+# Local dynasm check.py reads 1.1-1.7x; may_fail is inlined and the
+# raise is one virtualized bridge (1 loop, 1 bridge). 3.5 is twice the
+# slowest. 118 was the N=250000 blanket from the first synth sweep.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
 # 41258646 puts pypy at 63ms, barely clear of it; every count that leaves pypy

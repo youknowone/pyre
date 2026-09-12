@@ -3905,33 +3905,12 @@ pub fn trace_and_compile_from_bridge(
     // bridge-side analogue of the same fallthrough-not-catch resume gap.
     // pyre encodes the guard's resume_pc as the no-exception semantic
     // fallthrough (the next opcode after the call), NOT the `except`
-    // handler.  The blackhole compensates at runtime — `resume_in_blackhole`
-    // hands the pending exception to `handle_exception_in_frame`, which
-    // `find_catch_before_resume_live`-routes to the handler and runs it
-    // (e.g. `return -1`).  The bridge tracer has no such routing: it walks
-    // from the fallthrough resume_pc and records the RETURN of the (NULL)
-    // raised-call result — `Finish(<unbound box>)` — so the compiled bridge
-    // hands a NULL up to the caller ("call failed" / a corrupted kept value
-    // / a fault).  Detect the caught-in-frame case with the exact mechanism
-    // the interpreter's `handle_exception` uses — an exception-table lookup
-    // at the raising op (`last_instr` == resume_pc-1) — and decline so the
-    // always-correct blackhole resume handles it.  (Routing the bridge walk
-    // to the handler is the orthodox follow-up, gated on the in-try
-    // residual-call resume-PC epic; declining is correctness-first.)
-    //
-    // The escaping case — an exception guard whose raising op is NOT caught in
-    // this frame, so the exception unwinds OUT to the caller — has the same
-    // fallthrough-not-catch resume gap: the guard's resume_pc is the
-    // no-exception fallthrough, so the bridge walk records the RETURN of the
-    // NULL raised-call result and the compiled bridge hands a NULL up to the
-    // caller (the "call failed" crash).  The
-    // `emit_exception_bridge_prologue` GUARD_EXCEPTION path that would trace
-    // the propagate-out continuation needs resume-data replay pyre does not yet
-    // have (its synthetic guard carries no rd_resume_position), so decline the
-    // escaping case too and let the blackhole propagate the exception out of
-    // the frame to the caller's handler.  Compiling a real raising bridge
-    // (`Finish(exc, exit_frame_with_exception_descr_ref)`) is the orthodox
-    // follow-up, gated on the same exception-edge bridge epic.
+    // handler.  `finishframe_exception` (`pyjitpl.py`) looks up
+    // `catch_exception` on the resumed framestack innermost-first and
+    // jumps there; the walker's `find_catch_for_exc_resume` is that
+    // lookup.  Route any catching frame — live or inlined — onto that
+    // handler.  An uncaught raise still blackholes this failure
+    // (`compile_exit_frame_with_exception` is the remaining close).
     /// The exception-table byte offset a `next_instr`-style resume coordinate
     /// maps to, mirroring the live-frame form `frame.last_instr * 2` (where
     /// `last_instr` is `next_instr - 1`).
@@ -3969,48 +3948,44 @@ pub fn trace_and_compile_from_bridge(
         None
     }
 
-    let caught_in_frame = pending_exc && last_bridge_is_exception_guard && {
+    let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
             // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
             // INNERMOST inlined frame while `code` is the live OUTER frame, so
             // the single-frame lookup below would consult the wrong code object.
-            // Ask each resumed frame about its OWN pc instead. Only a raise that
-            // unwinds clear out of every inlined callee into the live frame's
-            // own handler is routable: that unwind discards the callee frames
-            // outright, so there is no inlined framestack left to rebuild. A
-            // catch inside a callee still needs the carrier subwalk and keeps
-            // declining below, as does a raise that escapes the whole resume.
-            resumed_catch_level(&resume_coords) == Some(0)
+            // Ask each resumed frame about its OWN pc instead.
+            // `finishframe_exception` walks `framestack` innermost-first and
+            // jumps to whichever frame's `catch_exception` answers; a catch
+            // inside an inlined callee is a real bridge, not a decline.
+            resumed_catch_level(&resume_coords)
         } else {
             let off = if frame.last_instr < 0 {
                 0u32
             } else {
                 (frame.last_instr as u32) * 2
             };
-            pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off).is_some()
+            pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off)
+                .map(|_| 0usize)
         }
+    } else {
+        None
     };
-    // Exception-edge bridge: route a resume whose handler lives in the LIVE
-    // frame to that `except` handler (walker `find_catch_before_resume_live`)
-    // instead of declining.  `caught_in_frame` already restricts the
-    // multi-frame case to the unwind-to-live-frame shape; the escaping case
-    // (uncaught) and a catch inside an inlined callee still decline below —
-    // those are separate slices (raising-bridge Finish(exc) / carrier subwalk).
-    // Only when the outermost resume section really IS the live frame, which is
-    // what lets the unwind land in a frame that already exists. Re-pointing the
-    // live frame to coordinates belonging to some other code object would
-    // resume the walk against the wrong bytecode.
+    let caught_in_frame = catch_level == Some(0);
+    // `finishframe_exception` (`pyjitpl.py`) jumps to the first catching
+    // frame, live or inlined.  Route whenever any resumed frame catches.
+    // An unwind that lands in the live frame discards the callee frames
+    // (no inlined framestack left).  A catch inside a callee keeps the
+    // carrier walk so the handler is recorded there.
     let unwind_to_live_frame = is_multiframe_resume
         && caught_in_frame
         && resume_coords
             .first()
             .is_some_and(|&(outer_w_code, _)| outer_w_code == frame.pycode as usize);
-    let route_exc_edge = caught_in_frame && (!is_multiframe_resume || unwind_to_live_frame);
-    // The levels this route is about to throw away: `resume_coords` minus the
-    // live frame, which keeps its own recorder at the handler entry.  Published
-    // unconditionally on the routing path — an empty slice for the single-frame
-    // shape — so a previous bridge's levels cannot survive into this walk.
-    pyre_jit_trace::jitcode_dispatch::set_exc_edge_discarded_levels(if route_exc_edge {
+    let route_exc_edge = catch_level.is_some();
+    // Discard inlined levels only when the raise unwinds *to* the live
+    // frame.  A catch inside a callee still needs those levels as the
+    // carrier recipes.
+    pyre_jit_trace::jitcode_dispatch::set_exc_edge_discarded_levels(if unwind_to_live_frame {
         resume_coords.get(1..).unwrap_or(&[])
     } else {
         &[]
@@ -4029,35 +4004,25 @@ pub fn trace_and_compile_from_bridge(
         // this exception-free bridge into the `except` handler (recording the
         // `v = -1` handler body as the bridge body → the handler path runs
         // every iteration).  Clear it so the walk resumes on the real
-        // no-exception continuation.  The decline path below (`pending_exc &&
-        // !route_exc_edge`) keeps the value for the blackhole.
+        // no-exception continuation.
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     }
     if pending_exc && !route_exc_edge {
+        // Uncaught: `finishframe_exception` would
+        // `compile_exit_frame_with_exception`.  That Finish(exc) close is
+        // not wired on this walk yet, so this failure blackholes —
+        // `compile.py` `must_compile` retries via the jitcounter, and
+        // `bridge_declined_terminally` is only for a backend that cannot
+        // attach (`bridge_decline_is_terminal`).
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-trace] decline (pending exc, caught_in_frame={caught_in_frame}) key={} trace={} fail={} resume_pc={}",
+                "[jit][bridge-trace] uncaught pending exc → blackhole key={} trace={} fail={} resume_pc={}",
                 green_key, trace_id, fail_index, resume_pc
             );
         }
         let (driver, _) = crate::eval::driver_pair();
         if driver.is_tracing() {
             driver.meta_interp_mut().abort_trace(false);
-        }
-        // This pre-walk decline returns before the `trace_bytecode` walk, so the
-        // walk-time `TraceAction::Abort` recorder below never runs for it. Record
-        // the guard here so `must_compile_with_values` does not re-enter this
-        // structurally-undecidable bridge every ~`trace_eagerness` failures. Only
-        // an exception guard is recorded: its `pending_exc` is guard-invariant, so
-        // the decline is deterministic while the exc-edge bridge is off. A
-        // `GUARD_NOT_FORCED` (even one carrying pending fields) has a
-        // runtime-conditional `pending_exc` and can still bridge on a later
-        // non-raising failure via the pending-field prologue, so blacklisting it
-        // after one raising failure would defeat that; leave it unrecorded.
-        if last_bridge_is_exception_guard {
-            driver
-                .meta_interp_mut()
-                .record_declined_bridge_guard(descr_arc);
         }
         return BridgeResolution::ResumeBlackhole;
     }

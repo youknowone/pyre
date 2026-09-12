@@ -5110,14 +5110,12 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut
     // re-seeds per frame after the first frame drained the cell.
     // For the walks that reach here this cell is the delivery path for
     // `_prepare_exception_resumption`: `call_jit.rs` publishes
-    // `cpu.grab_exc_value`'s result before bridge tracing starts, zeroes it when
-    // the guard carried no exception, and declines the bridge outright in the
-    // third case.  On an exception-guard bridge one of the two arms below always
-    // returns, so a pre-seed placed on the sym in `setup_bridge_sym` could only
-    // rewrite the pointer this read applies anyway.  Scoped to this leg: the
-    // multi-frame carrier walk never runs this function — `trace.rs` routes it
-    // through `drive_bridge_carrier_walk`, whose sub-walk seeds itself off
-    // `root_sym.last_exc_box()` instead.
+    // `cpu.grab_exc_value`'s result before bridge tracing starts and zeroes
+    // it when the guard carried no exception.  On an exception-guard
+    // bridge one of the two arms below always returns, so a pre-seed
+    // placed on the sym in `setup_bridge_sym` could only rewrite the
+    // pointer this read applies anyway.  The multi-frame carrier walk
+    // seeds the same cell in `drive_bridge_carrier_walk`.
     let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
     if bh_exc != 0 {
         let exc = bh_exc as pyre_object::PyObjectRef;

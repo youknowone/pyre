@@ -7683,6 +7683,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    // `BaseException.descr_reduce`: `(cls, args)` when `w_dict` is empty.
+    // The residual `bh_call_fn(__reduce__, NULL, exc)` otherwise forces
+    // the virtual exception every iteration (`exception_reduce`).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::ExceptionReduce, || {
+            try_walker_specialize_exception_reduce(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::RaiseVarargs
@@ -9173,6 +9186,17 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
                         )? {
                             return Ok(inlined);
+                        }
+                        // Int-strategy miss: `dict.lookup` on dstorage +
+                        // `int_lt < 0` then `raise_key_error`
+                        // (`ll_dict_getitem_with_hash`).  The hit fold
+                        // emits the same lookup's fail arm; residual
+                        // CallMayForce would force the virtual KeyError
+                        // the inlined except is about to catch.
+                        if let Some(outcome) = spec_gate(SpecFold::Subscr, || {
+                            try_walker_specialize_subscr_int_miss(ctx, op.pc, &r_args)
+                        })? {
+                            return Ok((outcome, op.next_pc));
                         }
                         // BINARY_SUBSCR list[int] getitem (int/float storage);
                         // falls through to the generic may-force leg otherwise.

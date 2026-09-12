@@ -410,6 +410,7 @@ spec_folds! {
     FloatCall            => ("float_call",               "residual_call", "-"),
     StrCall              => ("str_call",                 "residual_call", "-"),
     BuiltinDivmod        => ("builtin_divmod",           "residual_call", "-"),
+    ExceptionReduce      => ("exception_reduce",         "residual_call", "-"),
     SetAddMethod         => ("set_add_method",           "residual_call", "-"),
     StoreAttrDirect      => ("store_attr_direct",        "residual_call", "-"),
     StoreAttrResidual    => ("store_attr_residual",      "residual_call", "store_attr_direct"),

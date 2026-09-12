@@ -4727,19 +4727,45 @@ pub unsafe fn setattr_would_force_quasi_immut(
     }
 }
 
-/// Return the first `?` field mapdict.py / 461-470 delete would flip,
-/// without applying the deletion.
+/// First `?` flip of `PlainAttribute._copy_attr` → `add_attr` → `pick_attr`
+/// against `onto`, the map `back.copy` leaves before this node is re-added.
 ///
-/// The `PlainAttribute.delete` → `_copy_attr` → `add_attr` → `pick_attr`
-/// re-add chain (mapdict.py:461-470) is deliberately not modelled: simulating
-/// that rebuild side-effect-free is not tractable against the current
-/// `node_copy` / `add_attr` shape. The optimizer's
-/// `quasiimmut_field_still_valid` revalidation (heap.py:818-819, ported in
-/// majit-metainterp's `optimizeopt/heap.rs`) discards a loop whose recorded `?`
-/// value moved during tracing, so a missed force costs a wasted trace, never
-/// correctness. Watcher installation belongs to the tracer; this predicate
-/// reads no `*_qmut_installed` flag and takes no `QuasiImmutField` lock while a
-/// `cache_attrs` mutex or an `INSTANCE_LOCKS` stripe is held.
+/// `pick_attr` writes `CachedAttributeHolder.typ` when the unbox type
+/// disagrees; that assignment is the quasi-immut invalidation
+/// (`CachedAttributeHolder.pick_attr`). `find_branch_to_move_into_readonly`
+/// returning `None` is the `get_new_attr` arm, which builds a holder whose
+/// `typ` already matches and so does not force.
+unsafe fn copy_attr_would_force_quasi_immut<O: MapdictObject>(
+    onto: MapRef,
+    attr: MapRef,
+    obj: &O,
+) -> Option<MapdictQmutTarget> {
+    if onto.is_null() {
+        return None;
+    }
+    let p = unsafe { (*attr).as_plain() };
+    let w_value = unsafe { plain_direct_read(attr, obj) };
+    let unbox_type = unsafe { pick_unbox_type(onto, w_value) };
+    let (_, holder) =
+        unsafe { find_branch_to_move_into_readonly(onto, &p.name, p.attrkind, unbox_type) }?;
+    let typ = unsafe { (*holder).typ.get() };
+    if typ.is_some() && typ != unbox_type {
+        Some(MapdictQmutTarget::HolderTyp(holder))
+    } else {
+        None
+    }
+}
+
+/// Return the first `?` field `PlainAttribute.delete` would flip, without
+/// applying the deletion.
+///
+/// Matching node: `ever_mutated` (`PlainAttribute.delete`). Newer nodes
+/// that the recursive walk `_copy_attr`s onto `back.copy` run
+/// `add_attr` → `pick_attr`; each is checked against `deleted.back`, which
+/// is exact for the first re-add. Watcher installation belongs to the
+/// tracer; this predicate reads no `*_qmut_installed` flag and takes no
+/// `QuasiImmutField` lock while a `cache_attrs` mutex or an `INSTANCE_LOCKS`
+/// stripe is held.
 ///
 /// # Safety
 /// `w_obj` must be a live object.
@@ -4749,11 +4775,25 @@ pub unsafe fn delattr_would_force_quasi_immut(
     attrkind: u16,
 ) -> Option<MapdictQmutTarget> {
     let mut current = unsafe { mapdict_map_or_null(w_obj) };
+    // Newest first; `_copy_attr` re-adds closest-to-deleted first.
+    let mut newer: Vec<MapRef> = Vec::new();
     while !current.is_null() && unsafe { (*current).is_plain() } {
         let p = unsafe { (*current).as_plain() };
         if p.attrkind == attrkind && &*p.name == name {
-            return (!p.ever_mutated.get()).then_some(MapdictQmutTarget::PlainEverMutated(p));
+            if !p.ever_mutated.get() {
+                return Some(MapdictQmutTarget::PlainEverMutated(p));
+            }
+            let carrier = unsafe { mapdict_carrier(w_obj) };
+            for &newer_map in newer.iter().rev() {
+                if let Some(target) =
+                    unsafe { copy_attr_would_force_quasi_immut(p.back, newer_map, &carrier) }
+                {
+                    return Some(target);
+                }
+            }
+            return None;
         }
+        newer.push(current);
         current = p.back;
     }
     None

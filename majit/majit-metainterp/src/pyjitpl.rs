@@ -15378,9 +15378,28 @@ impl<M: Clone> MetaInterp<M> {
                     fail_descr.trace_id()
                 };
                 self.assign_guard_hashes(&optimized_ops);
+                // `compile.py propagate_original_jitcell_token`: every
+                // LABEL's TargetToken is rebound to
+                // `new_loop.original_jitcell_token`, which
+                // `compile_and_attach` set to the SOURCE loop's token.
+                // `compile_and_attach` runs this before
+                // `send_bridge_to_backend`; the retrace arm already does
+                // the same walk over `unroll_opt.target_tokens`.
+                for op in &optimized_ops {
+                    if !op.opcode.is_label() {
+                        continue;
+                    }
+                    if let Some(ltd) = op
+                        .getdescr()
+                        .as_ref()
+                        .and_then(|d| d.as_loop_target_descr())
+                    {
+                        ltd.set_original_jitcell_token_number(source_jct.number);
+                    }
+                }
                 // `compile.py record_loop_or_bridge(metainterp_sd,
                 //  new_loop)` parity — `new_loop.original_jitcell_token =
-                //  metainterp.resumekey_original_loop_token` (compile.py:801).
+                //  metainterp.resumekey_original_loop_token` (`compile_and_attach`).
                 // The walker stamps every internal `ResumeDescr.rd_loop_token
                 //  = clt(source_jct)` (compile.py:186), so the new
                 // bridge-internal guards inherit the *source* JCT identity

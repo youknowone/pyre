@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=55
-# The ceiling is twice the slowest ratio observed (27.3x on the linux runner),
-# rounded up.
+# pyre-check: max-pypy-ratio=37
+# Local dynasm check.py reads 10.3-18.3x; 37 is twice the slowest.
 # Exception-resume bridge (GuardException) with a CONSTANT pre-call operand.
 # Each `try` divides/indexes with a CONSTANT numerator/addend that lives on the
 # operand stack at the raising bytecode. The loop warms up exception-free
@@ -10,7 +9,7 @@
 # lost (NULL), the resume would run op(NULL, ...) and raise a spurious
 # TypeError (bumping `other`) instead of the real ZeroDivisionError / IndexError.
 # Output must stay byte-exact across backends and the oracle.
-N = 48000
+N = 250000
 DATA = [3, 1, 4, 1, 5]
 
 

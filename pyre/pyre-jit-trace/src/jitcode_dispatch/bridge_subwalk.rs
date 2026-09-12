@@ -293,11 +293,10 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // is recorded as the bridge instead of the NULL raised-call fallthrough.
     // `call_jit.rs trace_and_compile_from_bridge` only lets a bridge walk begin
     // with this precondition holding when it has already ROUTED the exc-edge
-    // (published the standing exception into `BH_LAST_EXC_VALUE` and declined to
-    // hand the guard to the blackhole).  So whenever the precondition holds the
-    // walk MUST resume at an `except` handler — falling through to the
-    // no-exception continuation would record the return of the NULL raised-call
-    // result (`Finish(NULL)` → "call failed").
+    // (published the standing exception into `BH_LAST_EXC_VALUE`).  So whenever
+    // the precondition holds the walk MUST resume at an `except` handler —
+    // falling through to the no-exception continuation would record the return
+    // of the NULL raised-call result (`Finish(NULL)` → "call failed").
     let exc_edge_precondition = trace_ctx.is_bridge_trace
         && trace_ctx.bridge_source_is_exception_guard()
         && !sym.last_exc_box().is_none()

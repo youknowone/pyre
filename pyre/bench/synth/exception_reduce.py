@@ -1,7 +1,7 @@
-# pyre-check: max-pypy-ratio=65
-# The ceiling is twice the slowest ratio observed (32.5x on the linux runner),
-# rounded up.
-N = 100000
+# pyre-check: max-pypy-ratio=4
+# After the descr_reduce fold the loop DCEs to incrementing integers.
+# Ceiling is twice a ~2x local dynasm reading.
+N = 8000000
 
 
 def main():

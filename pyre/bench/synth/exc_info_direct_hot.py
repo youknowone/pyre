@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=4.8
+# pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # pyre-check: spec-folds=sys_exc_info,subscr_tuple_slice2
 # PyPy's `vm.py exc_info_direct` lets `function.py funccall_valuestack`
