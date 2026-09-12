@@ -8594,6 +8594,13 @@ where
                     ) {
                         return action;
                     }
+                    // `dont_look_inside_cannot_raise` residuals skip the
+                    // may_force finalize. `dispatch_exception_handler`
+                    // still `frame.push`es the caught exception, so the
+                    // heap vsd moves while the vable shadow does not.
+                    // Reload vsd/stack only — a full static reload
+                    // clobbers last_instr (shadow newer than heap).
+                    ctx.reload_vable_stack_if_heap_moved();
                     // pyjitpl.py — vrefs_after_residual_call
                     // (see void arm for the explanation; gated on
                     // `is_forces` because the before-hook only stamps
@@ -8954,6 +8961,13 @@ where
                     ) {
                         return action;
                     }
+                    // `dont_look_inside_cannot_raise` residuals skip the
+                    // may_force finalize. `dispatch_exception_handler`
+                    // still `frame.push`es the caught exception, so the
+                    // heap vsd moves while the vable shadow does not.
+                    // Reload vsd/stack only — a full static reload
+                    // clobbers last_instr (shadow newer than heap).
+                    ctx.reload_vable_stack_if_heap_moved();
                     // pyjitpl.py — vrefs_after_residual_call
                     // (see void arm for the explanation; gated on
                     // `is_forces` because the before-hook only stamps
