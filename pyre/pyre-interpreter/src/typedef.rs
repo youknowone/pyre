@@ -3926,10 +3926,11 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let annotations_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(annotations);
     if !is_initializing {
-        let key = pyre_object::w_str_new("__annotations__");
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::intern_str_value("__annotations__"));
         crate::baseobjspace::setitem(
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
-            key,
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
             pyre_object::gc_roots::shadow_stack_get(annotations_slot),
         )?;
     }
@@ -3964,13 +3965,13 @@ fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let _ = pyre_object::gc_roots::pin_root(w_dict);
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(value);
-    let annotations_key = pyre_object::w_str_new("__annotations__");
+    let annotations_key = pyre_object::intern_str_value("__annotations__");
     crate::baseobjspace::setitem(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         annotations_key,
         pyre_object::gc_roots::shadow_stack_get(value_slot),
     )?;
-    let annotate_key = pyre_object::w_str_new("__annotate__");
+    let annotate_key = pyre_object::intern_str_value("__annotate__");
     let _ = crate::baseobjspace::delitem(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         annotate_key,
@@ -3991,12 +3992,12 @@ fn module_annotations_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if crate::baseobjspace::finditem_str(w_dict, "__annotations__")?.is_none() {
         return Err(crate::PyError::attribute_error("__annotations__"));
     }
-    let annotations_key = pyre_object::w_str_new("__annotations__");
+    let annotations_key = pyre_object::intern_str_value("__annotations__");
     crate::baseobjspace::delitem(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         annotations_key,
     )?;
-    let annotate_key = pyre_object::w_str_new("__annotate__");
+    let annotate_key = pyre_object::intern_str_value("__annotate__");
     let _ = crate::baseobjspace::delitem(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         annotate_key,
@@ -4022,7 +4023,7 @@ fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // subclass runs Python between the pin and this store and the module dict
     // moves under it; the store therefore reads the slot rather than the word
     // pinned earlier.  The key is an immortal non-GC string and needs no slot.
-    let annotate_key = pyre_object::w_str_new("__annotate__");
+    let annotate_key = pyre_object::intern_str_value("__annotate__");
     crate::baseobjspace::setitem(roots.get(dict_slot), annotate_key, none)?;
     Ok(none)
 }
@@ -4045,14 +4046,14 @@ fn module_annotate_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let _ = pyre_object::gc_roots::pin_root(w_dict);
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
     let value = pyre_object::gc_roots::pin_root(value);
-    let annotate_key = pyre_object::w_str_new("__annotate__");
+    let annotate_key = pyre_object::intern_str_value("__annotate__");
     crate::baseobjspace::setitem(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         annotate_key,
         pyre_object::gc_roots::shadow_stack_get(value_slot),
     )?;
     if !unsafe { pyre_object::is_none(value) } {
-        let annotations_key = pyre_object::w_str_new("__annotations__");
+        let annotations_key = pyre_object::intern_str_value("__annotations__");
         let _ = crate::baseobjspace::delitem(
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
             annotations_key,
@@ -18025,7 +18026,7 @@ fn staticmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
                 let value_roots = pyre_object::gc_roots::push_roots();
                 let value_slot = value_roots.base();
                 let _ = value_roots.pin_root(value);
-                let key = w_str_new(name);
+                let key = pyre_object::intern_str_value(name);
                 crate::baseobjspace::setitem(
                     roots.get(dict_slot),
                     key,
@@ -18103,7 +18104,7 @@ fn staticmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResul
     let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
     let value_slot = dict_slot + 1;
     let _ = roots.pin_root(crate::baseobjspace::getattr_str(function, name)?);
-    let key = w_str_new(name);
+    let key = pyre_object::intern_str_value(name);
     crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
     Ok(roots.get(value_slot))
 }
@@ -18127,7 +18128,7 @@ fn staticmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyR
     let _ = roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
     let value_slot = dict_slot + 1;
     let _ = roots.pin_root(args.get(2).copied().unwrap_or(PY_NULL));
-    let key = w_str_new(name);
+    let key = pyre_object::intern_str_value(name);
     crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
     Ok(w_none())
 }
@@ -18145,7 +18146,7 @@ fn staticmethod_wrapped_attr_del(args: &[PyObjectRef], name: &str) -> crate::PyR
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
     let _ = roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
-    let key = w_str_new(name);
+    let key = pyre_object::intern_str_value(name);
     if let Err(err) = crate::baseobjspace::delitem(roots.get(dict_slot), key) {
         if err.kind == crate::PyErrorKind::KeyError {
             return Err(crate::PyError::attribute_error(format!(
@@ -18370,7 +18371,7 @@ fn classmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
                 let value_roots = pyre_object::gc_roots::push_roots();
                 let value_slot = value_roots.base();
                 let _ = value_roots.pin_root(value);
-                let key = w_str_new(name);
+                let key = pyre_object::intern_str_value(name);
                 crate::baseobjspace::setitem(
                     roots.get(dict_slot),
                     key,
@@ -18433,7 +18434,7 @@ fn classmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResult
     let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
     let value_slot = dict_slot + 1;
     let _ = roots.pin_root(crate::baseobjspace::getattr_str(function, name)?);
-    let key = w_str_new(name);
+    let key = pyre_object::intern_str_value(name);
     crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
     Ok(roots.get(value_slot))
 }
@@ -18453,7 +18454,7 @@ fn classmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyRe
     let _ = roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(cm) });
     let value_slot = dict_slot + 1;
     let _ = roots.pin_root(args.get(2).copied().unwrap_or(PY_NULL));
-    let key = w_str_new(name);
+    let key = pyre_object::intern_str_value(name);
     crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
     Ok(w_none())
 }
@@ -18471,7 +18472,7 @@ fn classmethod_wrapped_attr_del(args: &[PyObjectRef], name: &str) -> crate::PyRe
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
     let _ = roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(cm) });
-    let key = w_str_new(name);
+    let key = pyre_object::intern_str_value(name);
     if let Err(err) = crate::baseobjspace::delitem(roots.get(dict_slot), key) {
         if err.kind == crate::PyErrorKind::KeyError {
             return Err(crate::PyError::attribute_error(format!(

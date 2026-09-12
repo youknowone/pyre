@@ -30,15 +30,12 @@ pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
     // below keeps the old-gen slice in the remembered set so young bounds
     // survive a later minor collection.
     let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(start);
-    let _ = crate::gc_roots::pin_root(stop);
-    let _ = crate::gc_roots::pin_root(step);
+    let save_point = crate::gc_roots::pin_roots(&[start, stop, step]);
     let header = PyObject {
         ob_type: &SLICE_TYPE as *const PyType,
         w_class: get_instantiate(&SLICE_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SLICE_GC_TYPE_ID, W_SLICE_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_SLICE_GC_TYPE_ID, W_SLICE_OBJECT_SIZE);
     let start = crate::gc_roots::shadow_stack_get(save_point);
     let stop = crate::gc_roots::shadow_stack_get(save_point + 1);
     let step = crate::gc_roots::shadow_stack_get(save_point + 2);

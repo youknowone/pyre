@@ -2775,12 +2775,12 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
                 // override `get` are observed.  When the lookup yields
                 // PY_NULL we fall back to `space.w_None` per the
                 // upstream attribute-not-found branch.
-                let name_key = pyre_object::w_str_new("__name__");
+                let mut name_key = pyre_object::unicodeobject::intern_str_value("__name__");
                 // `function.py Function.fget___module__` stores the app-call
                 // result back into `self.w_module`.  The translated graph's
                 // pop-roots reloads `self`; mirror that writeback before the
                 // native path dereferences `func` again.
-                let result = pyre_object::with_roots!(obj =>
+                let result = pyre_object::with_roots!(obj, name_key =>
                     crate::baseobjspace::call_method(w_globals, "get", &[name_key])
                 );
                 let func = obj as *mut Function;
