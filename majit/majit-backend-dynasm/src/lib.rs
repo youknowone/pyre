@@ -880,7 +880,7 @@ mod tests {
     fn test_guard_fail_values_do_not_read_resume_holes() {
         let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         let fail_descr = descr.as_fail_descr().expect("resume guard descr");
-        fail_descr.set_rd_locs(vec![0xFFFF, 2]);
+        fail_descr.set_rd_locs(vec![0xFFFF, 2].into());
 
         // Slot 0 deliberately contains a pointer-shaped poison. The first
         // logical failarg is a resume-data hole, so recovery must not publish
@@ -897,7 +897,7 @@ mod tests {
     fn test_guard_fail_values_all_holes_need_no_frame_slots() {
         let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Ref; 3]);
         let fail_descr = descr.as_fail_descr().expect("resume guard descr");
-        fail_descr.set_rd_locs(vec![0xFFFF; 3]);
+        fail_descr.set_rd_locs(vec![0xFFFF; 3].into());
 
         // No physical slot exists for these logical positions. In particular,
         // recovery must not perform even a speculative read of a hole.

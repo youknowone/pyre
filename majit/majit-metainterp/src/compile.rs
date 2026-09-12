@@ -5138,7 +5138,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
         // `optimize_guard_value` / `replace_old_guard_with_guard_class`, and
         // the vectorizer's `inhert_attributes` — and such a descr never
         // reaches `store_final_boxes_in_guard`, so it has no layout of its own.
-        my_fd.set_rd_locs(donor_fd.rd_locs().to_vec());
+        my_fd.set_rd_locs(donor_fd.rd_locs().to_vec().into());
         // compile.py — chain.clone() preserves the donor's
         // (already-flattened) accumulator chain on self, identity-stable.
         let donor_chain = donor_fd.vector_info();
