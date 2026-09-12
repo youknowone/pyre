@@ -1276,6 +1276,37 @@ pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
     unsafe { (w_str_len(s) != 0) as i64 }
 }
 
+/// `s.startswith(prefix)` / `s.endswith(suffix)` on two exact `str`s with
+/// default bounds.  `rstring.py startswith` / `endswith` are `@jit.elidable`
+/// byte walks; WTF-8 is self-synchronizing, so a byte prefix/suffix match is
+/// the code-point match.  The walker pins both operands as exact `str`
+/// before this call, so a tuple needle or a non-str stays on the residual.
+#[majit_macros::elidable]
+pub extern "C" fn jit_str_startswith(s: i64, prefix: i64) -> i64 {
+    let s = s as PyObjectRef;
+    let prefix = prefix as PyObjectRef;
+    unsafe {
+        i64::from(
+            w_str_get_wtf8(s)
+                .as_bytes()
+                .starts_with(w_str_get_wtf8(prefix).as_bytes()),
+        )
+    }
+}
+
+#[majit_macros::elidable]
+pub extern "C" fn jit_str_endswith(s: i64, suffix: i64) -> i64 {
+    let s = s as PyObjectRef;
+    let suffix = suffix as PyObjectRef;
+    unsafe {
+        i64::from(
+            w_str_get_wtf8(s)
+                .as_bytes()
+                .ends_with(w_str_get_wtf8(suffix).as_bytes()),
+        )
+    }
+}
+
 /// `str(i)` over an unboxed integer: render `i` to its decimal
 /// `W_UnicodeObject`.  The argument is a raw machine integer (the `'i'`
 /// argcode operand), not a boxed object pointer.

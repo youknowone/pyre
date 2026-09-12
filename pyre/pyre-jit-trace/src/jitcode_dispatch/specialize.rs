@@ -15885,14 +15885,45 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
 
     // --- emit the specialized IR (walker-native) ---
     walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
-    let arg_op = r_args[2];
+    walker_emit_jit_int_str(ctx, op.pc, r_args[2], boxed_result, dst)?;
+    Ok(Some(()))
+}
+
+/// Guard exact `int`, unbox, and emit `jit_int_str` + `GuardNoException`.
+/// Shared by [`try_walker_specialize_str_call`] and the FORMAT_SIMPLE int arm.
+///
+/// `EF_CAN_RAISE`, matching the helper's `#[dont_look_inside]` and NOT
+/// an elidable effect.  `descr_repr` (intobject.py) splits the render
+/// from the wrapper — `str(self.intval)` is the `@jit.elidable`
+/// `ll_int2dec` and `space.newutf8(res, len(res))` is a plain
+/// allocation — while this helper performs both in one call.  Recording
+/// the pair pure let the pure pass share one call between two `str(i)`
+/// sites on the same operand, and `is_w` gives a `str` of `_len() > 1`
+/// storage identity, so a compiled loop answered `str(i) is str(i)`
+/// True where the interpreter, pypy3 and CPython all answer False.
+/// Recovering the elidable half needs the render and the wrapper split
+/// into two ops, the shape `emit_box_long_inline` already gives the
+/// bigint arms.
+///
+/// The read/write sets stay empty: the call allocates and touches no
+/// field the trace has cached.  Concrete is set before the guard: the
+/// guard captures a resume snapshot, and a `raw` with no value yet is
+/// recorded into it without one.
+fn walker_emit_jit_int_str<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    boxed_result: pyre_object::PyObjectRef,
+    dst: usize,
+) -> Result<(), DispatchError> {
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op.pc, arg_op, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op.pc, arg_op, int_typeobj)?;
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    walker_guard_class(ctx, op_pc, operand, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, operand, int_typeobj)?;
     let int_raw = walker_unbox_int_typed(
         ctx,
-        op.pc,
-        arg_op,
+        op_pc,
+        operand,
         int_type_addr,
         crate::descr::int_intval_descr(),
     )?;
@@ -15903,34 +15934,222 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
         &[int_raw],
         &[majit_ir::Type::Int],
         majit_ir::Type::Ref,
-        // `EF_CAN_RAISE`, matching the helper's `#[dont_look_inside]` and NOT
-        // an elidable effect.  `descr_repr` (intobject.py) splits the render
-        // from the wrapper — `str(self.intval)` is the `@jit.elidable`
-        // `ll_int2dec` and `space.newutf8(res, len(res))` is a plain
-        // allocation — while this helper performs both in one call.  Recording
-        // the pair pure let the pure pass share one call between two `str(i)`
-        // sites on the same operand, and `is_w` gives a `str` of `_len() > 1`
-        // storage identity, so a compiled loop answered `str(i) is str(i)`
-        // True where the interpreter, pypy3 and CPython all answer False.
-        // Recovering the elidable half needs the render and the wrapper split
-        // into two ops, the shape `emit_box_long_inline` already gives the
-        // bigint arms.
-        //
-        // The read/write sets stay empty: the call allocates and touches no
-        // field the trace has cached.
         majit_ir::EffectInfo::const_new(
             majit_ir::ExtraEffect::CanRaise,
             majit_ir::OopSpecIndex::None,
         ),
     );
-    // Concrete before the guard: the guard captures a resume snapshot, and a
-    // `raw` with no value yet is recorded into it without one.
     ctx.trace_ctx.set_opref_concrete(
         raw,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
     );
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', raw)?;
+    Ok(())
+}
+
+/// FORMAT_SIMPLE (`f"{x}"` / empty-spec `format`) on an exact `int` or
+/// exact `str`: the same empty-spec fast path `format_w` takes, instead of
+/// the opaque `bh_format_simple_fn` residual.
+///
+/// `format_w` with an empty spec is identity for an exact `str` (`format(s,
+/// "") is s`) and `str(i)` for an exact `int`. The `str(i)` arm goes through
+/// [`walker_emit_jit_int_str`], the same emit [`try_walker_specialize_str_call`]
+/// uses. A bool, subclass, long, or anything with a Python `__format__`
+/// declines to the residual (SAFE); `FormatWithSpec` already inlines a
+/// Python `__format__` when a spec operand is present.
+pub(crate) fn try_walker_specialize_format_simple<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 1 {
+        return Ok(None);
+    }
+    let Some(concrete) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(concrete) {
+        return Ok(None);
+    }
+    let value = r_args[0];
+    if unsafe { pyre_object::is_exact_type(concrete, &pyre_object::STR_TYPE) } {
+        let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+        let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+        walker_guard_class(ctx, op.pc, value, str_type_addr)?;
+        walker_guard_exact_w_class(ctx, op.pc, value, str_typeobj)?;
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', value)?;
+        return Ok(Some(()));
+    }
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let int_value = unsafe {
+        if !std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE)
+            || !std::ptr::eq((*concrete).w_class, int_typeobj)
+        {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(concrete)
+    };
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::runtime_ops::format_value(concrete, pyre_object::PY_NULL)
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    let renders_the_same = unsafe {
+        pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE)
+            && pyre_object::w_str_get_value_opt(boxed_result)
+                == Some(pyre_object::unicodeobject::int_str_text(int_value).as_str())
+    };
+    if !renders_the_same {
+        return Ok(None);
+    }
+    walker_emit_jit_int_str(ctx, op.pc, value, boxed_result, dst)?;
+    Ok(Some(()))
+}
+
+/// `s.startswith(prefix)` / `s.endswith(suffix)` on two exact `str`s:
+/// `rstring.py startswith` / `endswith` as one elidable `call_i`, instead of
+/// the MayForce residual through the bound builtin.  The recorded loop in
+/// `string_ops` otherwise pins a fresh concat result and re-enters on every
+/// other word.
+///
+/// Recognition is the bound-method `CallFn` shape `set.add` uses: the
+/// callable is a `Method` whose `__func__` is `str.startswith` /
+/// `str.endswith` and whose `__self__` is an exact `str`.  A tuple needle,
+/// bounds, subclass, or bytes method declines (SAFE).
+pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+    start: bool,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 3 {
+        return Ok(None);
+    }
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(needle),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if callable.is_null() || !null_or_self.is_null() || needle.is_null() {
+        return Ok(None);
+    }
+    let name = if start { "startswith" } else { "endswith" };
+    let (inner_func, inner_self) = unsafe {
+        if !pyre_object::function::is_method(callable) {
+            return Ok(None);
+        }
+        let inner_func = pyre_object::function::w_method_get_func(callable);
+        let inner_self = pyre_object::function::w_method_get_self(callable);
+        if inner_func.is_null()
+            || inner_self.is_null()
+            || !pyre_object::is_exact_type(inner_self, &pyre_object::STR_TYPE)
+            || !pyre_object::is_exact_type(needle, &pyre_object::STR_TYPE)
+        {
+            return Ok(None);
+        }
+        let str_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::STR_TYPE);
+        if pyre_interpreter::lookup_in_type(str_type, name) != Some(inner_func) {
+            return Ok(None);
+        }
+        (inner_func, inner_self)
+    };
+    let observed = if start {
+        pyre_object::unicodeobject::jit_str_startswith(inner_self as i64, needle as i64) != 0
+    } else {
+        pyre_object::unicodeobject::jit_str_endswith(inner_self as i64, needle as i64) != 0
+    };
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(callable, &[needle])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    let boxed_true = std::ptr::eq(boxed_result, pyre_object::w_bool_from(true));
+    if !boxed_true && !std::ptr::eq(boxed_result, pyre_object::w_bool_from(false)) {
+        return Ok(None);
+    }
+    if boxed_true != observed {
+        return Ok(None);
+    }
+
+    let callable_op = r_args[0];
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
+        let type_const = ctx.trace_ctx.const_int(method_type_addr);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardClass,
+            &[callable_op, type_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(callable_op, method_type_addr);
+    }
+    let func_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_function_descr(),
+    );
+    let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[func_ref, func_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(func_ref, func_const);
+
+    let self_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_self_descr(),
+    );
+    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::STR_TYPE);
+    walker_guard_class(ctx, op.pc, self_ref, str_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, self_ref, str_typeobj)?;
+    let needle_op = r_args[2];
+    walker_guard_class(ctx, op.pc, needle_op, str_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, needle_op, str_typeobj)?;
+
+    let helper = if start {
+        pyre_object::unicodeobject::jit_str_startswith as *const ()
+    } else {
+        pyre_object::unicodeobject::jit_str_endswith as *const ()
+    };
+    let truth = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
+        helper,
+        &[self_ref, needle_op],
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_ir::Type::Int,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(helper as usize as i64),
+            majit_ir::Value::Ref(majit_ir::GcRef(inner_self as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(needle as usize)),
+        ],
+        majit_ir::Value::Int(i64::from(observed)),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int(i64::from(observed)));
+    let Some(boxed) = walker_newbool_guarded(ctx, op.pc, truth, observed, dst_bank)? else {
+        return Ok(None);
+    };
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
     Ok(Some(()))
 }
 
@@ -21274,6 +21493,15 @@ pub(crate) fn try_walker_specialize_compare_op_str<Sym: WalkSym>(
 /// between two `a + b` sites would answer `(a + b) is (a + b)` True where
 /// every other implementation answers False — the same reason `jit_int_str`
 /// gives for its own effect class.
+///
+/// Not tagged `OS_STR_CONCAT` even though `STR_CONCAT_TARGETS` would:
+/// `vstring.py opt_call_stroruni_STR_CONCAT` virtualizes the call and
+/// `force_box` later emits `newstr` + `copystrcontent` at the RPython
+/// `rstr.STR` layout (`bh_copystrcontent` / `rewrite.py` basesize).  A
+/// walker `str + str` is a `W_UnicodeObject`; memcpy at those offsets
+/// is a SIGBUS.  Resume already rematerializes via
+/// `callinfo_for_oopspec(OS_STR_CONCAT)` → `jit_str_concat`; optimizer
+/// force has to speak the same object before the oopspec can land.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,

@@ -6755,6 +6755,22 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // FORMAT_SIMPLE on an exact `int` / `str`: the empty-spec fast path
+    // `format_w` already takes, instead of the opaque MayForce residual.
+    // Keyed off the helper tag; anything else (bool, subclass, user
+    // `__format__`) falls through.  `FormatWithSpec` below inlines a
+    // Python `__format__` when a spec operand is present.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::FormatSimple
+        && ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && spec_gate(SpecFold::FormatSimple, || {
+            try_walker_specialize_format_simple(ctx, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // FORMAT_WITH_SPEC over a receiver whose `__format__` is Python: inline
     // the resolved body in place of the opaque format residual.  Keyed off
     // the helper tag, so every other `residual_call_r_r` falls straight
@@ -7640,6 +7656,26 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::StrCall, || {
             try_walker_specialize_str_call(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrStartswith, || {
+            try_walker_specialize_str_prefix_match(ctx, code, op, &r_args, dst, dst_bank, true)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrEndswith, || {
+            try_walker_specialize_str_prefix_match(ctx, code, op, &r_args, dst, dst_bank, false)
         })?
         .is_some()
     {
