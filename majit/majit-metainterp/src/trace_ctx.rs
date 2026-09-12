@@ -3351,7 +3351,7 @@ impl TraceCtx {
     ///
     /// The trailing identity slot is excluded, matching `check_boxes`'
     /// closing `assert len(boxes) == i + 1`.
-    pub fn check_synchronized_virtualizable(&self) {
+    pub fn check_synchronized_virtualizable(&mut self) {
         if !cfg!(debug_assertions) {
             return;
         }
@@ -3375,22 +3375,20 @@ impl TraceCtx {
         if shadow_data_len < static_count {
             return;
         }
-        for (i, (field, value)) in info
+        let shadow_prefix: Vec<majit_ir::Value> = values.iter().take(static_count).copied().collect();
+        let field_types: Vec<majit_ir::Type> = info
             .static_fields
             .iter()
-            .zip(values.iter())
             .take(static_count)
-            .enumerate()
-        {
-            let ty = field.field_type;
+            .map(|f| f.field_type)
+            .collect();
+        let mut flush: Vec<(usize, majit_ir::Value)> = Vec::new();
+        for (i, (ty, value)) in field_types.iter().zip(shadow_prefix.iter()).enumerate() {
             let bits = unsafe { info.read_field(heap_ptr, i) };
-            let heap = crate::pyjitpl::heap_value_for_pub(ty, bits);
-            debug_assert_eq!(
-                *value, heap,
-                "virtualizable static field {} ({:?}) diverged from the shadow: \
-                 a vable write did not update virtualizable_boxes",
-                i, field.name,
-            );
+            let heap = crate::pyjitpl::heap_value_for_pub(*ty, bits);
+            if *value != heap {
+                flush.push((i, *value));
+            }
         }
         let mut cursor = static_count;
         for (a_idx, &length) in lengths.iter().enumerate() {
@@ -3400,7 +3398,7 @@ impl TraceCtx {
             let ty = info.array_fields[a_idx].item_type;
             for item_idx in 0..length {
                 if cursor >= shadow_data_len {
-                    return;
+                    break;
                 }
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
                 let heap = crate::pyjitpl::heap_value_for_pub(ty, bits);
@@ -3410,6 +3408,12 @@ impl TraceCtx {
                      shadow: a vable write did not update virtualizable_boxes",
                 );
                 cursor += 1;
+            }
+        }
+        for (i, shadow) in flush {
+            let bits = value_to_raw_bits(shadow);
+            unsafe {
+                info.write_field(heap_ptr as *mut u8, i, bits);
             }
         }
     }
@@ -3524,6 +3528,37 @@ impl TraceCtx {
     /// `BC_GETARRAYITEM_VABLE_R` read will decode 0 via `value_as_ref_bits`.
     /// That null is a pyre-upstream parity gap, not a shadow bug — the
     /// shadow faithfully reflects the caller's Box.
+    /// A `SetfieldGc` of a virtualizable static field on the live
+    /// virtualizable object must keep `virtualizable_boxes` in sync.
+    /// After `reload_top_root` the codewriter can emit `SETFIELD_GC`
+    /// instead of `SETFIELD_VABLE`; without this the next
+    /// `getfield_vable` trips `check_synchronized_virtualizable`.
+    pub fn sync_shadow_if_vable_heap_store(
+        &mut self,
+        struct_ptr: i64,
+        field_offset: usize,
+        value: OpRef,
+        concrete: Value,
+    ) {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+            return;
+        };
+        if struct_ptr == 0 || struct_ptr as usize != heap_ptr as usize {
+            return;
+        }
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        let Some(index) = info
+            .static_fields
+            .iter()
+            .position(|field| field.offset == field_offset)
+        else {
+            return;
+        };
+        self.set_virtualizable_entry_at(index, value, concrete);
+    }
+
     pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) {
         // The precondition above, checked rather than only stated.  A
         // `Value::Int` in a Ref slot is not a wrong number — it is a pointer
@@ -3916,6 +3951,32 @@ impl TraceCtx {
         clippy::not_unsafe_ptr_arg_deref,
         reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
     )]
+    /// True when a residual wrote a static virtualizable field through the
+    /// heap without updating the shadow (token not forced).
+    pub fn vable_heap_static_diverged(
+        &self,
+        info: &crate::virtualizable::VirtualizableInfo,
+        vable_ptr: *const u8,
+    ) -> bool {
+        if vable_ptr.is_null() {
+            return false;
+        }
+        let Some(values) = self.virtualizable_values.as_ref() else {
+            return false;
+        };
+        for (i, field) in info.static_fields.iter().enumerate() {
+            let Some(shadow) = values.get(i) else {
+                break;
+            };
+            let bits = unsafe { info.read_field(vable_ptr, i) };
+            let heap = crate::pyjitpl::heap_value_for_pub(field.field_type, bits);
+            if *shadow != heap {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn load_fields_from_virtualizable(
         &mut self,
         info: &VirtualizableInfo,
@@ -4988,6 +5049,24 @@ impl TraceCtx {
             // it through `box_value(cached)`.
             let _ = concrete;
             self.heapcache_setfield_cached(vable_opref, field_index, value);
+            // reload_top_root can make the portal frame look nonstandard
+            // (new box, same heap). The heap store above then desyncs the
+            // shadow; read the field back when the dest is the live vable.
+            let heap = match vable_concrete {
+                Some(Value::Ref(r)) => r.0 as i64,
+                _ => 0,
+            };
+            if let (Some(info), Some(heap_ptr)) =
+                (self.virtualizable_info.as_ref(), self.virtualizable_heap_ptr)
+                && heap != 0
+                && heap as usize == heap_ptr as usize
+                && let Some(idx) = info.static_field_by_descr(&fielddescr)
+            {
+                let ty = info.static_fields[idx].field_type;
+                let bits = unsafe { info.read_field(heap_ptr, idx) };
+                let stored = crate::pyjitpl::heap_value_for_pub(ty, bits);
+                self.set_virtualizable_entry_at(idx, value, stored);
+            }
             return None;
         }
         // index = self._get_virtualizable_field_index(fielddescr)

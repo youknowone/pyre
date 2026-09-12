@@ -2314,7 +2314,68 @@ fn call_callable_with_mode(
         }
         return call_callable_with_mode(execution_context, func, &call_args, mode, profile_frame);
     }
+    // One-arg type call (`ValueError("v")`) is a word residual so the
+    // exception-bridge walk can construct the instance instead of
+    // residualising the slice-ABI generic dispatcher.
+    if unsafe { pyre_object::is_type(callable) } && args.len() == 1 {
+        let value = call_type_one_arg(execution_context, callable, args[0]);
+        if value.is_null() {
+            return Err(take_call_error()
+                .unwrap_or_else(|| PyError::type_error("constructor failed")));
+        }
+        return Ok(value);
+    }
     call_non_function_callable_with_mode(execution_context, callable, args, mode, profile_frame)
+}
+
+/// One-arg CALL as three word values (`frame`, callable, arg). Portal
+/// interpret cannot rebuild a `&[T]` from residual boxes — that SIGBUS'd
+/// in `pin_roots` — so `opcode_call` nargs=1 residual-calls this instead.
+/// Errors go through [`set_call_error`]; a null return is the failure.
+///
+/// `extern "C"` plus `inline(never)`: a Rust `fn(&mut PyFrame, …)` was
+/// emitted as an extract-time code address (not a symbolic path hash),
+/// which SIGSEGV'd at runtime. The C ABI matches `cpa3` remapping.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub extern "C" fn call_one_arg_in_frame(
+    frame: *mut PyFrame,
+    callable: PyObjectRef,
+    arg: PyObjectRef,
+) -> PyObjectRef {
+    if frame.is_null() {
+        set_call_error(PyError::type_error("call failed"));
+        return pyre_object::PY_NULL;
+    }
+    match call_callable(unsafe { &mut *frame }, callable, std::slice::from_ref(&arg)) {
+        Ok(value) => value,
+        Err(err) => {
+            set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// Word ABI for `Type(arg)`. The generic dispatcher takes a slice and
+/// returns `Result`, which cannot be a residual.
+#[majit_macros::dont_look_inside]
+pub fn call_type_one_arg(
+    execution_context: *const crate::PyExecutionContext,
+    w_type: PyObjectRef,
+    w_arg: PyObjectRef,
+) -> PyObjectRef {
+    match type_descr_call_with_mode(
+        execution_context,
+        w_type,
+        &[w_arg],
+        CallMode::Plain,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
 }
 
 #[inline(never)]

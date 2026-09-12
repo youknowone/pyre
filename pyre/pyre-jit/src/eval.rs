@@ -9488,7 +9488,6 @@ fn deliver_exit_frame_exception(
     // pc write and for the resumed interpretation, which would otherwise pin
     // the dead address into `handle_jitexception`'s own root.
     let mut frame_root = FrameRoot::new(frame);
-    let mut handler_instr = frame_root.frame().next_instr();
     let refused = !screen_exit_frame_delivery(frame_root.frame() as *mut PyFrame, &mut err);
     if exit_frame_diag_enabled() {
         report_exit_frame_delivery("deliver", frame_root.frame(), refused);
@@ -9496,10 +9495,11 @@ fn deliver_exit_frame_exception(
     if refused {
         return Err(err);
     }
-    if pyre_interpreter::eval::handle_exception(frame_root.frame(), &mut err, &mut handler_instr) {
+    let handler_instr = pyre_interpreter::eval::handle_exception(frame_root.frame(), &mut err);
+    if handler_instr >= 0 {
         frame_root
             .frame()
-            .set_last_instr_from_next_instr(handler_instr);
+            .set_last_instr_from_next_instr(handler_instr as usize);
         handle_jitexception(frame_root.frame())
     } else {
         Err(err)
@@ -9676,14 +9676,11 @@ fn eval_loop_warmup_tick(mut f: *mut PyFrame, opcode_pc: usize) -> i64 {
             (*ec_ptr).bytecode_trace(f, pyre_interpreter::executioncontext::TICK_COUNTER_STEP)
         } {
             f = FrameView::reload(f);
-            let mut next_instr = unsafe { &*f }.next_instr();
-            if pyre_interpreter::eval::handle_exception(
-                unsafe { &mut *f },
-                &mut err,
-                &mut next_instr,
-            ) {
+            let next_instr =
+                pyre_interpreter::eval::handle_exception(unsafe { &mut *f }, &mut err);
+            if next_instr >= 0 {
                 f = FrameView::reload(f);
-                unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
+                unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
                 WARMUP_TICK_FRAME.with(|c| c.set(f));
                 return 1;
             }
@@ -9707,14 +9704,11 @@ fn eval_loop_warmup_tick(mut f: *mut PyFrame, opcode_pc: usize) -> i64 {
         if ticker < 0 {
             if let Err(mut err) = unsafe { (*ec_ptr).perform_actions(f) } {
                 f = FrameView::reload(f);
-                let mut next_instr = unsafe { &*f }.next_instr();
-                if pyre_interpreter::eval::handle_exception(
-                    unsafe { &mut *f },
-                    &mut err,
-                    &mut next_instr,
-                ) {
+                let next_instr =
+                    pyre_interpreter::eval::handle_exception(unsafe { &mut *f }, &mut err);
+                if next_instr >= 0 {
                     f = FrameView::reload(f);
-                    unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
+                    unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
                     WARMUP_TICK_FRAME.with(|c| c.set(f));
                     return 1;
                 }
@@ -9747,14 +9741,10 @@ fn eval_loop_dispatch_poll(mut f: *mut PyFrame) -> i64 {
     if majit_ir::eval_breaker_word::take_memory_error() {
         majit_gc::gc_sync::safepoint_poll();
         let mut err = pyre_interpreter::PyError::memory_error("");
-        let mut next_instr = unsafe { &*f }.next_instr();
-        if pyre_interpreter::eval::handle_exception(
-            unsafe { &mut *f },
-            &mut err,
-            &mut next_instr,
-        ) {
+        let next_instr = pyre_interpreter::eval::handle_exception(unsafe { &mut *f }, &mut err);
+        if next_instr >= 0 {
             f = FrameView::reload(f);
-            unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
+            unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
             WARMUP_TICK_FRAME.with(|c| c.set(f));
             return 1;
         }
@@ -10004,14 +9994,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                         if refused {
                             return Err(err);
                         }
-                        if pyre_interpreter::eval::handle_exception(
+                        let last_instr = unsafe { &*f }.last_instr as i64;
+                        let next_instr = pyre_interpreter::eval::dispatch_exception_handler(
                             unsafe { &mut *f },
                             &mut err,
-                            &mut next_instr,
-                        ) {
-                            // handle_exception may allocate → re-seed.
+                            last_instr,
+                        );
+                        if next_instr >= 0 {
                             f = FrameView::reload_if_interp(f);
-                            unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
+                            unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
                             continue;
                         }
                         return Err(err);
@@ -10040,14 +10031,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer.
                 f = FrameView::reload_if_interp(f);
-                if pyre_interpreter::eval::handle_exception(
+                let last_instr = unsafe { &*f }.last_instr as i64;
+                let next_instr = pyre_interpreter::eval::dispatch_exception_handler(
                     unsafe { &mut *f },
                     &mut err,
-                    &mut next_instr,
-                ) {
-                    // handle_exception may allocate → re-seed before the write.
+                    last_instr,
+                );
+                if next_instr >= 0 {
                     f = FrameView::reload_if_interp(f);
-                    unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
+                    unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
                     continue;
                 }
                 return Err(err);

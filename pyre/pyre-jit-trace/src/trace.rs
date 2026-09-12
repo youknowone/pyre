@@ -1112,8 +1112,8 @@ fn try_commit_midbody_abort_inner(
             crate::state::frame_array_write_barrier(cf_addr as *mut u8, arr_ptr);
             outer.last_instr = words.call_py_pc as isize;
             outer.valuestackdepth = outer_stack_base + below_now.len();
-            let mut next_instr = words.call_py_pc;
-            if pyre_interpreter::eval::handle_exception(outer, &mut operr, &mut next_instr) {
+            let next_instr = pyre_interpreter::eval::handle_exception(outer, &mut operr);
+            if next_instr >= 0 {
                 outer.last_instr = next_instr as isize - 1;
             } else {
                 WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = Some(operr));

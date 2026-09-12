@@ -2483,6 +2483,51 @@ pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, 
 /// frame/ec colors from the current MIFrame's own red inputs. Root bridge
 /// setup keeps `ec` in its second root inputarg, outside the resumed
 /// MIFrame's semantic register bank.
+/// Recover the portal `ec` red for a bridge.
+///
+/// The translated portal jitcode is installed with degenerate
+/// `portal_ec_reg = u16::MAX` (`from_core_degenerate`), so the color
+/// lookup below is usually empty. The peel still carries `ec` as a
+/// loop-carried red; when the failing guard snapshotted that box it
+/// sits in `fail_values` and must be rebound as the matching bridge
+/// inputarg. A residual `getexecutioncontext` would leave a Call after
+/// opt; a missing box becomes `OpRef::NONE` and `close_bridge` panics
+/// in `arg_to_box`.
+fn recover_bridge_execution_context(
+    ctx: &mut majit_metainterp::TraceCtx,
+    portal_ec_reg: u16,
+    bridge_registers_r: &[OpRef],
+    fail_values: &[i64],
+    fail_types: &[Type],
+) -> OpRef {
+    if portal_ec_reg != u16::MAX
+        && let Some(&op) = bridge_registers_r.get(portal_ec_reg as usize)
+        && !op.is_none()
+    {
+        return op;
+    }
+    let ec_ptr = pyre_interpreter::call::getexecutioncontext() as i64;
+    if ec_ptr == 0 {
+        return OpRef::NONE;
+    }
+    for (i, (&val, &ty)) in fail_values.iter().zip(fail_types.iter()).enumerate() {
+        if ty == Type::Ref && val == ec_ptr {
+            return OpRef::input_arg_typed(i as u32, Type::Ref);
+        }
+    }
+    for &op in bridge_registers_r {
+        if op.is_none() {
+            continue;
+        }
+        if let Some(majit_ir::Value::Ref(r)) = ctx.concrete_of_opref(op)
+            && r.0 as i64 == ec_ptr
+        {
+            return op;
+        }
+    }
+    ctx.const_ref(ec_ptr)
+}
+
 pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
@@ -10786,14 +10831,13 @@ impl JitState for PyreJitState {
         // `MIFrame::ensure_execution_context`, which reads the thread's own
         // context instead.
         let (_, portal_ec_reg) = portal_red_regs_at(frame0.jitcode_index);
-        let bridge_execution_context = (portal_ec_reg != u16::MAX)
-            .then(|| {
-                bridge_registers_r
-                    .get(portal_ec_reg as usize)
-                    .copied()
-                    .unwrap_or(OpRef::NONE)
-            })
-            .unwrap_or(OpRef::NONE);
+        let bridge_execution_context = recover_bridge_execution_context(
+            ctx,
+            portal_ec_reg,
+            &bridge_registers_r,
+            fail_values,
+            fail_types,
+        );
         // Reconstruct the slot-indexed semantic register file
         // (`[locals.., stack_tail..]`) from the color-indexed resume decode.
         // The decode just filled `bridge_registers_r` by abstract-register
