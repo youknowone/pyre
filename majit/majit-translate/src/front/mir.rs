@@ -8618,8 +8618,10 @@ impl<'a> Lowering<'a> {
             // `root_scope_close` residual so a crate that only imports the
             // opaque guard can still name it.  Emit the named residual, not
             // both — a second close would truncate an already-rewound stack.
-            // Other drops keep the legacy goto until their glue bodies and
-            // residual callees are available to the translator.
+            // FrameAnchor drop is the matching rewind for `frame_anchor_new`;
+            // matching it here keeps that glue residual live.  Other drops
+            // keep the legacy goto until their glue bodies and residual
+            // callees are available to the translator.
             TermKind::Drop {
                 place,
                 fn_ptr,
@@ -19956,12 +19958,27 @@ fn gc_root_scope_drop_glue_path(name: &str) -> bool {
         && segments.iter().any(|s| *s == "RootScope")
 }
 
+/// Match Charon's `eval::FrameAnchor::<Impl>::drop_in_place` path.
+///
+/// `frame_anchor_new_jit_abi` publishes the slot and forgets `Drop`;
+/// the matching `drop_in_place` must become a residual
+/// `frame_anchor_release` or compiled loops leak every iteration.
+fn frame_anchor_drop_glue_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    let last = segments.last().copied();
+    // Charon names the Drop impl `FrameAnchor::drop`; the MIR
+    // terminator glue is `drop_in_place`. Either must close the
+    // `frame_anchor_new_jit_abi` slot.
+    (last == Some("drop_in_place") || last == Some("drop"))
+        && segments.iter().any(|s| *s == "FrameAnchor")
+}
+
 /// Drops supported by both lowering and its liveness analysis.
 fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) -> bool {
     matches!(place.kind, PlaceKind::Local(_))
-        && regular_call_name_path(fn_ptr, llbc)
-            .as_deref()
-            .is_some_and(gc_root_scope_drop_glue_path)
+        && regular_call_name_path(fn_ptr, llbc).as_deref().is_some_and(|name| {
+            gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name)
+        })
 }
 
 /// Match the lowered RootScope close used by result/exception rewrites.
@@ -35157,6 +35174,15 @@ mod tests {
         ));
         assert!(!super::gc_root_scope_drop_glue_path(
             "alloc::vec::Vec::<Impl>::drop_in_place"
+        ));
+        assert!(super::frame_anchor_drop_glue_path(
+            "pyre_interpreter::eval::FrameAnchor::<Impl>::drop_in_place"
+        ));
+        assert!(super::frame_anchor_drop_glue_path(
+            "eval::FrameAnchor::drop"
+        ));
+        assert!(!super::frame_anchor_drop_glue_path(
+            "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
         ));
 
         // `_1` is written in bb0 and read only by bb1's Drop.
