@@ -3067,8 +3067,18 @@ fn try_walker_specialize_frame_f_back<Sym: WalkSym>(
     }
     let frame = concrete_obj as *mut pyre_interpreter::PyFrame;
     let raw_ptr = unsafe { (*frame).f_backref };
+    let raw_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        obj,
+        crate::descr::pyframe_f_backref_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        raw_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_ptr as usize)),
+    );
     if raw_ptr.is_null() {
-        let none = ctx.trace_ctx.const_null();
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[raw_op])?;
+        let none = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, none)?;
         return Ok(Some(()));
     }
@@ -3091,15 +3101,6 @@ fn try_walker_specialize_frame_f_back<Sym: WalkSym>(
     if next_ptr.is_null() || next_ptr as usize != standard_ptr || unsafe { (*next_ptr).hide() } {
         return Ok(None);
     }
-    let raw_op = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        obj,
-        crate::descr::pyframe_f_backref_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        raw_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(raw_ptr as usize)),
-    );
     if raw_is_vref {
         let live_pair = ctx.trace_ctx.live_virtualref_pair_for_ptr(raw_ptr as usize);
         let virtual_op = live_pair.map(|pair| pair.0).or_else(|| {

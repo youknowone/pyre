@@ -4685,6 +4685,19 @@ fn immediate_inline_caller_py_pc<Sym: WalkSym>(
     // portal snapshot would stamp the surrounding user frame with an
     // unrelated offset. Inherit the Python caller's coordinate instead.
     if ctx.fbw_mode.transparent_helper_subwalk {
+        // Nested helper entry stores the Python CALL that invoked the
+        // helper on `InlineParentFrame.caller_py_pc`. That is the site
+        // `_getframe(1)` should report, not the CALL that entered the
+        // surrounding Python frame.
+        if let Some(pc) = ctx
+            .session
+            .borrow()
+            .framestack
+            .last()
+            .and_then(|frame| frame.parents.last().and_then(|parent| parent.caller_py_pc))
+        {
+            return Some(pc);
+        }
         return ctx
             .fbw_mode
             .immediate_inline_caller_py_pc

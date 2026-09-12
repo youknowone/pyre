@@ -12077,7 +12077,7 @@ fn handler_getfield_vable_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
@@ -12089,7 +12089,7 @@ fn handler_getfield_vable_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
@@ -12101,7 +12101,7 @@ fn handler_getfield_vable_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
@@ -12115,7 +12115,7 @@ fn handler_setfield_vable_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_i[code[p + 1] as usize];
-    vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
@@ -12128,7 +12128,7 @@ fn handler_setfield_vable_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_r[code[p + 1] as usize];
-    vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
@@ -12141,7 +12141,7 @@ fn handler_setfield_vable_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 1] as usize] as u64);
-    vable_clear_token_and_get_vinfo(bh, struct_ptr);
+    let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
@@ -12170,7 +12170,7 @@ fn handler_setfield_vable_f(
 fn vable_clear_token_and_get_vinfo(
     bh: &BlackholeInterpreter,
     vable: i64,
-) -> &'static crate::virtualizable::VirtualizableInfo {
+) -> (&'static crate::virtualizable::VirtualizableInfo, i64) {
     if bh.virtualizable_info.is_null() {
         panic!(
             "vable opcode requires `bh.virtualizable_info` to be set \
@@ -12179,8 +12179,9 @@ fn vable_clear_token_and_get_vinfo(
         );
     }
     let vinfo = unsafe { &*bh.virtualizable_info };
-    unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
-    vinfo
+    let vable =
+        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) } as i64;
+    (vinfo, vable)
 }
 
 /// Decode the vable-array descr pair after the register operands and
@@ -12195,8 +12196,8 @@ fn take_vable_array_descrs<'a>(
     vable: i64,
     code: &[u8],
     descr_pos: usize,
-) -> (BhDescr, &'a BhDescr, usize) {
-    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+) -> (BhDescr, &'a BhDescr, usize, i64) {
+    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable);
     let (field_descr, array_idx, p) = read_descr_vable_array(bh, code, descr_pos);
     let (array_descr, pos) = read_descr(bh, code, p);
     // `virtualizable.py` `make_sure_not_resized`: the array field is
@@ -12211,7 +12212,7 @@ fn take_vable_array_descrs<'a>(
              (virtualizable.py make_sure_not_resized); got {other:?}"
         ),
     }
-    (field_descr, array_descr, pos)
+    (field_descr, array_descr, pos, vable)
 }
 
 // Virtualizable array operations (`bhimpl_getarrayitem_vable_*`)
@@ -12222,7 +12223,7 @@ fn handler_getarrayitem_vable_i(
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 2);
+    let (field_descr, array_descr, p, vable) = take_vable_array_descrs(bh, vable, code, p + 2);
     let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
     bh.registers_i[code[p] as usize] =
         bh.cpu()
@@ -12237,7 +12238,7 @@ fn handler_getarrayitem_vable_r(
     let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 2);
+    let (field_descr, array_descr, p, vable) = take_vable_array_descrs(bh, vable, code, p + 2);
     let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
     let value = bh
         .cpu()
@@ -12260,7 +12261,7 @@ fn handler_setarrayitem_vable_i(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
-    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 3);
+    let (field_descr, array_descr, p, vable) = take_vable_array_descrs(bh, vable, code, p + 3);
     let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
     bh.cpu()
         .bh_setarrayitem_gc_i(array.0 as i64, index, value, array_descr);
@@ -12275,7 +12276,7 @@ fn handler_setarrayitem_vable_r(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
-    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 3);
+    let (field_descr, array_descr, p, vable) = take_vable_array_descrs(bh, vable, code, p + 3);
     if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
         eprintln!(
             "[nbody-debug][bh-vable-set-r] position={} last_opcode_position={} index={} value={:#x}",
@@ -12297,7 +12298,7 @@ fn handler_arraylen_vable(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 1);
+    let (field_descr, array_descr, p, vable) = take_vable_array_descrs(bh, vable, code, p + 1);
     let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
     bh.registers_i[code[p] as usize] = bh.cpu().bh_arraylen_gc(array.0 as i64, array_descr);
     Ok(p + 1)
@@ -12319,7 +12320,7 @@ fn handler_arraybase_vable(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+    let (vinfo, vable) = vable_clear_token_and_get_vinfo(bh, vable);
     let (field_descr, p) = read_descr(bh, code, p + 1);
     let array_idx = field_descr.as_vable_array_index();
     let (_, p) = read_descr(bh, code, p);
@@ -12899,7 +12900,7 @@ fn handler_getarrayitem_vable_f(
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
-    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 2);
+    let (field_descr, array_descr, p, vable) = take_vable_array_descrs(bh, vable, code, p + 2);
     let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
     bh.registers_f[code[p] as usize] = bh
         .cpu()
@@ -12916,7 +12917,7 @@ fn handler_setarrayitem_vable_f(
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_f[code[p + 2] as usize];
-    let (field_descr, array_descr, p) = take_vable_array_descrs(bh, vable, code, p + 3);
+    let (field_descr, array_descr, p, vable) = take_vable_array_descrs(bh, vable, code, p + 3);
     let array = bh.cpu().bh_getfield_gc_r(vable, &field_descr);
     bh.cpu().bh_setarrayitem_gc_f(
         array.0 as i64,

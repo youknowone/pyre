@@ -1967,6 +1967,11 @@ def synth_jitstats_bands(path, backend=None):
                 scoped, only_backend = (part.strip() for part in entry.rsplit("@", 1))
                 if not scoped or not only_backend:
                     raise ValueError(f"invalid jit-stats band in {path}: {line.strip()}")
+                if only_backend not in ALL_BACKENDS:
+                    raise ValueError(
+                        f"unknown jit-stats band backend {only_backend!r} in {path}: "
+                        f"{line.strip()}"
+                    )
             parts = scoped.split("=")
             if len(parts) != 2 or not all(part.strip() for part in parts):
                 raise ValueError(f"invalid jit-stats band in {path}: {line.strip()}")

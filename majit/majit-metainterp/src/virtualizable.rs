@@ -3437,26 +3437,52 @@ pub(crate) unsafe fn vable_write_array_item_at(
 ///
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
-pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
+/// Follow a nursery forwarding address left by a moving collection.
+///
+/// `force_now` can allocate while reconstructing a compiled frame. The
+/// blackhole keeps `virtualizable` as a GCREF that the GC updates; a
+/// raw `*mut u8` does not move with it.
+unsafe fn follow_forwarded_vable(obj_ptr: *mut u8) -> *mut u8 {
+    if obj_ptr.is_null() {
+        return obj_ptr;
+    }
+    unsafe {
+        let hdr = majit_gc::header::header_of(obj_ptr as usize);
+        if (*hdr).is_forwarded() {
+            majit_gc::header::GcHeader::forwarding_address(hdr) as *mut u8
+        } else {
+            obj_ptr
+        }
+    }
+}
+
+pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) -> *mut u8 {
     // virtualizable.py `clear_vable_token`: if token: force_now(); assert not token.
-    vinfo.clear_vable_token(obj_ptr, |_token| {
-        let Some(clear_vable_ptr) = vinfo.clear_vable_ptr else {
-            // A machine that registered no force helper has no compiled
-            // activation to write back. `force_now`'s else arm must still
-            // leave TOKEN_NONE.
-            unsafe {
-                let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
-                *token_ptr = 0;
-            }
-            return;
-        };
-        // `make_clear_vable_descr` declares `[Ref] -> Void` and
-        // `frame_layout.rs` registers a function taking that word as `i64`;
-        // spelling the pointee any other way mismatches the wasm32 signature
-        // and traps on call.
-        let force: unsafe extern "C" fn(i64) = unsafe { std::mem::transmute(clear_vable_ptr) };
-        unsafe { force(obj_ptr as i64) };
-    });
+    unsafe {
+        vinfo.clear_vable_token(obj_ptr, |_token| {
+            let Some(clear_vable_ptr) = vinfo.clear_vable_ptr else {
+                // A machine that registered no force helper has no compiled
+                // activation to write back. `force_now`'s else arm must still
+                // leave TOKEN_NONE.
+                unsafe {
+                    let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
+                    *token_ptr = 0;
+                }
+                return;
+            };
+            // `make_clear_vable_descr` declares `[Ref] -> Void` and
+            // `frame_layout.rs` registers a function taking that word as `i64`;
+            // spelling the pointee any other way mismatches the wasm32 signature
+            // and traps on call.
+            let force: unsafe extern "C" fn(i64) = unsafe { std::mem::transmute(clear_vable_ptr) };
+            force(obj_ptr as i64);
+        });
+    }
+    if vinfo.clear_vable_ptr.is_some() {
+        unsafe { follow_forwarded_vable(obj_ptr) }
+    } else {
+        obj_ptr
+    }
 }
 
 #[cfg(test)]
