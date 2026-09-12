@@ -1473,6 +1473,29 @@ pub(crate) fn exception_string_override_has_nested_call(
     false
 }
 
+/// Whether `__format__` builds a string (`"<" + spec + ">"`) rather than
+/// returning a field.  A field return (`return self.out`) can change type
+/// after the trace is recorded; inlining it drops `descroperation.py
+/// format`'s `isinstance_w` TypeError
+/// (`format_with_spec_result_type`).  The concat residual is
+/// `RuntimeHelperKind::BinaryOp`.
+fn format_body_constructs_str(body_code: &[u8], callee_descr_refs: &[DescrRef]) -> bool {
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return false;
+        };
+        if d.opname.starts_with("residual_call")
+            && residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs)
+                == Some(majit_ir::RuntimeHelperKind::BinaryOp)
+        {
+            return true;
+        }
+        pc = d.next_pc;
+    }
+    false
+}
+
 /// Active boxes for an inlined callee's OWN frame in a multi-frame snapshot
 /// (#68).  The fast-path inline predicate guarantees the callee does not own a
 /// virtualizable (any vable op declines the inline), so the owns_vable /
@@ -5592,7 +5615,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // not any admission test here.
                 let loop_header_admitted = !body_facts.owns_loop_header
                     || !fbw_callee_body_has_two_entry_method_push(body.code, callee_descr_refs);
-                foriter_deferred_admit = entry_is_call_boundary
+                foriter_deferred_admit = (entry_is_call_boundary
+                    || crate::jitcode_dispatch::format_inline_constructs_str_active())
                     && loop_header_admitted
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !body_facts.has_exception_table;
@@ -11912,6 +11936,20 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_value),
         ConcreteValue::Ref(concrete_spec),
     ];
+    // Admit a DeferredCall body that *builds* a string without naming
+    // FORMAT_WITH_SPEC a CALL boundary.  `return self.out` stays residual
+    // so a later non-str still raises.
+    let _format_constructs_str = match (
+        crate::state::sub_jitcode_body_for_code(w_code),
+        crate::state::sub_jitcode_descr_pool_for_code(w_code),
+    ) {
+        (Some(body), Some((descr_refs, _, _)))
+            if format_body_constructs_str(body.code, descr_refs) =>
+        {
+            Some(crate::jitcode_dispatch::FormatInlineConstructsStrGuard::enter())
+        }
+        _ => None,
+    };
     let Some(inlined) = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -11937,8 +11975,11 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         has_closure,
         Some((value, concrete_value, w_class, version_tag)),
         None,
-        // FORMAT_WITH_SPEC is a descriptor opcode, not a Python CALL
-        // boundary.  A bad effect-free result declines to this residual.
+        // FORMAT_WITH_SPEC is not a Python CALL.  Latching a CALL
+        // boundary on a bad result skips `descroperation.py format`'s
+        // `isinstance_w` TypeError (`format_with_spec_result_type`).
+        // DeferredCall admission for this route is `require_str_result`
+        // below, not this flag.
         false,
         // `__format__` returning a non-string is a TypeError the interpreter
         // raises; the plumbing guards the inlined result is a string so that

@@ -7583,6 +7583,31 @@ impl Drop for ExceptionStringInlineGuard {
     }
 }
 
+pub(crate) fn format_inline_constructs_str_active() -> bool {
+    FORMAT_INLINE_CONSTRUCTS_STR.with(|c| c.get())
+}
+
+pub(crate) struct FormatInlineConstructsStrGuard {
+    prior: bool,
+}
+
+impl FormatInlineConstructsStrGuard {
+    fn enter() -> Self {
+        let prior = FORMAT_INLINE_CONSTRUCTS_STR.with(|c| {
+            let prior = c.get();
+            c.set(true);
+            prior
+        });
+        Self { prior }
+    }
+}
+
+impl Drop for FormatInlineConstructsStrGuard {
+    fn drop(&mut self) {
+        FORMAT_INLINE_CONSTRUCTS_STR.with(|c| c.set(self.prior));
+    }
+}
+
 /// # Safety
 /// `data` must come from [`capture_fbw_store_journal_root_area`], and the
 /// owning thread must be quiesced.
