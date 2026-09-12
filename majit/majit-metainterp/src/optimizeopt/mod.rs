@@ -5688,10 +5688,7 @@ impl OptContext {
         if arg.bound_op().is_none() {
             return None;
         }
-        if !matches!(
-            arg.get_forwarded(),
-            majit_ir::forwarding::Forwarded::None
-        ) {
+        if !matches!(arg.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
             return None;
         }
         let canon = self.get_box_replacement_operand_opt(arg.to_opref())?;
@@ -11843,7 +11840,7 @@ mod opt_box_env_tests {
                 descr: Arc::new(DummySizeDescr),
                 known_class: Some(0x1234),
                 ob_type_descr: None,
-                fields: Vec::new(),
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),

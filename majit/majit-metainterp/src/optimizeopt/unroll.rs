@@ -7504,7 +7504,7 @@ mod tests {
             }
             recorded.push(Op::new(OpCode::Jump, &[input]));
             assign_positions(&mut recorded, 1);
-            let canonical: Vec<_> = recorded.into_iter().map(std::rc::Rc::new).collect();
+            let canonical: Vec<_> = recorded.into_iter().map(OpRc::new).collect();
             let source: Vec<_> = canonical.iter().map(|op| (**op).clone()).collect();
             let backup = source.clone();
             let mut unroll = UnrollOptimizer::new();
@@ -7522,11 +7522,11 @@ mod tests {
             // neither successful peeling nor InvalidLoop writes to its source.
             for (op, saved) in source.iter().zip(&backup) {
                 assert_eq!(op.opcode, saved.opcode);
-                assert_eq!(op.pos.get(), saved.pos.get());
-                assert_eq!(op.rd_resume_position.get(), saved.rd_resume_position.get());
-                assert_eq!(op.value.get(), saved.value.get());
+                assert_eq!(op.pos().get(), saved.pos().get());
+                assert_eq!(op.rd_resume_position(), saved.rd_resume_position());
+                assert_eq!(op.get_value(), saved.get_value());
                 assert!(matches!(
-                    *op.forwarded.borrow(),
+                    op.forwarded().borrow(),
                     majit_ir::forwarding::Forwarded::None
                 ));
                 assert_eq!(op.num_args(), saved.num_args());

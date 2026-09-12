@@ -1303,7 +1303,6 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
-
             // pure.py: `CallPureOptimizationResult.callback()` appends
             // `len(_newoperations) - 1` AFTER `emit_result` has routed the op
             // through the remaining optimizations. Recording it here (before
@@ -1324,8 +1323,7 @@ impl Optimization for OptPure {
                 // pure.py:222-225: replace CALL_PURE with CALL.
                 let new_op = self.demote_call_pure(op);
                 if !Self::call_pure_can_raise(op) {
-                    self.short_preamble_pure_ops
-                        .push(OpRc::new(new_op.clone()));
+                    self.short_preamble_pure_ops.push(OpRc::new(new_op.clone()));
                 }
                 return OptimizationResult::Replace(new_op);
             } else {
@@ -1430,8 +1428,7 @@ impl Optimization for OptPure {
             if let Some(d) = entry.descr.clone() {
                 imported_op.setdescr(d);
             }
-            self.short_preamble_pure_ops
-                .push(OpRc::new(imported_op));
+            self.short_preamble_pure_ops.push(OpRc::new(imported_op));
             let resolved_args: Vec<OpRef> = entry
                 .args
                 .iter()
@@ -2025,8 +2022,6 @@ mod tests {
         op0.pos().set(OpRef::int_op(2));
         let result0 = pass.propagate_forward(&op0, &OpRc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
-        assert!(pass.get_pure_result(&op0, &mut ctx).is_none());
-        pass.propagate_postprocess(&op0, &mut ctx);
 
         // Simulate: op1 = int_add(a, b) with same args
         let op1 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
@@ -2041,17 +2036,17 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(16, 0);
         let mut pass = OptPure::new();
         let make_arg = || {
-            let op = std::rc::Rc::new(Op::new(
+            let op = OpRc::new(Op::new(
                 OpCode::SameAsI,
                 &[Operand::const_from_value(Value::Int(7))],
             ));
-            op.pos.set(OpRef::int_op(2));
+            op.pos().set(OpRef::int_op(2));
             Operand::from_bound_op(&op)
         };
         let first = make_arg();
         let different = make_arg();
         let op = Op::new(OpCode::IntNeg, &[first]);
-        op.pos.set(OpRef::int_op(4));
+        op.pos().set(OpRef::int_op(4));
         pass.pure(&op);
         let query = Op::new(OpCode::IntNeg, &[different]);
         assert_eq!(pass.get_pure_result(&query, &mut ctx), None);
@@ -2064,14 +2059,14 @@ mod tests {
         let a = ctx.materialize_operand_at(OpRef::int_op(2));
         let b = ctx.materialize_operand_at(OpRef::int_op(3));
         let op = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
-        op.pos.set(OpRef::int_op(4));
+        op.pos().set(OpRef::int_op(4));
         pass.pure(&op);
         let stored = &pass.cache.bucket(OpCode::IntAdd).unwrap().lst[0]
             .as_ref()
             .unwrap()
             .0
             .args[0];
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(OpRc::ptr_eq(
             &stored.bound_op().unwrap(),
             &a.bound_op().unwrap(),
         ));

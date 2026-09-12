@@ -87,7 +87,7 @@ fn alias_inputargs_sharing_recovery_loc(
         .map(|op| {
             let args: smallvec::SmallVec<[Operand; 3]> =
                 op.getarglist().iter().map(&remap_operand).collect();
-            let cloned = std::rc::Rc::new(op.copy_and_change(op.opcode, Some(&args), None));
+            let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
             if let Some(failargs) = op.getfailargs() {
                 cloned.setfailargs(failargs.iter().map(&remap_operand).collect());
             }

@@ -522,7 +522,7 @@ mod simple_compile_view_tests {
             views.data.base.snapshots().as_ptr(),
             trace.snapshots.as_ptr(),
         ));
-        assert_eq!(std::rc::Rc::strong_count(&trace.ops[0]), 1);
+        assert_eq!(OpRc::strong_count(&trace.ops[0]), 1);
     }
 }
 
@@ -1053,7 +1053,7 @@ mod byte_snapshot_map_tests {
                 .map(|entry| {
                     entry
                         .as_ref()
-                        .map(|boxes| boxes.iter().map(|b| (b.opref, b.tp)).collect::<Vec<_>>())
+                        .map(|boxes| boxes.iter().map(|b| (b.opref, b.tp())).collect::<Vec<_>>())
                 })
                 .collect::<Vec<_>>()
         };
@@ -1072,17 +1072,20 @@ mod byte_snapshot_map_tests {
             OpRef::input_arg_typed(trace.inputargs[0].index, trace.inputargs[0].tp),
             input
         );
-        assert_eq!(trace.ops[0].pos.get(), result);
+        assert_eq!(trace.ops[0].pos().get(), result);
         assert_eq!(actual.0[1].as_ref().unwrap()[0].opref, input);
         assert_eq!(actual.0[1].as_ref().unwrap()[1].opref, result);
     }
 
     #[test]
     fn snapshot_roots_follow_map_buffers_into_optimizer() {
-        let mut boxes = vec![Some(vec![SnapshotBox::typed(
-            OpRef::ConstPtr(GcRef(0x1000)),
-            Type::Ref,
-        )])];
+        let mut boxes = vec![Some(
+            vec![SnapshotBox::typed(
+                OpRef::ConstPtr(GcRef(0x1000)),
+                Type::Ref,
+            )]
+            .into(),
+        )];
         let slots = collect_snapshot_const_ptr_slots(&mut [&mut boxes]);
         let maps = (boxes, Vec::<Vec<usize>>::new());
         let mut optimizer = Optimizer::default_pipeline();

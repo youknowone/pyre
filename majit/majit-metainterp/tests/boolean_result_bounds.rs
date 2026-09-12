@@ -1,23 +1,22 @@
 //! Regression coverage for pure.py callbacks and RecentPureOps lookup.
 use majit_ir::operand::Operand;
-use majit_ir::{ConstMap, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{ConstMap, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 use majit_metainterp::optimizeopt::optimizer::Optimizer;
 use majit_metainterp::optimizeopt::{OptContext, Optimization, OptimizationResult, pure::OptPure};
-use std::rc::Rc;
 
 #[test]
 fn postponed_boolean_result_is_not_retested_for_truth() {
     for opcode in [OpCode::IntIsZero, OpCode::IntIsTrue] {
         let input = InputArg::from_type_rc(Type::Int, 0);
-        let comparison = Rc::new(Op::new(opcode, &[Operand::from_bound_inputarg(&input)]));
-        comparison.pos.set(OpRef::int_op(1));
-        let truth = Rc::new(Op::new(
+        let comparison = OpRc::new(Op::new(opcode, &[Operand::from_bound_inputarg(&input)]));
+        comparison.pos().set(OpRef::int_op(1));
+        let truth = OpRc::new(Op::new(
             OpCode::IntIsTrue,
             &[Operand::from_bound_op(&comparison)],
         ));
-        truth.pos.set(OpRef::int_op(2));
-        let finish = Rc::new(Op::new(OpCode::Finish, &[Operand::from_bound_op(&truth)]));
-        finish.pos.set(OpRef::op_typed(3, Type::Void));
+        truth.pos().set(OpRef::int_op(2));
+        let finish = OpRc::new(Op::new(OpCode::Finish, &[Operand::from_bound_op(&truth)]));
+        finish.pos().set(OpRef::op_typed(3, Type::Void));
         let mut optimizer = Optimizer::default_pipeline();
         optimizer.trace_inputargs = OpRef::inputarg_refs(&[Type::Int]);
         let mut constants = ConstMap::<Value>::default();
@@ -32,7 +31,7 @@ fn postponed_boolean_result_is_not_retested_for_truth() {
             optimized.iter().map(|op| op.opcode).collect::<Vec<_>>(),
             [opcode, OpCode::Finish]
         );
-        assert_eq!(optimized[1].arg(0).to_opref(), optimized[0].pos.get());
+        assert_eq!(optimized[1].arg(0).to_opref(), optimized[0].pos().get());
     }
 }
 
@@ -112,17 +111,17 @@ fn checked_arithmetic_does_not_reuse_unchecked_arithmetic() {
         ));
         let x = ctx.get_box_replacement_operand_opt(x_pos).unwrap();
         pure.pure_from_args2(plain, x_pos, OpRef::ConstInt(5), OpRef::int_op(2), &mut ctx);
-        let checked = Rc::new(Op::new(
+        let checked = OpRc::new(Op::new(
             checked,
             &[x, Operand::const_from_value(Value::Int(5))],
         ));
-        checked.pos.set(OpRef::int_op(3));
+        checked.pos().set(OpRef::int_op(3));
         assert!(matches!(
             pure.propagate_forward(&checked, &checked, &mut ctx),
             OptimizationResult::Remove
         ));
-        let guard = Rc::new(Op::new(OpCode::GuardNoOverflow, &[]));
-        guard.pos.set(OpRef::op_typed(4, Type::Void));
+        let guard = OpRc::new(Op::new(OpCode::GuardNoOverflow, &[]));
+        guard.pos().set(OpRef::op_typed(4, Type::Void));
         assert!(matches!(
             pure.propagate_forward(&guard, &guard, &mut ctx),
             OptimizationResult::PassOn
