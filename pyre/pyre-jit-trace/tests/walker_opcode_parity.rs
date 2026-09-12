@@ -73,20 +73,28 @@ fn quoted(line: &str) -> Vec<String> {
 /// set, while a coverage snapshot has to compare two static arm lists.
 fn insns_table(root: &Path) -> Vec<(String, String)> {
     let src = read(root, "majit/majit-translate/src/codewriter/insns.rs");
-    let mut out = Vec::new();
+    // Drop `//` comments so a name that only appears in prose does not
+    // read as an implementation, then scan the joined remainder so a
+    // rustfmt-wrapped `m.insert(\n    "key",\n    BC_X,\n)` still
+    // counts as one encoding entry.
+    let mut stripped = String::new();
     for line in src.lines() {
-        let code = code_of(line);
-        let Some(at) = code.find("m.insert(\"") else {
+        stripped.push_str(code_of(line));
+        stripped.push('\n');
+    }
+    let mut out = Vec::new();
+    let mut rest = stripped.as_str();
+    while let Some(at) = rest.find("m.insert(") {
+        let after = &rest[at + "m.insert(".len()..];
+        let Some(key) = quoted(after).into_iter().next() else {
+            rest = &after[1..];
             continue;
         };
-        let rest = &code[at + "m.insert(".len()..];
-        let Some(key) = quoted(rest).into_iter().next() else {
+        let Some(comma) = after.find(',') else {
+            rest = &after[1..];
             continue;
         };
-        let Some(comma) = rest.find(',') else {
-            continue;
-        };
-        let bc: String = rest[comma + 1..]
+        let bc: String = after[comma + 1..]
             .trim_start()
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -94,6 +102,7 @@ fn insns_table(root: &Path) -> Vec<(String, String)> {
         if bc.starts_with("BC_") {
             out.push((key, bc));
         }
+        rest = &after[1..];
     }
     assert!(
         out.len() > 150,
@@ -231,6 +240,9 @@ const MAJIT_ONLY: &[&str] = &[
     // re-landed the fusion with the walker arm it needs, which is the move
     // this file exists to make visible.
     "arraybase_vable/rdd>i",
+    "convert_float_bytes_to_longlong/f>i",
+    "convert_longlong_bytes_to_float/i>f",
+    "goto_if_exception_mismatch/iL",
     "newlist_clear/idddd>r",
     "rvmprof_code/ii",
 ];
