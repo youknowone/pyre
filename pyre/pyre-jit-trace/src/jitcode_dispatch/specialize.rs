@@ -16153,7 +16153,192 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `s.startswith(prefix)` / `s.endswith(suffix)` on two exact `str`s:
+/// Runtime residual for [`try_walker_specialize_import_cached`].
+///
+/// Re-runs `dunder_import` at level 0 with an empty fromlist so a replaced
+/// `sys.modules` entry is visible; the caller `GuardValue`s the result.
+extern "C" fn jit_import_cached(name: i64) -> i64 {
+    let w_name = name as pyre_object::PyObjectRef;
+    if w_name.is_null() {
+        return 0;
+    }
+    let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
+        return 0;
+    };
+    let exec = pyre_interpreter::call::getexecutioncontext();
+    match pyre_interpreter::importing::dunder_import(
+        s,
+        pyre_object::w_none(),
+        pyre_object::w_none(),
+        pyre_object::w_none(),
+        0,
+        exec,
+    ) {
+        Ok(module) => module as i64,
+        Err(_) => 0,
+    }
+}
+
+/// Cached absolute `import name` / `from name import ...` on a module already
+/// in `sys.modules`: `_gcd_import` as one non-forcing residual instead of
+/// `CallMayForce` through `builtins.__import__`.
+///
+/// PyPy's `test_import.test_import_in_function` wants the IMPORT_NAME region
+/// to be `guard_not_invalidated` only.  Look-inside of the generated
+/// `__import__` wrapper is still refused (un-lowered helpers in the body), so
+/// the walker records `jit_import_cached` and `GuardValue`s the module
+/// observed at record time.  A replaced `sys.modules` entry side-exits.
+///
+/// A non-empty fromlist is accepted only when the cached module is not a
+/// package (`__path__` missing), matching `interp___import__`.  Relative
+/// imports, a non-zero level, a rebound `__import__`, or a cache miss decline
+/// (SAFE).
+pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // `simple_call(__import__, NULL, name, globals, locals, fromlist, level)`
+    if r_args.len() != 7 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(w_name),
+        _,
+        _,
+        ConcreteValue::Ref(w_fromlist),
+        ConcreteValue::Ref(w_level),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+        arg_concretes[4],
+        arg_concretes[5],
+        arg_concretes[6],
+    )
+    else {
+        return Ok(None);
+    };
+    if callable.is_null() || !null_or_self.is_null() || w_name.is_null() || w_level.is_null() {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_type(w_name, &pyre_object::STR_TYPE) } {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_type(w_level, &pyre_object::INT_TYPE) } {
+        return Ok(None);
+    }
+    if unsafe { pyre_object::w_int_get_value(w_level) } != 0 {
+        return Ok(None);
+    }
+    if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
+        return Ok(None);
+    }
+    let builtin_code =
+        unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
+    if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
+        return Ok(None);
+    }
+    let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
+    if fnaddr
+        != pyre_interpreter::builtins::__majit_wrap_builtin_dunder_import as *const () as usize
+    {
+        return Ok(None);
+    }
+    let w_mod = jit_import_cached(w_name as i64);
+    if w_mod == 0 {
+        return Ok(None);
+    }
+    let w_mod = w_mod as pyre_object::PyObjectRef;
+    let fromlist_empty = w_fromlist.is_null() || unsafe { pyre_object::is_none(w_fromlist) };
+    let fromlist_empty = fromlist_empty
+        || unsafe {
+            pyre_object::is_tuple(w_fromlist) && pyre_object::w_tuple_len(w_fromlist) == 0
+        };
+    if !fromlist_empty {
+        // Package fromlist goes through `_handle_fromlist`.  A non-package
+        // answers the module itself (`interp___import__`).
+        match pyre_interpreter::baseobjspace::findattr_result(w_mod, "__path__") {
+            Ok(None) => {}
+            _ => return Ok(None),
+        }
+    }
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(callable as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[callable_op, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let name_op = r_args[2];
+    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::STR_TYPE);
+    walker_guard_class(ctx, op.pc, name_op, str_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, name_op, str_typeobj)?;
+    if !name_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(w_name as i64);
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[name_op, expected])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(name_op, expected);
+    }
+    let fromlist_op = r_args[5];
+    if !fromlist_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(w_fromlist as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[fromlist_op, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(fromlist_op, expected);
+    }
+    let level_op = r_args[6];
+    let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(w_level);
+    let level_raw = walker_unbox_int_typed(ctx, op.pc, level_op, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op.pc, level_op, walker_numeric_builtin_class(w_level))?;
+    let zero = ctx.trace_ctx.const_int(0);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[level_raw, zero])?;
+
+    let helper = jit_import_cached as *const ();
+    let result = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallR,
+        helper,
+        &[name_op],
+        &[majit_ir::Type::Ref],
+        majit_ir::Type::Ref,
+        majit_metainterp::cannot_raise_effect_info(),
+        &[
+            majit_ir::Value::Int(helper as usize as i64),
+            majit_ir::Value::Ref(majit_ir::GcRef(w_name as usize)),
+        ],
+        majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        result,
+        majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
+    );
+    let expected = ctx.trace_ctx.const_ref(w_mod as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[result, expected])?;
+    ctx.trace_ctx.heap_cache_mut().replace_box(result, expected);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+    Ok(Some(()))
+}
 
 /// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
 /// shape the meta-tracer produces upstream (intobject.py `_divmod` →
