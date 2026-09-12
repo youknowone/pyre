@@ -289,6 +289,13 @@ pub fn notify_w_class_mutated() {
     }
 }
 
+/// Unlink the `w_class?` watcher and publish `store` under the same lock
+/// so a tracer cannot fold the old class onto a freshly installed watcher.
+#[inline]
+pub fn notify_w_class_mutated_then(store: impl FnOnce()) {
+    W_CLASS_WATCHERS.invalidate_then_store(store);
+}
+
 /// Field offset of `subclassrange_min` within PyType (OBJECT_VTABLE).
 /// rclass.py — first field in OBJECT_VTABLE.
 pub const SUBCLASSRANGE_MIN_OFFSET: usize = std::mem::offset_of!(PyType, subclassrange_min);
