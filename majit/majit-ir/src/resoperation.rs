@@ -2699,6 +2699,11 @@ fn drop_packed_word(w: u64) {
     }
     if is_thin_fwd_box(w) {
         let p = free_thin_fwd(box_payload(w) as *mut ThinFwd);
+        // `p.thin` still owns the `encode_thin_descr` Arc. `take_word`
+        // rebuilds it with `descr_arc_from_bits`; drop must too, or a
+        // SmallConst/SmallWide forward leaks the descriptor.
+        let (lo, hi) = thin_to_lo_hi(p.thin);
+        drop(descr_arc_from_bits(lo, hi));
         crate::forwarding::drop_packed_forwarded(p.forwarded);
         return;
     }
@@ -3248,7 +3253,8 @@ impl DescrSlot {
                     crate::forwarding::drop_packed_forwarded(old);
                     let (lo, hi) = thin_to_lo_hi(w);
                     let stamp = thin_stamp(w);
-                    let descr = descr_arc_clone_from_bits(lo, hi);
+                    // The thin word is abandoned; take the Arc, do not clone.
+                    let descr = descr_arc_from_bits(lo, hi);
                     unsafe {
                         *self.word.get() = 0;
                     }
@@ -3268,7 +3274,9 @@ impl DescrSlot {
             }
             let (lo, hi) = thin_to_lo_hi(w);
             let stamp = thin_stamp(w);
-            let descr = descr_arc_clone_from_bits(lo, hi);
+            // Boxing ThinFwd overwrites the thin word. Take the encoded
+            // Arc; clone_from_bits would leak it (Codex on write_thin_fwd).
+            let descr = descr_arc_from_bits(lo, hi);
             crate::forwarding::drop_packed_forwarded(old);
             unsafe {
                 *self.word.get() = 0;
@@ -6476,6 +6484,20 @@ mod tests {
             op.forwarded().borrow(),
             crate::forwarding::Forwarded::Info(crate::op_info::OpInfo::IntBound(_))
         ));
+    }
+
+    #[test]
+    fn thin_fwd_box_drop_releases_the_descr() {
+        let descr = crate::make_loop_target_descr(4, false);
+        let before = std::sync::Arc::strong_count(&descr);
+        {
+            let op = Op::with_descr(OpCode::GetfieldGcI, &[], descr.clone());
+            // SmallConst does not fit in the thin word, so write_thin_fwd
+            // boxes ThinFwd. Drop must release the encoded Arc.
+            op.forwarded()
+                .set(crate::forwarding::Forwarded::SmallConst(0));
+        }
+        assert_eq!(std::sync::Arc::strong_count(&descr), before);
     }
 
     #[test]
