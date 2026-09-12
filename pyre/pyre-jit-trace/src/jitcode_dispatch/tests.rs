@@ -8721,6 +8721,35 @@ fn unsupported_opname_surfaces_typed_error() {
 }
 
 #[test]
+fn canonical_cond_record_keys_have_walker_arms() {
+    // Assembler emit now publishes these four keys. The production
+    // walker must decode them; UnsupportedOpname here would abort a
+    // `conditional_call_elidable!` / `record_known_result!` trace.
+    let mut tc = fresh_trace_ctx();
+    let dummy = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
+    for key in [
+        "conditional_call_value_ir_i/iiIRd>i",
+        "conditional_call_value_ir_r/riIRd>r",
+        "record_known_result_i_ir_v/iiIRd",
+        "record_known_result_r_ir_v/riIRd",
+    ] {
+        let byte = *insns_opname_to_byte()
+            .get(key)
+            .unwrap_or_else(|| panic!("`{key}` must be in insns table"));
+        let code = [byte, 0, 0, 0, 0, 0, 0, 0];
+        let mut regs_r = [dummy];
+        let mut concrete_r = [ConcreteValue::Null];
+        let mut regs_i = [dummy, dummy];
+        let err = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut regs_i)
+            .expect_err("{key} with no call descr cannot complete");
+        assert!(
+            !matches!(err, DispatchError::UnsupportedOpname { .. }),
+            "{key} must have a walker arm, got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
     use majit_translate::codewriter::{call::CallControl, codewriter::CodeWriter};
     use majit_translate::{
