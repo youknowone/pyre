@@ -279,18 +279,18 @@ fn build_semantic_program_via_active_frontend(
             program.immutable_fields =
                 front::llbc_hints::harvest_immutable_fields_from_llbcs(&llbcs);
             // Re-source the annotator-only residual-stub carrier from Charon:
-            // unsafe function paths missing from GraphStore, every
-            // `dont_look_inside` declaration (whose body JitPolicy correctly
-            // excludes), and the `#[pyre_class]` allocation constructors all
-            // need a FunctionDesc signature even though they must not become
-            // JitCode candidates.
+            // unsafe function paths missing from GraphStore, every declaration
+            // the JIT policy rejects (`dont_look_inside` and `elidable` alike,
+            // whose bodies JitPolicy correctly excludes), and the
+            // `#[pyre_class]` allocation constructors all need a FunctionDesc
+            // signature even though they must not become JitCode candidates.
             program.unsafe_fn_stubs = llbcs
                 .iter()
                 .flat_map(|llbc| {
                     front::mir::collect_unsafe_fn_stubs_from_llbc(llbc, static_addrs.error_carrier)
                 })
                 .chain(llbcs.iter().flat_map(|llbc| {
-                    front::mir::collect_dont_look_inside_fn_stubs_from_llbc(
+                    front::mir::collect_policy_opaque_fn_stubs_from_llbc(
                         llbc,
                         static_addrs.error_carrier,
                     )
