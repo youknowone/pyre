@@ -822,6 +822,7 @@ impl PyError {
         if let Some(w_target) = crate::builtins::lookup_exc_class(class_name) {
             unsafe {
                 (*(self.exc_object as *mut pyre_object::PyObject)).w_class = w_target;
+                pyre_object::notify_w_class_mutated();
             }
         }
     }
@@ -1297,6 +1298,7 @@ impl PyError {
         if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
             unsafe {
                 (*(exc() as *mut pyre_object::PyObject)).w_class = w_target;
+                pyre_object::notify_w_class_mutated();
             }
         }
         // `PyErr_SetExcFromWindowsErrWithFilenameObjects` builds the exception
@@ -1459,6 +1461,7 @@ impl PyError {
         if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
             unsafe {
                 (*(exc() as *mut pyre_object::PyObject)).w_class = w_target;
+                pyre_object::notify_w_class_mutated();
             }
         }
         let errno_slot = exc_slot + 1;

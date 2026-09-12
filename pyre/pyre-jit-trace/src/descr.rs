@@ -122,6 +122,13 @@ const CELL_FAMILY_EVER_MUTATED_INDEX: u32 = CELL_FAMILY_DESCR_TAG;
 const EC_DESCR_TAG: u32 = 0x5400_0000;
 const EC_W_TRACEFUNC_INDEX: u32 = EC_DESCR_TAG;
 
+// `PyObject.w_class` sits at the same first-Ref coordinate as every other
+// `W_*` header field, so `stable_field_index` names a layout, not an owner.
+// `quasi_immut_descr` casts from the index alone. Reserved in a tag of its
+// own, disjoint from EC / PROPERTY / WRAPPER / MAPDICT / `object.typeptr`.
+const OBJECT_W_CLASS_DESCR_TAG: u32 = 0x5500_0000;
+const OBJECT_W_CLASS_INDEX: u32 = OBJECT_W_CLASS_DESCR_TAG;
+
 // The generated native user layouts append mapdict fields at different base
 // sizes. HeapCache keys by descriptor index; give each translated STRUCT field
 // the distinct identity provided by descr.py's per-STRUCT cache.
@@ -386,7 +393,13 @@ impl Descr for PyreFieldDescr {
         Some(self)
     }
     fn index(&self) -> u32 {
-        stable_field_index(self.offset, self.field_size, self.field_type, self.signed)
+        if self.is_class_word {
+            // `w_class?` — reserved so `quasi_immut_descr` can tell this
+            // header field from every other first-Ref at the same offset.
+            OBJECT_W_CLASS_INDEX
+        } else {
+            stable_field_index(self.offset, self.field_size, self.field_type, self.signed)
+        }
     }
 
     fn get_ei_index(&self) -> u32 {
@@ -3384,7 +3397,7 @@ use pyre_object::{
 // Re-import the rest without duplication
 use pyre_object::{FLOAT_TYPE, INT_TYPE};
 
-/// Field descriptor for `PyObject.w_class` (Ref, mutable).
+/// Field descriptor for `PyObject.w_class` (Ref, `w_class?`).
 ///
 /// PyObject layout: [ob_type(8)] [w_class(8)]
 /// The w_class field holds the Python class for all object types.
@@ -3393,7 +3406,9 @@ use pyre_object::{FLOAT_TYPE, INT_TYPE};
 /// getfield_gc_r then GUARD_VALUE. This is the pyre equivalent — a
 /// field read on the common PyObject header.
 ///
-/// Mutable because __class__ assignment can change it.
+/// `__class__` assignment can change it (`objectobject.py
+/// descr_set___class__`), so the field is `?` not frozen: the optimizer
+/// folds the load, and `notify_w_class_mutated` revokes those loops.
 fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
     // Declares itself the class word (`is_class_word`), which is what
     // `FieldDescr::is_w_class()` reports; the name is for diagnostics only
@@ -3416,7 +3431,7 @@ fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
         field_type: Type::Ref,
         signed: false,
         immutable: false,
-        quasi_immutable: false,
+        quasi_immutable: true,
         name: "w_class",
         is_class_word: true,
         index_in_parent: 0,
@@ -7247,7 +7262,7 @@ mod tests {
             field_flag: ArrayFlag::Signed,
             is_field_signed: false,
             is_immutable: false,
-            is_quasi_immutable: false,
+            is_quasi_immutable: true,
             // slot 0 is `ob_type`; `w_class` is slot 1 of the header.
             index_in_parent: Some(1),
             parent: None,
@@ -7260,6 +7275,13 @@ mod tests {
     /// walker pins a value's class through, so a codewriter-lowered subclass
     /// test (`is_plain_int1`) reads the header the walker already guarded
     /// instead of emitting a second, uncacheable read of the same offset.
+    #[test]
+    fn w_class_descr_is_quasi_immutable_with_reserved_index() {
+        let descr = w_class_descr();
+        assert!(descr.is_quasi_immutable());
+        assert_eq!(descr.index(), OBJECT_W_CLASS_INDEX);
+    }
+
     #[test]
     fn make_descr_from_bh_bridges_pyobject_w_class_to_the_walker_descr() {
         let canonical = w_class_descr();

@@ -5475,7 +5475,7 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     // one must fail loudly rather than reinterpret a headerless map-node
     // allocation as a `W_TypeObject`.  Dropping the old implicit `W_TypeObject`
     // fallback is safe: the arms below are every quasi-immutable descr this
-    // binary can mint — the twelve hand-minted singletons, plus the nine
+    // binary can mint — the thirteen hand-minted singletons, plus the nine
     // `Function` fields `function.py` declares, which
     // `function_quasi_immut_slot` resolves as a group.  No analyzer-derived
     // descr reaches here: a `#[jit_immutable_fields]` entry would need the
@@ -5538,6 +5538,10 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
             pyre_interpreter::executioncontext::ec_current_w_tracefunc_qmut(
                 struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
             )
+        } else if index == crate::descr::w_class_descr().index() {
+            // `PyObject.w_class?` — one process-global watcher; the
+            // struct_ptr is unused (every instance shares the invalidation).
+            Some(pyre_object::w_class_current_qmut())
         } else if let Some(slot) = crate::descr::function_quasi_immut_slot(index) {
             pyre_interpreter::function::function_current_qmut_instance(
                 struct_ptr as pyre_object::PyObjectRef,

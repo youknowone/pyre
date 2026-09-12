@@ -13020,6 +13020,7 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
             crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
         }
         (*w_obj).w_class = w_newcls;
+        pyre_object::notify_w_class_mutated();
     }
     Ok(w_none())
 }
