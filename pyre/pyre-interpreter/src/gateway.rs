@@ -355,15 +355,11 @@ pub struct FastFuncNotSupported;
 pub struct BuiltinActivation;
 
 pub struct GatewayCache {
-    base: crate::baseobjspace::SpaceCache<
-        usize,
-        usize,
-        std::sync::Arc<crate::baseobjspace::ObjSpace>,
-    >,
+    base: crate::baseobjspace::SpaceCache<usize, usize, crate::baseobjspace::SpaceHandle>,
 }
 
 impl GatewayCache {
-    pub fn new(space: std::sync::Arc<crate::baseobjspace::ObjSpace>) -> Self {
+    pub fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
         Self {
             base: crate::baseobjspace::SpaceCache::new(space),
         }

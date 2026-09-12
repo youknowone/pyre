@@ -4751,6 +4751,11 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "boolobject::FALSE_SINGLETON",
             pyre_object::w_bool_from(false) as usize as i64,
         ),
+        // Process-wide StdObjSpace prebuilt (`baseobjspace.py` space).
+        (
+            "baseobjspace::OBJECT_SPACE",
+            &crate::baseobjspace::OBJECT_SPACE as *const _ as i64,
+        ),
     ]
 }
 

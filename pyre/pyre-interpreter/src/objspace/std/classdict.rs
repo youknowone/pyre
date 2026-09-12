@@ -5,7 +5,7 @@
 //! `setdictvalue` / `deldictvalue`.
 
 use crate::PyError;
-use crate::baseobjspace::{ObjSpace, SpaceCacheClass, SpaceCacheInstance};
+use crate::baseobjspace::{SpaceCacheClass, SpaceCacheInstance};
 use pyre_object::dictmultiobject::{DictStrategy, DictStrategyRef, StrategyKind};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
@@ -13,11 +13,11 @@ use rustpython_wtf8::Wtf8;
 /// `classdict.py ClassDictStrategy`.
 pub struct ClassDictStrategy {
     #[allow(dead_code)]
-    space: std::sync::Arc<ObjSpace>,
+    space: crate::baseobjspace::SpaceHandle,
 }
 
 impl ClassDictStrategy {
-    pub fn new(space: std::sync::Arc<ObjSpace>) -> Self {
+    pub fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
         Self { space }
     }
 

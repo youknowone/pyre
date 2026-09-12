@@ -478,19 +478,52 @@ pub enum SpaceCacheInstance {
     ClassDictStrategy(std::sync::Arc<crate::objspace::std::classdict::ClassDictStrategy>),
 }
 
-impl SpaceCallable<std::sync::Weak<ObjSpace>> for SpaceCacheClass {
+/// Process-wide prebuilt space, or an isolated test space.
+/// Upstream the translated `ObjSpace` is one prebuilt instance; tests
+/// still construct extra spaces the way `StdObjSpace()` can be new'd
+/// at host time.
+#[derive(Clone)]
+pub enum SpaceHandle {
+    ProcessWide,
+    Isolated(std::sync::Weak<ObjSpace>),
+}
+
+/// Keeps an isolated `Arc` alive for the duration of a `&ObjSpace` borrow.
+pub enum SpaceGuard<'a> {
+    Static(&'a ObjSpace),
+    Held(std::sync::Arc<ObjSpace>),
+}
+
+impl std::ops::Deref for SpaceGuard<'_> {
+    type Target = ObjSpace;
+
+    fn deref(&self) -> &ObjSpace {
+        match self {
+            Self::Static(space) => space,
+            Self::Held(space) => space,
+        }
+    }
+}
+
+impl SpaceHandle {
+    pub fn get(&self) -> SpaceGuard<'_> {
+        match self {
+            Self::ProcessWide => SpaceGuard::Static(object_space()),
+            Self::Isolated(space) => {
+                SpaceGuard::Held(space.upgrade().expect("live InternalSpaceCache owner"))
+            }
+        }
+    }
+}
+
+impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
     type Value = SpaceCacheInstance;
     type Error = std::convert::Infallible;
 
     fn call(
         &self,
-        space: &std::sync::Weak<ObjSpace>,
+        space: &SpaceHandle,
     ) -> Result<Self::Value, majit_rlib::cache::CacheError<Self::Error>> {
-        // InternalSpaceCache.__init__ owns its space strongly upstream.
-        // Only the native self-reference is Weak (Arc::new_cyclic cannot
-        // upgrade during construction); fromcache's &self proves it live.
-        // Returned subclass caches retain a strong space just as PyPy does.
-        let space = space.upgrade().expect("live InternalSpaceCache owner");
         Ok(match self {
             Self::TypeCache => SpaceCacheInstance::TypeCache(std::sync::Arc::new(
                 crate::objspace::std::typeobject::TypeCache::new(space.clone()),
@@ -506,17 +539,23 @@ impl SpaceCallable<std::sync::Weak<ObjSpace>> for SpaceCacheClass {
 }
 
 /// baseobjspace.py ObjSpace.__init__: own InternalSpaceCache, whose callable
-/// keys construct per-space caches. The prebuilt strong ownership cycle is
-/// intentional: a returned cache keeps its space alive. Runtime operations
-/// remain free functions while they are migrated onto this owner.
+/// keys construct per-space caches. The process-wide instance is a prebuilt
+/// static (`OBJECT_SPACE`); isolated test spaces keep an `Arc`.
 pub struct ObjSpace {
-    fromcache: InternalSpaceCache<SpaceCacheClass, std::sync::Weak<ObjSpace>>,
+    fromcache: InternalSpaceCache<SpaceCacheClass, SpaceHandle>,
 }
 
 impl ObjSpace {
+    pub const PREBUILT: Self = Self {
+        fromcache: InternalSpaceCache {
+            space: SpaceHandle::ProcessWide,
+            base: majit_rlib::cache::Cache::EMPTY,
+        },
+    };
+
     pub fn new() -> std::sync::Arc<Self> {
         let space = std::sync::Arc::new_cyclic(|space| Self {
-            fromcache: InternalSpaceCache::new(space.clone()),
+            fromcache: InternalSpaceCache::new(SpaceHandle::Isolated(space.clone())),
         });
         OBJECT_SPACE_ROOTS
             .lock()
@@ -552,19 +591,22 @@ impl ObjSpace {
     }
 }
 
-static OBJECT_SPACE: std::sync::OnceLock<std::sync::Arc<ObjSpace>> = std::sync::OnceLock::new();
+/// Process-wide `StdObjSpace` instance. Upstream the translated space is
+/// a prebuilt captured by closures; this static is that instance, not a
+/// `OnceLock` holder around it.
+pub static OBJECT_SPACE: ObjSpace = ObjSpace::PREBUILT;
 
-// Native counterpart of the GC transform's prebuilt roots. Not a semantic
-// object-space lookup table: every live space must expose its actual caches.
+// Isolated test spaces, in addition to the process-wide prebuilt.
 static OBJECT_SPACE_ROOTS: parking_lot::Mutex<Vec<std::sync::Weak<ObjSpace>>> =
     parking_lot::Mutex::new(Vec::new());
 
-/// The existing single interpreter's object-space owner, shared by threads.
-pub fn object_space() -> &'static std::sync::Arc<ObjSpace> {
-    OBJECT_SPACE.get_or_init(ObjSpace::new)
+/// The process-wide object-space owner, shared by threads.
+pub fn object_space() -> &'static ObjSpace {
+    &OBJECT_SPACE
 }
 
 pub fn walk_object_space_cache_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    OBJECT_SPACE.walk_cache_roots(forward);
     OBJECT_SPACE_ROOTS.lock().retain(|owner| {
         if let Some(space) = owner.upgrade() {
             space.walk_cache_roots(forward);
