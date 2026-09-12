@@ -2196,11 +2196,6 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             } else {
                 baked_field_len
             };
-        // GETFIELD only the mint (or the shorter present prefix). Growing
-        // to `baked` when present > minted treats live virtualstate boxes
-        // as last_instr (`'frame' object is not an iterator` in
-        // setuptools entry points). Extra slots stay on LABEL/JUMP and
-        // must not join `loop.inputargs`.
         let walk_fields = present_fields.min(minted_fields);
         if walk_fields < n_static {
             return;
@@ -2212,6 +2207,13 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         );
         field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
         expanded_len = entry_prefix_len + field_types.len();
+        let types_match = inputargs
+            .get(entry_prefix_len..expanded_len)
+            .is_some_and(|tail| tail.iter().map(|ia| ia.tp).eq(field_types.iter().copied()));
+        if !types_match {
+            inputargs.truncate(entry_prefix_len);
+            return;
+        }
     }
 
     // `compile.py:458 assert i == len(inputargs)` requires the expanded
@@ -3806,6 +3808,45 @@ mod tests {
             .collect();
         assert_eq!(label_args[3], OpRef::input_arg_ref(3));
         assert_eq!(label_args[4], OpRef::input_arg_ref(4));
+    }
+
+    #[test]
+    fn test_patch_new_loop_rejects_leftover_empty_type_mismatch() {
+        // leftover-empty, length matches the mint (one Ref field) but the
+        // present slot is an Int. That is a live virtualstate box, not
+        // `obj`. Do not GETFIELD it as a Ref.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Int, 1),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_ref(1)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert!(
+            ops.iter().all(|op| op.opcode != OpCode::GetfieldGcR),
+            "a type-mismatched leftover-empty tail must not GETFIELD"
+        );
     }
 
     #[test]
