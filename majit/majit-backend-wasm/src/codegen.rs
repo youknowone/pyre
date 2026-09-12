@@ -13192,10 +13192,7 @@ mod tests {
         // Copy, do not drain: one module can emit more than one FINISH
         // (merged inline regions), and the second must keep the same
         // GUARD_NOT_FORCED_2 homes.
-        assert_eq!(
-            maps.finish_gcmap.borrow().as_slice(),
-            [maps.home_index(1)]
-        );
+        assert_eq!(maps.finish_gcmap.borrow().as_slice(), [maps.home_index(1)]);
     }
 
     /// x86/assembler.py `_reload_frame_if_necessary`: after a nursery frame
