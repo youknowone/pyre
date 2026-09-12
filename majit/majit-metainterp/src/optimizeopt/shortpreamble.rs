@@ -594,15 +594,18 @@ impl PotentialShortOp {
 
 impl ShortBoxes {
     pub fn new(num_label_args: usize) -> Self {
+        // shortpreamble.py create_short_boxes plants one ShortInputArg
+        // per label arg, then heap/pure candidates. Size the maps to
+        // that first loop so the IndexMap table is not grown per box.
         ShortBoxes {
-            potential_ops: IndexMap::new(),
-            potential_op_oprefs: IndexSet::new(),
-            produced_short_boxes: IndexMap::new(),
+            potential_ops: IndexMap::with_capacity(num_label_args),
+            potential_op_oprefs: IndexSet::with_capacity(num_label_args),
+            produced_short_boxes: IndexMap::with_capacity(num_label_args),
             const_short_boxes: Vec::new(),
             known_constants: IndexSet::new(),
-            short_inputargs: Vec::new(),
-            short_inputarg_refs: Vec::new(),
-            label_args: Vec::new(),
+            short_inputargs: Vec::with_capacity(num_label_args),
+            short_inputarg_refs: Vec::with_capacity(num_label_args),
+            label_args: Vec::with_capacity(num_label_args),
             boxes_in_production: IndexSet::new(),
             num_label_args,
         }
@@ -2303,7 +2306,7 @@ impl ShortPreambleBuilder {
         short_boxes: &[(majit_ir::operand::Operand, ProducedShortOp)],
         short_inputargs: &[OpRef],
     ) -> Self {
-        let mut produced_short_boxes = IndexMap::new();
+        let mut produced_short_boxes = IndexMap::with_capacity(short_boxes.len());
         for (k, v) in short_boxes {
             // shortpreamble.py: __init__ plants
             // `preamble_op.set_forwarded(info)` on every replay op. The
@@ -2667,7 +2670,7 @@ impl ExtendedShortPreambleBuilder {
             // res Box (#146); this builder keys by `preamble_op.pos` (the
             // assert in `ensure_dep_from_produced`), so re-key on copy.
             produced_short_boxes: {
-                let mut m = indexmap::IndexMap::new();
+                let mut m = indexmap::IndexMap::with_capacity(sb.produced_short_boxes.len());
                 for (_, p) in sb.produced_short_boxes.iter() {
                     m.insert(p.preamble_op.pos().get(), p.clone());
                 }
