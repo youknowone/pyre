@@ -8,7 +8,9 @@ use std::path::Path;
 /// closure, minus heavy optional trees (`asyncio`, `pdb`, `email`,
 /// `ssl`, `ctypes`, `unittest`, `tarfile`, …).  C-level dependencies
 /// (`_sre`, `_json`, `_random`, `_abc`, `_weakref`, `itertools`,
-/// `_collections`, `_thread`, `operator`) are builtin and not embedded.
+/// `_collections`, `_thread`) are builtin; the wrappers they back
+/// (`operator.py`, `codecs.py`, `json/{decoder,encoder,scanner}.py`)
+/// still have to be embedded.
 #[cfg(feature = "wasm_vfs")]
 const STDLIB_CLOSURE: &[&str] = &[
     "__future__.py",
@@ -26,6 +28,7 @@ const STDLIB_CLOSURE: &[&str] = &[
     "base64.py",
     "bisect.py",
     "calendar.py",
+    "codecs.py",
     "collections/__init__.py",
     "contextlib.py",
     "contextvars.py",
@@ -47,11 +50,15 @@ const STDLIB_CLOSURE: &[&str] = &[
     "html/entities.py",
     "io.py",
     "json/__init__.py",
+    "json/decoder.py",
+    "json/encoder.py",
+    "json/scanner.py",
     "keyword.py",
     "linecache.py",
     "logging/__init__.py",
     "ntpath.py",
     "numbers.py",
+    "operator.py",
     "os.py",
     "pathlib/__init__.py",
     "pathlib/_os.py",
