@@ -469,6 +469,7 @@ pub enum SpaceCacheClass {
     GatewayCache,
     TypeCache,
     ClassDictStrategy,
+    SysState,
 }
 
 #[derive(Clone)]
@@ -476,6 +477,7 @@ pub enum SpaceCacheInstance {
     GatewayCache(std::sync::Arc<crate::gateway::GatewayCache>),
     TypeCache(std::sync::Arc<crate::objspace::std::typeobject::TypeCache>),
     ClassDictStrategy(std::sync::Arc<crate::objspace::std::classdict::ClassDictStrategy>),
+    SysState(std::sync::Arc<crate::module::sys::state::SysState>),
 }
 
 /// Process-wide prebuilt space, or an isolated test space.
@@ -534,6 +536,9 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
             Self::ClassDictStrategy => SpaceCacheInstance::ClassDictStrategy(std::sync::Arc::new(
                 crate::objspace::std::classdict::ClassDictStrategy::new(space.clone()),
             )),
+            Self::SysState => SpaceCacheInstance::SysState(std::sync::Arc::new(
+                crate::module::sys::state::SysState::new(),
+            )),
         })
     }
 }
@@ -574,6 +579,7 @@ impl ObjSpace {
             SpaceCacheInstance::GatewayCache(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::TypeCache(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::ClassDictStrategy(cache) => cache.walk_roots(forward),
+            SpaceCacheInstance::SysState(cache) => cache.walk_roots(forward),
         });
     }
 

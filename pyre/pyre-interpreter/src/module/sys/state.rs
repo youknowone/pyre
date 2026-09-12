@@ -41,10 +41,33 @@ pub const RECURSION_LIMIT_WORD_SIZE: usize = std::mem::size_of::<AtomicUsize>();
 pub const DEFAULT_MAX_STR_DIGITS: i32 = 4300;
 pub const MAX_STR_DIGITS_THRESHOLD: i32 = 640;
 
-/// `State.w_int_max_str_digits` parity (`pypy/module/sys/state.py`).
-/// Pyre currently has one object space, so its process-global sys module
-/// state is represented by the corresponding process-global atomic.
-static INT_MAX_STR_DIGITS: AtomicI32 = AtomicI32::new(DEFAULT_MAX_STR_DIGITS);
+/// `pypy/module/sys/state.py class State` — `space.fromcache(State)`.
+/// `w_int_max_str_digits` is a field of this instance, not a module-level
+/// atomic.  The atomic is the free-threaded stand-in for assigning the
+/// field (`set_int_max_str_digits` writes `state.w_int_max_str_digits`).
+pub struct SysState {
+    int_max_str_digits: AtomicI32,
+}
+
+impl SysState {
+    pub fn new() -> Self {
+        Self {
+            int_max_str_digits: AtomicI32::new(DEFAULT_MAX_STR_DIGITS),
+        }
+    }
+
+    pub fn walk_roots(&self, _forward: &mut dyn FnMut(&mut pyre_object::PyObjectRef)) {}
+}
+
+/// `state.py get(space)` → `space.fromcache(State)`.
+fn sys_state() -> std::sync::Arc<SysState> {
+    match crate::baseobjspace::object_space()
+        .fromcache(crate::baseobjspace::SpaceCacheClass::SysState)
+    {
+        crate::baseobjspace::SpaceCacheInstance::SysState(state) => state,
+        _ => unreachable!("SpaceCacheClass::SysState builds SysState"),
+    }
+}
 
 /// `space.sys.recursionlimit` getter. Matches
 /// `pypy/module/sys/vm.py getrecursionlimit return space.newint(space.sys.recursionlimit)`.
@@ -72,19 +95,34 @@ pub fn set_recursion_limit(new_limit: i32) {
 
 #[inline]
 pub fn int_max_str_digits() -> i32 {
-    INT_MAX_STR_DIGITS.load(Ordering::Relaxed)
+    sys_state().int_max_str_digits.load(Ordering::Relaxed)
 }
 
 /// `pypy/module/sys/state.py:set_int_max_str_digits` validation.
 pub fn set_int_max_str_digits(maxdigits: i32) -> Result<(), crate::PyError> {
     if maxdigits == 0 || maxdigits >= MAX_STR_DIGITS_THRESHOLD {
-        INT_MAX_STR_DIGITS.store(maxdigits, Ordering::Relaxed);
+        sys_state()
+            .int_max_str_digits
+            .store(maxdigits, Ordering::Relaxed);
         Ok(())
     } else {
         Err(crate::PyError::new(
             crate::PyErrorKind::ValueError,
             format!("maxdigits {maxdigits} must be 0 or larger than {MAX_STR_DIGITS_THRESHOLD}"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn int_max_str_digits_lives_on_the_space_state() {
+        crate::typedef::init_typeobjects();
+        assert_eq!(super::int_max_str_digits(), super::DEFAULT_MAX_STR_DIGITS);
+        super::set_int_max_str_digits(1000).unwrap();
+        assert_eq!(super::int_max_str_digits(), 1000);
+        super::set_int_max_str_digits(super::DEFAULT_MAX_STR_DIGITS).unwrap();
+        assert!(super::set_int_max_str_digits(1).is_err());
     }
 }
 
