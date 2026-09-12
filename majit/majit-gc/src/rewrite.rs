@@ -252,6 +252,21 @@ pub fn remove_ref_constants_for_inputs(
                     .into_iter()
                     .map(|arg| {
                         let replaced = arg.get_box_replacement(false);
+                        // Same keep as `rewrite_operand`: a live InputArg
+                        // forwarded to null is still the virtualizable
+                        // identity. Baking ConstPtr(0) here is what
+                        // `consume_vable_info` then reads as identity 0.
+                        if let Some(Value::Ref(gcref)) = replaced.const_value()
+                            && gcref.is_null()
+                        {
+                            let orig = arg.to_opref();
+                            if !orig.is_none()
+                                && !orig.is_constant()
+                                && defined.contains(&orig.raw())
+                            {
+                                return arg;
+                            }
+                        }
                         register_constptr(&replaced, &mut gcrefs, &mut gcrefs_map);
                         replaced
                     })
