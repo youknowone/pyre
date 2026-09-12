@@ -13189,9 +13189,12 @@ mod tests {
                 maps.home_index(1)
             ]
         );
-        assert!(
-            maps.finish_gcmap.borrow().is_empty(),
-            "a later trace must not inherit this finish map"
+        // Copy, do not drain: one module can emit more than one FINISH
+        // (merged inline regions), and the second must keep the same
+        // GUARD_NOT_FORCED_2 homes.
+        assert_eq!(
+            maps.finish_gcmap.borrow().as_slice(),
+            [maps.home_index(1)]
         );
     }
 
