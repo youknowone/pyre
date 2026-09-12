@@ -10009,7 +10009,7 @@ mod tests {
     fn lower_compare_op_hlop_to_insn_emits_is_op_tag() {
         // IS_OP routes through the same compare helper as COMPARE_OP;
         // `is` lowers to op_val tag 8 (`is_not` → 9). `compare_value_from_tag`
-        // handles those tags via `is_w`, matching `bh_compare_fn`.
+        // handles those tags via `is_w`, matching `compare_value_from_tag`.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);
@@ -10030,11 +10030,7 @@ mod tests {
                     opname == "inline_call_ir_r" || opname == "residual_call_ir_r",
                     "unexpected compare lowering {opname}"
                 );
-                let tag_list = if opname == "inline_call_ir_r" {
-                    &args[1]
-                } else {
-                    &args[1]
-                };
+                let tag_list = &args[1];
                 match tag_list {
                     Operand::ListOfKind(list) => match &list.content[0] {
                         Operand::ConstInt(v) => {

@@ -226,10 +226,9 @@ pub fn compare_value_from_tag(
     b: PyObjectRef,
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
-    // Same contract as `bh_compare_fn`: a compiled force that has not
-    // written a local yet hands a NULL here.  Residual compare published
-    // TypeError; this helper must too, or the inlined path returns a
-    // NULL result without an exception (`ValueError: call failed`).
+    // A compiled force that has not written a local yet hands a NULL
+    // here.  It must raise, or the inlined path returns a NULL result
+    // without an exception (`ValueError: call failed`).
     if a.is_null() || b.is_null() {
         return Err(PyError::type_error("comparison on null operand"));
     }
@@ -247,17 +246,15 @@ pub fn compare_value_from_tag(
     }
     // CHECK_EXC_MATCH (tag 10): `except T:` is `exception_match(type(exc), T)`.
     // The codewriter residualises that as `compare_fn(exc, T, 10)`, and
-    // `cpu.compare_fn` is this helper (`jit_compare_value_from_tag`), not
-    // `bh_compare_fn`.  Without this arm the residual TypeErrors
-    // ("unsupported compare op tag: 10"), Truth sees NULL, and the
-    // handler takes the mismatch re-raise — a caught `ValueError`
-    // escapes the frame.
+    // `cpu.compare_fn` is this helper (`jit_compare_value_from_tag`).
+    // Without this arm the residual TypeErrors ("unsupported compare op
+    // tag: 10"), Truth sees NULL, and the handler takes the mismatch
+    // re-raise — a caught `ValueError` escapes the frame.
     if op_tag == crate::runtime_ops::ISINSTANCE_OP_TAG {
         crate::eval::validate_check_exc_match_class(b)?;
         return Ok(w_bool_from(crate::eval::check_exc_match_against(a, b)));
     }
-    // IS_OP: `space.is_w`, not raw pointer identity — same contract as
-    // `bh_compare_fn`. Infallible.
+    // IS_OP: `space.is_w`, not raw pointer identity.  Infallible.
     if crate::runtime_ops::compare_op_tag_is_identity(op_tag) {
         let same = crate::baseobjspace::is_w(a, b);
         let result = if op_tag == crate::runtime_ops::COMPARE_OP_IS_NOT {

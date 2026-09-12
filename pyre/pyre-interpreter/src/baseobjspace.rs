@@ -10415,11 +10415,7 @@ pub(crate) unsafe fn _lookup_where_class_uncached(
     w_name: *mut PyObject,
 ) -> *mut PyObject {
     let name = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
-    match name.as_str() {
-        Ok(s) => lookup_where_class_uncached(w_type, s).unwrap_or(std::ptr::null_mut()),
-        Err(_) => lookup_where_pair_wtf8_uncached(w_type, name)
-            .map_or(std::ptr::null_mut(), |(src, _value)| src),
-    }
+    lookup_where_pair_wtf8_uncached(w_type, name).map_or(std::ptr::null_mut(), |(src, _value)| src)
 }
 
 /// The uncached arms of [`lookup_in_type_where_wtf8`].  The ordinary
