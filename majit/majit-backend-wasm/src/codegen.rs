@@ -5118,6 +5118,17 @@ pub fn build_wasm_module(
             scanned
         }
     };
+    // `emit_publish_home_gcmap` `call_indirect`s `wasm_jit_union_gcmap`
+    // at `residual_type_base + 2`. A reload-only census is arity 0, a
+    // write-barrier-only census arity 1; either leaves that slot missing
+    // or pointing at a later incompatible type.
+    let residual_max_arity = if (ca.compute_home_gcmap || ca.home_gcmap_ptr != 0)
+        && let Some(max) = residual_max_arity
+    {
+        Some(max.max(2))
+    } else {
+        residual_max_arity
+    };
     // Typed float residual calls use their descr's faithful wasm ABI instead
     // of the uniform i64 helper family. Preserve first-use order so a given
     // trace gets stable type indices while declaring each signature once.

@@ -2908,6 +2908,76 @@ fn compute_home_gcmap_simple_loop_is_valid() {
     validate_wasm(&bytes);
 }
 
+#[test]
+fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let const_1 = OpRef::const_int(1);
+    let const_100 = OpRef::const_int(100);
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(1), OpRef::input_arg_int(0)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), const_100],
+            OpRef::int_op(4),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(4)],
+            &[OpRef::int_op(3), OpRef::int_op(2)],
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(2))]),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.compute_home_gcmap = true;
+    ca.ca_reload_fn_ptr = 1;
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants,
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs)
+        .expect("reload-only residual family must declare arity 2 for union");
+    validate_wasm(&bytes);
+}
+
 /// A re-emission that grew the LABEL-capture tail must still build when
 /// asked to null only the newly marked slots before publishing.
 #[test]
