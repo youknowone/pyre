@@ -11728,7 +11728,7 @@ fn read_portal_debugdata<Sym: WalkSym>(
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
 /// was recorded — is `record_portal_tracefunc_guard` for a trace function and
-/// the `is_being_profiled` green (`interp_jit.py greens`) for a profiler.
+/// `record_portal_profilefunc_guard` (`profilefunc?`) for a profiler.
 pub(crate) fn ec_hook_installed() -> bool {
     let ec = pyre_interpreter::call::getexecutioncontext();
     !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() || (*ec).profilefunc.is_some() }
@@ -11761,10 +11761,9 @@ pub(crate) fn ec_hook_installed() -> bool {
 /// A trace recorded while the slot is ALREADY non-NULL records nothing: there
 /// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
 /// declines every Python-callee inline in that state, so the events come from
-/// the interpreter's own `execute_frame`.  `sys.setprofile` needs no guard
-/// here at all — `is_being_profiled` is a portal-driver green
-/// (`interp_jit.py greens`), so arming a profiler mints a different cell whose
-/// own recording sees the hook and declines the same inlines.
+/// the interpreter's own `execute_frame`.  `sys.setprofile` is the
+/// sibling `profilefunc?` pin (`record_portal_profilefunc_guard`), not
+/// this slot.
 fn record_portal_tracefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -11807,6 +11806,50 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .nullity_now_known(read, false);
+    Ok(())
+}
+
+/// `executioncontext.py` `profilefunc?` — PyPy's opt log pins the empty
+/// function pointer with `getfield_gc_i(inst_profilefunc)` + `int_is_zero` +
+/// `guard_true` next to the `w_tracefunc` promote.  The green
+/// `is_being_profiled` selects a different cell for a *new* recording; a
+/// loop already compiled with the slot empty jumps to itself and never
+/// re-reads that green, so without this pin `sys.setprofile` leaves it
+/// running.  `setllprofile` invalidates the watchers.
+fn record_portal_profilefunc_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    if ctx.fbw_mode.inline_subwalk {
+        return Ok(());
+    }
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() || unsafe { (*ec).profilefunc.is_some() } {
+        return Ok(());
+    }
+    let Some(ec_box) = walker_ensure_execution_context(ctx) else {
+        return Ok(());
+    };
+    let descr = crate::descr::ec_profilefunc_descr();
+    let descr_index = descr.index();
+    if ctx
+        .trace_ctx
+        .heapcache_getfield_cached(ec_box, descr_index)
+        .is_some()
+    {
+        return Ok(());
+    }
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    let read = ctx
+        .trace_ctx
+        .record_op_with_descr(OpCode::GetfieldGcI, &[ec_box], descr);
+    ctx.trace_ctx
+        .heapcache_getfield_now_known(ec_box, descr_index, read);
+    ctx.trace_ctx.set_opref_concrete(read, Value::Int(0));
+    let is_zero = ctx.trace_ctx.record_op(OpCode::IntIsZero, &[read]);
+    ctx.trace_ctx.set_opref_concrete(is_zero, Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_zero])?;
     Ok(())
 }
 
@@ -13612,6 +13655,7 @@ fn handle<Sym: WalkSym>(
             // loop makes.  The walker records neither for an inlined callee,
             // so the loop pins the slot instead.
             record_portal_tracefunc_guard(ctx, op.pc)?;
+            record_portal_profilefunc_guard(ctx, op.pc)?;
 
             // pyjitpl.py, the tail of `MIFrame.debug_merge_point`,
             // which `opimpl_jit_merge_point` calls at :1542 — ahead of every
