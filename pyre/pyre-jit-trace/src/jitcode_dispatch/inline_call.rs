@@ -14560,6 +14560,30 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
     }
 
+    // `w_complex_new` is `malloc_typed` of a header-plus-payload struct.
+    // Walking `binary_value_from_tag` records that allocation as a bare
+    // `object` (`<object object at ...>`), so a compiled `abs(x - y)`
+    // over complexes TypeErrors. Residualize the helper; the real
+    // `complex_sub` builds a `W_ComplexObject`.
+    if is_binary_from_tag
+        && ref_args.len() == 2
+        && ref_args.iter().any(|&operand| {
+            walker_concrete_ref_object(ctx, operand)
+                .is_some_and(|obj| unsafe { pyre_object::is_complex(obj) })
+        })
+    {
+        let outcome = residualize_inline_call_via_fnaddr(
+            ctx,
+            code,
+            op.pc,
+            descr_index,
+            &int_args,
+            &ref_args,
+            &[],
+        )?;
+        return Ok((outcome, op.next_pc));
+    }
+
     let walked = run_inline_call_subwalk(
         ctx,
         code,

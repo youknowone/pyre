@@ -4372,9 +4372,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let mut residual_result_scope = None;
     let exec_result = match exec_result {
         Ok(result_i64)
-            if !is_void
-                && call_descr.result_type() == majit_ir::Type::Ref
-                && result_i64 != 0 =>
+            if !is_void && call_descr.result_type() == majit_ir::Type::Ref && result_i64 != 0 =>
         {
             let obj = result_i64 as usize as pyre_object::PyObjectRef;
             if obj.is_null() {
