@@ -9187,6 +9187,17 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         )? {
                             return Ok(inlined);
                         }
+                        // Int-strategy miss: `dict.lookup` on dstorage +
+                        // `int_lt < 0` then `raise_key_error`
+                        // (`ll_dict_getitem_with_hash`).  The hit fold
+                        // emits the same lookup's fail arm; residual
+                        // CallMayForce would force the virtual KeyError
+                        // the inlined except is about to catch.
+                        if let Some(outcome) = spec_gate(SpecFold::Subscr, || {
+                            try_walker_specialize_subscr_int_miss(ctx, op.pc, &r_args)
+                        })? {
+                            return Ok((outcome, op.next_pc));
+                        }
                         // BINARY_SUBSCR list[int] getitem (int/float storage);
                         // falls through to the generic may-force leg otherwise.
                         spec_gate(SpecFold::Subscr, || {

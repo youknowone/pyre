@@ -133,6 +133,49 @@ pub extern "C" fn jit_dict_exact_int_lookup_or_null(dict: i64, key: i64) -> i64 
     }
 }
 
+/// `rordereddict.py ll_dict_lookup` for `IntDictStrategy` — insertion-order
+/// index, or `-1` on a miss.  The four-argument shape is the `dict.lookup`
+/// oopspec (`d, key, hash, FLAG_LOOKUP`): `d` is the unerased `dstorage`
+/// table, and `key`/`hash` are the unboxed `plain_int_w` word.  Int hash is
+/// identity (`ll_int_hash`), which is why PyPy's after-opt is
+/// `call_i(lookup, p62, i47, i47, 0)`.
+pub extern "C" fn jit_dict_exact_int_lookup_index(
+    storage: i64,
+    key: i64,
+    _hash: i64,
+    flag: i64,
+) -> i64 {
+    debug_assert_eq!(flag, 0, "only FLAG_LOOKUP is implemented");
+    if storage == 0 {
+        return -1;
+    }
+    unsafe {
+        let entries = &*(storage as *const pyre_object::dictmultiobject::IntDictStorage);
+        entries
+            .index_of(&key)
+            .map(|index| index as i64)
+            .unwrap_or(-1)
+    }
+}
+
+/// Value half of an int-strategy `dict.lookup`: `d.entries[i].value` after
+/// the index settled.  Stands in for `getinteriorfield_gc_r` on
+/// `odictentry.value` (`ll_dict_getitem_with_hash`); pyre's `RDict` is not
+/// a GC array-of-structs, so the load cannot be a raw interior field.
+/// A stale index answers `PY_NULL` so the caller's `GuardNonnull` side-exits.
+pub extern "C" fn jit_dict_int_value_at(storage: i64, index: i64) -> i64 {
+    if index < 0 || storage == 0 {
+        return PY_NULL as i64;
+    }
+    unsafe {
+        let entries = &*(storage as *const pyre_object::dictmultiobject::IntDictStorage);
+        entries
+            .get_slot(index as usize)
+            .map(|(_, &value)| value as i64)
+            .unwrap_or(PY_NULL as i64)
+    }
+}
+
 /// Read a dict value at an entry index a traced `dict.lookup` settled on —
 /// `rordereddict.py ll_dict_getitem`'s `d.entries[i].value` after
 /// `ll_dict_lookup` returned the slot.  The read goes through the live storage

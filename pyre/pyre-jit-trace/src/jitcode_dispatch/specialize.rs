@@ -10138,6 +10138,16 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
+    // Int-strategy hit is the fail arm of the same `dict.lookup` the miss
+    // fold emits (`ll_dict_getitem_with_hash`: `int_lt(index, 0)` then
+    // `d.entries[index].value`).  A separate `lookup_or_null` would pin
+    // the first hit's value and storm the guard on every other key.
+    if matches!(hit.key_probe, DictFoldKeyProbe::Int) {
+        return walker_emit_exact_dict_int_hit(
+            ctx, op_pc, dict_op, key_op, dict, hit, dst, dst_bank,
+        );
+    }
+
     let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
     walker_guard_class(
         ctx,
@@ -10147,20 +10157,12 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
     )?;
     walker_guard_exact_w_class(ctx, op_pc, dict_op, canonical_dict)?;
 
-    let (key_type, canonical_key, strategy_ref, lookup_helper) = match hit.key_probe {
-        DictFoldKeyProbe::Int => (
-            &pyre_object::pyobject::INT_TYPE as *const _ as i64,
-            pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
-            &pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64,
-            crate::helpers::jit_dict_exact_int_lookup_or_null as *const (),
-        ),
-        DictFoldKeyProbe::Unicode => (
-            &pyre_object::pyobject::STR_TYPE as *const _ as i64,
-            pyre_object::get_instantiate(&pyre_object::pyobject::STR_TYPE),
-            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
-            crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const (),
-        ),
-    };
+    let (key_type, canonical_key, strategy_ref, lookup_helper) = (
+        &pyre_object::pyobject::STR_TYPE as *const _ as i64,
+        pyre_object::get_instantiate(&pyre_object::pyobject::STR_TYPE),
+        &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
+        crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const (),
+    );
 
     let strategy = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
@@ -10197,6 +10199,274 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
+}
+
+/// Hit arm of `ll_dict_getitem_with_hash` after `IntDictStrategy.getitem`
+/// found the key: the same `dict.lookup` the miss fold emits, then
+/// `int_lt(index, 0)` / `guard_false` and `d.entries[index].value`.
+fn walker_emit_exact_dict_int_hit<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    dict_op: OpRef,
+    key_op: OpRef,
+    dict: pyre_object::PyObjectRef,
+    hit: DictFoldHit,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some(key) = walker_concrete_ref_object(ctx, key_op) else {
+        return Ok(None);
+    };
+    let Some(index_concrete) =
+        (unsafe { pyre_object::dictmultiobject::w_dict_index_of_int_strategy(dict, key) })
+    else {
+        return Ok(None);
+    };
+    let (index_op, storage_op) = walker_emit_int_dict_lookup_index(
+        ctx,
+        op_pc,
+        dict_op,
+        key_op,
+        dict,
+        key,
+        index_concrete as i64,
+    )?;
+    let zero = ctx.trace_ctx.const_int(0);
+    let is_miss = ctx.trace_ctx.record_op(OpCode::IntLt, &[index_op, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(is_miss, majit_ir::Value::Int(0));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[is_miss])?;
+    let value = ctx.trace_ctx.call_ref_typed_with_effect(
+        crate::helpers::jit_dict_int_value_at as *const (),
+        &[storage_op, index_op],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[value])?;
+    ctx.trace_ctx.set_opref_concrete(
+        value,
+        majit_ir::Value::Ref(majit_ir::GcRef(hit.concrete_value as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+    Ok(Some(()))
+}
+
+/// `IntDictStrategy.getitem` miss: the key is a plain int and the table
+/// has no entry.  `descr_getitem` then does `space.raise_key_error(w_key)`.
+fn walker_probe_exact_dict_int_miss(
+    dict: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+) -> bool {
+    let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
+    if canonical_dict.is_null()
+        || !unsafe {
+            std::ptr::eq((*dict).ob_type, &pyre_object::pyobject::DICT_TYPE)
+                && std::ptr::eq((*dict).w_class, canonical_dict)
+        }
+    {
+        return false;
+    }
+    let strategy_kind =
+        unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(dict).strategy_kind() };
+    strategy_kind == pyre_object::dictmultiobject::StrategyKind::Int
+        && unsafe { pyre_object::listobject::is_plain_int1(key) && pyre_object::is_int(key) }
+        && unsafe { pyre_object::dictmultiobject::w_dict_index_of_int_strategy(dict, key) }
+            .is_none()
+}
+
+/// `rordereddict.py ll_dict_lookup` for an Int strategy: class / strategy /
+/// key pins, `getfield dstorage`, then the four-argument `dict.lookup`
+/// oopspec on the unerased table.  Returns `(index, storage)`.
+///
+/// Shape matches `ll_dict_getitem_with_hash`:
+/// `call_i(lookup, dstorage, plain_int_w(key), hash, FLAG_LOOKUP)`.
+/// Int hash is identity (`ll_int_hash`), so the hash operand is the same
+/// unboxed word as the key.
+fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    dict_op: OpRef,
+    key_op: OpRef,
+    dict: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+    index_concrete: i64,
+) -> Result<(OpRef, OpRef), DispatchError> {
+    let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
+    walker_guard_class(
+        ctx,
+        op_pc,
+        dict_op,
+        &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+    )?;
+    walker_guard_exact_w_class(ctx, op_pc, dict_op, canonical_dict)?;
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        dict_op,
+        crate::descr::dict_strategy_word_descr(),
+    );
+    let strategy_const = ctx
+        .trace_ctx
+        .const_int(&pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[strategy, strategy_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(strategy, strategy_const);
+    let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, key_op, int_type)?;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        key_op,
+        pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
+    )?;
+    let storage_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        dict_op,
+        crate::descr::dict_dstorage_descr(),
+    );
+    let storage_ptr =
+        unsafe { pyre_object::dictmultiobject::w_dict_int_storage(dict) as *const _ as usize };
+    ctx.trace_ctx.set_opref_concrete(
+        storage_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(storage_ptr)),
+    );
+    let key_int = walker_unbox_int(ctx, op_pc, key_op, int_type)?;
+    let mut lookup_effect = majit_ir::EffectInfo::new(
+        majit_ir::ExtraEffect::CannotRaise,
+        majit_ir::OopSpecIndex::DictLookup,
+    );
+    lookup_effect.extradescrs = Some(vec![
+        crate::descr::dict_lookup_namespace_descr(),
+        crate::descr::dict_lookup_entries_array_descr(),
+    ]);
+    let lookup_flag = ctx.trace_ctx.const_int(0);
+    let index_op = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallI,
+        crate::helpers::jit_dict_exact_int_lookup_index as *const (),
+        &[storage_op, key_int, key_int, lookup_flag],
+        &[
+            majit_ir::Type::Ref,
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+        ],
+        majit_ir::Type::Int,
+        lookup_effect,
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(index_op, majit_ir::Value::Int(index_concrete));
+    let _ = key;
+    Ok((index_op, storage_op))
+}
+
+/// BINARY_SUBSCR miss on an exact int-strategy dict: `descr_getitem` after
+/// `IntDictStrategy.getitem` returned None.  Emits `dict.lookup` +
+/// `int_lt(index, 0)` then `raise_key_error`, and surfaces `SubRaise` so
+/// the inlined `except KeyError` catches it.
+pub(crate) fn try_walker_specialize_subscr_int_miss<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 {
+        return Ok(None);
+    }
+    let (Some(dict), Some(key)) = (
+        walker_concrete_ref_object(ctx, r_args[0]),
+        walker_concrete_ref_object(ctx, r_args[1]),
+    ) else {
+        return Ok(None);
+    };
+    if !walker_probe_exact_dict_int_miss(dict, key) {
+        return Ok(None);
+    }
+    walker_emit_exact_dict_key_error(ctx, op_pc, r_args[0], r_args[1], dict, key)
+}
+
+/// `descr_getitem` miss after `IntDictStrategy.getitem` returned None:
+/// `space.raise_key_error(w_key)` — `KeyError(w_key)` then raise.  The
+/// exception is built inline so a locally-caught `except KeyError` DCEs it,
+/// matching the look-inside raise PyPy records after `int_lt(index, 0)`.
+fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    dict_op: OpRef,
+    key_op: OpRef,
+    dict: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        return Ok(None);
+    };
+    let (index_op, _storage_op) =
+        walker_emit_int_dict_lookup_index(ctx, op_pc, dict_op, key_op, dict, key, -1)?;
+    let zero = ctx.trace_ctx.const_int(0);
+    let is_miss = ctx.trace_ctx.record_op(OpCode::IntLt, &[index_op, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(is_miss, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_miss])?;
+
+    let concrete = pyre_interpreter::PyError::key_error_with_key(key).exc_object;
+    if concrete.is_null() || !unsafe { pyre_object::is_exception(concrete) } {
+        return Ok(None);
+    }
+    let kind = pyre_object::interp_exceptions::ExcKind::KeyError;
+    let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &[key_op]);
+    let list_w_class = pyre_object::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+    let list_w_class = ctx.trace_ctx.const_ref(list_w_class as i64);
+    let list_w_class_descr = crate::descr::list_w_class_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[args_list, list_w_class],
+        list_w_class_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(args_list, list_w_class_descr.index(), list_w_class);
+    let class = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
+    let class = ctx.trace_ctx.const_ref(class as i64);
+    let raised = crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class, args_list);
+    let exc_type = pyre_object::interp_exceptions::exc_kind_to_pytype(kind) as *const _ as i64;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(raised, exc_type);
+    ctx.trace_ctx.set_opref_concrete(
+        raised,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+    );
+    fbw_built_exc_insert(raised);
+    let active = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[raised, active],
+        crate::descr::w_exception_context_descr(kind),
+    );
+    fbw_context_chained_insert(raised);
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    if !active_concrete.is_null() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(concrete, active_concrete);
+        }
+    }
+    fbw_count_executed_residual(true, true);
+    ctx.set_last_exc_value(raised, ConcreteValue::Ref(concrete));
+    ctx.fbw_mode.class_of_last_exc_is_const = true;
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(concrete as i64));
+    Ok(Some(DispatchOutcome::SubRaise {
+        exc: raised,
+        exc_concrete: ConcreteValue::Ref(concrete),
+    }))
 }
 
 /// `dict.get` on an exact dictionary and an Int/Unicode strategy hit.
