@@ -197,8 +197,6 @@ mod residual_host {
             [callable, null_or_self] => pyre_jit::call_jit::bh_call_fn_0,
             [lhs, rhs, op_code] => pyre_interpreter::opcode_ops::jit_binary_value_from_tag,
             [lhs, rhs, op_code] => pyre_interpreter::opcode_ops::jit_compare_value_from_tag,
-            [lhs, rhs, op_code] => pyre_jit::call_jit::bh_binary_op_fn,
-            [lhs, rhs, op_code] => pyre_jit::call_jit::bh_compare_fn,
             [obj, key, value] => pyre_interpreter::opcode_ops::bh_store_subscr_fn,
             [callable, null_or_self, arg0] => pyre_jit::call_jit::bh_call_fn,
             [obj, w_code_ptr, name_idx] => pyre_jit::call_jit::bh_load_attr_fn,

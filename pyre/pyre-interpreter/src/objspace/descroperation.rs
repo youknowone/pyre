@@ -3506,10 +3506,8 @@ unsafe fn needs_set_binop_dispatch_unless_exact(a: PyObjectRef, b: PyObjectRef) 
 /// [`pyre_object::is_exact_builtin_instance`] with the class word promoted:
 /// `jit.promote(w_type)` as `W_TypeObject.lookup` spells it, so the trace
 /// pins `w_class` with a `guard_value` and the test against the payload's
-/// canonical class folds.  The specialised arity-2 tuple payload types map to
-/// the canonical `tuple` class, as `pyre_object::is_exact_tuple` does.  A null
-/// `w_class` (the read-only singletons) is exact by the same rule as the
-/// unpromoted predicate.
+/// canonical class folds.  The test itself is the shared
+/// [`pyre_object::class_word_is_exact_builtin`] tail.
 #[inline]
 unsafe fn is_exact_builtin_instance_promoted(a: PyObjectRef) -> bool {
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(a) {
@@ -3519,22 +3517,7 @@ unsafe fn is_exact_builtin_instance_promoted(a: PyObjectRef) -> bool {
         return false;
     }
     let w_class = majit_metainterp::jit::promote((*a).w_class);
-    if w_class.is_null() {
-        return true;
-    }
-    let ob_type = (*a).ob_type;
-    use pyre_object::specialisedtupleobject::{
-        SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
-    };
-    let builtin_class = if std::ptr::eq(ob_type, &SPECIALISED_TUPLE_II_TYPE)
-        || std::ptr::eq(ob_type, &SPECIALISED_TUPLE_FF_TYPE)
-        || std::ptr::eq(ob_type, &SPECIALISED_TUPLE_OO_TYPE)
-    {
-        pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE)
-    } else {
-        pyre_object::get_instantiate(&*ob_type)
-    };
-    std::ptr::eq(w_class, builtin_class)
+    pyre_object::class_word_is_exact_builtin(a, w_class)
 }
 
 /// Both operands of a binary operator are exact builtin instances, each
@@ -5722,7 +5705,12 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // so only they take the same-type shortcut.
     unsafe {
         if matches!(op, CompareOp::Eq | CompareOp::Ne) && same_unoverridden_rpy_type(a, b) {
-            return compare_slot(a, b, op);
+            // `_check_notimplemented`: a `NotImplemented` answer from the
+            // shortcut falls through to the full lookup below.
+            let w_res = compare_slot(a, b, op)?;
+            if !pyre_object::is_not_implemented(w_res) {
+                return Ok(w_res);
+            }
         }
     }
     // A builtin subclass overriding the comparison dunder dispatches the
