@@ -209,7 +209,7 @@ pub fn remove_ref_constants_for_inputs(
     let mut defined: HashSet<u32> = ops
         .iter()
         .filter_map(|op| {
-            let pos = op.pos.get();
+            let pos = op.pos().get();
             (pos != OpRef::NONE && !pos.is_constant()).then_some(pos.raw())
         })
         .collect();
