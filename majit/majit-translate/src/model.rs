@@ -6992,6 +6992,25 @@ impl FunctionGraph {
         self.set_control_flow_metadata(block, None, vec![link]);
     }
 
+    /// Close `block` with a single Goto whose `Link.args` keep mixed
+    /// Variable|Constant operands — `flowspace/model.py Link`.
+    pub fn set_goto_mixed(&mut self, block: BlockId, target: BlockId, args: Vec<LinkArg>) {
+        let target_inputarg_count = self.block(target).inputargs.len();
+        assert_eq!(
+            args.len(),
+            target_inputarg_count,
+            "set_goto_mixed: args.len() ({}) != target.inputargs.len() ({}) — \
+             block {:?} → target {:?} on graph {:?}",
+            args.len(),
+            target_inputarg_count,
+            block,
+            target,
+            self.name,
+        );
+        let link = Link::new_mixed(args, target, None);
+        self.set_control_flow_metadata(block, None, vec![link]);
+    }
+
     /// Close `block` with a single-exit Link into `target_block` whose
     /// `args` are derived from `pred_state.getoutputargs(target_state,
     /// self)`.  Direct port of `flowcontext.py:438`:

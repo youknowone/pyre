@@ -405,14 +405,7 @@ pub(crate) fn rewire_next_call_sites(
 /// root.  It lowers to `cast_pointer` (a pure alias), so it carries no
 /// side effect and its result is bit-identical to its operand.
 fn is_recast_narrow(kind: &OpKind) -> bool {
-    matches!(
-        kind,
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
-            args,
-            ..
-        } if args.len() == 1 && segments.first().is_some_and(|s| s == crate::runtime_names::shims::CAST_INSTANCE)
-    )
+    crate::model::cast_instance_root(kind).is_some()
 }
 
 /// An unregistered `next()` returns an opaque `Ref`; the MIR immediately

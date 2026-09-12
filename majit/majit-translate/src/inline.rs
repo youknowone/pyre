@@ -274,7 +274,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // Map call args to callee input values
     for (i, callee_input_var) in input_vars.iter().enumerate() {
         let remapped_input_var = value_map[callee_input_var].clone();
-        if let Some(call_arg_var) = call_args.get(i) {
+        if let Some(crate::model::LinkArg::Value(call_arg_var)) = call_args.get(i) {
             // Add alias: remapped callee input = call argument
             // We do this by prepending a "move" in the callee entry block
             // Actually, we set the entry block's inputargs and jump with call args
@@ -310,12 +310,12 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     // behaviour is preserved bit-for-bit when the callee has no
     // inputargs.
     let inputarg_count = callee_entry_block.inputargs.len();
-    let entry_arg_vars: Vec<crate::flowspace::model::Variable> =
-        crate::model::call_arg_vars(&call_args)
-            .into_iter()
-            .take(inputarg_count)
-            .collect();
-    graph.set_goto(block_id, callee_entry, entry_arg_vars);
+    // RPython `get_new_name` keeps Constants on the entry Link
+    // (`backendopt/inline.py`).  `call_arg_vars` would drop them and
+    // shift later arguments.
+    let entry_args: Vec<crate::model::LinkArg> =
+        call_args.into_iter().take(inputarg_count).collect();
+    graph.set_goto_mixed(block_id, callee_entry, entry_args);
 }
 
 /// Allocate fresh caller-graph Variables for every callee-graph
@@ -1775,6 +1775,50 @@ mod tests {
             .flat_map(|b| &b.operations)
             .any(|op| matches!(&op.kind, OpKind::Call { .. }));
         assert!(!has_call, "Call op should be replaced by inlined body");
+    }
+
+    #[test]
+    fn inline_keeps_constant_call_args_on_the_entry_link() {
+        use crate::flowspace::model::{ConstValue, Variable};
+        use crate::model::LinkArg;
+
+        let mut callee = FunctionGraph::new("const_callee");
+        let param = Variable::new();
+        callee.blocks[callee.startblock.0].inputargs = vec![param.clone()];
+        callee.set_return(callee.startblock, Some(param));
+
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let result = caller
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["const_callee"]),
+                    args: vec![LinkArg::from(ConstValue::Int(7))],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        caller.set_return(entry, Some(result));
+
+        let mut cc = CallControl::new();
+        cc.register_function_graph(CallPath::from_segments(["const_callee"]), callee);
+        cc.find_all_graphs_for_tests();
+        assert_eq!(inline_graph(&mut caller, &cc, 1), 1);
+
+        let entry_link = caller.blocks[caller.startblock.0]
+            .exits
+            .first()
+            .expect("caller jumps to inlined entry");
+        assert_eq!(entry_link.args.len(), 1);
+        assert!(
+            matches!(
+                &entry_link.args[0],
+                LinkArg::Const(c) if c.value == ConstValue::Int(7)
+            ),
+            "constant positional arg must stay on the entry Link"
+        );
     }
 
     #[test]
