@@ -103,21 +103,17 @@ pub static SPECIALISED_TUPLE_II_TYPE: PyType = new_pytype("tuple");
 pub static SPECIALISED_TUPLE_FF_TYPE: PyType = new_pytype("tuple");
 pub static SPECIALISED_TUPLE_OO_TYPE: PyType = new_pytype("tuple");
 
-/// Allocate an arity-2 specialised int tuple via the GC's old-gen
-/// (mark-sweep, non-moving) when the host hook is installed; falls
-/// back to `Box::into_raw` for unit tests run outside `JitDriver`
-/// init. The variant carries no GC-pointer fields
-/// (`gc_ptr_offsets = []`, `eval.rs`), so mark-sweep traversal
-/// has nothing to follow and routing through the GC stays
-/// correctness-safe. The canonical `W_TupleObject` is on the other side of
-/// this split: `w_tuple_new` allocates in the nursery, so two objects that
-/// answer `tuple` to `type()` differ in whether a minor collection moves them.
+/// Allocate an arity-2 specialised int tuple via the same nursery bump
+/// `w_tuple_new` uses (`malloc_fixedsize` / `try_gc_alloc_nursery_raw`).
+/// The variant carries no GC-pointer fields (`gc_ptr_offsets = []`,
+/// `eval.rs`). Falls back to `Box::into_raw` when the host hook is
+/// absent (unit tests outside `JitDriver` init).
 pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
     let header = PyObject {
         ob_type: &SPECIALISED_TUPLE_II_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         SPECIALISED_TUPLE_II_GC_TYPE_ID,
         SPECIALISED_TUPLE_II_OBJECT_SIZE,
     );
@@ -151,7 +147,7 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
         ob_type: &SPECIALISED_TUPLE_FF_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         SPECIALISED_TUPLE_FF_GC_TYPE_ID,
         SPECIALISED_TUPLE_FF_OBJECT_SIZE,
     );
@@ -185,9 +181,9 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
 /// `is_managed_heap_object` guard keeps that case correctness-safe.
 pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`):
-    // both inputs are live PyObjectRef roots that must survive the
-    // potential collection inside `try_gc_alloc_stable`. The ii/ff
-    // variants take unboxed i64/f64 and need no bracket here.
+    // both inputs are live PyObjectRef roots that must survive a
+    // nursery-full spill into old-gen. The ii/ff variants take unboxed
+    // i64/f64 and need no bracket here.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(value0);
@@ -196,11 +192,11 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
         ob_type: &SPECIALISED_TUPLE_OO_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         SPECIALISED_TUPLE_OO_GC_TYPE_ID,
         SPECIALISED_TUPLE_OO_OBJECT_SIZE,
     );
-    // pop_roots: the parameters still name the pre-collection addresses, so
+    // pop_roots: the parameters still name the pre-spill addresses, so
     // the values stored into the tuple are read back out of the shadow stack,
     // as `w_tuple_new_array_backed` does before filling its items block.
     let value0 = crate::gc_roots::shadow_stack_get(save_point);
@@ -217,14 +213,11 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
                 },
             );
         }
-        // The tuple lives in old-gen (`try_gc_alloc_stable`) but `value0` /
-        // `value1` may still be in the nursery. Without recording the store,
-        // the next minor collection scans only the remembered set, never
-        // visits this tuple, and reclaims a young element reachable solely
-        // through it — leaving an inline slot dangling. Register the tuple so
-        // the collection relocates/marks the young elements, mirroring the
-        // `write_barrier_from_array` an old-gen store emits
-        // (incminimark.py:1495) and `w_tuple_new_array_backed`.
+        // Nursery-full spills this header to old-gen while `value0` /
+        // `value1` may still be young. A young header needs no barrier;
+        // `try_gc_write_barrier_managed` is a no-op there and records the
+        // old-gen store when the bump spilled (incminimark.py
+        // `write_barrier`, `w_tuple_new_array_backed`).
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         return raw as PyObjectRef;
     }

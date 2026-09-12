@@ -5552,9 +5552,9 @@ fn build_class_inner(
             // post-metaclass cell validation below, so lift just that one key
             // via `space.getitem` rather than calling the mapping's `keys()`.
             let cellkey_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(
-                pyre_object::unicodeobject::intern_str_value("__classcell__"),
-            );
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
+                "__classcell__",
+            ));
             match crate::baseobjspace::getitem(
                 w_ns,
                 pyre_object::gc_roots::shadow_stack_get(cellkey_slot),

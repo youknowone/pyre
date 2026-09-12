@@ -1041,17 +1041,24 @@ fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
             let so_ext = extension_abi_suffix();
             unsafe {
                 for (name, value) in [("Py_DEBUG", 0), ("Py_GIL_DISABLED", 1)] {
-                    let w_key = pyre_object::w_str_new(name);
+                    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
                     let w_value = pyre_object::w_int_new(value);
-                    pyre_object::w_dict_store(roots.get(vars_slot), w_key, w_value);
+                    pyre_object::w_dict_store(roots.get(vars_slot), roots.get(key_slot), w_value);
                 }
                 for (name, value) in [
                     ("SOABI", soabi_middle(&so_ext)),
                     ("EXT_SUFFIX", so_ext.clone()),
                 ] {
-                    let w_key = pyre_object::w_str_new(name);
-                    let w_value = pyre_object::w_str_new_managed(&value);
-                    pyre_object::w_dict_store(roots.get(vars_slot), w_key, w_value);
+                    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
+                    let val_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = roots.pin_root(pyre_object::w_str_new_managed(&value));
+                    pyre_object::w_dict_store(
+                        roots.get(vars_slot),
+                        roots.get(key_slot),
+                        roots.get(val_slot),
+                    );
                 }
             }
             Ok(roots.get(vars_slot))
@@ -1226,22 +1233,25 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // value goes stale the moment the key or the value allocates.
     fn store_str(vars_slot: usize, key: &str, value: &str) {
         unsafe {
-            let w_key = pyre_object::w_str_new(key);
-            let w_value = pyre_object::w_str_new(value);
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(key));
+            let val_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(value));
             pyre_object::w_dict_store(
                 pyre_object::gc_roots::shadow_stack_get(vars_slot),
-                w_key,
-                w_value,
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+                pyre_object::gc_roots::shadow_stack_get(val_slot),
             );
         }
     }
     fn store_int(vars_slot: usize, key: &str, value: i64) {
         unsafe {
-            let w_key = pyre_object::w_str_new(key);
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(key));
             let w_value = pyre_object::w_int_new(value);
             pyre_object::w_dict_store(
                 pyre_object::gc_roots::shadow_stack_get(vars_slot),
-                w_key,
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
                 w_value,
             );
         }
@@ -1632,7 +1642,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let w_dict = pyre_object::gc_roots::pin_root(w_dict);
-    let name_obj = pyre_object::w_str_new(name);
+    let name_obj = pyre_object::w_str_new_managed(name);
     let _ = pyre_object::gc_roots::pin_root(name_obj);
     // Set __name__ (PyPy: Module.__init__ sets __name__)
     crate::module_ns_store(
@@ -6858,7 +6868,16 @@ pub fn import_all_from_w(
     into_locals: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     import_all_from_each(module, |name, value| {
-        crate::baseobjspace::setitem(into_locals, unsafe { pyre_object::w_str_new(name) }, value)?;
+        let _name_roots = pyre_object::gc_roots::push_roots();
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        crate::baseobjspace::setitem(
+            into_locals,
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        )?;
         Ok(())
     })
 }
