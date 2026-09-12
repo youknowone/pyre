@@ -467,9 +467,10 @@ pub fn address_of_func_or_global_var(
     let roots = pyre_object::gc_roots::push_roots();
     let lib_slot = roots.base();
     let _ = roots.pin_root(w_lib);
-    let value_slot = lib_slot + 1;
-    let w_name = roots.pin_root(pyre_object::w_str_new_managed(varname));
-    let _ = roots.pin_root(get_attr(roots.get(lib_slot), w_name, false)?);
+    let name_slot = lib_slot + 1;
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(varname));
+    let value_slot = lib_slot + 2;
+    let _ = roots.pin_root(get_attr(roots.get(lib_slot), roots.get(name_slot), false)?);
     let value = roots.get(value_slot);
     if cglob::W_GlobSupport::from_obj(value).is_some() {
         return cglob::address(value);
