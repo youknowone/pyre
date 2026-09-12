@@ -4210,6 +4210,10 @@ pub fn init_stream_codecs() -> Result<(), crate::PyError> {
 /// The version `GetVersionEx` reports, which the manifest the executable
 /// carries makes the running one rather than the one an unmanifested process is
 /// shimmed to.  `None` where the call fails, leaving the caller its own answer.
+///
+/// `windows::get_windows_version()` is not this triple: it overwrites
+/// major/minor/build with kernel32's file version, which this function's
+/// caller already publishes as `platform_version`.
 #[cfg(windows)]
 fn version_ex_triple() -> Option<(u32, u32, u32)> {
     use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};

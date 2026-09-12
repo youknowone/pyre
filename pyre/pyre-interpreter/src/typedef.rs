@@ -25864,87 +25864,9 @@ pub(crate) fn decode_bytes_to_wtf8(
     };
     let s = match enc_lower.as_ref() {
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
-        "ascii" | "us-ascii" | "646" => {
-            let mut out = Wtf8Buf::new();
-            // A custom error handler may replace exc.object; decoding then
-            // resumes from the new bytes (`abuf`).
-            let mut abuf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
-            let mut i = 0;
-            while i < abuf.len() {
-                let b = abuf[i];
-                if b >= 0x80 {
-                    match err_mode {
-                        "strict" => {
-                            return Err(unicode_decode_error(
-                                "ascii",
-                                &abuf,
-                                i,
-                                i + 1,
-                                "ordinal not in range(128)",
-                            ));
-                        }
-                        "ignore" => {
-                            i += 1;
-                            continue;
-                        }
-                        "replace" => {
-                            out.push_char('\u{FFFD}');
-                            i += 1;
-                            continue;
-                        }
-                        // surrogateescape escapes the non-ASCII byte as a lone
-                        // surrogate 0xdc00+b (interp_codecs.py:536-555).
-                        "surrogateescape" => {
-                            out.push(CodePoint::from_u32(0xDC00 + b as u32).unwrap());
-                            i += 1;
-                            continue;
-                        }
-                        // surrogatepass only decodes three-byte UTF-8 surrogate
-                        // sequences; a single non-ASCII byte is not one, so it
-                        // re-raises (interp_codecs.py:476-510).
-                        "surrogatepass" => {
-                            return Err(unicode_decode_error(
-                                "ascii",
-                                &abuf,
-                                i,
-                                i + 1,
-                                "ordinal not in range(128)",
-                            ));
-                        }
-                        "backslashreplace" => {
-                            out.push_str(&format!("\\x{:02x}", b));
-                            i += 1;
-                            continue;
-                        }
-                        "xmlcharrefreplace" | "namereplace" => {
-                            return Err(decode_error_encode_only_handler());
-                        }
-                        _ => {
-                            let (np, nb) =
-                                crate::type_methods::call_registered_decode_error_handler(
-                                    err_mode,
-                                    "ascii",
-                                    &abuf,
-                                    i,
-                                    i + 1,
-                                    "ordinal not in range(128)",
-                                    &mut out,
-                                )?;
-                            if let Some(nb) = nb {
-                                abuf = std::borrow::Cow::Owned(nb);
-                            }
-                            i = np;
-                            continue;
-                        }
-                    }
-                }
-                out.push_char(b as char);
-                i += 1;
-            }
-            out
-        }
+        "ascii" | "us-ascii" | "646" => crate::codec_engine::decode_ascii(data.to_vec(), err_mode)?,
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
-            Wtf8Buf::from_string(data.iter().map(|&b| b as char).collect::<String>())
+            crate::codec_engine::decode_latin1(data.to_vec(), err_mode)?
         }
         "raw-unicode-escape" => crate::type_methods::decode_raw_unicode_escape(data, err_mode)?,
         _ => {

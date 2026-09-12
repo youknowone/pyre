@@ -3986,129 +3986,16 @@ fn pad_wtf8(
 }
 
 /// runicode.py unicode_encode_utf_8 + interp_codecs.py
-/// surrogatepass / surrogateescape encode branches.  The WTF-8 backing
-/// already stores a lone surrogate as its three-byte sequence, so the
-/// surrogate-free common case is a direct byte copy; surrogate code points
-/// are routed to the named error handler.  `w_object` is the str being
-/// encoded, threaded through so a strict failure can build a structured
+/// surrogatepass / surrogateescape encode branches.  The conversion loop
+/// lives in `rustpython_common::encodings::utf8`; this only threads the
+/// str being encoded so a strict failure can build a structured
 /// UnicodeEncodeError carrying it.
 pub(crate) fn encode_utf8_with_errors(
     w_object: PyObjectRef,
     err_mode: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
     let s: &Wtf8 = unsafe { w_str_get_wtf8(w_object) };
-    // utf8_encode_utf_8 fast path: no surrogates → already valid UTF-8.
-    if let Ok(valid) = s.as_str() {
-        return Ok(valid.as_bytes().to_vec());
-    }
-    let mut out = Vec::with_capacity(s.len());
-    let mut buf = [0u8; 4];
-    let cps: Vec<CodePoint> = s.code_points().collect();
-    let mut i = 0usize;
-    while i < cps.len() {
-        let cp = cps[i];
-        if let Some(c) = cp.to_char() {
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            i += 1;
-            continue;
-        }
-        let code = cp.to_u32();
-        let index = i;
-        // PyPy `_utf8_encode_utf_8_deal_with_surrogates`: collect one
-        // high+low surrogate pair into a single error-handler call.
-        let error_end = if (0xD800..=0xDBFF).contains(&code)
-            && cps
-                .get(index + 1)
-                .is_some_and(|next| (0xDC00..=0xDFFF).contains(&next.to_u32()))
-        {
-            index + 2
-        } else {
-            index + 1
-        };
-        match err_mode {
-            // surrogatepass_errors encode branch (interp_codecs.py):
-            // emit the three-byte sequence for the surrogate code point.
-            "surrogatepass" => {
-                out.push(0xE0 | (code >> 12) as u8);
-                out.push(0x80 | ((code >> 6) & 0x3f) as u8);
-                out.push(0x80 | (code & 0x3f) as u8);
-                i += 1;
-                continue;
-            }
-            // surrogateescape_errors encode branch (interp_codecs.py):
-            // a 0xDC80..0xDCFF surrogate maps back to the byte code-0xDC00;
-            // any other surrogate fails.
-            "surrogateescape" => {
-                if (0xDC80..=0xDCFF).contains(&code) {
-                    out.push((code - 0xDC00) as u8);
-                    i += 1;
-                    continue;
-                } else {
-                    return Err(crate::typedef::unicode_encode_error(
-                        "utf-8",
-                        w_object,
-                        index as i64,
-                        error_end as i64,
-                        "surrogates not allowed",
-                    ));
-                }
-            }
-            "strict" => {
-                return Err(crate::typedef::unicode_encode_error(
-                    "utf-8",
-                    w_object,
-                    index as i64,
-                    error_end as i64,
-                    "surrogates not allowed",
-                ));
-            }
-            "ignore" => {}
-            "replace" => out.extend(std::iter::repeat_n(b'?', error_end - index)),
-            "backslashreplace" => {
-                for cp in &cps[index..error_end] {
-                    out.extend_from_slice(format!("\\u{:04x}", cp.to_u32()).as_bytes());
-                }
-            }
-            "xmlcharrefreplace" => {
-                for cp in &cps[index..error_end] {
-                    out.extend_from_slice(format!("&#{};", cp.to_u32()).as_bytes());
-                }
-            }
-            _ => {
-                let (rep, newpos) = call_registered_encode_error_handler(
-                    err_mode,
-                    "utf-8",
-                    w_object,
-                    cps.len(),
-                    index,
-                    error_end,
-                    "surrogates not allowed",
-                    EncodeErrorOwner::UnicodeObject,
-                )?;
-                match rep {
-                    EncodeReplacement::Str(rcps) => {
-                        for rc in rcps {
-                            if rc >= 0x80 {
-                                return Err(crate::typedef::unicode_encode_error(
-                                    "utf-8",
-                                    w_object,
-                                    index as i64,
-                                    error_end as i64,
-                                    "surrogates not allowed",
-                                ));
-                            }
-                            out.push(rc as u8);
-                        }
-                    }
-                    EncodeReplacement::Bytes(b) => out.extend_from_slice(&b),
-                }
-                i = newpos;
-                continue;
-            }
-        }
-        i = error_end;
-    }
-    Ok(out)
+    crate::codec_engine::encode_utf8(s, w_object, err_mode)
 }
 
 /// PyPy: unicodeobject.py descr_encode → encode_object.
@@ -4207,22 +4094,10 @@ pub fn encode_object(
     }
     let s = unsafe { w_str_get_wtf8(w_object) };
     match enc_lower.as_str() {
-        "ascii" | "us-ascii" | "646" => encode_narrow(
-            s,
-            w_object,
-            "ascii",
-            0x7f,
-            "ordinal not in range(128)",
-            errors,
-        ),
-        "latin-1" | "latin1" | "iso-8859-1" | "8859" => encode_narrow(
-            s,
-            w_object,
-            "latin-1",
-            0xff,
-            "ordinal not in range(256)",
-            errors,
-        ),
+        "ascii" | "us-ascii" | "646" => crate::codec_engine::encode_ascii(s, w_object, errors),
+        "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
+            crate::codec_engine::encode_latin1(s, w_object, errors)
+        }
         "raw-unicode-escape" => Ok(encode_raw_unicode_escape(s)),
         _ => match encode_utf16_32(s, &enc_lower, w_object, errors) {
             Some(out) => out,
@@ -4266,116 +4141,6 @@ pub fn decode_raw_unicode_escape_stateful(
     final_: bool,
 ) -> Result<(Wtf8Buf, usize), crate::PyError> {
     crate::codec_engine::decode_raw_unicode_escape(data.to_vec(), errors, final_)
-}
-
-fn encode_narrow(
-    s: &Wtf8,
-    source: PyObjectRef,
-    enc_name: &str,
-    max_cp: u32,
-    range_msg: &str,
-    errors: &str,
-) -> Result<Vec<u8>, crate::PyError> {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let source_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(source);
-    let cps: Vec<u32> = s.code_points().map(|c| c.to_u32()).collect();
-    let mut out: Vec<u8> = Vec::with_capacity(cps.len());
-    let mut i = 0usize;
-    while i < cps.len() {
-        if cps[i] <= max_cp {
-            out.push(cps[i] as u8);
-            i += 1;
-            continue;
-        }
-        // `surrogateescape` rescues only a 0xDC80..0xDCFF code point, mapping
-        // it back to the byte `code-0xDC00` (interp_codecs.py:528-534); any
-        // other unencodable code point still raises, so it is handled one at
-        // a time rather than over the maximal run.
-        if errors == "surrogateescape" && (0xDC80..=0xDCFF).contains(&cps[i]) {
-            out.push((cps[i] - 0xDC00) as u8);
-            i += 1;
-            continue;
-        }
-        // Maximal run of consecutive unencodable code points — `strict`
-        // reports the whole span as one error, like CPython.  A
-        // `surrogateescape`-rescuable code point ends the run.
-        let start = i;
-        let mut end = i;
-        while end < cps.len()
-            && cps[end] > max_cp
-            && !(errors == "surrogateescape" && (0xDC80..=0xDCFF).contains(&cps[end]))
-        {
-            end += 1;
-        }
-        match errors {
-            // `surrogateescape` reached here only for an unencodable code
-            // point outside the rescue range, so it raises like `strict`.
-            // `surrogatepass` only rescues surrogates for utf-8/16/32, so a
-            // narrow codec re-raises the original UnicodeEncodeError.
-            "strict" | "surrogateescape" | "surrogatepass" => {
-                return Err(crate::typedef::unicode_encode_error(
-                    enc_name,
-                    pyre_object::gc_roots::shadow_stack_get(source_slot),
-                    start as i64,
-                    end as i64,
-                    range_msg,
-                ));
-            }
-            "ignore" => {}
-            "replace" => out.resize(out.len() + (end - start), b'?'),
-            "backslashreplace" => {
-                for &cp in &cps[start..end] {
-                    let esc = if cp <= 0xff {
-                        format!("\\x{cp:02x}")
-                    } else if cp <= 0xffff {
-                        format!("\\u{cp:04x}")
-                    } else {
-                        format!("\\U{cp:08x}")
-                    };
-                    out.extend_from_slice(esc.as_bytes());
-                }
-            }
-            "xmlcharrefreplace" => {
-                for &cp in &cps[start..end] {
-                    out.extend_from_slice(format!("&#{cp};").as_bytes());
-                }
-            }
-            _ => {
-                let (rep, newpos) = call_registered_encode_error_handler(
-                    errors,
-                    enc_name,
-                    pyre_object::gc_roots::shadow_stack_get(source_slot),
-                    cps.len(),
-                    start,
-                    end,
-                    range_msg,
-                    EncodeErrorOwner::UnicodeObject,
-                )?;
-                match rep {
-                    EncodeReplacement::Str(rcps) => {
-                        for rc in rcps {
-                            if rc > max_cp {
-                                return Err(crate::typedef::unicode_encode_error(
-                                    enc_name,
-                                    pyre_object::gc_roots::shadow_stack_get(source_slot),
-                                    start as i64,
-                                    end as i64,
-                                    range_msg,
-                                ));
-                            }
-                            out.push(rc as u8);
-                        }
-                    }
-                    EncodeReplacement::Bytes(b) => out.extend_from_slice(&b),
-                }
-                i = newpos;
-                continue;
-            }
-        }
-        i = end;
-    }
-    Ok(out)
 }
 
 /// Collapse a normalized encoding name to its separator-free form so
