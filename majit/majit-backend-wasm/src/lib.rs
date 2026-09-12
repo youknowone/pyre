@@ -6511,11 +6511,7 @@ mod tests {
 
         let token = JitCellToken::new(1_500_294);
         backend
-            .compile_loop(
-                &[],
-                &[std::rc::Rc::new(constant), std::rc::Rc::new(finish)],
-                &token,
-            )
+            .compile_loop(&[], &[OpRc::new(constant), OpRc::new(finish)], &token)
             .expect("compile wasm loop with a reference constant");
 
         let clt = token.compiled_loop_token().expect("CLT");
