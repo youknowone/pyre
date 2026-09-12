@@ -8821,21 +8821,17 @@ impl<M: Clone> MetaInterp<M> {
         let Some(ctx) = self.tracing.as_mut() else {
             return;
         };
+        // pyjitpl.py `current_merge_points.append((live_arg_boxes, start))`
+        // is unconditional. A missing type is a bookkeeping bug, not a
+        // reason to skip the append.
+        debug_assert!(
+            jump_args.iter().all(|op| op.ty().is_some()),
+            "retrace merge-point jump_args must carry box.type (history.py)"
+        );
         let green_boxes: Vec<crate::trace_ctx::GreenBox> = jump_args
             .iter()
-            .filter_map(|&op| op.ty().map(|ty| crate::trace_ctx::GreenBox::new(op, ty)))
+            .map(|&op| crate::trace_ctx::GreenBox::new(op, op.ty().unwrap_or(majit_ir::Type::Void)))
             .collect();
-        if green_boxes.len() != jump_args.len() {
-            // `pyjitpl.py:3059-3060 self.current_merge_points.append(
-            // (live_arg_boxes, start))` appends unconditionally. This decline
-            // is a pyre stand-in and it ALSO suppresses the
-            // `keep_tracing_after_close` write below, so the trace is
-            // abandoned without appearing in `loops_aborted`. Slot 55 counts
-            // every firing so a corpus (run with a non-zero `retrace_limit`)
-            // reading 0 can promote it to a `debug_assert!`.
-            crate::mc_diag_bump(55);
-            return;
-        }
         let key = ctx.green_key;
         // pyjitpl.py:3059-3060 `self.current_merge_points.append(
         // (live_arg_boxes, start))` appends the greens the trace is closing
@@ -9819,11 +9815,13 @@ impl<M: Clone> MetaInterp<M> {
 
         let num_combined_ops = combined_ops.len();
         let opcodes_after: Vec<OpCode> = combined_ops.iter().map(|op| op.opcode).collect();
-        let has_guard = combined_ops.iter().any(|op| op.opcode.is_guard());
-        if !has_guard {
-            crate::debug::log_one("jit-abort", "compile_retrace: guardless loop");
-            return false;
-        }
+        // compile.py `compile_retrace` declines only on InvalidLoop.
+        // The optimizer always emits GUARD_NOT_INVALIDATED; a missing
+        // guard is a bug, not a cancel. Same check as `compile_loop`.
+        debug_assert!(
+            combined_ops.iter().any(|op| op.opcode.is_guard()),
+            "optimizer produced guardless retrace — GUARD_NOT_INVALIDATED should always be present"
+        );
 
         // `compile.py` — `resumekey.compile_and_attach(metainterp,
         // loop, inputargs)` dispatches on the resumekey's class:

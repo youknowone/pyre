@@ -4565,10 +4565,38 @@ impl Optimizer {
                     &format!("Retracing ({}/{retrace_limit})", retraced_count + 1),
                 );
             }
-            // unroll.py:231-233: export the bridge's own runtime boxes for retracing.
-            if let Some(ref mut state) = self.exported_loop_state {
-                state.runtime_boxes = runtime_boxes.to_vec();
-            }
+            // unroll.py `exported_state = self.optunroll.export_state(
+            //     info.jump_op.getarglist(), info.inputargs, runtime_boxes)`
+            // after the failed virtual-state match. Reusing a JUMP-time
+            // `exported_loop_state` (or leaving it None) skips that late
+            // export; `retrace_needed` then starts without a state.
+            let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
+                .map(|i| {
+                    let pos = ctx.inputarg_base + i as u32;
+                    OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
+                })
+                .collect();
+            let exported_int_bounds = self.collect_exported_int_bounds(&jump_args, &mut ctx);
+            let mut state = crate::optimizeopt::unroll::export_state(
+                &jump_args,
+                &renamed_inputargs,
+                self,
+                &mut ctx,
+                Some(&exported_int_bounds),
+            );
+            state.runtime_boxes = runtime_boxes.to_vec();
+            // unroll.py `exported_state.quasi_immutable_deps =
+            // self.quasi_immutable_deps`
+            crate::optimizeopt::unroll::merge_quasi_immutable_deps(
+                &mut state.quasi_immutable_deps,
+                &self.quasi_immutable_deps,
+            );
+            crate::optimizeopt::unroll::merge_quasi_immutable_deps(
+                &mut state.quasi_immutable_deps,
+                &ctx.quasi_immutable_deps,
+            );
+            state.patchguardop = self.patchguardop.clone();
+            self.exported_loop_state = Some(state);
             // unroll.py:234-236 returns `self._newoperations` whole, so the
             // retrace is built on the flush + end-of-preamble force + failed
             // match guards above, not on the body alone. `retarget_close_jump`
@@ -4578,6 +4606,8 @@ impl Optimizer {
             // heap store the bridge body performed.
             let mut result = optimized_ops;
             result.append(&mut ctx.new_operations);
+            // unroll.py `_clean_optimization_info(self._newoperations)`
+            Self::clean_optimization_info(&result);
             return Ok((result, true));
         }
 
@@ -4700,6 +4730,18 @@ impl Optimizer {
             }
         }
         exported
+    }
+
+    /// optimizer.py `_clean_optimization_info(lst)` — drop `_forwarded`
+    /// on each exported op so the next optimizer (the retrace body) does
+    /// not inherit preamble forwarding.
+    fn clean_optimization_info(ops: &[majit_ir::OpRc]) {
+        use majit_ir::forwarding::ForwardingHost;
+        for op in ops {
+            if !matches!(op.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
+                op.clear_forwarded();
+            }
+        }
     }
 
     /// Send one operation through the pass chain.

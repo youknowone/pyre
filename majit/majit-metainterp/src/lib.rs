@@ -1639,10 +1639,9 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// rule still cannot become an assert, because the same length test is what
 /// keeps the trace-start seed `TraceCtx::new` plants under the trace's own
 /// green key from matching a loop header's first arrival; 55 =
-/// `register_retrace_merge_point` declined to
-/// register because some jump arg carried no intrinsic type, where
-/// `pyjitpl.py:3059-3060 self.current_merge_points.append((live_arg_boxes,
-/// start))` appends unconditionally; 56 = `close_header_pc` fell back to
+/// `register_retrace_merge_point` used to decline when a jump arg
+/// carried no intrinsic type; it now appends unconditionally
+/// (`pyjitpl.py` `current_merge_points.append`); 56 = `close_header_pc` fell back to
 /// `self.header_pc` because the walk recorded no close greens, where
 /// `pyjitpl.py same_greenkey(original_boxes, live_arg_boxes,
 /// num_green_args)` always compares the actual closing boxes. 55 and 56 are
