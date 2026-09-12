@@ -351,6 +351,24 @@ pub extern "C" fn frame_anchor_new_jit_abi(frame: i64) -> i64 {
     depth as i64
 }
 
+/// One-word residual-call ABI for [`FrameAnchor`] drop glue.
+///
+/// `frame_anchor_new_jit_abi` returns the depth and forgets `Drop`.
+/// The translator must emit this residual at the matching `drop_in_place`
+/// so compiled loops do not leak a shadow-stack slot per iteration.
+/// `front::mir` aliases `&mut self` over a one-word local to that
+/// local's value — the depth — the same way [`frame_anchor_live_method_jit_abi`]
+/// reads `live`.
+pub extern "C" fn frame_anchor_drop_jit_abi(anchor: i64) {
+    frame_anchor_release(anchor as usize);
+}
+
+/// Distinct address from [`frame_anchor_drop_jit_abi`]: the registry
+/// refuses two unrelated path spellings on one function pointer.
+pub extern "C" fn frame_anchor_drop_in_place_jit_abi(anchor: i64) {
+    frame_anchor_release(anchor as usize);
+}
+
 /// One-word residual-call ABI for [`FrameAnchor::live`].
 ///
 /// `front::mir` aliases an `Rvalue::Ref` over a bare local to that local's own
