@@ -375,14 +375,11 @@ pub fn w_frozenset_new() -> PyObjectRef {
 }
 
 fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
-    // Allocate the body in GC old-gen (mark-sweep, non-moving) so it
-    // carries TRACK_YOUNG_PTRS, mirroring `w_list_new` / `w_tuple_new`.
-    // `w_set_add` stores possibly-young elements into `items`; the write
-    // barrier (`set_write_barrier`) only remembers the set on a minor
-    // collection when the body is an old-gen object, so a body allocated
-    // through the plain `malloc_typed` (no TRACK_YOUNG_PTRS) would leave
-    // young elements unforwarded and collected. Falls back to
-    // `malloc_typed` when no GC hook is installed (unit tests).
+    // Allocate the body on the same nursery bump as `w_tuple_new`
+    // (`malloc_fixedsize`). `w_set_add` stores possibly-young elements
+    // into `items`; the write barrier remembers an old-gen spill so those
+    // elements survive a later minor. Falls back to `malloc_typed` when
+    // no GC hook is installed (unit tests).
     //
     // The items box has no heap edge until the body is written, and both
     // `get_instantiate` and the body malloc can collect.  Pin the box and
@@ -395,7 +392,7 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(items as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(set_type));
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
     let items = crate::gc_roots::shadow_stack_get(items_slot) as *mut SetItemsStorage;
     let body = W_SetObject {
         ob_header: PyObject {
