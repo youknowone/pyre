@@ -925,27 +925,26 @@ impl JitCode {
     /// from `self.jitcode._resulttypes[self.pc]`.  This is that read, for the
     /// grouped encoding `inline_call_typed` (`jitcode/assembler.rs`) emits.
     ///
-    /// The instruction cannot be decoded backwards, so it is decoded forwards
-    /// from the only start position that can produce it.  Its width is
-    /// `1 + 2 + 2 + 3 * num_args + 1` — opcode, sub-JitCode index, argument
-    /// count, one `(kind, caller_src, callee_dst)` triple per argument, then
-    /// the single result-register byte (`NO_RETURN_REG` when the call is
-    /// void).  Each candidate `num_args` names exactly one start, and that
-    /// start is the real one only when the opcode byte is there AND the
-    /// count it encodes is the count that was assumed.  A position
-    /// satisfying both while still ending at `end_pc` has decoded itself;
-    /// requiring the match to be unique is what turns a coincidence into a
-    /// decline rather than into a wrong answer.
-    ///
-    /// `None` means `end_pc` is not the far side of a `BC_INLINE_CALL` in this
-    /// jitcode — including when it is one of the typed `BC_INLINE_CALL_*`
-    /// variants, which no `JitCodeBuilder` emits.  Callers read it as "cannot
-    /// resume through this frame" rather than guessing.
+    /// `JitCodeBuilder` emits the canonical `inline_call_{r,ir,irf}_*`
+    /// family (`dR` / `dIR` / `dIRF`). Leftover `BC_INLINE_CALL`
+    /// nested payloads still decode so a frozen body can resume.
     pub fn inline_call_ending_at(&self, end_pc: usize) -> Option<InlineCallSite> {
         let body = self.try_body()?;
         let code = &body.code;
         if end_pc > code.len() {
             return None;
+        }
+        if let Some(starts) = self.startpoints.as_ref() {
+            for &start in starts {
+                if start >= end_pc {
+                    continue;
+                }
+                if let Some((site, end)) = decode_typed_inline_call(code, start) {
+                    if end == end_pc {
+                        return Some(site);
+                    }
+                }
+            }
         }
         let mut found: Option<InlineCallSite> = None;
         for num_args in 0.. {
@@ -965,13 +964,9 @@ impl JitCode {
                 NO_RETURN_REG => None,
                 reg => Some(reg as usize),
             };
-            debug_assert_eq!(
-                cursor, end_pc,
-                "the inline-call width formula disagrees with the decode",
-            );
-            // The last operand is the single result register;
-            // `_resulttypes[end_pc]` says which bank, the same witness
-            // `make_result_of_lastop` reads.
+            if cursor != end_pc {
+                continue;
+            }
             let kind = body
                 .resulttypes
                 .as_ref()
@@ -1004,20 +999,11 @@ impl JitCode {
                 _ => continue,
             };
             if found.replace(site).is_some() {
-                // Two start positions both decode into an instruction ending
-                // here, so the bytes do not name one call.
                 return None;
             }
         }
         let site = found?;
         debug_assert!(site.filled_return_slots() <= 1);
-        // `pyjitpl.py make_result_of_lastop`'s own check, in its own place:
-        //
-        //     assert typeof[self.jitcode._resulttypes[self.pc]] == got_type
-        //
-        // The writer records the kind at end-of-instruction position
-        // (`record_resulttype`, `assembler.py`), which makes it an independent
-        // witness of which return slot this call filled.
         if body
             .resulttypes
             .as_ref()
@@ -1030,11 +1016,97 @@ impl JitCode {
     }
 }
 
-/// The encoded width of a `BC_INLINE_CALL` that passes no arguments: the
-/// opcode byte, the `u16` sub-JitCode index, the `u16` argument count, and
-/// the single result-register byte.  Each argument adds a
-/// `(kind, caller_src, callee_dst)` triple of one byte each.
+/// The encoded width of a leftover `BC_INLINE_CALL` that passes no
+/// arguments: opcode, `u16` sub-JitCode index, `u16` argument count,
+/// and the result-register byte. Each leftover argument adds a
+/// `(kind, caller_src, callee_dst)` triple.
 const INLINE_CALL_FIXED_WIDTH: usize = 1 + 2 + 2 + 1;
+
+/// Opcode bytes `JitCodeBuilder` emits for `inline_call_*`, plus leftover
+/// `BC_INLINE_CALL`.
+pub fn is_inline_call_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        insns::BC_INLINE_CALL
+            | insns::BC_INLINE_CALL_R_I
+            | insns::BC_INLINE_CALL_R_R
+            | insns::BC_INLINE_CALL_R_V
+            | insns::BC_INLINE_CALL_IR_I
+            | insns::BC_INLINE_CALL_IR_R
+            | insns::BC_INLINE_CALL_IR_V
+            | insns::BC_INLINE_CALL_IRF_I
+            | insns::BC_INLINE_CALL_IRF_R
+            | insns::BC_INLINE_CALL_IRF_F
+            | insns::BC_INLINE_CALL_IRF_V
+    )
+}
+
+fn decode_typed_inline_call(code: &[u8], start: usize) -> Option<(InlineCallSite, usize)> {
+    let opcode = *code.get(start)?;
+    let (has_i, has_f, return_kind) = match opcode {
+        insns::BC_INLINE_CALL_R_I => (false, false, Some(JitArgKind::Int)),
+        insns::BC_INLINE_CALL_R_R => (false, false, Some(JitArgKind::Ref)),
+        insns::BC_INLINE_CALL_R_V => (false, false, None),
+        insns::BC_INLINE_CALL_IR_I => (true, false, Some(JitArgKind::Int)),
+        insns::BC_INLINE_CALL_IR_R => (true, false, Some(JitArgKind::Ref)),
+        insns::BC_INLINE_CALL_IR_V => (true, false, None),
+        insns::BC_INLINE_CALL_IRF_I => (true, true, Some(JitArgKind::Int)),
+        insns::BC_INLINE_CALL_IRF_R => (true, true, Some(JitArgKind::Ref)),
+        insns::BC_INLINE_CALL_IRF_F => (true, true, Some(JitArgKind::Float)),
+        insns::BC_INLINE_CALL_IRF_V => (true, true, None),
+        _ => return None,
+    };
+    let mut cursor = start + 1;
+    let sub_idx = read_u16(code, &mut cursor) as usize;
+    let mut skip_list = || {
+        let count = *code.get(cursor)? as usize;
+        cursor = cursor.checked_add(1 + count)?;
+        if cursor > code.len() {
+            return None;
+        }
+        Some(())
+    };
+    if has_i {
+        skip_list()?;
+    }
+    skip_list()?;
+    if has_f {
+        skip_list()?;
+    }
+    let dest = if return_kind.is_some() {
+        Some(read_reg(code, &mut cursor) as usize)
+    } else {
+        None
+    };
+    let site = match (return_kind, dest) {
+        (Some(JitArgKind::Int), dest) => InlineCallSite {
+            sub_idx,
+            return_i: dest,
+            return_r: None,
+            return_f: None,
+        },
+        (Some(JitArgKind::Ref), dest) => InlineCallSite {
+            sub_idx,
+            return_i: None,
+            return_r: dest,
+            return_f: None,
+        },
+        (Some(JitArgKind::Float), dest) => InlineCallSite {
+            sub_idx,
+            return_i: None,
+            return_r: None,
+            return_f: dest,
+        },
+        (None, None) => InlineCallSite {
+            sub_idx,
+            return_i: None,
+            return_r: None,
+            return_f: None,
+        },
+        _ => return None,
+    };
+    Some((site, cursor))
+}
 
 /// The operands of one `BC_INLINE_CALL`, as [`JitCode::inline_call_ending_at`]
 /// recovers them from the instruction's far side.

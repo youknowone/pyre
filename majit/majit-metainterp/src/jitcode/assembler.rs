@@ -3541,7 +3541,17 @@ impl JitCodeBuilder {
         args_r: &[(u16, u16)],
         return_i: Option<u16>,
     ) {
-        self.inline_call_grouped(sub_jitcode_idx, &[], args_r, &[], return_i, None, None);
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            false,
+            false,
+            &[],
+            args_r,
+            &[],
+            return_i,
+            None,
+            None,
+        );
     }
 
     pub fn inline_call_r_r(
@@ -3550,7 +3560,17 @@ impl JitCodeBuilder {
         args_r: &[(u16, u16)],
         return_r: Option<u16>,
     ) {
-        self.inline_call_grouped(sub_jitcode_idx, &[], args_r, &[], None, return_r, None);
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            false,
+            false,
+            &[],
+            args_r,
+            &[],
+            None,
+            return_r,
+            None,
+        );
     }
 
     pub fn inline_call_r_v(
@@ -3559,7 +3579,17 @@ impl JitCodeBuilder {
         args_r: &[(u16, u16)],
         _return_v: Option<u16>,
     ) {
-        self.inline_call_grouped(sub_jitcode_idx, &[], args_r, &[], None, None, None);
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            false,
+            false,
+            &[],
+            args_r,
+            &[],
+            None,
+            None,
+            None,
+        );
     }
 
     pub fn inline_call_ir_i(
@@ -3569,7 +3599,17 @@ impl JitCodeBuilder {
         args_r: &[(u16, u16)],
         return_i: Option<u16>,
     ) {
-        self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, &[], return_i, None, None);
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            true,
+            false,
+            args_i,
+            args_r,
+            &[],
+            return_i,
+            None,
+            None,
+        );
     }
 
     pub fn inline_call_ir_r(
@@ -3579,7 +3619,17 @@ impl JitCodeBuilder {
         args_r: &[(u16, u16)],
         return_r: Option<u16>,
     ) {
-        self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, &[], None, return_r, None);
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            true,
+            false,
+            args_i,
+            args_r,
+            &[],
+            None,
+            return_r,
+            None,
+        );
     }
 
     pub fn inline_call_ir_v(
@@ -3589,7 +3639,17 @@ impl JitCodeBuilder {
         args_r: &[(u16, u16)],
         _return_v: Option<u16>,
     ) {
-        self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, &[], None, None, None);
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            true,
+            false,
+            args_i,
+            args_r,
+            &[],
+            None,
+            None,
+            None,
+        );
     }
 
     pub fn inline_call_irf_i(
@@ -3602,6 +3662,8 @@ impl JitCodeBuilder {
     ) {
         self.inline_call_grouped(
             sub_jitcode_idx,
+            true,
+            true,
             args_i,
             args_r,
             args_f,
@@ -3621,6 +3683,8 @@ impl JitCodeBuilder {
     ) {
         self.inline_call_grouped(
             sub_jitcode_idx,
+            true,
+            true,
             args_i,
             args_r,
             args_f,
@@ -3640,6 +3704,8 @@ impl JitCodeBuilder {
     ) {
         self.inline_call_grouped(
             sub_jitcode_idx,
+            true,
+            true,
             args_i,
             args_r,
             args_f,
@@ -3657,7 +3723,17 @@ impl JitCodeBuilder {
         args_f: &[(u16, u16)],
         _return_v: Option<u16>,
     ) {
-        self.inline_call_grouped(sub_jitcode_idx, args_i, args_r, args_f, None, None, None);
+        self.inline_call_grouped(
+            sub_jitcode_idx,
+            true,
+            true,
+            args_i,
+            args_r,
+            args_f,
+            None,
+            None,
+            None,
+        );
     }
 
     #[expect(
@@ -3667,6 +3743,8 @@ impl JitCodeBuilder {
     fn inline_call_grouped(
         &mut self,
         sub_jitcode_idx: u16,
+        has_i_list: bool,
+        has_f_list: bool,
         args_i: &[(u16, u16)],
         args_r: &[(u16, u16)],
         args_f: &[(u16, u16)],
@@ -3690,7 +3768,15 @@ impl JitCodeBuilder {
                 .iter()
                 .map(|&(caller_src, callee_dst)| (JitArgKind::Float, caller_src, callee_dst)),
         );
-        self.inline_call_typed(sub_jitcode_idx, &typed_args, return_i, return_r, return_f);
+        self.inline_call_typed(
+            sub_jitcode_idx,
+            has_i_list,
+            has_f_list,
+            &typed_args,
+            return_i,
+            return_r,
+            return_f,
+        );
     }
 
     /// Reject an inline call whose argument kinds disagree with the callee's
@@ -3757,6 +3843,8 @@ impl JitCodeBuilder {
     fn inline_call_typed(
         &mut self,
         sub_jitcode_idx: u16,
+        has_i_list: bool,
+        has_f_list: bool,
         args: &[(JitArgKind, u16, u16)],
         return_i: Option<u16>,
         return_r: Option<u16>,
@@ -3779,44 +3867,92 @@ impl JitCodeBuilder {
         if let Some(caller_dst) = return_f {
             self.touch_float_reg(caller_dst);
         }
-        self.start_instr(jitcode::insns::BC_INLINE_CALL);
-        self.push_u16(sub_jitcode_idx);
-        self.push_u16(args.len() as u16);
+        let opcode = match (has_i_list, has_f_list, return_i, return_r, return_f) {
+            (false, false, Some(_), None, None) => jitcode::insns::BC_INLINE_CALL_R_I,
+            (false, false, None, Some(_), None) => jitcode::insns::BC_INLINE_CALL_R_R,
+            (false, false, None, None, None) => jitcode::insns::BC_INLINE_CALL_R_V,
+            (true, false, Some(_), None, None) => jitcode::insns::BC_INLINE_CALL_IR_I,
+            (true, false, None, Some(_), None) => jitcode::insns::BC_INLINE_CALL_IR_R,
+            (true, false, None, None, None) => jitcode::insns::BC_INLINE_CALL_IR_V,
+            (true, true, Some(_), None, None) => jitcode::insns::BC_INLINE_CALL_IRF_I,
+            (true, true, None, Some(_), None) => jitcode::insns::BC_INLINE_CALL_IRF_R,
+            (true, true, None, None, Some(_)) => jitcode::insns::BC_INLINE_CALL_IRF_F,
+            (true, true, None, None, None) => jitcode::insns::BC_INLINE_CALL_IRF_V,
+            slots => panic!(
+                "inline_call_typed: unsupported shape has_i={has_i_list} has_f={has_f_list} \
+                 returns {slots:?}"
+            ),
+        };
+        // `bhimpl_inline_call_*` / `exec_typed_inline_call`: descr + I/R/F
+        // lists. Callee register i of each bank is list position i, so a
+        // non-positional callee_dst would be dropped.
+        let mut args_i = Vec::new();
+        let mut args_r = Vec::new();
+        let mut args_f = Vec::new();
         for &(kind, caller_src, callee_dst) in args {
-            self.push_u8(kind.encode());
-            self.push_reg_u8(caller_src, "inline_call caller argument");
-            self.push_reg_u8(callee_dst, "inline_call callee argument");
+            match kind {
+                JitArgKind::Int => {
+                    assert_eq!(
+                        callee_dst as usize,
+                        args_i.len(),
+                        "inline_call I-list is positional like bhimpl_inline_call_*"
+                    );
+                    args_i.push(caller_src);
+                }
+                JitArgKind::Ref => {
+                    assert_eq!(
+                        callee_dst as usize,
+                        args_r.len(),
+                        "inline_call R-list is positional like bhimpl_inline_call_*"
+                    );
+                    args_r.push(caller_src);
+                }
+                JitArgKind::Float => {
+                    assert_eq!(
+                        callee_dst as usize,
+                        args_f.len(),
+                        "inline_call F-list is positional like bhimpl_inline_call_*"
+                    );
+                    args_f.push(caller_src);
+                }
+            }
         }
-        // One result register as the last operand, the same shape
-        // `rewrite_call` gives `inline_call_*_* >i/>r/>f`.  Void emits
-        // `NO_RETURN_REG` so `_setup_return_value_*` is never asked to
-        // read it; a typed call's last byte is the destination
-        // `blackhole.py _setup_return_value_*` recovers as
-        // `code[position-1]`.
+        self.start_instr(opcode);
+        self.push_u16(sub_jitcode_idx);
+        if has_i_list {
+            self.push_reg_list(&args_i);
+        }
+        self.push_reg_list(&args_r);
+        if has_f_list {
+            self.push_reg_list(&args_f);
+        }
+        // Void `bhimpl_inline_call_*` has no result byte. Typed results
+        // write the destination last so `make_result_of_lastop` can
+        // recover it as `code[pc-1]`.
         match (return_i, return_r, return_f) {
             (Some(dst), None, None) => {
-                self.push_return_slot(Some(dst));
+                self.push_reg_u8(dst, "inline_call return");
                 self.record_resulttype('i');
             }
             (None, Some(dst), None) => {
-                self.push_return_slot(Some(dst));
+                self.push_reg_u8(dst, "inline_call return");
                 self.record_resulttype('r');
             }
             (None, None, Some(dst)) => {
-                self.push_return_slot(Some(dst));
+                self.push_reg_u8(dst, "inline_call return");
                 self.record_resulttype('f');
             }
-            (None, None, None) => self.push_return_slot(None),
+            (None, None, None) => {}
             slots => {
                 panic!("inline_call_typed: at most one return slot may be Some, got {slots:?}")
             }
         }
     }
 
-    fn push_return_slot(&mut self, ret: Option<u16>) {
-        match ret {
-            Some(caller_dst) => self.push_reg_u8(caller_dst, "inline_call return"),
-            None => self.push_u8(jitcode::NO_RETURN_REG),
+    fn push_reg_list(&mut self, regs: &[u16]) {
+        self.push_u8(regs.len() as u8);
+        for &reg in regs {
+            self.push_reg_u8(reg, "inline_call list");
         }
     }
 
@@ -6872,8 +7008,14 @@ mod tests {
                     bank.map(|kind| (kind, 9usize)),
                     "return slot for {args_r:?} args, bank {bank:?}",
                 );
-                // The width formula the search solves for.
-                assert_eq!(end - start, 6 + 3 * args_r.len(), "encoded width");
+                // Canonical `inline_call_r_*`: opcode + descr u16 + R-list
+                // + dest byte for a typed result.
+                let dest_bytes = usize::from(bank.is_some());
+                assert_eq!(
+                    end - start,
+                    1 + 2 + (1 + args_r.len()) + dest_bytes,
+                    "encoded width"
+                );
                 // A position one byte off is not the far side of this call,
                 // and answering there would be a wrong frame rebuild rather
                 // than a decline.

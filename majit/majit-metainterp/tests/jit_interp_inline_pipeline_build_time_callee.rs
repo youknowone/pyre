@@ -213,8 +213,9 @@ fn the_dispatch_jitcode_inline_calls_the_build_time_callee() {
     assert!(
         reached.iter().any(|jc| jc
             .code
-            .contains(&majit_metainterp::jitcode::insns::BC_INLINE_CALL)),
-        "the callee must arrive through BC_INLINE_CALL, not a residual call",
+            .iter()
+            .any(|b| majit_metainterp::jitcode::is_inline_call_opcode(*b))),
+        "the callee must arrive through inline_call_*, not a residual call",
     );
     // The callee is reached at depth 2, so this fixture also pins that the
     // walk does not stop at the dispatch's own slots.
