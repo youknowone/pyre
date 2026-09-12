@@ -923,7 +923,7 @@ impl PyError {
         // becomes `args[1]`.
         let details_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(details);
-        let w_msg = pyre_object::w_str_from_wtf8(message.clone());
+        let w_msg = pyre_object::w_str_from_wtf8_managed(message.clone());
         let msg_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_msg);
         unsafe {
@@ -1464,7 +1464,8 @@ impl PyError {
         let errno_slot = exc_slot + 1;
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(errno as i64));
         let strerror_slot = errno_slot + 1;
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8(strerror.clone()));
+        let _ =
+            pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(strerror.clone()));
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::gc_roots::shadow_stack_get(errno_slot),
             pyre_object::gc_roots::shadow_stack_get(strerror_slot),
@@ -1473,7 +1474,7 @@ impl PyError {
             pyre_object::interp_exceptions::w_exception_set_args(exc(), args_list);
             let w_errno = pyre_object::w_int_new(errno as i64);
             pyre_object::interp_exceptions::w_exception_set_errno(exc(), w_errno);
-            let w_strerror = pyre_object::w_str_from_wtf8(strerror.clone());
+            let w_strerror = pyre_object::w_str_from_wtf8_managed(strerror.clone());
             pyre_object::interp_exceptions::w_exception_set_strerror(exc(), w_strerror);
         }
         PyError {
@@ -1542,7 +1543,7 @@ impl PyError {
         let w_msg = if message.is_empty() {
             pyre_object::w_none()
         } else {
-            pyre_object::w_str_from_wtf8(message.clone())
+            pyre_object::w_str_from_wtf8_managed(message.clone())
         };
         // Reload name/path after the message allocation: the pins keep them
         // alive, but a minor collection may have relocated the young objects,
@@ -1652,7 +1653,7 @@ impl PyError {
         let exc = pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
-            let msg = pyre_object::w_str_from_wtf8(self.message.clone());
+            let msg = pyre_object::w_str_from_wtf8_managed(self.message.clone());
             let msg = pyre_object::gc_roots::pin_root(msg);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![msg]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
@@ -2059,20 +2060,18 @@ impl PyError {
         // vm.py:19-25 also carries `extra_line`; pyre's hook-args
         // structseq targets the 5-field shape, so only the default printer
         // receives the Rust-side extra line.
-        let hook_args = crate::_structseq::new_instance(
-            unraisable_hook_args_type(),
-            vec![
-                w_type,
-                w_value,
-                w_tb,
-                if first_line.is_empty() {
-                    pyre_object::w_none()
-                } else {
-                    pyre_object::w_str_from_wtf8(first_line.clone())
-                },
-                w_object,
-            ],
-        );
+        let mut hook_fields = pyre_object::gc_roots::RootedItems::new();
+        hook_fields.push(w_type);
+        hook_fields.push(w_value);
+        hook_fields.push(w_tb);
+        hook_fields.push(if first_line.is_empty() {
+            pyre_object::w_none()
+        } else {
+            pyre_object::w_str_from_wtf8_managed(first_line.clone())
+        });
+        hook_fields.push(w_object);
+        let hook_args =
+            crate::_structseq::new_instance(unraisable_hook_args_type(), hook_fields.take());
         if let Some(sys_mod) = crate::importing::get_interpreter_sys_module()
             && let Ok(w_hook) = crate::baseobjspace::getattr_str(sys_mod, "unraisablehook")
             && !w_hook.is_null()
@@ -2153,10 +2152,21 @@ impl PyError {
         // way a filesystem name is read so it keeps its escape instead of
         // folding to U+FFFD, and so this sink and the fd sink agree.
         let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
-            Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
-            None => pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_filename_wtf8(buf)),
+            Some(text) => pyre_object::w_str_from_wtf8_managed(text.to_wtf8_buf()),
+            None => {
+                pyre_object::w_str_from_wtf8_managed(crate::gateway::fsdecode_filename_wtf8(buf))
+            }
         };
-        let result = crate::baseobjspace::call_method(stderr, "write", &[w_text]);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let stream_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(stderr);
+        let _ = pyre_object::gc_roots::pin_root(w_text);
+        let text_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let result = crate::baseobjspace::call_method(
+            pyre_object::gc_roots::shadow_stack_get(stream_slot),
+            "write",
+            &[pyre_object::gc_roots::shadow_stack_get(text_slot)],
+        );
         if result.is_null() {
             let _ = crate::call::take_call_error();
             return false;
@@ -3422,7 +3432,7 @@ fn stdlib_module_name(name: &str) -> bool {
     }
     let names_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(names);
-    let name = pyre_object::w_str_new(name);
+    let name = pyre_object::w_str_new_managed(name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(name);
     let names = pyre_object::gc_roots::shadow_stack_get(names_slot);
@@ -4047,7 +4057,7 @@ pub(crate) fn emit_report_to_sys_stderr(buf: &[u8]) {
     // well-formed WTF-8; the lossy read is the last resort for a byte no writer
     // put there.
     let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
-        Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
+        Some(text) => pyre_object::w_str_from_wtf8_managed(text.to_wtf8_buf()),
         None => pyre_object::w_str_new_managed(&String::from_utf8_lossy(buf)),
     };
     let _ = pyre_object::gc_roots::pin_root(w_text);
@@ -4432,7 +4442,7 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
     let _ = _roots.pin_root(w_type);
     // `w_str_new`'s buffer-taking sibling: same allocation policy, and it is
     // the one that accepts a lone surrogate.
-    let w_message = pyre_object::w_str_from_wtf8(message.clone());
+    let w_message = pyre_object::w_str_from_wtf8_managed(message.clone());
     let _ = _roots.pin_root(w_message);
     let (w_type, w_message) = (_roots.get(base), _roots.get(base + 1));
     operation_error_from_instance(
@@ -4814,7 +4824,7 @@ pub fn new_exception_class(
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(w_dict.unwrap_or_else(pyre_object::w_dict_new));
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = _roots.pin_root(pyre_object::w_str_new(name));
+    let _ = _roots.pin_root(pyre_object::w_str_new_managed(name));
     let args = [
         _roots.get(name_slot),
         _roots.get(bases_slot),
@@ -4839,7 +4849,7 @@ pub fn new_exception_class(
         // Pinned like every other operand here: `setattr_str` allocates, and a
         // collection rewrites the root SLOT rather than this frame's copy.
         let module_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = _roots.pin_root(pyre_object::w_str_new(module));
+        let _ = _roots.pin_root(pyre_object::w_str_new_managed(module));
         // `space.setattr` propagates its failure through the same bare-return
         // channel as the class call above.
         if let Err(err) = crate::baseobjspace::setattr_str(
@@ -4972,8 +4982,11 @@ pub fn wrap_oserror(
     // from its slot afterwards.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.base();
-    let _ = _roots.pin_root(pyre_object::w_str_new(filename));
-    let w_filename2 = filename2.map(pyre_object::w_str_new);
+    let _ = _roots.pin_root(pyre_object::w_str_new_managed(filename));
+    let w_filename2 = filename2.map(|name| {
+        let _ = _roots.pin_root(pyre_object::w_str_new_managed(name));
+        _roots.get(base + 1)
+    });
     wrap_oserror2(
         space,
         error,

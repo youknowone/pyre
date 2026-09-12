@@ -1351,7 +1351,7 @@ pub(crate) fn seed_main_loader(
                 ty,
                 &[
                     pyre_object::w_str_new("__main__"),
-                    pyre_object::w_str_new(path),
+                    pyre_object::w_str_new_managed(path),
                 ],
             )
             .ok()

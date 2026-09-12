@@ -496,7 +496,7 @@ pub(crate) fn show_warning(
         let write_slot = pin_root_slot(write);
         crate::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(write_slot),
-            &[pyre_object::w_str_from_wtf8(line)],
+            &[pyre_object::w_str_from_wtf8_managed(line)],
         )?;
         let source_line = pyre_object::gc_roots::shadow_stack_get(source_line_slot);
         let source_line = if source_line.is_null() || unsafe { is_none(source_line) } {
@@ -705,7 +705,7 @@ pub(crate) fn do_warn_explicit(
                 filename_bytes[..filename_bytes.len() - 3].to_vec(),
             )
             .expect("removing an ASCII suffix preserves WTF-8");
-            w_str_from_wtf8(stem)
+            w_str_from_wtf8_managed(stem)
         } else {
             filename
         }

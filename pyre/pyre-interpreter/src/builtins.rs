@@ -4185,7 +4185,7 @@ unsafe fn print_emit_native(obj: PyObjectRef, errors: &str) -> Result<(), crate:
         crate::print_output(s);
         return Ok(());
     }
-    let s_obj = pyre_object::w_str_from_wtf8(w);
+    let s_obj = pyre_object::w_str_from_wtf8_managed(w);
     let bytes = crate::type_methods::encode_object(s_obj, "utf-8", errors)?;
     crate::print_output_bytes(&bytes);
     Ok(())
@@ -4808,7 +4808,8 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     // `_` is cleared before rendering so a failing repr does not leave a
     // stale binding, then set to the value once the write succeeds.
     set_builtins_underscore(w_none())?;
-    let repr = pyre_object::w_str_from_wtf8(unsafe { crate::display::py_repr_wtf8(value)? });
+    let repr =
+        pyre_object::w_str_from_wtf8_managed(unsafe { crate::display::py_repr_wtf8(value)? });
     // `pypy/module/sys/app.py:252-253` —
     //     print_item_to(repr(obj), sys_stdout())
     //     print_newline_to(sys_stdout())
@@ -4878,8 +4879,8 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         // is well-formed WTF-8; a decode failure would mean a byte no writer
         // put there, and the lossy read is the last resort for it.
         let w_text = match rustpython_wtf8::Wtf8::from_bytes(&rendered) {
-            Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
-            None => pyre_object::w_str_new(&String::from_utf8_lossy(&rendered)),
+            Some(text) => pyre_object::w_str_from_wtf8_managed(text.to_wtf8_buf()),
+            None => pyre_object::w_str_new_managed(&String::from_utf8_lossy(&rendered)),
         };
         // Read the stream back after that allocation, not before it.
         let result = crate::baseobjspace::call_method(
@@ -5837,12 +5838,16 @@ fn parse_single_required(
     let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
     let mut keywords_w: Vec<PyObjectRef> = Vec::new();
     if let Some(dict) = kwargs {
-        for (key, val) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
-            if key.as_str() == Ok("__pyre_kw__") {
-                continue;
-            }
-            keyword_names_w.push(pyre_object::w_str_from_wtf8(key));
-            keywords_w.push(val);
+        let entries: Vec<_> = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
+            .into_iter()
+            .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
+            .collect();
+        let values: Vec<PyObjectRef> = entries.iter().map(|(_, val)| *val).collect();
+        let values_base = pyre_object::gc_roots::pin_roots(&values);
+        for (index, (key, _)) in entries.into_iter().enumerate() {
+            let w_name = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(key));
+            keyword_names_w.push(w_name);
+            keywords_w.push(pyre_object::gc_roots::shadow_stack_get(values_base + index));
         }
     }
     let signature = crate::gateway::Signature::new(vec![name], None, None, 0, 0);
@@ -10017,7 +10022,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let repr_slot = if is_list_or_tuple {
         None
     } else {
-        let rendered = pyre_object::w_str_from_wtf8(unsafe {
+        let rendered = pyre_object::w_str_from_wtf8_managed(unsafe {
             crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 2))?
         });
         let _ = pyre_object::gc_roots::pin_root(rendered);
@@ -10812,7 +10817,7 @@ pub fn finalization_error(message: Option<&str>) -> crate::PyError {
         );
     };
     let args = match message {
-        Some(message) => vec![cls, pyre_object::w_str_new(message)],
+        Some(message) => vec![cls, pyre_object::w_str_new_managed(message)],
         None => vec![cls],
     };
     match exc_exception_new(&args) {
@@ -12742,7 +12747,7 @@ fn stamp_parser_syntax_metadata(error: &mut crate::PyError, source: &str) {
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(error.to_exc_object());
     let source_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(source));
     let zero_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(0));
     let zero = pyre_object::gc_roots::shadow_stack_get(zero_slot);

@@ -1730,7 +1730,7 @@ pub(crate) fn wtf8_display_string(rendered: Wtf8Buf, fallback: &str) -> String {
     if let Ok(s) = rendered.as_str() {
         return s.to_owned();
     }
-    let s_obj = pyre_object::w_str_from_wtf8(rendered);
+    let s_obj = pyre_object::w_str_from_wtf8_managed(rendered);
     crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
         .ok()
         .and_then(|b| String::from_utf8(b).ok())

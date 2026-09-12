@@ -465,7 +465,7 @@ fn frozen_name(
 fn frozen_error(message: String, name: &Wtf8) -> crate::PyError {
     crate::PyError::import_error_name_path(
         message,
-        pyre_object::w_str_from_wtf8(name.to_owned()),
+        pyre_object::w_str_from_wtf8_managed(name.to_owned()),
         pyre_object::w_none(),
     )
 }

@@ -511,7 +511,7 @@ mod imp {
             host_reg::REG_SZ | host_reg::REG_EXPAND_SZ => {
                 let units = utf16_units(data);
                 let end = units.iter().position(|&c| c == 0).unwrap_or(units.len());
-                w_str_from_wtf8(Wtf8Buf::from_wide(&units[..end]))
+                w_str_from_wtf8_managed(Wtf8Buf::from_wide(&units[..end]))
             }
             host_reg::REG_MULTI_SZ => {
                 // `countStrings`/`fixupMultiSZ` — one trailing terminator ends
@@ -524,17 +524,19 @@ mod imp {
                     Some(&0) => units.len() - 1,
                     Some(_) => units.len(),
                 };
-                let mut items = Vec::new();
+                let mut items = pyre_object::gc_roots::RootedItems::new();
                 let mut start = 0;
                 while start < end {
                     let mut stop = start;
                     while stop < end && units[stop] != 0 {
                         stop += 1;
                     }
-                    items.push(w_str_from_wtf8(Wtf8Buf::from_wide(&units[start..stop])));
+                    items.push(w_str_from_wtf8_managed(Wtf8Buf::from_wide(
+                        &units[start..stop],
+                    )));
                     start = stop + 1;
                 }
-                w_list_new(items)
+                w_list_new(items.take())
             }
             _ => {
                 if data.is_empty() {
@@ -843,7 +845,9 @@ mod imp {
         let pos = exact_args(args, "QueryValue", 2)?;
         let key = as_hkey(pos[0], false)?;
         let wide_sub = wide_or_empty(opt_text(pos[1], "QueryValue", "2")?)?;
-        Ok(w_str_from_wtf8(query_default_value(key, &wide_sub)?))
+        Ok(w_str_from_wtf8_managed(query_default_value(
+            key, &wide_sub,
+        )?))
     }
 
     fn query_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -872,7 +876,9 @@ mod imp {
         if rc != 0 {
             return Err(win_err(rc));
         }
-        Ok(w_str_from_wtf8(Wtf8Buf::from_wide(&buffer[..len as usize])))
+        Ok(w_str_from_wtf8_managed(Wtf8Buf::from_wide(
+            &buffer[..len as usize],
+        )))
     }
 
     fn enum_value(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1097,7 +1103,7 @@ mod imp {
             "",
         )?;
         match expand_environment_strings_wide(&wide(input)?) {
-            Some(value) => Ok(w_str_from_wtf8(value)),
+            Some(value) => Ok(w_str_from_wtf8_managed(value)),
             None => Err(win_err(
                 std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32,
             )),

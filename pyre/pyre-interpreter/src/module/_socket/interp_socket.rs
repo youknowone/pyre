@@ -3189,7 +3189,7 @@ fn windows_if_nameindex() -> Result<pyre_object::PyObjectRef, crate::PyError> {
             let entry = {
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 fields.push(pyre_object::w_int_new(i64::from(row.InterfaceIndex)));
-                fields.push(pyre_object::w_str_from_wtf8(
+                fields.push(pyre_object::w_str_from_wtf8_managed(
                     rustpython_wtf8::Wtf8Buf::from_wide(&name[..end]),
                 ));
                 pyre_object::w_tuple_new(fields.take())

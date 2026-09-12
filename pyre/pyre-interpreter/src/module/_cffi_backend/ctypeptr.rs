@@ -522,7 +522,7 @@ fn unpack_wide_string(item: &W_CType, ptr: *mut u8, length: i64) -> Result<PyObj
             super::wchar_helper::utf8_from_char32(ptr, length)?
         }
     };
-    Ok(pyre_object::w_str_from_wtf8(out))
+    Ok(pyre_object::w_str_from_wtf8_managed(out))
 }
 
 /// `W_CTypePtrOrArray.ctitem`, which every pointer and array has.

@@ -171,7 +171,7 @@ fn scanner_scan_once(
                 machinery::scan_string(&value[byte_index + 1..], char_index + 1, strict)
                     .map_err(|err| json_decode_error(err.msg, doc, err.pos))?;
             Ok((
-                pyre_object::w_str_from_wtf8(decoded),
+                pyre_object::w_str_from_wtf8_managed(decoded),
                 next_char,
                 byte_index + 1 + bytes_used,
             ))
@@ -361,7 +361,7 @@ fn scanner_parse_object(
 
             let iteration_roots = gc_roots::push_roots();
             let item_slot = gc_roots::shadow_stack_len();
-            let candidate = pyre_object::w_str_from_wtf8(decoded);
+            let candidate = pyre_object::w_str_from_wtf8_managed(decoded);
             let _ = gc_roots::pin_root(candidate);
             let memo = gc_roots::shadow_stack_get(slot + 1);
             let key =

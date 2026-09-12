@@ -929,11 +929,13 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                         // set still open holds the slots the outer one claims.
                         let entry = {
                             let mut fields = pyre_object::gc_roots::RootedItems::new();
-                            fields.push(pyre_object::w_str_from_wtf8(literal));
-                            fields.push(pyre_object::w_str_from_wtf8(field_name));
-                            fields.push(pyre_object::w_str_from_wtf8(format_spec));
+                            fields.push(pyre_object::w_str_from_wtf8_managed(literal));
+                            fields.push(pyre_object::w_str_from_wtf8_managed(field_name));
+                            fields.push(pyre_object::w_str_from_wtf8_managed(format_spec));
                             fields.push(match conversion_spec {
-                                Some(c) => pyre_object::w_str_new(&c.to_char_lossy().to_string()),
+                                Some(c) => {
+                                    pyre_object::w_str_new_managed(&c.to_char_lossy().to_string())
+                                }
                                 None => pyre_object::w_none(),
                             });
                             pyre_object::w_tuple_new(fields.take())
@@ -945,7 +947,7 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
             if let Some(text) = pending {
                 let entry = {
                     let mut fields = pyre_object::gc_roots::RootedItems::new();
-                    fields.push(pyre_object::w_str_from_wtf8(text));
+                    fields.push(pyre_object::w_str_from_wtf8_managed(text));
                     fields.push(pyre_object::w_none());
                     fields.push(pyre_object::w_none());
                     fields.push(pyre_object::w_none());
@@ -970,11 +972,10 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
             let first = match field_type {
                 FieldType::Auto => pyre_object::w_str_new(""),
                 FieldType::Index(n) => pyre_object::w_int_new(n as i64),
-                FieldType::Keyword(s) => pyre_object::w_str_from_wtf8(s),
+                FieldType::Keyword(s) => pyre_object::w_str_from_wtf8_managed(s),
             };
-            // A `str` and an `int` never move, so `first` is never read back,
-            // but nothing else refers to it while the parts below allocate:
-            // one liveness pin covers it to the end of the call.
+            // `first` is a young managed str or int; pin it across the parts
+            // below, which allocate.
             let roots = pyre_object::gc_roots::push_roots();
             let first = roots.pin_root(first);
             let mut rest = pyre_object::gc_roots::RootedItems::new();
@@ -984,7 +985,7 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                     match part {
                         FieldNamePart::Attribute(s) => {
                             fields.push(pyre_object::w_bool_from(true));
-                            fields.push(pyre_object::w_str_from_wtf8(s));
+                            fields.push(pyre_object::w_str_from_wtf8_managed(s));
                         }
                         FieldNamePart::Index(n) => {
                             fields.push(pyre_object::w_bool_from(false));
@@ -992,7 +993,7 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                         }
                         FieldNamePart::StringIndex(s) => {
                             fields.push(pyre_object::w_bool_from(false));
-                            fields.push(pyre_object::w_str_from_wtf8(s));
+                            fields.push(pyre_object::w_str_from_wtf8_managed(s));
                         }
                     }
                     pyre_object::w_tuple_new(fields.take())
@@ -1305,9 +1306,9 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     );
 
     let base_prefix = sysconfigdata_base_prefix();
-    let base_prefix_str = pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(
-        base_prefix.as_os_str(),
-    ));
+    let base_prefix_str = pyre_object::w_str_from_wtf8_managed(
+        crate::gateway::fsdecode_os_str_wtf8(base_prefix.as_os_str()),
+    );
     // `include/{implementation_lower}{py_version_short}{abi_thread}`, the
     // directory the posix_prefix scheme resolves `get_paths()['include']` to.
     // An interpreter that publishes no base prefix has nowhere to name.
@@ -1458,7 +1459,7 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // Python 3.14's relocation check reads these from the generated data.
     unsafe {
         for key in ["prefix", "exec_prefix", "srcdir"] {
-            let w_key = pyre_object::w_str_new(key);
+            let w_key = pyre_object::w_str_new_managed(key);
             pyre_object::w_dict_store(
                 pyre_object::gc_roots::shadow_stack_get(vars_slot),
                 w_key,
@@ -1501,7 +1502,7 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("TZPATH"));
             let w_value =
-                pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(&joined));
+                pyre_object::w_str_from_wtf8_managed(crate::gateway::fsdecode_os_str_wtf8(&joined));
             pyre_object::w_dict_store(
                 pyre_object::gc_roots::shadow_stack_get(vars_slot),
                 pyre_object::gc_roots::shadow_stack_get(key_slot),
@@ -1992,11 +1993,11 @@ fn fix_up_source_module_spec(
     let _ = pin_root(w_name);
     let ext_slot = shadow_stack_len();
     let _ = pin_root(ext);
-    let w_path = pyre_object::w_str_from_wtf8(pathname.to_wtf8_buf());
+    let w_path = pyre_object::w_str_from_wtf8_managed(pathname.to_wtf8_buf());
     let path_slot = shadow_stack_len();
     let _ = pin_root(w_path);
     let w_cpath = match cpathname {
-        Some(c) => pyre_object::w_str_new(c),
+        Some(c) => pyre_object::w_str_new_managed(c),
         None => pyre_object::w_none(),
     };
     let cpath_slot = shadow_stack_len();
@@ -3012,7 +3013,7 @@ pub fn add_sys_path(dir: &Path) {
     // path is allocation-free until the pinned entry reaches `w_list_append`.
     let _roots = push_roots();
     let slot = shadow_stack_len();
-    let _ = pin_root(pyre_object::w_str_from_wtf8(entry.clone()));
+    let _ = pin_root(pyre_object::w_str_from_wtf8_managed(entry.clone()));
     let Some(sys_mod) = get_interpreter_sys_module() else {
         return;
     };
@@ -3168,14 +3169,14 @@ pub(crate) fn sys_modules_registry_get(name: &str) -> Option<PyObjectRef> {
 /// report it — `None` is not a module it can hand back, so it falls through
 /// to the search — hence the separate lookup.
 fn sys_modules_blocks(name: &str) -> bool {
-    sys_modules_blocks_key(pyre_object::w_str_new(name))
+    sys_modules_blocks_key(pyre_object::w_str_new_managed(name))
 }
 
 /// [`sys_modules_blocks`] for a name with no `&str` spelling.  A module name
 /// is WTF-8 and may carry a lone surrogate, and `sys.modules` is free to hold
 /// such a name as a key, so the block is asked for as an object.
 fn sys_modules_blocks_wtf8(name: &Wtf8) -> bool {
-    sys_modules_blocks_key(pyre_object::w_str_from_wtf8(name.to_owned()))
+    sys_modules_blocks_key(pyre_object::w_str_from_wtf8_managed(name.to_owned()))
 }
 
 fn sys_modules_blocks_key(key: PyObjectRef) -> bool {
@@ -4219,7 +4220,7 @@ fn exec_code_module(
     // `write_paths=False` shape (REPL, builtin bootstrap).
     if let Some(p) = pathname {
         // importing.py:284 setitem('__file__', w_pathname).
-        let w_pathname = pyre_object::w_str_from_wtf8(p.to_wtf8_buf());
+        let w_pathname = pyre_object::w_str_from_wtf8_managed(p.to_wtf8_buf());
         unsafe {
             pyre_object::w_dict_setitem_str(w_globals, "__file__", w_pathname);
         }
@@ -4228,7 +4229,7 @@ fn exec_code_module(
         // import was not satisfied from a `.pyc`.  Pyre has no .pyc
         // path today so reachable callers still hit the None arm.
         let w_cpathname = match cpathname {
-            Some(c) => pyre_object::w_str_new(c),
+            Some(c) => pyre_object::w_str_new_managed(c),
             None => pyre_object::w_none(),
         };
         unsafe {
@@ -4341,7 +4342,11 @@ pub fn appleveldef_install_seeded(
     // seen under a different name -- the public spelling of an accelerator it
     // backs -- rebinds `__name__` itself, and that assignment runs later.
     unsafe {
-        pyre_object::w_dict_setitem_str(w_app_globals, "__name__", pyre_object::w_str_new(modname))
+        pyre_object::w_dict_setitem_str(
+            w_app_globals,
+            "__name__",
+            pyre_object::w_str_new_managed(modname),
+        )
     };
     for &(name, value) in seed {
         unsafe { pyre_object::w_dict_setitem_str(w_app_globals, name, value) };
@@ -4475,7 +4480,7 @@ fn load_source_module(
     } else {
         modulename
     };
-    let package_name = pyre_object::w_str_new(pkg);
+    let package_name = pyre_object::w_str_new_managed(pkg);
     unsafe {
         pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__package__", package_name);
     }
@@ -4515,7 +4520,7 @@ fn load_source_module(
     };
     if let Some(frozen) = frozen_exec_name {
         unsafe {
-            let frozen_name = pyre_object::w_str_new(frozen);
+            let frozen_name = pyre_object::w_str_new_managed(frozen);
             pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__name__", frozen_name);
         }
     }
@@ -4543,7 +4548,7 @@ fn load_source_module(
     // `__module__`; `module.__name__` resolves from this dict entry.
     if frozen_exec_name.is_some() {
         unsafe {
-            let public_name = pyre_object::w_str_new(modulename);
+            let public_name = pyre_object::w_str_new_managed(modulename);
             pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__name__", public_name);
         }
     }
@@ -4809,7 +4814,7 @@ fn set_frozen_alias_metadata(
     crate::baseobjspace::setattr_str(
         shadow_stack_get(module_slot),
         "__origname__",
-        pyre_object::w_str_new(origname),
+        pyre_object::w_str_new_managed(origname),
     )?;
     Ok(())
 }
@@ -4849,7 +4854,7 @@ fn load_namespace_package(
     let roots = pyre_object::gc_roots::push_roots();
     let globals_slot = roots.base();
     let _ = roots.pin_root(w_globals);
-    let package_name = pyre_object::w_str_new(modulename);
+    let package_name = pyre_object::w_str_new_managed(modulename);
     unsafe {
         pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__package__", package_name);
     }
@@ -5299,7 +5304,7 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
         let lock_unlock_slot = shadow_stack_len();
         let _ = pin_root(w_lock_unlock);
         let name_slot = shadow_stack_len();
-        let _ = pin_root(pyre_object::w_str_new(name));
+        let _ = pin_root(pyre_object::w_str_new_managed(name));
         crate::call::call_function_impl_result(
             shadow_stack_get(lock_unlock_slot),
             &[shadow_stack_get(name_slot)],
@@ -5590,7 +5595,7 @@ pub fn dunder_import(
                     level,
                 );
             }
-            let w_name = pyre_object::w_str_new(name);
+            let w_name = pyre_object::w_str_new_managed(name);
             return call_bootstrap_import(
                 shadow_stack_get(import_slot),
                 w_name,
@@ -5672,7 +5677,7 @@ pub fn call_dunder_import_name_only(
     // Minted before the slot is read back: the allocation can move what the
     // slot holds, and an argument read ahead of it would be a stale address.
     let name_slot = shadow_stack_len();
-    let _ = pin_root(pyre_object::w_str_new(name));
+    let _ = pin_root(pyre_object::w_str_new_managed(name));
     crate::call::call_function_impl_result(
         shadow_stack_get(import_slot),
         &[shadow_stack_get(name_slot)],
@@ -5722,7 +5727,7 @@ pub fn call_dunder_import(
     let _ = pin_root(dunder_import_binding(execution_context)?);
     // Minted before any slot is read back: the allocation can move what the
     // slots hold, and an argument read ahead of it would be a stale address.
-    let w_name = pyre_object::w_str_new(name);
+    let w_name = pyre_object::w_str_new_managed(name);
     call_bootstrap_import(
         shadow_stack_get(import_slot),
         w_name,
@@ -5875,7 +5880,7 @@ fn relative_import_head(
         w_globals
     });
     let name_slot = shadow_stack_len();
-    let _ = pin_root(pyre_object::w_str_new(name));
+    let _ = pin_root(pyre_object::w_str_new_managed(name));
     let level_slot = shadow_stack_len();
     let _ = pin_root(pyre_object::w_int_new(level));
 
@@ -5942,7 +5947,7 @@ fn relative_import_head(
         .unwrap_or(abs_name.as_str());
 
     let head_slot = shadow_stack_len();
-    let _ = pin_root(pyre_object::w_str_new(head));
+    let _ = pin_root(pyre_object::w_str_new_managed(head));
     // The raw `sys.modules` entry, `None` sentinel included: only a *missing*
     // key is the KeyError.
     let w_modules = sys_modules_dict();
@@ -6228,7 +6233,7 @@ fn handle_fromlist(
             message.push_str("'");
             return Err(crate::PyError::module_not_found_with_name_obj(
                 message,
-                pyre_object::w_str_from_wtf8(from_name),
+                pyre_object::w_str_from_wtf8_managed(from_name),
             ));
         }
         let Ok(child) = from_name.as_str() else {
@@ -6481,7 +6486,7 @@ pub(crate) fn is_spec_uninitialized_submodule(
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(false),
         Err(e) => return Err(e),
     };
-    crate::baseobjspace::contains(w_value, pyre_object::w_str_new(name))
+    crate::baseobjspace::contains(w_value, pyre_object::w_str_new_managed(name))
 }
 
 /// `_PyModuleSpec_GetFileOrigin` — the spec's file origin: its `origin` string
@@ -6624,7 +6629,10 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     let pkgname_slot = pyre_object::gc_roots::shadow_stack_len();
     let (w_pkgname, named) = match crate::baseobjspace::getattr_str(module, "__name__") {
         Ok(v) if unsafe { pyre_object::is_str(v) } => (v, true),
-        _ => (pyre_object::w_str_new("<unknown module name>"), false),
+        _ => (
+            pyre_object::w_str_new_managed("<unknown module name>"),
+            false,
+        ),
     };
     // Pinned for the whole function: every lookup below can run a descriptor
     // or `__getattr__` and so collect, and this name is young and movable.
@@ -6640,7 +6648,7 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
         });
         fullname.push_str(".");
         fullname.push_str(name);
-        if let Some(submod) = check_sys_modules_w(pyre_object::w_str_from_wtf8(fullname)) {
+        if let Some(submod) = check_sys_modules_w(pyre_object::w_str_from_wtf8_managed(fullname)) {
             return Ok(submod);
         }
     }
@@ -6658,9 +6666,9 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     // (including None) reports the location as unknown.
     let w_pkgpath = match crate::baseobjspace::getattr_str(module, "__file__") {
         Ok(v) if unsafe { pyre_object::is_str(v) } => v,
-        Ok(_) => pyre_object::w_str_new("unknown location"),
+        Ok(_) => pyre_object::w_str_new_managed("unknown location"),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            pyre_object::w_str_new("unknown location")
+            pyre_object::w_str_new_managed("unknown location")
         }
         Err(e) => return Err(e),
     };
@@ -6732,7 +6740,7 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     // built before the three reads below because the allocation can move the
     // pinned package name and path.
     let name_from_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(name));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
     let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
     let w_pkgpath = pyre_object::gc_roots::shadow_stack_get(pkgpath_slot);
     let w_name_from = pyre_object::gc_roots::shadow_stack_get(name_from_slot);

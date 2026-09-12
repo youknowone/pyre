@@ -7577,7 +7577,7 @@ fn attr_error_wtf8(obj: PyObjectRef, name: &Wtf8) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
-    let w_name = pyre_object::w_str_from_wtf8(name.to_wtf8_buf());
+    let w_name = pyre_object::w_str_from_wtf8_managed(name.to_wtf8_buf());
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_name);
     let exc = pyre_object::interp_exceptions::w_exception_new_wtf8(
@@ -20755,7 +20755,7 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
         qualname_repr,
         " was never awaited"
     );
-    let w_message = w_str_from_wtf8(message);
+    let w_message = w_str_from_wtf8_managed(message);
     if let Err(mut err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
         // A filter turned into `error` hands back the only reference to the
         // materialised exception, and it lives in this Rust `PyError`, which
@@ -20826,7 +20826,7 @@ fn warn_unawaited_coroutine(gen_obj: PyObjectRef) {
             unsafe { pyre_object::w_str_get_wtf8(qualname) }.to_wtf8_buf()
         };
         let message = crate::display::wtf8_format!("coroutine '", qualname, "' was never awaited");
-        let w_message = pyre_object::w_str_from_wtf8(message);
+        let w_message = pyre_object::w_str_from_wtf8_managed(message);
         if let Err(mut err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
             err.write_unraisable(w_none(), &where_desc, gen_obj);
         }

@@ -3281,10 +3281,13 @@ fn call_with_kwargs_in_ctx_impl(
                     // is handed to the profiling call, so the profiled frame is
                     // read back out of the anchor rather than from this local.
                     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
-                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
-                        .iter()
-                        .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
-                        .collect();
+                    let mut keyword_names_w: Vec<pyre_object::PyObjectRef> =
+                        Vec::with_capacity(kwargs.len());
+                    for (k, _) in kwargs.iter() {
+                        keyword_names_w.push(pyre_object::gc_roots::pin_root(
+                            pyre_object::w_str_from_wtf8_managed(k.clone()),
+                        ));
+                    }
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
                         kwargs.iter().map(|(_, v)| *v).collect();
                     let mut arguments = crate::argument::Arguments::with_kw(
@@ -3387,10 +3390,13 @@ fn call_with_kwargs_in_ctx_impl(
                     // is handed to the profiling call, so the profiled frame is
                     // read back out of the anchor rather than from this local.
                     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
-                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
-                        .iter()
-                        .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
-                        .collect();
+                    let mut keyword_names_w: Vec<pyre_object::PyObjectRef> =
+                        Vec::with_capacity(kwargs.len());
+                    for (k, _) in kwargs.iter() {
+                        keyword_names_w.push(pyre_object::gc_roots::pin_root(
+                            pyre_object::w_str_from_wtf8_managed(k.clone()),
+                        ));
+                    }
                     // `keyword_names_w` allocated a string per keyword, so
                     // everything read before it — the positionals, the keyword
                     // values, and the dict `full_args` carries — may have moved

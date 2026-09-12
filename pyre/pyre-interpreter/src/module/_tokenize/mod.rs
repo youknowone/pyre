@@ -737,7 +737,7 @@ fn positioned_syntax_error(
     };
     let _roots = gc_roots::push_roots();
     let _ = gc_roots::pin_root(class);
-    let _ = gc_roots::pin_root(w_str_new(message));
+    let _ = gc_roots::pin_root(w_str_new_managed(message));
     let base = gc_roots::shadow_stack_len() - 2;
     let exc = match crate::builtins::call_and_check(
         gc_roots::shadow_stack_get(base),

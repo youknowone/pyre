@@ -2815,11 +2815,11 @@ impl Converter<'_> {
     }
 
     fn string(&self, value: &str) -> Rooted {
-        self.pin(pyre_object::w_str_new(value))
+        self.pin(pyre_object::w_str_new_managed(value))
     }
 
     fn wtf8(&self, value: Wtf8Buf) -> Rooted {
-        self.pin(pyre_object::w_str_from_wtf8(value))
+        self.pin(pyre_object::w_str_from_wtf8_managed(value))
     }
 
     fn none(&self) -> Rooted {

@@ -206,7 +206,7 @@ fn prog_id(guid: &[u8; 16]) -> PyObjectRef {
     while unsafe { *progid.add(len) } != 0 {
         len += 1;
     }
-    let value = pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(unsafe {
+    let value = pyre_object::w_str_from_wtf8_managed(rustpython_wtf8::Wtf8Buf::from_wide(unsafe {
         std::slice::from_raw_parts(progid, len)
     }));
     unsafe { CoTaskMemFree(progid as *const _) };

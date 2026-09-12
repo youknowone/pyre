@@ -396,7 +396,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     };
                     let w_value = crate::baseobjspace::getitem(
                         pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                        w_str_from_wtf8(key),
+                        w_str_from_wtf8_managed(key),
                     )?;
                     // A keyed spec still consumes a positional slot when one
                     // is available (`%(k)s %s` leaves nothing for the `%s`).

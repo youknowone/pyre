@@ -6035,8 +6035,8 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // of which the collector rewrites, and each keyword name allocated below
     // can move a `list` or `dict` still waiting in them.  Both columns are
     // published before the first of those allocations and read back where the
-    // `Arguments` copy is taken; a keyword name is a `str` and never moves, so
-    // its pin is liveness only.
+    // `Arguments` copy is taken. Managed keyword names move, so each mint
+    // is pinned before the next allocation.
     let _roots = pyre_object::gc_roots::push_roots();
     let positional_base = pyre_object::gc_roots::pin_roots(positional);
     let (keyword_names_w, keyword_values_base) = match kwargs {
@@ -6049,7 +6049,7 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let base = pyre_object::gc_roots::pin_roots(&values);
             let mut names = Vec::with_capacity(entries.len());
             for (key, _) in entries {
-                let w_name = pyre_object::w_str_from_wtf8(key);
+                let w_name = pyre_object::w_str_from_wtf8_managed(key);
                 let w_name = pyre_object::gc_roots::pin_root(w_name);
                 names.push(w_name);
             }
@@ -6741,7 +6741,7 @@ fn init_str_type(ns: PyObjectRef) {
                     {
                         Ok(obj)
                     } else {
-                        Ok(pyre_object::w_str_from_wtf8(
+                        Ok(pyre_object::w_str_from_wtf8_managed(
                             unsafe { pyre_object::w_str_get_wtf8(obj) }.to_wtf8_buf(),
                         ))
                     }
@@ -8559,7 +8559,7 @@ fn init_dict_view_common_slots(
                     if args.is_empty() {
                         return Ok(pyre_object::w_str_new(""));
                     }
-                    Ok(pyre_object::w_str_from_wtf8(unsafe {
+                    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
                         crate::display::py_repr_wtf8(args[0])?
                     }))
                 },
@@ -13276,7 +13276,7 @@ fn init_type_type(ns: PyObjectRef) {
                 if let Some(end) = raw_doc.find(MARKER.as_ref())
                     && end > 0
                 {
-                    return Ok(pyre_object::w_str_from_wtf8(
+                    return Ok(pyre_object::w_str_from_wtf8_managed(
                         raw_doc[name.len()..end + 1].to_wtf8_buf(),
                     ));
                 }
@@ -15586,7 +15586,7 @@ fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
         // (`stamp_method_owners`), which is also what `bool.from_bytes`
         // reporting `int.from_bytes` requires.
         if unsafe { pyre_object::is_type(instance) } {
-            return Ok(pyre_object::w_str_from_wtf8(unsafe {
+            return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
                 crate::function::function_get_qualname(descr)
             }));
         }
@@ -15602,13 +15602,11 @@ fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
         // qualname, which is a `str` the read has to keep rather than reject.
         let type_qualname = unsafe { pyre_object::w_str_get_wtf8(type_qualname) };
         let name = unsafe { crate::function::function_get_name(descr) };
-        Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
-            type_qualname,
-            ".",
-            name,
-        )))
+        Ok(pyre_object::w_str_from_wtf8_managed(
+            crate::display::wtf8_format!(type_qualname, ".", name,),
+        ))
     } else {
-        Ok(pyre_object::w_str_from_wtf8(unsafe {
+        Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
             crate::function::function_get_qualname(obj)
         }))
     }
@@ -25275,7 +25273,7 @@ pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
         .unwrap_or(0);
     Err(unicode_encode_error(
         "utf-8",
-        pyre_object::w_str_from_wtf8(text),
+        pyre_object::w_str_from_wtf8_managed(text),
         position as i64,
         (position + 1) as i64,
         "surrogates not allowed",
@@ -31041,8 +31039,8 @@ fn itertools_constructor_scope_kwonly(
     // rewrites, and the names and defaults dict allocated below can move a
     // `list` or `dict` waiting in either.  Both columns are published before
     // the first of those allocations and read back where the `Arguments` copy
-    // is taken; a keyword name is a `str` and never moves, so its pin is
-    // liveness only.
+    // is taken. Managed keyword names move, so each mint is pinned before
+    // the next allocation.
     let positional_base = pyre_object::gc_roots::pin_roots(positional);
     let (keyword_names_w, keyword_values_base) = match kwargs {
         Some(dict) => {
@@ -31054,7 +31052,7 @@ fn itertools_constructor_scope_kwonly(
             let base = pyre_object::gc_roots::pin_roots(&values);
             let mut names = Vec::with_capacity(entries.len());
             for (key, _) in entries {
-                let w_name = pyre_object::w_str_from_wtf8(key);
+                let w_name = pyre_object::w_str_from_wtf8_managed(key);
                 let w_name = pyre_object::gc_roots::pin_root(w_name);
                 names.push(w_name);
             }
@@ -31178,7 +31176,7 @@ fn count_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         let step = unsafe { crate::display::py_repr_wtf8(w_step)? };
         crate::display::wtf8_format!(cls_name, "(", c, ", ", step, ")")
     };
-    Ok(w_str_from_wtf8(text))
+    Ok(w_str_from_wtf8_managed(text))
 }
 
 /// [3.14-spec] CPython `count_slots` publishes `Py_tp_getattro`, while PyPy's
@@ -31314,7 +31312,7 @@ fn repeat_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     } else {
         crate::display::wtf8_format!(cls_name, "(", objrepr, ")")
     };
-    Ok(w_str_from_wtf8(text))
+    Ok(w_str_from_wtf8_managed(text))
 }
 
 /// [3.14-spec] CPython `repeat_slots` publishes `Py_tp_getattro`, while PyPy's
@@ -31899,8 +31897,8 @@ fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // collector rewrites, and every allocation between here and the parse can
     // move a value sitting in it.  The value column is published as one root
     // set before the first of those allocations and read back where the
-    // `Arguments` copy is taken; a keyword name is a `str` and never moves, so
-    // its pin is liveness only.
+    // `Arguments` copy is taken. Managed keyword names move, so each mint
+    // is pinned before the next allocation.
     let (keyword_names_w, keyword_values_base) = match kwargs {
         Some(dict) => {
             let entries: Vec<_> = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
@@ -31911,7 +31909,7 @@ fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             let base = pyre_object::gc_roots::pin_roots(&values);
             let mut names = Vec::with_capacity(entries.len());
             for (key, _) in entries {
-                let w_name = pyre_object::w_str_from_wtf8(key);
+                let w_name = pyre_object::w_str_from_wtf8_managed(key);
                 let w_name = pyre_object::gc_roots::pin_root(w_name);
                 names.push(w_name);
             }

@@ -2073,7 +2073,7 @@ pub fn fsdecode_os_str(name: &std::ffi::OsStr) -> pyre_object::PyObjectRef {
     {
         use std::os::windows::ffi::OsStrExt;
         let units: Vec<u16> = name.encode_wide().collect();
-        pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(&units))
+        pyre_object::w_str_from_wtf8_managed(rustpython_wtf8::Wtf8Buf::from_wide(&units))
     }
     #[cfg(not(windows))]
     {

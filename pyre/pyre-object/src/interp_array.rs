@@ -321,7 +321,7 @@ fn unpack_exact(typecode: u8, buf: &[u8]) -> Option<PyObjectRef> {
         b'u' | b'w' => {
             let cp = u32::from_ne_bytes(buf.try_into().ok()?);
             match char::from_u32(cp) {
-                Some(c) => crate::unicodeobject::w_str_new(&c.to_string()),
+                Some(c) => crate::unicodeobject::w_str_new_managed(&c.to_string()),
                 None => {
                     // Lone surrogate / out-of-range Py_UCS4 — represent via
                     // WTF-8 (an out-of-range value yields the empty string).
@@ -329,7 +329,7 @@ fn unpack_exact(typecode: u8, buf: &[u8]) -> Option<PyObjectRef> {
                     if let Some(point) = CodePoint::from_u32(cp) {
                         wb.push(point);
                     }
-                    crate::unicodeobject::w_str_from_wtf8(wb)
+                    crate::unicodeobject::w_str_from_wtf8_managed(wb)
                 }
             }
         }

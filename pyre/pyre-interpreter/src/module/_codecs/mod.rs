@@ -442,7 +442,7 @@ fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             let mut replacement = Wtf8Buf::new();
             replacement.push(CodePoint::from_u32(code).unwrap());
             Ok(codec_result(
-                w_str_from_wtf8(replacement),
+                w_str_from_wtf8_managed(replacement),
                 w_int_new((exc.start + byte_len) as i64),
             ))
         }
@@ -487,7 +487,7 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
             }
             Ok(codec_result(
-                w_str_from_wtf8(replacement),
+                w_str_from_wtf8_managed(replacement),
                 w_int_new((exc.start + consumed) as i64),
             ))
         }
@@ -1389,7 +1389,7 @@ fn charmap_decode_impl(
             chars.get(b as usize).copied().map(|cp| {
                 let mut one = rustpython_wtf8::Wtf8Buf::new();
                 one.push(cp);
-                w_str_from_wtf8(one)
+                w_str_from_wtf8_managed(one)
             })
         } else {
             charmap_decode_lookup(pyre_object::gc_roots::shadow_stack_get(sp), b)?

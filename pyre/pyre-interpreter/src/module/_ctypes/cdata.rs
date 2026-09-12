@@ -1719,7 +1719,7 @@ pub(super) fn bstr_to_pyobject(bytes: &[u8]) -> PyObjectRef {
             windows_sys::Win32::Foundation::SysStringLen(addr as *const u16) as usize,
         )
     };
-    pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(units))
+    pyre_object::w_str_from_wtf8_managed(rustpython_wtf8::Wtf8Buf::from_wide(units))
 }
 
 /// The Python value the bytes of a slot of type code `tc` hold.

@@ -159,7 +159,7 @@ pub(crate) fn unsupported(message: &str) -> crate::PyError {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_str_new(message));
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(message));
     match crate::call::call_function_impl_result(
         w_type,
         &[pyre_object::gc_roots::shadow_stack_get(sp)],
