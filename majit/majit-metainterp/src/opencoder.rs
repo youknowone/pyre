@@ -515,24 +515,42 @@ where
         }
         let src: &majit_ir::Op = self.trace[self.pos].borrow();
         self.pos += 1;
-        let mut res: majit_ir::Op = src.clone();
-        // opencoder.py:379-387: for i in range(argnum):
-        //     res.setarg(i, self._untag(self._next()))
-        for i in 0..res.num_args() {
-            // The legacy adapter already carries the decoded Const object in
-            // the source op. RPython's byte iterator creates it once while
-            // decoding `_untag`; keep that object instead of flattening it to
-            // OpRef and allocating a second Const wrapper immediately.
-            if !res.arg(i).is_constant() {
-                res.setarg(i, self._untag(res.arg(i).to_opref()));
-            }
+        // opencoder.py `TraceIterator.next` `cls()` / `ResOperation(opnum, args)`
+        // — a fresh object, not a clone of the recorded op. Cloning copied
+        // `Box<OpKindExtra>` (32 B) on every guard; minting writes
+        // remapped args/fail_args onto a new `Op` the way `cls()` does.
+        let mut args: smallvec::SmallVec<[Operand; 4]> = smallvec::SmallVec::new();
+        for i in 0..src.num_args() {
+            let a = src.arg(i);
+            args.push(if a.is_constant() {
+                a
+            } else {
+                self._untag(a.to_opref())
+            });
         }
-        if let Some(fa) = res.fail_args_mut() {
-            for arg in fa.iter_mut() {
-                if !arg.is_constant() {
-                    *arg = self._untag(arg.to_opref());
-                }
-            }
+        let res = match src.getdescr() {
+            Some(d) => majit_ir::Op::with_descr(src.opcode, &args, d),
+            None => majit_ir::Op::new(src.opcode, &args),
+        };
+        if let Some(fa) = src.guard_fail_args() {
+            let mapped: majit_ir::resoperation::OpArgVec = fa
+                .iter()
+                .map(|arg| {
+                    if arg.is_constant() {
+                        arg.clone()
+                    } else {
+                        self._untag(arg.to_opref())
+                    }
+                })
+                .collect();
+            res.setfailargs(mapped);
+        }
+        let resume = src.rd_resume_position();
+        if resume >= 0 {
+            res.set_rd_resume_position(resume);
+        }
+        if let Some(types) = src.get_fail_arg_types() {
+            res.set_fail_arg_types(types);
         }
         // RPython opencoder.py:399-401:
         //     res = ResOperation(opnum, args, descr)   # fresh cls() object
