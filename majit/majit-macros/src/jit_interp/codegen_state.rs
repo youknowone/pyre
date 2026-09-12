@@ -2153,7 +2153,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                         (quote!(majit_ir::Type::Ref), quote!(usize), quote!(false))
                     }
                     StateFieldKind::Scalar { ir_type, .. } if ir_type == "float" => {
-                        (quote!(majit_ir::Type::Float), quote!(f64), quote!(false))
+                        let ty = scalar_rust_type(&f.kind);
+                        (quote!(majit_ir::Type::Float), ty, quote!(false))
                     }
                     _ => {
                         let ty = scalar_rust_type(&f.kind);
@@ -2177,7 +2178,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 let name = &f.name;
                 match &f.kind {
                     StateFieldKind::Scalar { ir_type, .. } if ir_type == "float" => {
-                        quote!(self.#name.to_bits() as i64)
+                        quote!((self.#name as f64).to_bits() as i64)
                     }
                     _ => quote!(self.#name as i64),
                 }

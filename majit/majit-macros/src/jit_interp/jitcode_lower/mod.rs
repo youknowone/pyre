@@ -354,13 +354,26 @@ impl LowererConfig {
     /// path re-derives at deopt. Returns `0` for a bank with no identity
     /// slots so the caller's `.max()` floor is inert there.
     pub(super) fn split_identity_reg_ends(&self) -> (u16, u16) {
-        let int_end = self.int_identity_base()
-            + self.state_scalars.len() as u16
-            + u16::from(!self.state_virt_arrays.is_empty());
-        let ref_end = if self.state_ref_scalars.is_empty() {
+        // Scalars redirected onto the virtualizable (`vable_fields`) are
+        // not independent identity slots. Counting them here would
+        // reserve registers the split arm never uses and can overflow
+        // the 256-register JitCode ceiling.
+        let int_scalars = self
+            .state_scalars
+            .keys()
+            .filter(|name| !self.vable_fields.contains_key(*name))
+            .count() as u16;
+        let int_end =
+            self.int_identity_base() + int_scalars + u16::from(!self.state_virt_arrays.is_empty());
+        let ref_scalars = self
+            .state_ref_scalars
+            .keys()
+            .filter(|name| !self.vable_fields.contains_key(*name))
+            .count() as u16;
+        let ref_end = if ref_scalars == 0 {
             0
         } else {
-            self.ref_identity_base() + self.state_ref_scalars.len() as u16
+            self.ref_identity_base() + ref_scalars
         };
         (int_end, ref_end)
     }

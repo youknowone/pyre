@@ -20,7 +20,7 @@ import time
 MIB = 1024 * 1024
 
 
-def process_tree(root):
+def process_tree(root, extra_pids=()):
     rows = {}
     text = subprocess.check_output(["ps", "-axo", "pid=,ppid=,pgid=,rss="], text=True)
     for line in text.splitlines():
@@ -28,8 +28,13 @@ def process_tree(root):
         rows[pid] = (parent, group, rss * 1024)
     selected = {pid for pid, (_, group, _) in rows.items() if group == root}
     selected.add(root)
+    selected.update(extra_pids)
     while True:
-        more = {pid for pid, (parent, _, _) in rows.items() if parent in selected} - selected
+        more = {
+            pid
+            for pid, (parent, group, _) in rows.items()
+            if pid not in selected and (parent in selected or group in selected)
+        }
         if not more:
             break
         selected.update(more)
@@ -109,11 +114,13 @@ def main():
                                     env=env, start_new_session=True, preexec_fn=limits)
             started = time.monotonic()
             members = {}
+            seen_pids = {proc.pid}
             next_sample = 0.0
             sample_bytes = 0
             try:
                 while proc.poll() is None:
-                    members = process_tree(proc.pid)
+                    members = process_tree(proc.pid, seen_pids)
+                    seen_pids.update(members)
                     rss = sum(row[2] for row in members.values())
                     peak = max(peak, rss)
                     elapsed = time.monotonic() - started
@@ -141,7 +148,7 @@ def main():
                     time.sleep(0.1)
                 code = proc.wait()
             finally:
-                stop_tree(proc.pid, process_tree(proc.pid))
+                stop_tree(proc.pid, process_tree(proc.pid, seen_pids))
                 proc.wait()
         # Bound our own memory too: never read the complete captured log.
         for path in (directory / "stdout.log", directory / "stderr.log"):
