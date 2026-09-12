@@ -71,6 +71,43 @@ pub fn decode_escape(
     }
 }
 
+pub fn encode_utf8(
+    s: &Wtf8,
+    w_object: pyre_object::PyObjectRef,
+    errors: &str,
+) -> Result<Vec<u8>, crate::PyError> {
+    let ctx = PyreEncodeContext::new(encodings::utf8::ENCODING_NAME, s, w_object);
+    encodings::utf8::encode(ctx, &PyreErrors { errors })
+}
+
+pub fn encode_ascii(
+    s: &Wtf8,
+    w_object: pyre_object::PyObjectRef,
+    errors: &str,
+) -> Result<Vec<u8>, crate::PyError> {
+    let ctx = PyreEncodeContext::new(encodings::ascii::ENCODING_NAME, s, w_object);
+    encodings::ascii::encode(ctx, &PyreErrors { errors })
+}
+
+pub fn encode_latin1(
+    s: &Wtf8,
+    w_object: pyre_object::PyObjectRef,
+    errors: &str,
+) -> Result<Vec<u8>, crate::PyError> {
+    let ctx = PyreEncodeContext::new(encodings::latin_1::ENCODING_NAME, s, w_object);
+    encodings::latin_1::encode(ctx, &PyreErrors { errors })
+}
+
+pub fn decode_ascii(data: Vec<u8>, errors: &str) -> Result<Wtf8Buf, crate::PyError> {
+    let ctx = PyreDecodeContext::new(encodings::ascii::ENCODING_NAME, data);
+    encodings::ascii::decode(ctx, &PyreErrors { errors }).map(|(text, _)| text)
+}
+
+pub fn decode_latin1(data: Vec<u8>, errors: &str) -> Result<Wtf8Buf, crate::PyError> {
+    let ctx = PyreDecodeContext::new(encodings::latin_1::ENCODING_NAME, data);
+    encodings::latin_1::decode(ctx, &PyreErrors { errors }).map(|(text, _)| text)
+}
+
 pub fn encode_utf16(
     s: &Wtf8,
     w_object: pyre_object::PyObjectRef,

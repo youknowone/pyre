@@ -1,10 +1,10 @@
 //! `unicodehelper_win32.py` — the Windows code page codecs.
 //!
-//! `MultiByteToWideChar` / `WideCharToMultiByte` are reached directly rather
-//! than through a mapping table: the table is the operating system's, and
-//! which one applies is chosen per call by code page number.  `mbcs`, `oem`
-//! and every `cpNNN` that `encodings/__init__.py`'s
-//! `win32_code_page_search_function` builds land here.
+//! `MultiByteToWideChar` / `WideCharToMultiByte` go through host_env; the
+//! table is the operating system's, and which one applies is chosen per
+//! call by code page number.  `mbcs`, `oem` and every `cpNNN` that
+//! `encodings/__init__.py`'s `win32_code_page_search_function` builds land
+//! here.
 
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
@@ -12,9 +12,11 @@ use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FLAGS, ERROR_NO_UNICODE_TRANSLATION,
 };
 use windows_sys::Win32::Globalization::{
-    CP_ACP, CP_UTF7, CP_UTF8, MB_ERR_INVALID_CHARS, MultiByteToWideChar, WC_ERR_INVALID_CHARS,
-    WC_NO_BEST_FIT_CHARS, WideCharToMultiByte,
+    CP_ACP, CP_UTF7, CP_UTF8, MB_ERR_INVALID_CHARS, WC_ERR_INVALID_CHARS, WC_NO_BEST_FIT_CHARS,
 };
+
+#[cfg(not(feature = "host_env"))]
+use windows_sys::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte};
 
 /// The Windows 2000 English message the decoder reports, which
 /// `decode_code_page_errors` hardcodes rather than asking `FormatMessage` for.
@@ -61,12 +63,156 @@ fn encode_code_page_flags(code_page: u32, errors: Option<&str>) -> u32 {
     }
 }
 
+#[cfg(not(feature = "host_env"))]
 fn last_win32_error() -> u32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32
 }
 
-fn win32_error() -> crate::PyError {
-    crate::PyError::os_error_win32_syscall2(last_win32_error() as i32, PY_NULL, PY_NULL)
+#[cfg(feature = "host_env")]
+fn os_err_code(err: &std::io::Error) -> u32 {
+    err.raw_os_error().unwrap_or(0) as u32
+}
+
+fn mb_to_wide_len(code_page: u32, flags: u32, data: &[u8]) -> Result<usize, u32> {
+    #[cfg(feature = "host_env")]
+    {
+        rustpython_host_env::windows::multi_byte_to_wide_len(code_page, flags, data)
+            .map_err(|e| os_err_code(&e))
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let size = unsafe {
+            MultiByteToWideChar(
+                code_page,
+                flags,
+                data.as_ptr(),
+                data.len() as i32,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if size > 0 {
+            Ok(size as usize)
+        } else {
+            Err(last_win32_error())
+        }
+    }
+}
+
+fn mb_to_wide(code_page: u32, flags: u32, data: &[u8], out: &mut [u16]) -> Result<usize, u32> {
+    #[cfg(feature = "host_env")]
+    {
+        rustpython_host_env::windows::multi_byte_to_wide(code_page, flags, data, out)
+            .map_err(|e| os_err_code(&e))
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let size = unsafe {
+            MultiByteToWideChar(
+                code_page,
+                flags,
+                data.as_ptr(),
+                data.len() as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+            )
+        };
+        if size > 0 {
+            Ok(size as usize)
+        } else {
+            Err(last_win32_error())
+        }
+    }
+}
+
+fn wide_to_mb_len(
+    code_page: u32,
+    flags: u32,
+    wide: &[u16],
+    track_default: bool,
+) -> Result<(usize, bool), u32> {
+    #[cfg(feature = "host_env")]
+    {
+        rustpython_host_env::windows::wide_char_to_multi_byte_len(
+            code_page,
+            flags,
+            wide,
+            track_default,
+        )
+        .map_err(|e| os_err_code(&e))
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let mut used_default = 0i32;
+        let used_default_ptr = if track_default {
+            &raw mut used_default
+        } else {
+            std::ptr::null_mut()
+        };
+        let size = unsafe {
+            WideCharToMultiByte(
+                code_page,
+                flags,
+                wide.as_ptr(),
+                wide.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                used_default_ptr,
+            )
+        };
+        if size > 0 {
+            Ok((size as usize, used_default != 0))
+        } else {
+            Err(last_win32_error())
+        }
+    }
+}
+
+fn wide_to_mb(
+    code_page: u32,
+    flags: u32,
+    wide: &[u16],
+    out: &mut [u8],
+    track_default: bool,
+) -> Result<(usize, bool), u32> {
+    #[cfg(feature = "host_env")]
+    {
+        rustpython_host_env::windows::wide_char_to_multi_byte(
+            code_page,
+            flags,
+            wide,
+            out,
+            track_default,
+        )
+        .map_err(|e| os_err_code(&e))
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let mut used_default = 0i32;
+        let used_default_ptr = if track_default {
+            &raw mut used_default
+        } else {
+            std::ptr::null_mut()
+        };
+        let size = unsafe {
+            WideCharToMultiByte(
+                code_page,
+                flags,
+                wide.as_ptr(),
+                wide.len() as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+                std::ptr::null(),
+                used_default_ptr,
+            )
+        };
+        if size > 0 {
+            Ok((size as usize, used_default != 0))
+        } else {
+            Err(last_win32_error())
+        }
+    }
 }
 
 /// The outcome of a conversion the caller retries through an error handler.
@@ -83,52 +229,36 @@ enum CodePageFail {
 fn decode_strict(code_page: u32, data: &[u8]) -> Result<Vec<u16>, CodePageFail> {
     debug_assert!(!data.is_empty());
     let mut flags = decode_code_page_flags(code_page);
-    let insize = data.len() as i32;
     let outsize = loop {
-        let size = unsafe {
-            MultiByteToWideChar(
-                code_page,
-                flags,
-                data.as_ptr(),
-                insize,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if size > 0 {
-            break size;
+        match mb_to_wide_len(code_page, flags, data) {
+            Ok(size) => break size,
+            Err(err) => {
+                // Some code pages — UTF-7 among them — reject any flag word at all.
+                if flags != 0 && err == ERROR_INVALID_FLAGS {
+                    flags = 0;
+                    continue;
+                }
+                return Err(decode_fail_code(err));
+            }
         }
-        // Some code pages — UTF-7 among them — reject any flag word at all.
-        if flags != 0 && last_win32_error() == ERROR_INVALID_FLAGS {
-            flags = 0;
-            continue;
-        }
-        return Err(decode_fail());
     };
-    let mut out = vec![0u16; outsize as usize];
-    let written = unsafe {
-        MultiByteToWideChar(
-            code_page,
-            flags,
-            data.as_ptr(),
-            insize,
-            out.as_mut_ptr(),
-            outsize,
-        )
+    let mut out = vec![0u16; outsize];
+    let written = match mb_to_wide(code_page, flags, data, &mut out) {
+        Ok(written) => written,
+        Err(err) => return Err(decode_fail_code(err)),
     };
-    if written <= 0 {
-        return Err(decode_fail());
-    }
-    out.truncate(written as usize);
+    out.truncate(written);
     Ok(out)
 }
 
 /// Classify the failure a conversion call just reported.
-fn decode_fail() -> CodePageFail {
-    if last_win32_error() == ERROR_NO_UNICODE_TRANSLATION {
+fn decode_fail_code(err: u32) -> CodePageFail {
+    if err == ERROR_NO_UNICODE_TRANSLATION {
         CodePageFail::NoTranslation
     } else {
-        CodePageFail::Os(win32_error())
+        CodePageFail::Os(crate::PyError::os_error_win32_syscall2(
+            err as i32, PY_NULL, PY_NULL,
+        ))
     }
 }
 
@@ -161,30 +291,23 @@ fn decode_errors(
         let mut insize = 1usize;
         let mut wide = [0u16; 2];
         let converted = loop {
-            let size = unsafe {
-                MultiByteToWideChar(
-                    code_page,
-                    flags,
-                    data[pos..].as_ptr(),
-                    insize as i32,
-                    wide.as_mut_ptr(),
-                    wide.len() as i32,
-                )
-            };
-            if size > 0 {
-                break size as usize;
-            }
-            let err = last_win32_error();
-            if err == ERROR_INVALID_FLAGS && flags != 0 {
-                flags = 0;
-                continue;
-            }
-            if err != ERROR_NO_UNICODE_TRANSLATION && err != ERROR_INSUFFICIENT_BUFFER {
-                return Err(win32_error());
-            }
-            insize += 1;
-            if insize > 4 || pos + insize > data.len() {
-                break 0;
+            match mb_to_wide(code_page, flags, &data[pos..pos + insize], &mut wide) {
+                Ok(size) => break size,
+                Err(err) => {
+                    if err == ERROR_INVALID_FLAGS && flags != 0 {
+                        flags = 0;
+                        continue;
+                    }
+                    if err != ERROR_NO_UNICODE_TRANSLATION && err != ERROR_INSUFFICIENT_BUFFER {
+                        return Err(crate::PyError::os_error_win32_syscall2(
+                            err as i32, PY_NULL, PY_NULL,
+                        ));
+                    }
+                    insize += 1;
+                    if insize > 4 || pos + insize > data.len() {
+                        break 0;
+                    }
+                }
             }
         };
         if converted > 0 {
@@ -242,62 +365,37 @@ fn uses_default_char(code_page: u32) -> bool {
 fn encode_strict(code_page: u32, wide: &[u16]) -> Result<Vec<u8>, CodePageFail> {
     debug_assert!(!wide.is_empty());
     let flags = encode_code_page_flags(code_page, None);
-    let mut used_default = 0i32;
-    let used_default_ptr = if uses_default_char(code_page) {
-        &raw mut used_default
-    } else {
-        std::ptr::null_mut()
+    let track_default = uses_default_char(code_page);
+    let (outsize, used_default) = match wide_to_mb_len(code_page, flags, wide, track_default) {
+        Ok(result) => result,
+        Err(err) => return Err(encode_fail_code(err)),
     };
-    let insize = wide.len() as i32;
-    let outsize = unsafe {
-        WideCharToMultiByte(
-            code_page,
-            flags,
-            wide.as_ptr(),
-            insize,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-            used_default_ptr,
-        )
-    };
-    if outsize <= 0 {
-        return Err(encode_fail());
-    }
     // A default character stands in for one this code page cannot spell, so
     // its use is the failure the per-character walk is there to report.
-    if used_default != 0 {
+    if used_default {
         return Err(CodePageFail::NoTranslation);
     }
-    let mut out = vec![0u8; outsize as usize];
-    let written = unsafe {
-        WideCharToMultiByte(
-            code_page,
-            flags,
-            wide.as_ptr(),
-            insize,
-            out.as_mut_ptr(),
-            outsize,
-            std::ptr::null(),
-            used_default_ptr,
-        )
+    let mut out = vec![0u8; outsize];
+    let (written, used_default) = match wide_to_mb(code_page, flags, wide, &mut out, track_default)
+    {
+        Ok(result) => result,
+        Err(err) => return Err(encode_fail_code(err)),
     };
-    if written <= 0 {
-        return Err(encode_fail());
-    }
-    if used_default != 0 {
+    if used_default {
         return Err(CodePageFail::NoTranslation);
     }
-    out.truncate(written as usize);
+    out.truncate(written);
     Ok(out)
 }
 
-/// [`decode_fail`]'s counterpart for the encoding direction.
-fn encode_fail() -> CodePageFail {
-    if last_win32_error() == ERROR_NO_UNICODE_TRANSLATION {
+/// [`decode_fail_code`]'s counterpart for the encoding direction.
+fn encode_fail_code(err: u32) -> CodePageFail {
+    if err == ERROR_NO_UNICODE_TRANSLATION {
         CodePageFail::NoTranslation
     } else {
-        CodePageFail::Os(win32_error())
+        CodePageFail::Os(crate::PyError::os_error_win32_syscall2(
+            err as i32, PY_NULL, PY_NULL,
+        ))
     }
 }
 
@@ -323,35 +421,25 @@ fn encode_one(
         chars[1] = (0xDC00 + (ch & 0x3FF)) as u16;
         2
     };
-    let mut used_default = 0i32;
-    let used_default_ptr = if takes_default {
-        &raw mut used_default
-    } else {
-        std::ptr::null_mut()
-    };
     // 4 is the longest sequence any code page spells one character in.
     let mut buffer = [0u8; 4];
-    let outsize = unsafe {
-        WideCharToMultiByte(
-            code_page,
-            flags,
-            chars.as_ptr(),
-            charsize,
-            buffer.as_mut_ptr(),
-            buffer.len() as i32,
-            std::ptr::null(),
-            used_default_ptr,
-        )
-    };
-    if outsize > 0 {
-        if used_default == 0 {
-            out.extend_from_slice(&buffer[..outsize as usize]);
-            return Ok(true);
+    match wide_to_mb(
+        code_page,
+        flags,
+        &chars[..charsize],
+        &mut buffer,
+        takes_default,
+    ) {
+        Ok((outsize, used_default)) if !used_default => {
+            out.extend_from_slice(&buffer[..outsize]);
+            Ok(true)
         }
-    } else if last_win32_error() != ERROR_NO_UNICODE_TRANSLATION {
-        return Err(win32_error());
+        Ok(_) => Ok(false),
+        Err(err) if err == ERROR_NO_UNICODE_TRANSLATION => Ok(false),
+        Err(err) => Err(crate::PyError::os_error_win32_syscall2(
+            err as i32, PY_NULL, PY_NULL,
+        )),
     }
-    Ok(false)
 }
 
 /// `encode_code_page_errors` — one character at a time, so the error handler
