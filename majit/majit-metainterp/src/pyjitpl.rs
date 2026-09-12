@@ -11903,10 +11903,17 @@ impl<M: Clone> MetaInterp<M> {
                 if op.opcode == OpCode::Label || op.opcode == OpCode::Jump {
                     return false;
                 }
-                op.with_arglist(|args| {
+                let in_args = op.with_arglist(|args| {
                     args.iter()
                         .any(|arg| !arg.is_constant() && arg.to_opref() == slot)
-                })
+                });
+                // A fail_arg is a resume use. Rewriting the JUMP would
+                // leave the next iteration's deopt with the entry value
+                // instead of the constant the recorded close produced.
+                let in_fail = op
+                    .getfailargs()
+                    .is_some_and(|fa| fa.iter().any(|arg| !arg.is_constant() && arg.to_opref() == slot));
+                in_args || in_fail
             });
             if !used {
                 jump.setarg(i, label_args[i].clone());
@@ -28991,6 +28998,28 @@ mod closing_jump_fixes_label_slots_tests {
         let ops = vec![
             op(OpCode::Label, &[boxed(1), boxed(2)]),
             op(OpCode::IntAdd, &[boxed(2), boxed(2)]),
+            op(OpCode::Jump, &[boxed(1), OpRef::ConstInt(605)]),
+        ];
+        assert_eq!(
+            MetaInterp::<()>::despecialize_unread_closing_jump_slots(&ops),
+            0
+        );
+        assert!(MetaInterp::<()>::closing_jump_fixes_label_slots(&ops));
+    }
+
+    #[test]
+    fn a_jump_constant_only_a_guard_failarg_reads_is_left_in_place() {
+        let guard = op(OpCode::GuardTrue, &[boxed(1)]);
+        guard.setfailargs(
+            vec![
+                Operand::bound_from_opref(boxed(1)),
+                Operand::bound_from_opref(boxed(2)),
+            ]
+            .into(),
+        );
+        let ops = vec![
+            op(OpCode::Label, &[boxed(1), boxed(2)]),
+            guard,
             op(OpCode::Jump, &[boxed(1), OpRef::ConstInt(605)]),
         ];
         assert_eq!(
