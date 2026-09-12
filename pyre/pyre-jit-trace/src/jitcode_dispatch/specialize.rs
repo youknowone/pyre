@@ -435,9 +435,7 @@ pub(crate) fn walker_guard_int_div_domain_if_exact<Sym: WalkSym>(
     // A `NewWithVtable` box is unescaped and the optimizer virtualizes
     // it; `GUARD_VALUE` on that box is `promote of a virtual`
     // (`optimizeopt` `optimize_GUARD_VALUE`).
-    if rhs_raw.is_constant()
-        && !rhs.is_constant()
-        && !ctx.trace_ctx.heap_cache().is_unescaped(rhs)
+    if rhs_raw.is_constant() && !rhs.is_constant() && !ctx.trace_ctx.heap_cache().is_unescaped(rhs)
     {
         let expected = ctx.trace_ctx.const_ref(rhs_obj as i64);
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[rhs, expected])?;
@@ -557,9 +555,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
     // Declining it forced `0 + overflowing_mul` onto a residual that
     // GuardValued each new `acc` long (`int_mul_ovf_bignum_promote`).
     // `walker_unbox_int_typed` already handles the tag; longs are never tagged.
-    if pyre_object::tagged_int::CAN_BE_TAGGED
-        && pyre_object::tagged_int::is_tagged_int(long_obj)
-    {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(long_obj) {
         return Ok(None);
     }
     let Some(long_class) = (unsafe { walker_exact_builtin_class(long_obj) }) else {
@@ -22061,14 +22057,7 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
         .trace_ctx
         .heapcache_getfield_cached(value_opref, crate::descr::int_intval_descr().index());
     let raw_int = match cached {
-        Some(raw)
-            if matches!(
-                ctx.trace_ctx.box_value(raw),
-                Some(majit_ir::Value::Int(_))
-            ) =>
-        {
-            raw
-        }
+        Some(raw) if matches!(ctx.trace_ctx.box_value(raw), Some(majit_ir::Value::Int(_))) => raw,
         cached => {
             let raw = match cached {
                 Some(raw) => raw,
@@ -22077,17 +22066,13 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
                     walker_unbox_int(ctx, op_pc, value_opref, int_type_addr)?
                 }
             };
-            if !matches!(
-                ctx.trace_ctx.box_value(raw),
-                Some(majit_ir::Value::Int(_))
-            ) {
+            if !matches!(ctx.trace_ctx.box_value(raw), Some(majit_ir::Value::Int(_))) {
                 if let Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) =
                     ctx.trace_ctx.box_value(value_opref)
                 {
                     if p != 0 {
-                        let v = unsafe {
-                            pyre_object::w_int_get_value(p as pyre_object::PyObjectRef)
-                        };
+                        let v =
+                            unsafe { pyre_object::w_int_get_value(p as pyre_object::PyObjectRef) };
                         ctx.trace_ctx
                             .set_opref_concrete(raw, majit_ir::Value::Int(v));
                     }
