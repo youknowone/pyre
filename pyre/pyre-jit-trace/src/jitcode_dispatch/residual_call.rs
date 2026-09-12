@@ -1976,7 +1976,7 @@ fn residual_operands_are_not_all_objects<Sym: WalkSym>(
 /// one on 1479 of the 2958 iterations past the compile point on dynasm, and
 /// none on cranelift.  Emitted here the stores sit between the token store and
 /// the call, where the residual reads them.
-fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
+pub(crate) fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
 ) {
@@ -3141,6 +3141,33 @@ pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
             pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ())
                 as *const ();
         w_code as usize == caller_code as usize
+    }
+}
+
+/// Whether the callable's frame needs cells. The self-rec CALL_ASSEMBLER
+/// fold is Branch A (`ncells == 0`); a closure or cell-bearing body
+/// declines there and must not be inlined past `execute_frame` either.
+fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    callable: OpRef,
+) -> bool {
+    let Some(majit_ir::Value::Ref(callable_ref)) = ctx.trace_ctx.box_value(callable) else {
+        return false;
+    };
+    if callable_ref == majit_ir::GcRef::NO_CONCRETE || callable_ref.as_usize() == 0 {
+        return false;
+    }
+    let obj = callable_ref.as_usize() as pyre_object::PyObjectRef;
+    unsafe {
+        let Some((w_code, _nparams, has_closure)) = resolve_inlinable_callee(obj) else {
+            return false;
+        };
+        if has_closure {
+            return true;
+        }
+        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject;
+        !raw.is_null() && pyre_interpreter::ncells(&*raw) != 0
     }
 }
 
@@ -6885,19 +6912,33 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // calls sub-walk the callee body in place of the residual; ineligible
     // calls (including every non-`call_fn` helper, gated on `runtime_helper`)
     // fall through with no IR emitted.
-    if let Some(inlined) = try_walker_inline_user_call(
-        ctx,
-        op,
-        code,
-        1,
-        funcptr,
-        &r_args,
-        call_descr,
-        foldable_runtime_helper,
-        dst_bank,
-        dst,
-    )? {
-        return Ok(inlined);
+    //
+    // A nested self-rec (`plain` closing over `best`) cannot take
+    // CALL_ASSEMBLER (that fold is Branch A: no cells). Inlining it
+    // instead compiles a function-entry call that skips
+    // `execute_frame`'s depth charge, so a JIT-hot run rides the
+    // native stack budget (~8000) past `sys.getrecursionlimit()`.
+    // Leave those on the residual so `execute_frame` still charges.
+    // Module-level self-rec (`fib`) has no cells and still unrolls.
+    let skip_cell_self_rec = r_args.first().is_some_and(|&callable| {
+        residual_callee_is_walk_self_recursive(ctx, &[funcptr, callable], foldable_runtime_helper)
+            && residual_callable_has_closure_or_cells(ctx, callable)
+    });
+    if !skip_cell_self_rec {
+        if let Some(inlined) = try_walker_inline_user_call(
+            ctx,
+            op,
+            code,
+            1,
+            funcptr,
+            &r_args,
+            call_descr,
+            foldable_runtime_helper,
+            dst_bank,
+            dst,
+        )? {
+            return Ok(inlined);
+        }
     }
 
     if ctx.is_authoritative_executor
