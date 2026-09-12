@@ -5,6 +5,14 @@ use majit_rlib::cache::CacheError;
 use pyre_object::typedef::{TypeDef, TypeDefValue};
 use pyre_object::*;
 
+/// `space.newtext_or_none` (`objspace.py`) for a TypeDef.doc.
+fn newtext_or_none(doc: Option<&str>) -> PyObjectRef {
+    match doc {
+        Some(text) => w_str_new(text),
+        None => w_none(),
+    }
+}
+
 pub struct TypeCache {
     base: SpaceCache<usize, usize, std::sync::Arc<ObjSpace>>,
 }
@@ -74,6 +82,22 @@ impl TypeCache {
         let _ = gc_roots::pin_root(w_tuple_new(bases));
         let ns_slot = gc_roots::shadow_stack_len();
         let _ = gc_roots::pin_root(w_dict_new());
+        // typeobject.py TypeCache.build: overridetypedef is
+        // `typedef.applevel_subclasses_base.typedef` or `typedef`.
+        // Compute it before `ensure_common_attributes` so
+        // `setup_builtin_type` can seed `w_doc` and
+        // `dict_w.setdefault('__doc__', w_doc)` from the override.
+        let overridetypedef = if definition.applevel_subclasses_base.is_null() {
+            definition as *const TypeDef
+        } else {
+            definition.applevel_subclasses_base
+        };
+        let override_def = unsafe { &*overridetypedef };
+        let w_override_doc = newtext_or_none(override_def.doc.as_deref());
+        let _ = gc_roots::pin_root(w_override_doc);
+        unsafe {
+            w_type_set_w_doc(w_type, w_override_doc);
+        }
         for (name, value) in &definition.rawdict {
             let value = match value {
                 TypeDefValue::Text(text) => w_str_new(text),
@@ -106,14 +130,6 @@ impl TypeCache {
             crate::typedef::w_type(),
         );
         unsafe {
-            // typeobject.py TypeCache.build: overridetypedef is
-            // `typedef.applevel_subclasses_base.typedef` or `typedef`.
-            let overridetypedef = if definition.applevel_subclasses_base.is_null() {
-                definition as *const TypeDef
-            } else {
-                definition.applevel_subclasses_base
-            };
-            let override_def = &*overridetypedef;
             // setup_builtin_type reads hasdict/weakrefable/heaptype off
             // instancetypedef (the override), not the derived declaration.
             w_type_set_hasdict(w_type, override_def.hasdict);
@@ -155,17 +171,14 @@ impl TypeCache {
                 // TypeCache.build's else arm: qualify member functions.
                 crate::typedef::stamp_new_descr_self(gc_roots::shadow_stack_get(ns_slot), w_type);
             } else {
-                // `typedef is not overridetypedef`: the qualname/objclass pass
-                // is skipped; only `ensure_static_new` (from
-                // `ensure_common_attributes`) still runs.  Upstream re-derives
-                // `w_type.w_doc = newtext_or_none(typedef.doc)` here; pyre's
-                // builtin doc observable is the namespace `__doc__` entry,
-                // which already holds `definition.doc` (rawdict) or the
-                // ensure-common None — the same value — so no store is needed.
-                // Divergence: upstream's dict additionally keeps the override
-                // declaration's doc via `dict_w.setdefault('__doc__', w_doc)`
-                // for instance-level lookup; a single storage cannot carry
-                // both values, and pyre keeps the type-level one.
+                // `typedef is not overridetypedef`: skip the
+                // qualname/objclass pass.  `setup_builtin_type` already
+                // seeded `w_doc` and `dict_w.setdefault('__doc__', w_doc)`
+                // from the override; overwrite only the type-level slot
+                // (`typeobject.py TypeCache.build`).
+                let w_derived_doc = newtext_or_none(definition.doc.as_deref());
+                let _ = gc_roots::pin_root(w_derived_doc);
+                w_type_set_w_doc(w_type, w_derived_doc);
                 crate::typedef::ensure_static_new(gc_roots::shadow_stack_get(ns_slot), w_type);
             }
         }
@@ -315,6 +328,66 @@ mod tests {
                 w_type_get_layout_ptr(base)
             ));
             assert_eq!((*w_type_get_layout_ptr(derived)).typedef, base_def);
+        }
+    }
+
+    #[test]
+    fn derived_declaration_keeps_override_doc_in_the_namespace() {
+        crate::typedef::init_typeobjects();
+        unsafe {
+            let base_def = TypeDef::from_rawdict(
+                "DocBase",
+                vec![],
+                IndexMap::from([("__doc__".into(), TypeDefValue::Text("override doc".into()))]),
+                &INSTANCE_TYPE,
+            ) as *mut TypeDef;
+            let space = ObjSpace::new();
+            let _base = space.gettypeobject(base_def).unwrap();
+            let derived_def = TypeDef::from_rawdict(
+                "DocDerived",
+                vec![base_def],
+                IndexMap::new(),
+                &INSTANCE_TYPE,
+            ) as *mut TypeDef;
+            (*derived_def).applevel_subclasses_base = base_def;
+            let derived = space.gettypeobject(derived_def).unwrap();
+            // `TypeCache.build`: dict keeps the override via setdefault;
+            // `w_doc` is the derived declaration (absent → None).
+            let ns = w_type_get_dict_ptr(derived) as PyObjectRef;
+            assert_eq!(
+                w_str_get_value(w_dict_getitem_str(ns, "__doc__").unwrap()),
+                "override doc"
+            );
+            assert!(is_none(w_type_get_w_doc(derived)));
+        }
+    }
+
+    #[test]
+    fn derived_declaration_doc_overwrites_only_the_type_slot() {
+        crate::typedef::init_typeobjects();
+        unsafe {
+            let base_def = TypeDef::from_rawdict(
+                "DocBaseOwn",
+                vec![],
+                IndexMap::from([("__doc__".into(), TypeDefValue::Text("override doc".into()))]),
+                &INSTANCE_TYPE,
+            ) as *mut TypeDef;
+            let space = ObjSpace::new();
+            let _base = space.gettypeobject(base_def).unwrap();
+            let derived_def = TypeDef::from_rawdict(
+                "DocDerivedOwn",
+                vec![base_def],
+                IndexMap::from([("__doc__".into(), TypeDefValue::Text("derived doc".into()))]),
+                &INSTANCE_TYPE,
+            ) as *mut TypeDef;
+            (*derived_def).applevel_subclasses_base = base_def;
+            let derived = space.gettypeobject(derived_def).unwrap();
+            let ns = w_type_get_dict_ptr(derived) as PyObjectRef;
+            assert_eq!(
+                w_str_get_value(w_dict_getitem_str(ns, "__doc__").unwrap()),
+                "derived doc"
+            );
+            assert_eq!(w_str_get_value(w_type_get_w_doc(derived)), "derived doc");
         }
     }
 

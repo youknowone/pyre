@@ -215,6 +215,12 @@ pub struct W_TypeObject {
     /// App-level `__qualname__` object, with the same lazy/identity semantics
     /// as `w_name`.
     pub w_qualname: PyObjectRef,
+    /// typeobject.py:212 `w_doc` — type-level `__doc__` for non-heap types
+    /// (`descr__doc`). Distinct from `dict_w['__doc__']`:
+    /// `setup_builtin_type` seeds both from the override TypeDef, then
+    /// `TypeCache.build` overwrites only this slot with the derived
+    /// declaration's doc when `typedef is not overridetypedef`.
+    pub w_doc: PyObjectRef,
     /// typeobject.py:213 `text_signature` — an optional interpreter-level
     /// string supplied by the builtin TypeDef.  This is not a Python object
     /// and therefore is not a GC edge.
@@ -578,6 +584,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         w_name: PY_NULL,
         qualname,
         w_qualname: PY_NULL,
+        w_doc: PY_NULL,
         text_signature: std::ptr::null_mut(),
         bases,
         dict: dict_ptr,
@@ -718,6 +725,7 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         w_name: PY_NULL,
         qualname: std::ptr::null_mut(),
         w_qualname: PY_NULL,
+        w_doc: PY_NULL,
         text_signature: std::ptr::null_mut(),
         bases: PY_NULL,
         dict: std::ptr::null_mut(),
@@ -1436,6 +1444,26 @@ pub unsafe fn w_type_set_text_signature(obj: PyObjectRef, signature: &str) {
     let type_obj = &mut *(obj as *mut W_TypeObject);
     debug_assert!(type_obj.text_signature.is_null());
     type_obj.text_signature = crate::lltype::malloc_raw(signature.to_owned());
+}
+
+/// typeobject.py `W_TypeObject.w_doc`.
+///
+/// # Safety
+/// `obj` must be a live `W_TypeObject`.
+pub unsafe fn w_type_get_w_doc(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const W_TypeObject)).w_doc
+}
+
+/// typeobject.py `W_TypeObject.w_doc = …`.
+///
+/// # Safety
+/// `obj` must be a live `W_TypeObject`. `w_doc` must be a live object
+/// (`w_None` or a unicode).
+pub unsafe fn w_type_set_w_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
+    let t = &mut *(obj as *mut W_TypeObject);
+    t.w_doc = w_doc;
+    crate::gc_roots::mark_prebuilt_roots_dirty();
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// Get the bases tuple.

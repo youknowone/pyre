@@ -482,6 +482,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.w_name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.w_qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut t.w_doc as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // `name` points at a GC-managed leaf storage box (`String`, off-GC storage
     // epic S5) for a mortal heap type; forward the field slot so a major GC greys
     // the box, and the box tid's drop glue reclaims the buffer on sweep. An

@@ -2936,7 +2936,17 @@ pub(crate) fn init_builtin_typeobject(
     let ns = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
     unsafe {
         if pyre_object::w_dict_getitem_str(ns, "__doc__").is_none() {
-            pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", pyre_object::w_none());
+            // `ensure_common_attributes`: `dict_w.setdefault('__doc__', w_self.w_doc)`.
+            let w_doc = pyre_object::w_type_get_w_doc(type_obj);
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__doc__",
+                if w_doc.is_null() {
+                    pyre_object::w_none()
+                } else {
+                    w_doc
+                },
+            );
         }
         let ns = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
         if pyre_object::w_dict_getitem_str(ns, "__eq__").is_some()
