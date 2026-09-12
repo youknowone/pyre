@@ -907,8 +907,9 @@ pub use error::*;
 pub use executioncontext::*;
 pub use function::*;
 pub use gateway::{
-    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFlags, BuiltinCodeFn, MethodOwner, Signature,
-    SignatureBuilder, builtin_code_call, builtin_code_get, builtin_code_get_fast_natural_arity,
+    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFlags, BuiltinCodeFn, HOPELESS, MethodOwner,
+    Signature, SignatureBuilder, builtin_code_call, builtin_code_get,
+    builtin_code_get_fast_natural_arity,
     builtin_code_get_signature, builtin_code_name, builtin_code_new,
     builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
     builtin_code_new_with_signature, builtin_code_no_keyword_arguments, is_builtin_code,
