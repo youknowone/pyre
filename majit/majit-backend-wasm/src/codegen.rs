@@ -431,7 +431,8 @@ pub struct FrameGeometry {
     /// resume-at-LABEL live-ins.  Ordinary per-trace Ref homes grow upward
     /// from `home_slot_base`; these captures grow from the frozen boundary and
     /// therefore survive execution of a chained bridge, whose own home map may
-    /// use the low slots.  The whole home region remains covered by jf_gcmap.
+    /// use the low slots.  The published `jf_gcmap` marks the used ordinary
+    /// prefix plus these captures, not the unused reserved tail.
     pub label_ref_slots: usize,
     /// Start of the GUARD_NOT_FORCED(_2) failarg spill area. It contains one
     /// i64 slot per value slot and is disjoint from exits, dispatch, homes and
@@ -1722,6 +1723,41 @@ pub fn label_ref_capture_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     LabelResumeData::collect(inputargs, ops).ref_slots
 }
 
+/// Mark the homes this module initializes: the used ordinary prefix and the
+/// LABEL-capture tail. Frozen geometry reserves extra ordinary slots so a
+/// later bridge can fit; those unused reserved words stay unmarked so
+/// recycled nursery bytes are not traced. assembler.py writes `jf_gcmap`
+/// for live slots only.
+pub(crate) fn build_home_gcmap(
+    frame: FrameGeometry,
+    used_ordinary: usize,
+    used_labels: usize,
+) -> Box<[usize]> {
+    let sign = std::mem::size_of::<isize>();
+    let bits_per_word = std::mem::size_of::<usize>() * 8;
+    let ordinary = used_ordinary.min(frame.ordinary_home_slots());
+    let label_base = frame.ordinary_home_slots();
+    let label_n = used_labels.min(frame.label_ref_slots);
+    if ordinary == 0 && label_n == 0 {
+        // One empty data word: a non-null jf_gcmap that traces nothing.
+        return vec![1usize, 0usize].into_boxed_slice();
+    }
+    let last_h = if label_n == 0 {
+        ordinary.saturating_sub(1)
+    } else {
+        label_base + label_n - 1
+    };
+    let last_index = (frame.home_slot_base as usize + last_h * 8) / sign;
+    let num_words = last_index / bits_per_word + 1;
+    let mut buf = vec![0usize; 1 + num_words];
+    buf[0] = num_words;
+    for h in (0..ordinary).chain(label_base..label_base + label_n) {
+        let index = (frame.home_slot_base as usize + h * 8) / sign;
+        buf[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
+    }
+    buf.into_boxed_slice()
+}
+
 /// First free value position — one past the highest id any value reference in
 /// the trace occupies (input args, op results, and every op argument, including
 /// a folded value the constants pool alone binds).
@@ -2594,6 +2630,142 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_add();
 }
 
+/// Publish `build_home_gcmap` on the live frame (`local 0` is the items
+/// base). `ptr == 0` is the test path that never installs a map.
+///
+/// Ordinary homes and LABEL captures grow independently, so the live map
+/// and this module's map can be incomparable. With a residual type family
+/// the store is their bitwise union (`wasm_jit_union_gcmap`). Without one
+/// (host tests) the store is still monotonic: publish this map only when
+/// it covers every live bit.
+fn emit_publish_home_gcmap(
+    sink: &mut PeepSink<'_, '_>,
+    ptr: i64,
+    map: &[usize],
+    old_local: u32,
+    idx_local: u32,
+    residual_type_base: Option<u32>,
+) {
+    if ptr == 0 || map.len() < 2 {
+        return;
+    }
+    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_GCMAP_OFS, SIZEOFSIGNED};
+    let word = std::mem::size_of::<usize>() as u32;
+    let n_new = map[0];
+    let new_words = &map[1..];
+    let emit_hdr = |sink: &mut PeepSink<'_, '_>| {
+        sink.local_get(0);
+        sink.i32_const(FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+    };
+    let load_usize = |sink: &mut PeepSink<'_, '_>, offset: u64| {
+        if word == 4 {
+            sink.i32_load(memarg(offset, 2));
+        } else {
+            sink.i64_load(memarg(offset, 3));
+        }
+    };
+    let const_usize = |sink: &mut PeepSink<'_, '_>, value: usize| {
+        if word == 4 {
+            sink.i32_const(value as i32);
+        } else {
+            sink.i64_const(value as i64);
+        }
+    };
+    let publish = |sink: &mut PeepSink<'_, '_>| {
+        emit_hdr(sink);
+        sink.i64_const(ptr);
+        emit_word_store(sink, JF_GCMAP_OFS as u64);
+    };
+    emit_hdr(sink);
+    if SIZEOFSIGNED == 4 {
+        sink.i32_load(memarg(JF_GCMAP_OFS as u64, 2));
+    } else {
+        sink.i64_load(memarg(JF_GCMAP_OFS as u64, 3));
+        sink.i32_wrap_i64();
+    }
+    sink.local_tee(old_local);
+    sink.i32_eqz();
+    sink.if_(BlockType::Empty);
+    publish(sink);
+    sink.else_();
+    if let Some(base) = residual_type_base {
+        // `(i64, i64) -> i64` at `residual_type_base + 2`.
+        let union_fn = crate::wasm_jit_union_gcmap as *const () as usize as i64;
+        emit_hdr(sink);
+        sink.local_get(old_local);
+        sink.i64_extend_i32_u();
+        sink.i64_const(ptr);
+        sink.i32_const(union_fn as i32);
+        sink.call_indirect(0, base + 2);
+        emit_word_store(sink, JF_GCMAP_OFS as u64);
+        sink.end();
+        return;
+    }
+    // Host-test fallback: no residual type family. Cover-check each live
+    // word against this module's map; leftover bits keep the live map.
+    sink.block(BlockType::Empty); // $keep
+    sink.block(BlockType::Empty); // $publish_ok
+    for (i, &new_word) in new_words.iter().enumerate() {
+        sink.local_get(old_local);
+        load_usize(sink, 0);
+        if word == 8 {
+            sink.i32_wrap_i64();
+        }
+        sink.i32_const(i as i32);
+        sink.i32_gt_u();
+        sink.if_(BlockType::Empty);
+        sink.local_get(old_local);
+        load_usize(sink, (1 + i as u32) as u64 * word as u64);
+        const_usize(sink, !new_word);
+        if word == 4 {
+            sink.i32_and();
+        } else {
+            sink.i64_and();
+            sink.i64_eqz();
+            sink.i32_eqz();
+        }
+        sink.br_if(2);
+        sink.end();
+    }
+    sink.i32_const(n_new as i32);
+    sink.local_set(idx_local);
+    sink.loop_(BlockType::Empty);
+    sink.local_get(idx_local);
+    sink.local_get(old_local);
+    load_usize(sink, 0);
+    if word == 8 {
+        sink.i32_wrap_i64();
+    }
+    sink.i32_lt_u();
+    sink.i32_eqz();
+    sink.br_if(1);
+    sink.local_get(old_local);
+    sink.local_get(idx_local);
+    sink.i32_const(1);
+    sink.i32_add();
+    sink.i32_const(word.trailing_zeros() as i32);
+    sink.i32_shl();
+    sink.i32_add();
+    load_usize(sink, 0);
+    if word == 8 {
+        sink.i64_eqz();
+        sink.i32_eqz();
+    }
+    sink.br_if(2);
+    sink.local_get(idx_local);
+    sink.i32_const(1);
+    sink.i32_add();
+    sink.local_set(idx_local);
+    sink.br(0);
+    sink.end();
+    sink.br(0);
+    sink.end();
+    publish(sink);
+    sink.end();
+    sink.end();
+}
+
 fn emit_word_store(sink: &mut PeepSink<'_, '_>, offset: u64) {
     if majit_backend::jitframe::SIZEOFSIGNED == 4 {
         sink.i32_wrap_i64();
@@ -2822,7 +2994,9 @@ fn emit_ca_malloc_cond_varsize_frame(
         emit_word_store(sink, ofs as u64);
     }
     // rewrite.rs after `gen_malloc_nursery_varsize_frame`: write
-    // `jf_frame` length and `jf_gcmap`.
+    // `jf_frame` length. Leave `jf_gcmap` null — assembler.py publishes
+    // the map at safepoints once homes are live. The callee entry stores
+    // `home_gcmap_ptr` after its home/input stores.
     sink.local_get(alloc_scratch_local);
     sink.local_get(ca_target_local);
     sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
@@ -3745,9 +3919,33 @@ pub struct CaParams {
     /// Active-GC state for the direct CA-only inline allocation/frame path.
     /// `None` retains the helpers (including under gc_stress).
     pub inline: Option<CaInlineParams>,
-    /// Per-loop `jf_gcmap` installed at key-0 entry after homes are nulled.
-    /// Zero leaves the map the allocator (or `execute_token`) already stored.
-    pub entry_gcmap_ptr: i64,
+    /// `build_home_gcmap` pointer published after the fresh-entry home/input
+    /// stores, and again on each keyed LABEL resume after those slots are
+    /// already valid or newly marked ones have been nulled. Used only when
+    /// [`Self::compute_home_gcmap`] is false. Zero leaves `jf_gcmap` unset
+    /// in the generated module (tests). assembler.py writes `jf_gcmap` at
+    /// safepoints once those slots are live.
+    pub home_gcmap_ptr: i64,
+    /// When set, leak a map from this module's `RefHomes` and LABEL captures
+    /// (raised to the `home_gcmap_min_*` floors) instead of
+    /// [`Self::home_gcmap_ptr`]. Re-emission and out-of-line bridges need
+    /// the floors so a later keyed tail-call cannot drop the source loop's
+    /// already-initialized homes.
+    pub compute_home_gcmap: bool,
+    pub home_gcmap_min_ordinary: usize,
+    pub home_gcmap_min_labels: usize,
+    /// True when `home_gcmap_min_*` is a previous publication's floor
+    /// (re-emission or a bridge that must cover the source loop). False
+    /// on a first compile, where min=0 must not wipe live homes on keyed
+    /// resume. Distinguishes a 0→N merge from an initial compile.
+    pub home_gcmap_has_prior: bool,
+    /// True only when a re-emitted module must null newly marked LABEL
+    /// homes for a keyed caller whose map did not include them. Re-emission
+    /// itself leaves this false and drops stale owner attachments when
+    /// the LABEL tail grows; key-0 still clears the full used-label range.
+    /// A compiled bridge with more captures than its source also leaves
+    /// this false: it writes those slots on the first crossing.
+    pub home_gcmap_null_grown_labels: bool,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -4161,7 +4359,7 @@ pub struct AllocHelpers {
     pub fmod_fn_ptr: i64,
 }
 
-type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize);
+type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize, usize);
 
 /// Counts entries into an out-of-line bridge module and calls out once there
 /// have been enough of them to pay for merging that bridge into its owner.
@@ -4920,6 +5118,17 @@ pub fn build_wasm_module(
             scanned
         }
     };
+    // `emit_publish_home_gcmap` `call_indirect`s `wasm_jit_union_gcmap`
+    // at `residual_type_base + 2`. A reload-only census is arity 0, a
+    // write-barrier-only census arity 1; either leaves that slot missing
+    // or pointing at a later incompatible type.
+    let residual_max_arity = if (ca.compute_home_gcmap || ca.home_gcmap_ptr != 0)
+        && let Some(max) = residual_max_arity
+    {
+        Some(max.max(2))
+    } else {
+        residual_max_arity
+    };
     // Typed float residual calls use their descr's faithful wasm ABI instead
     // of the uniform i64 helper family. Preserve first-use order so a given
     // trace gets stable type indices while declaring each signature once.
@@ -5241,7 +5450,8 @@ pub fn build_wasm_module(
     }
     module.section(&codes);
 
-    Ok((module.finish(), guards, num_ref_homes))
+    let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
+    Ok((module.finish(), guards, num_ref_homes, used_labels))
 }
 
 fn build_label_param_shim(wide_func_idx: u32) -> Function {
@@ -5567,6 +5777,8 @@ fn build_function(
     // it and branch back into the dispatch; without it the key is consumed
     // straight off the frame load.
     let resume_key_local = trace_entry_key_local + u32::from(trace_entry_needs_key_local);
+    let gcmap_old_local = resume_key_local + u32::from(resume_dispatch);
+    let gcmap_idx_local = gcmap_old_local + 1;
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
@@ -5631,7 +5843,8 @@ fn build_function(
         base_i32_locals
             + extra_alloc_i32
             + u32::from(trace_entry_needs_key_local)
-            + u32::from(resume_dispatch),
+            + u32::from(resume_dispatch)
+            + 2,
         ValType::I32,
     ));
     let mut func = Function::new(locals);
@@ -5648,6 +5861,51 @@ fn build_function(
         }
         sink.local_set(value_types.local(raw));
     }
+
+    // Build the map now; publish it only after the slots it marks are
+    // null or written (`push_gcmap` at a live safepoint). Key-0 does
+    // that after the entry stores. A keyed LABEL resume branches past
+    // those stores, so it publishes in the resume loader after the
+    // grown-slot null below.
+    let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
+    let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
+    let publish_map = build_home_gcmap(frame, used_ordinary, used_labels);
+    let publish_ptr = if ca.compute_home_gcmap {
+        // A first compile has no prior map. A re-emission or bridge may
+        // grow past a previous floor of zero, so `min > 0` is not the
+        // signal — `has_prior` is.
+        if ca.home_gcmap_has_prior && used_ordinary > ca.home_gcmap_min_ordinary {
+            emit_null_home_slots(
+                &mut sink,
+                frame,
+                ca.home_gcmap_min_ordinary as u64..used_ordinary as u64,
+                |_| true,
+            );
+        }
+        // Re-emission may mark a longer LABEL tail than the previous
+        // publication. Those new slots are region-only captures the live
+        // frame never stored; null them before the widened map is
+        // published. Previously published captures stay: a bridge that
+        // grew past its source writes them on the first crossing, and a
+        // later keyed tail-call restores from those slots. Key-0 still
+        // clears the full used-label range below.
+        if ca.home_gcmap_has_prior
+            && ca.home_gcmap_null_grown_labels
+            && used_labels > ca.home_gcmap_min_labels
+        {
+            let label_base = frame.ordinary_home_slots() as u64;
+            emit_null_home_slots(
+                &mut sink,
+                frame,
+                label_base + ca.home_gcmap_min_labels as u64..label_base + used_labels as u64,
+                |_| true,
+            );
+        }
+        Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
+            as usize as i64
+    } else {
+        ca.home_gcmap_ptr
+    };
 
     // A peeled loop arrives as `[preamble..][LABEL][body..][JUMP]`: the
     // preamble runs once on entry, the LABEL is the loop-back target, and
@@ -5763,13 +6021,13 @@ fn build_function(
         emit_trace_entry_census(&mut sink, census, bridge_slot_local, None);
     }
 
-    // Fresh entry owns key 0. `build_home_gcmap` marks every frozen home,
-    // including the chain-padding slots a later bridge may use and the high
-    // LABEL-capture homes. The nursery bump leaves `jf_gcmap` null and does
-    // not fill items, so unused padding still holds recycled nursery bytes;
-    // those must be null before the map is published. A resume dispatch
-    // branches past this code, preserving captures written when the source
-    // loop first crossed the LABEL.
+    // Fresh entry owns key 0. `build_home_gcmap` marks the used ordinary
+    // prefix and the LABEL-capture tail, not reserved chain-padding.
+    // The nursery bump leaves `jf_gcmap` null and does not fill items, so
+    // unused marked homes still hold recycled nursery bytes; those must
+    // be null before the map is published. A resume dispatch branches
+    // past this code, preserving captures written when the source loop
+    // first crossed the LABEL, and publishes in the resume loader.
     // A home the input loop fills below needs no null first: its store follows
     // immediately and nothing between the two allocates, so no collection can
     // read the slot while it is stale. Homes no input fills keep their clear
@@ -5824,20 +6082,16 @@ fn build_function(
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
         }
     }
-    if ca.entry_gcmap_ptr != 0 {
-        // Frozen homes are now null or the entry Refs. Publish the map
-        // the allocator left unset so a later collection can walk them.
-        sink.local_get(0);
-        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-        sink.i32_sub();
-        sink.i64_const(ca.entry_gcmap_ptr);
-        if majit_backend::jitframe::SIZEOFSIGNED == 4 {
-            sink.i32_wrap_i64();
-            sink.i32_store(memarg(majit_backend::jitframe::JF_GCMAP_OFS as u64, 2));
-        } else {
-            sink.i64_store(memarg(majit_backend::jitframe::JF_GCMAP_OFS as u64, 3));
-        }
-    }
+    // assembler.py `push_gcmap`: the map goes up once the slots it marks
+    // are live or null. Keyed resume publishes in the loader instead.
+    emit_publish_home_gcmap(
+        &mut sink,
+        publish_ptr,
+        &publish_map,
+        gcmap_old_local,
+        gcmap_idx_local,
+        residual_type_base,
+    );
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
     if let Some((probe, type_idx)) = inline_trip {
@@ -5920,6 +6174,18 @@ fn build_function(
             }
             sink.br(1); // segment done -> past_loader_j, over the resume loader
             sink.end(); // end C_j (the br_table lands here for key j+1)
+            // Keyed resume skipped the key-0 stores. Grown slots were
+            // nulled before `br_table`; remaining marked homes already
+            // hold the previous module's values. Publish before the
+            // loader stores, matching `push_gcmap` at a live safepoint.
+            emit_publish_home_gcmap(
+                &mut sink,
+                publish_ptr,
+                &publish_map,
+                gcmap_old_local,
+                gcmap_idx_local,
+                residual_type_base,
+            );
             // Resume loader: a loop-closing bridge wrote each label arg into
             // frame slot i (positionally, matching the in-loop JUMP move);
             // load them into the label-arg locals and refresh their Ref
