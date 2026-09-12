@@ -480,6 +480,9 @@ pub enum PendingLoopExit {
 /// context must not keep the source's compiled-loop watchers.
 struct WTracefuncWatchers(QuasiImmutField);
 
+/// Twin of [`WTracefuncWatchers`] for `profilefunc?`.
+struct ProfilefuncWatchers(QuasiImmutField);
+
 impl Default for WTracefuncWatchers {
     fn default() -> Self {
         Self(QuasiImmutField::new())
@@ -487,6 +490,18 @@ impl Default for WTracefuncWatchers {
 }
 
 impl Clone for WTracefuncWatchers {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl Default for ProfilefuncWatchers {
+    fn default() -> Self {
+        Self(QuasiImmutField::new())
+    }
+}
+
+impl Clone for ProfilefuncWatchers {
     fn clone(&self) -> Self {
         Self::default()
     }
@@ -509,6 +524,9 @@ pub struct ExecutionContext {
     /// `None` means profiling is disabled.  The user callable lives in
     /// `w_profilefuncarg`; the trampoline forwards to it.
     pub profilefunc: Option<ProfileFunc>,
+    /// Hidden `mutate_profilefunc` for
+    /// `executioncontext.py _immutable_fields_ = ['profilefunc?']`.
+    profilefunc_watchers: ProfilefuncWatchers,
     pub w_profilefuncarg: PyObjectRef,
     pub thread_disappeared: bool,
     pub w_async_exception_type: PyObjectRef,
@@ -642,6 +660,13 @@ pub const EC_TOPFRAMEREF_OFFSET: usize = std::mem::offset_of!(ExecutionContext, 
 /// code instead of running on past the events it now owes.
 pub const EC_W_TRACEFUNC_OFFSET: usize = std::mem::offset_of!(ExecutionContext, w_tracefunc);
 
+/// Byte offset of `profilefunc` within `ExecutionContext`, for the JIT's
+/// GETFIELD_GC_I lowering of the `profilefunc?` pin (`executioncontext.py`
+/// `_immutable_fields_`).  A compiled loop recorded with the slot empty
+/// must GNI-fail when `setllprofile` installs a profiler, the same way
+/// `w_tracefunc?` fails after `settrace`.
+pub const EC_PROFILEFUNC_OFFSET: usize = std::mem::offset_of!(ExecutionContext, profilefunc);
+
 /// `quasiimmut.py get_current_qmut_instance` for the EC `w_tracefunc?` slot.
 ///
 /// # Safety
@@ -653,6 +678,19 @@ pub unsafe fn ec_current_w_tracefunc_qmut(
         return None;
     }
     Some(unsafe { (*ec).current_w_tracefunc_qmut() })
+}
+
+/// `quasiimmut.py get_current_qmut_instance` for the EC `profilefunc?` slot.
+///
+/// # Safety
+/// `ec` must be null or a live `ExecutionContext`.
+pub unsafe fn ec_current_profilefunc_qmut(
+    ec: *const ExecutionContext,
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
+    if ec.is_null() {
+        return None;
+    }
+    Some(unsafe { (*ec).current_profilefunc_qmut() })
 }
 
 /// Byte offset of `py_recursion_depth` within `ExecutionContext`, for the
@@ -692,6 +730,7 @@ impl ExecutionContext {
             is_tracing: 0,
             compiler: pyre_object::PY_NULL,
             profilefunc: None,
+            profilefunc_watchers: ProfilefuncWatchers::default(),
             w_profilefuncarg: pyre_object::PY_NULL,
             thread_disappeared: false,
             w_async_exception_type: pyre_object::PY_NULL,
@@ -734,8 +773,7 @@ impl ExecutionContext {
         ec.accounted_activation = 0;
         ec.w_tracefunc = pyre_object::PY_NULL;
         ec.is_tracing = 0;
-        ec.profilefunc = None;
-        ec.w_profilefuncarg = pyre_object::PY_NULL;
+        ec.store_profilefunc(None, pyre_object::PY_NULL);
         ec.thread_disappeared = false;
         ec.w_async_exception_type = pyre_object::PY_NULL;
         // threadlocals.py — a fresh worker EC starts disabled.  `_set_ec`
@@ -1509,11 +1547,23 @@ impl ExecutionContext {
         self.w_tracefunc_watchers.0.get_current_qmut_instance()
     }
 
+    /// `quasiimmut.py get_current_qmut_instance` for `profilefunc?`.
+    pub fn current_profilefunc_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
+        self.profilefunc_watchers.0.get_current_qmut_instance()
+    }
+
+    fn store_profilefunc(&mut self, func: Option<ProfileFunc>, w_arg: PyObjectRef) {
+        if self.profilefunc_watchers.0.is_installed() {
+            self.profilefunc_watchers.0.invalidate();
+        }
+        self.profilefunc = func;
+        self.w_profilefuncarg = w_arg;
+    }
+
     /// `executioncontext.py setprofile`.
     pub fn setprofile(&mut self, w_func: PyObjectRef) -> Result<(), crate::PyError> {
         if w_func.is_null() || w_func == pyre_object::w_none() {
-            self.profilefunc = None;
-            self.w_profilefuncarg = pyre_object::PY_NULL;
+            self.store_profilefunc(None, pyre_object::PY_NULL);
             Ok(())
         } else {
             self.setllprofile(Some(app_profile_call), w_func)
@@ -1550,8 +1600,7 @@ impl ExecutionContext {
         } else {
             w_arg
         };
-        self.profilefunc = func;
-        self.w_profilefuncarg = w_arg;
+        self.store_profilefunc(func, w_arg);
         Ok(())
     }
 
@@ -1818,8 +1867,7 @@ impl ExecutionContext {
                 // executioncontext.py:421-425 — clear profile slots and
                 // re-raise so the caller observes the failure (matches
                 // the bare `raise` after the `except:` block).
-                self.profilefunc = None;
-                self.w_profilefuncarg = pyre_object::PY_NULL;
+                self.store_profilefunc(None, pyre_object::PY_NULL);
                 self.is_tracing -= 1;
                 return Err(err);
             }

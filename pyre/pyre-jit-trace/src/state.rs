@@ -5538,6 +5538,10 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
             pyre_interpreter::executioncontext::ec_current_w_tracefunc_qmut(
                 struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
             )
+        } else if index == crate::descr::ec_profilefunc_descr().index() {
+            pyre_interpreter::executioncontext::ec_current_profilefunc_qmut(
+                struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
+            )
         } else if index == crate::descr::w_class_descr().index() {
             // `PyObject.w_class?` — one process-global watcher; the
             // struct_ptr is unused (every instance shares the invalidation).

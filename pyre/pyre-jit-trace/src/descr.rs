@@ -121,6 +121,7 @@ const CELL_FAMILY_EVER_MUTATED_INDEX: u32 = CELL_FAMILY_DESCR_TAG;
 // the GC tid.
 const EC_DESCR_TAG: u32 = 0x5400_0000;
 const EC_W_TRACEFUNC_INDEX: u32 = EC_DESCR_TAG;
+const EC_PROFILEFUNC_INDEX: u32 = EC_DESCR_TAG + 1;
 
 // `PyObject.w_class` sits at the same first-Ref coordinate as every other
 // `W_*` header field, so `stable_field_index` names a layout, not an owner.
@@ -5773,6 +5774,16 @@ pub fn ec_w_tracefunc_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_W_TRACEFUNC_OFFSET)
 }
 
+/// Field descr for `ExecutionContext::profilefunc`, the slot
+/// `executioncontext.py` lists as `profilefunc?` next to `w_tracefunc?`.
+///
+/// The compiled loop pins the empty function-pointer with `GetfieldGcI` +
+/// `IntIsZero` + `GuardTrue`, the same shape PyPy's opt log shows for
+/// `inst_profilefunc`.  `setllprofile` invalidates the watchers.
+pub fn ec_profilefunc_descr() -> DescrRef {
+    ec_field_descr(pyre_interpreter::EC_PROFILEFUNC_OFFSET)
+}
+
 /// Resolve one `EC_DESCR_GROUP` field by byte offset.  The group stamps
 /// `index_in_parent` as the field's rank by offset, so the positional order of
 /// `field_descrs` follows the offsets rather than the declaration order; look
@@ -5867,6 +5878,11 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     w_tracefunc.index = EC_W_TRACEFUNC_INDEX;
     w_tracefunc.is_immutable = true;
     w_tracefunc.is_quasi_immutable = true;
+    let mut profilefunc = int_field(5, "profilefunc", pyre_interpreter::EC_PROFILEFUNC_OFFSET);
+    // `executioncontext.py _immutable_fields_ = ['profilefunc?']`.
+    profilefunc.index = EC_PROFILEFUNC_INDEX;
+    profilefunc.is_immutable = true;
+    profilefunc.is_quasi_immutable = true;
     let mut specs = vec![
         field(
             0,
@@ -5885,6 +5901,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
             "accounted_activation",
             pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET,
         ),
+        profilefunc,
     ];
     // `index_in_parent` is the field's rank by byte offset
     // (`jitcode/assembler.rs`'s `field_specs_from_layout`), and once a parent
@@ -6582,6 +6599,14 @@ mod tests {
         assert_ne!(idx, function_code_descr().index());
         assert!(function_quasi_immut_slot(idx).is_none());
         assert!(function_quasi_immut_slot(function_code_descr().index()).is_some());
+    }
+
+    #[test]
+    fn ec_profilefunc_quasi_index_is_not_a_function_slot() {
+        let idx = ec_profilefunc_descr().index();
+        assert_eq!(idx, EC_PROFILEFUNC_INDEX);
+        assert_ne!(idx, EC_W_TRACEFUNC_INDEX);
+        assert!(function_quasi_immut_slot(idx).is_none());
     }
 
     #[test]
@@ -7345,12 +7370,22 @@ mod tests {
                 pyre_interpreter::EC_W_TRACEFUNC_OFFSET,
                 ec_w_tracefunc_descr(),
             ),
+            (
+                "profilefunc",
+                pyre_interpreter::EC_PROFILEFUNC_OFFSET,
+                ec_profilefunc_descr(),
+            ),
         ] {
+            let (field_size, field_type) = if name == "profilefunc" {
+                (std::mem::size_of::<usize>(), Type::Int)
+            } else {
+                (std::mem::size_of::<pyre_object::PyObjectRef>(), Type::Ref)
+            };
             for owner in ["ExecutionContext", "executioncontext::ExecutionContext"] {
                 let descr = make_descr_from_bh(&BhDescr::Field {
                     offset,
-                    field_size: std::mem::size_of::<pyre_object::PyObjectRef>(),
-                    field_type: Type::Ref,
+                    field_size,
+                    field_type,
                     field_flag: ArrayFlag::Pointer,
                     is_field_signed: false,
                     is_immutable: false,
@@ -8308,6 +8343,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "sys_exc_value" => Some(ec_sys_exc_value_descr()),
                     "topframeref" => Some(ec_topframeref_descr()),
                     "w_tracefunc" => Some(ec_w_tracefunc_descr()),
+                    "profilefunc" => Some(ec_profilefunc_descr()),
                     _ => None,
                 };
                 if let Some(canonical) = canonical
