@@ -501,7 +501,8 @@ fn raise_path_calls(name: &str) -> (usize, usize, usize) {
                 continue;
             };
             match segments.last().map(String::as_str) {
-                Some("pyerror_type_error_to_exc_object") => fused += 1,
+                Some("pyerror_type_error_to_exc_object")
+                | Some("pyerror_zero_division_to_exc_object") => fused += 1,
                 Some("pyerror_to_exc_object") => materialise += 1,
                 Some(_) if segments.len() >= 2 && segments[segments.len() - 2] == "PyError" => {
                     ctors += 1

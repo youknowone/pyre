@@ -28,7 +28,8 @@ fn pyre_probe_bh_startup_enabled() -> bool {
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
     PyResult, function_get_closure, function_get_defaults, function_get_globals_obj,
-    function_get_name, is_function, register_jit_exc_raiser, register_jit_function_caller,
+    function_get_name, is_function, register_jit_exc_clearer, register_jit_exc_raiser,
+    register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
@@ -1898,6 +1899,7 @@ pub fn install_jit_call_bridge() {
         majit_ir::descr::set_w_class_obj_resolver(pyre_jit_trace::descr::w_class_obj_for_vtable);
         register_jit_function_caller(jit_call_user_function_from_frame);
         register_jit_exc_raiser(jit_exc_raise_shim);
+        register_jit_exc_clearer(jit_exc_clear_shim);
         // compile.py `memory_error = MemoryError()` parity — give
         // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
         // pyre's lazy `W_BaseException(MemoryError, "")` singleton
