@@ -825,11 +825,7 @@ fn snapshot_inputarg_for_stack_ptr(
     inputargs: &[majit_ir::InputArgRc],
     addr: usize,
 ) -> Option<majit_ir::OpRef> {
-    if addr <= 0x1000 {
-        return None;
-    }
-    let probe = 0usize;
-    if (std::ptr::addr_of!(probe) as usize).abs_diff(addr) >= 16 * 1024 * 1024 {
+    if !crate::optimizeopt::OptContext::ref_addr_is_stack_resident(addr) {
         return None;
     }
     inputargs.iter().find_map(|ia| {
