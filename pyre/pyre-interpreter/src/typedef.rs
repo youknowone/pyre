@@ -13450,11 +13450,10 @@ fn init_type_type(ns: PyObjectRef) {
             }
             // Builtin-name dot split fallback (`typeobject.py:619-624`).
             let name = unsafe { pyre_object::w_type_get_name(cls) };
-            let mod_name = match name.rfind('.') {
-                Some(dot) => name[..dot].to_string(),
-                None => "builtins".to_string(),
-            };
-            Ok(pyre_object::w_str_new(&mod_name))
+            Ok(match name.rfind('.') {
+                Some(dot) => pyre_object::w_str_new_managed(&name[..dot]),
+                None => pyre_object::w_str_new("builtins"),
+            })
         },
         2,
     );
@@ -26476,7 +26475,7 @@ fn bytearray_reduce_impl(
         // unicode string plus the explicit codec name.
         let latin1: String = data.iter().map(|&b| char::from(b)).collect();
         let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_str_new(&latin1));
+        fields.push(w_str_new_managed(&latin1));
         fields.push(w_str_new("latin-1"));
         w_tuple_new(fields.take())
     };

@@ -789,7 +789,7 @@ fn w_memoryview_new_with_flags_impl(
             let sp = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_obj);
             let _ = pyre_object::gc_roots::pin_root(backing_obj);
-            let _ = pyre_object::gc_roots::pin_root(w_str_new(&fmt));
+            let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&fmt));
             let shape_i64 = shape.iter().map(|&dim| dim as i64).collect::<Vec<_>>();
             let mut strides = vec![0i64; shape.len()];
             let mut stride = itemsize as i64;

@@ -27,7 +27,10 @@ fn struct_error(msg: impl Into<String>) -> crate::PyError {
     let cls = crate::builtins::lookup_exc_class("struct.error")
         .or_else(|| crate::builtins::lookup_exc_class("Exception"))
         .expect("Exception must be installed before _struct is used");
-    let exc = crate::builtins::exc_exception_new(&[cls, w_str_new_managed(&msg)])
+    let mut args = pyre_object::gc_roots::RootedItems::new();
+    args.push(cls);
+    args.push(w_str_new_managed(&msg));
+    let exc = crate::builtins::exc_exception_new(&args.take())
         .expect("exc_exception_new is infallible for str args");
     let mut err = crate::PyError::new(crate::PyErrorKind::ValueError, msg);
     err.exc_object = exc;
@@ -1581,7 +1584,9 @@ crate::py_module! {
         "iter_unpack" / 2 = |args| {
             let fmt = format_to_string(args[0])?;
             let size = parse_format(&fmt)?.calcsize()?;
-            make_unpack_iter(w_str_new(&fmt), size, args[1])
+            let _roots = pyre_object::gc_roots::push_roots();
+            let w_fmt = pyre_object::gc_roots::pin_root(w_str_new_managed(&fmt));
+            make_unpack_iter(w_fmt, size, args[1])
         },
     },
     extra_init: |ns| {

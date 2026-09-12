@@ -882,7 +882,8 @@ fn codec_encode_or_decode(
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     let encoding = crate::baseobjspace::str_utf8_w(w_encoding)?.to_string();
-    let w_codec_info = lookup_codec(&[w_str_new(&encoding)])?;
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(&encoding));
+    let w_codec_info = lookup_codec(&[w_encoding])?;
     let w_coder = unsafe {
         pyre_object::w_tuple_getitem(w_codec_info, i64::from(!encode)).unwrap_or_else(w_none)
     };

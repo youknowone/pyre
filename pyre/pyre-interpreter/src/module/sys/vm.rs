@@ -3933,7 +3933,7 @@ fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let event = crate::baseobjspace::str_utf8_w(w_event)?.to_string();
     let _roots = pyre_object::gc_roots::push_roots();
     let args_slot = pyre_object::gc_roots::pin_roots(&positional[1..]);
-    let w_text = w_str_new(&event);
+    let w_text = pyre_object::gc_roots::pin_root(w_str_new_managed(&event));
     let args_w: Vec<pyre_object::PyObjectRef> = (0..positional.len() - 1)
         .map(|i| pyre_object::gc_roots::shadow_stack_get(args_slot + i))
         .collect();
