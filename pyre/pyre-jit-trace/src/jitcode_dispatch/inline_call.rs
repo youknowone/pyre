@@ -5945,8 +5945,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if !raw.is_null() && unsafe { pyre_interpreter::code_is_self_recursive(&*raw) } {
             let root_code = {
                 let session = ctx.session.borrow();
-                let frame = session.recording_frame_ptr
-                    as *const pyre_interpreter::PyFrame;
+                let frame = session.recording_frame_ptr as *const pyre_interpreter::PyFrame;
                 if frame.is_null() {
                     0
                 } else {
@@ -14325,8 +14324,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         // residualize (`pure_tupleload`, `str_subscr_hot`).  Identify
         // SUBSCR by the I-list tag, not `get_jitcode_ref_by_index` —
         // that lookup is a global index and misses the per-fn pool.
-        if let Ok(setup) =
-            inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
+        if let Ok(setup) = inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
             && let Some(call_descr) = setup.descr.as_call_descr()
             && spec_gate(SpecFold::Subscr, || {
                 super::specialize::try_walker_specialize_subscr(
@@ -14432,8 +14430,14 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     {
         return Ok((outcome, op.next_pc));
     }
-    if dst_bank == 'r' && ref_args.len() == 2 && let Some(op_tag) = op_tag {
-        let int_args_tag = int_args.first().copied().unwrap_or_else(|| ctx.trace_ctx.const_int(op_tag));
+    if dst_bank == 'r'
+        && ref_args.len() == 2
+        && let Some(op_tag) = op_tag
+    {
+        let int_args_tag = int_args
+            .first()
+            .copied()
+            .unwrap_or_else(|| ctx.trace_ctx.const_int(op_tag));
         let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
         // Emit the machine-int body before descending `binary_value_from_tag`.
         // The descent walks `int_add_ovf`; a bridge InputArg for `total`
@@ -14483,13 +14487,19 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
         // Residual BINARY_OP's long/int family. Flatten lands bigint
         // `//` `%` `**` here, so the same folds must fire.
-        if let Ok(setup) =
-            inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
+        if let Ok(setup) = inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
             && let Some(call_descr) = setup.descr.as_call_descr()
         {
             if spec_gate(SpecFold::BinaryOpLongInt, || {
                 super::specialize::try_walker_specialize_binary_op_long_int(
-                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                    ctx,
+                    op.pc,
+                    op_tag,
+                    &ref_args,
+                    &setup.allboxes,
+                    call_descr,
+                    dst,
+                    dst_bank,
                 )
             })?
             .is_some()
@@ -14498,21 +14508,42 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             }
             if let Some(outcome) = spec_gate(SpecFold::BinaryOpLongIntShift, || {
                 super::specialize::try_walker_specialize_binary_op_long_int_shift(
-                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                    ctx,
+                    op.pc,
+                    op_tag,
+                    &ref_args,
+                    &setup.allboxes,
+                    call_descr,
+                    dst,
+                    dst_bank,
                 )
             })? {
                 return Ok((outcome, op.next_pc));
             }
             if let Some(outcome) = spec_gate(SpecFold::BinaryOpLongIntDiv, || {
                 super::specialize::try_walker_specialize_binary_op_long_int_div(
-                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                    ctx,
+                    op.pc,
+                    op_tag,
+                    &ref_args,
+                    &setup.allboxes,
+                    call_descr,
+                    dst,
+                    dst_bank,
                 )
             })? {
                 return Ok((outcome, op.next_pc));
             }
             if spec_gate(SpecFold::BinaryOpLongIntPow, || {
                 super::specialize::try_walker_specialize_binary_op_long_int_pow(
-                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                    ctx,
+                    op.pc,
+                    op_tag,
+                    &ref_args,
+                    &setup.allboxes,
+                    call_descr,
+                    dst,
+                    dst_bank,
                 )
             })?
             .is_some()
@@ -14521,7 +14552,14 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             }
             if spec_gate(SpecFold::BinaryOpLong, || {
                 super::specialize::try_walker_specialize_binary_op_long(
-                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                    ctx,
+                    op.pc,
+                    op_tag,
+                    &ref_args,
+                    &setup.allboxes,
+                    call_descr,
+                    dst,
+                    dst_bank,
                 )
             })?
             .is_some()
@@ -14530,7 +14568,14 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             }
             if spec_gate(SpecFold::TruedivOpLong, || {
                 super::specialize::try_walker_specialize_truediv_op_long(
-                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                    ctx,
+                    op.pc,
+                    op_tag,
+                    &ref_args,
+                    &setup.allboxes,
+                    call_descr,
+                    dst,
+                    dst_bank,
                 )
             })?
             .is_some()
