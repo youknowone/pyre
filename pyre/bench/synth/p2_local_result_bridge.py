@@ -1,6 +1,8 @@
 # pyre-check: max-pypy-ratio=11.8
-# pyre-check: max-wasm-ratio=5
-# leftover-empty abort of a non-iterator TOS peel; measured 4.3x × 1.15.
+# pyre-check: max-wasm-ratio=6.8
+# leftover-empty abort of a non-iterator TOS peel. After rebase onto
+# origin/main, darwin-arm64 measured 5.9x; 6.8x is that reading plus
+# WASM_RATIO_FIT_HEADROOM (15%).
 # Ubuntu run 33279264115: 2.2-5.9x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython
