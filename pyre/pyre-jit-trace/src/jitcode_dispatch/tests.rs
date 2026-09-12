@@ -696,7 +696,7 @@ fn branch_guard_snapshot_rechecks_the_condition_before_either_arm() {
     goto_if_not_branch_on(&code, &op, &mut wc, condbox, 1, 11).unwrap();
     drop(wc);
     let guard = tc.ops().last().unwrap();
-    let snapshot = tc.get_snapshot(guard.rd_resume_position().get()).unwrap();
+    let snapshot = tc.get_snapshot(guard.rd_resume_position()).unwrap();
     assert_eq!(
         snapshot.frames[0].pc, 11,
         "resume must enter the not-taken arm"
