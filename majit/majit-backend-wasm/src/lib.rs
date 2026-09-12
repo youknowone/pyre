@@ -3290,9 +3290,9 @@ impl WasmBackend {
         inputs.ca.home_gcmap_has_prior = true;
         // Do not null grown LABEL homes on every keyed entry. A later
         // loop-closing bridge writes those captures and tail-calls back;
-        // zeroing them here would restore nulls. Stale pre-growth bridges
-        // are dropped below when the merged extent grows. Key-0 still
-        // clears the full used-label range.
+        // zeroing them here would restore nulls. Pre-growth owner
+        // attachments are dropped below when the LABEL tail grows.
+        // Key-0 still clears the full used-label range.
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
@@ -3365,7 +3365,6 @@ impl WasmBackend {
         let old_labels = compiled.used_label_homes.get();
         let widened = merged_ref_homes.max(old_homes);
         let widened_labels = merged_labels.max(old_labels);
-        let owner_extent_grew = old_homes < widened || old_labels < widened_labels;
         // Leave retired bridge slots pointing at the old module. Callers
         // baked `return_call_indirect` with that bridge's LABEL key; the
         // replacement owner's `br_table` interprets the same key against
@@ -3373,10 +3372,28 @@ impl WasmBackend {
         // rewrites the jump in place; wasm cannot, so the old module stays
         // the destination. The source-guard cell is already zero, so the
         // inlined region is not also dispatched.
-        // Keep already-compiled bridges. Publication is monotonic in the
-        // marked-bit set, so a narrower bridge map cannot unmark homes
-        // the owner grew. Dropping them here forced `trace_eagerness`
-        // (200) extra guard failures and a new compile.
+        // Keep already-compiled bridges when only ordinary homes grew:
+        // those new slots are nulled at keyed entry, and publication is
+        // monotonic in the marked-bit set. Dropping them forced
+        // `trace_eagerness` (200) extra guard failures.
+        // When the LABEL-capture tail grows, a pre-growth loop-closing
+        // bridge still keys into this replacement and restores the new
+        // captures from uninitialized words. Drop those owner attachments
+        // so the next fail retraces against the merged floor. The region
+        // just inlined is already gone from `bridge_slots`.
+        if old_labels < widened_labels {
+            let dropped: Vec<u32> = compiled.bridge_slots.borrow().keys().copied().collect();
+            compiled.bridge_slots.borrow_mut().clear();
+            if !dropped.is_empty() {
+                let owner_tid = compiled.trace_id;
+                compiled
+                    .bridge_descr_ranges
+                    .borrow_mut()
+                    .retain(|(tid, fail_index, _, _)| {
+                        !(*tid == owner_tid && dropped.contains(fail_index))
+                    });
+            }
+        }
         #[cfg(target_arch = "wasm32")]
         if new_cells_base != 0 {
             for (&fail_index, &bridge_slot) in compiled.bridge_slots.borrow().iter() {
@@ -3384,7 +3401,6 @@ impl WasmBackend {
                 unsafe { core::ptr::write(cell, bridge_slot) };
             }
         }
-        let _ = owner_extent_grew;
         if let Some(owner) = new_cells_owner {
             compiled._bridge_owned_cells.borrow_mut().push(owner);
         }

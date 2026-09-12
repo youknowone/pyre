@@ -3941,8 +3941,8 @@ pub struct CaParams {
     pub home_gcmap_has_prior: bool,
     /// True only when a re-emitted module must null newly marked LABEL
     /// homes for a keyed caller whose map did not include them. Re-emission
-    /// itself leaves this false and drops stale owner bridges when the
-    /// merged extent grows; key-0 still clears the full used-label range.
+    /// itself leaves this false and drops stale owner attachments when
+    /// the LABEL tail grows; key-0 still clears the full used-label range.
     /// A compiled bridge with more captures than its source also leaves
     /// this false: it writes those slots on the first crossing.
     pub home_gcmap_null_grown_labels: bool,
