@@ -10073,10 +10073,13 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
             _ => false,
         },
     };
-    if cond_true {
+    if cond_true && ctx.is_authoritative_executor {
         let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr) else {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         };
+        if func_addr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr) {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
         let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes) else {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         };
@@ -10152,35 +10155,49 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
         },
     };
     let (result, concrete) = if should_call {
-        let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr) else {
+        if !ctx.is_authoritative_executor {
+            (recorded, ConcreteValue::Null)
+        } else {
+            let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr) else {
+                match dst_bank {
+                    'i' => write_int_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
+                    'r' => write_ref_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
+                    _ => {}
+                }
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            };
+            if func_addr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr) {
+                match dst_bank {
+                    'i' => write_int_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
+                    'r' => write_ref_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
+                    _ => {}
+                }
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes) else {
+                match dst_bank {
+                    'i' => write_int_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
+                    'r' => write_ref_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
+                    _ => {}
+                }
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            };
             match dst_bank {
-                'i' => write_int_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                'r' => write_ref_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                _ => {}
+                'i' => {
+                    let n =
+                        majit_metainterp::call_int_function(func_addr as *const (), &concrete_args);
+                    (recorded, ConcreteValue::Int(n))
+                }
+                'r' => {
+                    let p =
+                        majit_metainterp::call_ref_function(func_addr as *const (), &concrete_args);
+                    (
+                        recorded,
+                        ConcreteValue::Ref(p as usize as pyre_object::PyObjectRef),
+                    )
+                }
+                _ => (recorded, ConcreteValue::Null),
             }
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        };
-        let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes) else {
-            match dst_bank {
-                'i' => write_int_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                'r' => write_ref_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                _ => {}
-            }
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        };
-        match dst_bank {
-            'i' => {
-                let n = majit_metainterp::call_int_function(func_addr as *const (), &concrete_args);
-                (recorded, ConcreteValue::Int(n))
-            }
-            'r' => {
-                let p = majit_metainterp::call_ref_function(func_addr as *const (), &concrete_args);
-                (
-                    recorded,
-                    ConcreteValue::Ref(p as usize as pyre_object::PyObjectRef),
-                )
-            }
-            _ => (recorded, ConcreteValue::Null),
         }
     } else {
         (
@@ -10233,9 +10250,8 @@ fn dispatch_record_known_result_ir<Sym: WalkSym>(
         Some(first),
     );
     let ei = call_descr.get_extra_info().clone();
-    ctx.trace_ctx
-        .profiler()
-        .count_ops(OpCode::RecordKnownResult, majit_metainterp::counters::OPS);
+    // `opimpl_record_known_result_i_ir_v` records via
+    // `_record_helper_varargs` and increments only RECORDED_OPS.
     ctx.trace_ctx.profiler().count_ops(
         OpCode::RecordKnownResult,
         majit_metainterp::counters::RECORDED_OPS,

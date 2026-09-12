@@ -808,6 +808,16 @@ mod tests {
                     | majit_metainterp::jitcode::insns::BC_INT_RETURN
                     | majit_metainterp::jitcode::insns::BC_INT_RETURN_C
                     | majit_metainterp::jitcode::insns::BC_INLINE_CALL
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_R_I
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_R_R
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_R_V
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_IR_I
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_IR_R
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_IR_V
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_IRF_I
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_IRF_R
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_IRF_F
+                    | majit_metainterp::jitcode::insns::BC_INLINE_CALL_IRF_V
             ) {
                 *leftover.entry(op).or_insert(0) += 1;
             }

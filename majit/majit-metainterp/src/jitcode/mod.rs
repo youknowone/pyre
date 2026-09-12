@@ -1074,7 +1074,9 @@ fn decode_typed_inline_call(code: &[u8], start: usize) -> Option<(InlineCallSite
         skip_list()?;
     }
     let dest = if return_kind.is_some() {
-        Some(read_reg(code, &mut cursor) as usize)
+        let reg = *code.get(cursor)? as usize;
+        cursor += 1;
+        Some(reg)
     } else {
         None
     };
