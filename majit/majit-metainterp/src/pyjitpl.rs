@@ -11910,9 +11910,10 @@ impl<M: Clone> MetaInterp<M> {
                 // A fail_arg is a resume use. Rewriting the JUMP would
                 // leave the next iteration's deopt with the entry value
                 // instead of the constant the recorded close produced.
-                let in_fail = op
-                    .getfailargs()
-                    .is_some_and(|fa| fa.iter().any(|arg| !arg.is_constant() && arg.to_opref() == slot));
+                let in_fail = op.getfailargs().is_some_and(|fa| {
+                    fa.iter()
+                        .any(|arg| !arg.is_constant() && arg.to_opref() == slot)
+                });
                 in_args || in_fail
             });
             if !used {

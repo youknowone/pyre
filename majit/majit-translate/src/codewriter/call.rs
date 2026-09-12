@@ -3873,10 +3873,18 @@ impl CallControl {
             "helper analysis has no portal"
         );
         assert!(!roots.is_empty(), "helper analysis requires explicit roots");
-        for root in roots {
+        for (index, root) in roots.iter().enumerate() {
+            let graph = self
+                .function_graphs
+                .get(root)
+                .unwrap_or_else(|| panic!("missing helper graph: {root:?}"));
             assert!(
-                self.function_graphs.contains_key(root),
-                "missing helper graph: {root:?}"
+                !roots[..index].iter().any(|previous| {
+                    self.function_graphs
+                        .get(previous)
+                        .is_some_and(|prev| std::ptr::eq(prev, graph))
+                }),
+                "duplicate helper root graph for {root:?}; aliases of one graph must share one JitCode"
             );
         }
         self.materialize_deferred_indirect_families();

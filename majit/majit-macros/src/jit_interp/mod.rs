@@ -2138,6 +2138,55 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
 }
 
 /// Transform the original function: replace jit_merge_point!() and can_enter_jit!() markers.
+/// Concrete (non-trace) path: rewrite `recursive_portal_call!` onto the
+/// declared `recursive_entry`. `jit_merge_point!` / `can_enter_jit!` stay
+/// as the exported no-ops.
+fn rewrite_recursive_portal_calls(block: &mut syn::Block, recursive_entry: Option<&syn::Path>) {
+    use syn::visit_mut::VisitMut;
+    struct Visitor<'a> {
+        recursive_entry: Option<&'a syn::Path>,
+    }
+    impl VisitMut for Visitor<'_> {
+        fn visit_expr_mut(&mut self, expr: &mut Expr) {
+            syn::visit_mut::visit_expr_mut(self, expr);
+            let Expr::Macro(em) = expr else {
+                return;
+            };
+            let path_str = em
+                .mac
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            if path_str != "recursive_portal_call" && !path_str.ends_with("::recursive_portal_call")
+            {
+                return;
+            }
+            let args = em
+                .mac
+                .parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                .expect("recursive_portal_call! takes `driver, green0, green1, ...`");
+            let mut iter = args.into_iter();
+            let _driver = iter
+                .next()
+                .expect("recursive_portal_call! requires a driver argument");
+            let greens: Vec<Expr> = iter.collect();
+            let entry = self.recursive_entry.unwrap_or_else(|| {
+                panic!(
+                    "recursive_portal_call! used but `#[jit_interp(..)]` declares no \
+                     `recursive_entry = <fn path>` for the concrete fallback"
+                )
+            });
+            let new_tokens = quote! { #entry(#(#greens),*) };
+            *expr = syn::parse2(new_tokens)
+                .expect("failed to parse recursive_portal_call concrete fallback");
+        }
+    }
+    Visitor { recursive_entry }.visit_block_mut(block);
+}
+
 fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> TokenStream {
     use syn::visit_mut::VisitMut;
 
@@ -2652,6 +2701,8 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
             finish_return.as_ref(),
         )
     } else {
+        let mut block = block;
+        rewrite_recursive_portal_calls(&mut block, config.recursive_entry.as_ref());
         quote!(#block)
     };
 

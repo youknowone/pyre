@@ -1210,10 +1210,17 @@ impl VirtualizableInfo {
         unsafe {
             let field = &self.static_fields[field_index];
             match field.field_type {
-                Type::Float => {
-                    let ptr = obj_ptr.add(field.offset) as *const f64;
-                    f64::to_bits(*ptr) as i64
-                }
+                Type::Float => match field.field_size {
+                    4 => {
+                        let ptr = obj_ptr.add(field.offset) as *const f32;
+                        f64::to_bits(f64::from(*ptr)) as i64
+                    }
+                    8 => {
+                        let ptr = obj_ptr.add(field.offset) as *const f64;
+                        f64::to_bits(*ptr) as i64
+                    }
+                    _ => unreachable!("invalid virtualizable float width"),
+                },
                 // Pointer-width field: 4 bytes on wasm32. Reading 8 bytes
                 // would fold in the next field's bytes.
                 Type::Ref => {
@@ -1247,10 +1254,17 @@ impl VirtualizableInfo {
         unsafe {
             let field = &self.static_fields[field_index];
             match field.field_type {
-                Type::Float => {
-                    let ptr = obj_ptr.add(field.offset) as *mut f64;
-                    *ptr = f64::from_bits(value as u64);
-                }
+                Type::Float => match field.field_size {
+                    4 => {
+                        let ptr = obj_ptr.add(field.offset) as *mut f32;
+                        *ptr = f64::from_bits(value as u64) as f32;
+                    }
+                    8 => {
+                        let ptr = obj_ptr.add(field.offset) as *mut f64;
+                        *ptr = f64::from_bits(value as u64);
+                    }
+                    _ => unreachable!("invalid virtualizable float width"),
+                },
                 // Pointer-width field: 4 bytes on wasm32. Writing 8 bytes
                 // would clobber the adjacent field.
                 Type::Ref => {
@@ -3101,6 +3115,28 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
                     }
                 }
                 VableArrayStorage::EmbeddedArray { .. } | VableArrayStorage::RustVec { .. } => {}
+            }
+        }
+        // virtualizable.py write_boxes: static ref fields live on the
+        // same object as the arrays. Root those pointer slots too so a
+        // later allocation cannot move the referent while the decoded
+        // address still sits in the raw state.
+        for field in &self.static_fields {
+            if field.field_type != Type::Ref {
+                continue;
+            }
+            let slot = unsafe { vable_ptr.add(field.offset) as *mut usize };
+            let value = unsafe { *slot };
+            if value != 0 && majit_gc::gc_owns_object(value) {
+                let current = majit_gc::gc_current_object_address(value);
+                if current != value {
+                    unsafe {
+                        *slot = current;
+                    }
+                }
+            }
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_root(&mut *slot.cast::<majit_ir::GcRef>());
             }
         }
     }

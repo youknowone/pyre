@@ -2988,7 +2988,27 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
             attrs.push(syn::parse_quote!(#[cfg(#condition)]));
         }
-        quote!(#file).into()
+        // `#[jit_module]` always emits `__majit_helper_trace_fnaddrs`,
+        // which calls `__majit_call_policy_<helper>`. Keep a stub when
+        // tracing is compiled out so a non-JIT build still resolves.
+        let unsupported = jit_interp::call_policy_byte::UNSUPPORTED;
+        quote! {
+            #file
+            #[cfg(not(#condition))]
+            #[doc(hidden)]
+            #[allow(non_snake_case)]
+            #vis fn #policy_name() -> (u8, *const (), *const (), *const (), *const (), i32) {
+                (
+                    #unsupported,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0i32,
+                )
+            }
+        }
+        .into()
     } else {
         expanded.into()
     }

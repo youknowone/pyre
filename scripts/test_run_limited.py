@@ -45,7 +45,7 @@ class Limits(unittest.TestCase):
         self.assertLess(len(result.stdout), 34000)
 
     def test_memory_samples_are_retained(self):
-        result = self.run_guard("import time; data=bytearray(8*1024*1024); time.sleep(0.7)")
+        result = self.run_guard("import time; data=bytearray(8*1024*1024); time.sleep(1.2)")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         directory = Path(result.stdout.split("logs: ", 1)[1].split(";", 1)[0])
         lines = (directory / "rss.tsv").read_text().splitlines()
