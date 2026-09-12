@@ -84,6 +84,7 @@ pub mod jit;
 mod trace_verify;
 
 // Re-export auto-generated trace functions from pyre-jit-trace
+pub use majit_metainterp::leftover_peel_tos_i64;
 pub use pyre_jit_trace::jitcode_runtime::{
     descr_demand_summary, descr_set_counts, descr_set_jit_stats, descr_spelling_gate_recheck_now,
     field_descr_identity_census_now, field_position_counts, field_position_jit_stats,
@@ -93,7 +94,6 @@ pub use pyre_jit_trace::{
     trace_box_float, trace_box_int, trace_float_binop, trace_float_compare, trace_int_binop,
     trace_int_binop_ovf, trace_int_compare, trace_unbox_float, trace_unbox_int,
 };
-pub use majit_metainterp::leftover_peel_tos_i64;
 
 pub fn fbw_diag_counter(i: usize) -> u64 {
     pyre_jit_trace::trace::fbw_diag::get(i)

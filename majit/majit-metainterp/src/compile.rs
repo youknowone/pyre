@@ -1968,8 +1968,7 @@ pub(crate) const LISTITER_TOS_RELOAD: u32 = u32::MAX;
 /// `W_ListIterObject` `ob_type` / `w_class` word. leftover_peel_tos
 /// scans the red frame for this type when TOS is not the iterator.
 /// Zero (tests, pre-boot) keeps the TOS-only peel.
-static LISTITER_TYPE_WORD: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static LISTITER_TYPE_WORD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Production `is_list_iter` (typed `ob_type` check). Tests leave this
 /// null and use `LISTITER_TYPE_WORD`.
@@ -2011,7 +2010,9 @@ fn note_leftover_empty_reject() {
 }
 
 fn leftover_has_listiter_id() -> bool {
-    !LISTITER_PRED.load(std::sync::atomic::Ordering::Relaxed).is_null()
+    !LISTITER_PRED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .is_null()
         || LISTITER_TYPE_WORD.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
@@ -2086,8 +2087,7 @@ pub(crate) unsafe fn live_tos_for_vable(
         // frames still peel when the header convention differs.
         let word_match = (vable_ty != 0 && (next_ty == vable_ty || next_class == vable_ty))
             || (vable_class != 0 && (next_ty == vable_class || next_class == vable_class));
-        let same_type = word_match
-            || vable_tid.is_some_and(|tid| gc_type_id(next) == Some(tid));
+        let same_type = word_match || vable_tid.is_some_and(|tid| gc_type_id(next) == Some(tid));
         if !same_type {
             break;
         }
@@ -2198,8 +2198,7 @@ pub unsafe extern "C" fn leftover_peel_tos(
         }
         let pred = LISTITER_PRED.load(std::sync::atomic::Ordering::Relaxed);
         if !pred.is_null() {
-            let f: unsafe extern "C" fn(*const u8) -> i32 =
-                unsafe { std::mem::transmute(pred) };
+            let f: unsafe extern "C" fn(*const u8) -> i32 = unsafe { std::mem::transmute(pred) };
             return unsafe { f(p as *const u8) } != 0;
         }
         let ty = LISTITER_TYPE_WORD.load(std::sync::atomic::Ordering::Relaxed);
@@ -3015,8 +3014,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     if let Some(path) = live_tos.as_ref() {
         if let Some(&portal_tos) = path.first() {
             let n_static = vinfo.static_fields.len();
-            let portal_tos_inputarg =
-                (entry_prefix_len + n_static + portal_tos) as u32;
+            let portal_tos_inputarg = (entry_prefix_len + n_static + portal_tos) as u32;
             let peeled = path.len() > 1;
             for op in ops.iter() {
                 if !op.opcode.is_call() {
@@ -3068,11 +3066,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         }
     }
     let peel_vable_prologue = match inline_vable {
-        Some(r) if r.is_input_arg() && (r.raw() as usize) < entry_prefix_len => {
-            Some(Operand::from_bound_inputarg(
-                &expanded_inputargs[r.raw() as usize],
-            ))
-        }
+        Some(r) if r.is_input_arg() && (r.raw() as usize) < entry_prefix_len => Some(
+            Operand::from_bound_inputarg(&expanded_inputargs[r.raw() as usize]),
+        ),
         Some(r) if r.is_input_arg() => Some(Operand::from_opref(r)),
         Some(_) => None,
         None => Some(vable_box.clone()),
@@ -3137,11 +3133,11 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         Some(Operand::from_bound_op(&call))
     };
     let mut peel_emitted = false;
-    if !tos_sources.is_empty()
-        && leftover_has_listiter_id()
-        && !orig_vable.is_null()
-    {
-        let vsd_f = vinfo.static_fields.iter().find(|f| f.name == "valuestackdepth");
+    if !tos_sources.is_empty() && leftover_has_listiter_id() && !orig_vable.is_null() {
+        let vsd_f = vinfo
+            .static_fields
+            .iter()
+            .find(|f| f.name == "valuestackdepth");
         let arr = vinfo.array_fields.first();
         if let (Some(vsd_f), Some(arr)) = (vsd_f, arr) {
             let (ptr_off, kind) = match arr.storage {
@@ -3205,10 +3201,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     let original_ops = std::mem::take(ops);
     for op in original_ops.iter() {
         emit_forwarded_patch_op(&mut extra_ops, op, &mut forwarding, &mut next_opref);
-        if !peel_emitted
-            && !tos_sources.is_empty()
-            && inline_vable == Some(op.pos.get())
-        {
+        if !peel_emitted && !tos_sources.is_empty() && inline_vable == Some(op.pos.get()) {
             if let Some(emitted) = extra_ops.last().cloned() {
                 let peel_vable = Operand::from_bound_op(&emitted);
                 if let Some(bound) = emit_peel(&mut extra_ops, &mut next_opref, peel_vable) {
@@ -4497,7 +4490,7 @@ mod tests {
             &mut constants,
             &entry_mints,
             &live_from_entry,
-            None
+            None,
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
@@ -4562,7 +4555,7 @@ mod tests {
             &mut constants,
             &entry_mints,
             &live_from_entry,
-            None
+            None,
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
@@ -4571,7 +4564,11 @@ mod tests {
             .filter(|op| op.opcode == OpCode::GetfieldGcR)
             .map(|op| op.pos.get())
             .collect();
-        assert_eq!(getfields.len(), 2, "two static Ref fields, got {getfields:?}");
+        assert_eq!(
+            getfields.len(),
+            2,
+            "two static Ref fields, got {getfields:?}"
+        );
         let label_args: Vec<OpRef> = ops
             .iter()
             .find(|op| op.opcode == OpCode::Label)
@@ -4668,10 +4665,7 @@ mod tests {
             Some(vec![0]),
         );
 
-        assert_eq!(
-            inputargs,
-            vec![InputArg::new_ref(0), InputArg::new_ref(1)]
-        );
+        assert_eq!(inputargs, vec![InputArg::new_ref(0), InputArg::new_ref(1)]);
         let peel = ops
             .iter()
             .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
@@ -4959,13 +4953,12 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 5),
             ],
         );
-        let mut call = Op::new(
-            OpCode::CallR,
-            &[rooted_inputarg_operand(Type::Ref, 5)],
-        );
+        let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 5)]);
         call.setdescr(descr);
-        let mut ops: Vec<majit_ir::OpRc> =
-            vec![label, call].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call]
+            .into_iter()
+            .map(std::rc::Rc::new)
+            .collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -5050,13 +5043,12 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 6),
             ],
         );
-        let mut call = Op::new(
-            OpCode::CallR,
-            &[rooted_inputarg_operand(Type::Ref, 6)],
-        );
+        let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 6)]);
         call.setdescr(descr);
-        let mut ops: Vec<majit_ir::OpRc> =
-            vec![label, call].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call]
+            .into_iter()
+            .map(std::rc::Rc::new)
+            .collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -5245,15 +5237,7 @@ mod tests {
             locals: &mut portal_arr,
         };
         let got = unsafe {
-            leftover_peel_tos(
-                &mut portal as *mut Frame as *const u8,
-                24,
-                40,
-                0,
-                8,
-                0,
-                1,
-            )
+            leftover_peel_tos(&mut portal as *mut Frame as *const u8, 24, 40, 0, 8, 0, 1)
         };
         assert_eq!(
             got as usize,
@@ -5475,12 +5459,9 @@ mod tests {
         const FRAME_CLASS: usize = 0xF2;
         const ZIPINFO_TY: usize = 0x5A;
         const LISTITER_TY: usize = 0x1A12;
-        let prev_ty =
-            LISTITER_TYPE_WORD.swap(LISTITER_TY, std::sync::atomic::Ordering::Relaxed);
-        let prev_scan = LEFTOVER_SCAN_FRAME.swap(
-            std::ptr::null_mut(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let prev_ty = LISTITER_TYPE_WORD.swap(LISTITER_TY, std::sync::atomic::Ordering::Relaxed);
+        let prev_scan =
+            LEFTOVER_SCAN_FRAME.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
         struct Restore {
             ty: usize,
             scan: *mut u8,

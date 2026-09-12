@@ -25343,10 +25343,9 @@ mod tests {
         );
         assert_eq!(inputargs.len(), 2);
         assert!(
-            live.iter()
-                .any(|&(r, j)| r.is_input_arg()
-                    && r.raw() >= 2
-                    && j == crate::compile::LISTITER_TOS_RELOAD),
+            live.iter().any(|&(r, j)| r.is_input_arg()
+                && r.raw() >= 2
+                && j == crate::compile::LISTITER_TOS_RELOAD),
             "ListIter leftover must bind to live TOS reload, got {live:?}"
         );
         assert_eq!(ops[0].arg(1).to_opref(), OpRef::input_arg_ref(1));
@@ -25429,7 +25428,9 @@ mod tests {
             &[],
         );
         assert!(
-            !live_dense.iter().any(|&(r, _)| r.is_input_arg() && r.raw() >= 2),
+            !live_dense
+                .iter()
+                .any(|&(r, _)| r.is_input_arg() && r.raw() >= 2),
             "expanded-tail ListIter leftover must not bind to the aliased slot, got {live_dense:?}"
         );
     }
@@ -25511,15 +25512,12 @@ mod tests {
         ));
         let start = std::rc::Rc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
         let mint: Vec<OpRef> = (0..8).map(|i| OpRef::input_arg_ref(50 + i)).collect();
-        let (_ia, _ops, live) = densify_root_loop_inputargs(
-            &renamed,
-            vec![start, std::rc::Rc::new(seq)],
-            &mint,
-            &[7],
-        );
+        let (_ia, _ops, live) =
+            densify_root_loop_inputargs(&renamed, vec![start, std::rc::Rc::new(seq)], &mint, &[7]);
         assert!(
-            live.iter().any(|&(r, j)| r == OpRef::input_arg_ref(2)
-                && j == crate::compile::LISTITER_TOS_RELOAD),
+            live.iter()
+                .any(|&(r, j)| r == OpRef::input_arg_ref(2)
+                    && j == crate::compile::LISTITER_TOS_RELOAD),
             "ListIter leftover InputArg(2) must bind to live TOS reload, got {live:?}"
         );
     }
