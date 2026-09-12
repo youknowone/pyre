@@ -6069,27 +6069,35 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // the guard failed forever while the code object it stands for is
         // loop-invariant.
         //
-        // Keep GETFIELD+GUARD_VALUE even on a ConstPtr callable. The
-        // `code?` marker matches `function.py getcode()` but is the
-        // Linux `test_uuid` SIGSEGV with the marker restored: after
-        // `test_UUID` warms the JIT, `jit_bigint_int_eq` still sees a
-        // small int as `*const BigInt` even when GuardClass(LONG) is
-        // recorded. The live field read stays until that residual is
-        // sound under the marker on every backend.
-        walker_guard_function_field(
-            ctx,
-            op.pc,
-            callable_guard_op,
-            crate::descr::function_code_descr(),
-            callee_code_key as i64,
-        )?;
-        walker_guard_function_field(
-            ctx,
-            op.pc,
-            callable_guard_op,
-            crate::descr::function_w_globals_descr(),
-            inline_consts.w_globals as i64,
-        )?;
+        // `function.py getcode()` promotes `self.code` via `code?`.  A
+        // ConstPtr callee is one object on every execution, so the
+        // marker is the orthodox pin (`kw_defs?` below does the same).
+        // A live operand is re-read: two closures from one `def` share
+        // a class and a code object.
+        if callable_guard_op.is_constant() {
+            walker_pin_function_code(ctx, op.pc, callable)?;
+            walker_pin_function_quasi_field(
+                ctx,
+                op.pc,
+                callable,
+                crate::descr::function_w_globals_descr(),
+            )?;
+        } else {
+            walker_guard_function_field(
+                ctx,
+                op.pc,
+                callable_guard_op,
+                crate::descr::function_code_descr(),
+                callee_code_key as i64,
+            )?;
+            walker_guard_function_field(
+                ctx,
+                op.pc,
+                callable_guard_op,
+                crate::descr::function_w_globals_descr(),
+                inline_consts.w_globals as i64,
+            )?;
+        }
         if !concrete_freevar_cells.is_empty() {
             // `closure?[*]`: the tuple itself is rebuilt by every
             // `MAKE_FUNCTION`, so read its cells live and thread those red
