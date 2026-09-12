@@ -10611,10 +10611,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // handlers and their `wire_bhimpl_handlers` calls already exist, but
     // `wire_handler` is a no-op for a key `setup_insns` never registered, so
     // without these entries the bytes reach `dispatch_step`'s unwired panic
-    // instead of their handler. Build-time (LLBC-extracted) jitcodes are the
-    // only producer — the runtime `JitCodeBuilder` emits the pyre-only
-    // `inline_call_nested_ext/P` byte instead — and any of them a
-    // guard-failure resume forward-executes can reach one.
+    // instead of their handler. `JitCodeBuilder` now emits these keys.
     //
     // A target whose path the host never published has no runtime address;
     // `read_inline_call_jitcode` + `is_callable_fnaddr` decline it rather than
@@ -13193,13 +13190,6 @@ fn interpret_unresolved_inline_call(
     dest: Option<(JitArgKind, usize)>,
     post_p: usize,
 ) -> Result<usize, DispatchError> {
-    // Grain and other hosts that never install MiniMark cannot execute
-    // Charon-lowered helper bodies: those bodies emit GETFIELD_GC that
-    // expect the collector. Fall back to LeaveFrame; the portal resumes
-    // at its merge point rather than jumping to a symbolic hash.
-    if !majit_gc::gc_sync::is_initialized() {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let Some(sub_jitcode) = handle.as_callee_jitcode() else {
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     };
