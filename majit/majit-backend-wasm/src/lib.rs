@@ -2269,7 +2269,6 @@ fn leak_home_gcmap(
 /// When one already covers the other the covered pointer is returned so a
 /// comparable publish does not leak.
 pub extern "C" fn wasm_jit_union_gcmap(old: i64, new: i64) -> i64 {
-    const MAX_WORDS: usize = 64;
     let old_ptr = old as usize as *const usize;
     let new_ptr = new as usize as *const usize;
     if old_ptr.is_null() {
@@ -2279,8 +2278,8 @@ pub extern "C" fn wasm_jit_union_gcmap(old: i64, new: i64) -> i64 {
         return old;
     }
     unsafe {
-        let n_old = (*old_ptr).min(MAX_WORDS);
-        let n_new = (*new_ptr).min(MAX_WORDS);
+        let n_old = *old_ptr;
+        let n_new = *new_ptr;
         let n_overlap = n_old.min(n_new);
         let mut old_extra = false;
         let mut new_extra = false;
@@ -6221,6 +6220,27 @@ mod tests {
             union as usize as i64,
             "owner is a subset of the union"
         );
+    }
+
+    #[test]
+    fn union_gcmap_keeps_bits_past_sixty_four_words() {
+        // value_slots=16, 4200 homes: last signed index is past 64 data words
+        // on a 64-bit host (`build_home_gcmap` word count).
+        let frame = codegen::FrameGeometry::compact(16, 4200, 2);
+        let owner = codegen::build_home_gcmap(frame, 4100, 0);
+        let bridge = codegen::build_home_gcmap(frame, 3, 2);
+        assert!(owner[0] > 64, "fixture must exceed the old 64-word cap");
+        let union = wasm_jit_union_gcmap(
+            owner.as_ptr() as usize as i64,
+            bridge.as_ptr() as usize as i64,
+        ) as usize as *const usize;
+        let n = unsafe { *union };
+        let words = unsafe { std::slice::from_raw_parts(union, 1 + n) };
+        let sign = std::mem::size_of::<isize>();
+        let idx = |h: usize| (frame.home_slot_base as usize + h * 8) / sign;
+        assert!(gcmap_marks(words, idx(4099)), "high ordinary home");
+        assert!(gcmap_marks(words, idx(4198)), "bridge label 0");
+        assert!(gcmap_marks(words, idx(4199)), "bridge label 1");
     }
 
     #[test]
