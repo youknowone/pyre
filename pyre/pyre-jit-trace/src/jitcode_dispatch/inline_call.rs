@@ -12660,11 +12660,14 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     let descent_unjournaled_before = fbw_has_unjournaled_effect();
     let mut driver = SubWalkDriver::new(frame);
     let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
-    let caller_replacements = FrameBoxReplacements::new(ctx.session);
-    caller_replacements.bind_banks(ctx.registers_r, ctx.registers_i, ctx.registers_f);
-    caller_replacements.bind_frame_state(&ctx.frame_state);
+    super::vable_ops::bind_paused_caller_regs(
+        ctx.session,
+        ctx.registers_r,
+        ctx.registers_i,
+        ctx.registers_f,
+        &ctx.frame_state,
+    );
     let result = driver.drive(ctx.trace_ctx);
-    drop(caller_replacements);
     match result {
         Ok((outcome, class_state)) => {
             // `MetaInterp.class_of_last_exc_is_const` is shared across the

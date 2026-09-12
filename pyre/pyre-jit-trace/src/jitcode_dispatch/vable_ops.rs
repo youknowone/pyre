@@ -100,7 +100,37 @@ fn replace_bound_banks(frame: &FrameBoxReplacementInbox, oldbox: OpRef, newbox: 
     }
 }
 
+fn replace_live_regs(live: &LiveFrameRegs, oldbox: OpRef, newbox: OpRef) {
+    live.replace_active_box(oldbox, newbox);
+}
+
+/// Bind this walk's live banks onto the MIFrame that is about to pause
+/// for a child: the top inlined Python frame, or the portal.
+pub(super) fn bind_paused_caller_regs(
+    session: &std::cell::RefCell<WalkSession>,
+    registers_r: &RegisterBank,
+    registers_i: &RegisterBank,
+    registers_f: &RegisterBank,
+    frame_state: &WalkFrameState,
+) {
+    let live = LiveFrameRegs::new(registers_r, registers_i, registers_f, frame_state);
+    let mut session = session.borrow_mut();
+    if let Some(top) = session.framestack.last_mut() {
+        top.live = Some(live);
+    } else {
+        session.portal_live = Some(live);
+    }
+}
+
 fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox: OpRef) {
+    if let Some(live) = session.portal_live.as_ref() {
+        replace_live_regs(live, oldbox, newbox);
+    }
+    for frame in &mut session.framestack {
+        if let Some(live) = frame.live.as_ref() {
+            replace_live_regs(live, oldbox, newbox);
+        }
+    }
     session.box_replacement_frames.retain(|frame| {
         if let Some(frame) = frame.upgrade() {
             if frame.listening.get() {
@@ -251,6 +281,7 @@ mod frame_replacement_tests {
                 frame_state: None,
             }],
             entry_executed_effects: 0,
+            live: None,
         });
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, middle);
         replace_box_in_paused_frames(&mut session.borrow_mut(), middle, standard);
@@ -404,6 +435,7 @@ mod frame_replacement_tests {
                 frame_state: Some(parent_state.clone()),
             }],
             entry_executed_effects: 0,
+            live: None,
         });
         assert!(session.borrow().box_replacement_frames.is_empty());
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
@@ -411,6 +443,30 @@ mod frame_replacement_tests {
         assert_eq!(parent_state.borrow().vstack_boxes, [new]);
         assert_eq!(parent_state.borrow().vstack_last_ref, new);
         assert_eq!(session.borrow().framestack[0].parents[0].boxes, vec![new]);
+    }
+
+    #[test]
+    fn replace_box_writes_portal_live_regs_without_a_mailbox() {
+        let old = OpRef::input_arg_ref(0);
+        let new = OpRef::input_arg_ref(1);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let regs = RegisterBank::new([old]);
+        let state = WalkFrameState::new(WalkFrameStateData {
+            vstack_boxes: vec![old],
+            ..Default::default()
+        });
+        bind_paused_caller_regs(
+            &session,
+            &regs,
+            &RegisterBank::default(),
+            &RegisterBank::default(),
+            &state,
+        );
+        assert!(session.borrow().framestack.is_empty());
+        assert!(session.borrow().portal_live.is_some());
+        replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
+        assert_eq!(regs.get(0), Some(new));
+        assert_eq!(state.borrow().vstack_boxes, [new]);
     }
 
     #[test]

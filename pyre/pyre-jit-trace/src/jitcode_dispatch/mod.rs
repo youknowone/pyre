@@ -557,6 +557,48 @@ pub struct InlineFrame {
     /// level and its descendants did, so it is only sound while the odometer
     /// has not moved since.
     pub entry_executed_effects: usize,
+    /// This level's own `MIFrame.registers_*` while a descendant (a helper
+    /// sub-walk) is running. `None` until a child pauses this frame.
+    live: Option<LiveFrameRegs>,
+}
+
+/// The live register banks of one paused `MIFrame`.
+///
+/// `MetaInterp.replace_box` writes `framestack` frames in place. The portal
+/// is not an `InlineFrame` (depth scans treat `framestack.len()` as the
+/// inlined-callee count), so it lives on [`WalkSession::portal_live`].
+pub(crate) struct LiveFrameRegs {
+    registers_r: RegisterBank,
+    registers_i: RegisterBank,
+    registers_f: RegisterBank,
+    frame_state: WalkFrameState,
+}
+
+impl LiveFrameRegs {
+    fn new(
+        registers_r: &RegisterBank,
+        registers_i: &RegisterBank,
+        registers_f: &RegisterBank,
+        frame_state: &WalkFrameState,
+    ) -> Self {
+        Self {
+            registers_r: registers_r.clone(),
+            registers_i: registers_i.clone(),
+            registers_f: registers_f.clone(),
+            frame_state: frame_state.clone(),
+        }
+    }
+
+    fn replace_active_box(&self, oldbox: OpRef, newbox: OpRef) {
+        let bank = match oldbox.ty() {
+            Some(majit_ir::Type::Int) => &self.registers_i,
+            Some(majit_ir::Type::Ref) => &self.registers_r,
+            Some(majit_ir::Type::Float) => &self.registers_f,
+            _ => return,
+        };
+        bank.replace_active_box(oldbox, newbox);
+        self.frame_state.replace_active_box(oldbox, newbox);
+    }
 }
 
 /// Per-trace-attempt walk session, owned by the walk driver and threaded
@@ -566,6 +608,9 @@ pub struct WalkSession {
     /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
     /// borrowed register banks. Resume snapshots are updated synchronously.
     pub(crate) box_replacement_frames: Vec<std::rc::Weak<vable_ops::FrameBoxReplacementInbox>>,
+    /// Portal `MIFrame` registers while a child runs. Not on `framestack`
+    /// because `framestack.len()` is the inlined-callee depth.
+    pub(crate) portal_live: Option<LiveFrameRegs>,
     /// The root frame's `is_being_profiled` portal green for this walk.
     pub is_being_profiled: bool,
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
@@ -700,6 +745,7 @@ impl Default for WalkSession {
         Self {
             is_being_profiled: false,
             box_replacement_frames: Vec::new(),
+            portal_live: None,
             framestack: Vec::new(),
             next_call_id: 1,
             open_inline_activations: 0,
@@ -6772,6 +6818,7 @@ impl<'a> InlineFrameGuard<'a> {
             debug_merge_point_py_pc: None,
             parents,
             entry_executed_effects: fbw_executed_effect_count(),
+            live: None,
         });
         drop(walk);
         if fbw_depth_census_enabled() {

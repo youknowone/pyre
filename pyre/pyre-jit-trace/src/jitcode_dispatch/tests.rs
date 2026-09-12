@@ -734,6 +734,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
         debug_merge_point_py_pc: None,
         parents: Vec::new(),
         entry_executed_effects: 0,
+        live: None,
     });
     let mut regs_r = Vec::new();
     let mut regs_i = Vec::new();
