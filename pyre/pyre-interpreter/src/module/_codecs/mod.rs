@@ -1490,58 +1490,6 @@ fn charmap_decode_impl(
         .finish())
 }
 
-fn utf7_is_base64(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'+' || b == b'/'
-}
-
-fn utf7_to_base64(n: u32) -> u8 {
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[(n & 0x3f) as usize]
-}
-
-fn utf7_from_base64(b: u8) -> u32 {
-    match b {
-        b'a'..=b'z' => (b - 71) as u32,
-        b'A'..=b'Z' => (b - 65) as u32,
-        b'0'..=b'9' => (b + 4) as u32,
-        b'+' => 62,
-        _ => 63,
-    }
-}
-
-fn utf7_decode_direct(b: u8) -> bool {
-    b <= 127 && b != b'+'
-}
-
-fn utf7_category(oc: u32) -> u8 {
-    if oc > 127 {
-        return 3;
-    }
-    let b = oc as u8;
-    if matches!(b, b'\t' | b'\n' | b'\r' | b' ') {
-        2
-    } else if b.is_ascii_alphanumeric() || b"'(),-./:?".contains(&b) {
-        0
-    } else if b"!\"#$%&*;<=>@[]^_`{|}".contains(&b) {
-        1
-    } else {
-        3
-    }
-}
-
-fn utf7_encode_direct(oc: u32) -> bool {
-    oc < 128 && oc > 0 && utf7_category(oc) != 3
-}
-
-fn utf7_encode_unit(out: &mut Vec<u8>, unit: u32, base64bits: &mut u32, base64buffer: &mut u32) {
-    *base64bits += 16;
-    *base64buffer = (*base64buffer << 16) | unit;
-    while *base64bits >= 6 {
-        out.push(utf7_to_base64(*base64buffer >> (*base64bits - 6)));
-        *base64bits -= 6;
-    }
-    *base64buffer &= (1 << *base64bits) - 1;
-}
-
 fn utf7_encode_impl(
     w_obj: PyObjectRef,
     errors: PyObjectRef,
@@ -1550,111 +1498,11 @@ fn utf7_encode_impl(
         return Err(bad_arg("utf_7_encode", Some(1), "str", w_obj));
     }
     let _errors = codec_errors_arg("utf_7_encode", 2, errors)?;
-    // PyPy `unicodehelper.py:utf8_encode_utf_7`.
-    let mut out = Vec::new();
-    let mut in_shift = false;
-    let mut base64bits = 0;
-    let mut base64buffer = 0;
-    for cp in unsafe { w_str_get_wtf8(w_obj) }.code_points() {
-        let oc = cp.to_u32();
-        if !in_shift {
-            if oc == b'+' as u32 {
-                out.extend_from_slice(b"+-");
-            } else if utf7_encode_direct(oc) {
-                out.push(oc as u8);
-            } else {
-                out.push(b'+');
-                in_shift = true;
-                if oc >= 0x10000 {
-                    utf7_encode_unit(
-                        &mut out,
-                        0xd800 | ((oc - 0x10000) >> 10),
-                        &mut base64bits,
-                        &mut base64buffer,
-                    );
-                    utf7_encode_unit(
-                        &mut out,
-                        0xdc00 | ((oc - 0x10000) & 0x3ff),
-                        &mut base64bits,
-                        &mut base64buffer,
-                    );
-                } else {
-                    utf7_encode_unit(&mut out, oc, &mut base64bits, &mut base64buffer);
-                }
-            }
-        } else if utf7_encode_direct(oc) {
-            if base64bits != 0 {
-                out.push(utf7_to_base64(base64buffer << (6 - base64bits)));
-                base64buffer = 0;
-                base64bits = 0;
-            }
-            in_shift = false;
-            if utf7_is_base64(oc as u8) || oc == b'-' as u32 {
-                out.push(b'-');
-            }
-            out.push(oc as u8);
-        } else if oc >= 0x10000 {
-            utf7_encode_unit(
-                &mut out,
-                0xd800 | ((oc - 0x10000) >> 10),
-                &mut base64bits,
-                &mut base64buffer,
-            );
-            utf7_encode_unit(
-                &mut out,
-                0xdc00 | ((oc - 0x10000) & 0x3ff),
-                &mut base64bits,
-                &mut base64buffer,
-            );
-        } else {
-            utf7_encode_unit(&mut out, oc, &mut base64bits, &mut base64buffer);
-        }
-    }
-    if base64bits != 0 {
-        out.push(utf7_to_base64(base64buffer << (6 - base64bits)));
-    }
-    if in_shift {
-        out.push(b'-');
-    }
+    let out = crate::codec_engine::encode_utf7(unsafe { w_str_get_wtf8(w_obj) });
     Ok(rooted_tuple()
         .arg(w_bytes_from_bytes(&out))
         .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
         .finish())
-}
-
-/// Route a utf-7 decode error through the requested handler, shaped like
-/// `unicode_escape_error`. Returns the resume position and, when a custom
-/// handler replaced `exc.object`, the new input bytes to resume from.
-fn utf7_decode_error(
-    errors: &str,
-    original: &[u8],
-    start: usize,
-    end: usize,
-    reason: &str,
-    out: &mut rustpython_wtf8::Wtf8Buf,
-) -> Result<(usize, Option<Vec<u8>>), crate::PyError> {
-    match errors {
-        "strict" => Err(crate::typedef::unicode_decode_error(
-            "utf7", original, start, end, reason,
-        )),
-        "ignore" => Ok((end, None)),
-        "replace" => {
-            out.push_char('\u{FFFD}');
-            Ok((end, None))
-        }
-        "backslashreplace" => {
-            for &b in &original[start..end.min(original.len())] {
-                out.push_str(&format!("\\x{b:02x}"));
-            }
-            Ok((end, None))
-        }
-        "xmlcharrefreplace" | "namereplace" => {
-            Err(crate::typedef::decode_error_encode_only_handler())
-        }
-        _ => crate::type_methods::call_registered_decode_error_handler(
-            errors, "utf7", original, start, end, reason, out,
-        ),
-    }
 }
 
 fn utf7_decode_impl(
@@ -1665,180 +1513,13 @@ fn utf7_decode_impl(
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_obj) } {
         return Err(bad_buffer_arg(w_obj));
     }
-    // PyPy `unicodehelper.py:str_decode_utf_7`.
     let errors_s = codec_errors_arg("utf_7_decode", 2, errors)?;
-    let errors_s = errors_s.as_str();
-    // A custom error handler may replace `exc.object`; decoding then resumes
-    // from the new bytes (`data`).
-    let mut data: std::borrow::Cow<[u8]> =
-        std::borrow::Cow::Borrowed(unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) });
-    let mut out = rustpython_wtf8::Wtf8Buf::new();
-    let mut pos = 0usize;
-    let mut in_shift = false;
-    let mut base64bits = 0u32;
-    let mut base64buffer = 0u32;
-    let mut surrogate = 0u32;
-    // Output byte length captured when a shift opened (`shiftOutStartPos`),
-    // used to back off an unterminated shift in a non-final chunk.
-    let mut shift_out_start = 0usize;
-    // Input position of the `+` that opened the current shift, used as the
-    // start anchor for its error spans (`startinpos`).
-    let mut startinpos = 0usize;
-    while pos < data.len() {
-        let ch = data[pos];
-        if in_shift {
-            if utf7_is_base64(ch) {
-                base64buffer = (base64buffer << 6) | utf7_from_base64(ch);
-                base64bits += 6;
-                pos += 1;
-                if base64bits >= 16 {
-                    let out_ch = base64buffer >> (base64bits - 16);
-                    base64bits -= 16;
-                    base64buffer &= (1 << base64bits) - 1;
-                    if surrogate != 0 {
-                        if (0xdc00..=0xdfff).contains(&out_ch) {
-                            let code = (((surrogate & 0x3ff) << 10) | (out_ch & 0x3ff)) + 0x10000;
-                            out.push(rustpython_wtf8::CodePoint::from_u32(code).unwrap());
-                            surrogate = 0;
-                            continue;
-                        }
-                        out.push(rustpython_wtf8::CodePoint::from_u32(surrogate).unwrap());
-                        surrogate = 0;
-                    }
-                    if (0xd800..=0xdbff).contains(&out_ch) {
-                        surrogate = out_ch;
-                    } else {
-                        out.push(rustpython_wtf8::CodePoint::from_u32(out_ch).unwrap());
-                    }
-                }
-            } else {
-                // now leaving a base-64 section
-                in_shift = false;
-                if base64bits >= 6 {
-                    // At least one base-64 character was seen but a whole
-                    // unit was not: partial character. The terminating byte
-                    // is consumed and folded into the error span.
-                    pos += 1;
-                    let (np, nb) = utf7_decode_error(
-                        errors_s,
-                        &data[..],
-                        startinpos,
-                        pos,
-                        "partial character in shift sequence",
-                        &mut out,
-                    )?;
-                    if let Some(nb) = nb {
-                        data = std::borrow::Cow::Owned(nb);
-                    }
-                    pos = np;
-                    continue;
-                } else if base64bits > 0 && base64buffer != 0 {
-                    // Leftover bits that should have been zero.
-                    pos += 1;
-                    let (np, nb) = utf7_decode_error(
-                        errors_s,
-                        &data[..],
-                        startinpos,
-                        pos,
-                        "non-zero padding bits in shift sequence",
-                        &mut out,
-                    )?;
-                    if let Some(nb) = nb {
-                        data = std::borrow::Cow::Owned(nb);
-                    }
-                    pos = np;
-                    continue;
-                }
-                if surrogate != 0 && utf7_decode_direct(ch) {
-                    out.push(rustpython_wtf8::CodePoint::from_u32(surrogate).unwrap());
-                }
-                surrogate = 0;
-                if ch == b'-' {
-                    // '-' is absorbed; other terminating characters are preserved.
-                    pos += 1;
-                }
-            }
-        } else if ch == b'+' {
-            startinpos = pos;
-            pos += 1;
-            if pos < data.len() && data[pos] == b'-' {
-                pos += 1;
-                out.push_char('+');
-            } else if pos < data.len() && !utf7_is_base64(data[pos]) {
-                let (np, nb) = utf7_decode_error(
-                    errors_s,
-                    &data[..],
-                    startinpos,
-                    startinpos + 2,
-                    "ill-formed sequence",
-                    &mut out,
-                )?;
-                if let Some(nb) = nb {
-                    data = std::borrow::Cow::Owned(nb);
-                }
-                pos = np;
-            } else {
-                // begin base64-encoded section
-                in_shift = true;
-                surrogate = 0;
-                shift_out_start = out.len();
-                base64bits = 0;
-                base64buffer = 0;
-            }
-        } else if utf7_decode_direct(ch) {
-            out.push_char(ch as char);
-            pos += 1;
-        } else {
-            startinpos = pos;
-            pos += 1;
-            let (np, nb) = utf7_decode_error(
-                errors_s,
-                &data[..],
-                startinpos,
-                pos,
-                "unexpected special character",
-                &mut out,
-            )?;
-            if let Some(nb) = nb {
-                data = std::borrow::Cow::Owned(nb);
-            }
-            pos = np;
-        }
-    }
-    // end of string
-    let mut consumed = data.len();
-    if in_shift && is_final {
-        // in shift sequence with no more input to follow
-        in_shift = false;
-        if surrogate != 0 || base64bits >= 6 || (base64bits > 0 && base64buffer != 0) {
-            // The handler pushes its replacement into `out` itself; the input
-            // is fully consumed, so its returned position is not reused.
-            let (_np, _nb) = utf7_decode_error(
-                errors_s,
-                &data[..],
-                startinpos,
-                pos,
-                "unterminated shift sequence",
-                &mut out,
-            )?;
-        }
-    } else if in_shift {
-        // Non-final chunk ending mid-shift: back off to the '+' that opened it.
-        consumed = startinpos;
-        out.truncate(shift_out_start);
-    }
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) }.to_vec();
+    let (out, consumed) = crate::codec_engine::decode_utf7(data, &errors_s, is_final)?;
     Ok(rooted_tuple()
         .arg(w_str_from_wtf8_managed(out))
         .arg(w_int_new(consumed as i64))
         .finish())
-}
-
-fn push_ascii_hex_escape(out: &mut Vec<u8>, prefix: u8, cp: u32, digits: usize) {
-    out.push(b'\\');
-    out.push(prefix);
-    for shift in (0..digits).rev() {
-        out.push(b"0123456789abcdef"[((cp >> (shift * 4)) & 0xf) as usize]);
-    }
 }
 
 fn unicode_escape_encode_impl(
@@ -1849,150 +1530,11 @@ fn unicode_escape_encode_impl(
         return Err(bad_arg("unicode_escape_encode", Some(1), "str", w_obj));
     }
     let _errors = codec_errors_arg("unicode_escape_encode", 2, errors)?;
-    // PyPy `unicodehelper.py:utf8_encode_unicode_escape`.
-    let mut out = Vec::new();
-    for cp in unsafe { w_str_get_wtf8(w_obj) }.code_points() {
-        match cp.to_u32() {
-            0x5c => out.extend_from_slice(br"\\"),
-            0x09 => out.extend_from_slice(br"\t"),
-            0x0a => out.extend_from_slice(br"\n"),
-            0x0d => out.extend_from_slice(br"\r"),
-            0x20..=0x7e => out.push(cp.to_u32() as u8),
-            c @ 0x00..=0xff => push_ascii_hex_escape(&mut out, b'x', c, 2),
-            c @ 0x100..=0xffff => push_ascii_hex_escape(&mut out, b'u', c, 4),
-            c => push_ascii_hex_escape(&mut out, b'U', c, 8),
-        }
-    }
+    let out = crate::codec_engine::encode_unicode_escape(unsafe { w_str_get_wtf8(w_obj) });
     Ok(rooted_tuple()
         .arg(w_bytes_from_bytes(&out))
         .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
         .finish())
-}
-
-fn unicode_escape_error(
-    errors: &str,
-    original: &[u8],
-    start: usize,
-    end: usize,
-    reason: &str,
-    out: &mut rustpython_wtf8::Wtf8Buf,
-) -> Result<(usize, Option<Vec<u8>>), crate::PyError> {
-    match errors {
-        "strict" => Err(crate::typedef::unicode_decode_error(
-            "unicodeescape",
-            original,
-            start,
-            end,
-            reason,
-        )),
-        "ignore" => Ok((end, None)),
-        "replace" => {
-            out.push_char('\u{FFFD}');
-            Ok((end, None))
-        }
-        "backslashreplace" => {
-            for &b in &original[start..end.min(original.len())] {
-                out.push_str(&format!("\\x{b:02x}"));
-            }
-            Ok((end, None))
-        }
-        "xmlcharrefreplace" | "namereplace" => {
-            Err(crate::typedef::decode_error_encode_only_handler())
-        }
-        _ => crate::type_methods::call_registered_decode_error_handler(
-            errors,
-            "unicodeescape",
-            original,
-            start,
-            end,
-            reason,
-            out,
-        ),
-    }
-}
-
-/// Route a unicode-escape decode error, rebinding `data` when the handler
-/// replaced `exc.object`. `pos_delta` accumulates the buffer length change so
-/// the reported consumed count stays relative to the original input
-/// (`str_decode_unicode_escape`'s `pos_delta`). Returns the resume position
-/// in the (possibly replaced) buffer.
-fn unicode_escape_run_error(
-    data: &mut std::borrow::Cow<[u8]>,
-    out: &mut rustpython_wtf8::Wtf8Buf,
-    pos_delta: &mut i64,
-    start: usize,
-    end: usize,
-    reason: &str,
-    errors: &str,
-) -> Result<usize, crate::PyError> {
-    let prelen = data.len();
-    let (np, nb) = unicode_escape_error(errors, &data[..], start, end, reason, out)?;
-    if let Some(b) = nb {
-        *data = std::borrow::Cow::Owned(b);
-        *pos_delta += prelen as i64 - data.len() as i64;
-    }
-    Ok(np)
-}
-
-/// `unicodehelper.py:hexescape` — `pos` points just past the `\x`/`\u`/`\U`
-/// intro, so the escape's backslash is at `pos - 2`. Decodes `digits` hex
-/// digits into a code point, or routes a truncated/illegal error. Returns the
-/// resume position.
-fn unicode_escape_hex(
-    data: &mut std::borrow::Cow<[u8]>,
-    out: &mut rustpython_wtf8::Wtf8Buf,
-    pos_delta: &mut i64,
-    pos: usize,
-    digits: usize,
-    message: &str,
-    errors: &str,
-) -> Result<usize, crate::PyError> {
-    if pos + digits <= data.len()
-        && data[pos..pos + digits]
-            .iter()
-            .all(|b| b.is_ascii_hexdigit())
-    {
-        let value = u32::from_str_radix(std::str::from_utf8(&data[pos..pos + digits]).unwrap(), 16)
-            .unwrap();
-        if let Some(cp) = rustpython_wtf8::CodePoint::from_u32(value) {
-            out.push(cp);
-            return Ok(pos + digits);
-        }
-        // A valid hex value outside the Unicode range: the whole escape span
-        // (`pos - 2 .. pos + digits`) is reported.
-        return unicode_escape_run_error(
-            data,
-            out,
-            pos_delta,
-            pos - 2,
-            pos + digits,
-            "illegal Unicode character",
-            errors,
-        );
-    }
-    // Too few digits, or a non-hex digit: the error span covers the run of hex
-    // digits actually present after the intro.
-    let mut endinpos = pos;
-    while endinpos < data.len() && data[endinpos].is_ascii_hexdigit() {
-        endinpos += 1;
-    }
-    unicode_escape_run_error(data, out, pos_delta, pos - 2, endinpos, message, errors)
-}
-
-/// The `DeprecationWarning` text an unrecognised escape earns while decoding.
-///
-/// `prefix` distinguishes the two decoders: the bytes-to-bytes transform names
-/// the sequence as a `bytes` literal, the text one as a `str` literal.  The
-/// wording stops after the "will not work in the future" sentence -- the longer
-/// report carrying a "Did you mean" suggestion belongs to the compiler, which
-/// has the surrounding literal to suggest a raw string for.
-fn invalid_escape_warning(prefix: &str, sequence: &str, octal: bool) -> String {
-    let kind = if octal {
-        "an invalid octal escape sequence"
-    } else {
-        "an invalid escape sequence"
-    };
-    format!("{prefix}\"\\{sequence}\" is {kind}. Such sequences will not work in the future. ")
 }
 
 /// Acquire a backslash-escape decoder's input.  A `str` answers with its own
@@ -2011,186 +1553,19 @@ fn unicode_escape_decode_impl(
     errors: PyObjectRef,
     final_: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let initial = escape_decoder_input(w_obj)?;
+    let data = escape_decoder_input(w_obj)?;
     let errors_s = codec_errors_arg("unicode_escape_decode", 2, errors)?;
-    let errors_s = errors_s.as_str();
-    // `unicodehelper.py:str_decode_unicode_escape` (final=True). A custom error
-    // handler may replace `exc.object`; decoding then resumes from the new
-    // bytes (`data`), and `pos_delta` keeps the reported consumed count
-    // relative to the original input length.
-    let mut data: std::borrow::Cow<[u8]> = std::borrow::Cow::Owned(initial);
-    let mut out = rustpython_wtf8::Wtf8Buf::new();
-    let mut pos = 0usize;
-    let mut pos_delta = 0i64;
-    let mut first_escape_warning: Option<String> = None;
-    while pos < data.len() {
-        let ch = data[pos];
-        if ch != b'\\' {
-            out.push(rustpython_wtf8::CodePoint::from_u32(ch as u32).unwrap());
-            pos += 1;
-            continue;
-        }
-        let escape_start = pos;
-        pos += 1;
-        if pos >= data.len() {
-            if !final_ {
-                // More input may follow, so the backslash is left unconsumed
-                // rather than reported: what it introduces is still unknown.
-                pos = escape_start;
-                break;
-            }
-            let end = data.len();
-            pos = unicode_escape_run_error(
-                &mut data,
-                &mut out,
-                &mut pos_delta,
-                escape_start,
-                end,
-                "\\ at end of string",
-                errors_s,
-            )?;
-            continue;
-        }
-        let ch = data[pos];
-        pos += 1;
-        match ch {
-            b'\n' => {}
-            b'\\' => out.push_char('\\'),
-            b'\'' => out.push_char('\''),
-            b'"' => out.push_char('"'),
-            b'b' => out.push_char('\x08'),
-            b'f' => out.push_char('\x0c'),
-            b't' => out.push_char('\t'),
-            b'n' => out.push_char('\n'),
-            b'r' => out.push_char('\r'),
-            b'v' => out.push_char('\x0b'),
-            b'a' => out.push_char('\x07'),
-            b'0'..=b'7' => {
-                let octal_start = pos - 1;
-                let mut value = (ch - b'0') as u32;
-                for _ in 0..2 {
-                    if pos < data.len() && matches!(data[pos], b'0'..=b'7') {
-                        value = (value << 3) + (data[pos] - b'0') as u32;
-                        pos += 1;
-                    }
-                }
-                // Only three octal digits are read, so the largest escape is
-                // `\777`; anything past `\377` leaves the byte range the
-                // sequence is written to address.
-                if value > 0o377 && first_escape_warning.is_none() {
-                    first_escape_warning = Some(invalid_escape_warning(
-                        "",
-                        &String::from_utf8_lossy(&data[octal_start..pos]),
-                        true,
-                    ));
-                }
-                out.push(rustpython_wtf8::CodePoint::from_u32(value).unwrap());
-            }
-            b'x' | b'u' | b'U' => {
-                let (digits, msg) = match ch {
-                    b'x' => (2usize, "truncated \\xXX escape"),
-                    b'u' => (4usize, "truncated \\uXXXX escape"),
-                    _ => (8usize, "truncated \\UXXXXXXXX escape"),
-                };
-                if !final_ && pos + digits > data.len() {
-                    // The escape runs off the end of this chunk; the digits it
-                    // is missing can still arrive.  A sequence the chunk does
-                    // decide -- four bytes that are not all hex -- is reported
-                    // here whether or not more input follows.
-                    pos = escape_start;
-                    break;
-                }
-                pos = unicode_escape_hex(
-                    &mut data,
-                    &mut out,
-                    &mut pos_delta,
-                    pos,
-                    digits,
-                    msg,
-                    errors_s,
-                )?;
-            }
-            b'N' => {
-                // `\N{NAME}` is resolved through the character database.  Only
-                // a name that names one character resolves, so a named
-                // sequence is reported as unknown; a name that is empty,
-                // unterminated, or not introduced by a brace at all is
-                // malformed instead, and each spelling reports its own span.
-                let (msg, end) = if pos < data.len() && data[pos] == b'{' {
-                    let name_start = pos + 1;
-                    let mut look = name_start;
-                    while look < data.len() && data[look] != b'}' {
-                        look += 1;
-                    }
-                    if look >= data.len() {
-                        if !final_ {
-                            // The closing brace can arrive with the next chunk.
-                            pos = escape_start;
-                            break;
-                        }
-                        ("malformed \\N character escape", data.len())
-                    } else if look == name_start {
-                        // An empty name is not a name to look up.
-                        ("malformed \\N character escape", name_start)
-                    } else {
-                        // Owned so the database read does not borrow `data`,
-                        // which the error path below hands out mutably.
-                        let name = String::from_utf8(data[name_start..look].to_vec()).ok();
-                        match name
-                            .as_deref()
-                            .and_then(rustpython_unicode::lookup_character)
-                        {
-                            Some(ch) => {
-                                out.push_char(ch);
-                                pos = look + 1;
-                                continue;
-                            }
-                            None => ("unknown Unicode character name", look + 1),
-                        }
-                    }
-                } else if pos >= data.len() && !final_ {
-                    // `\N` at the very end: the byte deciding whether a name
-                    // follows has not arrived yet.
-                    pos = escape_start;
-                    break;
-                } else {
-                    ("malformed \\N character escape", pos)
-                };
-                pos = unicode_escape_run_error(
-                    &mut data,
-                    &mut out,
-                    &mut pos_delta,
-                    escape_start,
-                    end,
-                    msg,
-                    errors_s,
-                )?;
-            }
-            _ => {
-                if first_escape_warning.is_none() {
-                    first_escape_warning = Some(invalid_escape_warning(
-                        "",
-                        &char::from(ch).to_string(),
-                        false,
-                    ));
-                }
-                out.push_char('\\');
-                out.push(rustpython_wtf8::CodePoint::from_u32(ch as u32).unwrap());
-            }
-        }
-    }
-    if let Some(message) = first_escape_warning {
-        crate::warn::warn_deprecation(&message)?;
+    let (out, consumed, note) =
+        crate::codec_engine::decode_unicode_escape(data, &errors_s, final_)?;
+    if let Some(note) = note {
+        crate::warn::warn_deprecation(&note.message)?;
     }
     Ok(rooted_tuple()
         .arg(w_str_from_wtf8_managed(out))
-        .arg(w_int_new(pos as i64 + pos_delta))
+        .arg(w_int_new(consumed as i64))
         .finish())
 }
 
-/// `unicode_escape_decode`'s raw counterpart: only `\uXXXX` and
-/// `\UXXXXXXXX` are escapes, every other byte -- a lone backslash included --
-/// standing for its own Latin-1 code point.
 fn raw_unicode_escape_decode_impl(
     w_obj: PyObjectRef,
     errors: PyObjectRef,
@@ -2206,9 +1581,6 @@ fn raw_unicode_escape_decode_impl(
         .finish())
 }
 
-/// `interp_codecs.py escape_decode` / `_PyString_DecodeEscape` — the
-/// bytes-to-bytes Python string-literal escape transform used by protocol-0
-/// pickle.
 fn escape_decode_impl(
     w_obj: PyObjectRef,
     errors: PyObjectRef,
@@ -2221,100 +1593,8 @@ fn escape_decode_impl(
         return Err(bad_buffer_arg(w_obj));
     };
     let errors_s = codec_errors_arg("escape_decode", 2, errors)?;
-    let errors_s = errors_s.as_str();
-
-    let mut out = Vec::with_capacity(data.len());
-    let mut pos = 0usize;
-    let mut first_escape_warning: Option<String> = None;
-    while pos < data.len() {
-        if data[pos] != b'\\' {
-            out.push(data[pos]);
-            pos += 1;
-            continue;
-        }
-
-        let escape_start = pos;
-        pos += 1;
-        if pos == data.len() {
-            return Err(crate::PyError::value_error("Trailing \\ in string"));
-        }
-        let ch = data[pos];
-        pos += 1;
-        match ch {
-            b'\n' => {}
-            b'\\' => out.push(b'\\'),
-            b'\'' => out.push(b'\''),
-            b'"' => out.push(b'"'),
-            b'b' => out.push(0x08),
-            b'f' => out.push(0x0c),
-            b't' => out.push(b'\t'),
-            b'n' => out.push(b'\n'),
-            b'r' => out.push(b'\r'),
-            b'v' => out.push(0x0b),
-            b'a' => out.push(0x07),
-            b'0'..=b'7' => {
-                let octal_start = pos - 1;
-                while pos < data.len()
-                    && pos < octal_start + 3
-                    && (b'0'..=b'7').contains(&data[pos])
-                {
-                    pos += 1;
-                }
-                let raw = data[octal_start..pos]
-                    .iter()
-                    .fold(0u16, |value, digit| value * 8 + (digit - b'0') as u16);
-                if raw >= 256 && first_escape_warning.is_none() {
-                    first_escape_warning = Some(invalid_escape_warning(
-                        "b",
-                        &String::from_utf8_lossy(&data[octal_start..pos]),
-                        true,
-                    ));
-                }
-                out.push(raw as u8);
-            }
-            b'x' => {
-                let hi = data.get(pos).and_then(|byte| (*byte as char).to_digit(16));
-                let lo = data
-                    .get(pos + 1)
-                    .and_then(|byte| (*byte as char).to_digit(16));
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi * 16 + lo) as u8);
-                    pos += 2;
-                } else {
-                    match errors_s {
-                        "strict" => {
-                            return Err(crate::PyError::value_error(format!(
-                                "invalid \\x escape at position {escape_start}"
-                            )));
-                        }
-                        "replace" => out.push(b'?'),
-                        "ignore" => {}
-                        other => {
-                            return Err(crate::PyError::value_error(format!(
-                                "decoding error; unknown error handling code: {other}"
-                            )));
-                        }
-                    }
-                    if data.get(pos).is_some_and(u8::is_ascii_hexdigit) {
-                        pos += 1;
-                    }
-                }
-            }
-            other => {
-                out.push(b'\\');
-                pos -= 1;
-                if first_escape_warning.is_none() {
-                    first_escape_warning = Some(invalid_escape_warning(
-                        "b",
-                        &char::from(other).to_string(),
-                        false,
-                    ));
-                }
-            }
-        }
-    }
-
-    if let Some(message) = first_escape_warning {
+    let (out, warning) = crate::codec_engine::decode_escape(&data, &errors_s)?;
+    if let Some(message) = warning {
         crate::warn::warn_deprecation(&message)?;
     }
     Ok(rooted_tuple()
@@ -2323,8 +1603,6 @@ fn escape_decode_impl(
         .finish())
 }
 
-/// `interp_codecs.py escape_encode` / `string_escape_encode(data,
-/// quote=False)` — the inverse bytes transform.
 fn escape_encode_impl(
     w_obj: PyObjectRef,
     errors: PyObjectRef,
@@ -2334,18 +1612,7 @@ fn escape_encode_impl(
     }
     let _errors = codec_errors_arg("escape_encode", 2, errors)?;
     let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
-    let mut out = Vec::with_capacity(data.len());
-    for byte in data {
-        match *byte {
-            b'\t' => out.extend_from_slice(b"\\t"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\'' => out.extend_from_slice(b"\\'"),
-            0x20..=0x7e => out.push(*byte),
-            value => out.extend_from_slice(format!("\\x{value:02x}").as_bytes()),
-        }
-    }
+    let out = crate::codec_engine::encode_escape(data);
     Ok(rooted_tuple()
         .arg(w_bytes_from_bytes(&out))
         .arg(w_int_new(data.len() as i64))
