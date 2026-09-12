@@ -7061,24 +7061,14 @@ impl OptContext {
         true
     }
 
-    /// The second merge-point Ref red — Grain's live `Vm`.
+    /// Grain's live `Vm`, when the bridge remint named it.
     ///
-    /// Only when the optimizer's inputargs are exactly the two portal
-    /// reds. An expanded virtualizable list puts a field (brainfuck's
-    /// tape pointer, pyre's next state slot) at index 1; treating that
-    /// as the Vm duplicates it into fail_args and leaves pending
-    /// fields untagged.
+    /// Not `inputargs[1]`: a two-Ref optimizer (this crate's virtualize
+    /// tests, brainfuck's tape pointer after vable expansion, pyre's
+    /// topframeref) is not Grain. Production Grain loops are already
+    /// expanded past two reds; the reminted failarg is `bridge_vm_red`.
     fn declared_vm_red(&self) -> Option<OpRef> {
-        if let Some(vm) = self.bridge_vm_red {
-            return Some(vm);
-        }
-        if self.inputargs.len() == 2
-            && self.inputargs[0].ty() == Some(Type::Ref)
-            && self.inputargs[1].ty() == Some(Type::Ref)
-        {
-            return self.inputargs.get(1).copied();
-        }
-        None
+        self.bridge_vm_red
     }
 
     /// Phase-1 name (`InputArg(1)`) or the Phase-2 host at `inputarg_base+1`.
@@ -10229,6 +10219,7 @@ mod boxref_forwarding_tests {
             OpRef::input_arg_typed(0, Type::Ref),
             OpRef::input_arg_typed(1, Type::Ref),
         ];
+        ctx.bridge_vm_red = Some(OpRef::input_arg_typed(1, Type::Ref));
         let mut boxes = vec![
             crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(0, Type::Ref), Type::Ref),
             crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(231, Type::Ref), Type::Ref),
