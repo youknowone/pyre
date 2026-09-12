@@ -3029,7 +3029,7 @@ fn emit_frontend_compare(
 /// CONTAINS_OP lowering — reuses the compare-residual machinery. The
 /// graph op carries the args as `[item, container]`; `flatten`'s
 /// `compare_op_tag_for_opname` maps `contains`/`not_contains` to tags
-/// 6/7, and `bh_compare_fn` dispatches them to `baseobjspace::contains`.
+/// 6/7, and `compare_value_from_tag` dispatches them to `baseobjspace::contains`.
 fn emit_frontend_contains(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -11891,7 +11891,7 @@ impl CodeWriter {
 
                         // IsOp: pops 2, pushes 1 bool. Net: -1.
                         // Pointer identity routed through the compare residual
-                        // (`is` → tag 8, `is_not` → tag 9; bh_compare_fn).
+                        // (`is` → tag 8, `is_not` → tag 9; compare_value_from_tag).
                         Instruction::IsOp { invert } => {
                             let invert_kind = invert.get(op_arg);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);

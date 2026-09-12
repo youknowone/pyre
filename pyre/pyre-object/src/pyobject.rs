@@ -166,11 +166,23 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
+    unsafe { class_word_is_exact_builtin(obj, (*obj).w_class) }
+}
+
+/// The tail of [`is_exact_builtin_instance`] for a non-null `obj` whose
+/// class word the caller has already read (and may have promoted): a null
+/// class word is a read-only singleton and exact; otherwise the class must
+/// be the one the object's layout instantiates, with the specialised
+/// arity-2 tuple payload types mapping to the canonical `tuple` class.
+///
+/// # Safety
+/// `obj` must be a valid non-null `PyObjectRef` and `w_class` its class word.
+#[inline]
+pub unsafe fn class_word_is_exact_builtin(obj: PyObjectRef, w_class: PyObjectRef) -> bool {
+    if w_class.is_null() {
+        return true;
+    }
     unsafe {
-        let w_class = (*obj).w_class;
-        if w_class.is_null() {
-            return true;
-        }
         let ob_type = (*obj).ob_type;
         use crate::specialisedtupleobject::{
             SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,

@@ -6975,7 +6975,7 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
 }
 
 /// Walker-native fold of the CHECK_EXC_MATCH
-/// residual (`bh_compare_fn(exc, match_type, op_tag=10)`,
+/// residual (`compare_value_from_tag(exc, match_type, op_tag=10)`,
 /// `call_jit.rs`). Computes the match concretely from
 /// `type(exc)` and `match_type` and emit a `const_ref` of the immortal
 /// TRUE/FALSE bool singleton, eliding the opaque may-force compare (and, since
@@ -7401,7 +7401,7 @@ fn is_w_compares_by_value(tp: *const pyre_object::pyobject::PyType) -> bool {
     .any(|special| std::ptr::eq(*special, tp))
 }
 
-/// Walker-native fold of the `IS_OP` residual — `bh_compare_fn(lhs, rhs,
+/// Walker-native fold of the `IS_OP` residual — `compare_value_from_tag(lhs, rhs,
 /// tag)` with tag 8 (`is`) or 9 (`is_not`), the tags
 /// `compare_op_tag_for_opname` assigns those two opnames.
 ///
@@ -9280,7 +9280,7 @@ pub(crate) fn binary_value_from_tag_jitcode()
 /// codewriter inlines for BINARY.  The per-index name table can miss a
 /// helper that `pathed_jitcode_cached` still owns, and a name-only
 /// check then skipped descent so a declined sub-walk residualized
-/// `CallMayForce` (`bh_binary_op_fn`) on fib bridges.
+/// `CallMayForce` (`binary_value_from_tag`) on fib bridges.
 pub(crate) fn jitcode_is_binary_value_from_tag(
     sub_index: usize,
     sub_body: &super::SubJitCodeBody,
@@ -9298,7 +9298,7 @@ pub(crate) fn jitcode_is_binary_value_from_tag(
 /// Tag for a declined helper walk that is `binary_value_from_tag` or a
 /// named `add`/`sub`/`int_add` body.  Used so a bridge that cannot
 /// stamp the helper resume word still emits `int_add` instead of
-/// `CallMayForce` (`bh_binary_op_fn`).
+/// `CallMayForce` (`binary_value_from_tag`).
 pub(crate) fn binary_op_tag_for_helper_index(
     sub_index: usize,
     int_concretes: &[ConcreteValue],
@@ -10134,7 +10134,7 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
 
 /// `s[i]` on an exact `str` with an exact machine-`int` index: emit the
 /// guarded unbox plus one elidable [`pyre_object::jit_str_getitem`] call
-/// instead of the opaque `bh_binary_op_fn` residual.
+/// instead of the opaque `binary_value_from_tag` residual.
 ///
 /// The residual it replaces is a `CallMayForce`, which forces virtualizables
 /// and clears the heap cache across itself; measured against an otherwise

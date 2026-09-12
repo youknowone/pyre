@@ -9502,7 +9502,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
                     // `op_tag == 10` is CHECK_EXC_MATCH
-                    // (`bh_compare_fn(exc, match_type, 10)`,
+                    // (`compare_value_from_tag(exc, match_type, 10)`,
                     // `call_jit.rs`).  Fold the match concretely to a
                     // const bool (the immortal TRUE/FALSE singleton) so the
                     // exception stays virtual and DCEs, eliding the may-force
