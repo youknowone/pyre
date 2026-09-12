@@ -1626,7 +1626,7 @@ crate::py_module! {
                 crate::make_module_builtin_function_with_arity_and_maybe_sig(
                     "pack",
                     pack,
-                    crate::BuiltinCodeFlags::HOPELESS.bits(),
+                    crate::HOPELESS,
                     Some(sig_posonly_then_varargs("pack", &["format"], "args")),
                 ),
             ),
@@ -1639,7 +1639,7 @@ crate::py_module! {
                 crate::make_module_builtin_function_with_arity_and_maybe_sig(
                     "pack_into",
                     pack_into,
-                    crate::BuiltinCodeFlags::HOPELESS.bits(),
+                    crate::HOPELESS,
                     Some(sig_posonly_then_varargs(
                         "pack_into",
                         &["format", "buffer", "offset"],

@@ -876,6 +876,11 @@ bitflags::bitflags! {
     }
 }
 
+/// eval.py:22 `HOPELESS = 0x400` — module-level integer so `immutablevalue`
+/// reads a prebuilt Constant; the `bitflags!` associated const has an Opaque
+/// initializer and becomes an unregistered nullary Call.
+pub const HOPELESS: u16 = 0x400;
+
 /// Allocate a new `BuiltinCode` with no docstring.
 /// `fast_natural_arity` defaults to HOPELESS (no fast path).
 pub fn builtin_code_new(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
@@ -910,7 +915,7 @@ pub fn builtin_code_new_with_doc(
         name,
         func,
         docstring,
-        BuiltinCodeFlags::HOPELESS.bits(),
+        HOPELESS,
         std::ptr::null(),
     )
 }
@@ -1016,7 +1021,7 @@ pub fn builtin_code_new_with_signature(
         name,
         func,
         docstring,
-        BuiltinCodeFlags::HOPELESS.bits(),
+        HOPELESS,
         sig,
     )
 }
@@ -1769,7 +1774,7 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
 ) -> PyObjectRef {
     let arity = match &signature {
         Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => {
-            BuiltinCodeFlags::HOPELESS.bits()
+            HOPELESS
         }
         _ => arity,
     };
@@ -1985,7 +1990,7 @@ pub fn make_module_builtin_function_with_arity_and_sig(
 ) -> PyObjectRef {
     let arity =
         if signature.has_vararg() || signature.has_kwarg() || signature.num_kwonlyargnames() > 0 {
-            BuiltinCodeFlags::HOPELESS.bits()
+            HOPELESS
         } else {
             arity
         };
@@ -2012,7 +2017,7 @@ pub fn make_module_builtin_function_with_arity_and_maybe_sig(
 ) -> PyObjectRef {
     let arity = match &signature {
         Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => {
-            BuiltinCodeFlags::HOPELESS.bits()
+            HOPELESS
         }
         _ => arity,
     };
