@@ -35755,6 +35755,46 @@ mod tests {
         );
     }
 
+    /// `rlib/jit.py isconstant` / `isvirtual` return `NonConstant(False)`, not
+    /// a bare `False`: the annotator must not read the result as a constant or
+    /// it folds every `if isconstant(x)` in the interpreter and deletes the
+    /// looked-inside arm before `jtransform` rewrites the call to
+    /// `*_isconstant`.  Pin the producer — both bodies must still route their
+    /// literal through `nonconst::non_constant`, which is resolved as a
+    /// registered external rather than a lifted graph.  Loads the majit-rlib
+    /// LLBC, ignored; run with `cargo test -p majit-translate --lib
+    /// jit_constancy_probes_return_non_constant -- --ignored`.
+    #[test]
+    #[ignore]
+    fn jit_constancy_probes_return_non_constant() {
+        use crate::model::{CallTarget, OpKind};
+        let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+        let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+        for probe in ["isconstant", "isvirtual"] {
+            let graph = super::lower_function(&llbc, probe)
+                .unwrap_or_else(|e| panic!("lower {probe}: {e}"));
+            let non_constant_calls = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if super::fmt_path_ends_with(
+                                segments,
+                                &["nonconst", "non_constant"],
+                            )
+                    )
+                })
+                .count();
+            assert_eq!(
+                non_constant_calls, 1,
+                "{probe} must return its literal through nonconst::non_constant"
+            );
+        }
+    }
+
     /// Regression: `RBigInt::digits` uses `from_raw_parts(base, capacity)` — the
     /// block's own length — so its header alias IS sound and must STILL fold
     /// (the P1 fix removes only the object-list arm). The residual

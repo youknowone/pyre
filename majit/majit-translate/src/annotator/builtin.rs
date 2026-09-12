@@ -409,6 +409,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "majit_rlib.jit.isvirtual",
         majit_metainterp_bool_flag,
     );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.nonconst.non_constant",
+        nonconst_non_constant,
+    );
     // `rlib/jit.py conditional_call` returns None. One analyzer covers
     // every residual arity (`conditional_call0`..`conditional_call4`).
     analyzer_for(
@@ -1957,6 +1962,24 @@ fn majit_metainterp_bool_flag(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     Ok(SomeValue::Bool(super::model::SomeBool::new()))
+}
+
+/// `rlib/nonconst.py EntryNonConstant.compute_result_annotation`:
+///
+/// ```python
+/// def compute_result_annotation(self, s_arg):
+///     return not_const(s_arg)
+/// ```
+///
+/// The value is passed through unchanged except that its constancy is
+/// dropped, so a caller branching on it keeps both arms.
+fn nonconst_non_constant(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    let s_arg = arg_at(args_s, 0, "nonconst.non_constant");
+    Ok(super::model::not_const(s_arg))
 }
 
 /// `rlib/jit.py ConditionalCallEntry.compute_result_annotation` for

@@ -2039,6 +2039,22 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             );
             continue;
         }
+        // `rlib/nonconst.py NonConstant` is an `ExtRegistryEntry`, not a
+        // graph: its whole purpose is that the annotator must NOT see the
+        // argument's constancy, and the identity body lifted from
+        // `majit-rlib` would hand that constancy straight back.  With no
+        // registry entry the callsite resolves through
+        // `translate_op` Layer-3b to the `majit_rlib.nonconst` HOST_ENV
+        // callable, whose analyzer answers `not_const(s_arg)` and whose
+        // `rtype_non_constant` returns argument 0.
+        if canonical_strip == ["nonconst", "non_constant"] {
+            crate::decline::record(
+                REGISTRY_GATE,
+                "skip-nonconst-extregistry-entry",
+                format_args!("{path}"),
+            );
+            continue;
+        }
         let signature = function_graphs
             .signature(path)
             .expect("iter() path resolves to a stored slot");

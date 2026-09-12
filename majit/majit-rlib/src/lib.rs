@@ -14,6 +14,7 @@ pub mod cache;
 pub mod debug;
 pub mod jit;
 pub mod lltypesystem;
+pub mod nonconst;
 pub mod rbigint;
 
 /// `lltype.malloc(T, flavor='raw')` (`rpython/rtyper/lltypesystem/lltype.py`) —
