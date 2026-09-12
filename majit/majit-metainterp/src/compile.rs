@@ -1866,7 +1866,7 @@ fn leftover_inputarg_refs(
         for a in op.getarglist() {
             consider(a.to_opref());
         }
-        if let Some(fa) = op.getfailargs() {
+        if let Some(fa) = op.guard_fail_args() {
             for a in fa {
                 consider(a.to_opref());
             }
@@ -2707,15 +2707,21 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             }
         }
         if leftover_fields.is_empty() && inputargs.len() <= entry_prefix_len {
-            let vable_rc = std::rc::Rc::new(inputargs[index_of_virtualizable].fresh_value_copy());
+            let vable_rc =
+                majit_ir::InputArgRc::new(inputargs[index_of_virtualizable].fresh_value_copy());
             let vable_box = Operand::from_bound_inputarg(&vable_rc);
             let max_runtime_ref = leftover_identity
                 .iter()
                 .map(|r| r.raw())
                 .chain(ops.iter().flat_map(|op| {
-                    std::iter::once(op.pos.get())
+                    std::iter::once(op.pos().get())
                         .chain(op.getarglist_copy().into_iter().map(|b| b.to_opref()))
-                        .chain(op.getfailargs().into_iter().flatten().map(|b| b.to_opref()))
+                        .chain(
+                            op.guard_fail_args()
+                                .into_iter()
+                                .flatten()
+                                .map(|b| b.to_opref()),
+                        )
                         .map(|r| {
                             if r.is_none() || r.is_constant() {
                                 0
@@ -3207,9 +3213,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                 Operand::from_opref(OpRef::const_int(kind)),
             ],
         );
-        call.pos.set(call_opref);
+        call.pos().set(call_opref);
         call.setdescr(descr);
-        let call = std::rc::Rc::new(call);
+        let call = OpRc::new(call);
         extra_ops.push(call.clone());
         Some(Operand::from_bound_op(&call))
     };
@@ -3282,7 +3288,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     let original_ops = std::mem::take(ops);
     for op in original_ops.iter() {
         emit_forwarded_patch_op(&mut extra_ops, op, &mut forwarding, &mut next_opref);
-        if !peel_emitted && !tos_sources.is_empty() && inline_vable == Some(op.pos.get()) {
+        if !peel_emitted && !tos_sources.is_empty() && inline_vable == Some(op.pos().get()) {
             if let Some(emitted) = extra_ops.last().cloned() {
                 let peel_vable = Operand::from_bound_op(&emitted);
                 if let Some(bound) = emit_peel(&mut extra_ops, &mut next_opref, peel_vable) {
@@ -4041,7 +4047,7 @@ mod tests {
         );
         let mut ops: Vec<majit_ir::OpRc> = vec![label, guard, jump]
             .into_iter()
-            .map(std::rc::Rc::new)
+            .map(OpRc::new)
             .collect();
         let mut inputargs = vec![InputArg::new_ref(0)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
@@ -4061,7 +4067,7 @@ mod tests {
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
-        let reloaded = ops[0].pos.get();
+        let reloaded = ops[0].pos().get();
         assert_eq!(
             ops[1]
                 .getarglist()
@@ -4072,7 +4078,7 @@ mod tests {
         );
         assert_eq!(
             ops[2]
-                .getfailargs()
+                .guard_fail_args()
                 .unwrap()
                 .iter()
                 .map(|a| a.to_opref())
@@ -4111,10 +4117,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 98),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label, jump]
-            .into_iter()
-            .map(std::rc::Rc::new)
-            .collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, jump].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![InputArg::new_ref(0)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
@@ -4174,10 +4177,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 99),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label, jump]
-            .into_iter()
-            .map(std::rc::Rc::new)
-            .collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, jump].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![InputArg::new_ref(0)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
@@ -4250,7 +4250,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Int, 50),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_int(2),
@@ -4307,8 +4307,7 @@ mod tests {
             ],
         );
         let get = Op::new(OpCode::GetfieldGcR, &[rooted_resop_operand(Type::Ref, 50)]);
-        let mut ops: Vec<majit_ir::OpRc> =
-            vec![label, get].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, get].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![InputArg::new_ref(0)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let entry_mints = vec![OpRef::input_arg_int(50)];
@@ -4369,7 +4368,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 2),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -4419,7 +4418,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Int, 3),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -4494,7 +4493,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 4),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_int(1),
@@ -4556,7 +4555,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 99),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let entry_mints = vec![OpRef::input_arg_ref(1)];
@@ -4617,7 +4616,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 2),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -4644,7 +4643,7 @@ mod tests {
         let getfields: Vec<OpRef> = ops
             .iter()
             .filter(|op| op.opcode == OpCode::GetfieldGcR)
-            .map(|op| op.pos.get())
+            .map(|op| op.pos().get())
             .collect();
         assert_eq!(
             getfields.len(),
@@ -4713,8 +4712,7 @@ mod tests {
                 "seq".into(),
             ),
         ));
-        let mut ops: Vec<majit_ir::OpRc> =
-            vec![label, seq].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, seq].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -4776,7 +4774,7 @@ mod tests {
             .to_opref();
         assert_eq!(
             seq_recv,
-            peel.pos.get(),
+            peel.pos().get(),
             "ListIter leftover must be leftover_peel_tos, got {seq_recv:?}"
         );
     }
@@ -4826,8 +4824,7 @@ mod tests {
                 "seq".into(),
             ),
         ));
-        let mut ops: Vec<majit_ir::OpRc> =
-            vec![label, seq].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, seq].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -4883,7 +4880,7 @@ mod tests {
         );
         assert_eq!(
             seq_recv,
-            peel.pos.get(),
+            peel.pos().get(),
             "ListIter leftover must be leftover_peel_tos, got {seq_recv:?}"
         );
     }
@@ -4913,7 +4910,7 @@ mod tests {
             OpCode::GetfieldGcR,
             &[rooted_inputarg_operand(Type::Ref, 0)],
         );
-        new_frame.pos.set(compile_frame);
+        new_frame.pos().set(compile_frame);
         new_frame.setdescr(majit_ir::descr::make_field_descr(
             0,
             8,
@@ -4937,7 +4934,7 @@ mod tests {
             ),
         ));
         let mut ops: Vec<majit_ir::OpRc> = vec![
-            std::rc::Rc::new(Op::new(
+            OpRc::new(Op::new(
                 OpCode::Label,
                 &[
                     rooted_inputarg_operand(Type::Ref, 0),
@@ -4945,8 +4942,8 @@ mod tests {
                     rooted_inputarg_operand(Type::Ref, 5),
                 ],
             )),
-            std::rc::Rc::new(new_frame),
-            std::rc::Rc::new(seq),
+            OpRc::new(new_frame),
+            OpRc::new(seq),
         ];
         let mut inputargs = vec![
             InputArg::new_ref(0),
@@ -4989,7 +4986,7 @@ mod tests {
         );
         let frame_load = ops
             .iter()
-            .find(|op| op.pos.get() == peel_vable)
+            .find(|op| op.pos().get() == peel_vable)
             .expect("peel vable must be a produced op");
         assert_eq!(frame_load.opcode, OpCode::GetfieldGcR);
         assert!(
@@ -5037,10 +5034,7 @@ mod tests {
         );
         let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 5)]);
         call.setdescr(descr);
-        let mut ops: Vec<majit_ir::OpRc> = vec![label, call]
-            .into_iter()
-            .map(std::rc::Rc::new)
-            .collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -5084,7 +5078,7 @@ mod tests {
             .to_opref();
         assert_eq!(
             call_arg,
-            peel.pos.get(),
+            peel.pos().get(),
             "ForIterNext leftover off the TOS field must bind to leftover_peel_tos, got {call_arg:?}"
         );
     }
@@ -5127,10 +5121,7 @@ mod tests {
         );
         let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 6)]);
         call.setdescr(descr);
-        let mut ops: Vec<majit_ir::OpRc> = vec![label, call]
-            .into_iter()
-            .map(std::rc::Rc::new)
-            .collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -5174,7 +5165,7 @@ mod tests {
             .to_opref();
         assert_eq!(
             call_arg,
-            peel.pos.get(),
+            peel.pos().get(),
             "ForIterNext leftover at the peeled portal TOS must be leftover_peel_tos, got {call_arg:?}"
         );
     }
@@ -5223,8 +5214,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 35),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> =
-            vec![label, seq].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, seq].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -5686,8 +5676,7 @@ mod tests {
                 "seq".into(),
             ),
         ));
-        let mut ops: Vec<majit_ir::OpRc> =
-            vec![label, seq].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, seq].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -5746,7 +5735,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Int, 1),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let entry_mints = vec![OpRef::input_arg_ref(1)];
@@ -5801,7 +5790,7 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 4),
             ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_int(1),
