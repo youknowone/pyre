@@ -5261,6 +5261,8 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         opt.supports_efficient_uint_mul_high = self.backend.supports_efficient_uint_mul_high();
+        // optimizer.py Optimizer.__init__: `self.cpu = metainterp_sd.cpu`.
+        opt.cpu = self.cpu.clone();
         opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
         // `virtualize.py:140` `vrefinfo =
         // self.optimizer.metainterp_sd.virtualref_info` — install the
@@ -7930,6 +7932,7 @@ impl<M: Clone> MetaInterp<M> {
                         };
                         simple_opt.supports_efficient_uint_mul_high =
                             self.backend.supports_efficient_uint_mul_high();
+                        simple_opt.cpu = self.cpu.clone();
                         // Clone rather than move: only the success arm below hands
                         // the list back, so a retry that aborts would otherwise
                         // leave `unroll_opt.all_descrs` empty, and the
@@ -10689,6 +10692,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
+        optimizer.cpu = self.cpu.clone();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
@@ -11186,6 +11190,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
+        optimizer.cpu = self.cpu.clone();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py/261/307 — `Const.type` / `InputArg.type` are
