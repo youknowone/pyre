@@ -9820,7 +9820,14 @@ fn walker_guard_class<Sym: WalkSym>(
     obj: OpRef,
     type_addr: i64,
 ) -> Result<(), DispatchError> {
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+    // `heapcache.py is_class_known` is only `HF_KNOWN_CLASS`, not
+    // `isinstance`.  `W_IntObject.intval` and `W_LongObject.value` sit at
+    // the same offset, so skipping `GuardClass(LONG)` because some other
+    // class is already known lets a box recorded as `INT` take the long
+    // payload path: `jit_bigint_int_eq` then treats the intval as a
+    // `*const BigInt`.  Skip only when the known class is this one, the
+    // same compare `walker_guard_mapdict_instance_shape` already does.
+    if ctx.trace_ctx.heap_cache().get_known_class(obj) != Some(type_addr) {
         // `GuardClass` reads `ob_type` off `obj` (rpython/jit/backend/x86/
         // assembler.py `_cmp_guard_class` derefs the pointer with no tag
         // test), so the frontend must not hand it a tagged immediate. `obj`
