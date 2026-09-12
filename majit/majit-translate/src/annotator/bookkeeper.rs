@@ -2674,6 +2674,23 @@ impl Bookkeeper {
         if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
             return self.project_struct_field_type("pyobject::PyObject");
         }
+        // A function-pointer field is `Ptr(FuncType)` (`lltype.py FuncType`,
+        // `SomePtr`), not a classdef-less `SomeInstance`.  Raw `fn` has
+        // `_gckind == 'raw'`, so `getkind` is Signed — the dual-gate twin
+        // of the legacy walker's address word (`gateway::builtin_code_get`).
+        if is_fn_type_spelling(t) {
+            return SomeValue::Ptr(super::model::SomePtr::new(
+                crate::translator::rtyper::lltypesystem::lltype::Ptr {
+                    TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(
+                        crate::translator::rtyper::lltypesystem::lltype::FuncType {
+                            args: vec![],
+                            result:
+                                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                        },
+                    ),
+                },
+            ));
+        }
         // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
         // pointer, not a `T`.  Projecting the pointee is right for an
         // aggregate target (`*mut Vec<T>` / `*mut Struct`): the structural
@@ -2755,11 +2772,7 @@ impl Bookkeeper {
             // still has RPython's one-GC-reference shape.  Match the
             // `BigInt.from` builtin analyzer and foreign-method cutover:
             // retain a classdef-less `SomeInstance`, never lattice bottom.
-            // A function pointer is a one-word code pointer, so it shares
-            // that shell: an optional function pointer then joins with None
-            // as a nullable pointer instead of collapsing to `SomeNone`,
-            // which blocks every read on the field.
-            "BigInt" | "fn" => {
+            "BigInt" => {
                 return SomeValue::Instance(super::model::SomeInstance::new(
                     None,
                     false,
@@ -4008,6 +4021,13 @@ fn is_nullable_sum_spelling(field_ty: &str) -> bool {
     strip_generic_one(t, "Option<").is_some() || strip_generic_one(t, "Result<").is_some()
 }
 
+/// Charon spelling of a Rust function-pointer type (`fn`, `fn(…)`,
+/// `unsafe fn(…)`).  Not a named struct.
+fn is_fn_type_spelling(t: &str) -> bool {
+    let t = t.trim();
+    t == "fn" || t.starts_with("fn(") || t.starts_with("fn ") || t.starts_with("unsafe fn")
+}
+
 /// Strip `Wrapper<` prefix and matching `>` suffix from a type string,
 /// returning the inner generic-args slice unchanged.  Returns `None` if
 /// the prefix is absent OR the suffix is not `>`.
@@ -4594,6 +4614,17 @@ mod tests {
         assert!(
             matches!(bk.project_struct_field_type("BigInt"), SomeValue::Instance(ref s) if s.classdef.is_none()),
             "dependency-opaque compiler BigInt remains one GC reference"
+        );
+        assert!(
+            matches!(bk.project_struct_field_type("fn"), SomeValue::Ptr(_)),
+            "a bare fn field is Ptr(FuncType), not a classdef-less instance"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>"),
+                SomeValue::Ptr(_)
+            ),
+            "a Rust fn-pointer spelling is Ptr(FuncType)"
         );
         assert!(
             matches!(

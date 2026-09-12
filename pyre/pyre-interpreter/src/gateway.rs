@@ -911,13 +911,7 @@ pub fn builtin_code_new_with_doc(
     func: BuiltinCodeFn,
     docstring: Option<&'static str>,
 ) -> PyObjectRef {
-    builtin_code_new_full(
-        name,
-        func,
-        docstring,
-        HOPELESS,
-        std::ptr::null(),
-    )
+    builtin_code_new_full(name, func, docstring, HOPELESS, std::ptr::null())
 }
 
 /// Allocate a new `BuiltinCode` with `fast_natural_arity = PASSTHROUGHARGS1`.
@@ -1017,13 +1011,7 @@ pub fn builtin_code_new_with_signature(
     signature: Signature,
 ) -> PyObjectRef {
     let sig: *const Signature = Box::into_raw(Box::new(signature));
-    builtin_code_new_full(
-        name,
-        func,
-        docstring,
-        HOPELESS,
-        sig,
-    )
+    builtin_code_new_full(name, func, docstring, HOPELESS, sig)
 }
 
 /// Check if an object is a built-in function.
@@ -1773,9 +1761,7 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
     signature: Option<Signature>,
 ) -> PyObjectRef {
     let arity = match &signature {
-        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => {
-            HOPELESS
-        }
+        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => HOPELESS,
         _ => arity,
     };
     let sig: *const Signature = match signature {
@@ -2016,9 +2002,7 @@ pub fn make_module_builtin_function_with_arity_and_maybe_sig(
     signature: Option<Signature>,
 ) -> PyObjectRef {
     let arity = match &signature {
-        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => {
-            HOPELESS
-        }
+        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => HOPELESS,
         _ => arity,
     };
     let sig: *const Signature = match signature {

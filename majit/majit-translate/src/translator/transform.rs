@@ -409,11 +409,14 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
         let trace = cutoff_block_trace_with_counts(ann, block, n, total);
         eprintln!("[DTRACE-CUT] {trace}");
     }
-    // upstream: `assert 0 <= n < len(block.operations)`.
-    assert!(
-        n < total,
-        "cutoff_alwaysraising_block: no failing op (n={n}, total={total})"
-    );
+    // upstream: `assert 0 <= n < len(block.operations)`.  A
+    // `Result::Err` constructor has no unannotated op — every
+    // statement succeeded and the Ok exit was the one
+    // `transform_dead_code` killed.  The remaining exits already
+    // raise; inventing AssertionError would be a second raise.
+    if n >= total {
+        return;
+    }
 
     // upstream: `del block.operations[n+1:]`.
     block.borrow_mut().operations.truncate(n + 1);
