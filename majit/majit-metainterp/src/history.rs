@@ -4041,16 +4041,17 @@ impl TraceCtx {
     /// mirroring `call.py getcalldescr`'s analyzer chain output.
     pub fn cond_call_void_typed(
         &mut self,
-        condition: i64,
+        condition: OpRef,
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) {
-        let cond_ref = OpRef::const_int(condition);
+        // `pyjitpl.py opimpl_conditional_call_ir_v` records `condbox`
+        // itself, not a ConstInt snapshot of this iteration's value.
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Void, slot);
-        let mut call_args = vec![cond_ref, func_ref];
+        let mut call_args = vec![condition, func_ref];
         call_args.extend_from_slice(args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallN, &call_args, descr);
@@ -4059,16 +4060,15 @@ impl TraceCtx {
     /// RPython pyjitpl.py opimpl_conditional_call_value_ir_i: emit CondCallValueI.
     pub fn cond_call_value_int_typed(
         &mut self,
-        value: i64,
+        value: OpRef,
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) -> OpRef {
-        let value_ref = OpRef::const_int(value);
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Int, slot);
-        let mut call_args = vec![value_ref, func_ref];
+        let mut call_args = vec![value, func_ref];
         call_args.extend_from_slice(args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallValueI, &call_args, descr)
@@ -4086,18 +4086,18 @@ impl TraceCtx {
     /// pin distinct types at construction).
     pub fn cond_call_value_ref_typed(
         &mut self,
-        value: i64,
+        value: OpRef,
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) -> OpRef {
-        // history.py ConstPtr.value inline (the op-graph walker
-        // forwards `OpRef::ConstPtr(GcRef)` slots in `op.args`).
-        let value_ref = OpRef::const_ptr(majit_ir::GcRef(value as usize));
+        // `pyjitpl.py _opimpl_conditional_call_value` records `valuebox`
+        // (a Ref box). The caller must pass that box, not a ConstInt of
+        // this iteration's pointer bits.
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Ref, slot);
-        let mut call_args = vec![value_ref, func_ref];
+        let mut call_args = vec![value, func_ref];
         call_args.extend_from_slice(args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallValueR, &call_args, descr)
@@ -4134,33 +4134,20 @@ impl TraceCtx {
     /// `make_call_descr_from_target_slot` for the resolution rule.
     pub fn record_known_result_typed(
         &mut self,
-        result_value: i64,
+        result: OpRef,
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
         result_type: Type,
         slot: EffectInfoSlot,
     ) {
-        // `blackhole.py:620-628` declares the two opcodes as
-        //   @arguments("cpu", "i", "i", "I", "R", "d")  # _i_ir_v
-        //   @arguments("cpu", "r", "i", "I", "R", "d")  # _r_ir_v
-        // so the leading known-result argbox is Ref-typed for
-        // `record_known_result_r_ir_v` and Int-typed for `_i_ir_v`.
-        // Use `get_or_insert_typed(result_value, result_type)` so the
-        // recorded constant lands as `ConstPtr` for Ref results,
-        // matching `history.py ConstPtr` and preventing alias with
-        // `ConstInt` slots of the same raw value.
-        // history.py/268/314 Const{Int,Float,Ptr}.value inline.
-        // The op-graph walker forwards Ref slots.
-        let result_ref = match result_type {
-            Type::Int => OpRef::const_int(result_value),
-            Type::Float => OpRef::const_float(f64::from_bits(result_value as u64)),
-            Type::Ref => OpRef::const_ptr(majit_ir::GcRef(result_value as usize)),
-            Type::Void => OpRef::const_int(0),
-        };
+        // `opimpl_record_known_result_{i,r}_ir_v` records `resbox` itself.
+        // `result_type` still selects the calldescr identity
+        // (`jtransform.py rewrite_op_jit_record_known_result` uses
+        // `op.args[0]`'s concretetype).
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, result_type, slot);
-        let mut call_args = vec![result_ref, func_ref];
+        let mut call_args = vec![result, func_ref];
         call_args.extend_from_slice(args);
         self.recorder
             .record_op_with_descr(OpCode::RecordKnownResult, &call_args, descr);
