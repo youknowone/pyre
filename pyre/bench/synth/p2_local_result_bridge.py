@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=11.8
+# pyre-check: max-wasm-ratio=5
+# leftover-empty abort of a non-iterator TOS peel; measured 4.3x × 1.15.
 # Ubuntu run 33279264115: 2.2-5.9x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython
