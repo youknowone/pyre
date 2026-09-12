@@ -3854,8 +3854,10 @@ pub unsafe fn w_dict_getitem_wtf8(
         w_dict_getitem_str(obj, wtf8_key_as_str_unchecked(key))
     } else {
         let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
         let w_key = crate::gc_roots::pin_root(wtf8_surrogate_key_str_object(key));
-        w_dict_lookup(obj, w_key)
+        w_dict_lookup(crate::gc_roots::shadow_stack_get(obj_slot), w_key)
     }
 }
 
@@ -3893,8 +3895,10 @@ pub unsafe fn w_dict_getitem_wtf8_checked(
         w_dict_getitem_str_checked(obj, wtf8_key_as_str_unchecked(key))
     } else {
         let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
         let w_key = crate::gc_roots::pin_root(wtf8_surrogate_key_str_object(key));
-        w_dict_lookup_checked(obj, w_key)
+        w_dict_lookup_checked(crate::gc_roots::shadow_stack_get(obj_slot), w_key)
     }
 }
 
@@ -3915,8 +3919,13 @@ pub unsafe fn w_dict_setitem_wtf8(
         w_dict_setitem_str(obj, wtf8_key_as_str_unchecked(key), value);
     } else {
         let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::pin_roots(&[obj, value]);
         let w_key = crate::gc_roots::pin_root(wtf8_surrogate_key_str_object(key));
-        w_dict_store(obj, w_key, value);
+        w_dict_store(
+            crate::gc_roots::shadow_stack_get(obj_slot),
+            w_key,
+            crate::gc_roots::shadow_stack_get(obj_slot + 1),
+        );
     }
 }
 
@@ -3966,8 +3975,12 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
         StrategyKind::Object => {}
         StrategyKind::Map | StrategyKind::Class => {
             let _roots = crate::gc_roots::push_roots();
+            let obj_slot = crate::gc_roots::shadow_stack_len();
+            let _ = crate::gc_roots::pin_root(obj);
             let w_key =
                 crate::gc_roots::pin_root(crate::w_str_from_wtf8_managed(key.to_wtf8_buf()));
+            let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+            let dict = &mut *(obj as *mut W_DictObject);
             return dict.dstrategy.delitem(obj, w_key);
         }
         _ => dict.dstrategy.switch_to_object_strategy(obj),

@@ -1306,9 +1306,6 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     );
 
     let base_prefix = sysconfigdata_base_prefix();
-    let base_prefix_str = pyre_object::w_str_from_wtf8_managed(
-        crate::gateway::fsdecode_os_str_wtf8(base_prefix.as_os_str()),
-    );
     // `include/{implementation_lower}{py_version_short}{abi_thread}`, the
     // directory the posix_prefix scheme resolves `get_paths()['include']` to.
     // An interpreter that publishes no base prefix has nowhere to name.
@@ -1332,6 +1329,10 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let vars_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    let prefix_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
+        crate::gateway::fsdecode_os_str_wtf8(base_prefix.as_os_str()),
+    ));
     // `_init_non_posix` derives the same `t` from `Py_GIL_DISABLED` below.
     // The lower-case `abiflags` that forms the include and site-packages
     // directory names is a separate variable, read from `sys.abiflags`
@@ -1459,11 +1460,12 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // Python 3.14's relocation check reads these from the generated data.
     unsafe {
         for key in ["prefix", "exec_prefix", "srcdir"] {
-            let w_key = pyre_object::w_str_new_managed(key);
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(key));
             pyre_object::w_dict_store(
                 pyre_object::gc_roots::shadow_stack_get(vars_slot),
-                w_key,
-                base_prefix_str,
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+                pyre_object::gc_roots::shadow_stack_get(prefix_slot),
             );
         }
     }
@@ -6486,7 +6488,15 @@ pub(crate) fn is_spec_uninitialized_submodule(
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(false),
         Err(e) => return Err(e),
     };
-    crate::baseobjspace::contains(w_value, pyre_object::w_str_new_managed(name))
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_value);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
+    crate::baseobjspace::contains(
+        pyre_object::gc_roots::shadow_stack_get(list_slot),
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+    )
 }
 
 /// `_PyModuleSpec_GetFileOrigin` — the spec's file origin: its `origin` string

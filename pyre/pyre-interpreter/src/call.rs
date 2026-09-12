@@ -3288,10 +3288,23 @@ fn call_with_kwargs_in_ctx_impl(
                             pyre_object::w_str_from_wtf8_managed(k.clone()),
                         ));
                     }
+                    // Name mints can move the positionals, keyword values, and
+                    // the earlier `bound` slice. Reload from the entry bracket
+                    // and rebind before the profiled call, as the marker
+                    // branch below does.
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
-                        kwargs.iter().map(|(_, v)| *v).collect();
+                        (0..kwargs.len()).map(current_kwarg).collect();
+                    let refreshed_pos: Vec<pyre_object::PyObjectRef> =
+                        (0..pos_args.len()).map(current_pos_arg).collect();
+                    let refreshed_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = kwargs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (name, _))| (name.clone(), current_kwarg(index)))
+                        .collect();
+                    let bound =
+                        bind_kwargs_to_signature(sig, &fname, &refreshed_pos, &refreshed_kwargs)?;
                     let mut arguments = crate::argument::Arguments::with_kw(
-                        pos_args,
+                        &refreshed_pos,
                         &keyword_names_w,
                         &keywords_w,
                     );
