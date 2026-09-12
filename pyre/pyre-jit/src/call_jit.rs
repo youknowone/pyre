@@ -557,6 +557,10 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
     store_jit_exception(value);
 }
 
+extern "C" fn jit_exc_clear_shim() {
+    drain_backend_jit_exc();
+}
+
 /// Publish a raise from a may-force residual helper to BOTH executors.
 ///
 /// `bh_call_fn`/`bh_call_fn_N` is bound as the may-force CALL target
