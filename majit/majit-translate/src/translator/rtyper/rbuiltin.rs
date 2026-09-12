@@ -1511,6 +1511,32 @@ pub(super) fn rtype_we_are_jitted(
     Ok(Some(Hlvalue::Constant(c)))
 }
 
+/// RPython `rlib/nonconst.py:40-42`
+/// `EntryNonConstant.specialize_call(self, hop)`:
+///
+/// ```python
+/// def specialize_call(self, hop):
+///     hop.exception_cannot_occur()
+///     return hop.inputarg(hop.r_result, arg=0)
+/// ```
+///
+/// The whole of `NonConstant` is an annotation-time effect; at the low level
+/// the argument is the result.
+pub(super) fn rtype_non_constant(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    let r_result = {
+        let borrow = hop.r_result.borrow();
+        borrow
+            .as_ref()
+            .ok_or_else(|| TyperError::message("rtype_non_constant: r_result missing".to_string()))?
+            .clone()
+    };
+    hop.exception_cannot_occur()?;
+    Ok(Some(hop.inputarg(&r_result, 0)?))
+}
+
 /// Rust source marker for RPython
 /// `VirtualizableInstanceRepr.hook_access_field`.
 ///

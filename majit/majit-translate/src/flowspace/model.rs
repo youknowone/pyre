@@ -2258,6 +2258,28 @@ impl HostEnv {
             "conditional_call4",
             HostObject::new_builtin_callable("majit_rlib.jit.conditional_call4"),
         );
+        // `rlib/nonconst.py NonConstant` is an `ExtRegistryEntry`, never a
+        // graph: looking inside it would hand the caller back the very
+        // constant it exists to hide.  Registering it as a host callable is
+        // how pyre spells that — `populate_call_registry_from_call_graphs`
+        // skips the lifted body so Layer-3b resolution reaches this entry,
+        // whose analyzer answers `not_const(s_arg)`.
+        let majit_rlib_nonconst = HostObject::new_module("majit_rlib.nonconst");
+        majit_rlib_nonconst.module_set(
+            "non_constant",
+            HostObject::new_builtin_callable("majit_rlib.nonconst.non_constant"),
+        );
+        // The callers live in `majit-rlib` itself, so the front can spell the
+        // path crate-qualified or bare.  Bind the bare module to the SAME
+        // callable, not a fresh same-qualname one, the way `core.ptr` reuses
+        // `std.ptr`'s members.
+        let nonconst = HostObject::new_module("nonconst");
+        nonconst.module_set(
+            "non_constant",
+            majit_rlib_nonconst
+                .module_get("non_constant")
+                .expect("majit_rlib.nonconst.non_constant bound above"),
+        );
 
         // Container constructors emitted as `[Type, "new"]` 2-segment
         // FunctionPath callsites by pyre-source helpers.  Same shape
@@ -2535,6 +2557,8 @@ impl HostEnv {
         mods.insert("majit_metainterp".into(), majit_metainterp);
         mods.insert("majit_metainterp.jit".into(), majit_metainterp_jit);
         mods.insert("majit_rlib.jit".into(), majit_rlib_jit);
+        mods.insert("majit_rlib.nonconst".into(), majit_rlib_nonconst);
+        mods.insert("nonconst".into(), nonconst);
         mods.insert("u32".into(), primitive_u32);
         mods.insert("i64".into(), primitive_i64);
         mods.insert("usize".into(), primitive_usize);

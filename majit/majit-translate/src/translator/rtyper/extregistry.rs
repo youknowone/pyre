@@ -137,6 +137,20 @@ pub enum ExtRegistryEntry {
     /// per model.py:222), so no separate `unsigned` carrier is needed
     /// here — that would duplicate state RPython does not.
     ForType { instance: HostObject },
+    /// Upstream `rpython/rlib/nonconst.py:34-42`:
+    ///
+    /// ```python
+    /// class EntryNonConstant(ExtRegistryEntry):
+    ///     _about_ = NonConstant
+    ///
+    ///     def compute_result_annotation(self, s_arg):
+    ///         return not_const(s_arg)
+    ///
+    ///     def specialize_call(self, hop):
+    ///         hop.exception_cannot_occur()
+    ///         return hop.inputarg(hop.r_result, arg=0)
+    /// ```
+    NonConstant,
     /// Upstream `rpython/rlib/jit.py:396-406`:
     ///
     /// ```python
@@ -317,6 +331,9 @@ pub enum ExtRegistryEntryKey {
     BigIntFrom,
     Float2LongLong,
     LongLong2Float,
+    /// Singleton key for the `NonConstant` `_about_` entry
+    /// (rlib/nonconst.py:34). No per-instance identity.
+    NonConstant,
 }
 
 impl ExtRegistryEntry {
@@ -356,6 +373,7 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::BigIntFrom => ExtRegistryEntryKey::BigIntFrom,
             ExtRegistryEntry::Float2LongLong => ExtRegistryEntryKey::Float2LongLong,
             ExtRegistryEntry::LongLong2Float => ExtRegistryEntryKey::LongLong2Float,
+            ExtRegistryEntry::NonConstant => ExtRegistryEntryKey::NonConstant,
         }
     }
 
@@ -512,6 +530,17 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::LongLong2Float => Ok(SomeValue::Float(
                 crate::annotator::model::SomeFloat::default(),
             )),
+            // `NonConstant` has no `compute_annotation` override upstream, so
+            // the base implementation's `SomeBuiltin(compute_result_annotation,
+            // methodname=...)` applies.  The call-time annotation is served by
+            // the `majit_rlib.nonconst.non_constant` `BUILTIN_ANALYZERS` entry,
+            // which `immutablevalue_hostobject` resolves before the
+            // `extregistry.is_registered` fall-through.
+            ExtRegistryEntry::NonConstant => Ok(SomeValue::Builtin(SomeBuiltin::new(
+                "majit_rlib.nonconst.non_constant",
+                None,
+                Some("non_constant".to_string()),
+            ))),
         }
     }
 
@@ -643,6 +672,12 @@ impl ExtRegistryEntry {
             // at the result repr's lltype.
             ExtRegistryEntry::WeAreJitted => {
                 Ok(super::rbuiltin::rtype_we_are_jitted as BuiltinTyperFn)
+            }
+            // rlib/nonconst.py — `EntryNonConstant.specialize_call(self, hop)`:
+            //     hop.exception_cannot_occur()
+            //     return hop.inputarg(hop.r_result, arg=0)
+            ExtRegistryEntry::NonConstant => {
+                Ok(super::rbuiltin::rtype_non_constant as BuiltinTyperFn)
             }
             ExtRegistryEntry::JitForceVirtualizable => {
                 Ok(super::rbuiltin::rtype_jit_force_virtualizable as BuiltinTyperFn)
@@ -903,6 +938,12 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     }
     if host.qualname() == "pyre_interpreter.executioncontext.jit_force_virtualizable" {
         return Some(ExtRegistryEntry::JitForceVirtualizable);
+    }
+    // `rlib/nonconst.py class EntryNonConstant(ExtRegistryEntry): _about_ =
+    // NonConstant` — keyed by the same qualname `annotator/builtin.rs`
+    // registers for `BUILTIN_ANALYZERS`.
+    if host.qualname() == "majit_rlib.nonconst.non_constant" {
+        return Some(ExtRegistryEntry::NonConstant);
     }
     // `BigInt.from` residual external — keyed by the qualname the
     // `BigInt.from` `BUILTIN_ANALYZERS` annotation entry uses, so the
