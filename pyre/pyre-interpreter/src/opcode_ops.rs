@@ -162,11 +162,11 @@ fn operator_symbol(op: BinaryOperator) -> &'static str {
     }
 }
 
-/// `inline(never)` is load-bearing: rustc otherwise folds this body into its
-/// one-call wrapper and the codewriter never mints the graph a trace descends
-/// (`specialize.rs try_walker_orthodox_binary_op`).
-#[inline(never)]
-pub fn binary_value_from_tag(
+/// Body of [`binary_value_from_tag`].  The public function stays
+/// `inline(never)` so the codewriter mints a graph; the residual C ABI
+/// wrapper calls this directly so compiled traces do not pay that hop.
+#[inline]
+fn binary_value_from_tag_inner(
     a: PyObjectRef,
     b: PyObjectRef,
     op_tag: i64,
@@ -202,6 +202,18 @@ pub fn binary_value_from_tag(
     }
 }
 
+/// `inline(never)` is load-bearing: rustc otherwise folds this body into its
+/// one-call wrapper and the codewriter never mints the graph a trace descends
+/// (`specialize.rs try_walker_orthodox_binary_op`).
+#[inline(never)]
+pub fn binary_value_from_tag(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op_tag: i64,
+) -> Result<PyObjectRef, PyError> {
+    binary_value_from_tag_inner(a, b, op_tag)
+}
+
 pub fn compare_value(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -218,10 +230,9 @@ pub fn compare_value(
     compare(a, b, cmp_op)
 }
 
-/// `inline(never)` for the same reason as [`binary_value_from_tag`]: the
-/// codewriter must mint the graph a trace descends.
-#[inline(never)]
-pub fn compare_value_from_tag(
+/// Body of [`compare_value_from_tag`].  See [`binary_value_from_tag_inner`].
+#[inline]
+fn compare_value_from_tag_inner(
     a: PyObjectRef,
     b: PyObjectRef,
     op_tag: i64,
@@ -281,6 +292,17 @@ pub fn compare_value_from_tag(
         }
     };
     compare(a, b, op)
+}
+
+/// `inline(never)` for the same reason as [`binary_value_from_tag`]: the
+/// codewriter must mint the graph a trace descends.
+#[inline(never)]
+pub fn compare_value_from_tag(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op_tag: i64,
+) -> Result<PyObjectRef, PyError> {
+    compare_value_from_tag_inner(a, b, op_tag)
 }
 
 pub fn unary_negative_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
@@ -1047,7 +1069,7 @@ pub extern "C" fn jit_bool_value_from_truth(value: i64) -> i64 {
 
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
-    match binary_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
+    match binary_value_from_tag_inner(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
@@ -1055,7 +1077,7 @@ pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 
 
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
-    match compare_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
+    match compare_value_from_tag_inner(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }

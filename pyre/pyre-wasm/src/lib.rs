@@ -193,6 +193,7 @@ mod residual_host {
             [value] => pyre_jit::call_jit::bh_truth_fn,
             [array] => pyre_jit::call_jit::bh_newtuple_from_array,
             [array] => pyre_jit::call_jit::bh_newlist_from_array,
+            [subcls, cls] => pyre_object::pyobject::__majit_call_target_ll_issubclass,
             [index, seq] => pyre_jit::call_jit::bh_unpack_item_fn,
             [callable, null_or_self] => pyre_jit::call_jit::bh_call_fn_0,
             [lhs, rhs, op_code] => pyre_interpreter::opcode_ops::jit_binary_value_from_tag,
