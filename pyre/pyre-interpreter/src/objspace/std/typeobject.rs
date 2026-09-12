@@ -14,11 +14,11 @@ fn newtext_or_none(doc: Option<&str>) -> PyObjectRef {
 }
 
 pub struct TypeCache {
-    base: SpaceCache<usize, usize, std::sync::Arc<ObjSpace>>,
+    base: SpaceCache<usize, usize, crate::baseobjspace::SpaceHandle>,
 }
 
 impl TypeCache {
-    pub fn new(space: std::sync::Arc<ObjSpace>) -> Self {
+    pub fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
         Self {
             base: SpaceCache::new(space),
         }
@@ -51,7 +51,7 @@ impl TypeCache {
         &self,
         definition: *const TypeDef,
     ) -> Result<PyObjectRef, CacheError<crate::PyError>> {
-        let space = &self.base.space;
+        let space = self.base.space.get();
         let definition = unsafe { &*definition };
         let name = definition
             .name
@@ -389,6 +389,14 @@ mod tests {
             );
             assert_eq!(w_str_get_value(w_type_get_w_doc(derived)), "derived doc");
         }
+    }
+
+    #[test]
+    fn process_wide_space_is_the_prebuilt_static() {
+        let a = crate::baseobjspace::object_space();
+        let b = crate::baseobjspace::object_space();
+        assert!(std::ptr::eq(a, b));
+        assert!(std::ptr::eq(a, &crate::baseobjspace::OBJECT_SPACE));
     }
 
     #[test]
