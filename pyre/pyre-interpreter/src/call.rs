@@ -5511,6 +5511,8 @@ fn build_class_inner(
         let w_ns = body_ns_root
             .map(pyre_object::gc_roots::shadow_stack_get)
             .unwrap_or(body_ns);
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_ns);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         // A plain class body now writes directly into class_ns, preserving the
         // `__classdict__` closure identity.  Only a distinct custom prepared
@@ -5521,7 +5523,9 @@ fn build_class_inner(
             // namespace during body execution don't survive in class_ns.
             unsafe { pyre_object::w_dict_clear(class_ns) };
         }
-        let backing = crate::type_methods::resolve_dict_backing(w_ns);
+        let backing = crate::type_methods::resolve_dict_backing(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        );
         if distinct_namespace && !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
             // Dict subclass: read final entries off the backing dict.
             let backing_root = pyre_object::gc_roots::shadow_stack_len();
@@ -5556,7 +5560,7 @@ fn build_class_inner(
                 "__classcell__",
             ));
             match crate::baseobjspace::getitem(
-                w_ns,
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 pyre_object::gc_roots::shadow_stack_get(cellkey_slot),
             ) {
                 Ok(value) if !value.is_null() => {
@@ -5577,14 +5581,20 @@ fn build_class_inner(
             // namespace) and read each value back via `space.getitem` so
             // `__getitem__` overrides apply.  `keys()` rather than `iter()`
             // keeps a mapping without `__iter__` working.
-            let keys_method = crate::baseobjspace::getattr_str(w_ns, "keys")?;
+            let keys_method = crate::baseobjspace::getattr_str(
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                "keys",
+            )?;
             let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
             let keys = crate::builtins::collect_iterable(keys_obj)?;
             for key in keys {
                 if !unsafe { pyre_object::is_str(key) } {
                     continue;
                 }
-                let value = crate::baseobjspace::getitem(w_ns, key)?;
+                let value = crate::baseobjspace::getitem(
+                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    key,
+                )?;
                 if !value.is_null() {
                     let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
                     unsafe {
@@ -5612,13 +5622,15 @@ fn build_class_inner(
         };
         if let Some(w_ns) = mapping_namespace {
             // Interning the key still allocates on a first sighting, so
-            // the value is read back after it.
+            // the mapping is reloaded after the pin.
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_ns);
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
                 "__orig_bases__",
             ));
             crate::baseobjspace::setitem(
-                w_ns,
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 pyre_object::gc_roots::shadow_stack_get(key_slot),
                 pyre_object::gc_roots::shadow_stack_get(orig_bases_slot),
             )?;

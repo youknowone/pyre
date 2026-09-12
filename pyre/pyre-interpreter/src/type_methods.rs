@@ -1785,11 +1785,13 @@ fn format_render(
             // `{name}` via `space.getitem(mapping, w_key)` per
             // `newformat.py:Template.get_value`; KeyError propagates
             // to the caller (no silent default).
-            let m = pyre_object::gc_roots::shadow_stack_get(mapping_slot);
+            let _key_roots = pyre_object::gc_roots::push_roots();
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
+            // `w_str_new_managed` / `pin_root` may collect; reload the
+            // mapping only after the key is published.
             return crate::baseobjspace::getitem(
-                m,
+                pyre_object::gc_roots::shadow_stack_get(mapping_slot),
                 pyre_object::gc_roots::shadow_stack_get(key_slot),
             )
             .map(Some);
@@ -1896,7 +1898,9 @@ fn format_render(
         //
         // Each hop can collect. Keep the current value in one shadow-stack
         // slot and reload it before the next getattr/getitem, the same way
-        // the nested-spec arm already republishes `val`.
+        // the nested-spec arm already republishes `val`. The scope is this
+        // field only (`newformat.py` `_render_field` locals).
+        let field_roots = pyre_object::gc_roots::push_roots();
         let val_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(val);
         for name_part in &parts {
@@ -2016,6 +2020,7 @@ fn format_render(
             )?));
         }
         let formatted = format_value_dispatch(converted, &resolved_spec)?;
+        drop(field_roots);
         result.push_wtf8(&formatted);
     }
     Ok(TemplateRender::Text(result))

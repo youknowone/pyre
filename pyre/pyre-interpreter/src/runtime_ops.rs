@@ -183,16 +183,13 @@ pub extern "C" fn jit_store_name_to_namespace(
             }
         } else {
             let _key_roots = pyre_object::gc_roots::push_roots();
-            let globals_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_globals);
-            let value_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(value as PyObjectRef);
+            let live = pyre_object::gc_roots::pin_roots(&[w_globals, value as PyObjectRef]);
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
             if let Err(mut error) = crate::baseobjspace::setitem(
-                pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                pyre_object::gc_roots::shadow_stack_get(live),
                 pyre_object::gc_roots::shadow_stack_get(key_slot),
-                pyre_object::gc_roots::shadow_stack_get(value_slot),
+                pyre_object::gc_roots::shadow_stack_get(live + 1),
             ) {
                 jit_publish_exception(error.to_exc_object());
             }
