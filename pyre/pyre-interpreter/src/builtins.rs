@@ -23333,7 +23333,20 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         &[true, false, false, false, false],
         "__import__",
     )?;
-    let name_obj = scope[0];
+    import_bound_objects(scope[0], scope[1], scope[2], scope[3], scope[4])
+}
+
+/// `__import__` after the five named slots are bound.
+///
+/// Shared by the keyword gateway and the five-positional wrapper so both
+/// reach `dunder_import` / `gcd_import_fast` with the same objects.
+fn import_bound_objects(
+    name_obj: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    level_obj: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { pyre_object::is_str(name_obj) } {
         return Err(crate::PyError::type_error("module name must be a string"));
     }
@@ -23345,22 +23358,21 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     // The other three bound arguments outlive `level.__index__` too, and each
     // is a kind the nursery relocates: two dicts and the `fromlist` tuple.
     // Publish them beside the name and read every one back below.
-    let globals_slot = (!scope[1].is_null()).then(|| {
+    let globals_slot = (!w_globals.is_null()).then(|| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(scope[1]);
+        let _ = pyre_object::gc_roots::pin_root(w_globals);
         slot
     });
-    let locals_slot = (!scope[2].is_null()).then(|| {
+    let locals_slot = (!w_locals.is_null()).then(|| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(scope[2]);
+        let _ = pyre_object::gc_roots::pin_root(w_locals);
         slot
     });
-    let fromlist_slot = (!scope[3].is_null()).then(|| {
+    let fromlist_slot = (!w_fromlist.is_null()).then(|| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(scope[3]);
+        let _ = pyre_object::gc_roots::pin_root(w_fromlist);
         slot
     });
-    let level_obj = scope[4];
     // `@unwrap_spec(level=int)` — an omitted level defaults to 0; a supplied
     // non-integer raises through the index protocol rather than defaulting.
     let level = if level_obj.is_null() {
@@ -23400,13 +23412,22 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `BuiltinCode.func` wrapper is therefore a member of the annotator's PBC
 /// family and the meta-interpreter can descend through it.  Hand-written
 /// builtins have to publish that wrapper explicitly in pyre (the same shape
-/// used by `__majit_wrap_builtin_len` below), otherwise an `IMPORT_NAME`
-/// reached through the ordinary CALL path stops at an opaque native function
-/// pointer instead of tracing `dunder_import` / `gcd_import_fast`.
+/// used by `__majit_wrap_builtin_len`): read each positional slot out of the
+/// slice so the descent walker can key the args-array heap-cache off those
+/// element reads.  Forwarding the whole slice hid every `getarrayitem` and
+/// the walker declined with "wrapper args item descriptor unresolved".
 pub fn __majit_wrap_builtin_dunder_import(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    builtin_dunder_import(args)
+    if args.len() != 5 {
+        return builtin_dunder_import(args);
+    }
+    let name_obj = args[0];
+    let w_globals = args[1];
+    let w_locals = args[2];
+    let w_fromlist = args[3];
+    let level_obj = args[4];
+    import_bound_objects(name_obj, w_globals, w_locals, w_fromlist, level_obj)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
