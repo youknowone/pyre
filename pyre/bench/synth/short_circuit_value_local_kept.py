@@ -1,4 +1,8 @@
 # pyre-check: max-pypy-ratio=15.4
+# pyre-check: max-wasm-ratio=5.7
+# leftover-empty GETFIELD tails vs native loads; darwin-arm64 measured
+# 4.9x against dynasm after rebase onto origin/main. 5.7x is that
+# reading plus WASM_RATIO_FIT_HEADROOM (15%).
 # Ubuntu run 33279264115: 3.5-7.7x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython

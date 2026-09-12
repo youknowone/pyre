@@ -1,4 +1,8 @@
 # pyre-check: max-pypy-ratio=9
+# pyre-check: max-wasm-ratio=5.5
+# leftover-empty GETFIELD tails vs native loads; darwin-arm64 measured
+# 4.7x against dynasm after rebase onto origin/main. 5.5x is that
+# reading plus WASM_RATIO_FIT_HEADROOM (15%).
 # The trip count answers two ends at once.  The loop has to run long enough to
 # reach the JIT, or the merge this fixture exists for never happens; and pypy's
 # own execution has to clear FLOOR_GATE_MIN_BASELINE_S, or the ratio divides
