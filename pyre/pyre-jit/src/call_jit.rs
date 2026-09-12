@@ -2100,15 +2100,7 @@ fn jit_blackhole_resume_from_guard(
     descr_addr: usize,
     deadframe: *mut majit_backend::jitframe::JitFrame,
     guard_exc: i64,
-    savedata: usize,
 ) -> Option<i64> {
-    // `ResumeGuardForcedDescr.handle_fail` retains the GC-owned cache across
-    // resume preparation. The raw CALL_ASSEMBLER ABI copied jf_savedata, so
-    // root that copy too and read its forwarded value at the actual decode.
-    let savedata_slot = [savedata as i64];
-    let _savedata_root = unsafe {
-        majit_metainterp::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata != 0)
-    };
     let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
     let ca_finished_frame = CA_WALK_FINISHED_FRAME.with(|c| c.replace(0));
     let ca_resume_frame = CA_WALK_RESUME_FRAME.with(|c| c.replace(0));
@@ -2259,14 +2251,18 @@ fn jit_blackhole_resume_from_guard(
         // instead of resuming the no-exception continuation with a NULL
         // result.
         // compile.py `ResumeGuardForcedDescr.handle_fail` fishes the
-        // cache `handle_async_forcing` saved; no other `handle_fail` does.
-        let all_virtuals = if descr_arc.is_guard_forced() {
-            crate::eval::take_forced_virtuals_for_frame(
-                fail0 as *const pyre_interpreter::pyframe::PyFrame,
-            )
+        // cache `handle_async_forcing` saved via `cpu.get_savedata_ref(deadframe)`.
+        let savedata = unsafe { (*deadframe).jf_savedata };
+        let savedata_slot = [savedata as i64];
+        let _savedata_root = unsafe {
+            majit_metainterp::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata != 0)
+        };
+        let all_virtuals = if descr_arc.is_guard_forced() && savedata != 0 {
+            majit_metainterp::allvirtuals::reveal(majit_ir::GcRef(savedata_slot[0] as usize))
         } else {
             None
         };
+        let identity_override = (fail0 != 0).then_some(fail0);
         let result = blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
@@ -2276,9 +2272,9 @@ fn jit_blackhole_resume_from_guard(
             Some(deadframe_types.as_slice()),
             guard_exc,
             false, // CALL_ASSEMBLER portal is jd0 (virtualizable)
-            raw_deadframe.first().copied().filter(|&ptr| ptr != 0),
+            identity_override,
             all_virtuals,
-            None, // `raw_deadframe` is rooted only by the copy made inside
+            None,
         );
         return handle_blackhole_result(result, actual_green_key);
     }
