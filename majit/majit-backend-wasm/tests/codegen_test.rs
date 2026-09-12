@@ -9,7 +9,7 @@ use std::process::Command;
 
 use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRef, RuntimeHelperKind, Type};
+use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRc, OpRef, RuntimeHelperKind, Type};
 use smallvec::smallvec;
 use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store, Table, TableType, Val, ValType};
 
@@ -486,7 +486,7 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
 fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
     let op = Op::new(opcode, &bx);
-    op.pos.set(pos);
+    op.pos().set(pos);
     op
 }
 
@@ -495,12 +495,7 @@ use majit_ir::forwarding::bound_operand_from_opref as rb;
 fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
     let op = Op::new(opcode, &bx);
-    op.setfailargs(smallvec![rb(fail_args[0]); 0]);
-    let mut fa: smallvec::SmallVec<[Operand; 3]> = smallvec::SmallVec::new();
-    for &a in fail_args {
-        fa.push(rb(a));
-    }
-    op.setfailargs(fa);
+    op.setfailargs(fail_args.iter().copied().map(rb).collect());
     op
 }
 
@@ -3649,7 +3644,7 @@ fn test_exception_guards() {
         // GuardException(expected_type) — caught value bound to int_op(1).
         {
             let op = Op::new(OpCode::GuardException, &[rb(OpRef::input_arg_int(0))]);
-            op.pos.set(OpRef::int_op(1));
+            op.pos().set(OpRef::int_op(1));
             op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
             op
         },
@@ -4980,25 +4975,25 @@ impl majit_ir::descr::FailDescr for HostFailDescr {
 /// A two-input loop whose single LABEL sits at the entry, so
 /// `stamp_and_publish_label_targets` publishes it as a re-enterable target and
 /// a bridge closing onto `label_descr` resolves in-module.
-fn host_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::rc::Rc<Op>> {
-    let label = std::rc::Rc::new(Op::new(
+fn host_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<OpRc> {
+    let label = OpRc::new(Op::new(
         OpCode::Label,
         &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
     ));
     label.setdescr(label_descr.clone());
-    let advance = std::rc::Rc::new(make_op(
+    let advance = OpRc::new(make_op(
         OpCode::IntAdd,
         &[OpRef::input_arg_int(0), OpRef::const_int(1)],
         OpRef::int_op(2),
     ));
-    let guard = std::rc::Rc::new(make_guard(
+    let guard = OpRc::new(make_guard(
         OpCode::GuardTrue,
         &[OpRef::int_op(2)],
         &[OpRef::int_op(2), OpRef::input_arg_int(1)],
     ));
     // Bind the JUMP to the real producer, not to a synthetic stand-in: the
     // loop-carried advance is read off the arg's producing opcode.
-    let jump = std::rc::Rc::new(Op::new(
+    let jump = OpRc::new(Op::new(
         OpCode::Jump,
         &[
             Operand::from_bound_op(&advance),
@@ -5011,13 +5006,13 @@ fn host_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::
 
 /// A loop-closing bridge for the loop above: it advances one loop-carried
 /// value and jumps back onto the owner's published label.
-fn host_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::rc::Rc<Op>> {
-    let advance = std::rc::Rc::new(make_op(
+fn host_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<OpRc> {
+    let advance = OpRc::new(make_op(
         OpCode::IntAdd,
         &[OpRef::input_arg_int(40), OpRef::const_int(1)],
         OpRef::int_op(42),
     ));
-    let jump = std::rc::Rc::new(Op::new(
+    let jump = OpRc::new(Op::new(
         OpCode::Jump,
         &[
             Operand::from_bound_op(&advance),

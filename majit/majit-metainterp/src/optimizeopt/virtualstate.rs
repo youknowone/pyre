@@ -570,8 +570,10 @@ impl VirtualState {
         Self::reset_positions(&self.state);
         // Borrow split: clone the top-level Rcs into a temporary list so
         // the per-node `enum_into` can take `&mut self`. Rc::clone is
-        // refcount-only.
-        let top: Vec<Rc<VirtualStateInfoNode>> = self.state.clone();
+        // refcount-only. RPython `VirtualState.__init__` walks `state`
+        // directly; keep the clone on the stack for the usual few inputs.
+        let top: smallvec::SmallVec<[Rc<VirtualStateInfoNode>; 8]> =
+            self.state.iter().cloned().collect();
         for node in &top {
             node.enum_into(self);
         }
@@ -580,8 +582,12 @@ impl VirtualState {
     /// Walk all reachable nodes and reset position cells to -1 so the
     /// next `enum_top_level` traversal mirrors a fresh RPython
     /// VirtualState.__init__ over fresh subclass instances.
+    ///
+    /// RPython `__init__` has no visited set (fresh instances). The set
+    /// here only breaks shared-Rc DAGs; a linear SmallVec stays off the
+    /// 48 B IndexMap-bucket class on the regex graphs.
     fn reset_positions(state: &[Rc<VirtualStateInfoNode>]) {
-        let mut visited: indexmap::IndexSet<usize> = indexmap::IndexSet::new();
+        let mut visited: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
         for node in state {
             Self::reset_positions_walk(node, &mut visited);
         }
@@ -589,13 +595,13 @@ impl VirtualState {
 
     fn reset_positions_walk(
         node: &Rc<VirtualStateInfoNode>,
-        visited: &mut indexmap::IndexSet<usize>,
+        visited: &mut smallvec::SmallVec<[usize; 8]>,
     ) {
         let key = Rc::as_ptr(node) as usize;
-        if visited.contains(&key) {
+        if visited.iter().any(|&k| k == key) {
             return;
         }
-        visited.insert(key);
+        visited.push(key);
         node.position.set(-1);
         node.position_in_notvirtuals.set(-1);
         match &node.info {
@@ -2333,116 +2339,20 @@ impl VirtualState {
 }
 
 impl Clone for VirtualState {
-    /// Deep-clone the entire `VirtualStateInfoNode` tree so the cloned
-    /// `VirtualState` owns an independent set of `position` /
-    /// `position_in_notvirtuals` cells. Within a single clone, source nodes
-    /// shared by `Rc` identity remain shared in the destination (cached by
-    /// `Rc::as_ptr`), preserving RPython's `VirtualStateConstructor`
-    /// box-keyed instance sharing semantics.
-    ///
-    /// A naive `#[derive(Clone)]` would `Rc::clone` (refcount-only) and
-    /// leak position cells across clones; calling `enum_top_level` on
-    /// either copy then resets shared `Cell<i32>` positions, corrupting
-    /// the other. RPython's `VirtualState.__init__` constructs fresh
-    /// subclass instances per VirtualState — this manual impl reproduces
-    /// that invariant.
+    /// Share the `AbstractVirtualStateInfo` graph. RPython `VirtualState`
+    /// is one object; assignment (`TargetToken.virtual_state = vs`,
+    /// `ExportedState.virtual_state = vs`) never copies the instance tree.
+    /// `VirtualState.__init__` / `from_shared_rcs` is the only constructor
+    /// that walks `enum`; `refresh_from_gc` and `force_boxes` rewrite this
+    /// instance in place. A deep copy of the node tree was a compile-time
+    /// `IndexMap` + per-node `Rc` on every `token.virtual_state.clone()`.
     fn clone(&self) -> Self {
-        let mut cache: indexmap::IndexMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>> =
-            indexmap::IndexMap::new();
-        let cloned: Vec<Rc<VirtualStateInfoNode>> = self
-            .state
-            .iter()
-            .map(|src| deep_clone_node(src, &mut cache))
-            .collect();
-        VirtualState::from_shared_rcs(cloned)
+        VirtualState {
+            state: self.state.clone(),
+            numnotvirtuals: self.numnotvirtuals,
+            info_counter: self.info_counter,
+        }
     }
-}
-
-/// Deep-clone a `VirtualStateInfoNode` tree, mapping each source `Rc`
-/// identity to one fresh `Rc` in the destination via `cache`. Used by
-/// `<VirtualState as Clone>::clone`.
-fn deep_clone_node(
-    src: &Rc<VirtualStateInfoNode>,
-    cache: &mut indexmap::IndexMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>>,
-) -> Rc<VirtualStateInfoNode> {
-    let key = Rc::as_ptr(src);
-    if let Some(hit) = cache.get(&key) {
-        return Rc::clone(hit);
-    }
-    let cloned_info = match &src.info {
-        VirtualStateInfo::Constant(v) => VirtualStateInfo::Constant(*v),
-        VirtualStateInfo::KnownClass { class_ptr } => VirtualStateInfo::KnownClass {
-            class_ptr: *class_ptr,
-        },
-        VirtualStateInfo::NonNull => VirtualStateInfo::NonNull,
-        VirtualStateInfo::IntBounded(b) => VirtualStateInfo::IntBounded(b.clone()),
-        VirtualStateInfo::Unknown(t) => VirtualStateInfo::Unknown(*t),
-        VirtualStateInfo::Virtual {
-            descr,
-            known_class,
-            ob_type_descr,
-            fields,
-            field_descrs,
-        } => VirtualStateInfo::Virtual {
-            descr: descr.clone(),
-            known_class: *known_class,
-            ob_type_descr: ob_type_descr.clone(),
-            fields: fields
-                .iter()
-                .map(|(idx, child)| (*idx, deep_clone_node(child, cache)))
-                .collect(),
-            field_descrs: field_descrs.clone(),
-        },
-        VirtualStateInfo::VStruct {
-            descr,
-            fields,
-            field_descrs,
-        } => VirtualStateInfo::VStruct {
-            descr: descr.clone(),
-            fields: fields
-                .iter()
-                .map(|(idx, child)| (*idx, deep_clone_node(child, cache)))
-                .collect(),
-            field_descrs: field_descrs.clone(),
-        },
-        VirtualStateInfo::VArray {
-            descr,
-            items,
-            lenbound,
-        } => VirtualStateInfo::VArray {
-            descr: descr.clone(),
-            items: items
-                .iter()
-                .map(|child| child.as_ref().map(|child| deep_clone_node(child, cache)))
-                .collect(),
-            lenbound: lenbound.clone(),
-        },
-        VirtualStateInfo::VArrayStruct {
-            descr,
-            fielddescrs,
-            element_fields,
-        } => VirtualStateInfo::VArrayStruct {
-            descr: descr.clone(),
-            fielddescrs: fielddescrs.clone(),
-            element_fields: element_fields
-                .iter()
-                .map(|fields| {
-                    fields
-                        .iter()
-                        .map(|(idx, child)| {
-                            (
-                                *idx,
-                                child.as_ref().map(|child| deep_clone_node(child, cache)),
-                            )
-                        })
-                        .collect()
-                })
-                .collect(),
-        },
-    };
-    let new_rc = VirtualStateInfoNode::new_rc_with_lenbound(cloned_info, src.lenbound.clone());
-    cache.insert(key, Rc::clone(&new_rc));
-    new_rc
 }
 
 /// A guard that must be emitted to make an incoming state compatible.
@@ -2656,8 +2566,8 @@ pub(crate) fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
     // `Rc<VirtualStateInfoNode>` cache shared across the whole export, including
     // recursive nested-field calls AND top-level jump args.
     //
-    // virtualstate.py:713 `box = get_box_replacement(box)` is performed
-    // inside `export_single_value`, so we don't pre-resolve here.
+    // virtualstate.py `create_state` does `box = get_box_replacement(box)`
+    // inside the per-value walk, so we don't pre-resolve here.
     let mut cache = ExportCache::new();
     let state: Vec<Rc<VirtualStateInfoNode>> = oprefs
         .iter()
@@ -2666,6 +2576,20 @@ pub(crate) fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
     // virtualstate.py VirtualState.__init__ assigns positions via
     // _enum so subsequent walks dedup shared Rc'd subtrees via
     // `state.position > self.position`.
+    VirtualState::from_shared_rcs(state)
+}
+
+/// Same walk as [`export_state`], keyed by the already-resolved boxes.
+/// RPython `get_virtual_state(end_args)` holds Box objects, not positions.
+pub(crate) fn export_state_operands(
+    operands: &[majit_ir::operand::Operand],
+    ctx: &OptContext,
+) -> VirtualState {
+    let mut cache = ExportCache::new();
+    let state: Vec<Rc<VirtualStateInfoNode>> = operands
+        .iter()
+        .map(|operand| export_single_operand(operand, ctx, &mut cache))
+        .collect();
     VirtualState::from_shared_rcs(state)
 }
 
@@ -2713,11 +2637,21 @@ fn create_state_or_none(
     ctx: &OptContext,
     cache: &mut ExportCache,
 ) -> Option<Rc<VirtualStateInfoNode>> {
-    let opref = operand.to_opref();
-    if opref.is_none() {
+    // virtualstate.py `create_state_or_none`: `if box is None: return None`. The
+    // absent-slot sentinel is `Operand::None`, not `to_opref() == None`:
+    // a bound ResOp whose `pos` was never stamped still has `box.type`
+    // (`Op.type_`) and must be exported.
+    if operand.is_none() {
         None
     } else {
-        Some(export_single_value(opref, ctx, cache))
+        let opref = operand.to_opref();
+        if opref.is_none() {
+            // Bound ResOp whose `pos` was never stamped: keep the
+            // operand so `Op.type_` can still pick the not_virtual leaf.
+            Some(export_single_operand(operand, ctx, cache))
+        } else {
+            Some(export_single_value(opref, ctx, cache))
+        }
     }
 }
 
@@ -2751,18 +2685,27 @@ fn export_single_value(
     ctx: &OptContext,
     cache: &mut ExportCache,
 ) -> Rc<VirtualStateInfoNode> {
+    export_single_operand(&ctx.get_box_replacement_operand(opref), ctx, cache)
+}
+
+fn export_single_operand(
+    operand: &majit_ir::operand::Operand,
+    ctx: &OptContext,
+    cache: &mut ExportCache,
+) -> Rc<VirtualStateInfoNode> {
     // virtualstate.py:713-716 `box = get_box_replacement(box)` then keyed
     // lookup on `self.info`: resolve the forwarding chain BEFORE the cache
     // lookup so two field references forwarding to the same target collapse
     // onto the same VirtualStateInfo. Key the DAG cache by the resolved box's
     // identity (`Rc::ptr_eq`, const by value) — the bound producer's one
     // canonical `Rc`.
-    let box_ = ctx.get_box_replacement_operand(opref);
+    let box_ = operand.get_box_replacement(false);
+    let opref = box_.to_opref();
     // bind-at-alloc invariant (see ExportCache): every position reaching
     // export resolves to a bound box, so `box_` is a stable canonical `Rc`
     // rather than a fresh `from_opref` placeholder that would split the cache.
     debug_assert!(
-        ctx.get_box_replacement_operand_opt(opref).is_some(),
+        !box_.is_none() || opref.is_none(),
         "export_single_value: unbound position {opref:?} reached export — \
          bind-at-alloc invariant violated (every value reaching create_state \
          must be a bound box; virtualstate.py:711-720)"
@@ -2795,7 +2738,7 @@ fn export_single_value(
     let key = box_.clone();
     cache.in_progress.insert(key.clone());
 
-    let info = export_single_value_inner(box_.to_opref(), ctx, cache);
+    let info = export_single_value_inner(&box_, ctx, cache);
     // virtualstate.py NotVirtualStateInfoPtr.__init__: retain the
     // widened ArrayPtrInfo / StrPtrInfo length bound on the per-instance
     // pointer leaf. Virtual pointer infos have their own state variants and
@@ -2820,10 +2763,11 @@ fn export_single_value(
 }
 
 fn export_single_value_inner(
-    opref: OpRef,
+    box_: &majit_ir::operand::Operand,
     ctx: &OptContext,
     cache: &mut ExportCache,
 ) -> VirtualStateInfo {
+    let opref = box_.to_opref();
     // virtualstate.py `visit_not_virtual` dispatches via
     // `not_virtual(cpu, value.type, optimizer.getinfo(value))`; when
     // `info.is_constant()` is true the resulting state is LEVEL_CONSTANT
@@ -2832,25 +2776,24 @@ fn export_single_value_inner(
     // returns Some exactly when the chain terminates at a Const Box,
     // i.e. when PyPy's `info.is_constant()` is true. Mirror that:
     // export LEVEL_CONSTANT regardless of OpRef namespace.
-    if let Some(value) = ctx
-        .get_box_replacement_operand_opt(opref)
-        .and_then(|b| ctx.get_constant_box(&b))
-    {
+    if let Some(value) = ctx.get_constant_box(box_) {
         return VirtualStateInfo::Constant(value);
     }
 
     // operand-routing PtrInfo read (info.py op.get_forwarded()).
-    let opref_box = ctx.get_box_replacement_operand_opt(opref);
-    if let Some(info) = opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+    if let Some(info) = ctx.peek_ptr_info(box_) {
         let info_fielddescrs = info.all_fielddescrs_from_descr();
         match info {
             PtrInfo::Virtual(vinfo) => {
+                // virtualstate.py `create_state`: fieldboxes go through
+                // `create_state_or_none`. An unwritten slot is `None` and
+                // stays absent from the sparse field list.
                 let fields = vinfo
                     .fields
                     .iter()
-                    .map(|(field_idx, field_ref)| {
-                        let field_state = export_single_value(field_ref.to_opref(), ctx, cache);
-                        (*field_idx, field_state)
+                    .filter_map(|(field_idx, field_ref)| {
+                        create_state_or_none(field_ref, ctx, cache)
+                            .map(|field_state| (*field_idx, field_state))
                     })
                     .collect();
                 return VirtualStateInfo::Virtual {
@@ -2877,12 +2820,14 @@ fn export_single_value_inner(
                 };
             }
             PtrInfo::VirtualStruct(vinfo) => {
+                // virtualstate.py `create_state`: same `create_state_or_none`
+                // walk as Virtual / VArray. Unwritten slots stay absent.
                 let fields = vinfo
                     .fields
                     .iter()
-                    .map(|(field_idx, field_ref)| {
-                        let field_state = export_single_value(field_ref.to_opref(), ctx, cache);
-                        (*field_idx, field_state)
+                    .filter_map(|(field_idx, field_ref)| {
+                        create_state_or_none(field_ref, ctx, cache)
+                            .map(|field_state| (*field_idx, field_state))
                     })
                     .collect();
                 return VirtualStateInfo::VStruct {
@@ -2966,20 +2911,28 @@ fn export_single_value_inner(
     // is picked by `box.type` which is ALWAYS set on RPython Boxes.
     // pyre's OptContext::opref_type reconstructs it from value_types
     // (seeded from trace_inputargs) / producing-op result_type.
-    let tp = ctx.opref_type(opref).unwrap_or_else(|| {
-        // Two different failures reach this line: the absent-operand sentinel
-        // is unexpected outside `create_state_or_none`, while a named ref
-        // means value_types lacks an entry for a real box. Keep both loud.
-        let seen = if opref.is_none() {
-            "the absent-operand sentinel reached export_state"
-        } else {
-            "no type recorded for a ref that does exist"
-        };
-        panic!(
-            "not_virtual: opref_type({opref:?}) found no type — {seen}; \
+    let tp = ctx
+        .opref_type(opref)
+        .or_else(|| {
+            // A bound ResOp whose `pos` was never stamped has no OpRef
+            // variant tag; `Op.type_` is still `opclasses[opnum].type`.
+            let t = box_.type_();
+            (t != Type::Void).then_some(t)
+        })
+        .unwrap_or_else(|| {
+            // Two different failures reach this line: the absent-operand sentinel
+            // is unexpected outside `create_state_or_none`, while a named ref
+            // means value_types lacks an entry for a real box. Keep both loud.
+            let seen = if box_.is_none() {
+                "the absent-operand sentinel reached export_state"
+            } else {
+                "no type recorded for a ref that does exist"
+            };
+            panic!(
+                "not_virtual: opref_type({opref:?}) found no type — {seen}; \
              RPython box.type is always set (virtualstate.py:360)",
-        );
-    });
+            );
+        });
     // virtualstate.py NotVirtualStateInfoInt.__init__: an int leaf's
     // info is `getintbound(op)` (optimizer.py — always an IntBound for a
     // non-constant int), and the constructor widens it (`info.widen_update()`)
@@ -3478,6 +3431,39 @@ mod tests {
     }
 
     #[test]
+    fn test_export_virtual_struct_skips_unwritten_slot() {
+        // virtualstate.py `create_state_or_none`: an unwritten
+        // struct fieldbox is None and must not reach not_virtual.
+        let mut ctx = OptContext::new(32);
+        let struct_ref = OpRef::ref_op(10);
+        let written_ref = OpRef::int_op(11);
+        let struct_box = ctx.materialize_operand_at(struct_ref);
+        let written_box = ctx.materialize_operand_at(written_ref);
+        ctx.set_ptr_info(
+            &struct_box,
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr: test_descr(21),
+                fields: vec![(0, Operand::None), (1, written_box)].into(),
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let state = export_state(&[struct_ref], &ctx);
+        let VirtualStateInfo::VStruct { fields, .. } = &state.state[0].info else {
+            panic!("exported state is not a virtual struct");
+        };
+        assert_eq!(fields.len(), 1, "unwritten slot must stay absent");
+        assert_eq!(fields[0].0, 1);
+        assert_eq!(state.num_boxes(), 1);
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let inputargs = state
+            .make_inputargs(&[struct_ref], &mut optimizer, &mut ctx, false)
+            .expect("exported virtual struct must enumerate its written slot");
+        assert_eq!(inputargs, vec![written_ref]);
+    }
+
+    #[test]
     fn test_make_inputargs_skips_virtual_entries() {
         let descr = test_descr(7);
         let state = VirtualState::new(vec![
@@ -3499,7 +3485,7 @@ mod tests {
             &b11,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![],
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3535,7 +3521,7 @@ mod tests {
             &b21,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![],
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3687,7 +3673,7 @@ mod tests {
             &outer_a_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr: descr.clone(),
-                fields: vec![(0, inner_field_op.clone())],
+                fields: vec![(0, inner_field_op.clone())].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3696,7 +3682,7 @@ mod tests {
             &outer_b_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![(0, inner_field_op.clone())],
+                fields: vec![(0, inner_field_op.clone())].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3736,6 +3722,17 @@ mod tests {
         assert_eq!(inputargs, vec![outer_ref]);
     }
 
+    /// `VirtualState` assignment shares the info graph (`VirtualState.__init__`
+    /// is the constructor; later copies are the same Python object).
+    #[test]
+    fn clone_shares_node_identity() {
+        let vs = VirtualState::new(vec![VirtualStateInfo::NonNull]);
+        let cloned = vs.clone();
+        assert!(Rc::ptr_eq(&vs.state[0], &cloned.state[0]));
+        assert_eq!(vs.num_boxes(), cloned.num_boxes());
+        assert_eq!(vs.state[0].position.get(), cloned.state[0].position.get());
+    }
+
     #[test]
     fn test_make_inputargs_recursively_extracts_virtual_fields() {
         let descr = test_descr(11);
@@ -3759,7 +3756,7 @@ mod tests {
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![(0, Operand::None), (8, field_value_op.clone())],
+                fields: vec![(0, Operand::None), (8, field_value_op.clone())].into(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3818,7 +3815,7 @@ mod tests {
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![],
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -3860,7 +3857,7 @@ mod tests {
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
-                fields: vec![],
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),

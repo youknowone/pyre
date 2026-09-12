@@ -5,7 +5,7 @@
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
-use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -280,7 +280,7 @@ pub(crate) mod test_support {
     /// producer handle, so forwarding asserts read the same canonical
     /// `InputArg` host the operand routes writes to.
     pub(crate) fn bound_inputarg_operand(tp: Type, index: u32) -> (Operand, InputArgRc) {
-        let ia = std::rc::Rc::new(InputArg::from_type(tp, index));
+        let ia = InputArgRc::new(InputArg::from_type(tp, index));
         (Operand::from_bound_inputarg(&ia), ia)
     }
 
@@ -293,13 +293,13 @@ pub(crate) mod test_support {
             Type::Ref => OpCode::SameAsR,
             Type::Void => OpCode::Jump,
         };
-        let op = std::rc::Rc::new(Op::new(opcode, &[]));
-        op.pos.set(OpRef::op_typed(position, tp));
+        let op = OpRc::new(Op::new(opcode, &[]));
+        op.pos().set(OpRef::op_typed(position, tp));
         (Operand::from_bound_op(&op), op)
     }
 
     thread_local! {
-        static PRODUCER_ROOTS: std::cell::RefCell<Vec<std::rc::Rc<dyn std::any::Any>>> =
+        static PRODUCER_ROOTS: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
@@ -310,7 +310,7 @@ pub(crate) mod test_support {
     /// still finds the live producer instead of a dangling `Weak`.
     pub(crate) fn rooted_resop_operand(tp: Type, position: u32) -> Operand {
         let (operand, op) = bound_resop_operand(tp, position);
-        let rooted: std::rc::Rc<dyn std::any::Any> = op;
+        let rooted: Box<dyn std::any::Any> = Box::new(op);
         PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
         operand
     }
@@ -320,7 +320,7 @@ pub(crate) mod test_support {
     /// re-resolution stays bound.
     pub(crate) fn rooted_inputarg_operand(tp: Type, index: u32) -> Operand {
         let (operand, ia) = bound_inputarg_operand(tp, index);
-        let rooted: std::rc::Rc<dyn std::any::Any> = ia;
+        let rooted: Box<dyn std::any::Any> = Box::new(ia);
         PRODUCER_ROOTS.with(|p| p.borrow_mut().push(rooted));
         operand
     }
@@ -367,8 +367,8 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn op(&mut self, opcode: OpCode, args: &[Operand]) -> Operand {
-            let op = std::rc::Rc::new(Op::new(opcode, args));
-            op.pos
+            let op = OpRc::new(Op::new(opcode, args));
+            op.pos()
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;
             let result = Operand::from_bound_op(&op);
@@ -382,8 +382,8 @@ pub(crate) mod test_support {
             args: &[Operand],
             descr: majit_ir::DescrRef,
         ) -> Operand {
-            let op = std::rc::Rc::new(Op::with_descr(opcode, args, descr));
-            op.pos
+            let op = OpRc::new(Op::with_descr(opcode, args, descr));
+            op.pos()
                 .set(OpRef::op_typed(self.next_pos, opcode.result_type()));
             self.next_pos += 1;
             let result = Operand::from_bound_op(&op);
@@ -501,8 +501,8 @@ impl TreeLoop {
     /// `TreeLoop.operations` semantic).
     pub fn new(inputargs: Vec<InputArg>, ops: Vec<Op>) -> Self {
         TreeLoop {
-            inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
-            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+            inputargs: inputargs.into_iter().map(InputArgRc::new).collect(),
+            ops: ops.into_iter().map(OpRc::new).collect(),
             snapshots: Vec::new(),
         }
     }
@@ -514,8 +514,8 @@ impl TreeLoop {
         snapshots: Vec<crate::recorder::Snapshot>,
     ) -> Self {
         TreeLoop {
-            inputargs: inputargs.into_iter().map(std::rc::Rc::new).collect(),
-            ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+            inputargs: inputargs.into_iter().map(InputArgRc::new).collect(),
+            ops: ops.into_iter().map(OpRc::new).collect(),
             snapshots,
         }
     }
@@ -652,7 +652,7 @@ impl TreeLoop {
             // PyPy's operation objects are unique by allocation. Rust traces
             // carry that identity in OpRef positions, so duplicate positions
             // are structurally invalid before considering dataflow.
-            if !op.pos.get().is_none() && !op_positions.insert(op.pos.get()) {
+            if !op.pos().get().is_none() && !op_positions.insert(op.pos().get()) {
                 return false;
             }
             // history.py:576-578: ovf ops must be followed by guard_overflow
@@ -680,7 +680,7 @@ impl TreeLoop {
                     return false;
                 }
                 // history.py:588-591: fail_args validation
-                if let Some(fa) = op.getfailargs() {
+                if let Some(fa) = op.guard_fail_args() {
                     for arg in fa.iter() {
                         if arg.is_none() {
                             continue;
@@ -701,8 +701,8 @@ impl TreeLoop {
             }
             // history.py:594-595: if op produces a value, add to seen
             if op.opcode.result_type() != Type::Void
-                && !op.pos.get().is_none()
-                && !seen.insert(op.pos.get())
+                && !op.pos().get().is_none()
+                && !seen.insert(op.pos().get())
             {
                 return false;
             }
@@ -798,8 +798,8 @@ impl TreeLoop {
         // Collect all OpRefs defined by post-cut ops.
         let defined_after_cut: IndexSet<OpRef> = cut_ops
             .iter()
-            .filter(|op| !op.pos.get().is_none())
-            .map(|op| op.pos.get())
+            .filter(|op| !op.pos().get().is_none())
+            .map(|op| op.pos().get())
             .collect();
 
         // Phase 2: Find escaped refs — referenced after cut, defined before
@@ -948,7 +948,7 @@ impl TreeLoop {
                                 stack.push((a, false));
                             }
                         }
-                        extra.push(other.pos.get());
+                        extra.push(other.pos().get());
                     }
                 }
                 for arg in op.getarglist().iter() {
@@ -961,7 +961,7 @@ impl TreeLoop {
             Some(extra)
         };
         for op in cut_ops {
-            let snapshot_id = op.rd_resume_position.get();
+            let snapshot_id = op.rd_resume_position();
             if snapshot_id < 0 {
                 continue;
             }
@@ -1073,7 +1073,7 @@ impl TreeLoop {
         let new_inputargs: Vec<majit_ir::InputArgRc> = new_ia_types
             .iter()
             .enumerate()
-            .map(|(i, &tp)| std::rc::Rc::new(InputArg::from_type(tp, i as u32)))
+            .map(|(i, &tp)| InputArgRc::new(InputArg::from_type(tp, i as u32)))
             .collect();
 
         // Bind a remapped operand to its producer in the NEW namespace:
@@ -1122,9 +1122,9 @@ impl TreeLoop {
         // Also assign fresh refs for post-cut ops (shifted by prefix count).
         let prefix_count = op_escaped.len() as u32;
         for (i, op) in cut_ops.iter().enumerate() {
-            if !op.pos.get().is_none() {
+            if !op.pos().get().is_none() {
                 remap.insert(
-                    op.pos.get(),
+                    op.pos().get(),
                     OpRef::op_typed(
                         new_inputargs_count + prefix_count + i as u32,
                         op.opcode.result_type(),
@@ -1152,7 +1152,7 @@ impl TreeLoop {
             // fresh identity (new pos, fresh _forwarded) per
             // history.py:551-558 cut_trace_from re-emission.
             let mut new_op: Op = (**orig_op).clone();
-            new_op.pos.set(OpRef::op_typed(
+            new_op.pos().set(OpRef::op_typed(
                 new_inputargs_count + pi as u32,
                 new_op.opcode.result_type(),
             ));
@@ -1167,7 +1167,7 @@ impl TreeLoop {
             }
             // Prefix ops don't need fail_args (they're not guards).
             new_op.clearfailargs();
-            new_ops.push(std::rc::Rc::new(new_op));
+            new_ops.push(OpRc::new(new_op));
         }
 
         // Phase 6: Remap post-cut ops.
@@ -1176,7 +1176,7 @@ impl TreeLoop {
             // fresh identity in the new trace per history.py:cut_trace_from
             // semantics (RPython makes new ResOperation objects).
             let mut new_op: Op = (**op).clone();
-            new_op.pos.set(OpRef::op_typed(
+            new_op.pos().set(OpRef::op_typed(
                 new_inputargs_count + prefix_count + i as u32,
                 new_op.opcode.result_type(),
             ));
@@ -1201,7 +1201,7 @@ impl TreeLoop {
                     "cut-trace op carried fail_args: {cut_opcode:?}"
                 );
             }
-            new_ops.push(std::rc::Rc::new(new_op));
+            new_ops.push(OpRc::new(new_op));
         }
 
         // opencoder.py parity: carry snapshots through cut_trace_from.
@@ -1272,7 +1272,7 @@ mod tests {
     impl majit_ir::Descr for DummyGuardDescr {}
 
     // Raw-OpRef position helpers (oparser-style names), used where a bare
-    // `OpRef` is needed: `op.pos.set(..)`, `to_opref()` comparisons,
+    // `OpRef` is needed: `op.pos().set(..)`, `to_opref()` comparisons,
     // `GreenBox::new`, recorder args.
     fn iarg(pos: u32) -> OpRef {
         OpRef::input_arg_int(pos)
@@ -1405,7 +1405,7 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
-        let fa = guards[0].getfailargs().unwrap();
+        let fa = guards[0].guard_fail_args().unwrap();
         assert_eq!(fa.len(), 2);
         assert_eq!(fa[0].to_opref(), OpRef::input_arg_int(0));
         assert_eq!(fa[1].to_opref(), OpRef::input_arg_int(1));
@@ -1512,8 +1512,8 @@ mod tests {
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 2);
 
-        assert_eq!(guards[0].getfailargs().unwrap().len(), 1);
-        assert_eq!(guards[1].getfailargs().unwrap().len(), 2);
+        assert_eq!(guards[0].guard_fail_args().unwrap().len(), 1);
+        assert_eq!(guards[1].guard_fail_args().unwrap().len(), 2);
     }
 
     #[test]
@@ -1638,7 +1638,7 @@ mod tests {
         let mut prev = iarg_box(0);
         for i in 0..100 {
             let mut op = Op::new(OpCode::IntAdd, &[prev, iarg_box(0)]);
-            op.pos.set(OpRef::int_op(i + 1));
+            op.pos().set(OpRef::int_op(i + 1));
             ops.push(op);
             prev = iop_box(i + 1);
         }
@@ -1677,7 +1677,7 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let guard = trace.iter_guards().next().unwrap();
-        let fa = guard.getfailargs().unwrap();
+        let fa = guard.guard_fail_args().unwrap();
         // All referenced OpRefs are valid: 0, 1 are inputargs; 2 is the add op
         assert!(fa.iter().all(|r| r.to_opref().raw() <= 2));
         assert_eq!(fa.len(), 3);
@@ -1708,9 +1708,9 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 3);
-        assert_eq!(guards[0].getfailargs().unwrap().len(), 0);
-        assert_eq!(guards[1].getfailargs().unwrap().len(), 1);
-        assert_eq!(guards[2].getfailargs().unwrap().len(), 3);
+        assert_eq!(guards[0].guard_fail_args().unwrap().len(), 0);
+        assert_eq!(guards[1].guard_fail_args().unwrap().len(), 1);
+        assert_eq!(guards[2].guard_fail_args().unwrap().len(), 3);
     }
 
     #[test]
@@ -1724,7 +1724,7 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
         let mut trace2 = trace.clone();
 
-        trace2.ops.push(std::rc::Rc::new(Op::new(
+        trace2.ops.push(OpRc::new(Op::new(
             OpCode::IntSub,
             &[iarg_box(0), iarg_box(0)],
         )));
@@ -1764,7 +1764,7 @@ mod tests {
     fn test_check_consistency_valid() {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
-        op0.pos.set(iop(2));
+        op0.pos().set(iop(2));
         let ops = vec![op0, Op::new(OpCode::Jump, &[iop_box(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
@@ -1814,7 +1814,7 @@ mod tests {
             OpCode::IntAdd,
             &[iarg_box(0), Operand::from_opref(const_ref)],
         );
-        op0.pos.set(iop(1));
+        op0.pos().set(iop(1));
         let ops = vec![op0, Op::new(OpCode::Finish, &[iop_box(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
@@ -1825,7 +1825,7 @@ mod tests {
         // history.py:576-578: ovf must be followed by guard_overflow
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg_box(0), iarg_box(1)]);
-        op0.pos.set(iop(2));
+        op0.pos().set(iop(2));
         let ops = vec![op0, Op::new(OpCode::Finish, &[iop_box(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
@@ -1835,7 +1835,7 @@ mod tests {
     fn test_check_consistency_ovf_followed_by_guard() {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg_box(0), iarg_box(1)]);
-        op0.pos.set(iop(2));
+        op0.pos().set(iop(2));
         let mut guard = Op::new(OpCode::GuardNoOverflow, &[]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![op0, guard, Op::new(OpCode::Finish, &[iop_box(2)])];
@@ -1849,7 +1849,7 @@ mod tests {
         // including overflow guards.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg_box(0), iarg_box(1)]);
-        op0.pos.set(iop(2));
+        op0.pos().set(iop(2));
         let ops = vec![
             op0,
             Op::new(OpCode::GuardNoOverflow, &[]),
@@ -1890,7 +1890,7 @@ mod tests {
         // history.py:596-602: LABEL resets the seen set to its args
         let inputargs = vec![InputArg::new_int(0)];
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
-        op0.pos.set(iop(1));
+        op0.pos().set(iop(1));
         // LABEL introduces a fresh scope with iarg(0) only
         let label = Op::new(OpCode::Label, &[iarg_box(0)]);
         // iop(1) was defined before label, so it's no longer in seen
@@ -1903,7 +1903,7 @@ mod tests {
     fn test_check_consistency_label_valid() {
         let inputargs = vec![InputArg::new_int(0)];
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
-        op0.pos.set(iop(1));
+        op0.pos().set(iop(1));
         let label = Op::new(OpCode::Label, &[iop_box(1)]);
         let ops = vec![op0, label, Op::new(OpCode::Jump, &[iop_box(1)])];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1914,9 +1914,9 @@ mod tests {
     fn test_check_consistency_duplicate_op_position_invalid() {
         let inputargs = vec![InputArg::new_int(0)];
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
-        op0.pos.set(iop(1));
+        op0.pos().set(iop(1));
         let mut op1 = Op::new(OpCode::IntSub, &[iop_box(1), iarg_box(0)]);
-        op1.pos.set(iop(1));
+        op1.pos().set(iop(1));
         let ops = vec![op0, op1, Op::new(OpCode::Finish, &[iop_box(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
@@ -1978,14 +1978,14 @@ mod tests {
         // without a matching inputarg would cache-miss in `_get`.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
-        add.pos.set(iop(2));
+        add.pos().set(iop(2));
         let ops = vec![add, Op::new(OpCode::Jump, &[iop_box(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         let mut iter = trace.get_iter();
         assert!(!iter.done());
         // Walk one op via TraceIterator.next() — opencoder.py.
         let r = iter.next().unwrap();
-        assert_eq!(r.pos.get(), iop(2));
+        assert_eq!(r.pos().get(), iop(2));
         assert_eq!(r.arg(0).to_opref(), iarg(0));
         assert_eq!(r.arg(1).to_opref(), iarg(1));
         assert_eq!(iter.pos, 1);
@@ -2013,14 +2013,14 @@ mod tests {
         let mut ops = Vec::new();
         // Pre-cut ops (2 inputargs → first op is BoxInt at position 2)
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
-        op0.pos.set(iop(2));
+        op0.pos().set(iop(2));
         ops.push(op0);
         // Post-cut ops
         let mut op1 = Op::new(OpCode::IntMul, &[iarg_box(0), iarg_box(1)]);
-        op1.pos.set(iop(3));
+        op1.pos().set(iop(3));
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
-        op2.pos.set(vop(4));
+        op2.pos().set(vop(4));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -2050,14 +2050,14 @@ mod tests {
         let mut ops = Vec::new();
         // op0: v2 = int_add(v0, v1) — before cut
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
-        op0.pos.set(iop(2));
+        op0.pos().set(iop(2));
         ops.push(op0);
         // op1: v3 = int_mul(v2, v0) — after cut, references v2 (escaped!)
         let mut op1 = Op::new(OpCode::IntMul, &[iop_box(2), iarg_box(0)]);
-        op1.pos.set(iop(3));
+        op1.pos().set(iop(3));
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iop_box(3)]);
-        op2.pos.set(vop(4));
+        op2.pos().set(vop(4));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -2082,7 +2082,7 @@ mod tests {
         let mut ops = Vec::new();
         // pre-cut: noop
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
-        op0.pos.set(iop(1));
+        op0.pos().set(iop(1));
         ops.push(op0);
         // post-cut: uses a constant
         let const_ref = OpRef::const_int(0);
@@ -2090,10 +2090,10 @@ mod tests {
             OpCode::IntAdd,
             &[iarg_box(0), Operand::from_opref(const_ref)],
         );
-        op1.pos.set(iop(2));
+        op1.pos().set(iop(2));
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iop_box(2)]);
-        op2.pos.set(vop(3));
+        op2.pos().set(vop(3));
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -2115,18 +2115,18 @@ mod tests {
         let mut ops = Vec::new();
         // v1 = int_add(v0, v0) — before cut
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]);
-        op0.pos.set(iop(1));
+        op0.pos().set(iop(1));
         ops.push(op0);
         // v2 = int_mul(v1, v0) — before cut
         let mut op1 = Op::new(OpCode::IntMul, &[iop_box(1), iarg_box(0)]);
-        op1.pos.set(iop(2));
+        op1.pos().set(iop(2));
         ops.push(op1);
         // v3 = int_sub(v2, v0) — after cut, references v2 (escaped, depends on v1)
         let mut op2 = Op::new(OpCode::IntSub, &[iop_box(2), iarg_box(0)]);
-        op2.pos.set(iop(3));
+        op2.pos().set(iop(3));
         ops.push(op2);
         let mut op3 = Op::new(OpCode::Jump, &[iop_box(3)]);
-        op3.pos.set(vop(4));
+        op3.pos().set(vop(4));
         ops.push(op3);
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -2184,15 +2184,15 @@ mod tests {
         let mut ops = Vec::new();
         // v2 = int_add(v0, v1) — before the cut; consumed by nothing after it.
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
-        op0.pos.set(iop(2));
+        op0.pos().set(iop(2));
         ops.push(op0);
         // guard_true(v0) — after the cut, resuming through snapshot 0.
         let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        op1.pos.set(vop(3));
-        op1.rd_resume_position.set(0);
+        op1.pos().set(vop(3));
+        op1.set_rd_resume_position(0);
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
-        op2.pos.set(vop(4));
+        op2.pos().set(vop(4));
         ops.push(op2);
         let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
@@ -2215,7 +2215,7 @@ mod tests {
             panic!("snapshot slot lost its box: {slot:?}");
         };
         assert!(!r.is_none(), "snapshot slot mapped to NONE: {slot:?}");
-        assert_eq!(r, cut.ops[0].pos.get());
+        assert_eq!(r, cut.ops[0].pos().get());
     }
 
     #[test]
@@ -2228,14 +2228,14 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
         let mut op0 = Op::new(OpCode::CallMayForceR, &[iarg_box(0)]);
-        op0.pos.set(OpRef::ref_op(1));
+        op0.pos().set(OpRef::ref_op(1));
         ops.push(op0);
         let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        op1.pos.set(vop(2));
-        op1.rd_resume_position.set(0);
+        op1.pos().set(vop(2));
+        op1.set_rd_resume_position(0);
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
-        op2.pos.set(vop(3));
+        op2.pos().set(vop(3));
         ops.push(op2);
         let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
@@ -2270,14 +2270,14 @@ mod tests {
         let mut ops = Vec::new();
         // v2 = int_add(v0, v1) — pre-cut, named by nothing after the cut.
         let mut op0 = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(1)]);
-        op0.pos.set(iop(2));
+        op0.pos().set(iop(2));
         ops.push(op0);
         let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        op1.pos.set(vop(3));
-        op1.rd_resume_position.set(0);
+        op1.pos().set(vop(3));
+        op1.set_rd_resume_position(0);
         ops.push(op1);
         let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
-        op2.pos.set(vop(4));
+        op2.pos().set(vop(4));
         ops.push(op2);
         let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
@@ -2313,16 +2313,16 @@ mod tests {
         // not block the admission and is not replayed.
         let inputargs = vec![InputArg::new_int(0)];
         let mut op0 = Op::new(OpCode::NewWithVtable, &[]);
-        op0.pos.set(OpRef::ref_op(1));
+        op0.pos().set(OpRef::ref_op(1));
         let mut op1 = Op::new(OpCode::SetfieldGc, &[rop_box(1), iarg_box(0)]);
-        op1.pos.set(vop(2));
+        op1.pos().set(vop(2));
         let mut op2 = Op::new(OpCode::GuardClass, &[rop_box(1)]);
-        op2.pos.set(vop(3));
+        op2.pos().set(vop(3));
         let mut op3 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-        op3.pos.set(vop(4));
-        op3.rd_resume_position.set(0);
+        op3.pos().set(vop(4));
+        op3.set_rd_resume_position(0);
         let mut op4 = Op::new(OpCode::Jump, &[iarg_box(0)]);
-        op4.pos.set(vop(5));
+        op4.pos().set(vop(5));
         let snapshots = vec![snapshot_with_frame_boxes(vec![
             crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
         ])];
@@ -2341,14 +2341,14 @@ mod tests {
         );
         assert_eq!(
             cut.ops[1].arg(0).to_opref(),
-            cut.ops[0].pos.get(),
+            cut.ops[0].pos().get(),
             "the replayed store does not write into the replayed allocation"
         );
         let slot = cut.snapshots[0].frames[0].boxes[0];
         let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
             panic!("snapshot slot lost its box: {slot:?}");
         };
-        assert_eq!(r, cut.ops[0].pos.get());
+        assert_eq!(r, cut.ops[0].pos().get());
     }
 
     #[test]
@@ -2361,24 +2361,24 @@ mod tests {
         for publish_with_a_call in [false, true] {
             let inputargs = vec![InputArg::new_int(0)];
             let mut op0 = Op::new(OpCode::NewWithVtable, &[]);
-            op0.pos.set(OpRef::ref_op(1));
+            op0.pos().set(OpRef::ref_op(1));
             let mut op1 = Op::new(OpCode::NewWithVtable, &[]);
-            op1.pos.set(OpRef::ref_op(2));
+            op1.pos().set(OpRef::ref_op(2));
             let mut publish = if publish_with_a_call {
                 Op::new(OpCode::CallMayForceR, &[rop_box(1)])
             } else {
                 Op::new(OpCode::SetfieldGc, &[rop_box(2), rop_box(1)])
             };
-            publish.pos.set(if publish_with_a_call {
+            publish.pos().set(if publish_with_a_call {
                 OpRef::ref_op(3)
             } else {
                 vop(3)
             });
             let mut op3 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-            op3.pos.set(vop(4));
-            op3.rd_resume_position.set(0);
+            op3.pos().set(vop(4));
+            op3.set_rd_resume_position(0);
             let mut op4 = Op::new(OpCode::Jump, &[iarg_box(0)]);
-            op4.pos.set(vop(5));
+            op4.pos().set(vop(5));
             let snapshots = vec![snapshot_with_frame_boxes(vec![
                 crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
             ])];
@@ -2420,12 +2420,12 @@ mod tests {
 
             let inputargs = vec![InputArg::new_int(0)];
             let mut op0 = Op::new(opcode, &[iarg_box(0)]);
-            op0.pos.set(OpRef::ref_op(1));
+            op0.pos().set(OpRef::ref_op(1));
             let mut op1 = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
-            op1.pos.set(vop(2));
-            op1.rd_resume_position.set(0);
+            op1.pos().set(vop(2));
+            op1.set_rd_resume_position(0);
             let mut op2 = Op::new(OpCode::Jump, &[iarg_box(0)]);
-            op2.pos.set(vop(3));
+            op2.pos().set(vop(3));
             let snapshots = vec![snapshot_with_frame_boxes(vec![
                 crate::recorder::SnapshotTagged::Box(OpRef::ref_op(1), Type::Ref),
             ])];
@@ -2508,7 +2508,7 @@ mod tests {
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
 
-        let fail_args = guards[0].getfailargs().unwrap();
+        let fail_args = guards[0].guard_fail_args().unwrap();
         assert_eq!(fail_args.len(), 2);
         assert_eq!(fail_args[0].to_opref(), i0);
         assert_eq!(fail_args[1].to_opref(), i1);
@@ -2560,9 +2560,9 @@ mod tests {
         rec.close_loop(&[ref2, i1]);
         let trace = rec.get_trace();
 
-        assert_eq!(trace.ops[0].pos.get(), ref0);
-        assert_eq!(trace.ops[1].pos.get(), ref1);
-        assert_eq!(trace.ops[2].pos.get(), ref2);
+        assert_eq!(trace.ops[0].pos().get(), ref0);
+        assert_eq!(trace.ops[1].pos().get(), ref1);
+        assert_eq!(trace.ops[2].pos().get(), ref2);
     }
 
     #[test]

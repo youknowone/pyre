@@ -3899,7 +3899,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let live_frame = if ctx.fbw_mode.snapshot_sym.is_null() {
         0
     } else {
-        unsafe { (*ctx.fbw_mode.snapshot_sym).live_vable_frame_addr() }
+        // The symbol stores a raw address. A residual is a collection
+        // point (`push_roots` below), so a nursery frame may have been
+        // forwarded since the address was captured. RPython's live
+        // virtualizable is a GC pointer and is rewritten in place;
+        // follow the stub the same way `gc_current_object_address` does.
+        let raw = unsafe { (*ctx.fbw_mode.snapshot_sym).live_vable_frame_addr() };
+        if raw == 0 {
+            0
+        } else {
+            majit_gc::gc_current_object_address(raw)
+        }
     };
     // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
     // the outer walk's mirror and a sub-walk never advances it.
@@ -4076,15 +4086,23 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let mut residual_locals_roots = ((fbw_debug_abort_enabled()
         || fbw_import_residual_locals_enabled())
         && is_may_force
-        && live_frame != 0)
-        .then(|| unsafe {
-            let pf = &*(live_frame as *const pyre_interpreter::PyFrame);
-            let snapshot = locals_w!(pf).as_slice().to_vec();
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.publish(&snapshot);
-            roots.normalize(base, snapshot.len());
-            (roots, base, snapshot.len())
-        });
+        && live_frame != 0
+        && majit_gc::gc_owns_object(live_frame))
+    .then(|| unsafe {
+        // The residual is a collection point. `live_frame` is a raw
+        // copy of the virtualizable; follow the nursery stub before
+        // projecting `locals_cells_stack_w` (`incminimark`
+        // `gc_current_object_address`). A collected frame is refused
+        // by `gc_owns_object` above so this memcpy never runs on a
+        // from-space slice (exception_reused_object_tb_not_doubled).
+        let live_frame = majit_gc::gc_current_object_address(live_frame);
+        let pf = &*(live_frame as *const pyre_interpreter::PyFrame);
+        let snapshot = locals_w!(pf).as_slice().to_vec();
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.publish(&snapshot);
+        roots.normalize(base, snapshot.len());
+        (roots, base, snapshot.len())
+    });
     let exec_result = {
         let escape_frame = if is_may_force { live_frame } else { 0 };
         // Latch the operand-stack mirror for the escape flush: at force time
@@ -4394,7 +4412,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     ),
                     Err(exc) => (None, exc, true),
                 };
-                if ctx.session.borrow().framestack.is_empty() && !ctx.fbw_mode.inline_subwalk {
+                // Same non-bridge latch as the escape-flush commit above:
+                // a bridge walk never adopts this image (`run_perfn_walk`
+                // epilogue is skipped).
+                if ctx.session.borrow().framestack.is_empty()
+                    && !ctx.fbw_mode.inline_subwalk
+                    && !ctx.trace_ctx.is_bridge_trace
+                {
                     let jitcode = unsafe {
                         let sym = &*ctx.fbw_mode.snapshot_sym;
                         (!sym.jitcode().is_null())

@@ -17,6 +17,63 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
+/// Sparse virtual/instance field lists stay at 1–4 entries on the
+/// regex `and`/`or` leaf. A `Vec` grow 16→32→64 is the leftover
+/// 0.16 allocs/char of 64 B (and the matching 16/32 B classes).
+pub type VirtualFieldList = smallvec::SmallVec<[(u32, Operand); 4]>;
+pub type CachedFieldList = smallvec::SmallVec<[(u32, FieldEntry); 4]>;
+
+/// info.py `init_fields`: one list sized to the descr, not a grow
+/// chain. Kept for the remaining Vec field lists (virtualizable heap
+/// fields). Virtual/instance lists are inline and do not reserve.
+#[allow(dead_code)]
+fn reserve_assoc<T>(fields: &mut Vec<T>, n: usize) {
+    if n > fields.capacity() {
+        fields.reserve(n - fields.len());
+    }
+}
+
+fn push_assoc<V>(fields: &mut Vec<(u32, V)>, field_idx: u32, value: V, reserve_n: usize) {
+    for entry in fields.iter_mut() {
+        if entry.0 == field_idx {
+            entry.1 = value;
+            return;
+        }
+    }
+    if fields.capacity() == 0 {
+        fields.reserve(reserve_n.max(1));
+    }
+    fields.push((field_idx, value));
+}
+
+fn push_assoc_virtual(fields: &mut VirtualFieldList, field_idx: u32, value: Operand) {
+    for entry in fields.iter_mut() {
+        if entry.0 == field_idx {
+            entry.1 = value;
+            return;
+        }
+    }
+    fields.push((field_idx, value));
+}
+
+fn push_assoc_cached(fields: &mut CachedFieldList, field_idx: u32, value: FieldEntry) {
+    for entry in fields.iter_mut() {
+        if entry.0 == field_idx {
+            entry.1 = value;
+            return;
+        }
+    }
+    fields.push((field_idx, value));
+}
+
+#[allow(dead_code)]
+fn descr_field_len(descr: Option<&DescrRef>) -> usize {
+    descr
+        .and_then(|d| d.as_size_descr())
+        .map(|sd| sd.all_fielddescrs().len())
+        .unwrap_or(8)
+}
+
 /// info.py `reasonable_array_index(index)` — sanity gate on a
 /// constant array index or array size. Returns false for negative
 /// values or values above 150_000 so invalid loops and pathological
@@ -198,7 +255,7 @@ pub struct VirtualInfo {
     /// Field values: `(field_descr_index, value_opref)`.
     /// **Invariant**: every key is a slot of the descr's `all_fielddescrs()`;
     /// typeptr is never one — see struct-level docs.
-    pub fields: Vec<(u32, Operand)>,
+    pub fields: VirtualFieldList,
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `AbstractVirtualPtrInfo._cached_vinfo` inherited
@@ -234,8 +291,8 @@ pub struct InstancePtrInfo {
     pub known_class: Option<i64>,
     /// info.py:175 _fields — cached field values.
     /// RPython stores both normal Boxes and PreambleOp sentinels in the
-    /// same list. Rust mirrors this with `Vec<(u32, FieldEntry)>`.
-    pub fields: Vec<(u32, FieldEntry)>,
+    /// same list. Four inline slots keep the 16→32→64 grow off the heap.
+    pub fields: CachedFieldList,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -248,7 +305,7 @@ pub struct StructPtrInfo {
     /// Exact struct descriptor.
     pub descr: DescrRef,
     /// info.py _fields — cached field values (same as InstancePtrInfo).
-    pub fields: Vec<(u32, FieldEntry)>,
+    pub fields: CachedFieldList,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -275,7 +332,7 @@ pub struct VirtualStructInfo {
     /// The size descriptor.
     pub descr: DescrRef,
     /// Field values: (field_index, value, optional original field descriptor).
-    pub fields: Vec<(u32, Operand)>,
+    pub fields: VirtualFieldList,
     /// info.py:91-92
     pub last_guard_pos: i32,
     /// info.py `_cached_vinfo` — see AbstractVirtualPtrInfo.
@@ -291,8 +348,8 @@ pub struct VirtualStructInfo {
 pub struct ArrayStructInfo {
     /// The array descriptor (arraydescr).
     pub descr: DescrRef,
-    /// Per-element fields: outer Vec = elements, inner Vec = (field_descr_index, value_opref).
-    pub element_fields: Vec<Vec<(u32, Operand)>>,
+    /// Per-element fields: outer Vec = elements, inner list = (field_descr_index, value_opref).
+    pub element_fields: Vec<VirtualFieldList>,
     /// resume.py VArrayStructInfo.fielddescrs — InteriorFieldDescr per field.
     /// Used by _number_virtuals to extract item_size/field_offset/field_size.
     pub fielddescrs: Vec<DescrRef>,
@@ -513,18 +570,17 @@ impl PtrInfo {
     /// must walk the actual `OpRef` / `GcRef` slots explicitly.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_field(entry: &mut FieldEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
-            match entry {
-                FieldEntry::Value(b) => b.walk_const_ptr_refs(visitor),
-                FieldEntry::Preamble(pop) => {
-                    pop.op.walk_const_ptr_refs(visitor);
-                    pop.preamble_op.walk_const_ptr_refs_mut(visitor);
-                    // An invented ref-typed alias can carry a `ConstPtr`
-                    // `same_as_source`; walk it so a moving GC updates the
-                    // pointer before the cached preamble emits its `SameAs`.
-                    if let Some(src) = &pop.same_as_source {
-                        src.walk_const_ptr_refs(visitor);
-                    }
+            if let Some(pop) = entry.as_preamble_mut() {
+                pop.op.walk_const_ptr_refs(visitor);
+                pop.preamble_op.walk_const_ptr_refs_mut(visitor);
+                // An invented ref-typed alias can carry a `ConstPtr`
+                // `same_as_source`; walk it so a moving GC updates the
+                // pointer before the cached preamble emits its `SameAs`.
+                if let Some(src) = &pop.same_as_source {
+                    src.walk_const_ptr_refs(visitor);
                 }
+            } else if let Some(b) = entry.as_value() {
+                b.walk_const_ptr_refs(visitor);
             }
         }
 
@@ -694,7 +750,7 @@ impl PtrInfo {
         PtrInfo::Instance(InstancePtrInfo {
             descr: None,
             known_class: Some(class_ptr),
-            fields: Vec::new(),
+            fields: CachedFieldList::new(),
             last_guard_pos: -1,
         })
     }
@@ -704,7 +760,7 @@ impl PtrInfo {
         PtrInfo::Instance(InstancePtrInfo {
             descr,
             known_class,
-            fields: Vec::new(),
+            fields: CachedFieldList::new(),
             last_guard_pos: -1,
         })
     }
@@ -713,7 +769,7 @@ impl PtrInfo {
     pub fn struct_ptr(descr: DescrRef) -> Self {
         PtrInfo::Struct(StructPtrInfo {
             descr,
-            fields: Vec::new(),
+            fields: CachedFieldList::new(),
             last_guard_pos: -1,
         })
     }
@@ -734,7 +790,7 @@ impl PtrInfo {
             descr,
             known_class,
             ob_type_descr: None,
-            fields: Vec::new(),
+            fields: VirtualFieldList::new(),
             last_guard_pos: -1,
             avpi: AbstractVirtualPtrInfo::new(),
         })
@@ -755,7 +811,7 @@ impl PtrInfo {
     pub fn virtual_struct(descr: DescrRef) -> Self {
         PtrInfo::VirtualStruct(VirtualStructInfo {
             descr,
-            fields: Vec::new(),
+            fields: VirtualFieldList::new(),
             last_guard_pos: -1,
             avpi: AbstractVirtualPtrInfo::new(),
         })
@@ -857,7 +913,7 @@ impl PtrInfo {
             PtrInfo::Virtual(v) => v.fields.len(),
             PtrInfo::VirtualArray(v) => v.items.len(),
             PtrInfo::VirtualStruct(v) => v.fields.len(),
-            PtrInfo::VirtualArrayStruct(v) => v.element_fields.iter().map(Vec::len).sum(),
+            PtrInfo::VirtualArrayStruct(v) => v.element_fields.iter().map(|f| f.len()).sum(),
             PtrInfo::VirtualRawBuffer(v) => v.buffer.len(),
             PtrInfo::Str(s) => str_child_count(s),
             _ => 0,
@@ -1089,7 +1145,9 @@ impl PtrInfo {
     }
 
     /// info.py `AbstractStructPtrInfo.init_fields` — upgrade the
-    /// descr when a more-precise one shows up via `setfield`.
+    /// descr when a more-precise one shows up via `setfield`, and
+    /// size `_fields` to `len(descr.get_all_fielddescrs())` so
+    /// subsequent `setfield`s do not grow a 96 B `Vec` mid-guard.
     pub fn init_fields(&mut self, descr: DescrRef, index: usize) {
         let Some(size_descr) = descr.as_size_descr() else {
             return;
@@ -1106,6 +1164,10 @@ impl PtrInfo {
                 if (v.descr.is_none() || index >= cur_len) && (cur_len == 0 || new_len > cur_len) {
                     v.descr = Some(descr);
                 }
+                // `(u32, FieldEntry)` is 24 B; reserving `new_len` for a
+                // 6-field NodeRec was 144 B. Header-band keys are not
+                // positions, so this list stays sparse and grows on
+                // setfield (`info.py` `_fields[index] = op`).
             }
             PtrInfo::Struct(v) => {
                 let cur_len = v
@@ -1116,6 +1178,7 @@ impl PtrInfo {
                 if cur_len == 0 || (index >= cur_len && new_len > cur_len) {
                     v.descr = descr;
                 }
+                // Same 144 B spare as Instance: do not reserve `new_len`.
             }
             PtrInfo::Virtual(v) => {
                 let cur_len = v
@@ -1145,49 +1208,19 @@ impl PtrInfo {
     pub fn setfield(&mut self, field_idx: u32, value: Operand) {
         match self {
             PtrInfo::Instance(v) => {
-                for entry in &mut v.fields {
-                    if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value.clone());
-                        return;
-                    }
-                }
-                v.fields.push((field_idx, FieldEntry::Value(value)));
+                push_assoc_cached(&mut v.fields, field_idx, FieldEntry::Value(value));
             }
             PtrInfo::Struct(v) => {
-                for entry in &mut v.fields {
-                    if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value.clone());
-                        return;
-                    }
-                }
-                v.fields.push((field_idx, FieldEntry::Value(value)));
+                push_assoc_cached(&mut v.fields, field_idx, FieldEntry::Value(value));
             }
             PtrInfo::Virtual(v) => {
-                for entry in &mut v.fields {
-                    if entry.0 == field_idx {
-                        entry.1 = value.clone();
-                        return;
-                    }
-                }
-                v.fields.push((field_idx, value));
+                push_assoc_virtual(&mut v.fields, field_idx, value);
             }
             PtrInfo::VirtualStruct(v) => {
-                for entry in &mut v.fields {
-                    if entry.0 == field_idx {
-                        entry.1 = value.clone();
-                        return;
-                    }
-                }
-                v.fields.push((field_idx, value));
+                push_assoc_virtual(&mut v.fields, field_idx, value);
             }
             PtrInfo::Virtualizable(v) => {
-                for entry in &mut v.heap_fields {
-                    if entry.0 == field_idx {
-                        entry.1 = FieldEntry::Value(value.clone());
-                        return;
-                    }
-                }
-                v.heap_fields.push((field_idx, FieldEntry::Value(value)));
+                push_assoc(&mut v.heap_fields, field_idx, FieldEntry::Value(value), 8);
             }
             _ => {}
         }
@@ -1199,24 +1232,24 @@ impl PtrInfo {
         match self {
             PtrInfo::Instance(v) => {
                 v.fields.retain(|(k, _)| *k != field_idx);
-                v.fields.push((field_idx, FieldEntry::Preamble(pop)));
+                v.fields.push((field_idx, FieldEntry::preamble(pop)));
             }
             PtrInfo::Struct(v) => {
                 v.fields.retain(|(k, _)| *k != field_idx);
-                v.fields.push((field_idx, FieldEntry::Preamble(pop)));
+                v.fields.push((field_idx, FieldEntry::preamble(pop)));
             }
             // The catch-all below re-seats `self` as an `InstancePtrInfo`,
             // which would drop the tracked virtualizable state. Store the
             // hoisted field alongside the other ordinary heap fields instead.
             PtrInfo::Virtualizable(v) => {
                 v.heap_fields.retain(|(k, _)| *k != field_idx);
-                v.heap_fields.push((field_idx, FieldEntry::Preamble(pop)));
+                v.heap_fields.push((field_idx, FieldEntry::preamble(pop)));
             }
             _ => {
                 *self = PtrInfo::Instance(InstancePtrInfo {
                     descr: None,
                     known_class: None,
-                    fields: vec![(field_idx, FieldEntry::Preamble(pop))],
+                    fields: smallvec::smallvec![(field_idx, FieldEntry::preamble(pop))],
                     last_guard_pos: -1,
                 });
             }
@@ -1230,7 +1263,7 @@ impl PtrInfo {
             if index >= v.items.len() {
                 v.items.resize(index + 1, FieldEntry::Value(Operand::None));
             }
-            v.items[index] = FieldEntry::Preamble(pop);
+            v.items[index] = FieldEntry::preamble(pop);
         }
     }
 
@@ -1329,8 +1362,8 @@ impl PtrInfo {
     /// info.py: all_items — returns _fields directly.
     pub fn all_items(&self) -> Vec<(u32, FieldEntry)> {
         match self {
-            PtrInfo::Instance(v) => v.fields.clone(),
-            PtrInfo::Struct(v) => v.fields.clone(),
+            PtrInfo::Instance(v) => v.fields.to_vec(),
+            PtrInfo::Struct(v) => v.fields.to_vec(),
             PtrInfo::Virtual(v) => v
                 .fields
                 .iter()
@@ -1461,7 +1494,8 @@ impl PtrInfo {
     ) {
         if let PtrInfo::VirtualArrayStruct(v) = self {
             if element_index >= v.element_fields.len() {
-                v.element_fields.resize(element_index + 1, Vec::new());
+                v.element_fields
+                    .resize(element_index + 1, VirtualFieldList::new());
             }
             let fields = &mut v.element_fields[element_index];
             if let Some(entry) = fields
@@ -1521,5 +1555,56 @@ impl PtrInfo {
             }
         }
         result
+    }
+
+    #[cfg(test)]
+    fn fields_capacity(&self) -> usize {
+        match self {
+            PtrInfo::Instance(v) => v.fields.capacity(),
+            PtrInfo::Struct(v) => v.fields.capacity(),
+            PtrInfo::Virtual(v) => v.fields.capacity(),
+            PtrInfo::VirtualStruct(v) => v.fields.capacity(),
+            _ => 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setfield_does_not_reserve_a_six_field_144b_list() {
+        let mut info = PtrInfo::instance(None, None);
+        let value = Operand::from_opref(OpRef::ConstInt(1));
+        assert_eq!(
+            info.fields_capacity(),
+            4,
+            "CachedFieldList must start with four inline slots, cap={}",
+            info.fields_capacity()
+        );
+        for i in 0..4 {
+            info.setfield(i, value.clone());
+            assert_eq!(
+                info.fields_capacity(),
+                4,
+                "four sparse setfields must stay inline, cap={}",
+                info.fields_capacity()
+            );
+        }
+    }
+
+    #[test]
+    fn field_list_pairs_stay_16b_so_four_fit_inline() {
+        assert!(
+            std::mem::size_of::<(u32, Operand)>() <= 16,
+            "(u32, Operand) is {} B",
+            std::mem::size_of::<(u32, Operand)>()
+        );
+        assert!(
+            std::mem::size_of::<(u32, FieldEntry)>() <= 16,
+            "(u32, FieldEntry) is {} B",
+            std::mem::size_of::<(u32, FieldEntry)>()
+        );
     }
 }

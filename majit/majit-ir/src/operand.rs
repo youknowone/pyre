@@ -29,8 +29,9 @@ use crate::ptr_info::PtrInfo;
 use crate::resoperation::{OpRc, OpRef};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::cell::{Cell, RefCell};
+use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 /// Allocation-free identity source for the small-`ConstInt` arm below.
 ///
@@ -44,7 +45,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static NEXT_SMALL_INT_ID: AtomicU32 = AtomicU32::new(1);
 
 #[inline]
-fn fresh_small_int(value: i64) -> Option<u64> {
+pub(crate) fn fresh_small_int(value: i64) -> Option<u64> {
     let value = i32::try_from(value).ok()?;
     let id = NEXT_SMALL_INT_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -53,8 +54,74 @@ fn fresh_small_int(value: i64) -> Option<u64> {
 }
 
 #[inline]
-fn small_int_value(encoded: u64) -> i64 {
+pub(crate) fn small_int_value(encoded: u64) -> i64 {
     (encoded as u32 as i32) as i64
+}
+
+/// Allocation-free identity for `ConstFloat` / `ConstPtr` / out-of-i32
+/// `ConstInt`. The token is the slab index; a clone keeps it, a fresh mint
+/// gets a new one — the same `is` identity `SmallInt` keeps, without an
+/// `Rc<Cell<Value>>` (32 B). Values live in leaked chunks so a GC walk can
+/// forward a `ConstPtr` in place. Not a value intern: two mints of the same
+/// bits are unequal.
+const WIDE_CHUNK: usize = 512;
+const WIDE_MAX_CHUNKS: usize = 8192;
+
+static NEXT_WIDE_ID: AtomicU32 = AtomicU32::new(1);
+static WIDE_CHUNKS: [AtomicPtr<Cell<Value>>; WIDE_MAX_CHUNKS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; WIDE_MAX_CHUNKS];
+
+fn init_wide_chunk(chunk_i: usize) -> *mut Cell<Value> {
+    let boxed: Box<[Cell<Value>]> = (0..WIDE_CHUNK)
+        .map(|_| Cell::new(Value::Void))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let raw = Box::into_raw(boxed) as *mut Cell<Value>;
+    match WIDE_CHUNKS[chunk_i].compare_exchange(
+        ptr::null_mut(),
+        raw,
+        Ordering::Release,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => raw,
+        Err(existing) => {
+            unsafe {
+                drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
+                    raw, WIDE_CHUNK,
+                )));
+            }
+            existing
+        }
+    }
+}
+
+pub(crate) fn wide_slot(id: u32) -> &'static Cell<Value> {
+    let idx = id as usize;
+    let chunk_i = idx / WIDE_CHUNK;
+    assert!(
+        chunk_i < WIDE_MAX_CHUNKS,
+        "wide Const identity space exhausted"
+    );
+    let off = idx % WIDE_CHUNK;
+    let p = WIDE_CHUNKS[chunk_i].load(Ordering::Acquire);
+    let p = if p.is_null() {
+        init_wide_chunk(chunk_i)
+    } else {
+        p
+    };
+    unsafe { &*p.add(off) }
+}
+
+pub(crate) fn fresh_wide(value: Value) -> u64 {
+    let id = NEXT_WIDE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .unwrap_or_else(|_| panic!("wide Const identity space exhausted"));
+    wide_slot(id).set(value);
+    u64::from(id)
+}
+
+pub(crate) fn wide_value(id: u64) -> Value {
+    wide_slot(id as u32).get()
 }
 
 /// An operand stored in `Op.args` / `Op.fail_args`.
@@ -63,38 +130,220 @@ fn small_int_value(encoded: u64) -> i64 {
 /// strong `Rc` instead of a flat position: `Op` ⇆ `OpRef::*Op`, `InputArg`
 /// ⇆ `OpRef::InputArg*`, `Const` ⇆ the inline `OpRef::Const*`, and `None` ⇆
 /// `OpRef::None` (an absent `fail_args` slot).
-#[derive(Clone, Debug)]
-pub enum Operand {
-    /// Absent slot — the mirror of `OpRef::None`.
+///
+/// Packed to 8 B so four inline args are 32 B and `Rc<Op>` leaves the
+/// 128-byte class; a 4-/6-failarg list is 32/48 B instead of 64/96 B.
+#[repr(transparent)]
+pub struct Operand {
+    packed: u64,
+}
+
+const OP_TAG: u64 = 0b111;
+const OP_OP: u64 = 0;
+const OP_INPUTARG: u64 = 1;
+const OP_CONST: u64 = 2;
+const OP_SMALLINT: u64 = 3;
+const OP_SMALLWIDE: u64 = 4;
+const OP_NULLREF: u64 = 5;
+
+/// Decoded view. Pointer variants own an `Rc` clone.
+enum Opnd {
     None,
-    /// A result-op producer (`resoperation.py` `AbstractResOp`).
     Op(OpRc),
-    /// An input-arg producer (`resoperation.py` `AbstractInputArg`).
     InputArg(InputArgRc),
-    /// A freshly-minted `ConstInt` whose value fits in the opencoder's common
-    /// machine-int band. `encoded = identity:u32 | value:i32`; this has the
-    /// same one-word payload as an `Rc`, so it does not enlarge `Operand` or
-    /// the three inline operand slots in every [`Op`](crate::resoperation::Op).
     SmallInt(u64),
-    /// `opencoder.py Trace._cached_const_ptr`: null is encoded as ref-pool
-    /// index zero without adding an entry. It is immutable and needs no GC
-    /// forwarding cell, so keep the global null constant allocation-free.
+    SmallWide(u64),
     NullRef,
-    /// A constant (`history.py/268/314` `ConstInt`/`ConstFloat`/
-    /// `ConstPtr`). The value lives in an `Rc<Cell<Value>>`: the `Cell` lets
-    /// the GC root walker forward an inline `ConstPtr` `GcRef` in place
-    /// through a shared `&self` borrow of `Op.args` (`walk_const_ptr_refs`
-    /// get/visit/set cycle), and the `Rc` gives the const an object identity
-    /// — `==` is `Rc::ptr_eq` (resoperation.py `AbstractValue` keys by
-    /// `is`), so two distinct `const_` mints compare unequal while a clone
-    /// shares the same const object (`getarglist_copy` reuses the same
-    /// `Const`). Value equality is the opt-in `same_constant` (history.py),
-    /// surfaced as [`same_box`](Self::same_box). This is the same shared-cell
-    /// in-place-forward contract the const-kind `Forwarded::Const`
-    /// carrier provided. The forwarding visitor is
-    /// idempotent on an already-forwarded object (collector.rs), so a
-    /// const cell reachable from two slots forwards safely.
     Const(Rc<Cell<Value>>),
+}
+
+impl Operand {
+    /// Absent slot — the mirror of `OpRef::None`.
+    #[allow(non_upper_case_globals)]
+    pub const None: Operand = Operand { packed: 0 };
+
+    /// `opencoder.py Trace._cached_const_ptr` null.
+    #[allow(non_upper_case_globals)]
+    pub const NullRef: Operand = Operand { packed: OP_NULLREF };
+
+    #[allow(non_snake_case)]
+    pub fn Op(op: OpRc) -> Operand {
+        let p = OpRc::into_raw(op) as u64;
+        debug_assert_eq!(p & OP_TAG, 0);
+        Operand { packed: p }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn InputArg(ia: InputArgRc) -> Operand {
+        let p = InputArgRc::into_raw(ia) as u64;
+        debug_assert_eq!(p & OP_TAG, 0);
+        Operand {
+            packed: p | OP_INPUTARG,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SmallInt(enc: u64) -> Operand {
+        let id = enc >> 32;
+        let val = enc as u32 as u64;
+        debug_assert!(id < (1 << 29), "SmallInt identity exceeds 29 bits");
+        Operand {
+            packed: OP_SMALLINT | (val << 3) | (id << 35),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn SmallWide(id: u64) -> Operand {
+        debug_assert!(id < (1 << 61));
+        Operand {
+            packed: OP_SMALLWIDE | (id << 3),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Const(cell: Rc<Cell<Value>>) -> Operand {
+        let p = Rc::into_raw(cell) as u64;
+        debug_assert_eq!(p & OP_TAG, 0);
+        Operand {
+            packed: p | OP_CONST,
+        }
+    }
+
+    fn view(&self) -> Opnd {
+        if self.packed == 0 {
+            return Opnd::None;
+        }
+        match self.packed & OP_TAG {
+            OP_OP => {
+                let rc = unsafe { OpRc::from_raw(self.packed as *const crate::resoperation::Op) };
+                let out = Opnd::Op(rc.clone());
+                std::mem::forget(rc);
+                out
+            }
+            OP_INPUTARG => {
+                let rc = unsafe {
+                    InputArgRc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
+                };
+                let out = Opnd::InputArg(rc.clone());
+                std::mem::forget(rc);
+                out
+            }
+            OP_CONST => {
+                let rc = unsafe { Rc::from_raw((self.packed & !OP_TAG) as *const Cell<Value>) };
+                let out = Opnd::Const(Rc::clone(&rc));
+                std::mem::forget(rc);
+                out
+            }
+            OP_SMALLINT => {
+                let val = (self.packed >> 3) as u32 as u64;
+                let id = self.packed >> 35;
+                Opnd::SmallInt((id << 32) | val)
+            }
+            OP_SMALLWIDE => Opnd::SmallWide(self.packed >> 3),
+            OP_NULLREF => Opnd::NullRef,
+            _ => Opnd::None,
+        }
+    }
+
+    pub fn is_small_int(&self) -> bool {
+        self.packed != 0 && self.packed & OP_TAG == OP_SMALLINT
+    }
+
+    pub fn is_small_wide(&self) -> bool {
+        self.packed != 0 && self.packed & OP_TAG == OP_SMALLWIDE
+    }
+
+    pub fn is_null_ref(&self) -> bool {
+        self.packed == OP_NULLREF
+    }
+
+    /// Steal the packed word. The caller owns the refs.
+    pub(crate) fn into_packed(self) -> u64 {
+        let packed = self.packed;
+        std::mem::forget(self);
+        packed
+    }
+
+    /// Clone an operand from a packed word the caller still owns.
+    pub(crate) fn clone_from_packed(packed: u64) -> Operand {
+        let view = Operand { packed };
+        let out = view.clone();
+        std::mem::forget(view);
+        out
+    }
+
+    /// Drop the refs in a packed word the caller is releasing.
+    pub(crate) fn drop_packed(packed: u64) {
+        drop(Operand { packed });
+    }
+}
+
+impl Clone for Operand {
+    fn clone(&self) -> Self {
+        if self.packed == 0 || self.packed == OP_NULLREF {
+            return Operand {
+                packed: self.packed,
+            };
+        }
+        match self.packed & OP_TAG {
+            OP_OP => unsafe {
+                OpRc::increment_strong_count(self.packed as *const crate::resoperation::Op);
+            },
+            OP_INPUTARG => unsafe {
+                InputArgRc::increment_strong_count(
+                    (self.packed & !OP_TAG) as *const crate::value::InputArg,
+                );
+            },
+            OP_CONST => unsafe {
+                Rc::<Cell<Value>>::increment_strong_count(
+                    (self.packed & !OP_TAG) as *const Cell<Value>,
+                );
+            },
+            _ => {}
+        }
+        Operand {
+            packed: self.packed,
+        }
+    }
+}
+
+impl Drop for Operand {
+    fn drop(&mut self) {
+        if self.packed == 0 || self.packed == OP_NULLREF {
+            return;
+        }
+        match self.packed & OP_TAG {
+            OP_OP => {
+                drop(unsafe { OpRc::from_raw(self.packed as *const crate::resoperation::Op) });
+            }
+            OP_INPUTARG => {
+                drop(unsafe {
+                    InputArgRc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
+                });
+            }
+            OP_CONST => {
+                drop(unsafe { Rc::from_raw((self.packed & !OP_TAG) as *const Cell<Value>) });
+            }
+            _ => {}
+        }
+    }
+}
+
+impl std::fmt::Debug for Operand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.view() {
+            Opnd::None => f.write_str("None"),
+            Opnd::Op(op) => f.debug_tuple("Op").field(&op.pos().get()).finish(),
+            Opnd::InputArg(ia) => f.debug_tuple("InputArg").field(&ia.index).finish(),
+            Opnd::SmallInt(enc) => f
+                .debug_tuple("SmallInt")
+                .field(&small_int_value(enc))
+                .finish(),
+            Opnd::SmallWide(id) => f.debug_tuple("SmallWide").field(&wide_value(id)).finish(),
+            Opnd::NullRef => f.write_str("NullRef"),
+            Opnd::Const(c) => f.debug_tuple("Const").field(&c.get()).finish(),
+        }
+    }
 }
 
 impl Operand {
@@ -108,20 +357,20 @@ impl Operand {
         {
             return Operand::SmallInt(encoded);
         }
-        Operand::Const(Rc::new(Cell::new(value)))
+        Operand::SmallWide(fresh_wide(value))
     }
 
     /// Wrap a bound op as `Operand::Op` (`Rc::clone`, cheap). The successor
     /// (`resoperation.py:250`) — no `box_cache` memoization, the `Rc`
     /// itself IS the stable identity.
     pub fn from_bound_op(op: &OpRc) -> Operand {
-        Operand::Op(Rc::clone(op))
+        Operand::Op(op.clone())
     }
 
     /// Wrap a bound input arg as `Operand::InputArg` (`Rc::clone`). Successor
     /// (`resoperation.py:699`).
     pub fn from_bound_inputarg(ia: &InputArgRc) -> Operand {
-        Operand::InputArg(Rc::clone(ia))
+        Operand::InputArg(ia.clone())
     }
 
     /// A constant operand — mints a fresh const box (`history.py:227`
@@ -156,9 +405,9 @@ impl Operand {
         match r {
             OpRef::None => Operand::None,
             OpRef::ConstInt(v) => Self::fresh_const_value(Value::Int(v)),
-            OpRef::ConstFloat(v) => Operand::Const(Rc::new(Cell::new(Value::Float(v)))),
+            OpRef::ConstFloat(v) => Self::fresh_const_value(Value::Float(v)),
             OpRef::ConstPtr(v) if v.is_null() => Operand::NullRef,
-            OpRef::ConstPtr(v) => Operand::Const(Rc::new(Cell::new(Value::Ref(v)))),
+            OpRef::ConstPtr(v) => Self::fresh_const_value(Value::Ref(v)),
             _ => panic!(
                 "from_opref: position-only ref {r:?} has no producer to bind — \
                  every operand source must carry a bound producer or a const (#9)"
@@ -188,7 +437,7 @@ impl Operand {
         let ty = r.ty().unwrap_or(Type::Void);
         match r {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                let ia: InputArgRc = Rc::new(InputArg::from_type(ty, r.raw()));
+                let ia: InputArgRc = InputArgRc::new(InputArg::from_type(ty, r.raw()));
                 Operand::from_bound_inputarg(&ia)
             }
             _ => {
@@ -198,8 +447,8 @@ impl Operand {
                     Type::Ref => OpCode::SameAsR,
                     Type::Void => OpCode::Jump,
                 };
-                let op: OpRc = Rc::new(Op::new(opcode, &[]));
-                op.pos.set(r);
+                let op: OpRc = OpRc::new(Op::new(opcode, &[]));
+                op.pos().set(r);
                 Operand::from_bound_op(&op)
             }
         }
@@ -213,15 +462,19 @@ impl Operand {
     /// position straight off `op.pos`; a `Const*` maps to the matching inline
     /// `OpRef` (`history.py:227/268/314`).
     pub fn to_opref(&self) -> OpRef {
-        match self {
-            Operand::None => OpRef::NONE,
-            Operand::Op(op) => op.pos.get(),
-            Operand::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
-            Operand::SmallInt(encoded) => OpRef::const_int(small_int_value(*encoded)),
-            Operand::NullRef => OpRef::const_ptr(GcRef::NULL),
-            // Re-encodes from the live `Cell` value, so a GC-moved `ConstPtr`
-            // reads back at its post-move address (forwarding.rs parity).
-            Operand::Const(cell) => match cell.get() {
+        match self.view() {
+            Opnd::None => OpRef::NONE,
+            Opnd::Op(op) => op.pos().get(),
+            Opnd::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
+            Opnd::SmallInt(encoded) => OpRef::const_int(small_int_value(encoded)),
+            Opnd::SmallWide(id) => match wide_value(id) {
+                Value::Int(v) => OpRef::const_int(v),
+                Value::Float(v) => OpRef::const_float(v),
+                Value::Ref(v) => OpRef::const_ptr(v),
+                Value::Void => OpRef::NONE,
+            },
+            Opnd::NullRef => OpRef::const_ptr(GcRef::NULL),
+            Opnd::Const(cell) => match cell.get() {
                 Value::Int(v) => OpRef::const_int(v),
                 Value::Float(v) => OpRef::const_float(v),
                 Value::Ref(v) => OpRef::const_ptr(v),
@@ -233,32 +486,34 @@ impl Operand {
     /// `resoperation.py:233 _pos` accessor: the pool index for `Op` /
     /// `InputArg`; `Const` / `None` have no canonical position.
     pub fn position(&self) -> Option<u32> {
-        match self {
-            Operand::Op(op) => Some(op.pos.get().raw()),
-            Operand::InputArg(ia) => Some(ia.index),
-            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => None,
+        match self.view() {
+            Opnd::Op(op) => Some(op.pos().get().raw()),
+            Opnd::InputArg(ia) => Some(ia.index),
+            _ => None,
         }
     }
 
     /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
     pub fn type_(&self) -> Type {
-        match self {
-            Operand::Op(op) => op.pos.get().ty().unwrap_or(Type::Void),
-            Operand::InputArg(ia) => ia.tp,
-            Operand::SmallInt(_) => Type::Int,
-            Operand::NullRef => Type::Ref,
-            Operand::Const(cell) => cell.get().get_type(),
-            Operand::None => Type::Void,
+        match self.view() {
+            Opnd::Op(op) => op.pos().get().ty().unwrap_or(op.type_),
+            Opnd::InputArg(ia) => ia.tp,
+            Opnd::SmallInt(_) => Type::Int,
+            Opnd::SmallWide(id) => wide_value(id).get_type(),
+            Opnd::NullRef => Type::Ref,
+            Opnd::Const(cell) => cell.get().get_type(),
+            Opnd::None => Type::Void,
         }
     }
 
     /// The inline constant value (`history.py` `Const.getint` family),
     /// `None` for non-`Const`.
     pub fn const_value(&self) -> Option<Value> {
-        match self {
-            Operand::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
-            Operand::NullRef => Some(Value::Ref(GcRef::NULL)),
-            Operand::Const(cell) => Some(cell.get()),
+        match self.view() {
+            Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(encoded))),
+            Opnd::SmallWide(id) => Some(wide_value(id)),
+            Opnd::NullRef => Some(Value::Ref(GcRef::NULL)),
+            Opnd::Const(cell) => Some(cell.get()),
             _ => None,
         }
     }
@@ -269,22 +524,27 @@ impl Operand {
     /// (`resoperation.py IntOp._resint`); `None` carries no value.
     /// `history.py` concrete-value read.
     pub fn get_value(&self) -> Option<Value> {
-        match self {
-            Operand::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
-            Operand::NullRef => Some(Value::Ref(GcRef::NULL)),
-            Operand::Const(cell) => Some(cell.get()),
-            Operand::Op(op) => op.get_value(),
-            Operand::InputArg(ia) => ia.get_value(),
-            Operand::None => None,
+        match self.view() {
+            Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(encoded))),
+            Opnd::SmallWide(id) => Some(wide_value(id)),
+            Opnd::NullRef => Some(Value::Ref(GcRef::NULL)),
+            Opnd::Const(cell) => Some(cell.get()),
+            Opnd::Op(op) => op.get_value(),
+            Opnd::InputArg(ia) => ia.get_value(),
+            Opnd::None => None,
         }
     }
 
     /// Raw `ConstInt` value with no `IntBound` synthesis (`forwarding.rs`
     /// parity).
     pub fn const_int(&self) -> Option<i64> {
-        match self {
-            Operand::SmallInt(encoded) => Some(small_int_value(*encoded)),
-            Operand::Const(cell) => match cell.get() {
+        match self.view() {
+            Opnd::SmallInt(encoded) => Some(small_int_value(encoded)),
+            Opnd::SmallWide(id) => match wide_value(id) {
+                Value::Int(v) => Some(v),
+                _ => None,
+            },
+            Opnd::Const(cell) => match cell.get() {
                 Value::Int(v) => Some(v),
                 _ => None,
             },
@@ -294,23 +554,26 @@ impl Operand {
 
     /// `resoperation.py is_constant`.
     pub fn is_constant(&self) -> bool {
+        if self.packed == 0 {
+            return false;
+        }
         matches!(
-            self,
-            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_)
-        )
+            self.packed & OP_TAG,
+            OP_SMALLINT | OP_SMALLWIDE | OP_NULLREF | OP_CONST
+        ) || self.packed == OP_NULLREF
     }
 
     pub fn is_inputarg(&self) -> bool {
-        matches!(self, Operand::InputArg(_))
+        self.packed != 0 && self.packed & OP_TAG == OP_INPUTARG
     }
 
     pub fn is_resop(&self) -> bool {
-        matches!(self, Operand::Op(_))
+        self.packed != 0 && self.packed & OP_TAG == OP_OP
     }
 
     /// True for the absent-slot sentinel — the mirror of `OpRef::is_none`.
     pub fn is_none(&self) -> bool {
-        matches!(self, Operand::None)
+        self.packed == 0
     }
 
     /// `resoperation.py AbstractValue.same_box`: pointer identity
@@ -327,13 +590,13 @@ impl Operand {
     /// wrapper per producer, so its `Rc::ptr_eq` short-circuit and this
     /// producer-`Rc` `ptr_eq` agree), without re-minting a `Const` box.
     pub fn same_box(&self, other: &Operand) -> bool {
-        match (self, other) {
-            (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
-            (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
-            (a, b) if a.is_constant() && b.is_constant() => a.const_value() == b.const_value(),
-            (Operand::None, Operand::None) => true,
-            _ => false,
+        if (self.is_resop() && other.is_resop()) || (self.is_inputarg() && other.is_inputarg()) {
+            return self.packed == other.packed;
         }
+        if self.is_constant() && other.is_constant() {
+            return self.const_value() == other.const_value();
+        }
+        self.is_none() && other.is_none()
     }
 
     /// `resoperation.py get_box_replacement(not_const=False)`.
@@ -349,12 +612,12 @@ impl Operand {
         let mut cur = self.clone();
         loop {
             // Only a bound producer has a forwarded slot to read.
-            let forwarded = match &cur {
-                Operand::Op(op) => op.get_forwarded(),
-                Operand::InputArg(ia) => ia.get_forwarded(),
-                Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => {
-                    return cur;
-                }
+            let forwarded = if let Some(op) = cur.bound_op() {
+                op.get_forwarded()
+            } else if let Some(ia) = cur.bound_inputarg() {
+                ia.get_forwarded()
+            } else {
+                return cur;
             };
             match forwarded {
                 Forwarded::None | Forwarded::Info(_) => return cur,
@@ -369,6 +632,18 @@ impl Operand {
                     // here made every replacement lookup allocate.
                     return Operand::Const(c);
                 }
+                Forwarded::SmallConst(enc) => {
+                    if not_const {
+                        return cur;
+                    }
+                    return Operand::SmallInt(enc);
+                }
+                Forwarded::SmallWide(id) => {
+                    if not_const {
+                        return cur;
+                    }
+                    return Operand::SmallWide(id);
+                }
             }
         }
     }
@@ -377,18 +652,26 @@ impl Operand {
     /// `InputArg` / `Const` / `None`. The operand IS the producer `Rc` — no
     /// indirection and no `box_cache`.
     pub fn bound_op(&self) -> Option<OpRc> {
-        match self {
-            Operand::Op(op) => Some(Rc::clone(op)),
-            _ => None,
+        if !self.is_resop() {
+            return None;
+        }
+        let ptr = self.packed as *const crate::resoperation::Op;
+        unsafe {
+            OpRc::increment_strong_count(ptr);
+            Some(OpRc::from_raw(ptr))
         }
     }
 
     /// The bound `InputArg` (`Operand::InputArg` arm); `None` otherwise.
     /// The carried `InputArg` producer handle, if this is an `InputArg`.
     pub fn bound_inputarg(&self) -> Option<InputArgRc> {
-        match self {
-            Operand::InputArg(ia) => Some(Rc::clone(ia)),
-            _ => None,
+        if !self.is_inputarg() {
+            return None;
+        }
+        let ptr = (self.packed & !OP_TAG) as *const crate::value::InputArg;
+        unsafe {
+            InputArgRc::increment_strong_count(ptr);
+            Some(InputArgRc::from_raw(ptr))
         }
     }
 
@@ -397,10 +680,12 @@ impl Operand {
     /// have no `_forwarded` slot and take the default (mirror of
     /// the carried producer's forwarding host).
     fn read_forwarding_host<R>(&self, default: R, f: impl FnOnce(&dyn ForwardingHost) -> R) -> R {
-        match self {
-            Operand::Op(op) => f(&**op),
-            Operand::InputArg(ia) => f(&**ia),
-            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => default,
+        if let Some(op) = self.bound_op() {
+            f(&*op)
+        } else if let Some(ia) = self.bound_inputarg() {
+            f(&*ia)
+        } else {
+            default
         }
     }
 
@@ -408,13 +693,15 @@ impl Operand {
     /// rejected by the caller's assert first; `None` has no slot and panics
     /// (routes to the carried producer's forwarding host).
     fn with_forwarding_host(&self, what: &str, f: impl FnOnce(&dyn ForwardingHost)) {
-        match self {
-            Operand::Op(op) => f(&**op),
-            Operand::InputArg(ia) => f(&**ia),
-            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => panic!(
+        if let Some(op) = self.bound_op() {
+            f(&*op)
+        } else if let Some(ia) = self.bound_inputarg() {
+            f(&*ia)
+        } else {
+            panic!(
                 "Operand::{what} on a non-producer operand — only a bound \
                  Op/InputArg carries a _forwarded slot (box identity precondition)"
-            ),
+            )
         }
     }
 
@@ -513,7 +800,7 @@ impl Operand {
 
     /// Live `Rc<RefCell<IntBound>>` handle. Mirror of
     /// Live `Rc<RefCell<IntBound>>` handle.
-    pub fn int_bound_handle(&self) -> Option<Rc<RefCell<IntBound>>> {
+    pub fn int_bound_handle(&self) -> Option<crate::intbound::IntBoundRc> {
         self.read_forwarding_host(None, |h| h.int_bound_handle())
     }
 
@@ -529,7 +816,7 @@ impl Operand {
     /// renumbered producer (no snapshot rewrite needed); `Const` / `None`
     /// carry no position to remap.
     pub fn is_bound(&self) -> bool {
-        matches!(self, Operand::Op(_) | Operand::InputArg(_))
+        self.is_resop() || self.is_inputarg()
     }
 
     /// GC walk over any inline `ConstPtr` reachable from this operand
@@ -538,22 +825,21 @@ impl Operand {
     /// `InputArg` carry no inline const (their own `value` slot is walked at
     /// the producer).
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        match self {
+        if self.packed == 0 {
+            return;
+        }
+        let cell = match self.packed & OP_TAG {
             // Forward an inline `ConstPtr` `GcRef` in place through the cell's
             // get/visit/set cycle (forwarding.rs parity) — no `&mut self`
             // needed, so `Op.args` GC walks keep their shared `borrow()`.
-            Operand::Const(cell) => {
-                let mut v = cell.get();
-                if let Value::Ref(gcref) = &mut v {
-                    visitor(gcref);
-                    cell.set(v);
-                }
-            }
-            Operand::None
-            | Operand::Op(_)
-            | Operand::InputArg(_)
-            | Operand::SmallInt(_)
-            | Operand::NullRef => {}
+            OP_CONST => unsafe { &*((self.packed & !OP_TAG) as *const Cell<Value>) },
+            OP_SMALLWIDE => wide_slot((self.packed >> 3) as u32),
+            _ => return,
+        };
+        let mut v = cell.get();
+        if let Value::Ref(gcref) = &mut v {
+            visitor(gcref);
+            cell.set(v);
         }
     }
 }
@@ -569,15 +855,7 @@ impl PartialEq for Operand {
     /// (`history.py`), never `==`, so a `same_box`-deduping table must
     /// build an explicit value-keyed map, not key on `Operand`.
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Operand::None, Operand::None) => true,
-            (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
-            (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
-            (Operand::SmallInt(a), Operand::SmallInt(b)) => a == b,
-            (Operand::NullRef, Operand::NullRef) => true,
-            (Operand::Const(a), Operand::Const(b)) => Rc::ptr_eq(a, b),
-            _ => false,
-        }
+        self.packed == other.packed
     }
 }
 
@@ -589,26 +867,7 @@ impl std::hash::Hash for Operand {
     /// per-variant tag keeps cross-variant collisions from aliasing, and the
     /// `Rc` address is the identity for `Op` / `InputArg` / `Const`.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            Operand::None => 0u8.hash(state),
-            Operand::Op(op) => {
-                1u8.hash(state);
-                (Rc::as_ptr(op) as *const () as usize).hash(state);
-            }
-            Operand::InputArg(ia) => {
-                2u8.hash(state);
-                (Rc::as_ptr(ia) as *const () as usize).hash(state);
-            }
-            Operand::SmallInt(encoded) => {
-                3u8.hash(state);
-                encoded.hash(state);
-            }
-            Operand::NullRef => 4u8.hash(state),
-            Operand::Const(cell) => {
-                5u8.hash(state);
-                (Rc::as_ptr(cell) as usize).hash(state);
-            }
-        }
+        self.packed.hash(state);
     }
 }
 
@@ -619,8 +878,8 @@ mod tests {
     use crate::value::{Const, InputArg, Type, Value};
 
     fn op_at(pos: u32, tp: Type) -> OpRc {
-        let op = Rc::new(Op::new(OpCode::SameAsI, &[]));
-        op.pos.set(OpRef::op_typed(pos, tp));
+        let op = OpRc::new(Op::new(OpCode::SameAsI, &[]));
+        op.pos().set(OpRef::op_typed(pos, tp));
         op
     }
 
@@ -632,7 +891,7 @@ mod tests {
             OpRef::op_typed(3, Type::Int)
         );
 
-        let ia = Rc::new(InputArg::from_type(Type::Ref, 2));
+        let ia = InputArgRc::new(InputArg::from_type(Type::Ref, 2));
         assert_eq!(
             Operand::from_bound_inputarg(&ia).to_opref(),
             OpRef::input_arg_typed(2, Type::Ref),
@@ -654,7 +913,7 @@ mod tests {
         assert_eq!(o_op.type_(), Type::Int);
         assert_eq!(o_op.const_value(), None);
 
-        let ia = Rc::new(InputArg::from_type(Type::Float, 1));
+        let ia = InputArgRc::new(InputArg::from_type(Type::Float, 1));
         let o_ia = Operand::from_bound_inputarg(&ia);
         assert!(o_ia.is_inputarg());
         assert_eq!(o_ia.position(), Some(1));
@@ -696,9 +955,9 @@ mod tests {
     /// `0.0 != -0.0`, `NaN == NaN`), and cross-kind always-false.
     #[test]
     fn same_box_inputarg_float_and_cross_kind() {
-        let ia = Rc::new(InputArg::from_type(Type::Int, 0));
+        let ia = InputArgRc::new(InputArg::from_type(Type::Int, 0));
         assert!(Operand::from_bound_inputarg(&ia).same_box(&Operand::from_bound_inputarg(&ia)));
-        let ia_other = Rc::new(InputArg::from_type(Type::Int, 0));
+        let ia_other = InputArgRc::new(InputArg::from_type(Type::Int, 0));
         assert!(
             !Operand::from_bound_inputarg(&ia).same_box(&Operand::from_bound_inputarg(&ia_other))
         );
@@ -723,7 +982,7 @@ mod tests {
     /// operand representation and panics (#9 invariant tripwire).
     #[test]
     fn from_opref_none_and_const_arms() {
-        assert!(matches!(Operand::from_opref(OpRef::None), Operand::None));
+        assert!(Operand::from_opref(OpRef::None).is_none());
         assert_eq!(
             Operand::from_opref(OpRef::ConstInt(7)).const_value(),
             Some(Value::Int(7))
@@ -796,13 +1055,16 @@ mod tests {
         assert!(matches!(a.get_forwarded(), Forwarded::None));
         a.set_forwarded_op(&b);
         match a.get_forwarded() {
-            Forwarded::Op(target) => assert!(Rc::ptr_eq(&target, &b)),
+            Forwarded::Op(target) => assert!(OpRc::ptr_eq(&target, &b)),
             other => panic!("expected Forwarded::Op, got {other:?}"),
         }
         // The walker follows a -> b to the terminal.
-        match a.get_box_replacement(false) {
-            Operand::Op(op) => assert!(Rc::ptr_eq(&op, &b)),
-            other => panic!("expected Operand::Op(b), got {other:?}"),
+        match a.get_box_replacement(false).bound_op() {
+            Some(op) => assert!(OpRc::ptr_eq(&op, &b)),
+            None => panic!(
+                "expected Operand::Op(b), got {:?}",
+                a.get_box_replacement(false)
+            ),
         }
         a.clear_forwarded();
         assert!(matches!(a.get_forwarded(), Forwarded::None));
@@ -832,18 +1094,19 @@ mod tests {
             let c = op_at(2, Type::Int);
             b.set_forwarded_op(&c);
             a.set_forwarded_op(&b);
-            (Rc::as_ptr(&b), Rc::as_ptr(&c))
+            (OpRc::as_ptr(&b), OpRc::as_ptr(&c))
         };
 
-        match a.get_box_replacement(false) {
-            Operand::Op(op) => assert!(
-                std::ptr::eq(Rc::as_ptr(&op), c_ptr),
+        match a.get_box_replacement(false).bound_op() {
+            Some(op) => assert!(
+                std::ptr::eq(OpRc::as_ptr(&op), c_ptr),
                 "the walk stopped short of the chain terminal",
             ),
-            other => panic!(
-                "the walk returned {other:?}; landing back on `a` is the \
+            None => panic!(
+                "the walk returned {:?}; landing back on `a` is the \
                  dropped-target termination this test exists to refuse \
                  (middle was {b_ptr:?})",
+                a.get_box_replacement(false),
             ),
         }
 
@@ -851,13 +1114,16 @@ mod tests {
         // same way in bridge import and retrace remap.
         let d = Operand::from_bound_op(&op_at(3, Type::Int));
         let e_ptr = {
-            let e = Rc::new(InputArg::from_type(Type::Int, 9));
+            let e = InputArgRc::new(InputArg::from_type(Type::Int, 9));
             d.set_forwarded_inputarg(&e);
-            Rc::as_ptr(&e)
+            InputArgRc::as_ptr(&e)
         };
-        match d.get_box_replacement(false) {
-            Operand::InputArg(ia) => assert!(std::ptr::eq(Rc::as_ptr(&ia), e_ptr)),
-            other => panic!("the InputArg walk returned {other:?}"),
+        match d.get_box_replacement(false).bound_inputarg() {
+            Some(ia) => assert!(std::ptr::eq(InputArgRc::as_ptr(&ia), e_ptr)),
+            None => panic!(
+                "the InputArg walk returned {:?}",
+                d.get_box_replacement(false)
+            ),
         }
     }
 
@@ -867,12 +1133,15 @@ mod tests {
     fn bound_op_and_bound_inputarg_arms() {
         let op = op_at(2, Type::Int);
         let o_op = Operand::from_bound_op(&op);
-        assert!(o_op.bound_op().is_some_and(|o| Rc::ptr_eq(&o, &op)));
+        assert!(o_op.bound_op().is_some_and(|o| OpRc::ptr_eq(&o, &op)));
         assert!(o_op.bound_inputarg().is_none());
 
-        let ia = Rc::new(InputArg::from_type(Type::Ref, 1));
+        let ia = InputArgRc::new(InputArg::from_type(Type::Ref, 1));
         let o_ia = Operand::from_bound_inputarg(&ia);
-        assert!(o_ia.bound_inputarg().is_some_and(|i| Rc::ptr_eq(&i, &ia)));
+        assert!(
+            o_ia.bound_inputarg()
+                .is_some_and(|i| InputArgRc::ptr_eq(&i, &ia))
+        );
         assert!(o_ia.bound_op().is_none());
 
         let o_c = Operand::const_(Const::Int(3));
@@ -939,8 +1208,8 @@ mod tests {
     fn small_int_is_inline_but_keeps_fresh_object_identity() {
         let first = Operand::const_(Const::Int(42));
         let second = Operand::const_(Const::Int(42));
-        assert!(matches!(first, Operand::SmallInt(_)));
-        assert!(matches!(second, Operand::SmallInt(_)));
+        assert!(first.is_small_int());
+        assert!(second.is_small_int());
         assert_ne!(
             first, second,
             "fresh ConstInt objects have distinct identity"
@@ -950,14 +1219,46 @@ mod tests {
 
         let edge = Operand::const_(Const::Int(i32::MAX as i64));
         let outside = Operand::const_(Const::Int(i32::MAX as i64 + 1));
-        assert!(matches!(edge, Operand::SmallInt(_)));
-        assert!(matches!(outside, Operand::Const(_)));
+        assert!(edge.is_small_int());
+        assert!(outside.is_small_wide());
 
-        // SmallInt deliberately replaces an Rc-sized payload. Pin this on the
-        // two 64-bit production hosts so adding it cannot silently grow the
-        // three inline Operand slots embedded in every Op.
+        // Tagged-word packing: four inline Operand slots stay in 32 B.
         #[cfg(target_pointer_width = "64")]
-        assert_eq!(std::mem::size_of::<Operand>(), 16);
+        assert_eq!(std::mem::size_of::<Operand>(), 8);
+    }
+
+    #[test]
+    fn wide_const_keeps_fresh_object_identity_without_rc() {
+        let f1 = Operand::const_(Const::Float(1.5));
+        let f2 = Operand::const_(Const::Float(1.5));
+        assert!(f1.is_small_wide());
+        assert!(f2.is_small_wide());
+        assert_ne!(f1, f2, "fresh ConstFloat objects have distinct identity");
+        assert_eq!(f1, f1.clone(), "cloning preserves ConstFloat identity");
+        assert!(f1.same_box(&f2), "ConstFloat.same_box compares bits");
+
+        let p1 = Operand::const_(Const::Ref(GcRef(0x1000)));
+        let p2 = Operand::const_(Const::Ref(GcRef(0x1000)));
+        assert!(p1.is_small_wide());
+        assert_ne!(p1, p2, "fresh ConstPtr objects have distinct identity");
+        assert_eq!(p1, p1.clone());
+        assert!(p1.same_box(&p2));
+        assert_eq!(p1.to_opref(), OpRef::const_ptr(GcRef(0x1000)));
+
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(std::mem::size_of::<Operand>(), 8);
+    }
+
+    #[test]
+    fn set_forwarded_const_wide_keeps_token_identity() {
+        let host = Operand::from_bound_op(&op_at(0, Type::Ref));
+        host.set_forwarded_const(Const::Ref(GcRef(0x1000)));
+        let first = host.get_box_replacement(false);
+        let second = host.get_box_replacement(false);
+        assert!(first.is_small_wide());
+        assert_eq!(first, second);
+        assert_eq!(first.const_value(), Some(Value::Ref(GcRef(0x1000))));
+        assert!(host.get_forwarded().is_const());
     }
 
     /// `opencoder.py Trace._cached_const_ptr` reserves ref-pool index zero for
@@ -965,7 +1266,7 @@ mod tests {
     #[test]
     fn null_ref_is_inline_and_round_trips() {
         let null = Operand::from_opref(OpRef::const_ptr(GcRef::NULL));
-        assert!(matches!(null, Operand::NullRef));
+        assert!(null.is_null_ref());
         assert!(null.is_constant());
         assert_eq!(null.type_(), Type::Ref);
         assert_eq!(null.const_value(), Some(Value::Ref(GcRef::NULL)));
@@ -973,6 +1274,6 @@ mod tests {
         assert!(null.same_box(&Operand::const_(Const::Ref(GcRef::NULL))));
 
         #[cfg(target_pointer_width = "64")]
-        assert_eq!(std::mem::size_of::<Operand>(), 16);
+        assert_eq!(std::mem::size_of::<Operand>(), 8);
     }
 }

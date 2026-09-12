@@ -1,7 +1,7 @@
 #![allow(non_upper_case_globals)]
 
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
+use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -684,7 +684,7 @@ impl OptString {
         } else {
             OpCode::Strlen
         };
-        ctx.register_pure_from_args1(strlen_opcode, op.pos.get(), len_ref);
+        ctx.register_pure_from_args1(strlen_opcode, op.pos().get(), len_ref);
         OptimizationResult::PassOn
     }
 
@@ -765,7 +765,7 @@ impl OptString {
                 OpCode::Strgetitem
             };
             let mut getitem = Op::new(get_opcode, &[arg_s.clone(), arg_i.clone()]);
-            getitem.pos.set(op.pos.get());
+            getitem.pos().set(op.pos().get());
             // vstring.py `_strgetitem`: resbox = replace_op_with(resbox,
             // STRGETITEM, ...); emit_extra(resbox). emit_extra =
             // send_extra_operation(op, self.next_optimization) — the rewritten
@@ -1050,7 +1050,7 @@ impl OptString {
         // position (no producer / inputarg yet) has no resolvable Operand, so
         // fall back to its canonical materialized stand-in rather than the
         // total resolver's position-only panic.
-        let args: Vec<Operand> = op
+        let args: smallvec::SmallVec<[Operand; 4]> = op
             .getarglist()
             .iter()
             .map(|a| match ctx.resolve_operand_operand_opt(a) {
@@ -1218,7 +1218,7 @@ impl OptString {
             if let (Some(v1), Some(v2)) = (l1c, l2c)
                 && v1 != v2
             {
-                let b = ctx.materialize_operand_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos().get());
                 ctx.make_constant_box(&b, Value::Int(0));
                 return OptimizationResult::Remove;
             }
@@ -1291,7 +1291,7 @@ impl OptString {
                     let arg_len = ctx.materialize_operand_at(lengthbox);
                     let arg_zero = ctx.materialize_operand_at(zero);
                     let mut eq_op = Op::new(OpCode::IntEq, &[arg_len.clone(), arg_zero.clone()]);
-                    eq_op.pos.set(op.pos.get());
+                    eq_op.pos().set(op.pos().get());
                     // vstring.py:751-754: replace_op_with(INT_EQ, [len, 0]) then
                     // seo(op) = send_extra_operation(op, opt=None) restarts from
                     // first_optimization. Restart, not a final Emit.
@@ -1316,7 +1316,7 @@ impl OptString {
                     let arg_ch1 = ctx.materialize_operand_at(c1);
                     let arg_ch2 = ctx.materialize_operand_at(c2);
                     let mut eq_op = Op::new(OpCode::IntEq, &[arg_ch1.clone(), arg_ch2.clone()]);
-                    eq_op.pos.set(op.pos.get());
+                    eq_op.pos().set(op.pos().get());
                     // vstring.py:765-767: replace_op_with(INT_EQ, [c1, c2]) then
                     // seo(op) = send_extra_operation(op, opt=None) restarts from
                     // first_optimization. Restart, not a final Emit.
@@ -1340,12 +1340,12 @@ impl OptString {
         // vstring.py:776-787: arg2 is null
         if self.is_known_null(arg2, ctx) {
             if self.is_known_nonnull(arg1, ctx) {
-                let b = ctx.materialize_operand_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos().get());
                 ctx.make_constant_box(&b, Value::Int(0));
                 return Some(OptimizationResult::Remove);
             }
             if self.is_known_null(arg1, ctx) {
-                let b = ctx.materialize_operand_at(op.pos.get());
+                let b = ctx.materialize_operand_at(op.pos().get());
                 ctx.make_constant_box(&b, Value::Int(1));
                 return Some(OptimizationResult::Remove);
             }
@@ -1354,7 +1354,7 @@ impl OptString {
             let arg_a = ctx.materialize_operand_at(arg1.to_opref());
             let arg_null = ctx.materialize_operand_at(null_const);
             let mut eq_op = Op::new(OpCode::PtrEq, &[arg_a.clone(), arg_null.clone()]);
-            eq_op.pos.set(op.pos.get());
+            eq_op.pos().set(op.pos().get());
             // vstring.py:785-786: replace_op_with(PTR_EQ, ...) then self.emit(op)
             // (Optimization.emit) — the op flows on to the passes after OptString.
             // pyre's Replace continues current_op through the rest of the chain.
@@ -1463,7 +1463,7 @@ impl OptString {
             Some(d) => Op::with_descr(OpCode::CallI, &call_args_operand, d.clone()),
             None => Op::new(OpCode::CallI, &call_args_operand),
         };
-        call_op.pos.set(result_op.pos.get());
+        call_op.pos().set(result_op.pos().get());
         // vstring.py:857: return self.emit(op) (Optimization.emit) — the CALL_I
         // flows on to the passes after OptString (OptPure/OptHeap), not a final
         // emit. pyre's Replace re-runs current_op through the rest of the chain.
@@ -1513,7 +1513,7 @@ impl OptString {
             let arg_char1 = ctx.materialize_operand_at(char1);
             let arg_char2 = ctx.materialize_operand_at(char2);
             let mut sub_op = Op::new(OpCode::IntSub, &[arg_char1.clone(), arg_char2.clone()]);
-            sub_op.pos.set(op.pos.get());
+            sub_op.pos().set(op.pos().get());
             return OptimizationResult::Restart(sub_op);
         }
         self.force_args_if_virtual(op, ctx);
@@ -1717,7 +1717,7 @@ mod tests {
     /// Assign sequential positions to ops and pre-seed constants in OptContext.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(i as u32, op.type_));
+            op.pos().set(OpRef::op_typed(i as u32, op.type_));
         }
     }
 
@@ -1735,7 +1735,7 @@ mod tests {
         // (start_next_pos = max(num_inputs, max_pos + 1)).
         let max_pos = ops
             .iter()
-            .map(|op| op.pos.get())
+            .map(|op| op.pos().get())
             .filter(|op| !op.is_none() && !op.is_constant())
             .map(|op| op.raw())
             .max()
@@ -1758,7 +1758,7 @@ mod tests {
         // synthetic there would shadow the real producer and defeat
         // virtualization. Constant positions already carry a Const box.
         let produced: std::collections::HashSet<OpRef> =
-            ops.iter().map(|op| op.pos.get()).collect();
+            ops.iter().map(|op| op.pos().get()).collect();
         for op in ops {
             for i in 0..op.num_args() {
                 let r = op.arg(i).to_opref();
@@ -1781,7 +1781,7 @@ mod tests {
             for i in 0..resolved_op.num_args() {
                 resolved_op.setarg(i, ctx.resolve_operand_operand(&resolved_op.arg(i)));
             }
-            let resolved_rc = std::rc::Rc::new(resolved_op.clone());
+            let resolved_rc = OpRc::new(resolved_op.clone());
             ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
             match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
@@ -2151,7 +2151,7 @@ mod tests {
             .extra_operations_after
             .back()
             .expect("strgetitem_emit must emit a residual STRGETITEM");
-        assert_eq!(res, op.pos.get());
+        assert_eq!(res, op.pos().get());
         assert_eq!(op.opcode, OpCode::Strgetitem);
         // arg0 is the SOURCE (ref_op(10)), not the slice (ref_op(11)); arg1 is
         // `start + 0`, which collapses back to the start box (int_op(300)).
@@ -2192,7 +2192,7 @@ mod tests {
                 .back()
                 .expect("strgetitem_emit must emit a residual STRGETITEM");
             (
-                op.pos.get(),
+                op.pos().get(),
                 op.opcode,
                 op.arg(0).to_opref(),
                 op.arg(1).get_box_replacement(false),
@@ -2235,8 +2235,8 @@ mod tests {
         ctx.materialize_operand_at(index_ref);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         let mut getitem = Op::new(OpCode::Strgetitem, &[rop(11), iop(302)]);
-        getitem.pos.set(pos);
-        let op_rc = std::rc::Rc::new(getitem.clone());
+        getitem.pos().set(pos);
+        let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
 
         let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut ctx);
@@ -2249,7 +2249,7 @@ mod tests {
                 // arg1 is INT_ADD(start, index), not the original index alone.
                 assert_ne!(emitted.arg(1).to_opref(), index_ref);
                 // The rewritten op keeps the original result position.
-                assert_eq!(emitted.pos.get(), pos);
+                assert_eq!(emitted.pos().get(), pos);
             }
             other => panic!("expected Replace(STRGETITEM on source), got {other:?}"),
         }
@@ -2294,8 +2294,8 @@ mod tests {
         ctx.make_constant_box(&b, Value::Int(1));
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         let mut getitem = Op::new(OpCode::Strgetitem, &[rop(13), iop(302)]);
-        getitem.pos.set(pos);
-        let op_rc = std::rc::Rc::new(getitem.clone());
+        getitem.pos().set(pos);
+        let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
 
         let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut ctx);
@@ -2310,7 +2310,7 @@ mod tests {
                     ctx.get_constant_int_box(&emitted.arg(1).get_box_replacement(false)),
                     Some(0)
                 );
-                assert_eq!(emitted.pos.get(), pos);
+                assert_eq!(emitted.pos().get(), pos);
             }
             other => panic!("expected Replace(STRGETITEM on child), got {other:?}"),
         }
@@ -2366,7 +2366,7 @@ mod tests {
             .back()
             .expect("getstrlen must emit a len op");
 
-        assert_eq!(len_ref, last_op.pos.get());
+        assert_eq!(len_ref, last_op.pos().get());
         assert_eq!(last_op.opcode, OpCode::Unicodelen);
         assert_eq!(
             last_op
@@ -2668,13 +2668,13 @@ mod tests {
 
         // Simulate: NEWSTR(2) for left
         let mut left_op = Op::new(OpCode::Newstr, &[iop(200)]);
-        left_op.pos.set(left);
+        left_op.pos().set(left);
         let mut ctx = OptContext::new(10);
         let b = ctx.materialize_operand_at(OpRef::int_op(200));
         ctx.make_constant_box(&b, Value::Int(2));
 
         // Process NEWSTR → creates virtual Plain
-        let left_op_rc = std::rc::Rc::new(left_op.clone());
+        let left_op_rc = OpRc::new(left_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&left_op_rc));
         let _ = pass.propagate_forward(&left_op, &left_op_rc, &mut ctx);
         assert!(pass.is_virtual(&ctx.get_box_replacement_operand(left), &ctx));
@@ -2913,7 +2913,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![arg2]
         );
-        assert_eq!(strlen_ref, strlen_op.pos.get());
+        assert_eq!(strlen_ref, strlen_op.pos().get());
 
         // Subsequent call must return the cached lgtop.
         let strlen_ref2 = ctx.getstrlen_opref(arg2, 0);

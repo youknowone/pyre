@@ -1357,6 +1357,136 @@ impl std::fmt::Display for IntBound {
     }
 }
 
+/// Shared-identity `IntBound` handle. `getintbound` / `setintbound`
+/// mint through [`IntBoundRc::new`]. A one-word refcount (no `Weak`)
+/// in reserved chunks so the first install leaves the 56-byte
+/// `RcBox<RefCell<IntBound>>` class. Clone is a count bump; the last
+/// drop returns the slot to the chunk free list.
+pub struct IntBoundRc {
+    ptr: std::ptr::NonNull<IntBoundInner>,
+}
+
+#[repr(C)]
+struct IntBoundInner {
+    strong: std::cell::Cell<usize>,
+    value: std::cell::RefCell<IntBound>,
+}
+
+const INT_BOUND_CHUNK: usize = 256;
+
+struct IntBoundHeap {
+    chunks: Vec<(*mut IntBoundInner, usize)>,
+    free: Vec<std::ptr::NonNull<IntBoundInner>>,
+}
+
+unsafe impl Send for IntBoundHeap {}
+unsafe impl Sync for IntBoundHeap {}
+
+static INT_BOUND_HEAP: std::sync::Mutex<IntBoundHeap> = std::sync::Mutex::new(IntBoundHeap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn alloc_int_bound_inner() -> std::ptr::NonNull<IntBoundInner> {
+    let mut heap = INT_BOUND_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < INT_BOUND_CHUNK
+    {
+        let p = unsafe { std::ptr::NonNull::new_unchecked((*base).add(*used)) };
+        *used += 1;
+        return p;
+    }
+    let layout =
+        std::alloc::Layout::array::<IntBoundInner>(INT_BOUND_CHUNK).expect("IntBoundInner chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut IntBoundInner };
+    assert!(!base.is_null(), "IntBoundInner chunk alloc failed");
+    heap.chunks.push((base, 1));
+    unsafe { std::ptr::NonNull::new_unchecked(base) }
+}
+
+fn free_int_bound_inner(p: std::ptr::NonNull<IntBoundInner>) {
+    INT_BOUND_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+impl IntBoundRc {
+    pub fn new(bound: IntBound) -> Self {
+        let ptr = alloc_int_bound_inner();
+        unsafe {
+            ptr.as_ptr().write(IntBoundInner {
+                strong: std::cell::Cell::new(1),
+                value: std::cell::RefCell::new(bound),
+            });
+        }
+        IntBoundRc { ptr }
+    }
+
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr == other.ptr
+    }
+
+    pub fn as_ptr(this: &Self) -> *const () {
+        this.ptr.as_ptr() as *const ()
+    }
+
+    pub fn into_raw(this: Self) -> *const () {
+        let p = Self::as_ptr(&this);
+        std::mem::forget(this);
+        p
+    }
+
+    /// # Safety
+    /// `inner` must be a pointer previously returned by [`Self::into_raw`].
+    pub unsafe fn from_raw(inner: *const ()) -> Self {
+        IntBoundRc {
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(inner.cast_mut().cast()) },
+        }
+    }
+
+    pub fn borrow(&self) -> std::cell::Ref<'_, IntBound> {
+        unsafe { self.ptr.as_ref().value.borrow() }
+    }
+
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, IntBound> {
+        unsafe { self.ptr.as_ref().value.borrow_mut() }
+    }
+}
+
+impl Clone for IntBoundRc {
+    fn clone(&self) -> Self {
+        let inner = unsafe { self.ptr.as_ref() };
+        inner.strong.set(inner.strong.get() + 1);
+        IntBoundRc { ptr: self.ptr }
+    }
+}
+
+impl Drop for IntBoundRc {
+    fn drop(&mut self) {
+        let inner = unsafe { self.ptr.as_ref() };
+        let n = inner.strong.get() - 1;
+        if n == 0 {
+            unsafe {
+                std::ptr::drop_in_place(&mut (*self.ptr.as_ptr()).value);
+            }
+            free_int_bound_inner(self.ptr);
+        } else {
+            inner.strong.set(n);
+        }
+    }
+}
+
+impl std::fmt::Debug for IntBoundRc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("IntBoundRc").field(&*self.borrow()).finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2647,5 +2777,16 @@ mod tests {
     fn test_default() {
         let b = IntBound::default();
         assert!(b.is_unbounded());
+    }
+
+    #[test]
+    fn int_bound_rc_shares_identity_and_mutation() {
+        let a = IntBoundRc::new(IntBound::unbounded());
+        let b = a.clone();
+        assert!(IntBoundRc::ptr_eq(&a, &b));
+        a.borrow_mut().lower = 3;
+        assert_eq!(b.borrow().lower, 3);
+        let c = IntBoundRc::new(IntBound::unbounded());
+        assert!(!IntBoundRc::ptr_eq(&a, &c));
     }
 }

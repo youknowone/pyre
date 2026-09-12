@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use majit_backend::{
     ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
-    ExitVirtualLayout,
+    ExitVirtualLayout, FailArgSource,
 };
 use majit_ir::{Const, GcRef, OpRef, Type};
 
@@ -129,7 +129,9 @@ fn leaf3_prov_enabled() -> bool {
 /// debug builds rather than silently producing an out-of-RPython-shape
 /// numbering state.
 pub struct LiveboxMap {
-    entries: Vec<(majit_ir::operand::Operand, i16)>,
+    /// Insertion-order live set. Eight pairs stay inline so the common
+    /// four-or-fewer liveboxes never heap-grow (24 B/pair, Vec 1→2→4 = 96 B).
+    entries: SmallVec<[(majit_ir::operand::Operand, i16); 8]>,
     /// Identity index over `entries`, built once the map outgrows
     /// [`Self::LINEAR_MAX`] and maintained from then on.
     ///
@@ -151,9 +153,19 @@ impl LiveboxMap {
 
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: SmallVec::new(),
             index: None,
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.index = None;
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Slot of `b` in `entries`, through the index once there is one.
@@ -262,6 +274,9 @@ impl NumberingState {
     pub fn create_numbering(&self) -> Vec<u8> {
         self.writer.create_numbering()
     }
+    pub fn create_numbering_arc(&self) -> majit_ir::NumberingRef {
+        self.writer.create_numbering_arc()
+    }
 }
 
 /// RPython snapshot: the state captured at a guard point.
@@ -287,11 +302,9 @@ pub struct Snapshot {
 /// RPython carries `box.type` on the Box object itself. Pyre's typed
 /// `OpRef` enum (resoperation.py:719/727/739 InputArg{Int,Float,Ref},
 /// resoperation.py:564-638 *Op mixin variants) carries the same type
-/// tag intrinsically, so SnapshotBox copies it from the OpRef variant
-/// at construction time. The explicit `tp` field stays around so the
-/// SnapshotBox API can answer `box.type` without re-decoding the
-/// variant on every read.
-#[derive(Debug, Clone)]
+/// tag intrinsically. There is no parallel type word: a second field
+/// made a two-box snapshot 48 B.
+#[derive(Debug, Clone, Copy)]
 pub struct SnapshotBox {
     /// The trace-position ref this snapshot slot references. A
     /// `Const{Ptr}` slot carries its gcref inline (history.py
@@ -299,19 +312,15 @@ pub struct SnapshotBox {
     /// (`walk_compile_snapshot_refs`) forwards it in place through a
     /// collected `*mut OpRef` slot address.
     pub opref: majit_ir::OpRef,
-    pub tp: Option<majit_ir::Type>,
 }
 
 impl SnapshotBox {
     pub fn untyped(opref: majit_ir::OpRef) -> Self {
-        SnapshotBox { opref, tp: None }
+        SnapshotBox { opref }
     }
 
-    pub fn typed(opref: majit_ir::OpRef, tp: majit_ir::Type) -> Self {
-        SnapshotBox {
-            opref,
-            tp: Some(tp),
-        }
+    pub fn typed(opref: majit_ir::OpRef, _tp: majit_ir::Type) -> Self {
+        SnapshotBox { opref }
     }
 
     /// The trace-position `OpRef` view of this slot.
@@ -319,10 +328,14 @@ impl SnapshotBox {
         self.opref
     }
 
+    /// history.py `Box.type` — the OpRef variant tag.
+    pub fn tp(&self) -> Option<majit_ir::Type> {
+        self.opref.ty()
+    }
+
     pub fn map_opref(&self, f: impl FnOnce(majit_ir::OpRef) -> majit_ir::OpRef) -> Self {
         SnapshotBox {
             opref: f(self.opref),
-            tp: self.tp,
         }
     }
 }
@@ -330,6 +343,18 @@ impl SnapshotBox {
 impl From<majit_ir::OpRef> for SnapshotBox {
     fn from(opref: majit_ir::OpRef) -> Self {
         SnapshotBox::untyped(opref)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_box_size {
+    #[test]
+    fn snapshot_box_is_one_opref() {
+        assert_eq!(
+            std::mem::size_of::<super::SnapshotBox>(),
+            std::mem::size_of::<majit_ir::OpRef>(),
+            "SnapshotBox must stay one OpRef; box.type lives on the variant"
+        );
     }
 }
 
@@ -651,7 +676,7 @@ impl<T> std::ops::Deref for SharedResumeSlice<T> {
 pub struct ResumeStorage {
     /// resume.py:466 `storage.rd_numb` — packed byte stream (NUMBERING
     /// lltype equivalent). Immutable once installed.
-    pub rd_numb: Arc<[u8]>,
+    pub rd_numb: majit_ir::NumberingRef,
     /// resume.py:467 `storage.rd_consts` — shared constant pool.
     ///
     /// Interior mutability: the minor-collection root walker visits
@@ -805,7 +830,7 @@ impl ResumeStorage {
         rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) -> Arc<Self> {
         Arc::new(ResumeStorage {
-            rd_numb: Arc::from(rd_numb),
+            rd_numb: majit_ir::NumberingRef::from_bytes(&rd_numb),
             rd_consts: majit_ir::SharedConstPool::new(rd_consts),
             rd_virtuals: rd_virtuals.into(),
             rd_pendingfields: rd_pendingfields.into(),
@@ -884,7 +909,7 @@ impl ResumeStorage {
     }
 
     pub fn with_shared_consts(
-        rd_numb: Arc<[u8]>,
+        rd_numb: majit_ir::NumberingRef,
         rd_consts: Arc<majit_ir::SharedConstPool>,
         rd_virtuals: Option<Arc<[std::rc::Rc<majit_ir::RdVirtualInfo>]>>,
         rd_pendingfields: Option<Arc<[majit_ir::GuardPendingFieldEntry]>>,
@@ -3468,6 +3493,16 @@ pub struct ResumeDataLoopMemo {
     pub nvirtuals: usize,
     pub nvholes: usize,
     pub nvreused: usize,
+    /// Reused by `number_slices` / `finish` so timed-section guards do not
+    /// mint a fresh writer `Vec` and livebox hole list on every bridge.
+    writer_scratch: Vec<i32>,
+    livebox_opt_scratch: Vec<Option<majit_ir::OpRef>>,
+    ordered_livebox_scratch: Vec<majit_ir::OpRef>,
+    livebox_map_scratch: LiveboxMap,
+    new_livebox_map_scratch: LiveboxMap,
+    livebox_types_scratch: LiveboxTypeMap,
+    virtual_fields_scratch: indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
+    virtual_worklist_scratch: Vec<majit_ir::OpRef>,
 }
 
 impl ResumeDataLoopMemo {
@@ -3481,6 +3516,111 @@ impl ResumeDataLoopMemo {
             nvirtuals: 0,
             nvholes: 0,
             nvreused: 0,
+            writer_scratch: Vec::new(),
+            livebox_opt_scratch: Vec::new(),
+            ordered_livebox_scratch: Vec::new(),
+            livebox_map_scratch: LiveboxMap::new(),
+            new_livebox_map_scratch: LiveboxMap::new(),
+            livebox_types_scratch: LiveboxTypeMap::default(),
+            virtual_fields_scratch: indexmap::IndexMap::new(),
+            virtual_worklist_scratch: Vec::new(),
+        }
+    }
+
+    /// Drop per-compile caches (`resume.py ResumeDataLoopMemo.__init__`)
+    /// but keep the writer / livebox scratch capacities.
+    pub fn recycle_for_next_compile(&mut self) {
+        self.consts = majit_ir::SharedConstPool::new(Vec::new());
+        self.large_ints.clear();
+        self.refs.clear();
+        self.cached_boxes.clear();
+        self.cached_virtuals.clear();
+        self.nvirtuals = 0;
+        self.nvholes = 0;
+        self.nvreused = 0;
+        self.livebox_map_scratch.clear();
+        self.new_livebox_map_scratch.clear();
+        self.livebox_types_scratch.clear();
+        self.virtual_fields_scratch.clear();
+        self.virtual_worklist_scratch.clear();
+    }
+
+    fn take_livebox_map(&mut self) -> LiveboxMap {
+        let mut map = std::mem::take(&mut self.livebox_map_scratch);
+        map.clear();
+        map
+    }
+
+    fn return_livebox_map(&mut self, mut map: LiveboxMap) {
+        map.clear();
+        if map.entries.capacity() > self.livebox_map_scratch.entries.capacity() {
+            self.livebox_map_scratch = map;
+        }
+    }
+
+    fn take_new_livebox_map(&mut self) -> LiveboxMap {
+        let mut map = std::mem::take(&mut self.new_livebox_map_scratch);
+        map.clear();
+        map
+    }
+
+    fn return_new_livebox_map(&mut self, mut map: LiveboxMap) {
+        map.clear();
+        if map.entries.capacity() > self.new_livebox_map_scratch.entries.capacity() {
+            self.new_livebox_map_scratch = map;
+        }
+    }
+
+    fn take_livebox_types(&mut self) -> LiveboxTypeMap {
+        let mut types = std::mem::take(&mut self.livebox_types_scratch);
+        types.clear();
+        types
+    }
+
+    pub fn recycle_livebox_types(&mut self, mut types: LiveboxTypeMap) {
+        types.clear();
+        if types.capacity() > self.livebox_types_scratch.capacity() {
+            self.livebox_types_scratch = types;
+        }
+    }
+
+    fn take_virtual_fields(
+        &mut self,
+    ) -> indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo> {
+        let mut fields = std::mem::take(&mut self.virtual_fields_scratch);
+        fields.clear();
+        fields
+    }
+
+    fn return_virtual_fields(
+        &mut self,
+        mut fields: indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
+    ) {
+        fields.clear();
+        if fields.capacity() > self.virtual_fields_scratch.capacity() {
+            self.virtual_fields_scratch = fields;
+        }
+    }
+
+    fn take_virtual_worklist(&mut self) -> Vec<majit_ir::OpRef> {
+        let mut worklist = std::mem::take(&mut self.virtual_worklist_scratch);
+        worklist.clear();
+        worklist
+    }
+
+    fn return_virtual_worklist(&mut self, mut worklist: Vec<majit_ir::OpRef>) {
+        worklist.clear();
+        if worklist.capacity() > self.virtual_worklist_scratch.capacity() {
+            self.virtual_worklist_scratch = worklist;
+        }
+    }
+
+    /// Return the `finish` livebox list so the next guard reuses its
+    /// allocation. The caller must be done reading the boxes.
+    pub fn recycle_ordered_liveboxes(&mut self, mut liveboxes: Vec<majit_ir::OpRef>) {
+        liveboxes.clear();
+        if liveboxes.capacity() > self.ordered_livebox_scratch.capacity() {
+            self.ordered_livebox_scratch = liveboxes;
         }
     }
 
@@ -3891,6 +4031,15 @@ impl ResumeDataLoopMemo {
         env: &dyn majit_ir::BoxEnv,
     ) -> Result<(Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>, usize), TagOverflow> {
         // resume.py: new_liveboxes = [None] * memo.num_cached_boxes()
+        // then reverse + extend onto `liveboxes`. When this finish() saw no
+        // field-walk boxes and no virtuals, that list is all holes — extend
+        // them in place and skip the intermediate Vec the memo's cached-box
+        // count would otherwise allocate on every timed-section guard.
+        if new_liveboxes.is_empty() && virtual_fields.is_empty() {
+            let n = self.num_cached_boxes();
+            liveboxes.extend(std::iter::repeat_n(None, n));
+            return Ok((Vec::new(), n));
+        }
         let mut new_boxes_list: Vec<Option<majit_ir::OpRef>> = vec![None; self.num_cached_boxes()];
         let mut count = 0;
         // Iterate in insertion order (RPython dict iteration = insertion order).
@@ -4178,10 +4327,7 @@ impl ResumeDataLoopMemo {
             // to a Ref virtual after optimization; keeping the stale fallback
             // would number that virtual as a TAGBOX and the subsequent
             // optimizer.py:681 fail-arg force would materialize it.
-            let box_type = opref
-                .ty()
-                .or(snapshot_box.tp)
-                .unwrap_or_else(|| env.get_type(opref));
+            let box_type = opref.ty().unwrap_or_else(|| env.get_type(opref));
             let is_virtual = match box_type {
                 majit_ir::Type::Ref => env.is_virtual_ref(opref),
                 majit_ir::Type::Int => env.is_virtual_raw(opref),
@@ -4264,7 +4410,7 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
-        let frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 1]> = snapshot
+        let frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 4]> = snapshot
             .framestack
             .iter()
             .map(|frame| {
@@ -4291,8 +4437,8 @@ impl ResumeDataLoopMemo {
     /// RPython's `SnapshotIterator` reads the opencoder buffer lazily; it does
     /// not copy every live-box array once per guard. The optimizer stores the
     /// equivalent arrays separately, so this entry point borrows those slices
-    /// and only builds the one-element frame descriptor inline for the common
-    /// single-frame case.
+    /// and only builds the frame descriptor inline for the common
+    /// four-or-fewer-frame case.
     pub fn number_from_parts(
         &mut self,
         snapshot_boxes: &[SnapshotBox],
@@ -4303,7 +4449,7 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
-        let mut frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 1]> = SmallVec::new();
+        let mut frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 4]> = SmallVec::new();
         if let Some(sizes) = frame_sizes.filter(|sizes| sizes.len() > 1) {
             let mut offset = 0;
             for (i, &size) in sizes.iter().enumerate() {
@@ -4340,7 +4486,20 @@ impl ResumeDataLoopMemo {
                 .map(|(_, _, _, boxes)| boxes.len() + 3)
                 .sum::<usize>()
             + 4;
-        let mut numb_state = NumberingState::new(size_hint);
+        let mut writer = majit_ir::resumecode::Writer {
+            current: std::mem::take(&mut self.writer_scratch),
+        };
+        writer.current.clear();
+        writer.current.reserve(size_hint);
+        let mut livebox_types = self.take_livebox_types();
+        livebox_types.reserve(size_hint);
+        let mut numb_state = NumberingState {
+            writer,
+            liveboxes: self.take_livebox_map(),
+            num_boxes: 0,
+            num_virtuals: 0,
+            livebox_types,
+        };
 
         // resume.py:231-232: patch later
         numb_state.append_int(0); // slot 0: size of resume section
@@ -4423,7 +4582,7 @@ impl ResumeDataLoopMemo {
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
     ) -> Result<
         (
-            Vec<u8>,
+            majit_ir::NumberingRef,
             Arc<majit_ir::SharedConstPool>,
             Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
             Vec<majit_ir::OpRef>,
@@ -4434,16 +4593,18 @@ impl ResumeDataLoopMemo {
         let num_env_virtuals = numb_state.num_virtuals;
 
         // resume.py: split liveboxes_from_env into TAGBOX/TAGVIRTUAL
-        let mut liveboxes: Vec<Option<majit_ir::OpRef>> = vec![None; numb_state.num_boxes as usize];
+        let mut liveboxes = std::mem::take(&mut self.livebox_opt_scratch);
+        liveboxes.clear();
+        liveboxes.resize(numb_state.num_boxes as usize, None);
 
         // resume.py:413: self.vfieldboxes collected by virtual walk
         // resume.py:408: self.liveboxes — newly discovered boxes from field walk
-        let mut new_liveboxes = LiveboxMap::new();
+        let mut new_liveboxes = self.take_new_livebox_map();
 
         // resume.py:414-426: iterate liveboxes_from_env, discover virtual
         // fields. RPython walks the dict in insertion order; pyre's
-        // `LiveboxMap` is built on `IndexMap` so the
-        // `.iter()` sequence already matches that order, which the
+        // `LiveboxMap` keeps that order in `entries` so the
+        // `.iter()` sequence already matches, which the
         // virtual worklist drain below relies on for byte-identical
         // visitor_walk_recursive sequencing. Sorting by tag would
         // observably re-order virtuals across builds.
@@ -4460,11 +4621,10 @@ impl ResumeDataLoopMemo {
         // (resume.py:419-426 visitor_walk_recursive pattern). Keyed by
         // typed OpRef so the same_box (resoperation.py) identity is
         // preserved end-to-end through the worklist drain.
-        let mut virtual_fields: indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo> =
-            indexmap::IndexMap::new();
+        let mut virtual_fields = self.take_virtual_fields();
 
         // resume.py:419-426: visitor_walk_recursive — worklist for nested virtuals.
-        let mut virtual_worklist: Vec<majit_ir::OpRef> = Vec::new();
+        let mut virtual_worklist = self.take_virtual_worklist();
 
         for (b, tagged) in numb_state.liveboxes.iter() {
             // #160/S11: liveboxes is now box-keyed; the serialized livebox
@@ -4633,7 +4793,8 @@ impl ResumeDataLoopMemo {
         )?;
 
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
-        let rd_numb = numb_state.create_numbering();
+        let rd_numb = numb_state.create_numbering_arc();
+        self.writer_scratch = std::mem::take(&mut numb_state.writer.current);
         let rd_consts = self.consts.clone();
 
         // Resolve each livebox through the forwarding chain so the backend
@@ -4667,22 +4828,27 @@ impl ResumeDataLoopMemo {
         // `make_constant` flip without paired numbering) is racing the
         // numbering snapshot, which would break rd_numb / liveboxes
         // alignment downstream.
-        let ordered_liveboxes: Vec<majit_ir::OpRef> = liveboxes
-            .into_iter()
-            .map(|opt| {
-                opt.map(|opref| {
-                    let walked = env.get_box_replacement_not_const(opref);
-                    debug_assert!(
-                        !walked.is_constant(),
-                        "resume.py:412-417 invariant: liveboxes entry walked to \
-                         constant-namespace OpRef post-numbering ({opref:?} → {walked:?}); \
-                         _number_boxes should have classified this as TAGCONST inline"
-                    );
-                    walked
-                })
-                .unwrap_or(majit_ir::OpRef::NONE)
+        let mut ordered_liveboxes = std::mem::take(&mut self.ordered_livebox_scratch);
+        ordered_liveboxes.clear();
+        ordered_liveboxes.extend(liveboxes.iter().map(|opt| {
+            opt.map(|opref| {
+                let walked = env.get_box_replacement_not_const(opref);
+                debug_assert!(
+                    !walked.is_constant(),
+                    "resume.py:412-417 invariant: liveboxes entry walked to \
+                     constant-namespace OpRef post-numbering ({opref:?} → {walked:?}); \
+                     _number_boxes should have classified this as TAGCONST inline"
+                );
+                walked
             })
-            .collect();
+            .unwrap_or(majit_ir::OpRef::NONE)
+        }));
+        liveboxes.clear();
+        self.livebox_opt_scratch = liveboxes;
+        self.return_livebox_map(std::mem::take(&mut numb_state.liveboxes));
+        self.return_new_livebox_map(new_liveboxes);
+        self.return_virtual_fields(virtual_fields);
+        self.return_virtual_worklist(virtual_worklist);
 
         // Merge livebox_types: numbering-time types + types for boxes
         // discovered during virtual field walking.
@@ -5667,7 +5833,7 @@ mod tests {
             &rd_numb,
             &[],
             &all_liveness,
-            &[],
+            FailArgSource::Slice(&[]),
             None,
             None,
             None,
@@ -5712,8 +5878,15 @@ mod tests {
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
-        let mut reader =
-            ResumeDataDirectReader::new(&rd_numb, &[], &[], &[], None, None, &NullAllocator);
+        let mut reader = ResumeDataDirectReader::new(
+            &rd_numb,
+            &[],
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &NullAllocator,
+        );
         reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None, None);
     }
 
@@ -5766,7 +5939,7 @@ mod tests {
                 &rd_numb,
                 &[],
                 &all_liveness,
-                &deadframe,
+                FailArgSource::Slice(&deadframe),
                 Some(&deadframe_types),
                 None, // rd_virtuals
                 None, // rd_guard_pendingfields
@@ -5913,7 +6086,7 @@ mod tests {
             &rd_numb,
             &[],
             &all_liveness,
-            &deadframe,
+            FailArgSource::Slice(&deadframe),
             Some(&deadframe_types),
             None, // rd_virtuals
             None, // rd_guard_pendingfields
@@ -5972,7 +6145,7 @@ mod tests {
             &[0, 0],
             &[],
             &[],
-            &[],
+            FailArgSource::Slice(&[]),
             None,
             Some((vec![0x1234], vec![7])),
             &NullAllocator,
@@ -5989,8 +6162,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "load_next_value_of_type: unexpected type Void")]
     fn test_next_value_of_type_rejects_void() {
-        let mut reader =
-            ResumeDataDirectReader::new(&[0, 0], &[], &[], &[], None, None, &NullAllocator);
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &[],
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &NullAllocator,
+        );
         let _ = reader.next_value_of_type(majit_ir::Type::Void);
     }
 
@@ -6015,8 +6195,15 @@ mod tests {
         // Model the root walker forwarding rd_consts during the allocation
         // window. The later field decode must observe the new pointer.
         consts[0] = majit_ir::Const::Ref(majit_ir::GcRef(0x2000));
-        let mut reader =
-            ResumeDataDirectReader::new(&[0, 0], &consts, &[], &[], None, None, &NullAllocator);
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &consts,
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &NullAllocator,
+        );
         assert_eq!(reader.decode_field_source(&parent), 0x2000);
     }
 
@@ -6107,6 +6294,12 @@ pub trait VirtualizableInfo {
     /// pyre: register virtualizable-owned Ref buffers for any virtualizable
     /// object already present in a blackhole Ref register bank.
     fn push_resume_ref_roots_for_value(&self, _value: i64) {}
+
+    /// False for a state-field machine with no heap `vable_token`.
+    /// `consume_one_section` asks once so it can skip the per-ref dyn call.
+    fn has_vable_token(&self) -> bool {
+        false
+    }
 
     /// pyre: register virtualizable-owned Ref buffers for any virtualizable
     /// object already present in a blackhole Ref register bank.
@@ -6235,8 +6428,8 @@ pub struct ResumeDataDirectReader<'a> {
     pub consts: &'a [majit_ir::Const],
 
     // ResumeDataDirectReader fields (resume.py)
-    /// resume.py:1366 deadframe — raw fail_args values
-    pub deadframe: &'a [i64],
+    /// resume.py `ResumeDataDirectReader.deadframe` — `cpu.get_int_value`
+    pub deadframe: FailArgSource<'a>,
     /// pyre flat-deadframe adaptation: original type of each deadframe slot.
     /// RPython's CPU exposes typed getters (get_ref_value/get_int_value/...);
     /// pyre passes a flat raw slice and needs slot kinds to emulate
@@ -7067,7 +7260,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         rd_numb: &'a [u8],
         rd_consts: &'a [majit_ir::Const],
         all_liveness: &'a [u8],
-        deadframe: &'a [i64],
+        deadframe: FailArgSource<'a>,
         deadframe_types: Option<&'a [majit_ir::Type]>,
         all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
         allocator: &'a dyn BlackholeAllocator,
@@ -7450,8 +7643,13 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py next_int
+    #[inline]
     pub fn next_int(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item() as i16;
+        // resume.py decode_int `TAGINT`: the payload is the signed value.
+        if (tagged as u16) & TAGMASK as u16 == TAGINT as u16 {
+            return (tagged >> 2) as i64;
+        }
         self.decode_int(tagged)
     }
 
@@ -7466,10 +7664,17 @@ impl<'a> ResumeDataDirectReader<'a> {
         if self.virtualizable_identity_override.is_some()
             && self.virtualizable_identity_tagged == Some(tagged)
         {
-            self.virtualizable_ptr
-        } else {
-            self.decode_ref(tagged)
+            return self.virtualizable_ptr;
         }
+        // resume.py decode_ref `TAGBOX`: the payload is a deadframe index.
+        if (tagged as u16) & TAGMASK as u16 == TAGBOX as u16 {
+            let mut idx = (tagged >> 2) as i32;
+            if idx < 0 {
+                idx += self.count;
+            }
+            return self.deadframe.get(idx as usize);
+        }
+        self.decode_ref(tagged)
     }
 
     /// resume.py next_float
@@ -7603,6 +7808,9 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py _prepare_virtuals
     fn prepare_virtuals(&mut self, virtuals: Option<&'a [VirtualInfo]>) {
         if let Some(v) = virtuals {
+            if v.is_empty() {
+                return;
+            }
             self.rd_virtuals = Some(v);
             // resume.py:990-991
             self.virtuals_cache = VirtualCache::from_caches(vec![0; v.len()], vec![0; v.len()]);
@@ -7666,24 +7874,16 @@ impl<'a> ResumeDataDirectReader<'a> {
         // jitcode.py:152
         let mut offset = info + 3;
 
-        let bh_debug = crate::bh_debug_enabled();
-        if bh_debug {
-            eprintln!(
-                "[bh-section] info={info} length_i={length_i} length_r={length_r} length_f={length_f} \
-                 items_read={} items_resume_section={}",
-                self.resumecodereader.items_read, self.items_resume_section,
-            );
-        }
+        // resume.py `write_an_int` / `write_a_ref` / `write_a_float`
+        // assign the register file directly. `setarg_*` is the same
+        // store plus a `jit_strict_mode` bound check; the regex leaf
+        // pays that call once per live slot per frame per character.
+        let vinfo_heap = vinfo.filter(|v| v.has_vable_token());
         // resume.py `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             for reg_idx in it.by_ref() {
-                let value = self.next_int();
-                if bh_debug {
-                    eprintln!("[bh-seed] i{reg_idx} = {value}");
-                }
-                // resume.py `write_an_int`.
-                bh.setarg_i(reg_idx as usize, value);
+                bh.registers_i[reg_idx as usize] = self.next_int();
             }
             offset = it.offset;
         }
@@ -7692,12 +7892,8 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             for reg_idx in it.by_ref() {
                 let value = self.next_ref_for_resume_slot();
-                if bh_debug {
-                    eprintln!("[bh-seed] r{reg_idx} = {value:#x}");
-                }
-                // resume.py `write_a_ref`.
-                bh.setarg_r(reg_idx as usize, value);
-                if let Some(vinfo) = vinfo {
+                bh.registers_r[reg_idx as usize] = value;
+                if let Some(vinfo) = vinfo_heap {
                     vinfo.push_resume_ref_roots_for_value(value);
                 }
             }
@@ -7707,9 +7903,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             for reg_idx in it {
-                let value = self.next_float();
-                // resume.py `write_a_float`.
-                bh.setarg_f(reg_idx as usize, value);
+                bh.registers_f[reg_idx as usize] = self.next_float();
             }
             // `offset` is the end of the float section; no further use.
             let _ = offset;
@@ -7930,7 +8124,11 @@ impl<'a> ResumeDataDirectReader<'a> {
             self.virtualizable_identity_tagged = None;
             self.virtualizable_identity_override = None;
         }
-        self.virtualizable_ptr = virtualizable;
+        self.virtualizable_ptr = if virtualizable == 0 {
+            0
+        } else {
+            majit_gc::gc_current_object_address(virtualizable as usize) as i64
+        };
         if self.virtualizable_root_base_depth.is_none() {
             self.virtualizable_root_base_depth =
                 Some(majit_gc::shadow_stack::resume_ref_roots_depth());
@@ -8041,7 +8239,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe[idx as usize]
+                self.deadframe.get(idx as usize)
             }
             _ => unreachable!("bad tag: {tag}"),
         }
@@ -8072,7 +8270,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                let value = self.deadframe[idx as usize];
+                let value = self.deadframe.get(idx as usize);
                 let slot_type = match self.deadframe_types {
                     // resume.py has no `deadframe_types`: `cpu.get_ref_value`
                     // reads a self-describing deadframe, so a ref slot always
@@ -8127,7 +8325,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe[idx as usize]
+                self.deadframe.get(idx as usize)
             }
             _ => {
                 // resume.py — only TAGCONST and TAGBOX valid for floats
@@ -8141,7 +8339,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// Virtual sources go through getvirtual_ptr (REF virtuals).
     pub fn decode_field_source(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => self.deadframe[*index],
+            ResumeValueSource::FailArg(index) => self.deadframe.get(*index),
             // resume.py:1568 ConstPtr.getref_base() — the Const carries its type.
             ResumeValueSource::Constant(c) => c.getref_base().as_usize() as i64,
             ResumeValueSource::Virtual(index) => self.getvirtual_ptr(*index),
@@ -8156,7 +8354,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// Virtual sources go through getvirtual_int (INT/raw virtuals).
     pub fn decode_field_source_int(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => self.deadframe[*index],
+            ResumeValueSource::FailArg(index) => self.deadframe.get(*index),
             // resume.py:1555 ConstInt.getint().
             ResumeValueSource::Constant(c) => c.getint(),
             ResumeValueSource::Virtual(index) => self.getvirtual_int(*index),
@@ -8173,7 +8371,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// VirtualInfo variant.
     pub fn decode_field_source_float(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => self.deadframe[*index],
+            ResumeValueSource::FailArg(index) => self.deadframe.get(*index),
             // resume.py:1583 ConstFloat.getfloatstorage().
             ResumeValueSource::Constant(c) => c.getfloatstorage(),
             ResumeValueSource::Virtual(_) => {
@@ -8475,7 +8673,7 @@ pub fn prepare_resume_heap<'a>(
         rd_numb,
         rd_consts,
         all_liveness,
-        deadframe,
+        deadframe.into(),
         deadframe_types,
         None,
         allocator,
@@ -8494,7 +8692,7 @@ pub fn blackhole_from_resumedata<'a>(
     rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
-    deadframe: &'a [i64],
+    deadframe: FailArgSource<'a>,
     deadframe_types: Option<&'a [majit_ir::Type]>,
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
@@ -8538,10 +8736,24 @@ pub fn blackhole_from_resumedata<'a>(
     // already built the virtuals and applied the pending fields; redoing
     // either would rebuild the objects it handed to the interpreter and
     // replay its heap writes.
+    let empty_pending = rd_guard_pendingfields.is_none_or(|p| p.is_empty());
+    let empty_virtuals = rd_virtuals.is_none_or(|v| v.is_empty());
     let _resume_roots = if resuming_after_guard_not_forced {
-        prepare_resume_heap_with_roots(&mut resumereader, None, None)
+        Some(prepare_resume_heap_with_roots(
+            &mut resumereader,
+            None,
+            None,
+        ))
+    } else if empty_virtuals && empty_pending {
+        // regex leaf: nvirtuals=0 and no pending fields. Skip the
+        // empty `VirtualCache` root and the pending-field walk.
+        None
     } else {
-        prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, rd_guard_pendingfields)
+        Some(prepare_resume_heap_with_roots(
+            &mut resumereader,
+            rd_virtuals,
+            rd_guard_pendingfields,
+        ))
     };
 
     // resume.py:1325
@@ -8573,7 +8785,7 @@ pub fn blackhole_from_resumedata<'a>(
                 resolved.pc
             );
         }
-        nextbh.setposition(resolved.jitcode.clone(), resolved.pc);
+        nextbh.setposition_ref(&resolved.jitcode, resolved.pc);
         if let Some(stack_base) = resolved.virtualizable_stack_base {
             nextbh.virtualizable_stack_base = stack_base;
         }
@@ -8594,7 +8806,9 @@ pub fn blackhole_from_resumedata<'a>(
         resumereader.consume_one_section(&mut nextbh, vinfo);
 
         // resume.py:1342
-        nextbh.handle_rvmprof_enter();
+        if nextbh.op_rvmprof_code != majit_translate::insns::BC_ABSENT {
+            nextbh.handle_rvmprof_enter();
+        }
 
         curbh = Some(nextbh);
     }
@@ -8643,7 +8857,7 @@ pub fn force_from_resumedata<'a>(
         rd_numb,
         rd_consts,
         all_liveness,
-        deadframe,
+        deadframe.into(),
         deadframe_types,
         None,
         allocator,

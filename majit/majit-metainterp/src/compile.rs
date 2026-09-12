@@ -27,7 +27,7 @@ use majit_backend::{
 use majit_ir::operand::Operand;
 use majit_ir::{
     AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op, OpCode,
-    OpRef, RdVirtualInfo, Type, Value,
+    OpRc, OpRef, RdVirtualInfo, Type, Value,
 };
 
 use crate::blackhole::ExceptionState;
@@ -650,7 +650,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 // No descr — synthetic test FINISH only.
                 op.getarglist().iter().map(finish_arg_type).collect()
             }
-        } else if let Some(fail_args) = op.getfailargs() {
+        } else if let Some(fail_args) = op.guard_fail_args() {
             // `store_final_boxes_in_guard` (resume.py:397) writes the
             // reduced liveboxes' types authoritatively. Prefer the descr's
             // fail_arg_types (single source of truth, matches RPython
@@ -789,7 +789,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
                 builder.push_frame(0, pc, -1);
                 let num_slots = op
-                    .getfailargs()
+                    .guard_fail_args()
                     .map(|fa| fa.len())
                     .unwrap_or(exit_types.len());
                 for slot_idx in 0..num_slots {
@@ -1750,8 +1750,8 @@ pub(crate) fn normalize_closing_jump_args(
 
     let defined: indexmap::IndexSet<OpRef> = ops
         .iter()
-        .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos.get().is_none())
-        .map(|op| op.pos.get())
+        .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos().get().is_none())
+        .map(|op| op.pos().get())
         .collect();
 
     let Some(jump) = ops.iter().rfind(|op| op.opcode == OpCode::Jump) else {
@@ -1963,11 +1963,11 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             if let Some(bound) = get_local_box_replacement(forwarding, orig_arg.to_opref()) {
                 if !replaced {
                     emitted = op.copy_and_change(op.opcode, None, None);
-                    if op.result_type() != Type::Void && !op.pos.get().is_none() {
+                    if op.result_type() != Type::Void && !op.pos().get().is_none() {
                         let new_pos = OpRef::op_typed(*next_opref, op.result_type());
                         *next_opref += 1;
-                        emitted.pos.set(new_pos);
-                        forwarded_source = Some(op.pos.get());
+                        emitted.pos().set(new_pos);
+                        forwarded_source = Some(op.pos().get());
                     }
                     replaced = true;
                 }
@@ -1988,7 +1988,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             }
         }
 
-        let emitted = std::rc::Rc::new(emitted);
+        let emitted = OpRc::new(emitted);
         if let Some(source) = forwarded_source {
             set_local_forwarded(forwarding, source, Operand::from_bound_op(&emitted));
         }
@@ -2006,7 +2006,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
 
     let expanded_inputargs: Vec<majit_ir::InputArgRc> = inputargs
         .iter()
-        .map(|ia| std::rc::Rc::new(ia.fresh_value_copy()))
+        .map(|ia| majit_ir::InputArgRc::new(ia.fresh_value_copy()))
         .collect();
 
     // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
@@ -2015,18 +2015,22 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // compile.py keeps Box identities disjoint automatically; in the flat
     // OpRef model we must allocate above every runtime ref already reachable
     // from the trace so copied ops can stand in for `orig_op.set_forwarded(op)`.
-    let max_runtime_ref = ops
-        .iter()
-        .flat_map(|op| {
-            std::iter::once(op.pos.get())
-                .chain(op.getarglist_copy().into_iter().map(|b| b.to_opref()))
-                .chain(op.getfailargs().into_iter().flatten().map(|b| b.to_opref()))
-        })
-        .chain(expanded_inputargs.iter().map(|ia| ia.opref()))
-        .filter(|opref| !opref.is_none() && !opref.is_constant())
-        .map(|opref| opref.raw())
-        .max()
-        .unwrap_or(0);
+    let mut max_runtime_ref = 0u32;
+    let mut consider = |opref: majit_ir::OpRef| {
+        if !opref.is_none() && !opref.is_constant() {
+            max_runtime_ref = max_runtime_ref.max(opref.raw());
+        }
+    };
+    for op in ops.iter() {
+        consider(op.pos().get());
+        for b in op.getarglist().iter() {
+            consider(b.to_opref());
+        }
+        op.visit_failarg_oprefs(&mut consider);
+    }
+    for ia in expanded_inputargs.iter() {
+        consider(ia.opref());
+    }
     let mut next_opref = max_runtime_ref + 1;
 
     // Allocate fresh const indices above the existing max.
@@ -2078,9 +2082,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         let new_opref = OpRef::op_typed(next_opref, field.field_type);
         next_opref += 1;
         let mut op = Op::new(opcode, std::slice::from_ref(&vable_box));
-        op.pos.set(new_opref);
+        op.pos().set(new_opref);
         op.setdescr(descr);
-        let op = std::rc::Rc::new(op);
+        let op = OpRc::new(op);
         set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&op));
         extra_ops.push(op);
         i += 1;
@@ -2109,9 +2113,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         let array_opref = OpRef::ref_op(next_opref);
         next_opref += 1;
         let mut arr_load = Op::new(OpCode::GetfieldGcR, std::slice::from_ref(&vable_box));
-        arr_load.pos.set(array_opref);
+        arr_load.pos().set(array_opref);
         arr_load.setdescr(array_field_descr.clone());
-        let arr_load = std::rc::Rc::new(arr_load);
+        let arr_load = OpRc::new(arr_load);
         let array_box = Operand::from_bound_op(&arr_load);
         extra_ops.push(arr_load);
 
@@ -2189,14 +2193,14 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 let ptr_opref = OpRef::int_op(next_opref);
                 next_opref += 1;
                 let mut ptr_load = Op::new(OpCode::GetfieldGcI, std::slice::from_ref(&array_box));
-                ptr_load.pos.set(ptr_opref);
+                ptr_load.pos().set(ptr_opref);
                 ptr_load.setdescr(majit_ir::descr::make_field_descr(
                     ptr_offset,
                     std::mem::size_of::<usize>(),
                     Type::Int,
                     ArrayFlag::Unsigned,
                 ));
-                let ptr_load = std::rc::Rc::new(ptr_load);
+                let ptr_load = OpRc::new(ptr_load);
                 let ptr_box = Operand::from_bound_op(&ptr_load);
                 extra_ops.push(ptr_load);
 
@@ -2227,9 +2231,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 item_opcode,
                 &[item_base.clone(), Operand::from_opref(const_opref)],
             );
-            elem_op.pos.set(new_opref);
+            elem_op.pos().set(new_opref);
             elem_op.setdescr(item_descr.clone());
-            let elem_op = std::rc::Rc::new(elem_op);
+            let elem_op = OpRc::new(elem_op);
             set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&elem_op));
             extra_ops.push(elem_op);
             i += 1;
@@ -2593,7 +2597,7 @@ pub fn compile_tmp_callback(
     let call_opcode = OpCode::call_for_type(jitdriver_sd.result_type);
     // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
     // descr=jd.portal_calldescr)`.
-    let call_op = std::rc::Rc::new(Op::with_descr(call_opcode, &callargs_box, portal_calldescr));
+    let call_op = OpRc::new(Op::with_descr(call_opcode, &callargs_box, portal_calldescr));
     //
     // `compile.py` `if call_op.type != 'v': finishargs = [call_op]
     // else: finishargs = []`.
@@ -2609,7 +2613,7 @@ pub fn compile_tmp_callback(
         // resoperation.py IntOp/FloatOp/RefOp mixin: the result
         // box of a typed CALL is a typed ResOp variant.
         let call_result_ref = OpRef::op_typed(num_inputs, jitdriver_sd.result_type);
-        call_op.pos.set(call_result_ref);
+        call_op.pos().set(call_result_ref);
         vec![Operand::from_bound_op(&call_op)]
     };
     //
@@ -2620,11 +2624,7 @@ pub fn compile_tmp_callback(
     // `compile.py` `operations[1].setfailargs([])` — no fail args.
     guard_op.setfailargs(smallvec![]);
     let finish_op = Op::with_descr(OpCode::Finish, &finishargs_box, portal_finishtoken);
-    let operations: Vec<majit_ir::OpRc> = vec![
-        call_op,
-        std::rc::Rc::new(guard_op),
-        std::rc::Rc::new(finish_op),
-    ];
+    let operations: Vec<majit_ir::OpRc> = vec![call_op, OpRc::new(guard_op), OpRc::new(finish_op)];
     //
     // `compile.py:1145` `operations = get_deep_immutable_oplist(operations)` —
     // pyre has no immutable-list transformation.
@@ -2901,24 +2901,24 @@ mod tests {
         // box, so patch_new_loop's forwarding rewrites them through op identity.
         let op0: majit_ir::OpRc = {
             let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, 1)]);
-            op.pos.set(OpRef::ref_op(10));
-            std::rc::Rc::new(op)
+            op.pos().set(OpRef::ref_op(10));
+            OpRc::new(op)
         };
         let op0_result = majit_ir::operand::Operand::from_bound_op(&op0);
-        let op1: majit_ir::OpRc = std::rc::Rc::new(Op::new(
+        let op1: majit_ir::OpRc = OpRc::new(Op::new(
             OpCode::Label,
             &[rooted_inputarg_operand(Type::Ref, 0), op0_result.clone()],
         ));
         let op2: majit_ir::OpRc = {
             let mut op = Op::new(OpCode::GetfieldGcI, &[op0_result]);
-            op.pos.set(OpRef::int_op(11));
+            op.pos().set(OpRef::int_op(11));
             op.setdescr(majit_ir::descr::make_field_descr(
                 16,
                 8,
                 Type::Int,
                 ArrayFlag::Signed,
             ));
-            std::rc::Rc::new(op)
+            OpRc::new(op)
         };
         let mut ops: Vec<majit_ir::OpRc> = vec![op0, op1, op2];
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
@@ -2937,7 +2937,7 @@ mod tests {
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
         assert_eq!(ops.len(), 4);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
-        let vable_field = ops[0].pos.get();
+        let vable_field = ops[0].pos().get();
 
         assert_eq!(ops[1].opcode, OpCode::SameAsR);
         assert_eq!(
@@ -2948,7 +2948,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vable_field]
         );
-        let forwarded_same_as = ops[1].pos.get();
+        let forwarded_same_as = ops[1].pos().get();
         assert_ne!(forwarded_same_as, OpRef::ref_op(10));
 
         assert_eq!(ops[2].opcode, OpCode::Label);
@@ -3001,7 +3001,7 @@ mod tests {
         ];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
-        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
             &mut inputargs,
@@ -3022,12 +3022,12 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![ops[0].pos.get()]
+            vec![ops[0].pos().get()]
         );
         assert_eq!(ops[2].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[2].arg(0).to_opref(), ops[1].pos.get());
+        assert_eq!(ops[2].arg(0).to_opref(), ops[1].pos().get());
         assert_eq!(ops[3].opcode, OpCode::GetarrayitemRawR);
-        assert_eq!(ops[3].arg(0).to_opref(), ops[1].pos.get());
+        assert_eq!(ops[3].arg(0).to_opref(), ops[1].pos().get());
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
             ops[4]
@@ -3035,7 +3035,11 @@ mod tests {
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            vec![OpRef::input_arg_ref(0), ops[2].pos.get(), ops[3].pos.get()]
+            vec![
+                OpRef::input_arg_ref(0),
+                ops[2].pos().get(),
+                ops[3].pos().get()
+            ]
         );
     }
 
@@ -3078,7 +3082,7 @@ mod tests {
             InputArg::new_int(3),
         ];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
@@ -3110,8 +3114,8 @@ mod tests {
             vec![
                 OpRef::input_arg_int(0),
                 OpRef::input_arg_ref(1),
-                ops[2].pos.get(),
-                ops[3].pos.get()
+                ops[2].pos().get(),
+                ops[3].pos().get()
             ]
         );
     }
@@ -3262,7 +3266,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
@@ -3346,7 +3350,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
@@ -3525,13 +3529,13 @@ impl FailDescr for ResumeAtPositionDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.payload.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.payload.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.inner.payload.set_rd_numb(value)
     }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
     fn rd_consts(&self) -> Option<&[Const]> {
@@ -3579,7 +3583,7 @@ impl FailDescr for ResumeAtPositionDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.inner.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -3668,7 +3672,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -3800,13 +3804,13 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.payload.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.payload.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.inner.payload.set_rd_numb(value)
     }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
     fn rd_consts(&self) -> Option<&[Const]> {
@@ -3854,7 +3858,7 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.inner.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -3943,7 +3947,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -4056,13 +4060,13 @@ impl FailDescr for ResumeGuardExcDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.payload.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.payload.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.inner.payload.set_rd_numb(value)
     }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
     fn rd_consts(&self) -> Option<&[Const]> {
@@ -4110,7 +4114,7 @@ impl FailDescr for ResumeGuardExcDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.inner.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -4199,7 +4203,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -4260,7 +4264,7 @@ pub struct ResumeGuardCopiedDescr {
     adr_jump_offset: UnsafeCell<usize>,
     /// `history.py` `_attrs_` `rd_locs` — same per-fail scoping
     /// as `adr_jump_offset`.
-    rd_locs: UnsafeCell<Vec<u16>>,
+    rd_locs: UnsafeCell<majit_ir::RdLocs>,
     /// `compile.py` `AbstractResumeGuardDescr._attrs_` `status` —
     /// each copied descr carries its own status (the copied receiver is
     /// retraced independently of the donor).
@@ -4403,7 +4407,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             prev: UnsafeCell::new(self.prev().clone()),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -4490,7 +4494,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.prev().as_fail_descr().and_then(|fd| fd.rd_numb())
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.prev().as_fail_descr().and_then(|fd| fd.rd_numb_arc())
     }
     fn set_rd_numb(&self, _value: Option<Vec<u8>>) {
@@ -4552,7 +4556,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -4734,7 +4738,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 prev: UnsafeCell::new(self.inner.prev().clone()),
                 vector_info: UnsafeCell::new(None),
                 adr_jump_offset: UnsafeCell::new(0),
-                rd_locs: UnsafeCell::new(Vec::new()),
+                rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
                 status: AtomicU64::new(0),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
@@ -4798,7 +4802,7 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
@@ -4840,7 +4844,7 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn rd_locs(&self) -> &[u16] {
         self.inner.rd_locs()
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         self.inner.set_rd_locs(locs);
     }
     fn get_status(&self) -> u64 {
@@ -4946,7 +4950,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         prev: UnsafeCell::new(prev),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
@@ -4984,7 +4988,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             prev: UnsafeCell::new(prev),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -5161,7 +5165,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 payload: self.inner.payload.deep_clone(),
                 vector_info: UnsafeCell::new(unsafe { (&*self.inner.vector_info.get()).clone() }),
                 adr_jump_offset: UnsafeCell::new(0),
-                rd_locs: UnsafeCell::new(Vec::new()),
+                rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
                 status: AtomicU64::new(0),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
@@ -5236,13 +5240,13 @@ impl FailDescr for CompileLoopVersionDescr {
     fn rd_numb(&self) -> Option<&[u8]> {
         self.inner.payload.rd_numb()
     }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.payload.rd_numb_arc()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.inner.payload.set_rd_numb(value)
     }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
     fn rd_consts(&self) -> Option<&[Const]> {
@@ -5290,7 +5294,7 @@ impl FailDescr for CompileLoopVersionDescr {
     fn rd_locs(&self) -> &[u16] {
         unsafe { &*self.inner.rd_locs.get() }
     }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
+    fn set_rd_locs(&self, locs: majit_ir::RdLocs) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn get_status(&self) -> u64 {
@@ -5377,7 +5381,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             payload,
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
@@ -5955,7 +5959,7 @@ mod fail_descr_tests {
                 payload: RdPayload::empty(),
                 vector_info: UnsafeCell::new(None),
                 adr_jump_offset: UnsafeCell::new(0),
-                rd_locs: UnsafeCell::new(Vec::new()),
+                rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
                 status: AtomicU64::new(0),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),

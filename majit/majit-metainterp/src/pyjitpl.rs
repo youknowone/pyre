@@ -132,7 +132,8 @@ use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::{
-    Const, FailDescr, GcRef, IndexMapExt, InputArg, Op, OpCode, OpRc, OpRef, Type, Value,
+    Const, FailDescr, GcRef, IndexMapExt, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type,
+    Value,
 };
 
 use crate::blackhole::ExceptionState;
@@ -392,10 +393,7 @@ impl OptimizationInfoItem for OpRc {
             .into_iter()
             .chain(self.getfailargs().into_iter().flatten());
         for arg in producers {
-            if matches!(
-                arg,
-                majit_ir::operand::Operand::Op(_) | majit_ir::operand::Operand::InputArg(_)
-            ) {
+            if arg.is_bound() {
                 arg.clear_forwarded();
             }
         }
@@ -880,18 +878,20 @@ fn snapshot_map_from_trace_snapshots(
         }
     };
     for snap in trace_snapshots {
-        let boxes: Vec<SnapshotBox> = snap
+        let boxes: crate::optimizeopt::SnapshotBoxList = snap
             .frames
             .iter()
             .flat_map(|f| f.boxes.iter())
             .map(&tagged_to_box)
             .collect();
         let frame_sizes: Vec<usize> = snap.frames.iter().map(|f| f.boxes.len()).collect();
-        let vable_boxes: Vec<SnapshotBox> = snap.vable_boxes.iter().map(&tagged_to_box).collect();
+        let vable_boxes: crate::optimizeopt::SnapshotBoxList =
+            snap.vable_boxes.iter().map(&tagged_to_box).collect();
         // opencoder.py create_top_snapshot writes BOTH vable_array
         // AND vref_array. resume.py _number_boxes consumes
         // vref_array as a separate section after vable_array.
-        let vref_boxes: Vec<SnapshotBox> = snap.vref_boxes.iter().map(&tagged_to_box).collect();
+        let vref_boxes: crate::optimizeopt::SnapshotBoxList =
+            snap.vref_boxes.iter().map(&tagged_to_box).collect();
         let frame_pcs: Vec<(i32, i32, i32)> = snap
             .frames
             .iter()
@@ -954,7 +954,8 @@ fn snapshot_map_from_byte_recorder(
         }
     };
     recorder.for_each_captured_snapshot_arrays(|vable_t, vref_t, frames_t, py_pcs| {
-        let mut boxes = Vec::new();
+        let n_boxes: usize = frames_t.iter().map(|(_, _, tagged)| tagged.len()).sum();
+        let mut boxes = crate::optimizeopt::SnapshotBoxList::with_capacity(n_boxes);
         let mut frame_sizes = Vec::with_capacity(frames_t.len());
         let mut frame_pcs = Vec::with_capacity(frames_t.len());
         for (fi, (jc, pc, tagged)) in frames_t.into_iter().enumerate() {
@@ -970,11 +971,11 @@ fn snapshot_map_from_byte_recorder(
                     .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique))),
             );
         }
-        let vable_boxes: Vec<SnapshotBox> = vable_t
+        let vable_boxes: crate::optimizeopt::SnapshotBoxList = vable_t
             .into_iter()
             .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
             .collect();
-        let vref_boxes: Vec<SnapshotBox> = vref_t
+        let vref_boxes: crate::optimizeopt::SnapshotBoxList = vref_t
             .into_iter()
             .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
             .collect();
@@ -1104,7 +1105,7 @@ fn translate_trace_iter_box_map(
 /// just to rewrite `pos` is a second `cls()`. Rewrite args and
 /// positions in place when `strong_count == 1`.
 fn prepare_bridge_trace_from_owned(
-    mut bridge_ops: Vec<majit_ir::OpRc>,
+    bridge_ops: Vec<majit_ir::OpRc>,
     bridge_inputargs: &[InputArg],
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
@@ -1115,36 +1116,28 @@ fn prepare_bridge_trace_from_owned(
     runtime_boxes: Vec<OpRef>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace {
-    if !bridge_ops
-        .iter()
-        .all(|op| std::rc::Rc::strong_count(op) == 1)
-    {
-        return prepare_bridge_trace_for_optimizer(
-            &bridge_ops,
-            bridge_inputargs,
-            snapshot_boxes,
-            snapshot_frame_sizes,
-            snapshot_vable_boxes,
-            snapshot_vref_boxes,
-            snapshot_frame_pcs,
-            pending_bridge_rd,
-            runtime_boxes,
-            bridge_inputarg_base,
-        );
-    }
+    // `Operand::Op` already shares the producer `Rc`. Later uses hold a
+    // second strong ref, so `strong_count == 1` on every op is false on
+    // any real bridge and used to fall through to a second `cls()`.
+    // `pos` / `setarg` / guard extra are interior-mutable: rewrite the
+    // live objects and every operand already pointing at them sees the
+    // new `pos`. That is the one materialization `TraceIterator.next`
+    // would have done.
     #[cfg(feature = "jit-audits")]
     next_audit_prepare_generation();
-    let max_pos = bridge_ops
-        .iter()
-        .flat_map(|op| {
-            std::iter::once(op.pos.get())
-                .chain(op.getarglist_copy().into_iter().map(|a| a.to_opref()))
-                .chain(op.getfailargs().into_iter().flatten().map(|a| a.to_opref()))
-        })
-        .filter(|opref| !opref.is_none() && !opref.is_constant())
-        .map(|opref| opref.raw())
-        .max()
-        .unwrap_or(0);
+    let mut max_pos = 0u32;
+    let mut consider = |opref: majit_ir::OpRef| {
+        if !opref.is_none() && !opref.is_constant() {
+            max_pos = max_pos.max(opref.raw());
+        }
+    };
+    for op in bridge_ops.iter() {
+        consider(op.pos().get());
+        for a in op.getarglist().iter() {
+            consider(a.to_opref());
+        }
+        op.visit_failarg_oprefs(&mut consider);
+    }
     let cache_size = ((max_pos as usize) + 1).max(bridge_inputargs.len());
     let mut cache: Vec<Option<majit_ir::operand::Operand>> = vec![None; cache_size];
     let mut fresh = bridge_inputarg_base;
@@ -1171,39 +1164,34 @@ fn prepare_bridge_trace_from_owned(
         cache[p] = Some(majit_ir::operand::Operand::from_bound_inputarg(&ia));
     }
     for i in 0..bridge_ops.len() {
-        let orig;
-        let is_void;
-        {
-            let op = std::rc::Rc::get_mut(&mut bridge_ops[i]).expect("strong_count checked above");
-            for ai in 0..op.num_args() {
-                let arg = op.arg(ai);
-                if !arg.is_constant() {
-                    op.setarg(ai, untag_prepared_cache(arg.to_opref(), &cache));
-                }
+        let op = &bridge_ops[i];
+        for ai in 0..op.num_args() {
+            let arg = op.arg(ai);
+            if let Some(rewritten) = remap_prepared_arg(&arg, &cache, bridge_inputarg_base) {
+                op.setarg(ai, rewritten);
             }
-            if let Some(fa) = op.fail_args_mut() {
-                for arg in fa.iter_mut() {
-                    if !arg.is_constant() {
-                        *arg = untag_prepared_cache(arg.to_opref(), &cache);
-                    }
-                }
+        }
+        op.map_failargs_in_place(|arg| {
+            if let Some(rewritten) = remap_prepared_arg(arg, &cache, bridge_inputarg_base) {
+                *arg = rewritten;
             }
-            orig = op.pos.get();
-            is_void = orig.is_none() || op.opcode.result_type() == Type::Void;
-            if !is_void {
-                op.pos.set(OpRef::op_typed(fresh, op.opcode.result_type()));
-                fresh += 1;
-            } else if !orig.is_none() {
-                op.pos.set(OpRef::void_op(fresh));
-                fresh += 1;
-            }
+        });
+        let orig = op.pos().get();
+        let is_void = orig.is_none() || op.opcode.result_type() == Type::Void;
+        if !is_void {
+            op.pos()
+                .set(OpRef::op_typed(fresh, op.opcode.result_type()));
+            fresh += 1;
+        } else if !orig.is_none() {
+            op.pos().set(OpRef::void_op(fresh));
+            fresh += 1;
         }
         if !is_void {
             let slot = orig.raw() as usize;
             if slot >= cache.len() {
                 cache.resize(slot + 1, None);
             }
-            cache[slot] = Some(majit_ir::operand::Operand::from_bound_op(&bridge_ops[i]));
+            cache[slot] = Some(majit_ir::operand::Operand::from_bound_op(op));
         }
     }
     finish_prepared_bridge(
@@ -1218,6 +1206,41 @@ fn prepare_bridge_trace_from_owned(
         pending_bridge_rd,
         runtime_boxes,
     )
+}
+
+/// Remap one operand into the prepared namespace. `None` means keep `arg`.
+/// A bound same-bridge producer already has its `pos` rewritten; looking
+/// that live `pos` up in a cache keyed by the *old* position misses
+/// (`IntOp(396)` vs `cache_len=175`).
+fn remap_prepared_arg(
+    arg: &majit_ir::operand::Operand,
+    cache: &[Option<majit_ir::operand::Operand>],
+    bridge_inputarg_base: u32,
+) -> Option<majit_ir::operand::Operand> {
+    if arg.is_constant() || arg.is_none() {
+        return None;
+    }
+    if let Some(prod) = arg.bound_op() {
+        let p = prod.pos().get();
+        if p.is_none() || p.is_constant() || p.raw() >= bridge_inputarg_base {
+            return None;
+        }
+        return cache.get(p.raw() as usize).and_then(|slot| slot.clone());
+    }
+    let opref = arg.to_opref();
+    if opref.is_none() || opref.is_constant() {
+        return None;
+    }
+    match cache
+        .get(opref.raw() as usize)
+        .and_then(|slot| slot.clone())
+    {
+        Some(found) => {
+            assert_prepared_cache_bank("remap_prepared_arg", opref, found.to_opref().ty());
+            Some(found)
+        }
+        None => None,
+    }
 }
 
 fn untag_prepared_cache(
@@ -1481,14 +1504,16 @@ fn densify_root_loop_inputargs(
         .iter()
         .enumerate()
         .map(|(position, &opref)| {
-            let tp = opref.ty().unwrap_or_else(|| {
-                panic!(
+            let tp = match opref.ty() {
+                Some(majit_ir::Type::Void) => majit_ir::Type::Ref,
+                Some(tp) => tp,
+                None => panic!(
                     "renamed inputarg {:?} has no intrinsic type \
                      (history.py:220 Box.type invariant)",
                     opref
-                )
-            });
-            let dense = std::rc::Rc::new(InputArg::from_type(tp, position as u32));
+                ),
+            };
+            let dense = InputArgRc::new(InputArg::from_type(tp, position as u32));
             replacements.insert(opref, dense.clone());
             InputArg::from_type(tp, position as u32)
         })
@@ -1508,8 +1533,8 @@ fn densify_root_loop_inputargs(
                 .iter()
                 .map(&remap)
                 .collect::<smallvec::SmallVec<[_; 3]>>();
-            let cloned = std::rc::Rc::new(op.copy_and_change(op.opcode, Some(&args), None));
-            if let Some(failargs) = op.getfailargs() {
+            let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
+            if let Some(failargs) = op.guard_fail_args() {
                 cloned.setfailargs(failargs.iter().map(&remap).collect());
             }
             cloned
@@ -1732,12 +1757,12 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>>(inputargs: &[InputArg], ops
         .iter()
         .map(|op| {
             let op = op.as_ref();
-            let mut hw = opref_high_water(op.pos.get());
+            let mut hw = opref_high_water(op.pos().get());
             for a in op.getarglist().iter() {
                 hw = hw.max(opref_high_water(a.to_opref()));
             }
-            if let Some(fa) = op.getfailargs() {
-                for a in fa {
+            if let Some(fa) = op.guard_fail_args() {
+                for a in fa.iter() {
                     hw = hw.max(opref_high_water(a.to_opref()));
                 }
             }
@@ -2187,6 +2212,11 @@ pub struct MetaInterp<M: Clone> {
     /// `consts` — and the raw-address keys of its `refs` cache — name nothing
     /// the collector forwards. Emptied by [`CompileSnapshotRootsGuard`].
     pub(crate) compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
+    /// Reused across sequential `compile_bridge` calls so the pass boxes
+    /// and `ResumeDataLoopMemo` scratch stay allocated. RPython
+    /// `BridgeCompileData.optimize` constructs a new `UnrollOptimizer`
+    /// per compile; nursery allocation is cheap there.
+    cached_optimizer: Option<crate::optimizeopt::optimizer::Optimizer>,
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
@@ -2775,10 +2805,10 @@ pub fn record_discarded_level_traceback_for_recording(exc_value: i64, w_code: i6
 /// OpRef` slot in `Op::args` / `Op::fail_args` is the canonical
 /// forwardable Ref site.
 fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
-    for arg in op.args.borrow().iter() {
+    for arg in op.args_slice().iter() {
         arg.walk_const_ptr_refs(visitor);
     }
-    if let Some(fail_args) = op.getfailargs() {
+    if let Some(fail_args) = op.guard_fail_args() {
         for arg in fail_args.iter() {
             arg.walk_const_ptr_refs(visitor);
         }
@@ -2907,9 +2937,10 @@ impl<M: Clone> MetaInterp<M> {
                 // (`model.py CompiledLoopToken`).  Walk those tracers so a
                 // bridge guard's pool is a root for the token's lifetime,
                 // the same way the root loop's descrs are reached above.
-                // Dynasm registers `Vec<Arc<FailDescrCell>>`, cranelift and
-                // wasm `Vec<DescrRef>`; the other tracer kinds (GcTables)
-                // are rooted through the gcreftracer registry.
+                // Dynasm registers `FailDescrStore` (shared via
+                // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
+                // the other tracer kinds (GcTables) are rooted through
+                // the gcreftracer registry.
                 let tokens = entry.live_token().into_iter().chain(
                     entry
                         .previous_tokens
@@ -2925,10 +2956,8 @@ impl<M: Clone> MetaInterp<M> {
                             let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_arc());
                             visit_pool(pool.as_ref(), generation, is_minor, &mut visitor);
                         };
-                        if let Some(cells) =
-                            tracer.downcast_ref::<Vec<Arc<majit_ir::FailDescrCell>>>()
-                        {
-                            for cell in cells {
+                        if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+                            for cell in store.iter() {
                                 visit_descr(&*cell.descr);
                             }
                         } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
@@ -3843,6 +3872,7 @@ impl<M: Clone> MetaInterp<M> {
             compile_snapshot_refs: Vec::new(),
             compile_short_preamble_producer: None,
             compile_resume_memos: Vec::new(),
+            cached_optimizer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
             pending_preamble_tokens: indexmap::IndexMap::new(),
@@ -5224,6 +5254,34 @@ impl<M: Clone> MetaInterp<M> {
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();
         opt
+    }
+
+    fn take_optimizer(&mut self) -> Optimizer {
+        match self.cached_optimizer.take() {
+            Some(mut opt) => {
+                let want_vable = self
+                    .current_virtualizable_optimizer_config()
+                    .map(|config| config.static_field_offsets.len() as i64)
+                    .unwrap_or(-1);
+                if opt.minimum_virtualizable_size != want_vable {
+                    return self.make_optimizer();
+                }
+                opt.recycle_for_next_compile();
+                opt.supports_efficient_uint_mul_high =
+                    self.backend.supports_efficient_uint_mul_high();
+                opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
+                opt.set_vrefinfo(self.virtualref_info().clone());
+                opt.string_length_resolver = self.string_length_resolver.clone();
+                opt.string_content_resolver = self.string_content_resolver.clone();
+                opt.string_constant_alloc = self.string_constant_alloc.clone();
+                opt
+            }
+            None => self.make_optimizer(),
+        }
+    }
+
+    fn return_optimizer(&mut self, optimizer: Optimizer) {
+        self.cached_optimizer = Some(optimizer);
     }
 
     /// Install the host-runtime `getstrlen1` resolver. The closure must be
@@ -7690,7 +7748,7 @@ impl<M: Clone> MetaInterp<M> {
         // through `OpRef::ty()` / `Const::get_type()`.
         // Phase 1's copy of the snapshot banks. The originals stay owned here
         // because the `InvalidLoop` arm below moves them into the unroll-free
-        // optimizer, so this is a second set, one `Vec<SnapshotBox>` per
+        // optimizer, so this is a second set, one snapshot-box list per
         // recorded guard. A trace that records guards in the thousands makes
         // that the largest single allocation of the compile, and the arm that
         // never peels never reads it.
@@ -7879,7 +7937,7 @@ impl<M: Clone> MetaInterp<M> {
                         let trace_ops_snapshot_rc: Vec<majit_ir::OpRc> = trace_ops_snapshot
                             .unwrap_or_else(|| std::mem::take(&mut trace_ops))
                             .into_iter()
-                            .map(std::rc::Rc::new)
+                            .map(OpRc::new)
                             .collect();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7973,7 +8031,7 @@ impl<M: Clone> MetaInterp<M> {
                     user_code,
                 )
                 .into_iter()
-                .map(std::rc::Rc::new)
+                .map(OpRc::new)
                 .collect()
             } else {
                 optimized_ops
@@ -8064,8 +8122,8 @@ impl<M: Clone> MetaInterp<M> {
                     .map(Operand::from_bound_inputarg)
                     .collect::<Vec<_>>(),
             );
-            label_op.pos.set(majit_ir::OpRef::NONE);
-            optimized_ops.insert(0, std::rc::Rc::new(label_op));
+            label_op.pos().set(majit_ir::OpRef::NONE);
+            optimized_ops.insert(0, OpRc::new(label_op));
         }
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
             root_inputargs,
@@ -8180,7 +8238,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated
-                    && let Some(fa) = op.getfailargs()
+                    && let Some(fa) = op.guard_fail_args()
                 {
                     let raw: Vec<String> = fa
                         .iter()
@@ -8307,9 +8365,9 @@ impl<M: Clone> MetaInterp<M> {
                         .map(Operand::from_bound_inputarg)
                         .collect::<Vec<_>>(),
                 );
-                label_op.pos.set(majit_ir::OpRef::NONE);
+                label_op.pos().set(majit_ir::OpRef::NONE);
                 label_op.setdescr(target_token.as_jump_target_descr());
-                compiled_ops.insert(0, std::rc::Rc::new(label_op));
+                compiled_ops.insert(0, OpRc::new(label_op));
             }
             vec![target_token]
         } else if unroll_opt.target_tokens.is_empty() {
@@ -10781,7 +10839,7 @@ impl<M: Clone> MetaInterp<M> {
         // references). This ensures gcmap and adapt-live agree on which
         // slots are GC refs vs raw ints.
         for op in optimized_ops.iter().filter(|op| op.opcode.is_guard()) {
-            let Some(fail_args) = op.getfailargs() else {
+            let Some(fail_args) = op.guard_fail_args() else {
                 continue;
             };
             for fa in fail_args.iter() {
@@ -11251,9 +11309,9 @@ impl<M: Clone> MetaInterp<M> {
                 .map(Operand::from_bound_inputarg)
                 .collect::<Vec<_>>(),
         );
-        label_op.pos.set(majit_ir::OpRef::NONE);
+        label_op.pos().set(majit_ir::OpRef::NONE);
         label_op.setdescr(target_token.as_jump_target_descr());
-        compiled_ops.insert(0, std::rc::Rc::new(label_op));
+        compiled_ops.insert(0, OpRc::new(label_op));
 
         // compile.py send_loop_to_backend virtualizable hook —
         // simple-loop compile path must also reload virtualizable fields on
@@ -11818,7 +11876,7 @@ impl<M: Clone> MetaInterp<M> {
     fn compiled_ops_concrete_at(compiled_ops: &[majit_ir::OpRc], raw: u32) -> Option<Value> {
         compiled_ops
             .iter()
-            .find(|op| op.pos.get().raw() == raw)
+            .find(|op| op.pos().get().raw() == raw)
             .and_then(|op| op.get_value())
     }
 
@@ -14352,7 +14410,7 @@ impl<M: Clone> MetaInterp<M> {
                 eprintln!(
                     "[jit][entry-bridge] op[{i}] {:?} pos={:?} args={:?} descr={:?}",
                     op.opcode,
-                    op.pos.get(),
+                    op.pos().get(),
                     op.getarglist(),
                     op.descr
                 );
@@ -14616,7 +14674,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         for op in bridge_ops.iter().map(std::borrow::Borrow::borrow) {
-            let pos = op.pos.get();
+            let pos = op.pos().get();
             if !pos.is_none()
                 && let Some(v) = op.get_value()
             {
@@ -14928,7 +14986,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_trace_data = TreeLoop::from_oprc(
             bridge_inputargs
                 .iter()
-                .map(|arg| std::rc::Rc::new(arg.fresh_value_copy()))
+                .map(|arg| InputArgRc::new(arg.fresh_value_copy()))
                 .collect(),
             prepared_ops,
             Vec::new(),
@@ -14966,7 +15024,7 @@ impl<M: Clone> MetaInterp<M> {
         // optimize_bridge's generate_guards reads them in the re-minted space.
         let bridge_runtime_boxes = prepared_runtime_boxes.as_slice();
 
-        let mut optimizer = self.make_optimizer();
+        let mut optimizer = self.take_optimizer();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
@@ -15079,6 +15137,7 @@ impl<M: Clone> MetaInterp<M> {
                         inv.0, green_key, fail_index
                     );
                 }
+                self.return_optimizer(optimizer);
                 return false;
             }
         };
@@ -15135,6 +15194,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.retrace_needed(green_key, optimized_ops.clone(), renamed_inputargs, es);
             }
             self.retrace_after_bridge = true;
+            self.return_optimizer(optimizer);
             return false;
         }
 
@@ -15191,6 +15251,7 @@ impl<M: Clone> MetaInterp<M> {
                             "bridge giveup: JUMP args {jump_len} != target LABEL args {target_len}"
                         ),
                     );
+                    self.return_optimizer(optimizer);
                     return false;
                 }
             }
@@ -15349,6 +15410,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
                     hook(green_key, fail_index, num_optimized_ops);
                 }
+                self.return_optimizer(optimizer);
                 true
             }
             Err(e) => {
@@ -15376,6 +15438,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
+                self.return_optimizer(optimizer);
                 false
             }
         }
@@ -22475,7 +22538,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos.get(), opref);
+        assert_eq!(op.pos().get(), opref);
     }
 
     extern "C" fn cond_call_void_helper(_cond: i64, _func_addr: i64) {}
@@ -22845,7 +22908,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos.get(), opref);
+        assert_eq!(op.pos().get(), opref);
     }
 
     #[test]
@@ -23002,7 +23065,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallMayForceI)
             .expect("CallMayForceI must be recorded");
-        assert_eq!(call_op.pos.get(), opref);
+        assert_eq!(call_op.pos().get(), opref);
         assert!(
             ctx.recorder
                 .ops()
@@ -23119,7 +23182,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos.get(), opref);
+        assert_eq!(op.pos().get(), opref);
         assert_eq!(op.num_args(), 3);
         assert_eq!(op.arg(0).to_opref(), funcbox_ref);
         assert_eq!(op.arg(1).to_opref(), OpRef::int_op(1));
@@ -23299,7 +23362,7 @@ mod metainterp_static_data_tests {
                 .constants_get_value(op.arg(0).to_opref())
                 .expect("typeptr constant");
             assert_eq!(typeptr, majit_ir::Value::Int(0xc1a55));
-            op.pos.get()
+            op.pos().get()
         };
 
         // pyjitpl.py:3392: class_of_last_exc_is_const = True after.
@@ -24627,7 +24690,7 @@ mod tests {
         let args: Vec<majit_ir::operand::Operand> =
             args.iter().map(|a| bound_operand(*a)).collect();
         let op = Op::new(opcode, &args);
-        op.pos.set(if pos == OpRef::NONE.raw() {
+        op.pos().set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
             OpRef::op_typed(pos, opcode.result_type())
@@ -24639,7 +24702,7 @@ mod tests {
         let args: Vec<majit_ir::operand::Operand> =
             args.iter().map(|a| bound_operand(*a)).collect();
         let op = Op::with_descr(opcode, &args, descr);
-        op.pos.set(if pos == OpRef::NONE.raw() {
+        op.pos().set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
             OpRef::op_typed(pos, opcode.result_type())
@@ -24686,7 +24749,7 @@ mod tests {
             10,
         );
         meta.partial_trace = Some(PartialTrace {
-            ops: vec![std::rc::Rc::new(op)],
+            ops: vec![OpRc::new(op)],
             inputargs: Vec::new(),
         });
 
@@ -24716,7 +24779,7 @@ mod tests {
             Operand::from_opref(OpRef::const_int(123)),
         ]);
         meta.partial_trace = Some(PartialTrace {
-            ops: vec![std::rc::Rc::new(guard)],
+            ops: vec![OpRc::new(guard)],
             inputargs: Vec::new(),
         });
 
@@ -24727,7 +24790,7 @@ mod tests {
         });
 
         let ops = &meta.partial_trace.as_ref().unwrap().ops;
-        let fail_args = ops[0].getfailargs().expect("guard has fail_args");
+        let fail_args = ops[0].guard_fail_args().expect("guard has fail_args");
         assert_eq!(fail_args[0].to_opref().as_const_ptr(), Some(GcRef(0x8000)));
         // Non-Ref inline-Const slots untouched.
         assert_eq!(fail_args[1].to_opref(), OpRef::const_int(123));
@@ -25008,7 +25071,7 @@ mod tests {
             ),
         ];
 
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let err =
             normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
         assert_eq!(err, (0, 3));
@@ -25027,7 +25090,7 @@ mod tests {
             OpRef::NONE.raw(),
         )];
 
-        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
         let err =
             normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
         assert_eq!(err, (0, 2));
@@ -25043,7 +25106,7 @@ mod tests {
             OpRef::input_arg_int(596),
             OpRef::input_arg_ref(614),
         ];
-        let guard = std::rc::Rc::new(mk_op(
+        let guard = OpRc::new(mk_op(
             OpCode::GuardClass,
             &[renamed[0], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
             OpRef::NONE.raw(),
@@ -25069,7 +25132,7 @@ mod tests {
         );
         assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(0));
         assert_eq!(
-            ops[0].getfailargs().unwrap()[0].to_opref(),
+            ops[0].guard_fail_args().unwrap()[0].to_opref(),
             OpRef::input_arg_ref(2)
         );
     }
@@ -25090,7 +25153,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut snapshot_boxes = Vec::new();
+        let mut snapshot_boxes: SnapshotBoxes = Vec::new();
         snapshot_insert(
             &mut snapshot_boxes,
             0,
@@ -25098,13 +25161,14 @@ mod tests {
                 OpRef::input_arg_int(0).into(),
                 OpRef::ref_op(2).into(),
                 OpRef::int_op(3).into(),
-            ],
+            ]
+            .into(),
         );
-        let mut snapshot_vable_boxes = Vec::new();
+        let mut snapshot_vable_boxes: SnapshotBoxes = Vec::new();
         snapshot_insert(
             &mut snapshot_vable_boxes,
             0,
-            vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()],
+            vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()].into(),
         );
         let pending_bridge_rd = PendingBridgeRd {
             storage: crate::resume::ResumeStorage::new(vec![1, 2, 3], vec![], vec![], vec![]),
@@ -25139,7 +25203,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(10, Type::Int), (11, Type::Ref)]
         );
-        assert_eq!(prepared.ops[0].pos.get(), OpRef::ref_op(12));
+        assert_eq!(prepared.ops[0].pos().get(), OpRef::ref_op(12));
         assert_eq!(
             prepared.ops[0]
                 .getarglist()
@@ -25148,7 +25212,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![OpRef::input_arg_ref(11)]
         );
-        assert_eq!(prepared.ops[1].pos.get(), OpRef::int_op(13));
+        assert_eq!(prepared.ops[1].pos().get(), OpRef::int_op(13));
         assert_eq!(
             prepared.ops[1]
                 .getarglist()
@@ -25259,7 +25323,7 @@ mod tests {
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+                ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
                 terminal_exit_layouts: indexmap::IndexMap::new(),
@@ -25330,7 +25394,7 @@ mod tests {
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+                ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
                 terminal_exit_layouts: indexmap::IndexMap::new(),
@@ -26089,7 +26153,7 @@ mod tests {
         meta.backend.set_next_trace_id(trace_id);
         meta.backend
             .set_next_frame_value_count_fn(meta.active_frame_value_count_fn());
-        let ops_rc: Vec<majit_ir::OpRc> = ops.iter().cloned().map(std::rc::Rc::new).collect();
+        let ops_rc: Vec<majit_ir::OpRc> = ops.iter().cloned().map(OpRc::new).collect();
         meta.backend
             .compile_loop(inputargs, &ops_rc, &token)
             .expect("loop should compile");
@@ -26130,7 +26194,7 @@ mod tests {
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                ops: ops.into_iter().map(std::rc::Rc::new).collect(),
+                ops: ops.into_iter().map(OpRc::new).collect(),
                 constants: constants_typed,
                 exit_layouts,
                 terminal_exit_layouts,
@@ -28670,7 +28734,7 @@ mod closing_jump_fixes_label_slots_tests {
 
     fn op(opcode: OpCode, args: &[OpRef]) -> majit_ir::OpRc {
         let args: Vec<Operand> = args.iter().map(|a| Operand::bound_from_opref(*a)).collect();
-        std::rc::Rc::new(Op::new(opcode, &args))
+        OpRc::new(Op::new(opcode, &args))
     }
 
     /// An `OpRef` naming a producer, i.e. what a LABEL declares each of its
@@ -28765,13 +28829,19 @@ mod forget_optimization_info_tests {
                 Operand::const_from_value(Value::Int(2)),
             ],
         ));
-        recorded.pos.set(OpRef::int_op(3));
+        recorded.pos().set(OpRef::int_op(3));
         let emitted = OpRc::new((*recorded).clone());
         let guard = Op::new(OpCode::GuardTrue, &[Operand::from_bound_op(&recorded)]);
         guard.setfailargs(smallvec::smallvec![Operand::from_bound_op(&recorded)]);
         let guard = OpRc::new(guard);
         recorded.set_forwarded_const(Const::Int(3));
-        assert!(matches!(recorded.get_forwarded(), Forwarded::Const(_)));
+        assert!(
+            matches!(
+                recorded.get_forwarded(),
+                Forwarded::Const(_) | Forwarded::SmallConst(_) | Forwarded::SmallWide(_)
+            ),
+            "i32 ConstInt packs as SmallConst"
+        );
 
         forget_optimization_info(&[emitted, guard]);
 

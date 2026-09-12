@@ -27,7 +27,7 @@ impl OptSimplify {
     fn rewrite_call(op: &Op) -> Op {
         let new_opcode = OpCode::call_for_type(op.result_type());
         let new_op = op.copy_and_change(new_opcode, None, None);
-        new_op.pos.set(op.pos.get());
+        new_op.pos().set(op.pos().get());
         new_op
     }
 }
@@ -60,7 +60,7 @@ impl Optimization for OptSimplify {
             // VIRTUAL_REF -> SAME_AS_R (just forward the first arg)
             OpCode::VirtualRefR => {
                 let mut new_op = Op::new(OpCode::SameAsR, &[op.arg(0)]);
-                new_op.pos.set(op.pos.get());
+                new_op.pos().set(op.pos().get());
                 OptimizationResult::Emit(new_op)
             }
 
@@ -98,14 +98,14 @@ mod tests {
     use majit_ir::{OpRc, OpRef, Type};
 
     /// Seed empty guard snapshots over the canonical `OpRc` slice in place
-    /// (each guard's `rd_resume_position` is a `Cell`, so the assignment is
+    /// (each guard's `rd_resume_position` is on GuardExtra, so the assignment is
     /// shared through the `Rc`), mirroring `seed_empty_guard_snapshots` for
     /// the `OpRc`-threaded driver.
     fn seed_oprc(ops: &[OpRc]) -> super::super::SnapshotBoxes {
         let scratch: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
         let (seeded, snapshots) = super::super::seed_empty_guard_snapshots(&scratch);
         for (op, seed) in ops.iter().zip(seeded.iter()) {
-            op.rd_resume_position.set(seed.rd_resume_position.get());
+            op.set_rd_resume_position(seed.rd_resume_position());
         }
         snapshots
     }

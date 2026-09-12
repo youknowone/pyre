@@ -516,6 +516,11 @@ impl<'a> Iterator for LivenessIterator<'a> {
     type Item = u32;
 
     /// RPython liveness.py `next(self)`.
+    ///
+    /// Same scan as the bit-at-a-time loop: skip a zero tail with
+    /// `trailing_zeros` and return the next set index. The produced
+    /// sequence is identical.
+    #[inline]
     fn next(&mut self) -> Option<u32> {
         if self.length == 0 {
             return None;
@@ -531,11 +536,13 @@ impl<'a> Iterator for LivenessIterator<'a> {
                 self.curr_byte = curr_byte;
                 self.offset += 1;
             }
-            if (curr_byte >> (count & 7)) & 1 != 0 {
+            let remaining = curr_byte >> (count & 7);
+            if remaining != 0 {
+                count += remaining.trailing_zeros();
                 self.count = count + 1;
                 return Some(count);
             }
-            count += 1;
+            count = (count & !7) + 8;
         }
     }
 }
@@ -680,5 +687,15 @@ mod tests {
         let mut it = LivenessIterator::new(0, live.len() as u32, &encoded);
         let decoded: Vec<u32> = (&mut it).collect();
         assert_eq!(decoded, live.iter().map(|&i| i as u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn liveness_iterator_skips_zero_bytes() {
+        // live = [0, 16, 23] spans three bytes with a zero middle byte.
+        let live = [0u8, 16, 23];
+        let encoded = encode_liveness(&live);
+        assert_eq!(encoded, vec![0x01, 0x00, 0x81]);
+        let decoded: Vec<u32> = LivenessIterator::new(0, live.len() as u32, &encoded).collect();
+        assert_eq!(decoded, vec![0, 16, 23]);
     }
 }

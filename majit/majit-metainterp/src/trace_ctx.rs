@@ -2400,6 +2400,26 @@ impl TraceCtx {
         self.recorder.num_inputargs()
     }
 
+    /// True when `r` names a recorded void opcode (e.g. `DebugMergePoint`)
+    /// at that raw slot. A Ref-tagged copy of the same raw must not be
+    /// used as a JUMP red — `box_for_operand` would otherwise bind it to
+    /// the void producer.
+    pub fn opref_is_void_producer(&self, r: OpRef) -> bool {
+        if r.is_none() || r.ty() == Some(Type::Void) {
+            return true;
+        }
+        if r.is_constant() || r.is_input_arg() {
+            return false;
+        }
+        let n = self.recorder.num_inputargs();
+        let Some(idx) = (r.raw() as usize).checked_sub(n) else {
+            return false;
+        };
+        self.recorder.ops().get(idx).is_some_and(|op| {
+            op.pos().get().raw() == r.raw() && op.opcode.result_type() == Type::Void
+        })
+    }
+
     /// Input argument types in loop-header order.
     pub fn inputarg_types(&self) -> Vec<Type> {
         self.recorder.inputarg_types()
@@ -2427,21 +2447,25 @@ impl TraceCtx {
         eprintln!("[p2-ir] {label} num_ops={}", self.recorder.num_ops());
         for op in self.recorder.ops() {
             let args: Vec<String> = op
-                .args
-                .borrow()
+                .args_slice()
                 .iter()
-                .map(|a| match a {
-                    Operand::Op(o) => format!("{:?}", o.pos.get()),
-                    Operand::InputArg(ia) => format!("IA{}", ia.index),
-                    Operand::SmallInt(_) => format!("C{:?}", a.const_value().unwrap()),
-                    Operand::NullRef => "CRef(NULL)".to_string(),
-                    Operand::Const(c) => format!("C{:?}", c.get()),
-                    Operand::None => "_".to_string(),
+                .map(|a| {
+                    if a.is_none() {
+                        "_".to_string()
+                    } else if let Some(o) = a.bound_op() {
+                        format!("{:?}", o.pos().get())
+                    } else if let Some(ia) = a.bound_inputarg() {
+                        format!("IA{}", ia.index)
+                    } else if a.is_null_ref() {
+                        "CRef(NULL)".to_string()
+                    } else {
+                        format!("C{:?}", a.const_value().unwrap())
+                    }
                 })
                 .collect();
             eprintln!(
                 "[p2-ir]   {:?} = {:?} [{}]",
-                op.pos.get(),
+                op.pos().get(),
                 op.opcode,
                 args.join(" ")
             );
@@ -2525,21 +2549,25 @@ impl TraceCtx {
         greens: &(Vec<i64>, Vec<i64>, Vec<i64>),
     ) -> Option<GreenKey> {
         let (ints, refs, floats) = greens;
-        let spec = if let Some(key) = self.green_key_values.as_ref() {
-            debug_assert_eq!(
-                key.types.first().copied(),
-                Some(GreenType::Int),
-                "structured green key must start with the prepended target pc",
-            );
-            key.types.get(1..)?.to_vec()
-        } else {
-            self.driver_descriptor
-                .as_ref()
-                .map(|d| d.green_args_spec())?
-        };
+        let spec: smallvec::SmallVec<[GreenType; 4]> =
+            if let Some(key) = self.green_key_values.as_ref() {
+                debug_assert_eq!(
+                    key.types.first().copied(),
+                    Some(GreenType::Int),
+                    "structured green key must start with the prepended target pc",
+                );
+                smallvec::SmallVec::from_slice(key.types.get(1..)?)
+            } else {
+                smallvec::SmallVec::from_iter(
+                    self.driver_descriptor
+                        .as_ref()
+                        .map(|d| d.green_args_spec())?
+                        .into_iter(),
+                )
+            };
 
-        let mut values = Vec::with_capacity(spec.len() + 1);
-        let mut types = Vec::with_capacity(spec.len() + 1);
+        let mut values = smallvec::SmallVec::<[i64; 4]>::new();
+        let mut types = smallvec::SmallVec::<[GreenType; 4]>::new();
         values.push(pc);
         types.push(GreenType::Int);
         let mut int_i = 0;
@@ -2565,7 +2593,7 @@ impl TraceCtx {
             };
             values.push(value);
         }
-        types.extend(spec);
+        types.extend(spec.iter().copied());
         Some(GreenKey::with_types(values, types))
     }
 
@@ -3704,7 +3732,7 @@ impl TraceCtx {
                 return None;
             }
             let descr = op.descr.borrow().clone()?;
-            let obj = op.args.borrow().first()?.to_opref();
+            let obj = op.args_slice().first()?.to_opref();
             (descr, obj)
         };
         let Value::Ref(obj_ref) = self.recover_ref_value(obj, depth - 1)? else {

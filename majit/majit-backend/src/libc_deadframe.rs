@@ -270,7 +270,7 @@ mod tests {
         rd_locs[41] = 13;
         rd_locs[42] = 27;
         rd_locs[44] = 28;
-        fail_descr.set_rd_locs(rd_locs);
+        fail_descr.set_rd_locs(rd_locs.into());
 
         // No frame access is performed: this test isolates `_decode_pos`'s
         // logical-to-physical ordering. The borrowed null owner is therefore

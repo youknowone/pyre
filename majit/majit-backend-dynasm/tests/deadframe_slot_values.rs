@@ -16,11 +16,9 @@
 //! jitframe slot index coincide, so every reader agrees no matter which of the
 //! two it is actually indexing by — the comparison would pass with the
 //! `rd_locs` decode removed entirely, and would be no control at all.
-use std::rc::Rc;
-
 use majit_backend::{Backend, JitCellToken};
 use majit_ir::forwarding::bound_operand_from_opref as rb;
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value, make_loop_target_descr};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_loop_target_descr};
 
 use majit_backend_dynasm::runner::DynasmBackend;
 
@@ -137,14 +135,14 @@ fn finish_one_int() -> Case {
         OpCode::IntAdd,
         &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
     );
-    add_op.pos.set(OpRef::int_op(1));
+    add_op.pos().set(OpRef::int_op(1));
 
     let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
-    finish_op.pos.set(OpRef::void_op(2));
+    finish_op.pos().set(OpRef::void_op(2));
     finish_op.set_fail_arg_types(vec![Type::Int]);
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
-    let ops: Vec<Rc<Op>> = vec![add_op, finish_op].into_iter().map(Rc::new).collect();
+    let ops: Vec<OpRc> = vec![add_op, finish_op].into_iter().map(OpRc::new).collect();
     backend
         .compile_loop(&inputargs, &ops, &token)
         .expect("compile_loop");
@@ -167,33 +165,33 @@ fn guard_one_int() -> Case {
     let loop_descr = make_loop_target_descr(token.number, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]);
-    label_op.pos.set(OpRef::void_op(100));
+    label_op.pos().set(OpRef::void_op(100));
     label_op.setdescr(loop_descr.clone());
 
     let add_op = Op::new(
         OpCode::IntAdd,
         &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
     );
-    add_op.pos.set(OpRef::int_op(1));
+    add_op.pos().set(OpRef::int_op(1));
 
     let lt_op = Op::new(
         OpCode::IntLt,
         &[rb(OpRef::int_op(1)), rb(OpRef::const_int(5))],
     );
-    lt_op.pos.set(OpRef::int_op(2));
+    lt_op.pos().set(OpRef::int_op(2));
 
     let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
-    guard_op.pos.set(OpRef::void_op(3));
+    guard_op.pos().set(OpRef::void_op(3));
     guard_op.set_fail_arg_types(vec![Type::Int]);
     guard_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let jump_op = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
-    jump_op.pos.set(OpRef::void_op(4));
+    jump_op.pos().set(OpRef::void_op(4));
     jump_op.setdescr(loop_descr);
 
-    let ops: Vec<Rc<Op>> = vec![label_op, add_op, lt_op, guard_op, jump_op]
+    let ops: Vec<OpRc> = vec![label_op, add_op, lt_op, guard_op, jump_op]
         .into_iter()
-        .map(Rc::new)
+        .map(OpRc::new)
         .collect();
     backend
         .compile_loop(&inputargs, &ops, &token)
@@ -234,53 +232,53 @@ fn guard_float_and_int() -> Case {
         OpCode::Label,
         &[rb(OpRef::input_arg_float(0)), rb(OpRef::input_arg_int(1))],
     );
-    label_op.pos.set(OpRef::void_op(100));
+    label_op.pos().set(OpRef::void_op(100));
     label_op.setdescr(loop_descr.clone());
 
     let lt_op = Op::new(
         OpCode::IntLt,
         &[rb(OpRef::input_arg_int(1)), rb(OpRef::const_int(5))],
     );
-    lt_op.pos.set(OpRef::int_op(2));
+    lt_op.pos().set(OpRef::int_op(2));
 
     let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
-    guard_op.pos.set(OpRef::void_op(3));
+    guard_op.pos().set(OpRef::void_op(3));
     guard_op.set_fail_arg_types(vec![Type::Float, Type::Int]);
     guard_op.setfailargs(vec![rb(OpRef::input_arg_float(0)), rb(OpRef::input_arg_int(1))].into());
 
     let cast_op = Op::new(OpCode::CastIntToFloat, &[rb(OpRef::input_arg_int(1))]);
-    cast_op.pos.set(OpRef::float_op(4));
+    cast_op.pos().set(OpRef::float_op(4));
 
     let mul_op = Op::new(
         OpCode::FloatMul,
         &[rb(OpRef::float_op(4)), rb(OpRef::const_float(0.5))],
     );
-    mul_op.pos.set(OpRef::float_op(5));
+    mul_op.pos().set(OpRef::float_op(5));
 
     let add_op = Op::new(
         OpCode::FloatAdd,
         &[rb(OpRef::input_arg_float(0)), rb(OpRef::float_op(5))],
     );
-    add_op.pos.set(OpRef::float_op(6));
+    add_op.pos().set(OpRef::float_op(6));
 
     let inc_op = Op::new(
         OpCode::IntAdd,
         &[rb(OpRef::input_arg_int(1)), rb(OpRef::const_int(1))],
     );
-    inc_op.pos.set(OpRef::int_op(7));
+    inc_op.pos().set(OpRef::int_op(7));
 
     let jump_op = Op::new(
         OpCode::Jump,
         &[rb(OpRef::float_op(6)), rb(OpRef::int_op(7))],
     );
-    jump_op.pos.set(OpRef::void_op(8));
+    jump_op.pos().set(OpRef::void_op(8));
     jump_op.setdescr(loop_descr);
 
-    let ops: Vec<Rc<Op>> = vec![
+    let ops: Vec<OpRc> = vec![
         label_op, lt_op, guard_op, cast_op, mul_op, add_op, inc_op, jump_op,
     ]
     .into_iter()
-    .map(Rc::new)
+    .map(OpRc::new)
     .collect();
     backend
         .compile_loop(&inputargs, &ops, &token)
@@ -307,39 +305,39 @@ fn guard_with_hole() -> Case {
     let loop_descr = make_loop_target_descr(token.number, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]);
-    label_op.pos.set(OpRef::void_op(100));
+    label_op.pos().set(OpRef::void_op(100));
     label_op.setdescr(loop_descr.clone());
 
     let add_op = Op::new(
         OpCode::IntAdd,
         &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
     );
-    add_op.pos.set(OpRef::int_op(1));
+    add_op.pos().set(OpRef::int_op(1));
 
     let dbl_op = Op::new(
         OpCode::IntMul,
         &[rb(OpRef::int_op(1)), rb(OpRef::const_int(2))],
     );
-    dbl_op.pos.set(OpRef::int_op(2));
+    dbl_op.pos().set(OpRef::int_op(2));
 
     let lt_op = Op::new(
         OpCode::IntLt,
         &[rb(OpRef::int_op(1)), rb(OpRef::const_int(5))],
     );
-    lt_op.pos.set(OpRef::int_op(3));
+    lt_op.pos().set(OpRef::int_op(3));
 
     let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(3))]);
-    guard_op.pos.set(OpRef::void_op(4));
+    guard_op.pos().set(OpRef::void_op(4));
     guard_op.set_fail_arg_types(vec![Type::Int, Type::Void, Type::Int]);
     guard_op.setfailargs(vec![rb(OpRef::int_op(1)), rb(OpRef::None), rb(OpRef::int_op(2))].into());
 
     let jump_op = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
-    jump_op.pos.set(OpRef::void_op(5));
+    jump_op.pos().set(OpRef::void_op(5));
     jump_op.setdescr(loop_descr);
 
-    let ops: Vec<Rc<Op>> = vec![label_op, add_op, dbl_op, lt_op, guard_op, jump_op]
+    let ops: Vec<OpRc> = vec![label_op, add_op, dbl_op, lt_op, guard_op, jump_op]
         .into_iter()
-        .map(Rc::new)
+        .map(OpRc::new)
         .collect();
     backend
         .compile_loop(&inputargs, &ops, &token)

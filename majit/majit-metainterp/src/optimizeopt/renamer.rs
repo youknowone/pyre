@@ -6,7 +6,7 @@
 use std::rc::Rc;
 
 use majit_ir::resoperation::{Op, OpCode, OpRc};
-use majit_ir::{InputArg, OpRef, Type};
+use majit_ir::{InputArg, InputArgRc, OpRef, Type};
 
 use indexmap::IndexMap;
 use majit_ir::operand::Operand;
@@ -35,7 +35,7 @@ pub struct Renamer {
     /// never re-number it), so `from_bound_op(&rc).to_opref()` equals the
     /// renamed `OpRef` byte-for-byte. Identity (`Rc::ptr_eq`) is irrelevant: the
     /// dormant vectorizer keys every map by `OpRef`, never by box identity.
-    producer_roots: Vec<Rc<dyn std::any::Any>>,
+    producer_roots: Vec<Box<dyn std::any::Any>>,
 }
 
 impl Default for Renamer {
@@ -90,9 +90,9 @@ impl Renamer {
         let pos = r.raw();
         match r {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                let ia = Rc::new(InputArg::from_type(ty, pos));
+                let ia = InputArgRc::new(InputArg::from_type(ty, pos));
                 let b = Operand::from_bound_inputarg(&ia);
-                self.producer_roots.push(ia);
+                self.producer_roots.push(Box::new(ia));
                 b
             }
             _ => {
@@ -102,10 +102,10 @@ impl Renamer {
                     Type::Ref => OpCode::SameAsR,
                     Type::Void => OpCode::Jump,
                 };
-                let op: OpRc = Rc::new(Op::new(opcode, &[]));
-                op.pos.set(OpRef::op_typed(pos, ty));
+                let op: OpRc = OpRc::new(Op::new(opcode, &[]));
+                op.pos().set(OpRef::op_typed(pos, ty));
                 let b = Operand::from_bound_op(&op);
-                self.producer_roots.push(op);
+                self.producer_roots.push(Box::new(op));
                 b
             }
         }

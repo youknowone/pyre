@@ -2077,10 +2077,7 @@ fn ca_complete_after_bridge_walk(
 
 fn jit_blackhole_resume_from_guard(
     descr_addr: usize,
-    fail_values_ptr: *const i64,
-    num_fail_values: usize,
-    raw_deadframe_ptr: *const i64,
-    num_raw_deadframe: usize,
+    deadframe: *mut majit_backend::jitframe::JitFrame,
     guard_exc: i64,
 ) -> Option<i64> {
     let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
@@ -2104,43 +2101,10 @@ fn jit_blackhole_resume_from_guard(
         return None;
     }
 
-    if fail_values_ptr.is_null() || num_fail_values == 0 {
+    if deadframe.is_null() {
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
         return None;
     }
-    let fail_values_raw = unsafe { std::slice::from_raw_parts(fail_values_ptr, num_fail_values) };
-    let mut fail_values_owned;
-    let fail_values = if let Some(values) = ca_resume_deadframe.as_deref() {
-        values
-    } else if ca_resume_frame != 0 {
-        fail_values_owned = fail_values_raw.to_vec();
-        fail_values_owned[0] = ca_resume_frame as i64;
-        fail_values_owned.as_slice()
-    } else {
-        fail_values_raw
-    };
-
-    if let Some(result) =
-        ca_complete_after_bridge_walk(ca_finished_frame, ca_adopted_frame, fail_values[0] as usize)
-    {
-        return Some(result);
-    }
-
-    let raw_deadframe_raw = if let Some(values) = ca_resume_deadframe.as_deref() {
-        values
-    } else if !raw_deadframe_ptr.is_null() && num_raw_deadframe > 0 {
-        unsafe { std::slice::from_raw_parts(raw_deadframe_ptr, num_raw_deadframe) }
-    } else {
-        fail_values
-    };
-    let mut raw_deadframe_owned;
-    let raw_deadframe = if ca_resume_frame != 0 && !raw_deadframe_raw.is_empty() {
-        raw_deadframe_owned = raw_deadframe_raw.to_vec();
-        raw_deadframe_owned[0] = ca_resume_frame as i64;
-        raw_deadframe_owned.as_slice()
-    } else {
-        raw_deadframe_raw
-    };
 
     // compile.py:710-716 `resume_in_blackhole(descr, deadframe)` parity:
     // recover the failed descr from `descr_addr` (history.py:125
@@ -2159,6 +2123,25 @@ fn jit_blackhole_resume_from_guard(
         .expect("fail_descr_arc_from_addr returned non-FailDescr");
     let trace_id = descr_fd.trace_id();
     let fail_index = descr_fd.fail_index_per_trace();
+    let n_fail_args = descr_fd.fail_arg_types().len();
+    let fail_args = if let Some(values) = ca_resume_deadframe.as_deref() {
+        majit_backend::FailArgSource::Slice(values)
+    } else {
+        majit_backend::FailArgSource::from_jitframe(deadframe, descr_fd, n_fail_args)
+    };
+    let fail0 = if ca_resume_frame != 0 {
+        ca_resume_frame as i64
+    } else if fail_args.len() > 0 {
+        fail_args.get(0)
+    } else {
+        0
+    };
+
+    if let Some(result) =
+        ca_complete_after_bridge_walk(ca_finished_frame, ca_adopted_frame, fail0 as usize)
+    {
+        return Some(result);
+    }
 
     // `descr_owning_jct == None` is the giveup signal: the descr's
     // `rd_loop_token.loop_token_wref()` is dead (memmgr-evicted JCT —
@@ -2183,8 +2166,8 @@ fn jit_blackhole_resume_from_guard(
     // recovery block.
     let actual_green_key = match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key()) {
         Some(gk) => gk,
-        None if num_fail_values >= 1 => {
-            let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
+        None => {
+            let frame_ptr = fail0 as *const pyre_interpreter::pyframe::PyFrame;
             if !frame_ptr.is_null() {
                 let frame = unsafe { &*frame_ptr };
                 crate::eval::make_green_key(frame.pycode, 0, frame.get_is_being_profiled())
@@ -2192,13 +2175,12 @@ fn jit_blackhole_resume_from_guard(
                 0
             }
         }
-        None => 0,
     };
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[blackhole-resume] gk={} trace={} fail_idx={} nvals={}",
-            actual_green_key, trace_id, fail_index, num_fail_values,
+            actual_green_key, trace_id, fail_index, n_fail_args,
         );
     }
 
@@ -2225,7 +2207,7 @@ fn jit_blackhole_resume_from_guard(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
                 storage.rd_numb.len(),
                 storage.rd_consts().len(),
-                raw_deadframe.len(),
+                fail_args.len(),
             );
         }
         // resume.py:922 storage.rd_consts: the decoder borrows the shared
@@ -2248,10 +2230,7 @@ fn jit_blackhole_resume_from_guard(
         // it names the frame a force would have attached its cache to.
         let all_virtuals = if descr_arc.is_guard_forced() {
             crate::eval::take_forced_virtuals_for_frame(
-                fail_values
-                    .first()
-                    .map(|v| *v as *const pyre_interpreter::pyframe::PyFrame)
-                    .unwrap_or(std::ptr::null()),
+                fail0 as *const pyre_interpreter::pyframe::PyFrame,
             )
         } else {
             None
@@ -2259,7 +2238,7 @@ fn jit_blackhole_resume_from_guard(
         let result = blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
-            raw_deadframe,
+            fail_args,
             Some(&storage.rd_pendingfields),
             Some(&storage.rd_virtuals),
             Some(deadframe_types.as_slice()),
@@ -2666,10 +2645,10 @@ pub(crate) fn propagate_portal_frame_escape(frame: *mut PyFrame, got_exception: 
 /// resume.py blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
-pub fn blackhole_resume_via_rd_numb(
+pub fn blackhole_resume_via_rd_numb<'df>(
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],
-    deadframe: &[i64],
+    deadframe: majit_backend::FailArgSource<'df>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     deadframe_types: Option<&[majit_ir::Type]>,
@@ -2763,16 +2742,9 @@ pub fn blackhole_resume_via_rd_numb(
         )
     };
 
-    // Own the guard-failure values in host memory so the box-sourced `Ref`
-    // slots can be registered as GC roots: `blackhole_from_resumedata` below
-    // lazily materializes virtuals, and a minor collection during that work
-    // would relocate the boxed objects out from under the off-heap copy.
-    // Rooting forwards each `Ref` slot in place; `decode_ref` then reads the
-    // live (to-space) pointer rather than a dangling from-space one.  The
-    // `to_vec` uses the host allocator, so it cannot itself trigger a GC.
-    let mut deadframe_buf: Vec<i64> = deadframe.to_vec();
-    let deadframe_roots = ResumeDeadframeRoots::register(&mut deadframe_buf, deadframe_types);
-    let deadframe: &[i64] = &deadframe_buf;
+    // resume.py `cpu.get_int_value(deadframe, i)`: values stay in
+    // `jf_frame[]`. `jitframe_trace` walks the Ref slots. A host copy
+    // is not a deadframe.
 
     // resume.py _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
     // for lazy materialization in getvirtual_ptr/getvirtual_int.
@@ -2824,7 +2796,7 @@ pub fn blackhole_resume_via_rd_numb(
             rd_numb,
             rd_consts,
             &all_liveness,
-            deadframe,
+            deadframe.clone(),
             deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
             rd_virtuals_slice,      // rd_virtuals
             rd_guard_pendingfields, // rd_guard_pendingfields
@@ -2846,9 +2818,9 @@ pub fn blackhole_resume_via_rd_numb(
     if !novable {
         if virtualizable_ptr != 0 {
             bh.virtualizable_ptr = virtualizable_ptr;
-        } else if !deadframe.is_empty() {
+        } else if deadframe.len() > 0 {
             // Fallback for guards without vable section.
-            bh.virtualizable_ptr = deadframe[0];
+            bh.virtualizable_ptr = deadframe.get(0);
         }
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
     }
@@ -2864,7 +2836,6 @@ pub fn blackhole_resume_via_rd_numb(
     // `finally` never runs.  `blackhole.py resume_in_blackhole` ends
     // `deadframe`'s live range at `_prepare_resume_from_failure`, before
     // `_run_forever`, for the same reason.
-    drop(deadframe_roots);
     drop(caller_deadframe_roots);
     // resume.py builds the caller chain (`nextblackholeinterp`)
     // but does not set the virtualizable-info handle on each frame.  pyre
@@ -4444,8 +4415,7 @@ pub fn trace_and_compile_from_bridge(
 /// from_bridge` which walks `resumedescr.rd_loop_token.loop_token_wref()`
 /// for the owning JCT.
 fn jit_ca_handle_guard_failure(
-    raw_values_ptr: *const i64,
-    num_values: usize,
+    deadframe: *mut majit_backend::jitframe::JitFrame,
     descr_addr: usize,
     guard_value_operand: i64,
     guard_value_operand_present: bool,
@@ -4459,7 +4429,7 @@ fn jit_ca_handle_guard_failure(
     // `num_values == 0` would leave such a guard without a counter tick, and so
     // without a bridge, forever. Only a null pointer with a non-zero length is
     // unusable — that pairing cannot be turned into a slice at all.
-    if raw_values_ptr.is_null() && num_values != 0 {
+    if deadframe.is_null() {
         return false;
     }
     // `enter_profiler_tracing` is not re-entrant (pyjitpl.py:2914 — RPython's
@@ -4480,14 +4450,6 @@ fn jit_ca_handle_guard_failure(
             return false;
         }
     }
-    // `from_raw_parts` requires a non-null, aligned pointer even for a zero
-    // length, and a backend with nothing to report may pass null.
-    let raw_values_input: &[i64] = if num_values == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) }
-    };
-    let mut raw_values_vec = raw_values_input.to_vec();
 
     // compile.py _trace_and_compile_from_bridge.  Native CA code
     // crosses the backend boundary with only the raw descr pointer; recover
@@ -4512,14 +4474,21 @@ fn jit_ca_handle_guard_failure(
     else {
         return false;
     };
-    let deadframe_types = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.get_recovery_slot_types(source_green_key, source_trace_id, source_fail_index)
-    };
-    let _raw_values_roots =
-        ResumeDeadframeRoots::register(&mut raw_values_vec, deadframe_types.as_deref());
-    let raw_values = raw_values_vec.as_slice();
+    let descr_fd = descr_arc
+        .as_fail_descr()
+        .expect("fail_descr_arc_from_addr returned non-FailDescr");
+    let n_fail_args = descr_fd.fail_arg_types().len();
+    let fail0 = unsafe { majit_backend::get_int_value(deadframe, descr_fd, 0) };
     let guard_value_operand = guard_value_operand_present.then_some(guard_value_operand);
+    // pyjitpl.py: the virtualizable stays a GC root for the whole
+    // handle_fail. `must_compile` and `get_compiled_exit_layout` allocate,
+    // so root failarg 0 before either runs — a raw `&mut PyFrame` taken
+    // here would dangle by the time `trace_and_compile_from_bridge`
+    // builds its `FrameRoot`.
+    if fail0 == 0 {
+        return false;
+    }
+    let mut frame_root = FrameRoot::new(unsafe { &mut *(fail0 as *mut PyFrame) });
 
     // This callback has no channel for the exception value carried by a
     // failing CALL_ASSEMBLER exception guard.  Compiling from its post-call
@@ -4535,7 +4504,7 @@ fn jit_ca_handle_guard_failure(
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().must_compile_with_values(
             &descr_arc,
-            raw_values,
+            &[],
             guard_value_operand,
             source_green_key,
         )
@@ -4572,15 +4541,6 @@ fn jit_ca_handle_guard_failure(
         return false;
     };
 
-    // Obtain callee frame from deadframe vable header.
-    // pyre vable_boxes = [frame, ni, code, vsd, ns, locals..., stack...],
-    // so raw_values[0] is the callee's PyFrame pointer.
-    let frame_ptr = raw_values[0] as *mut PyFrame;
-    if frame_ptr.is_null() {
-        return false;
-    }
-    let frame = unsafe { &mut *frame_ptr };
-
     // compile.py try/finally: `start_compiling()` before
     // bridge, `done_compiling()` on every unwind path.  RAII guard
     // dispatches both via `descr.as_fail_descr()` (instance-method
@@ -4596,7 +4556,29 @@ fn jit_ca_handle_guard_failure(
         // walk that terminates with a kept finish-concrete stash hands it to
         // the back-to-back blackhole hook via `CA_WALK_FINISHED_FRAME`
         // (returned as `ResumeBlackhole` here).
-        match trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout, 0, false) {
+        let raw_values: Vec<i64> = (0..n_fail_args)
+            .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
+            .collect();
+        // The copy is not a JITFRAME: `jitframe_trace` cannot update it.
+        // Root Ref slots for the same window `handle_fail` already covers
+        // (`DeadFrameRefRoots` / `compute_gcmap`).
+        let _deadframe_roots = unsafe {
+            majit_metainterp::resume::DeadFrameRefRoots::enter(&raw_values, |index| {
+                // Slot 0 is the virtualizable (PyFrame). It is a GC
+                // object even when `exit_types` has not yet classified
+                // it; a CA bridge walk that forces `f_locals` reads it
+                // as `live_vable_frame_addr`.
+                index == 0 || exit_layout.is_traced_ref_slot(index)
+            })
+        };
+        let compiled = match trace_and_compile_from_bridge(
+            &descr_arc,
+            frame_root.frame(),
+            &raw_values,
+            &exit_layout,
+            0,
+            false,
+        ) {
             BridgeResolution::CompiledContinue => true,
             BridgeResolution::ResumeBlackhole => false,
             // Unreachable: for this caller a kept stash takes the
@@ -4609,7 +4591,8 @@ fn jit_ca_handle_guard_failure(
                 );
                 false
             }
-        }
+        };
+        compiled
     };
     // compile.py record_loop_or_bridge registers every bridge's dependencies.
     crate::eval::register_quasi_immutable_deps(source_green_key);
@@ -4620,15 +4603,6 @@ fn jit_ca_handle_guard_failure(
             compiled, source_green_key, source_trace_id, source_fail_index,
         );
     }
-
-    drop(_raw_values_roots);
-    // compile.py:701-717 is an exclusive bridge/blackhole branch, but pyre's
-    // handle_fail_resume_guard in majit-backend-dynasm always runs the
-    // blackhole hook after this bridge hook. Its caller buffer is not rooted,
-    // so the blackhole must read the values rooted here on both outcomes.
-    CA_WALK_RESUME_DEADFRAME.with(|c| {
-        *c.borrow_mut() = Some(raw_values_vec);
-    });
 
     compiled
 }
@@ -4861,6 +4835,11 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // Inert today (wasm host allocations never collect) but keeps the
             // carrier rooted at parity with dynasm if that invariant changes.
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
+            let _deadframe_roots = unsafe {
+                majit_metainterp::resume::DeadFrameRefRoots::enter(&raw_values, |index| {
+                    exit_layout.is_traced_ref_slot(index)
+                })
+            };
             let attempt = try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand);
             if attempt.terminal_declined {
                 // This target cannot reach compiled steady state: each CA
@@ -7978,7 +7957,7 @@ pub fn cranelift_resumedata_deopt(
         rd_numb,
         rd_consts,
         &all_liveness,
-        &deadframe,
+        majit_backend::FailArgSource::Slice(&deadframe),
         Some(types),
         None,
         &allocator,

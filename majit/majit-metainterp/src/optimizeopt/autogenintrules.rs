@@ -172,7 +172,7 @@ fn autogen_eq_b(box1: &Operand, bound1: &IntBound, box2: &Operand, bound2: &IntB
 
 fn replace_with(original: &Op, opcode: OpCode, args: &[Operand]) -> OptimizationResult {
     let new_op = Op::new(opcode, args);
-    new_op.pos.set(original.pos.get());
+    new_op.pos().set(original.pos().get());
     OptimizationResult::Restart(new_op)
 }
 

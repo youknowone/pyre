@@ -79,7 +79,7 @@ pub(crate) fn loc_as_key(loc: &Loc) -> i32 {
         Loc::Ebp(e) => stack_key(e.value),
         // Never a destination and re-materialisable at will, so it needs no
         // identity — only a value no real location can take.
-        Loc::Immed(_) => i32::MIN,
+        Loc::Immed(_) | Loc::ImmedFloat(_) => i32::MIN,
         // `AddressLoc` is the one location class upstream leaves without a key:
         // it overrides neither `_getregkey` nor, for its `'a'`/`'m'` codes, the
         // `value` the inherited one reads (`regloc.py:207-250`), so a parallel

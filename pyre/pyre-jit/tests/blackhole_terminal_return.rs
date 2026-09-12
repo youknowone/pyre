@@ -84,7 +84,7 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
                 let result = blackhole_resume_via_rd_numb(
                     &writer.create_numbering(),
                     &constants,
-                    &[frame_ptr as i64],
+                    majit_backend::FailArgSource::from(&[frame_ptr as i64][..]),
                     None,
                     None,
                     Some(&[Type::Ref]),

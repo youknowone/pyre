@@ -298,9 +298,9 @@ pub struct Trace {
     snapshot_offsets: Vec<usize>,
     /// Per-snapshot `py_pc` words, outermost-first. RPython's
     /// `_encode_snapshot` has no twin; resume still reads this pyre
-    /// extra after decode. Inline capacity covers the usual 1-frame
-    /// portal (regex) plus a few inlines without a heap `Vec`.
-    snapshot_py_pcs: Vec<smallvec::SmallVec<[u32; 4]>>,
+    /// extra after decode. Inline capacity covers the portal plus the
+    /// inlined matcher frames; `[; 4]` heap-grew 32 B on this path.
+    snapshot_py_pcs: Vec<smallvec::SmallVec<[u32; 8]>>,
 }
 
 impl Trace {
@@ -494,7 +494,7 @@ impl Trace {
     /// `rd_resume_position`; the byte offset lives in `snapshot_offsets`.
     pub fn encode_captured_snapshot(&mut self, snapshot: &Snapshot) -> i32 {
         let id = self.snapshot_offsets.len() as i32;
-        let py_pcs: smallvec::SmallVec<[u32; 4]> =
+        let py_pcs: smallvec::SmallVec<[u32; 8]> =
             snapshot.frames.iter().map(|f| f.py_pc).collect();
 
         // Write `_snapshot_data` only. `create_top_snapshot` also patches
@@ -565,7 +565,7 @@ impl Trace {
         all_liveness: &[u8],
     ) -> i32 {
         let id = self.snapshot_offsets.len() as i32;
-        let py_pcs: smallvec::SmallVec<[u32; 4]> = framestack.iter().map(|f| f.pc as u32).collect();
+        let py_pcs: smallvec::SmallVec<[u32; 8]> = framestack.iter().map(|f| f.pc as u32).collect();
         let vable: smallvec::SmallVec<[OcBox; 8]> = virtualizable_boxes
             .iter()
             .map(|r| self.arg_to_box(*r))
@@ -820,7 +820,8 @@ impl Trace {
         }
         for (i, op) in ops.iter().enumerate() {
             let unique = n + i as u32;
-            op.pos.set(OpRef::op_typed(unique, op.opcode.result_type()));
+            op.pos()
+                .set(OpRef::op_typed(unique, op.opcode.result_type()));
             if let Some(slot) = self.slots.get(i) {
                 if let Some(v) = slot.concrete.get() {
                     op.set_value(v);
@@ -828,7 +829,7 @@ impl Trace {
                 if let Some(d) = slot.descr.clone() {
                     op.setdescr(d);
                 }
-                op.rd_resume_position.set(slot.resume.get());
+                op.set_rd_resume_position(slot.resume.get());
                 if let Some(ref types) = slot.fail_arg_types {
                     op.set_fail_arg_types(types.clone());
                 }
@@ -970,7 +971,7 @@ impl Trace {
         let n = self.inputargs.len();
         if let Some(idx) = (r.raw() as usize).checked_sub(n)
             && let Some(op) = self.ops.get(idx)
-            && op.pos.get().raw() == r.raw()
+            && op.pos().get() == r
         {
             return Operand::from_bound_op(op);
         }
@@ -1005,7 +1006,7 @@ impl Trace {
         }
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let op = Op::new(opcode, &self.box_args(args));
-        op.pos.set(opref);
+        op.pos().set(opref);
         self.ops.push(OpRc::new(op));
         self.recorded_ops_total += 1;
         self.op_count += 1;
@@ -1029,7 +1030,7 @@ impl Trace {
         }
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let op = Op::with_descr(opcode, &self.box_args(args), descr);
-        op.pos.set(opref);
+        op.pos().set(opref);
         self.ops.push(OpRc::new(op));
         self.recorded_ops_total += 1;
         self.op_count += 1;
@@ -1062,7 +1063,7 @@ impl Trace {
             Some(d) => Op::with_descr(opcode, &self.box_args(args), d),
             None => Op::new(opcode, &self.box_args(args)),
         };
-        op.pos.set(opref);
+        op.pos().set(opref);
         self.ops.push(OpRc::new(op));
         self.recorded_ops_total += 1;
         self.op_count += 1;
@@ -1092,7 +1093,7 @@ impl Trace {
             Some(d) => Op::with_descr(opcode, &self.box_args(args), d),
             None => Op::new(opcode, &self.box_args(args)),
         };
-        op.pos.set(opref);
+        op.pos().set(opref);
         op.setfailargs(self.box_args(fail_args).iter().cloned().collect());
         self.ops.push(OpRc::new(op));
         self.recorded_ops_total += 1;
@@ -1111,7 +1112,7 @@ impl Trace {
             return;
         }
         if let Some(op) = self.ops.last() {
-            op.rd_resume_position.set(snapshot_id);
+            op.set_rd_resume_position(snapshot_id);
         }
     }
 
@@ -1157,7 +1158,7 @@ impl Trace {
             .filter(|op| op.opcode.is_guard())
             .nth(from_end)
         {
-            op.rd_resume_position.set(snapshot_id);
+            op.set_rd_resume_position(snapshot_id);
         }
     }
 
@@ -1266,7 +1267,7 @@ impl Trace {
             .ops
             .iter()
             .rev()
-            .find(|op| op.pos.get() == opref)
+            .find(|op| op.pos().get() == opref)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
         op.setfailargs(boxed_fail_args);
     }
@@ -1309,7 +1310,7 @@ impl Trace {
             Some(descr) => Op::with_descr(OpCode::Jump, &self.box_args(jump_args), descr),
             None => Op::new(OpCode::Jump, &self.box_args(jump_args)),
         };
-        op.pos.set(opref);
+        op.pos().set(opref);
         self.ops.push(OpRc::new(op));
         self.recorded_ops_total += 1;
         self.op_count += 1;
@@ -1327,7 +1328,7 @@ impl Trace {
         }
         let opref = OpRef::op_typed(self.op_count, OpCode::Finish.result_type());
         let op = Op::with_descr(OpCode::Finish, &self.box_args(finish_args), descr);
-        op.pos.set(opref);
+        op.pos().set(opref);
         self.ops.push(OpRc::new(op));
         self.recorded_ops_total += 1;
         self.op_count += 1;
@@ -1548,12 +1549,12 @@ impl Trace {
             }
         }
         for op in &self.ops {
-            for arg in op.args.borrow().iter() {
+            for arg in op.args_slice().iter() {
                 if !is_pooled_const_ptr(arg) {
                     arg.walk_const_ptr_refs(visitor);
                 }
             }
-            if let Some(fail_args) = op.getfailargs() {
+            if let Some(fail_args) = op.guard_fail_args() {
                 for arg in fail_args.iter() {
                     if !is_pooled_const_ptr(arg) {
                         arg.walk_const_ptr_refs(visitor);
@@ -1593,7 +1594,7 @@ impl Trace {
     pub fn get_op_by_pos(&self, pos: OpRef) -> Option<&Op> {
         self.ops
             .iter()
-            .find(|op| op.pos.get() == pos)
+            .find(|op| op.pos().get() == pos)
             .map(|op| &**op)
     }
 
@@ -1626,7 +1627,7 @@ impl Trace {
     pub fn get_op_by_raw_pos(&self, raw: u32) -> Option<&Op> {
         self.ops
             .iter()
-            .find(|op| op.pos.get().raw() == raw)
+            .find(|op| op.pos().get().raw() == raw)
             .map(|op| &**op)
     }
 
@@ -1938,10 +1939,10 @@ mod tests {
         let trace = rec.get_trace();
 
         // The op's .pos should match
-        assert_eq!(trace.ops[0].pos.get(), iop(2)); // IntAdd
-        assert_eq!(trace.ops[1].pos.get(), vop(3)); // GuardTrue
-        assert_eq!(trace.ops[2].pos.get(), iop(4)); // IntSub
-        assert_eq!(trace.ops[3].pos.get(), vop(5)); // Jump
+        assert_eq!(trace.ops[0].pos().get(), iop(2)); // IntAdd
+        assert_eq!(trace.ops[1].pos().get(), vop(3)); // GuardTrue
+        assert_eq!(trace.ops[2].pos().get(), iop(4)); // IntSub
+        assert_eq!(trace.ops[3].pos().get(), vop(5)); // Jump
     }
 
     #[test]
@@ -1962,10 +1963,10 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         assert_eq!(ops.len(), 3);
         assert_eq!(ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(ops[0].pos.get(), i2);
+        assert_eq!(ops[0].pos().get(), i2);
         assert_eq!(ops[1].opcode, OpCode::GuardTrue);
-        assert_eq!(ops[1].pos.get(), g0);
-        assert_eq!(ops[1].rd_resume_position.get(), 7);
+        assert_eq!(ops[1].pos().get(), g0);
+        assert_eq!(ops[1].rd_resume_position(), 7);
         assert_eq!(ops[2].opcode, OpCode::Jump);
     }
 
@@ -2067,7 +2068,7 @@ mod tests {
         rec.materialize_into_ops();
         let first = rec.ops()[0].clone();
         let (_, ops) = rec.into_parts();
-        assert!(std::rc::Rc::ptr_eq(&first, &ops[0]));
+        assert!(OpRc::ptr_eq(&first, &ops[0]));
     }
 
     #[test]
@@ -2088,7 +2089,7 @@ mod tests {
             Some(&[OpRef::const_ptr(GcRef(0x2000))][..])
         );
         rec.materialize_into_ops();
-        let fail = rec.ops()[1].getfailargs().expect("guard fail_args");
+        let fail = rec.ops()[1].guard_fail_args().expect("guard fail_args");
         assert_eq!(fail[0].to_opref(), OpRef::const_ptr(GcRef(0x2000)));
     }
 
@@ -2249,7 +2250,7 @@ mod tests {
         let trace = rec.get_trace();
 
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(trace.ops[0].pos.get(), iop(1)); // after 1 inputarg
+        assert_eq!(trace.ops[0].pos().get(), iop(1)); // after 1 inputarg
         assert_eq!(trace.ops[1].opcode, OpCode::IntSub);
         assert_eq!(trace.ops[1].arg(0).to_opref(), add); // references the add result
         assert_eq!(trace.ops[1].arg(1).to_opref(), i0); // references the input arg
@@ -2273,9 +2274,9 @@ mod tests {
         let trace = rec.get_trace();
         // Find the guard op.
         let guard_op = &trace.ops[1]; // after IntAdd
-        assert_eq!(guard_op.pos.get(), guard);
+        assert_eq!(guard_op.pos().get(), guard);
         assert!(guard_op.opcode.is_guard());
-        let fail_args = guard_op.getfailargs().unwrap();
+        let fail_args = guard_op.guard_fail_args().unwrap();
         assert_eq!(fail_args.len(), 3);
         assert_eq!(fail_args[0].to_opref(), i0);
         assert_eq!(fail_args[1].to_opref(), i1);
@@ -2307,13 +2308,13 @@ mod tests {
         assert_eq!(guards[1].opcode, OpCode::GuardFalse);
 
         // First guard's fail_args
-        let fa0 = guards[0].getfailargs().unwrap();
+        let fa0 = guards[0].guard_fail_args().unwrap();
         assert_eq!(fa0.len(), 2);
         assert_eq!(fa0[0].to_opref(), i0);
         assert_eq!(fa0[1].to_opref(), i1);
 
         // Second guard's fail_args
-        let fa1 = guards[1].getfailargs().unwrap();
+        let fa1 = guards[1].guard_fail_args().unwrap();
         assert_eq!(fa1.len(), 2);
         assert_eq!(fa1[0].to_opref(), i0);
         assert_eq!(fa1[1].to_opref(), add);
@@ -2443,7 +2444,7 @@ mod tests {
         rec.close_loop(&[iarg(0), iarg(1), iarg(2)]);
         let trace = rec.get_trace();
         assert_eq!(trace.num_inputargs(), 3);
-        assert_eq!(trace.ops[0].pos.get(), iop(3));
+        assert_eq!(trace.ops[0].pos().get(), iop(3));
     }
 
     #[test]
@@ -2492,7 +2493,7 @@ mod tests {
         rec.close_loop(&[i0]);
         let trace = rec.get_trace();
         let guard = &trace.ops[0];
-        let fail_args = guard.getfailargs().unwrap();
+        let fail_args = guard.guard_fail_args().unwrap();
         assert!(fail_args.is_empty());
     }
 
@@ -2656,8 +2657,8 @@ mod tests {
 
         // Find the guard
         let guard_op = trace.iter_guards().next().unwrap();
-        assert_eq!(guard_op.pos.get(), guard);
-        let fa = guard_op.getfailargs().unwrap();
+        assert_eq!(guard_op.pos().get(), guard);
+        let fa = guard_op.guard_fail_args().unwrap();
         assert_eq!(fa.len(), 13);
 
         // Verify all fail_args match what we specified

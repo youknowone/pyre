@@ -1367,6 +1367,17 @@ impl MIFrameStack {
         self.free_frames.push(frame);
     }
 
+    /// Park the free list so a standalone walk can hand it to the next
+    /// `StandaloneFrameStack` (`MetaInterp.free_frames_list` has no owner
+    /// on that path).
+    pub fn take_free_frames(&mut self) -> Vec<MIFrame> {
+        std::mem::take(&mut self.free_frames)
+    }
+
+    pub fn restore_free_frames(&mut self, frames: Vec<MIFrame>) {
+        self.free_frames = frames;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }

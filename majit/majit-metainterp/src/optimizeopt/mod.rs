@@ -45,13 +45,375 @@ use crate::resume::SnapshotBox;
 use indexmap::{IndexMap, IndexSet};
 use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
 use rustc_hash::{FxBuildHasher, FxHashMap};
-use std::collections::VecDeque;
 
-pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
+/// `optimizer.py` extra-operations list. Almost always 0–2 ops (one
+/// lazy SETFIELD / force). Inline those so the first `VecDeque` grow
+/// (64 B) is gone.
+#[derive(Default)]
+pub(crate) struct ExtraQueue(smallvec::SmallVec<[(usize, majit_ir::OpRc); 2]>);
+
+impl ExtraQueue {
+    pub(crate) fn new() -> Self {
+        Self(smallvec::SmallVec::new())
+    }
+
+    pub(crate) fn push_back(&mut self, item: (usize, majit_ir::OpRc)) {
+        self.0.push(item);
+    }
+
+    pub(crate) fn push_front(&mut self, item: (usize, majit_ir::OpRc)) {
+        self.0.insert(0, item);
+    }
+
+    pub(crate) fn pop_front(&mut self) -> Option<(usize, majit_ir::OpRc)> {
+        if self.0.is_empty() {
+            None
+        } else {
+            Some(self.0.remove(0))
+        }
+    }
+
+    pub(crate) fn front(&self) -> Option<&(usize, majit_ir::OpRc)> {
+        self.0.first()
+    }
+
+    pub(crate) fn back(&self) -> Option<&(usize, majit_ir::OpRc)> {
+        self.0.last()
+    }
+
+    pub(crate) fn remove(&mut self, at: usize) -> Option<(usize, majit_ir::OpRc)> {
+        (at < self.0.len()).then(|| self.0.remove(at))
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, (usize, majit_ir::OpRc)> {
+        self.0.iter()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Extend<(usize, majit_ir::OpRc)> for ExtraQueue {
+    fn extend<T: IntoIterator<Item = (usize, majit_ir::OpRc)>>(&mut self, iter: T) {
+        self.0.extend(iter);
+    }
+}
+
+impl IntoIterator for ExtraQueue {
+    type Item = (usize, majit_ir::OpRc);
+    type IntoIter = smallvec::IntoIter<[(usize, majit_ir::OpRc); 2]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// Compile-time snapshot box list. RPython keeps the live boxes themselves;
+/// this adapter copies OpRefs into a side table. A six-box list is one
+/// 96 B `Layout::array` (`SnapshotBox` is one `OpRef`); twelve boxes
+/// mint from the chunked slab instead. `create_numbering_arc` mints a
+/// `NumberingRef` slab cell (`resumecode.create_numbering` /
+/// `lltype.malloc(NUMBERING)`).
+const SNAP_LIST_SLAB: usize = 12;
+const SNAP_LIST_SLAB_BYTES: usize = SNAP_LIST_SLAB * std::mem::size_of::<SnapshotBox>();
+const SNAP_LIST_SLAB_BIT: u32 = 1 << 31;
+const SNAP_LIST_CHUNK: usize = 2048;
+
+const _: () = assert!(
+    std::mem::size_of::<SnapshotBox>() > 0
+        && std::mem::size_of::<SnapshotBox>() <= SNAP_LIST_SLAB_BYTES
+);
+
+struct SnapListHeap {
+    chunks: Vec<(*mut SnapshotBox, usize)>,
+    free: Vec<*mut SnapshotBox>,
+}
+
+unsafe impl Send for SnapListHeap {}
+unsafe impl Sync for SnapListHeap {}
+
+static SNAP_LIST_HEAP: std::sync::Mutex<SnapListHeap> = std::sync::Mutex::new(SnapListHeap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn alloc_snap_list_slab() -> *mut SnapshotBox {
+    let mut heap = SNAP_LIST_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    if let Some((base, used)) = heap.chunks.last_mut() {
+        if *used < SNAP_LIST_CHUNK {
+            let p = unsafe { (*base).add(*used * SNAP_LIST_SLAB) };
+            *used += 1;
+            return p;
+        }
+    }
+    let layout = std::alloc::Layout::from_size_align(
+        SNAP_LIST_CHUNK * SNAP_LIST_SLAB_BYTES,
+        std::mem::align_of::<SnapshotBox>(),
+    )
+    .expect("snapshot-list chunk");
+    let base = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
+    assert!(!base.is_null(), "snapshot-list chunk alloc failed");
+    heap.chunks.push((base, 1));
+    base
+}
+
+fn free_snap_list_slab(p: *mut SnapshotBox) {
+    SNAP_LIST_HEAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .push(p);
+}
+
+pub struct SnapshotBoxList {
+    ptr: std::ptr::NonNull<SnapshotBox>,
+    len: u32,
+    cap: u32,
+}
+
+unsafe impl Send for SnapshotBoxList {}
+unsafe impl Sync for SnapshotBoxList {}
+
+impl SnapshotBoxList {
+    pub fn new() -> Self {
+        Self {
+            ptr: std::ptr::NonNull::dangling(),
+            len: 0,
+            cap: 0,
+        }
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        if n == 0 {
+            return Self::new();
+        }
+        if n <= SNAP_LIST_SLAB {
+            return Self {
+                ptr: unsafe { std::ptr::NonNull::new_unchecked(alloc_snap_list_slab()) },
+                len: 0,
+                cap: SNAP_LIST_SLAB as u32 | SNAP_LIST_SLAB_BIT,
+            };
+        }
+        let layout = std::alloc::Layout::array::<SnapshotBox>(n).expect("snapshot box list");
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
+        assert!(!ptr.is_null(), "snapshot box list alloc failed");
+        Self {
+            ptr: unsafe { std::ptr::NonNull::new_unchecked(ptr) },
+            len: 0,
+            cap: n as u32,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        (self.cap & !SNAP_LIST_SLAB_BIT) as usize
+    }
+
+    fn is_slab(&self) -> bool {
+        self.cap & SNAP_LIST_SLAB_BIT != 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[SnapshotBox] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [SnapshotBox] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }
+    }
+
+    pub fn push(&mut self, item: SnapshotBox) {
+        let len = self.len as usize;
+        if len == self.capacity() {
+            self.grow();
+        }
+        unsafe {
+            self.ptr.as_ptr().add(len).write(item);
+        }
+        self.len += 1;
+    }
+
+    fn grow(&mut self) {
+        let old_len = self.len as usize;
+        let old_cap = self.capacity();
+        let new_cap = (old_cap.max(1) * 2).max(old_len + 1);
+        let layout = std::alloc::Layout::array::<SnapshotBox>(new_cap).expect("snapshot box grow");
+        let new_ptr = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
+        assert!(!new_ptr.is_null(), "snapshot box grow failed");
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr, old_len);
+        }
+        self.dealloc_storage(old_len);
+        self.ptr = unsafe { std::ptr::NonNull::new_unchecked(new_ptr) };
+        self.cap = new_cap as u32;
+    }
+
+    fn dealloc_storage(&mut self, len: usize) {
+        if self.capacity() == 0 {
+            return;
+        }
+        if self.is_slab() {
+            free_snap_list_slab(self.ptr.as_ptr());
+        } else {
+            let layout = std::alloc::Layout::array::<SnapshotBox>(self.capacity())
+                .expect("snapshot box dealloc");
+            unsafe {
+                std::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
+            }
+        }
+        let _ = len;
+    }
+}
+
+impl Default for SnapshotBoxList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for SnapshotBoxList {
+    fn clone(&self) -> Self {
+        let mut out = Self::with_capacity(self.len as usize);
+        for item in self.as_slice() {
+            out.push(*item);
+        }
+        out
+    }
+}
+
+impl Drop for SnapshotBoxList {
+    fn drop(&mut self) {
+        unsafe {
+            for i in 0..self.len as usize {
+                self.ptr.as_ptr().add(i).drop_in_place();
+            }
+        }
+        self.dealloc_storage(self.len as usize);
+    }
+}
+
+impl std::ops::Deref for SnapshotBoxList {
+    type Target = [SnapshotBox];
+
+    fn deref(&self) -> &[SnapshotBox] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for SnapshotBoxList {
+    fn deref_mut(&mut self) -> &mut [SnapshotBox] {
+        self.as_mut_slice()
+    }
+}
+
+impl Extend<SnapshotBox> for SnapshotBoxList {
+    fn extend<T: IntoIterator<Item = SnapshotBox>>(&mut self, iter: T) {
+        let iter = iter.into_iter();
+        if let Some(extra) = iter
+            .size_hint()
+            .0
+            .checked_sub(self.capacity() - self.len as usize)
+        {
+            if extra > 0 && !self.is_slab() {
+                let want = self.len as usize + extra;
+                if want > self.capacity() {
+                    let layout = std::alloc::Layout::array::<SnapshotBox>(want)
+                        .expect("snapshot box extend");
+                    let new_ptr = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
+                    assert!(!new_ptr.is_null(), "snapshot box extend failed");
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.ptr.as_ptr(),
+                            new_ptr,
+                            self.len as usize,
+                        );
+                    }
+                    self.dealloc_storage(self.len as usize);
+                    self.ptr = unsafe { std::ptr::NonNull::new_unchecked(new_ptr) };
+                    self.cap = want as u32;
+                }
+            }
+        }
+        for item in iter {
+            self.push(item);
+        }
+    }
+}
+
+impl FromIterator<SnapshotBox> for SnapshotBoxList {
+    fn from_iter<T: IntoIterator<Item = SnapshotBox>>(iter: T) -> Self {
+        let iter = iter.into_iter();
+        let mut list = Self::with_capacity(iter.size_hint().0);
+        list.extend(iter);
+        list
+    }
+}
+
+impl From<Vec<SnapshotBox>> for SnapshotBoxList {
+    fn from(v: Vec<SnapshotBox>) -> Self {
+        v.into_iter().collect()
+    }
+}
+
+impl<'a> IntoIterator for &'a SnapshotBoxList {
+    type Item = &'a SnapshotBox;
+    type IntoIter = std::slice::Iter<'a, SnapshotBox>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut SnapshotBoxList {
+    type Item = &'a mut SnapshotBox;
+    type IntoIter = std::slice::IterMut<'a, SnapshotBox>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut_slice().iter_mut()
+    }
+}
+
+pub type SnapshotBoxes = Vec<Option<SnapshotBoxList>>;
 pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;
 pub type SnapshotFramePcs = Vec<Option<Vec<(i32, i32, i32)>>>;
+
+#[cfg(test)]
+mod snapshot_box_list_size {
+    #[test]
+    fn option_snapshot_box_list_niches() {
+        assert_eq!(
+            std::mem::size_of::<Option<super::SnapshotBoxList>>(),
+            16,
+            "Option<SnapshotBoxList> must niche so a 2-slot map leaves 48 B"
+        );
+    }
+
+    #[test]
+    fn twelve_snapshot_boxes_stay_on_the_slab() {
+        let list = super::SnapshotBoxList::with_capacity(12);
+        assert!(
+            list.is_slab(),
+            "a 12-box resume frame must use the chunked slab, not a 96 B malloc"
+        );
+        assert!(list.capacity() >= 12);
+    }
+}
 type OpRefFxIndexMap<V> = indexmap::IndexMap<OpRef, V, FxBuildHasher>;
 
 pub(crate) fn snapshot_get<T>(store: &[Option<T>], pos: i32) -> Option<&T> {
@@ -249,48 +611,44 @@ impl std::ops::Deref for PtrInfoHandleRef<'_> {
 ///     `ConstInt` (`optimizer.py from_constant`).  Two
 ///     `Const` handles never compare equal under `ptr_eq` even when
 ///     they wrap the same value.
-///   - `Live(Rc<RefCell<IntBound>>)` — the actual `_forwarded` cell.
-///     `Rc::ptr_eq` ≡ Python `is`.  In-place mutation via
+///   - `Live(IntBoundRc)` — the actual `_forwarded` cell.
+///     `IntBoundRc::ptr_eq` ≡ Python `is`.  In-place mutation via
 ///     `handle.borrow_mut()` propagates to every other live handle
 ///     cloned from the same cell.
 pub enum IntBoundHandle {
     /// Freshly synthesized `IntBound::from_constant(_)` object
-    /// (optimizer.py:102-103 return path). Wrapped in `Rc<RefCell<>>`
-    /// so callers retain Python `from_constant(...)` reference
-    /// semantics — the object is mutable, and clones of *this same
-    /// handle* share the cell. Two independent `getintbound_handle`
-    /// calls on the same ConstInt mint distinct Rcs (PyPy: two
-    /// `from_constant(7)` calls return two distinct objects), so
-    /// mutations do not propagate across calls.
-    Const(std::rc::Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>),
+    /// (`optimizer.py` `from_constant` return path). Each call mints
+    /// a distinct slab cell (two `from_constant(7)` calls return two
+    /// distinct objects), so mutations do not propagate across calls.
+    Const(majit_ir::intbound::IntBoundRc),
     /// Live `_forwarded` cell — mutations propagate to every handle
-    /// cloned from the same Rc and through `box._forwarded`.
-    Live(std::rc::Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>),
+    /// cloned from the same slab slot and through `box._forwarded`.
+    Live(majit_ir::intbound::IntBoundRc),
 }
 
 impl IntBoundHandle {
     /// Wrap a freshly synthesized `IntBound::from_constant(_)`
-    /// (`optimizer.py:102-103` return path). Mints a fresh `Rc` so
-    /// each call produces a distinct object (Python `is` semantics).
+    /// (`optimizer.py` `from_constant` return path). Mints a fresh
+    /// slab cell so each call produces a distinct object.
     pub fn const_(b: crate::optimizeopt::intutils::IntBound) -> Self {
-        IntBoundHandle::Const(std::rc::Rc::new(std::cell::RefCell::new(b)))
+        IntBoundHandle::Const(majit_ir::intbound::IntBoundRc::new(b))
     }
 
-    /// Wrap a live `_forwarded` cell handle (`optimizer.py:111-112`
-    /// return path).
-    pub fn live(
-        rc: std::rc::Rc<std::cell::RefCell<crate::optimizeopt::intutils::IntBound>>,
-    ) -> Self {
+    /// Wrap a live `_forwarded` cell handle (`optimizer.py`
+    /// `getintbound` return path).
+    pub fn live(rc: majit_ir::intbound::IntBoundRc) -> Self {
         IntBoundHandle::Live(rc)
     }
 
     /// Identity comparison. Two handles are `ptr_eq` iff they hold
-    /// the same `Rc` — Python `is` parity. Const/Live cross-arm pairs
-    /// are never equal because they live in disjoint cell namespaces.
+    /// the same slab slot — Python `is` parity. Const/Live cross-arm
+    /// pairs are never equal because they live in disjoint namespaces.
     pub fn ptr_eq(&self, other: &IntBoundHandle) -> bool {
         match (self, other) {
             (IntBoundHandle::Const(a), IntBoundHandle::Const(b))
-            | (IntBoundHandle::Live(a), IntBoundHandle::Live(b)) => std::rc::Rc::ptr_eq(a, b),
+            | (IntBoundHandle::Live(a), IntBoundHandle::Live(b)) => {
+                majit_ir::intbound::IntBoundRc::ptr_eq(a, b)
+            }
             _ => false,
         }
     }
@@ -316,8 +674,7 @@ impl IntBoundHandle {
         }
     }
 
-    /// Convert to an owned `IntBound` snapshot. Clones for both arms
-    /// since both wrap `Rc<RefCell<_>>`.
+    /// Convert to an owned `IntBound` snapshot.
     pub fn into_int_bound(self) -> crate::optimizeopt::intutils::IntBound {
         match self {
             IntBoundHandle::Const(rc) | IntBoundHandle::Live(rc) => rc.borrow().clone(),
@@ -463,7 +820,7 @@ impl ImportedShortPureOp {
         // `op.copy_and_change(opnum, args=arglist)`) still hands
         // `ProducedShortOp` a freshly allocated replay op rather than
         // `self.res` itself.
-        replay.pos.set(result);
+        replay.pos().set(result);
         if let Some(d) = descr.clone() {
             replay.setdescr(d);
         }
@@ -481,7 +838,7 @@ impl ImportedShortPureOp {
             pop: crate::optimizeopt::info::PreambleOp {
                 op: pop_op,
                 invented_name,
-                preamble_op: std::rc::Rc::new(replay),
+                preamble_op: OpRc::new(replay),
                 same_as_source,
             },
         }
@@ -534,9 +891,9 @@ fn describe_operand_for_assert(b: &Operand) -> String {
         .and_then(|d| d.as_field_descr().map(|fd| fd.field_name().to_string()))
         .unwrap_or_default();
     if name.is_empty() {
-        format!("{:?} {:?}", op.opcode, op.pos.get())
+        format!("{:?} {:?}", op.opcode, op.pos().get())
     } else {
-        format!("{:?} {:?} `{name}`", op.opcode, op.pos.get())
+        format!("{:?} {:?} `{name}`", op.opcode, op.pos().get())
     }
 }
 
@@ -641,7 +998,7 @@ pub struct OptContext {
     /// without re-entering the heap pass itself.
     /// Held as `OpRc` (resoperation.py: emit_extra appends a ResOperation
     /// object) so the queued op carries object identity into the drain.
-    pub(crate) extra_operations_after: VecDeque<(usize, majit_ir::OpRc)>,
+    pub(crate) extra_operations_after: ExtraQueue,
     /// The queues `Optimizer::drain_extra_operations_from` is working through,
     /// innermost last. The drain moves `extra_operations_after` aside before it
     /// starts so that a nested drain only sees what was queued after it began —
@@ -653,7 +1010,7 @@ pub struct OptContext {
     /// emits the allocation as one step, while pyre's `emit_op` only queues the
     /// allocation when the force runs from a pass, so a store can be emitted
     /// while the `NEW_WITH_VTABLE` that defines it is still parked.
-    pub(crate) extra_pending: Vec<VecDeque<(usize, majit_ir::OpRc)>>,
+    pub(crate) extra_pending: Vec<ExtraQueue>,
     /// optimizer.py:47-54: deferred postprocess for GUARD_CLASS.
     /// Set by rewrite pass, executed by emit_operation after the guard
     /// is added to new_operations (matching RPython's callback pattern).
@@ -1822,7 +2179,7 @@ impl OptContext {
             num_inputs: 0,
             inputarg_base: 0,
             next_pos: 0,
-            extra_operations_after: VecDeque::new(),
+            extra_operations_after: ExtraQueue::new(),
             extra_pending: Vec::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
@@ -1937,7 +2294,7 @@ impl OptContext {
             .map(|(i, &tp)| {
                 (
                     i as u32,
-                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, i as u32)),
+                    majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(tp, i as u32)),
                 )
             })
             .collect();
@@ -2013,7 +2370,7 @@ impl OptContext {
             _ => {
                 self.inputarg_refs.insert(
                     pos,
-                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos)),
+                    majit_ir::InputArgRc::new(majit_ir::InputArg::from_type(tp, pos)),
                 );
             }
         }
@@ -2061,7 +2418,7 @@ impl OptContext {
         self.input_ops_index.clear();
         self.input_ops_index.reserve(self.input_ops.len());
         for op in &self.input_ops {
-            self.input_ops_index.insert(op.pos.get(), op.clone());
+            self.input_ops_index.insert(op.pos().get(), op.clone());
         }
     }
 
@@ -2070,7 +2427,7 @@ impl OptContext {
     /// overwrites, so the last push at a given position wins — matching the
     /// `iter().rfind(...)` (last-occurrence) scan the index replaces.
     pub(crate) fn push_new_operation(&mut self, op: majit_ir::OpRc) {
-        self.new_operations_index.insert(op.pos.get(), op.clone());
+        self.new_operations_index.insert(op.pos().get(), op.clone());
         self.new_operations.push(op);
     }
 
@@ -2079,7 +2436,7 @@ impl OptContext {
     /// the new op into `new_operations_index`, so the index keeps agreeing
     /// with `new_operations` for the rest of the forward phase.
     pub(crate) fn replace_new_operation(&mut self, idx: usize, op: majit_ir::OpRc) {
-        self.new_operations_index.insert(op.pos.get(), op.clone());
+        self.new_operations_index.insert(op.pos().get(), op.clone());
         self.new_operations[idx] = op;
     }
 
@@ -2103,7 +2460,7 @@ impl OptContext {
         self.new_operations_index.clear();
         self.new_operations_index.reserve(self.new_operations.len());
         for op in &self.new_operations {
-            self.new_operations_index.insert(op.pos.get(), op.clone());
+            self.new_operations_index.insert(op.pos().get(), op.clone());
         }
     }
 
@@ -2117,7 +2474,8 @@ impl OptContext {
         self.phase1_emit_ops_index
             .reserve(self.phase1_emit_ops.len());
         for op in &self.phase1_emit_ops {
-            self.phase1_emit_ops_index.insert(op.pos.get(), op.clone());
+            self.phase1_emit_ops_index
+                .insert(op.pos().get(), op.clone());
         }
     }
 
@@ -2125,7 +2483,7 @@ impl OptContext {
     /// (pos -> vector index) in lockstep. At most one live entry per position
     /// (emit invariant), so a plain insert replaces any stale mapping.
     pub(crate) fn live_synthetics_push(&mut self, op: majit_ir::OpRc) {
-        let pos = op.pos.get();
+        let pos = op.pos().get();
         let idx = self.live_synthetics.len();
         self.live_synthetics.push(op);
         self.live_synthetics_index.insert(pos, idx);
@@ -2140,7 +2498,7 @@ impl OptContext {
         let removed = self.live_synthetics.swap_remove(i);
         if i < self.live_synthetics.len() {
             // The element formerly at the tail now lives at `i`.
-            let moved_pos = self.live_synthetics[i].pos.get();
+            let moved_pos = self.live_synthetics[i].pos().get();
             self.live_synthetics_index.insert(moved_pos, i);
         }
         Some(removed)
@@ -2166,8 +2524,8 @@ impl OptContext {
             majit_ir::Type::Ref => OpCode::SameAsR,
             majit_ir::Type::Void => OpCode::Jump,
         };
-        let synthetic = std::rc::Rc::new(Op::new(opcode, &[]));
-        synthetic.pos.set(opref);
+        let synthetic = OpRc::new(Op::new(opcode, &[]));
+        synthetic.pos().set(opref);
         self.resop_refs.insert(opref, synthetic.clone());
         self.live_synthetics_push(synthetic.clone());
         synthetic
@@ -2209,7 +2567,7 @@ impl OptContext {
     /// mirrors `emit`'s live_synthetics catch-up: a producer-less stand-in only
     /// ever holds `None`/`Info`, never a redirect.
     fn install_canonical_producer(&mut self, op: &majit_ir::OpRc) {
-        let pos = op.pos.get();
+        let pos = op.pos().get();
         if pos.is_none() || pos.is_constant() {
             return;
         }
@@ -2228,10 +2586,10 @@ impl OptContext {
         // `ptr_eq` guard skips the self-clone — and its `RefCell` double-borrow
         // — when `op` is already the registered stand-in.
         if let Some(superseded) = self.live_synthetics_swap_remove_pos(pos)
-            && !std::rc::Rc::ptr_eq(&superseded, op)
+            && !OpRc::ptr_eq(&superseded, op)
         {
-            let carried = superseded.forwarded.borrow().clone();
-            *op.forwarded.borrow_mut() = carried;
+            let carried = superseded.forwarded().borrow().clone();
+            *op.forwarded().borrow_mut() = carried;
             // replace_op_with parity (optimizer.py): forward the
             // superseded stand-in to `op`. A consumer dispatched before
             // this supersession bound its operand to `superseded` (the
@@ -2271,7 +2629,7 @@ impl OptContext {
                 .map(|ia| ia.forwarded.borrow().clone()),
             _ => self
                 .find_producer_op(opref)
-                .map(|op| op.forwarded.borrow().clone()),
+                .map(|op| op.forwarded().borrow().clone()),
         }
     }
 
@@ -2345,7 +2703,7 @@ impl OptContext {
             }
             _ => {
                 if let Some(op) = self.find_producer_op(opref) {
-                    *op.forwarded.borrow_mut() = majit_ir::forwarding::Forwarded::None;
+                    *op.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::None;
                 }
             }
         }
@@ -2365,7 +2723,7 @@ impl OptContext {
             if let Some(ia) = o.bound_inputarg() {
                 self.inputarg_refs.insert(ia.index, ia);
             } else if let Some(op) = o.bound_op() {
-                self.resop_refs.insert(op.pos.get(), op);
+                self.resop_refs.insert(op.pos().get(), op);
             }
         }
     }
@@ -2394,7 +2752,7 @@ impl OptContext {
         // `live_synthetics` — the collision-safe stores `find_producer_op`
         // consults.
         for op in ops {
-            let pos = op.pos.get();
+            let pos = op.pos().get();
             if pos.is_none() || pos.is_constant() {
                 continue;
             }
@@ -2449,7 +2807,7 @@ impl OptContext {
             num_inputs: num_inputs as u32,
             inputarg_base,
             next_pos: start_next_pos,
-            extra_operations_after: VecDeque::new(),
+            extra_operations_after: ExtraQueue::new(),
             extra_pending: Vec::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
@@ -2597,7 +2955,7 @@ impl OptContext {
             OpCode::SameAsI,
             &[Operand::const_from_value(Value::Int(value))],
         );
-        op.pos.set(pos_ref);
+        op.pos().set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         let b = self.materialize_operand_at(opref);
         self.make_constant_box(&b, Value::Int(value));
@@ -2613,7 +2971,7 @@ impl OptContext {
             OpCode::SameAsR,
             &[Operand::const_from_value(Value::Ref(value))],
         );
-        op.pos.set(pos_ref);
+        op.pos().set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         let b = self.materialize_operand_at(opref);
         self.make_constant_box(&b, Value::Ref(value));
@@ -2629,7 +2987,7 @@ impl OptContext {
             OpCode::SameAsF,
             &[Operand::const_from_value(Value::Float(value))],
         );
-        op.pos.set(pos_ref);
+        op.pos().set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         let b = self.materialize_operand_at(opref);
         self.make_constant_box(&b, Value::Float(value));
@@ -2904,11 +3262,18 @@ impl OptContext {
         ]
         .iter()
         .filter_map(|key| self.resop_refs.get(key))
-        .any(|op| matches!(*op.forwarded.borrow(), Forwarded::Const(_)));
-        let inputarg_const = self
-            .inputarg_refs
-            .get(&raw)
-            .is_some_and(|ia| matches!(*ia.forwarded.borrow(), Forwarded::Const(_)));
+        .any(|op| {
+            matches!(
+                op.forwarded().borrow(),
+                Forwarded::Const(_) | Forwarded::SmallConst(_) | Forwarded::SmallWide(_)
+            )
+        });
+        let inputarg_const = self.inputarg_refs.get(&raw).is_some_and(|ia| {
+            matches!(
+                ia.forwarded.borrow(),
+                Forwarded::Const(_) | Forwarded::SmallConst(_) | Forwarded::SmallWide(_)
+            )
+        });
         resop_const || inputarg_const
     }
 
@@ -2920,7 +3285,7 @@ impl OptContext {
     /// Checked at the emit/emit_extra producer surfaces, where both the
     /// `Op` result type and the typed `OpRef` are available.
     fn debug_assert_box_type_invariant(op: &Op) {
-        let pos = op.pos.get();
+        let pos = op.pos().get();
         debug_assert_eq!(
             op.type_,
             op.opcode.result_type(),
@@ -2950,6 +3315,56 @@ impl OptContext {
         self.emit_impl(op, false)
     }
 
+    /// Append an already-allocated `OpRc` without a second `ResOperation()`.
+    /// Used when the optimizer pass-through is the recorder/iterator op
+    /// itself (`optimizer.py _newoperations.append(op)`).
+    pub(crate) fn emit_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
+        if op.pos().get().is_none() || op.pos().get().is_constant() {
+            op.pos().set(self.reserve_pos_typed(op.result_type()));
+        } else {
+            self.next_pos = self.next_pos.max(op.pos().get().raw().saturating_add(1));
+        }
+        let pos_ref = op.pos().get();
+        if op.opcode.is_guard() {
+            if !self.in_final_emission {
+                let _ = self.emit_guard_operation(&op);
+            }
+        } else {
+            let dominated_by_side_effect = !((op.opcode.has_no_side_effect()
+                || op.opcode.is_ovf()
+                || op.opcode.is_jit_debug())
+                && !Self::is_call_pure_pure_canraise(&op));
+            if dominated_by_side_effect {
+                self.last_guard_idx = None;
+                self.guard_chain_broken = true;
+            }
+        }
+        Self::debug_assert_box_type_invariant(&op);
+        self.emitted_operations
+            .insert(majit_ir::operand::Operand::from_bound_op(&op));
+        self.push_new_operation(op);
+        pos_ref
+    }
+
+    pub(crate) fn stamp_emitted_op(src: &Op, dst: &Op) {
+        for i in 0..src.num_args() {
+            dst.setarg(i, src.arg(i));
+        }
+        match src.getdescr() {
+            Some(d) => dst.setdescr(d),
+            None => dst.cleardescr(),
+        }
+        if src.opcode.is_guard() {
+            dst.copy_failargs_shared(src);
+            match src.get_fail_arg_types() {
+                Some(ts) => dst.set_fail_arg_types(ts),
+                None => dst.clear_fail_arg_types(),
+            }
+            dst.set_rd_resume_position(src.rd_resume_position());
+        }
+        dst.pos().set(src.pos().get());
+    }
+
     /// `emit` variant that REUSES the recorder input op (the `live_synthetics`
     /// entry at this position) as the emitted producer instead of cloning into
     /// a fresh `Rc<Op>`. The input op is the object later ops' operands already
@@ -2963,12 +3378,12 @@ impl OptContext {
     }
 
     fn emit_impl(&mut self, mut op: Op, reuse: bool) -> OpRef {
-        if op.pos.get().is_none() || op.pos.get().is_constant() {
+        if op.pos().get().is_none() || op.pos().get().is_constant() {
             // Tag the freshly allocated position with the producer op's
             // result type so the variant-tag readers
             // (`opref_type`/`OptBoxEnv::get_type`) resolve at priority 0
             // (resoperation.py `opclasses[opnum].type` parity).
-            op.pos.set(self.reserve_pos_typed(op.result_type()));
+            op.pos().set(self.reserve_pos_typed(op.result_type()));
         } else {
             // Position invariants for an op that already carries a position:
             //
@@ -3004,14 +3419,14 @@ impl OptContext {
                 !self
                     .new_operations
                     .iter()
-                    .any(|e| e.pos.get() == op.pos.get()),
+                    .any(|e| e.pos().get() == op.pos().get()),
                 "emit: OpRef collision at {:?} — new_operations already contains this position. \
                  Body optimization should use a fresh TraceIterator and reserve_pos() should be \
                  monotonic above all raw trace positions.",
-                op.pos.get(),
+                op.pos().get(),
             );
             let has_op_fwd = self
-                .get_box_replacement_operand_opt(op.pos.get())
+                .get_box_replacement_operand_opt(op.pos().get())
                 .is_some_and(|b| self.has_op_forwarding(&b));
             debug_assert!(
                 !(has_op_fwd && op.result_type() != majit_ir::Type::Void),
@@ -3019,11 +3434,11 @@ impl OptContext {
                  import_state should only forward inputarg slots in \
                  [inputarg_base..inputarg_base + num_inputs), and body op results \
                  live in a disjoint range above the parent trace high-water mark.",
-                op.pos.get(),
+                op.pos().get(),
             );
-            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos().get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos.get();
+        let pos_ref = op.pos().get();
         // RPython parity: emit() does NOT clear forwarding.
         // In RPython, Box._forwarded is never cleared by emit — each Box
         // has unique identity. The forwarding set by import_box must
@@ -3054,7 +3469,9 @@ impl OptContext {
         // `Optimizer::last_guard_op_idx` instead.
         if op.opcode.is_guard() {
             if !self.in_final_emission {
-                self.emit_guard_operation(&mut op);
+                if let Some(newop) = self.emit_guard_operation(&op) {
+                    op = newop;
+                }
             }
         } else {
             // optimizer.py `_emit_operation` — the test runs for every emitted non-guard
@@ -3079,7 +3496,7 @@ impl OptContext {
         // the primary fast path. The Box.type invariant is checked by
         // `debug_assert_box_type_invariant` below.
         Self::debug_assert_box_type_invariant(&op);
-        let op_pos = op.pos.get();
+        let op_pos = op.pos().get();
         // Reuse path: when an unchanged op flows through to final emission, reuse
         // the recorder input op (the `live_synthetics` entry at this position) as
         // the emitted producer rather than cloning. The input op is what later
@@ -3089,11 +3506,12 @@ impl OptContext {
         // value (resoperation.py:233 the op IS the box). This is the structural
         // collapse the clone path's catch-up only approximates by copying
         // `_forwarded` onto a fresh clone and redirecting input -> clone.
-        // Guards are excluded (the guard path mutates `op` in emit_guard_operation
-        // before reaching here). The opcode/num_args match guards against reusing
-        // a non-matching stand-in; on any mismatch we fall through to the clone
-        // path below, which is always correct.
-        if reuse && !op.opcode.is_guard() {
+        // Guards used to be excluded because emit_guard_operation mutates
+        // the owned `op` (failargs / descr / rd_resume_position) before
+        // we get here. Stamp that same state onto the live recorder op
+        // instead of `Rc::new` — the opcode/num_args match still rejects
+        // a stand-in that is no longer the same guard.
+        if reuse {
             // At most one live entry per position (emit invariant), so the
             // O(1) index resolves the reuse candidate; the opcode/num_args
             // predicate then guards against reusing a non-matching stand-in
@@ -3117,6 +3535,18 @@ impl OptContext {
                     Some(d) => reused.setdescr(d),
                     None => reused.cleardescr(),
                 }
+                if op.opcode.is_guard() {
+                    if let Some(fa) = op.guard_fail_args() {
+                        reused.setfailargs(fa.iter().cloned().collect());
+                    } else {
+                        reused.clearfailargs();
+                    }
+                    match op.get_fail_arg_types() {
+                        Some(ts) => reused.set_fail_arg_types(ts),
+                        None => reused.clear_fail_arg_types(),
+                    }
+                    reused.set_rd_resume_position(op.rd_resume_position());
+                }
                 // optimizer.py `self._emittedoperations[op] = None`. The
                 // clone path below records this too; `get_producing_op` only
                 // admits producers present here, so the reused op must be
@@ -3127,7 +3557,7 @@ impl OptContext {
                 return op_pos;
             }
         }
-        let op_rc = std::rc::Rc::new(op);
+        let op_rc = OpRc::new(op);
         // Catch up any operand placeholder that `materialize_operand_at` created for
         // `op_pos` ahead of this emit (forward-reference path).
         // `resoperation.py:233 _forwarded` lives on the operation
@@ -3144,7 +3574,7 @@ impl OptContext {
         // `_forwarded` host every `find_producer_op` reaches before this emit
         // supersedes it.
         if let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) {
-            *op_rc.forwarded.borrow_mut() = synth.forwarded.borrow().clone();
+            *op_rc.forwarded().borrow_mut() = synth.forwarded().borrow().clone();
             // replace_op_with parity (optimizer.py): forward the superseded
             // stand-in to the emitted producer. A consumer dispatched BEFORE
             // this producer emitted (forward reference) bound its operand to
@@ -3152,7 +3582,7 @@ impl OptContext {
             // orphaned stand-in while the OpRef path resolves `op_rc`, so a
             // later fold (e.g. GUARD_TRUE constant-folding the operand) lands
             // on a different host and `resolve_operand_operand`'s witness diverges.
-            if !std::rc::Rc::ptr_eq(&synth, &op_rc) {
+            if !OpRc::ptr_eq(&synth, &op_rc) {
                 use majit_ir::forwarding::ForwardingHost;
                 synth.set_forwarded_op(&op_rc);
             }
@@ -3219,6 +3649,13 @@ impl OptContext {
     pub fn emit_extra(&mut self, after_pass_idx: usize, op: Op) -> OpRef {
         // emit_extra enters the chain at the pass AFTER the caller; the first
         // re-processing pass is `after_pass_idx + 1`.
+        self.emit_extra_at(after_pass_idx + 1, OpRc::new(op))
+    }
+
+    /// `emit_extra` when the caller already holds the ResOperation object
+    /// (`heap.py _lazy_set = op` then `emit_extra(op)`). Queue that `OpRc`
+    /// instead of a second `cls()`.
+    pub fn emit_extra_rc(&mut self, after_pass_idx: usize, op: majit_ir::OpRc) -> OpRef {
         self.emit_extra_at(after_pass_idx + 1, op)
     }
 
@@ -3226,25 +3663,24 @@ impl OptContext {
     /// `start_pass`. `emit_extra` enters downstream of the caller; head
     /// re-dispatch (`send_extra_operation`, optimizer.py with
     /// `opt=first_optimization`) enters at pass 0.
-    fn emit_extra_at(&mut self, start_pass: usize, mut op: Op) -> OpRef {
-        if op.pos.get().is_none() {
+    fn emit_extra_at(&mut self, start_pass: usize, op: majit_ir::OpRc) -> OpRef {
+        if op.pos().get().is_none() {
             // Typed allocation, same rationale as `emit`.
-            op.pos.set(self.reserve_pos_typed(op.result_type()));
+            op.pos().set(self.reserve_pos_typed(op.result_type()));
         } else {
-            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos().get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos.get();
+        let pos_ref = op.pos().get();
         // Queued ops carry their intrinsic `op.type_`
         // (resoperation.py:1693 parity). Once the queued op flushes
         // through `propagate_one` into `new_operations`, `op_at` resolves
         // its type without the side-table detour.
         Self::debug_assert_box_type_invariant(&op);
-        let op_rc = std::rc::Rc::new(op);
         // Register the queued op as the producer for its position so a fold
         // through `make_equal_to(from_bound_op(op_rc), ..)` reaches a host
         // `find_producer_op` resolves to.
-        self.register_extra_producer(&op_rc);
-        self.extra_operations_after.push_back((start_pass, op_rc));
+        self.register_extra_producer(&op);
+        self.extra_operations_after.push_back((start_pass, op));
         pos_ref
     }
 
@@ -3257,7 +3693,7 @@ impl OptContext {
         if self.in_final_emission {
             self.emit(op)
         } else {
-            self.emit_extra_at(0, op)
+            self.emit_extra_at(0, OpRc::new(op))
         }
     }
 
@@ -3282,14 +3718,14 @@ impl OptContext {
                 // Rc (a synthetic producer registered on first
                 // materialization), stable across calls, so no warm-up is
                 // needed for the lookup keys to be ptr_eq.
-                let pos = entry.op.pos.get();
+                let pos = entry.op.pos().get();
                 let res = self.materialize_operand_at(pos);
                 (
                     res.clone(),
                     crate::optimizeopt::shortpreamble::ProducedShortOp {
                         kind: entry.kind.clone(),
                         res,
-                        preamble_op: std::rc::Rc::new((*entry.op).clone()),
+                        preamble_op: OpRc::new((*entry.op).clone()),
                         source_op: entry.source_op.clone().unwrap_or_else(|| entry.op.clone()),
                         invented_name: entry.invented_name,
                         same_as_source: entry.same_as_source.clone(),
@@ -3520,15 +3956,15 @@ impl OptContext {
                         pure_call_opcode(produced_op.preamble_op.opcode),
                         &resolved_arg_boxes,
                     );
-                    op.pos.set(replay_pos(*source, produced_op));
+                    op.pos().set(replay_pos(*source, produced_op));
                     if let Some(d) = produced_op.preamble_op.getdescr() {
                         op.setdescr(d);
                     }
-                    let res = self.materialize_operand_at(op.pos.get());
+                    let res = self.materialize_operand_at(op.pos().get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         res,
-                        preamble_op: std::rc::Rc::new(op),
+                        preamble_op: OpRc::new(op),
                         source_op: produced_op.source_op.clone(),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
@@ -3583,13 +4019,13 @@ impl OptContext {
                             // phase box that a retrace cannot bind.
                             let obj_b = produced_op.preamble_op.arg(0);
                             let mut op = Op::new(opcode, &[obj_b]);
-                            op.pos.set(replay_pos(*source, produced_op));
+                            op.pos().set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
-                            let res = self.materialize_operand_at(op.pos.get());
+                            let res = self.materialize_operand_at(op.pos().get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
-                                preamble_op: std::rc::Rc::new(op),
+                                preamble_op: OpRc::new(op),
                                 source_op: produced_op.source_op.clone(),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -3625,13 +4061,13 @@ impl OptContext {
                             let obj_b = produced_op.preamble_op.arg(0);
                             let index_b = produced_op.preamble_op.arg(1);
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
-                            op.pos.set(replay_pos(*source, produced_op));
+                            op.pos().set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
-                            let res = self.materialize_operand_at(op.pos.get());
+                            let res = self.materialize_operand_at(op.pos().get());
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
                                 res,
-                                preamble_op: std::rc::Rc::new(op),
+                                preamble_op: OpRc::new(op),
                                 source_op: produced_op.source_op.clone(),
                                 invented_name: produced_op.invented_name,
                                 same_as_source: produced_op.same_as_source.clone(),
@@ -3666,12 +4102,12 @@ impl OptContext {
                     }
                     let func_b = dep_or_materialize(self, &produced, func_opref);
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_b]);
-                    op.pos.set(replay_pos(*source, produced_op));
-                    let res = self.materialize_operand_at(op.pos.get());
+                    op.pos().set(replay_pos(*source, produced_op));
+                    let res = self.materialize_operand_at(op.pos().get());
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         res,
-                        preamble_op: std::rc::Rc::new(op),
+                        preamble_op: OpRc::new(op),
                         source_op: produced_op.source_op.clone(),
                         invented_name: produced_op.invented_name,
                         same_as_source: produced_op.same_as_source.clone(),
@@ -3763,7 +4199,7 @@ impl OptContext {
             // `forwarded[pop.op]` does not collide with the replay's
             // info at `forwarded[pop.preamble_op.pos]`.
             if let Some(info) =
-                self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos.get())
+                self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos().get())
             {
                 self.setinfo_from_preamble_item_option(result, &info, None);
             }
@@ -3918,7 +4354,7 @@ impl OptContext {
             );
             let has_replay_marker = arg_operand.bound_op().is_some_and(|op| {
                 !matches!(
-                    &*op.forwarded.borrow(),
+                    &op.forwarded().borrow(),
                     majit_ir::forwarding::Forwarded::None
                 )
             });
@@ -3936,8 +4372,8 @@ impl OptContext {
             // returning None is the equivalent.
         }
         let result_info: Option<(OpRef, ForwardedInfo)> =
-            snapshot_forwarded(self, preamble_op.pos.get())
-                .map(|info| (preamble_op.pos.get(), info));
+            snapshot_forwarded(self, preamble_op.pos().get())
+                .map(|info| (preamble_op.pos().get(), info));
 
         // Phase 2: generate guards — `make_guards` takes `&mut self`
         // directly. Constants seed via reserve_const_ref + seed_constant
@@ -4082,21 +4518,23 @@ impl OptContext {
                 majit_ir::forwarding::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
                     Some(OpInfo::FloatConstInfo(*f))
                 }
-                majit_ir::forwarding::Forwarded::Const(c) => {
+                majit_ir::forwarding::Forwarded::Const(_)
+                | majit_ir::forwarding::Forwarded::SmallConst(_)
+                | majit_ir::forwarding::Forwarded::SmallWide(_) => {
                     // optimizer.py `getinfo` parity for the Const
                     // terminal — Refs surface as `ConstPtrInfo`, Floats as
                     // `FloatConstInfo`, Ints as `IntBound::from_constant`.
-                    match c.get() {
-                        majit_ir::Value::Ref(gcref) => Some(OpInfo::ptr(
+                    match fwd.const_value() {
+                        Some(majit_ir::Value::Ref(gcref)) => Some(OpInfo::ptr(
                             crate::optimizeopt::info::PtrInfo::Constant(gcref),
                         )),
-                        majit_ir::Value::Float(f) => Some(OpInfo::FloatConstInfo(
+                        Some(majit_ir::Value::Float(f)) => Some(OpInfo::FloatConstInfo(
                             crate::optimizeopt::info::FloatConstInfo::new(f),
                         )),
-                        majit_ir::Value::Int(i) => Some(OpInfo::int_bound(
+                        Some(majit_ir::Value::Int(i)) => Some(OpInfo::int_bound(
                             crate::optimizeopt::intutils::IntBound::from_constant(i),
                         )),
-                        majit_ir::Value::Void => None,
+                        Some(majit_ir::Value::Void) | None => None,
                     }
                 }
                 _ => None,
@@ -4524,7 +4962,7 @@ impl OptContext {
                     .extra_same_as()
                     .iter()
                     .map(|op| ImportedShortAlias {
-                        result: op.pos.get(),
+                        result: op.pos().get(),
                         same_as_source: op.arg(0),
                         same_as_opcode: op.opcode,
                     })
@@ -4723,10 +5161,7 @@ impl OptContext {
             // tripping `set_forwarded_op`'s self-cycle assert. Honour
             // the upstream `is` semantics by comparing the bound `Op`
             // identities first.
-            if op
-                .bound_op()
-                .is_some_and(|o| std::rc::Rc::ptr_eq(&o, &target_op))
-            {
+            if op.bound_op().is_some_and(|o| OpRc::ptr_eq(&o, &target_op)) {
                 return;
             }
             op.set_forwarded_op(&target_op);
@@ -4737,7 +5172,7 @@ impl OptContext {
             // identities.
             if op
                 .bound_inputarg()
-                .is_some_and(|i| std::rc::Rc::ptr_eq(&i, &target_ia))
+                .is_some_and(|i| majit_ir::InputArgRc::ptr_eq(&i, &target_ia))
             {
                 return;
             }
@@ -5053,7 +5488,7 @@ impl OptContext {
             .iter()
             .chain(self.phase1_emit_ops.iter())
             .chain(self.input_ops.iter())
-            .any(|op| op.pos.get().raw() == raw);
+            .any(|op| op.pos().get().raw() == raw);
         if raw_hit {
             return "b-typetag";
         }
@@ -5314,7 +5749,7 @@ impl OptContext {
         // Skip when `canon` wraps the same bound `Op` as `arg` under a distinct
         // host — linking would be a one-node self-cycle.
         if let (Some(ao), Some(co)) = (arg.bound_op(), canon.bound_op())
-            && std::rc::Rc::ptr_eq(&ao, &co)
+            && OpRc::ptr_eq(&ao, &co)
         {
             return;
         }
@@ -5375,7 +5810,18 @@ impl OptContext {
             return opref;
         }
         match self.get_box_replacement_operand_opt(opref) {
-            Some(o) => o.to_opref(),
+            Some(o) => {
+                let resolved = o.to_opref();
+                // A bound ResOp whose `pos` was never stamped has
+                // `to_opref() == None`. Returning that sentinel loses the
+                // box: `export_state` can no longer resolve it.
+                // `get_box_replacement` returns the box, not None.
+                if resolved.is_none() && !o.is_none() {
+                    opref
+                } else {
+                    resolved
+                }
+            }
             None => opref,
         }
     }
@@ -5702,7 +6148,7 @@ impl OptContext {
         }
         match &resolved.get_forwarded() {
             majit_ir::forwarding::Forwarded::Info(OpInfo::IntBound(rc)) => {
-                return IntBoundHandle::live(std::rc::Rc::clone(rc));
+                return IntBoundHandle::live(rc.clone());
             }
             majit_ir::forwarding::Forwarded::None => {}
             _ => {
@@ -5932,7 +6378,9 @@ impl OptContext {
     /// `_get_info`/`_get_array_info` half is `const_infos.entry(...)`
     /// (RPython: `optheap.const_infos[ref]`).
     fn copy_fields_to_const(&mut self, source: OpRef, gcref: majit_ir::GcRef) {
-        use crate::optimizeopt::info::{ArrayPtrInfo, FieldEntry, PtrInfo, StructPtrInfo};
+        use crate::optimizeopt::info::{
+            ArrayPtrInfo, CachedFieldList, FieldEntry, PtrInfo, StructPtrInfo,
+        };
         // `source` is always chain-walked by the caller (`make_constant`),
         // so peek's chain
         // walk is a no-op — owned PtrInfo clone here matches the prior
@@ -5953,7 +6401,7 @@ impl OptContext {
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
-                        fields: Vec::new(),
+                        fields: CachedFieldList::new(),
 
                         last_guard_pos: -1,
                     })
@@ -5968,7 +6416,7 @@ impl OptContext {
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
-                        fields: Vec::new(),
+                        fields: CachedFieldList::new(),
 
                         last_guard_pos: -1,
                     })
@@ -5979,7 +6427,7 @@ impl OptContext {
             }
             PtrInfo::Virtual(v) if !v.fields.is_empty() => {
                 let descr = v.descr.clone();
-                let fields: Vec<(u32, FieldEntry)> = v
+                let fields: CachedFieldList = v
                     .fields
                     .iter()
                     .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
@@ -5987,7 +6435,7 @@ impl OptContext {
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
-                        fields: Vec::new(),
+                        fields: CachedFieldList::new(),
 
                         last_guard_pos: -1,
                     })
@@ -5998,7 +6446,7 @@ impl OptContext {
             }
             PtrInfo::VirtualStruct(v) if !v.fields.is_empty() => {
                 let descr = v.descr.clone();
-                let fields: Vec<(u32, FieldEntry)> = v
+                let fields: CachedFieldList = v
                     .fields
                     .iter()
                     .map(|(k, r)| (*k, FieldEntry::Value(r.clone())))
@@ -6006,7 +6454,7 @@ impl OptContext {
                 let ci = self.const_infos.entry(key).or_insert_with(|| {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
-                        fields: Vec::new(),
+                        fields: CachedFieldList::new(),
 
                         last_guard_pos: -1,
                     })
@@ -6280,7 +6728,7 @@ impl OptContext {
     /// optimizer.py emit_guard_operation — decide whether to share
     /// resume data from the previous guard (_copy_resume_data_from) or build
     /// new resume data (store_final_boxes_in_guard).
-    fn emit_guard_operation(&mut self, op: &mut Op) {
+    fn emit_guard_operation(&mut self, op: &Op) -> Option<Op> {
         let opnum = op.opcode;
 
         // optimizer.py:655-664: GUARD_(NO_)EXCEPTION following a guard that
@@ -6310,13 +6758,13 @@ impl OptContext {
         // then simply unused and must not gate the test.
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
-        // `op.rd_resume_position.get() < 0`: see the same conjunct in
+        // `op.rd_resume_position() < 0`: see the same conjunct in
         // `Optimizer::emit_guard_operation` — a guard that owns a recorded
         // snapshot cannot inherit another's without replaying the recorded
         // bytecode range, and its committed side effects with it.
         let can_share = self.last_guard_idx.is_some()
             && !op.has_descr()
-            && op.rd_resume_position.get() < 0
+            && op.rd_resume_position() < 0
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
@@ -6353,16 +6801,15 @@ impl OptContext {
                 }
                 _ => crate::compile::make_resume_guard_copied_descr(donor_descr),
             });
-            // optimizer.py:722: guard_op.setfailargs(last_guard_op.getfailargs())
-            match self.new_operations[idx].getfailargs() {
+            // optimizer.py _copy_resume_data_from: guard_op.setfailargs(last_guard_op.getfailargs())
+            match self.new_operations[idx].guard_fail_args() {
                 Some(fa) => op.setfailargs(fa.iter().cloned().collect()),
                 None => op.clearfailargs(),
             }
             // The sharer resumes at the donor's snapshot, so it must carry the
             // donor's position too — its own recorded one is unused.  Mirrors
             // the Optimizer path's `_copy_resume_data_from`.
-            op.rd_resume_position
-                .set(self.new_operations[idx].rd_resume_position.get());
+            op.set_rd_resume_position(self.new_operations[idx].rd_resume_position());
             // bridgeopt.py parity: fail_arg_types carry the types the
             // serializer used when writing the class-knowledge bitfield in
             // rd_numb (memo.finish() uses numb_state.livebox_types). A
@@ -6375,10 +6822,16 @@ impl OptContext {
                 None => op.clear_fail_arg_types(),
             }
             // optimizer.py: _maybe_replace_guard_value after copy.
-            if op.opcode == OpCode::GuardValue {
-                self.maybe_replace_guard_value(op);
-            }
+            let replaced = if op.opcode == OpCode::GuardValue {
+                self.maybe_replace_guard_value(op)
+            } else {
+                None
+            };
             // Don't update last_guard_idx — copied guards don't become sources.
+            if opnum == OpCode::GuardException {
+                self.last_guard_idx = None;
+            }
+            return replaced;
         } else {
             // optimizer.py: store_final_boxes_in_guard.  This is
             // the standalone OptContext path (used by tests and the
@@ -6390,8 +6843,10 @@ impl OptContext {
             // optimizer.py: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
             // handle tracked preamble ops, force virtuals.
-            if let Some(fa) = op.getfailargs() {
-                let fargs: Vec<OpRef> = fa.iter().map(|b| b.to_opref()).collect();
+            if let Some(fa) = op.guard_fail_args() {
+                let fargs: smallvec::SmallVec<[OpRef; 8]> =
+                    fa.iter().map(|b| b.to_opref()).collect();
+                drop(fa);
                 for farg in fargs {
                     if !farg.is_none() {
                         // regalloc.py:1206: Const objects skip forcing.
@@ -6408,54 +6863,53 @@ impl OptContext {
                 }
             }
             // optimizer.py: _maybe_replace_guard_value after store.
-            if op.opcode == OpCode::GuardValue {
-                self.maybe_replace_guard_value(op);
+            let replaced = if op.opcode == OpCode::GuardValue {
+                self.maybe_replace_guard_value(op)
+            } else {
+                None
+            };
+            // optimizer.py: GUARD_EXCEPTION clears sharing.
+            if opnum == OpCode::GuardException {
+                self.last_guard_idx = None;
             }
-        }
-
-        // optimizer.py:684-685: GUARD_EXCEPTION clears sharing.
-        if opnum == OpCode::GuardException {
-            self.last_guard_idx = None;
+            return replaced;
         }
     }
 
     /// optimizer.py _maybe_replace_guard_value — turn
     /// guard_value(bool) into guard_true/guard_false.
-    fn maybe_replace_guard_value(&self, op: &mut Op) {
+    fn maybe_replace_guard_value(&self, op: &Op) -> Option<Op> {
         let arg0 = op.arg(0);
         // optimizer.py:755: if op.getarg(0).type == 'i'
         let arg0_resolved = self.resolve_operand_operand(&arg0).to_opref();
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
-            return;
+            return None;
         }
         // optimizer.py: b = self.getintbound(op.getarg(0))
         let Some(bound) = self
             .get_box_replacement_operand_opt(arg0_resolved)
             .and_then(|b| self.peek_intbound_box(&b))
         else {
-            return;
+            return None;
         };
         if !bound.is_bool() {
-            return;
+            return None;
         }
         let arg1 = op.arg(1);
-        let Some(constvalue) = self
+        let constvalue = self
             .resolve_operand_operand_opt(&arg1)
-            .and_then(|cb| cb.const_int())
-        else {
-            return;
-        };
+            .and_then(|cb| cb.const_int())?;
         let new_opcode = match constvalue {
             0 => OpCode::GuardFalse,
             1 => OpCode::GuardTrue,
-            _ => return, // optimizer.py:775: strange code, just disable
+            _ => return None, // optimizer.py: strange code, just disable
         };
         // optimizer.py newop = self.replace_op_with(op, opnum,
         //                                  [op.getarg(0)], descr)
         // — produce a fresh op with new opcode and trimmed args, descr
         // unchanged.  copy_and_change preserves fail_args / rd_resume_position
         // / fail_arg_types for guard ops (resoperation.py:498-503).
-        *op = op.copy_and_change(new_opcode, Some(&[arg0]), None);
+        Some(op.copy_and_change(new_opcode, Some(&[arg0]), None))
     }
 
     /// optimizer.py force_box — inline equivalent for
@@ -6525,7 +6979,7 @@ impl OptContext {
     /// Uses snapshot data (vable_boxes, frame_pcs, multi-frame) when available.
     pub fn finalize_guard_resume_data(
         &mut self,
-        op: &mut Op,
+        op: &Op,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) {
@@ -6534,7 +6988,7 @@ impl OptContext {
 
     fn store_final_boxes_in_guard(
         &mut self,
-        op: &mut Op,
+        op: &Op,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         mut pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) {
@@ -6608,7 +7062,7 @@ impl OptContext {
         // capture_resumedata (tracer guards) or patchguardop copy
         // (unroll.py:336/409). No fallback — the position is always set
         // before store_final_boxes_in_guard runs.
-        let resume_pos = op.rd_resume_position.get();
+        let resume_pos = op.rd_resume_position();
         let has_snapshot = snapshot_contains(&self.snapshot_boxes, resume_pos);
         // resume.py: `assert resume_position >= 0` —
         // RPython asserts the position is set before calling
@@ -6631,10 +7085,10 @@ impl OptContext {
             let fallback_pos = self
                 .patchguardop
                 .as_ref()
-                .map(|p| p.rd_resume_position.get())
+                .map(|p| p.rd_resume_position())
                 .filter(|&p| snapshot_contains(&self.snapshot_boxes, p));
             if let Some(fb_pos) = fallback_pos {
-                op.rd_resume_position.set(fb_pos);
+                op.set_rd_resume_position(fb_pos);
                 // resume.py _add_optimizer_sections: forward knowledge
                 // to the patchguardop snapshot so heap/class/loopinvariant
                 // sections are serialized into rd_numb. RPython's finish()
@@ -6655,8 +7109,8 @@ impl OptContext {
                  ancestor — RPython resume.py:397 \
                  `assert resume_position >= 0` parity",
                 op.opcode,
-                op.pos.get(),
-                op.rd_resume_position.get()
+                op.pos().get(),
+                op.rd_resume_position()
             );
         }
 
@@ -6664,16 +7118,16 @@ impl OptContext {
         // including guards with rd_virtuals. The snapshot uses original boxes
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
         // _number_virtuals then builds rd_virtuals from PtrInfo.
-        let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position.get())
-            .map(Vec::as_slice)
+        let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position())
+            .map(|v| v.as_slice())
             .unwrap_or_default();
-        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position.get())
-            .map(Vec::as_slice)
+        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position())
+            .map(|v| v.as_slice())
             .unwrap_or_default();
-        let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position.get())
-            .map(Vec::as_slice)
+        let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position())
+            .map(|v| v.as_slice())
             .unwrap_or_default();
-        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position.get())
+        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position())
             .map(Vec::as_slice)
             .unwrap_or_default();
 
@@ -6681,8 +7135,8 @@ impl OptContext {
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
-        let frame_sizes = snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position.get())
-            .map(Vec::as_slice);
+        let frame_sizes =
+            snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position()).map(Vec::as_slice);
 
         // Compare every snapshot cell's carried type with the type encoded by
         // its `OpRef` variant. `None` is an unclassified producer rather than
@@ -6699,7 +7153,7 @@ impl OptContext {
                 .chain(vref_oprefs.iter());
             for cell in cells {
                 let encoded = cell.opref.ty();
-                match cell.tp {
+                match cell.tp() {
                     None => untyped += 1,
                     Some(tp) if Some(tp) == encoded => agree += 1,
                     Some(tp) => {
@@ -6738,8 +7192,8 @@ impl OptContext {
             eprintln!(
                 "[callee-rca][store-final-vable] op={:?} pos={:?} resume_pos={} vable={:?}",
                 op.opcode,
-                op.pos.get(),
-                op.rd_resume_position.get(),
+                op.pos().get(),
+                op.rd_resume_position(),
                 vable_debug,
             );
         }
@@ -6774,7 +7228,7 @@ impl OptContext {
                 .collect();
             eprintln!(
                 "[jit][guard-resume] pos={:?} snapshot={:?} vable={:?}",
-                op.pos.get(),
+                op.pos().get(),
                 snapshot_debug,
                 vable_debug
             );
@@ -6849,8 +7303,8 @@ impl OptContext {
                 "[callee-rca][store-final-numbered] op={:?} pos={:?} resume_pos={} \
                  vable_items={:?} liveboxes={:?} livebox_types={:?} rd_consts={:?}",
                 op.opcode,
-                op.pos.get(),
-                op.rd_resume_position.get(),
+                op.pos().get(),
+                op.rd_resume_position(),
                 vable_items,
                 liveboxes,
                 livebox_types,
@@ -6861,7 +7315,7 @@ impl OptContext {
         if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
             eprintln!(
                 "[jit][guard-resume] pos={:?} liveboxes={:?} rd_virtuals={} livebox_types={:?}",
-                op.pos.get(),
+                op.pos().get(),
                 liveboxes,
                 rd_virtuals.len(),
                 livebox_types
@@ -6883,6 +7337,7 @@ impl OptContext {
                     .unwrap_or(majit_ir::Type::Ref)
             })
             .collect();
+        memo.recycle_livebox_types(livebox_types);
 
         // optimizer.py:712 liveboxes are the canonical Box objects returned
         // by `resumedata.finish()`; resolve each numbering position to its
@@ -6899,7 +7354,8 @@ impl OptContext {
                     .unwrap_or_else(|| Operand::from_opref(*a))
             })
             .collect();
-        let logical_rd_locs: Vec<u16> = final_operands
+        memo.recycle_ordered_liveboxes(liveboxes);
+        let logical_rd_locs: majit_ir::RdLocs = final_operands
             .iter()
             .enumerate()
             .map(|(index, operand)| {
@@ -6918,8 +7374,8 @@ impl OptContext {
             eprintln!(
                 "[callee-rca][store-final-operands] op={:?} pos={:?} resume_pos={} final_oprefs={:?}",
                 op.opcode,
-                op.pos.get(),
-                op.rd_resume_position.get(),
+                op.pos().get(),
+                op.rd_resume_position(),
                 final_oprefs,
             );
         }
@@ -7002,7 +7458,7 @@ impl OptContext {
             // holes on the latter backends, shifting the known-class
             // bitfield into the heap-knowledge stream.
             fd.set_rd_locs(logical_rd_locs);
-            fd.set_rd_numb(Some(rd_numb));
+            fd.set_rd_numb_arc(Some(rd_numb));
             fd.set_rd_consts_arc(Some(rd_consts));
             fd.set_rd_virtuals(descr_rd_virtuals);
             fd.set_rd_pendingfields(descr_pending);
@@ -7439,7 +7895,7 @@ impl OptContext {
             .new_operations
             .iter()
             .rev()
-            .find(|op| op.pos.get() == opref)
+            .find(|op| op.pos().get() == opref)
         {
             return Some(op);
         }
@@ -7453,7 +7909,7 @@ impl OptContext {
         self.phase1_emit_ops
             .iter()
             .rev()
-            .find(|op| op.pos.get() == opref)
+            .find(|op| op.pos().get() == opref)
             .map(|rc| rc.as_ref())
     }
 
@@ -7733,7 +8189,11 @@ impl OptContext {
             // or `Info(_)` per the chain walker (forwarding.rs); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh operand whose own slot is None.
-            Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
+            Forwarded::Const(_)
+            | Forwarded::SmallConst(_)
+            | Forwarded::SmallWide(_)
+            | Forwarded::Op(_)
+            | Forwarded::InputArg(_) => {
                 unreachable!(
                     "getrawptrinfo: chain terminal must not carry Forwarded::Const \
                  (forwarding.rs get_box_replacement walker invariant)",
@@ -7821,7 +8281,11 @@ impl OptContext {
             // or `Info(_)` per the chain walker (forwarding.rs); a
             // `Forwarded::Const` terminal is materialized inline by the
             // walker into a fresh operand whose own slot is None.
-            Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
+            Forwarded::Const(_)
+            | Forwarded::SmallConst(_)
+            | Forwarded::SmallWide(_)
+            | Forwarded::Op(_)
+            | Forwarded::InputArg(_) => {
                 unreachable!(
                     "getptrinfo: chain terminal must not carry Forwarded::Const \
                  (forwarding.rs get_box_replacement walker invariant)",
@@ -8314,7 +8778,11 @@ impl OptContext {
                     // its target (`forwarding.rs Forwarded::Op`); while it held
                     // a `Weak`, a dropped target ended the walk one hop early
                     // and this arm fired.
-                    Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
+                    Forwarded::Const(_)
+                    | Forwarded::SmallConst(_)
+                    | Forwarded::SmallWide(_)
+                    | Forwarded::Op(_)
+                    | Forwarded::InputArg(_) => {
                         unreachable!("chain walker terminal")
                     }
                     Forwarded::None => {}
@@ -8610,7 +9078,10 @@ impl OptContext {
                 .is_some()
         {
             let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
-            if let Some(info) = self.get_const_info_mut(arg0, parent_descr) {
+            if let Some(info) = self.get_const_info_mut(arg0, parent_descr.clone()) {
+                if let Some(parent) = parent_descr {
+                    info.init_fields(parent, field_idx as usize);
+                }
                 info.setfield(field_idx, value.clone());
             }
             return;
@@ -8632,10 +9103,14 @@ impl OptContext {
         // info.py AbstractStructPtrInfo.setfield: mutate `_fields`
         // in the PtrInfo object stored in the operand's `_forwarded` slot.
         // PyPy has the same single-object behavior via `box._forwarded`.
+        let parent_descr = op.with_field_descr(|fd| fd.get_parent_descr()).flatten();
         self.with_ensured_ptr_info_arg0(op, |mut handle| {
             if let Some(mut pi) = handle.as_mut() {
                 if is_header_word && pi.is_virtual() {
                     return;
+                }
+                if let Some(parent) = parent_descr.clone() {
+                    pi.init_fields(parent, field_idx as usize);
                 }
                 pi.setfield(field_idx, value.clone());
             }
@@ -9111,10 +9586,10 @@ where
     let mut next_resume_pos = 0i32;
     for op in seeded.iter_mut().filter(|op| op.opcode.is_guard()) {
         let snapshot_boxes = snapshot_for_guard(op);
-        let resume_pos = if op.rd_resume_position.get() >= 0
-            && !snapshot_contains(&snapshots, op.rd_resume_position.get())
+        let resume_pos = if op.rd_resume_position() >= 0
+            && !snapshot_contains(&snapshots, op.rd_resume_position())
         {
-            op.rd_resume_position.get()
+            op.rd_resume_position()
         } else {
             while snapshot_contains(&snapshots, next_resume_pos) {
                 next_resume_pos += 1;
@@ -9123,7 +9598,7 @@ where
             next_resume_pos += 1;
             resume_pos
         };
-        op.rd_resume_position.set(resume_pos);
+        op.set_rd_resume_position(resume_pos);
         snapshot_insert(
             &mut snapshots,
             resume_pos,
@@ -9152,8 +9627,8 @@ mod input_ops_index_tests {
 
     fn op_at(pos: OpRef) -> majit_ir::OpRc {
         let op = Op::new(OpCode::SameAsI, &[]);
-        op.pos.set(pos);
-        Rc::new(op)
+        op.pos().set(pos);
+        OpRc::new(op)
     }
 
     /// `input_ops_index` is a derived O(1) acceleration of
@@ -9179,12 +9654,67 @@ mod input_ops_index_tests {
             .find_producer_op(pos)
             .expect("a producer must be found at the seeded position");
         assert!(
-            Rc::ptr_eq(&producer, &last),
+            OpRc::ptr_eq(&producer, &last),
             "the last occurrence at a shared position must win"
         );
         assert!(
-            !Rc::ptr_eq(&producer, &first),
+            !OpRc::ptr_eq(&producer, &first),
             "the earlier occurrence must be shadowed by the later one"
+        );
+    }
+
+    /// `make_constant` stores an i32 ConstInt as `Forwarded::SmallConst`.
+    /// `allocate_next_pos_raw` must treat that as a claimed position.
+    #[test]
+    fn reserve_pos_skips_a_smallconst_forwarded_position() {
+        use majit_ir::forwarding::ForwardingHost;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 0, 0, 0);
+        let pos = OpRef::int_op(5);
+        let op = Op::new(OpCode::SameAsI, &[]);
+        op.pos().set(pos);
+        op.set_forwarded_const(majit_ir::Const::from_value(majit_ir::Value::Int(7)));
+        assert!(
+            matches!(
+                op.forwarded().borrow(),
+                majit_ir::forwarding::Forwarded::SmallConst(_)
+            ),
+            "i32 ConstInt must pack as SmallConst"
+        );
+        ctx.resop_refs.insert(pos, OpRc::new(op));
+        ctx.next_pos = 5;
+        let reserved = ctx.reserve_pos_typed(majit_ir::Type::Int);
+        assert_eq!(
+            reserved.raw(),
+            6,
+            "SmallConst-forwarded position 5 must stay claimed"
+        );
+    }
+
+    #[test]
+    fn take_preamble_forwarded_opinfo_reads_smallconst() {
+        use majit_ir::forwarding::ForwardingHost;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 0, 0, 0);
+        let pos = OpRef::int_op(5);
+        let op = Op::new(OpCode::SameAsI, &[]);
+        op.pos().set(pos);
+        op.set_forwarded_const(majit_ir::Const::from_value(majit_ir::Value::Int(7)));
+        ctx.resop_refs.insert(pos, OpRc::new(op));
+        let info = ctx
+            .take_preamble_forwarded_opinfo(pos)
+            .expect("SmallConst must produce preamble IntBound info");
+        match info {
+            crate::optimizeopt::info::OpInfo::IntBound(ib) => {
+                assert_eq!(ib.borrow().lower, 7);
+                assert_eq!(ib.borrow().upper, 7);
+            }
+            other => panic!("expected IntBound, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                ctx.read_forwarded(pos),
+                None | Some(majit_ir::forwarding::Forwarded::None)
+            ),
+            "consumed SmallConst forwarding must be cleared"
         );
     }
 }
@@ -9222,7 +9752,7 @@ mod boxref_forwarding_tests {
         ctx.make_equal_to(&b0, &b1);
         assert!(matches!(b0.get_forwarded(), BoxForwarded::InputArg(_)));
         let walked = b0.get_box_replacement(false);
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &walked
                 .bound_inputarg()
                 .expect("walked terminal carries bound InputArg"),
@@ -9260,7 +9790,7 @@ mod boxref_forwarding_tests {
 
         // The producer emits at pos 2.
         let mut producer = Op::new(OpCode::IntLt, &[b0.clone(), b1.clone()]);
-        producer.pos.set(pos2);
+        producer.pos().set(pos2);
         ctx.emit(producer);
 
         // The frozen consumer arg must resolve to the emitted producer; the
@@ -9273,7 +9803,7 @@ mod boxref_forwarding_tests {
         assert!(
             resolved
                 .bound_op()
-                .is_some_and(|op| std::rc::Rc::ptr_eq(&op, &producer_b)),
+                .is_some_and(|op| OpRc::ptr_eq(&op, &producer_b)),
             "consumer must resolve to the emitted producer, not the orphaned stand-in"
         );
     }
@@ -9310,7 +9840,7 @@ mod boxref_forwarding_tests {
         // transient operand sharing `ia_holder[1]`'s identity.
         assert!(matches!(b0.get_forwarded(), BoxForwarded::InputArg(_)));
         let walked = b0.get_box_replacement(false);
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &walked
                 .bound_inputarg()
                 .expect("walked terminal carries bound InputArg"),
@@ -9334,7 +9864,7 @@ mod boxref_forwarding_tests {
         // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
         match &b0.get_forwarded() {
-            BoxForwarded::Const(c) => assert_eq!(c.get(), majit_ir::Value::Int(42)),
+            other if other.const_value() == Some(majit_ir::Value::Int(42)) => {}
             other => panic!("expected b0 to forward to Const, got {:?}", other),
         }
     }
@@ -9366,28 +9896,21 @@ mod boxref_forwarding_tests {
         let (b, _ia) = bound_inputarg_operand(Type::Ref, 0);
         ctx.seed_boxes_canonical(std::slice::from_ref(&b));
         ctx.make_constant_arg(&b, Value::Ref(GcRef(0xdead_beef)));
-        match &b.get_forwarded() {
-            BoxForwarded::Const(c) => {
-                assert_eq!(c.get(), majit_ir::Value::Ref(GcRef(0xdead_beef)));
-            }
-            other => panic!(
-                "expected Forwarded::Const(Ref) post make_constant, got {:?}",
-                other
-            ),
-        }
+        assert_eq!(
+            b.get_forwarded().const_value(),
+            Some(majit_ir::Value::Ref(GcRef(0xdead_beef))),
+            "expected const-ref terminal post make_constant, got {:?}",
+            b.get_forwarded()
+        );
         // Use the operand form because `make_nonnull` writes to the box's
         // forwarded slot.
         ctx.make_nonnull(&b);
-        match &b.get_forwarded() {
-            BoxForwarded::Const(c) => {
-                assert_eq!(
-                    c.get(),
-                    majit_ir::Value::Ref(GcRef(0xdead_beef)),
-                    "make_nonnull must not overwrite the Const slot"
-                );
-            }
-            other => panic!("make_nonnull clobbered Const slot — got {:?}", other),
-        }
+        assert_eq!(
+            b.get_forwarded().const_value(),
+            Some(majit_ir::Value::Ref(GcRef(0xdead_beef))),
+            "make_nonnull must not overwrite the Const slot — got {:?}",
+            b.get_forwarded()
+        );
     }
 
     /// `resoperation.py get_box_replacement` + `history.py:188
@@ -9418,13 +9941,10 @@ mod boxref_forwarding_tests {
         let first = b1.get_box_replacement(false);
         let second = b1.get_box_replacement(false);
         assert!(first.is_constant());
-        match (&first, &second) {
-            (Operand::Const(a), Operand::Const(b)) => assert!(
-                std::rc::Rc::ptr_eq(a, b),
-                "get_box_replacement must return the Const object stored in _forwarded"
-            ),
-            other => panic!("expected two Const terminals, got {other:?}"),
-        }
+        assert_eq!(
+            first, second,
+            "get_box_replacement must return the identity stored in _forwarded"
+        );
         // Negative case: operand with no constant forwarding.
         let (nb, _ia_nb) = bound_inputarg_operand(Type::Int, 0);
         assert!(!nb.get_box_replacement(false).is_constant());
@@ -9465,9 +9985,7 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         ctx.make_constant_arg(&b0, Value::Int(42));
         match &b0.get_forwarded() {
-            BoxForwarded::Const(c) => {
-                assert_eq!(c.get(), majit_ir::Value::Int(42));
-            }
+            other if other.const_value() == Some(majit_ir::Value::Int(42)) => {}
             other => panic!("expected Forwarded::Const(Int 42), got {:?}", other),
         }
     }
@@ -9501,9 +10019,7 @@ mod boxref_forwarding_tests {
         let b_const = ctx.materialize_operand_at(const_opref);
         ctx.make_equal_to(&b0, &b_const);
         match &b0.get_forwarded() {
-            BoxForwarded::Const(c) => {
-                assert_eq!(c.get(), majit_ir::Value::Int(42));
-            }
+            other if other.const_value() == Some(majit_ir::Value::Int(42)) => {}
             other => panic!("expected Forwarded::Const(Int 42), got {:?}", other),
         }
     }
@@ -9679,7 +10195,7 @@ mod boxref_forwarding_tests {
             .expect("canonical store resolves the slot");
         // No forwarding: the resolver materialises a fresh terminal operand
         // bound to the same `InputArgRc` as the seeded slot.
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &got.bound_inputarg()
                 .expect("resolved terminal carries bound InputArg"),
             &ia_holder[0],
@@ -9700,7 +10216,7 @@ mod boxref_forwarding_tests {
         let got = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_typed(0, Type::Int))
             .expect("bound box resolves");
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &got.bound_inputarg()
                 .expect("walked terminal carries bound InputArg"),
             &ia_holder[1],
@@ -9744,7 +10260,7 @@ mod boxref_forwarding_tests {
             .expect("canonical store resolves the slot");
         // Walker terminates at the slot (its `_forwarded` is Info, not a
         // chain step); the resolved operand shares b0's bound InputArg.
-        assert!(std::rc::Rc::ptr_eq(
+        assert!(majit_ir::InputArgRc::ptr_eq(
             &got.bound_inputarg()
                 .expect("resolved terminal carries bound InputArg"),
             &ia_holder[0],
@@ -9775,7 +10291,7 @@ mod boxref_forwarding_tests {
             descr: std::sync::Arc::new(DummySizeDescr),
             known_class: None,
             ob_type_descr: None,
-            fields: Vec::new(),
+            fields: Default::default(),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         });
@@ -9845,13 +10361,13 @@ mod boxref_forwarding_tests {
     #[test]
     fn drained_operations_invalidate_recorded_guard_positions() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        let guard = std::rc::Rc::new(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&b)));
+        let guard = OpRc::new(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&b)));
         ctx.push_new_operation(guard);
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 0 });
         assert!(ctx.get_last_guard(&b).is_some());
 
         let _old_operations = ctx.take_new_operations();
-        ctx.push_new_operation(std::rc::Rc::new(Op::new(OpCode::IntAdd, &[])));
+        ctx.push_new_operation(OpRc::new(Op::new(OpCode::IntAdd, &[])));
 
         assert!(ctx.get_last_guard(&b).is_none());
         assert!(ctx.last_guard_pos(&b).is_none());
@@ -10788,7 +11304,7 @@ mod ensure_ptr_info_arg0_tests {
             )],
             descr,
         );
-        op.pos.set(OpRef::int_op(1));
+        op.pos().set(OpRef::int_op(1));
         op
     }
 
@@ -10806,7 +11322,7 @@ mod ensure_ptr_info_arg0_tests {
             )],
             descr,
         );
-        op.pos.set(OpRef::int_op(1));
+        op.pos().set(OpRef::int_op(1));
         op
     }
 
@@ -10875,7 +11391,7 @@ mod ensure_ptr_info_arg0_tests {
                 )],
                 descr,
             );
-            op.pos.set(OpRef::int_op(1));
+            op.pos().set(OpRef::int_op(1));
             op
         };
         let seed_box = op.arg(0);
@@ -10912,7 +11428,7 @@ mod ensure_ptr_info_arg0_tests {
                 )],
                 descr,
             );
-            op.pos.set(OpRef::int_op(1));
+            op.pos().set(OpRef::int_op(1));
             op
         };
         let seed_box = op.arg(0);
@@ -11238,14 +11754,14 @@ mod imported_short_preamble_fallback_tests {
                 crate::history::test_support::rooted_resop_operand(majit_ir::Type::Int, 8),
             ],
         );
-        replay_op.pos.set(OpRef::int_op(14));
+        replay_op.pos().set(OpRef::int_op(14));
         // shortpreamble.py non-invented PureOp.produce_op: `op = self.res`.
         // pop.op carries the body-visible OpRef directly (no forwarding chain
         // installed for non-invented Pure).
         let pop = crate::optimizeopt::info::PreambleOp {
             op: majit_ir::operand::Operand::bound_from_opref(OpRef::int_op(41)),
             invented_name: false,
-            preamble_op: std::rc::Rc::new(replay_op),
+            preamble_op: OpRc::new(replay_op),
             same_as_source: None,
         };
 
@@ -11266,7 +11782,7 @@ mod imported_short_preamble_fallback_tests {
                 .collect::<Vec<_>>(),
             vec![OpRef::int_op(7), OpRef::int_op(8)]
         );
-        assert_eq!(sp.ops[0].op.pos.get(), OpRef::int_op(14));
+        assert_eq!(sp.ops[0].op.pos().get(), OpRef::int_op(14));
     }
 }
 
@@ -11326,7 +11842,7 @@ mod opt_box_env_tests {
                 descr: Arc::new(DummySizeDescr),
                 known_class: Some(0x1234),
                 ob_type_descr: None,
-                fields: Vec::new(),
+                fields: Default::default(),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
@@ -11369,7 +11885,7 @@ mod opt_box_env_tests {
         // identity lives on the bound `InputArgRc`.
         let second = ctx.materialize_operand_at(arg);
         assert!(
-            std::rc::Rc::ptr_eq(
+            majit_ir::InputArgRc::ptr_eq(
                 &ia,
                 &second.bound_inputarg().expect("second bound to InputArg"),
             ),
@@ -11387,6 +11903,6 @@ mod opt_box_env_tests {
         let op = materialised
             .bound_op()
             .expect("empty ResOp slot lazy-materialised the wrong host kind");
-        assert_eq!(op.pos.get(), result);
+        assert_eq!(op.pos().get(), result);
     }
 }

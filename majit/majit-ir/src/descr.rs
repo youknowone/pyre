@@ -133,10 +133,10 @@ pub type DescrRef = Arc<dyn Descr>;
 /// Rust's `Arc<dyn Descr>` is a fat pointer (data + vtable).  Codegen can
 /// only bake the data half, so reconstructing the fat Arc at recovery
 /// time needs a side-channel for the vtable.  `FailDescrCell` is a
-/// concrete-typed wrapper: `Arc<FailDescrCell>` is thin, so
-/// `Arc::as_ptr(&cell) as *const () as usize` bakes a complete identity
-/// and `Arc::from_raw(addr as *const FailDescrCell)` recovers it
-/// without a registry.
+/// concrete-typed wrapper: the cell is the 16 B fat `DescrRef`, and
+/// [`FailDescrStore`] keeps many cells in one `Vec` so `thin_ptr` still
+/// bakes a complete identity without a 16 B `Box` per guard.
+/// [`recover_fail_descr_cell`] reads the descr back without a registry.
 ///
 /// The cell is the unit kept alive by
 /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py`);
@@ -146,8 +146,55 @@ pub struct FailDescrCell {
 }
 
 impl FailDescrCell {
-    pub fn wrap(descr: DescrRef) -> Arc<Self> {
-        Arc::new(Self { descr })
+    pub fn new(descr: DescrRef) -> Self {
+        Self { descr }
+    }
+
+    pub fn wrap(descr: DescrRef) -> Box<Self> {
+        Box::new(Self::new(descr))
+    }
+
+    /// Address baked into `jf_descr` / `jf_force_descr`.
+    pub fn thin_ptr(cell: &Self) -> usize {
+        cell as *const Self as usize
+    }
+}
+
+/// Keep-alive for baked [`FailDescrCell`] addresses.
+///
+/// One `Vec` of inline 16 B fat pointers instead of one `Box` per guard:
+/// `with_capacity(n)` is a single `n * 16` heap, so the 16-byte class
+/// is not hit on every guard. Chunks never reallocate once a thin
+/// pointer has been handed out.
+#[derive(Default)]
+pub struct FailDescrStore {
+    chunks: Vec<Vec<FailDescrCell>>,
+}
+
+impl FailDescrStore {
+    pub fn with_capacity(n: usize) -> Self {
+        let mut chunks = Vec::new();
+        if n > 0 {
+            chunks.push(Vec::with_capacity(n));
+        }
+        Self { chunks }
+    }
+
+    pub fn push(&mut self, descr: DescrRef) -> usize {
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() == chunk.capacity())
+        {
+            self.chunks.push(Vec::with_capacity(8));
+        }
+        let last = self.chunks.last_mut().expect("fail descr chunk");
+        last.push(FailDescrCell::new(descr));
+        FailDescrCell::thin_ptr(last.last().expect("just pushed"))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &FailDescrCell> {
+        self.chunks.iter().flatten()
     }
 }
 
@@ -172,17 +219,14 @@ impl std::fmt::Debug for FailDescrCell {
 /// `history.py AbstractDescr.show(cpu, descr_gcref)` parity.
 ///
 /// # Safety
-/// `addr` MUST be the address of a live `Arc<FailDescrCell>` whose
-/// strong refcount is held by `CompiledLoopToken.asmmemmgr_gcreftracers`
+/// `addr` MUST be [`FailDescrCell::thin_ptr`] of a live cell whose
+/// cell is held by `CompiledLoopToken.asmmemmgr_gcreftracers`
 /// (or an equivalent keep-alive collection) while the baked JIT code
 /// references this address.  Calling with any other address — including
 /// the address of a different concrete type — is undefined behavior.
-pub unsafe fn recover_fail_descr_cell(addr: usize) -> Arc<FailDescrCell> {
-    let ptr = addr as *const FailDescrCell;
-    unsafe {
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
-    }
+pub unsafe fn recover_fail_descr_cell(addr: usize) -> DescrRef {
+    let cell = unsafe { &*(addr as *const FailDescrCell) };
+    cell.descr.clone()
 }
 
 /// descr.py: GcCache dict keys.
@@ -3855,6 +3899,11 @@ impl Descr for QuasiImmutDescr {
     }
 }
 
+/// `history.py` `AbstractFailDescr.rd_locs` — per-fail-arg jitframe
+/// slots. Eight `u16`s stay inline so `append_guard_token` does not
+/// mint a 16 B `Vec` for the common guard.
+pub type RdLocs = smallvec::SmallVec<[u16; 8]>;
+
 /// Descriptor for guard failures — carries resume information.
 ///
 /// Mirrors rpython/jit/metainterp/history.py AbstractFailDescr.
@@ -3918,11 +3967,11 @@ pub trait FailDescr: Descr {
     }
 
     /// `compile.py self.rd_numb = other.rd_numb` parity: the
-    /// reference-share variant of `rd_numb()`.  `Arc<[u8]>` lets
+    /// reference-share variant of `rd_numb()`.  `NumberingRef` lets
     /// `copy_all_attributes_from` clone the donor's payload with a
     /// single refcount bump rather than allocating a fresh buffer.
     /// Returns `None` for non-resume descrs.
-    fn rd_numb_arc(&self) -> Option<std::sync::Arc<[u8]>> {
+    fn rd_numb_arc(&self) -> Option<crate::NumberingRef> {
         None
     }
 
@@ -3940,7 +3989,7 @@ pub trait FailDescr: Descr {
     /// `compile.py self.rd_numb = other.rd_numb` reference-share
     /// setter.  Default panics for non-resume descrs (same contract as
     /// `set_rd_numb`).
-    fn set_rd_numb_arc(&self, _value: Option<std::sync::Arc<[u8]>>) {
+    fn set_rd_numb_arc(&self, _value: Option<crate::NumberingRef>) {
         panic!(
             "set_rd_numb_arc invoked on a FailDescr that does not \
              carry rd_numb (compile.py:855 `_attrs_` only on \
@@ -4226,22 +4275,20 @@ pub trait FailDescr: Descr {
     }
 
     /// `history.py` `AbstractFailDescr._attrs_` `rd_locs` —
-    /// `llsupport/assembler.py:279 guardtok.faildescr.rd_locs =
-    /// positions` writes the per-fail-arg jitframe slot positions as a
-    /// `Vec<u16>`.  `llsupport/llmodel.py:424 descr.rd_locs[index] *
-    /// WORD` reads to compute the absolute jitframe offset during
-    /// `get_value_direct`.
+    /// `llsupport/assembler.py` writes the per-fail-arg jitframe slot
+    /// positions as `rd_locs`. `llsupport/llmodel.py` reads
+    /// `descr.rd_locs[index] * WORD` during `get_value_direct`.
     ///
     /// Default `&[]` — every `AbstractFailDescr` instance has the slot,
     /// empty by default; populated by
-    /// `llsupport/assembler.py:225 write_failure_recovery_description`.
+    /// `write_failure_recovery_description`.
     fn rd_locs(&self) -> &[u16] {
         &[]
     }
 
-    /// `llsupport/assembler.py:279` write side.  Default panics — only
+    /// `llsupport/assembler.py` write side.  Default panics — only
     /// `ResumeGuardDescr`-family guards reach this writer.
-    fn set_rd_locs(&self, _locs: Vec<u16>) {
+    fn set_rd_locs(&self, _locs: RdLocs) {
         panic!(
             "set_rd_locs invoked on a FailDescr that does not carry \
              the AbstractFailDescr.rd_locs slot (history.py:132)"
@@ -8093,6 +8140,29 @@ mod tests {
         // even a few times would repeat the array descr's own name.
         assert_eq!(from_array.matches("SimpleArrayDescr").count(), 1);
         assert_eq!(from_interior.matches("SimpleInteriorFieldDescr").count(), 1);
+    }
+
+    #[test]
+    fn wrap_bakes_a_thin_ptr_that_recovers_the_same_descr() {
+        let descr: DescrRef = Arc::new(SimpleFailDescr::new(1, 2, vec![Type::Int]));
+        let cell = FailDescrCell::wrap(descr.clone());
+        assert!(std::mem::size_of_val(&*cell) <= 16);
+        let ptr = FailDescrCell::thin_ptr(&cell);
+        let recovered = unsafe { recover_fail_descr_cell(ptr) };
+        assert!(Arc::ptr_eq(&descr, &recovered));
+    }
+
+    #[test]
+    fn fail_descr_store_keeps_thin_ptrs_stable() {
+        let a: DescrRef = Arc::new(SimpleFailDescr::new(1, 2, vec![Type::Int]));
+        let b: DescrRef = Arc::new(SimpleFailDescr::new(3, 4, vec![Type::Int]));
+        let mut store = FailDescrStore::with_capacity(2);
+        let pa = store.push(a.clone());
+        let pb = store.push(b.clone());
+        let ra = unsafe { recover_fail_descr_cell(pa) };
+        let rb = unsafe { recover_fail_descr_cell(pb) };
+        assert!(Arc::ptr_eq(&a, &ra));
+        assert!(Arc::ptr_eq(&b, &rb));
     }
 
     /// `class_word_field()` is the layout's own answer, and "this layout has

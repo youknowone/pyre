@@ -11,12 +11,12 @@
 //! without it.
 
 use majit_ir::operand::Operand;
-use majit_ir::{ConstMap, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{ConstMap, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 use majit_metainterp::optimizeopt::unroll::UnrollOptimizer;
 
 fn positioned(opcode: OpCode, args: &[Operand], raw: u32) -> Op {
     let op = Op::new(opcode, args);
-    op.pos.set(OpRef::op_typed(raw, opcode.result_type()));
+    op.pos().set(OpRef::op_typed(raw, opcode.result_type()));
     op
 }
 
@@ -34,8 +34,8 @@ fn peeled_integer_loop_drops_the_loop_invariant_null_guard() {
     let null_arg = Operand::from_bound_inputarg(&null);
 
     let is_null = positioned(OpCode::GuardIsnull, std::slice::from_ref(&null_arg), 3);
-    is_null.rd_resume_position.set(0);
-    let less_than = std::rc::Rc::new(positioned(
+    is_null.set_rd_resume_position(0);
+    let less_than = OpRc::new(positioned(
         OpCode::IntLt,
         &[
             index_arg.clone(),
@@ -44,9 +44,9 @@ fn peeled_integer_loop_drops_the_loop_invariant_null_guard() {
         4,
     ));
     let in_range = positioned(OpCode::GuardTrue, &[Operand::from_bound_op(&less_than)], 5);
-    in_range.rd_resume_position.set(1);
-    let next_acc = std::rc::Rc::new(positioned(OpCode::IntAdd, &[acc_arg, index_arg.clone()], 6));
-    let next_index = std::rc::Rc::new(positioned(
+    in_range.set_rd_resume_position(1);
+    let next_acc = OpRc::new(positioned(OpCode::IntAdd, &[acc_arg, index_arg.clone()], 6));
+    let next_index = OpRc::new(positioned(
         OpCode::IntAdd,
         &[index_arg, Operand::const_from_value(Value::Int(1))],
         7,
@@ -72,7 +72,10 @@ fn peeled_integer_loop_drops_the_loop_invariant_null_guard() {
     let mut optimizer = UnrollOptimizer::new();
     optimizer.trace_inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Int, Type::Ref]);
     optimizer.trace_inputarg_boxes = vec![acc, index, null];
-    optimizer.snapshot_boxes = vec![Some(Vec::new()), Some(Vec::new())];
+    optimizer.snapshot_boxes = vec![
+        Some(majit_metainterp::optimizeopt::SnapshotBoxList::new()),
+        Some(majit_metainterp::optimizeopt::SnapshotBoxList::new()),
+    ];
     let mut constants: ConstMap<Value> = ConstMap::default();
     let (optimized, _) =
         optimizer.optimize_trace_with_constants_and_inputs(&ops, &mut constants, 3);

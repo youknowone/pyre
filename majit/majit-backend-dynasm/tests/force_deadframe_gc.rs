@@ -47,15 +47,14 @@
 //! else, and only then collects.
 use parking_lot::Mutex;
 use std::cell::{Cell, UnsafeCell};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use majit_backend::{Backend, DeadFrame, JitCellToken};
 use majit_backend_dynasm::runner::DynasmBackend;
 use majit_ir::forwarding::bound_operand_from_opref as rb;
 use majit_ir::{
-    CallDescr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, OopSpecIndex, Op, OpCode, OpRef,
-    Type, Value,
+    CallDescr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, OopSpecIndex, Op, OpCode, OpRc,
+    OpRef, Type, Value,
 };
 
 /// The owner-root slots and the published nursery state are shared beyond one
@@ -324,7 +323,7 @@ impl Fixture {
         let r1 = inputargs[1].opref();
 
         let force_token = Op::new(OpCode::ForceToken, &[]);
-        force_token.pos.set(OpRef::ref_op(2));
+        force_token.pos().set(OpRef::ref_op(2));
 
         let call = Op::new(
             OpCode::CallMayForceN,
@@ -333,7 +332,7 @@ impl Fixture {
                 rb(OpRef::ref_op(2)),
             ],
         );
-        call.pos.set(OpRef::void_op(3));
+        call.pos().set(OpRef::void_op(3));
         call.setdescr(Arc::new(MayForceCallDescr {
             arg_types: vec![Type::Ref],
         }) as DescrRef);
@@ -341,18 +340,18 @@ impl Fixture {
         // Both probes are fail args here, so they are live across the call and
         // the call's gcmap has to cover the slots they spill to.
         let guard = Op::new(OpCode::GuardNotForced, &[]);
-        guard.pos.set(OpRef::void_op(4));
+        guard.pos().set(OpRef::void_op(4));
         guard.set_fail_arg_types(vec![Type::Ref, Type::Ref]);
         guard.setfailargs(vec![rb(r0), rb(r1)].into());
 
         let finish = Op::new(OpCode::Finish, &[]);
-        finish.pos.set(OpRef::void_op(5));
+        finish.pos().set(OpRef::void_op(5));
         finish.set_fail_arg_types(vec![Type::Ref, Type::Ref]);
         finish.setfailargs(vec![rb(r0), rb(r1)].into());
 
-        let ops: Vec<Rc<Op>> = vec![force_token, call, guard, finish]
+        let ops: Vec<OpRc> = vec![force_token, call, guard, finish]
             .into_iter()
-            .map(Rc::new)
+            .map(OpRc::new)
             .collect();
         let token = JitCellToken::new(token_number);
         backend

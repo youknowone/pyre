@@ -37,6 +37,7 @@ on:
       - ".pre-commit-config.yaml"
   workflow_dispatch:
 
+# Retrigger path: this file is in the pull_request paths filter.
 concurrency:
   # One group per PR and one per tracked branch, so only the newest run of each
   # survives: a PR's runs supersede each other, and a merge train on `main`

@@ -106,8 +106,8 @@ impl IntBoundMakeGuards for IntBound {
             // pyre allocates a fresh Int OpRef into `op.pos` so the next
             // guard's arg vector captures the producer's result, not the
             // sentinel `OpRef::NONE` left over from `Op::new`.
-            op.pos.set(ctx.alloc_op_position_typed(Type::Int));
-            let op_pos = op.pos.get();
+            op.pos().set(ctx.alloc_op_position_typed(Type::Int));
+            let op_pos = op.pos().get();
             guards.push(op);
             let arg_op = ctx.materialize_operand_at(op_pos);
             guards.push(Op::new(OpCode::GuardTrue, std::slice::from_ref(&arg_op)));
@@ -120,8 +120,8 @@ impl IntBoundMakeGuards for IntBound {
             // intutils.py:1281 INT_LE producer identity: a fresh Int OpRef in
             // `op.pos` so the GuardTrue below captures the producer's result
             // rather than `Op::new`'s `OpRef::NONE`.
-            op.pos.set(ctx.alloc_op_position_typed(Type::Int));
-            let op_pos = op.pos.get();
+            op.pos().set(ctx.alloc_op_position_typed(Type::Int));
+            let op_pos = op.pos().get();
             guards.push(op);
             let arg_op = ctx.materialize_operand_at(op_pos);
             guards.push(Op::new(OpCode::GuardTrue, std::slice::from_ref(&arg_op)));
@@ -134,8 +134,8 @@ impl IntBoundMakeGuards for IntBound {
             // intutils.py:1286 INT_AND producer identity: a fresh Int OpRef in
             // `op.pos` so the GuardValue below captures the producer's result
             // rather than `Op::new`'s `OpRef::NONE`.
-            op.pos.set(ctx.alloc_op_position_typed(Type::Int));
-            let op_pos = op.pos.get();
+            op.pos().set(ctx.alloc_op_position_typed(Type::Int));
+            let op_pos = op.pos().get();
             guards.push(op);
             let value = alloc_const(Value::Int(self.tvalue as i64));
             let arg_op = ctx.materialize_operand_at(op_pos);
