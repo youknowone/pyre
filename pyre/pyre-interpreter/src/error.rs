@@ -820,9 +820,9 @@ impl PyError {
             return;
         }
         if let Some(w_target) = crate::builtins::lookup_exc_class(class_name) {
+            // Fresh instance: no recorded `w_class?` read can name it yet.
             unsafe {
                 (*(self.exc_object as *mut pyre_object::PyObject)).w_class = w_target;
-                pyre_object::notify_w_class_mutated();
             }
         }
     }
@@ -1296,9 +1296,9 @@ impl PyError {
         // `os_error_family_new`: the subclasses share OSError's layout, so
         // the ExcKind stays OSError and only the class differs.
         if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
+            // Fresh instance: no recorded `w_class?` read can name it yet.
             unsafe {
                 (*(exc() as *mut pyre_object::PyObject)).w_class = w_target;
-                pyre_object::notify_w_class_mutated();
             }
         }
         // `PyErr_SetExcFromWindowsErrWithFilenameObjects` builds the exception
@@ -1459,9 +1459,9 @@ impl PyError {
         // object alive without keeping it in place.
         let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
         if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
+            // Fresh instance: no recorded `w_class?` read can name it yet.
             unsafe {
                 (*(exc() as *mut pyre_object::PyObject)).w_class = w_target;
-                pyre_object::notify_w_class_mutated();
             }
         }
         let errno_slot = exc_slot + 1;

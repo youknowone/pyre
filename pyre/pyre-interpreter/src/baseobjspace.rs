@@ -13019,8 +13019,10 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         if crate::objspace::std::mapdict::has_mapdict_storage(w_obj) {
             crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
         }
-        (*w_obj).w_class = w_newcls;
+        // Invalidate before the store so a folded `w_class?` cannot observe
+        // the new class while `GUARD_NOT_INVALIDATED` is still valid.
         pyre_object::notify_w_class_mutated();
+        (*w_obj).w_class = w_newcls;
     }
     Ok(w_none())
 }
