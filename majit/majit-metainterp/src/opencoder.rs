@@ -532,6 +532,16 @@ where
             Some(d) => majit_ir::Op::with_descr(src.opcode, &args, d),
             None => majit_ir::Op::new(src.opcode, &args),
         };
+        // history.py FrontendOp `_resint`/`_resfloat`/`_resref` ride on
+        // the recorded box. The byte-stream iterator never sees them;
+        // this structured walker must keep the stamp or fannkuch grows
+        // two extra JUMP bridges (22 → 24, 5049 → 5450 guard_failures).
+        if let Some(v) = src.get_value() {
+            res.set_value(v);
+        }
+        if let Some(vecinfo) = src.get_vecinfo() {
+            res.set_vecinfo(vecinfo);
+        }
         if let Some(fa) = src.guard_fail_args() {
             let mapped: majit_ir::resoperation::OpArgVec = fa
                 .iter()
@@ -3429,6 +3439,19 @@ mod tests {
         let fa = r2.guard_fail_args().unwrap();
         assert_eq!(fa[0].to_opref(), iarg(10));
         assert_eq!(fa[1].to_opref(), iop(11));
+    }
+
+    #[test]
+    fn test_trace_iterator_keeps_frontend_stamp() {
+        // history.py FrontendOp `_resint` lives on the recorded box.
+        // The structured walker must copy it onto the cls() result.
+        let mut add = op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(0)]);
+        add.set_value(majit_ir::value::Value::Int(7));
+        let ops = vec![add];
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &[majit_ir::Type::Int], 10);
+        let r = iter.next().unwrap();
+        assert_eq!(r.get_value(), Some(majit_ir::value::Value::Int(7)));
     }
 
     #[test]
