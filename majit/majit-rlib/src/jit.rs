@@ -36,6 +36,7 @@ pub fn install_we_are_jitted(f: fn() -> bool) {
 /// would let it fold every `if isconstant(x)` in the interpreter to the
 /// not-constant arm and delete the looked-inside arm before `jtransform`
 /// ever rewrites the call to `*_isconstant`.
+#[majit_macros::specialize_call_location]
 #[majit_macros::oopspec("jit.isconstant(value)")]
 pub fn isconstant<T: ?Sized>(_value: &T) -> bool {
     crate::nonconst::non_constant(false)
@@ -44,6 +45,7 @@ pub fn isconstant<T: ?Sized>(_value: &T) -> bool {
 /// `rlib/jit.py isvirtual`.
 ///
 /// Non-constant for the same reason as [`isconstant`].
+#[majit_macros::specialize_call_location]
 #[majit_macros::oopspec("jit.isvirtual(value)")]
 pub fn isvirtual<T: ?Sized>(_value: &T) -> bool {
     crate::nonconst::non_constant(false)

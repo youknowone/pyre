@@ -44,6 +44,11 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
     // objectmodel.py specialize.memo's function attribute, consumed by
     // Bookkeeper.newfuncdesc (not an elidable/residual JIT-policy flag).
     ("_annspecialcase_memo_", &["specialize:memo"]),
+    // objectmodel.py specialize.call_location's function attribute.
+    (
+        "_annspecialcase_call_location_",
+        &["specialize:call_location"],
+    ),
 ];
 
 /// Build a `{crate_stripped_fn_path → sorted-deduped hints}` map from
@@ -427,6 +432,24 @@ mod tests {
                 &functions,
             ),
             "owner::Cache::getorbuild"
+        );
+    }
+
+    #[test]
+    fn call_location_marker_recovers_its_function_attribute() {
+        let (prefix, hints) = super::CONST_PREFIX_HINTS
+            .iter()
+            .find(|(prefix, _)| *prefix == "_annspecialcase_call_location_")
+            .unwrap();
+        assert_eq!(*hints, &["specialize:call_location"]);
+        let functions = HashSet::from(["jit::isconstant".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "majit_rlib::jit::isconstant::_annspecialcase_call_location_isconstant",
+                prefix,
+                &functions,
+            ),
+            "jit::isconstant"
         );
     }
 
