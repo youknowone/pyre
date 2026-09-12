@@ -3834,6 +3834,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     | majit_ir::RuntimeHelperKind::BoxInt
                     | majit_ir::RuntimeHelperKind::NewtupleFromArray
                     | majit_ir::RuntimeHelperKind::NewlistFromArray
+                    | majit_ir::RuntimeHelperKind::BuildStringFromArray
                     | majit_ir::RuntimeHelperKind::GetCurrentException
                     | majit_ir::RuntimeHelperKind::LoadDeref
                     // `super_attr_unwrap` is a total function of its argument —

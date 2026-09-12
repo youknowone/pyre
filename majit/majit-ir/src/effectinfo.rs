@@ -1010,6 +1010,14 @@ pub enum RuntimeHelperKind {
     /// recovered from the backing array (const length + per-index element
     /// shadows) rather than from residual args.
     NewlistFromArray,
+    /// `bh_build_string_from_array(array)` — the BUILD_STRING array consumer
+    /// (`pyopcode.py BUILD_STRING`).  Fragments are already strings
+    /// (FORMAT_* / CONVERT_VALUE ran first).  The walker recovers them
+    /// from the backing-array heap-cache and left-folds `descr_add`
+    /// (`jit_str_concat`), the same channel as `BINARY_OP ADD` of two
+    /// exact `str`s.  `Utf8StringBuilder` look-inside remains the next
+    /// port for a single virtualized build.
+    BuildStringFromArray,
     /// `n_varargs_fn(frame, exc, cause)` — the RAISE-family residual the
     /// codewriter emits for `n argc>=1` (`build_n_varargs_fn_residual_call_r_r_insn`).
     /// `cause` (the trailing Ref arg) is a `PY_NULL` sentinel for `raise X`

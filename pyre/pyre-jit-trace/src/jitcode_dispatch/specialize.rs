@@ -16153,6 +16153,96 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// BUILD_STRING — already-string fragments concatenated by
+/// `pyopcode.py BUILD_STRING`.
+///
+/// The codewriter residualises the opcode as `new_array_clear` +
+/// `setarrayitem_gc` + `bh_build_string_from_array`.  Recover the
+/// fragment boxes from the backing-array heap-cache (the same
+/// [`try_walker_specialize_newtuple`] read) and left-fold
+/// `descr_add` (`jit_str_concat`), the channel
+/// [`try_walker_specialize_binary_op_str`] already records for
+/// `BINARY_OP ADD` of two exact `str`s.  A one-fragment BUILD_STRING
+/// is the operand itself.
+///
+/// `Utf8StringBuilder` look-inside (`rutf8.py`) remains the next port
+/// for a single virtualized build.  This fold does not stamp
+/// `OS_STR_CONCAT`: see [`try_walker_specialize_binary_op_str`].
+pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+        return Ok(None);
+    }
+    let arr = r_args[0];
+    let descr_idx = crate::state::pyobject_gcarray_descr().index();
+    let mut fragments = Vec::new();
+    let mut concretes = Vec::new();
+    loop {
+        let index = fragments.len() as i64;
+        let Some(elem) =
+            ctx.trace_ctx
+                .heapcache_getarrayitem(arr, OpRef::ConstInt(index), descr_idx)
+        else {
+            break;
+        };
+        let Some(obj) = walker_concrete_ref_object(ctx, elem) else {
+            return Ok(None);
+        };
+        if unsafe { !pyre_object::is_exact_type(obj, &pyre_object::STR_TYPE) } {
+            return Ok(None);
+        }
+        fragments.push(elem);
+        concretes.push(obj);
+    }
+    if fragments.is_empty() {
+        return Ok(None);
+    }
+
+    let boxed_result = pyre_interpreter::runtime_ops::build_string_from_refs(&concretes);
+    if boxed_result.is_null()
+        || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
+    {
+        return Ok(None);
+    }
+
+    for &frag in &fragments {
+        walker_guard_exact_str(ctx, op_pc, frag)?;
+    }
+
+    if fragments.len() == 1 {
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, fragments[0])?;
+        return Ok(Some(()));
+    }
+
+    let helper = pyre_object::unicodeobject::jit_str_concat as *const ();
+    let mut acc = fragments[0];
+    for i in 1..fragments.len() {
+        let prefix = if i + 1 == fragments.len() {
+            boxed_result
+        } else {
+            pyre_interpreter::runtime_ops::build_string_from_refs(&concretes[..=i])
+        };
+        let concat = ctx.trace_ctx.call_ref_typed_with_effect(
+            helper,
+            &[acc, fragments[i]],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            concat,
+            majit_ir::Value::Ref(majit_ir::GcRef(prefix as usize)),
+        );
+        acc = concat;
+    }
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, acc)?;
+    Ok(Some(()))
+}
+
 /// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
 /// shape the meta-tracer produces upstream (intobject.py `_divmod` →
 /// `space.newtuple2(space.newint(z), space.newint(m))`) instead of the opaque
