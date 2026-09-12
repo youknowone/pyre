@@ -611,6 +611,9 @@ pub struct WalkSession {
     /// Portal `MIFrame` registers while a child runs. Not on `framestack`
     /// because `framestack.len()` is the inlined-callee depth.
     pub(crate) portal_live: Option<LiveFrameRegs>,
+    /// Paused transparent-helper `SubWalkFrame` banks. Helpers are not
+    /// Python `MIFrame`s and must not overwrite `portal_live`.
+    pub(crate) helper_live: Vec<LiveFrameRegs>,
     /// The root frame's `is_being_profiled` portal green for this walk.
     pub is_being_profiled: bool,
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
@@ -746,6 +749,7 @@ impl Default for WalkSession {
             is_being_profiled: false,
             box_replacement_frames: Vec::new(),
             portal_live: None,
+            helper_live: Vec::new(),
             framestack: Vec::new(),
             next_call_id: 1,
             open_inline_activations: 0,
@@ -6622,6 +6626,10 @@ struct InlineParentFrame {
     registers_i: Option<RegisterBank>,
     registers_f: Option<RegisterBank>,
     frame_state: Option<WalkFrameState>,
+    /// CALL in this paused caller that entered the child. `f_lasti` /
+    /// `f_lineno` for a getframe landing on this caller. `None` when the
+    /// parent is a reconstructed image with no live CALL.
+    caller_py_pc: Option<u32>,
 }
 
 impl InlineParentFrame {
@@ -6637,6 +6645,22 @@ impl InlineParentFrame {
         self.registers_f = Some(registers_f.clone());
         self.frame_state = Some(frame_state.clone());
         self
+    }
+
+    fn with_caller_py_pc(mut self, jitcode_index: u32, call_jit_pc: usize) -> Self {
+        self.caller_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc_public(
+            jitcode_index as i32,
+            call_jit_pc as i32,
+        )
+        .map(|py| py as u32);
+        self
+    }
+
+    fn paused_concrete_frame(&self) -> Option<usize> {
+        let state = self.frame_state.as_ref()?;
+        let borrowed = state.borrow();
+        let ptr = borrowed.callee_shadow.as_ref()?.concrete_frame;
+        (ptr != 0).then_some(ptr)
     }
 }
 
@@ -6697,6 +6721,7 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
         registers_i: None,
         registers_f: None,
         frame_state: None,
+        caller_py_pc: None,
     })
 }
 

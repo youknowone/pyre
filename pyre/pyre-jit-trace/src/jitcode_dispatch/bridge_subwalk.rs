@@ -892,6 +892,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         registers_i: None,
         registers_f: None,
         frame_state: None,
+        caller_py_pc: None,
     })
 }
 
@@ -1092,6 +1093,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         registers_i: None,
         registers_f: None,
         frame_state: None,
+        caller_py_pc: None,
     })
 }
 

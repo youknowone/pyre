@@ -2768,6 +2768,39 @@ fn walker_immediate_inline_caller_box<Sym: WalkSym>(
     Some((caller_box, caller_ptr))
 }
 
+/// A paused inlined ancestor stores the CALL that entered its child on
+/// `InlineParentFrame.caller_py_pc`. Walk `framestack` the way
+/// `MetaInterp.replace_box` walks `MIFrame`s.
+fn walker_paused_ancestor_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    landing_ptr: usize,
+) -> Option<(OpRef, u32)> {
+    let session = ctx.session.borrow();
+    for frame in &session.framestack {
+        for parent in &frame.parents {
+            let Some(py_pc) = parent.caller_py_pc else {
+                continue;
+            };
+            let Some(ptr) = parent.paused_concrete_frame() else {
+                continue;
+            };
+            if ptr != landing_ptr {
+                continue;
+            }
+            let red = ctx
+                .trace_ctx
+                .virtualref_virtual_for_object_ptr(ptr)
+                .or_else(|| {
+                    (ctx.trace_ctx.standard_virtualizable_ptr() == Some(ptr))
+                        .then(|| ctx.trace_ctx.standard_virtualizable_box())
+                        .flatten()
+                })?;
+            return Some((red, py_pc));
+        }
+    }
+    None
+}
+
 fn walker_frame_executing_py_pc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     concrete_obj: pyre_object::PyObjectRef,
@@ -2797,6 +2830,9 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
         && caller_ptr == concrete_obj as usize
     {
         return Some((caller_box, caller_py_pc));
+    }
+    if let Some(found) = walker_paused_ancestor_py_pc(ctx, concrete_obj as usize) {
+        return Some(found);
     }
     let (frame_box, frame_ptr) = walker_executing_frame_box(ctx)?;
     if frame_ptr != concrete_obj as usize {
@@ -13721,22 +13757,15 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     };
 
     // Until every app-level frame getter is lowered through its own red frame,
-    // admitting an arbitrary positive-depth result would expose it to a
-    // generic residual whose single live-coordinate slot cannot describe a
-    // nested caller chain.  `walker_frame_executing_py_pc` only knows the
-    // portal CALL and THIS level's immediate caller CALL.  A hop that lands
-    // on a farther inlined ancestor has a red box but no tracked pc, so
-    // `f_lasti` / `f_lineno` would fall through to the heap reader.
-    // Admit the portal and the immediate caller (`depth == 1`) only.
+    // admitting a landing whose CALL pc is untracked would expose `f_lasti`
+    // to the generic heap reader.  `walker_frame_executing_py_pc` now also
+    // reads `InlineParentFrame.caller_py_pc` for a farther inlined ancestor.
     if inline_level && depth_value > 0 {
         let landing_ptr = final_concrete_frame as usize;
         let standard_frame = landing_ptr == standard_vable_ptr;
-        let immediate_caller = depth_value == 1
-            && ctx
-                .trace_ctx
-                .virtualref_virtual_for_object_ptr(landing_ptr)
-                .is_some();
-        let known_red = (standard_frame || immediate_caller)
+        let tracked_ancestor =
+            walker_frame_executing_py_pc(ctx, final_concrete_frame as _, op.pc).is_some();
+        let known_red = (standard_frame || tracked_ancestor)
             && unsafe { (*final_concrete_frame).ob_header.ob_type }
                 == &pyre_interpreter::pyframe::FRAME_TYPE
             && unsafe {

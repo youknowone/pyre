@@ -2447,13 +2447,15 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         registers_i: None,
         registers_f: None,
         frame_state: None,
+        caller_py_pc: None,
     }
     .attach_live_caller(
         ctx.registers_r,
         ctx.registers_i,
         ctx.registers_f,
         &ctx.frame_state,
-    ))
+    )
+    .with_caller_py_pc(jitcode_index, call_jit_pc))
 }
 
 /// Paused-caller-frame computation for a NESTED multiframe inline (#68): the
@@ -2712,13 +2714,15 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         registers_i: None,
         registers_f: None,
         frame_state: None,
+        caller_py_pc: None,
     }
     .attach_live_caller(
         ctx.registers_r,
         ctx.registers_i,
         ctx.registers_f,
         &ctx.frame_state,
-    ))
+    )
+    .with_caller_py_pc(jitcode_index, call_jit_pc))
 }
 
 /// Capture the current inlined Python frame at a translated helper call's
@@ -2808,13 +2812,15 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         registers_i: None,
         registers_f: None,
         frame_state: None,
+        caller_py_pc: None,
     }
     .attach_live_caller(
         ctx.registers_r,
         ctx.registers_i,
         ctx.registers_f,
         &ctx.frame_state,
-    ))
+    )
+    .with_caller_py_pc(jitcode_index, call_jit_pc))
 }
 
 fn publish_outermost_parent_vable_scalars<Sym: WalkSym>(

@@ -122,8 +122,30 @@ pub(super) fn bind_paused_caller_regs(
     }
 }
 
+pub(super) fn push_helper_live(
+    session: &std::cell::RefCell<WalkSession>,
+    registers_r: &RegisterBank,
+    registers_i: &RegisterBank,
+    registers_f: &RegisterBank,
+    frame_state: &WalkFrameState,
+) {
+    session.borrow_mut().helper_live.push(LiveFrameRegs::new(
+        registers_r,
+        registers_i,
+        registers_f,
+        frame_state,
+    ));
+}
+
+pub(super) fn pop_helper_live(session: &std::cell::RefCell<WalkSession>) {
+    session.borrow_mut().helper_live.pop();
+}
+
 fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox: OpRef) {
     if let Some(live) = session.portal_live.as_ref() {
+        replace_live_regs(live, oldbox, newbox);
+    }
+    for live in &session.helper_live {
         replace_live_regs(live, oldbox, newbox);
     }
     for frame in &mut session.framestack {
@@ -279,6 +301,7 @@ mod frame_replacement_tests {
                 registers_i: None,
                 registers_f: None,
                 frame_state: None,
+                caller_py_pc: None,
             }],
             entry_executed_effects: 0,
             live: None,
@@ -433,6 +456,7 @@ mod frame_replacement_tests {
                 registers_i: None,
                 registers_f: None,
                 frame_state: Some(parent_state.clone()),
+                caller_py_pc: None,
             }],
             entry_executed_effects: 0,
             live: None,

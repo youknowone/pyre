@@ -31,6 +31,7 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
         registers_i: None,
         registers_f: None,
         frame_state: None,
+        caller_py_pc: None,
     };
     let frames = vec![
         InlineFrameGuard::enter(&outer, 0, false, vec![parent(0x1000)]),

@@ -12099,8 +12099,18 @@ impl Drop for SubWalkDriverGuard {
     }
 }
 
+struct HelperLiveGuard<'a> {
+    session: &'a std::cell::RefCell<WalkSession>,
+}
+
+impl Drop for HelperLiveGuard<'_> {
+    fn drop(&mut self) {
+        super::vable_ops::pop_helper_live(self.session);
+    }
+}
+
 struct SubWalkFrame<'a, Sym: WalkSym> {
-    box_replacements: FrameBoxReplacements,
+    _helper_live: HelperLiveGuard<'a>,
     id: usize,
     caller_pc: usize,
     pc: usize,
@@ -12187,9 +12197,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         }
         // The bank is rooted by `SubWalkDriver::push_frame` for this frame's
         // whole residency, which outlasts this call.
-        self.box_replacements.set_listening(false);
         let result = walk(self.body.code, self.pc, &mut walk_ctx);
-        self.box_replacements.set_listening(true);
 
         self.inline_callee_consts = walk_ctx.inline_callee_consts;
         self.inline_poison_pcs = walk_ctx.inline_poison_pcs.take();
@@ -12594,30 +12602,39 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         exchange.next_frame_id += 1;
         id
     };
+    let registers_i = RegisterBank::with_constants(callee_regs_i, sub_body.num_regs_i);
+    let registers_f = RegisterBank::with_constants(callee_regs_f, sub_body.num_regs_f);
+    let frame_state = WalkFrameState::new(WalkFrameStateData {
+        callee_shadow: None,
+        concrete_registers_r: callee_concrete_r,
+        current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
+        current_exception_seed_concrete: ctx.frame_state.borrow().current_exception_seed_concrete,
+        outer_active_boxes: ctx.frame_state.borrow().outer_active_boxes.clone(),
+        vstack_boxes: Vec::new(),
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_saved: None,
+        ..Default::default()
+    });
+    super::vable_ops::push_helper_live(
+        ctx.session,
+        &callee_regs_r,
+        &registers_i,
+        &registers_f,
+        &frame_state,
+    );
     let mut frame = SubWalkFrame {
-        box_replacements: FrameBoxReplacements::new(ctx.session),
+        _helper_live: HelperLiveGuard {
+            session: ctx.session,
+        },
         id: frame_id,
         caller_pc: pc,
         pc: start_pc,
         body: sub_body.clone(),
         seed_from_active_resume: start_pc == 0,
         registers_r: callee_regs_r,
-        registers_i: RegisterBank::with_constants(callee_regs_i, sub_body.num_regs_i),
-        registers_f: RegisterBank::with_constants(callee_regs_f, sub_body.num_regs_f),
-        frame_state: WalkFrameState::new(WalkFrameStateData {
-            callee_shadow: None,
-            concrete_registers_r: callee_concrete_r,
-            current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
-            current_exception_seed_concrete: ctx
-                .frame_state
-                .borrow()
-                .current_exception_seed_concrete,
-            outer_active_boxes: ctx.frame_state.borrow().outer_active_boxes.clone(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
-            ..Default::default()
-        }),
+        registers_i,
+        registers_f,
+        frame_state,
         concrete_registers_i: callee_concrete_i,
 
         inline_callee_consts: None,
@@ -12651,10 +12668,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    frame
-        .box_replacements
-        .bind_banks(&frame.registers_r, &frame.registers_i, &frame.registers_f);
-    frame.box_replacements.bind_frame_state(&frame.frame_state);
 
     if !driver_pointer.is_null() {
         // Nested descent: publish the heap frame and yield the parent at its
