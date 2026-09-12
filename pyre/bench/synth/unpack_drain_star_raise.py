@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=106
+# pyre-check: max-pypy-ratio=79
 # The ceiling is twice the slowest ratio observed (52.7x on the linux runner),
 # rounded up.
 # Star-unpack of an iterator of unknown length: `f(*it)` is the consumer that

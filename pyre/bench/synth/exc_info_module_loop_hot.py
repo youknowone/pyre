@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=45
+# pyre-check: max-pypy-ratio=25
 # Module-scope `for i in range(N)` whose body raises, catches, and reads
 # sys.exc_info() both inside and after the handler.  At module scope the loop
 # variable `i` is a STORE_NAME (a global-dict residual), not a STORE_FAST frame
@@ -11,7 +11,7 @@
 
 import sys
 
-N = 6000
+N = 50000
 
 exc_info_inside = 0
 exc_info_after_none = 0

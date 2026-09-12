@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=24
+# pyre-check: max-pypy-ratio=11
 # Regression guard: when a traced function raises, the write-back into its own
 # virtualizable frame must store every local, including the ones whose value is
 # still a virtual box.

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=81
+# pyre-check: max-pypy-ratio=16
 # A callee raises TWO different exception classes into a hot try/except loop.
 # The loop trace records the raising iteration's GUARD_EXCEPTION(class-A); the
 # no-raise iterations chronically fail that guard WITHOUT a pending exception,
@@ -7,7 +7,7 @@
 # bridge — the bridge's entry flavor guard (GUARD_NO_EXCEPTION,
 # prepare_resume_from_failure) must deopt that entry to the blackhole instead
 # of running the recorded continuation on the NULL raised-call result.
-N = 120000
+N = 1200000
 
 
 def f(i):

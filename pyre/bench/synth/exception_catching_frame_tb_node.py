@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=42
+# pyre-check: max-pypy-ratio=14
 # Tightened 53 -> 42 when `seeded_callee_resume` stopped requiring the
 # callee's own exception table: execution-only time here fell 1.53x against a
 # same-day build of the parent commit, so the previous headroom is kept and
