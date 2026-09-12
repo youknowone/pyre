@@ -9267,6 +9267,11 @@ const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "BINARY-OP-SUBWALK",
 };
 
+pub(crate) fn binary_value_from_tag_jitcode()
+-> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+    crate::jitcode_runtime::pathed_runtime_jitcode_cached(BINARY_OP_DESCENT.path)
+}
+
 /// True when `sub_body` is the `binary_value_from_tag` helper the
 /// codewriter inlines for BINARY.  The per-index name table can miss a
 /// helper that `pathed_jitcode_cached` still owns, and a name-only

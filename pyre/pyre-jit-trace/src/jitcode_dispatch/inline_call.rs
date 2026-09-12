@@ -12815,6 +12815,29 @@ fn inline_fnaddr_call_setup<Sym: WalkSym>(
     let Some(jc) = ctx.raw_descrs.runtime_jitcode_at(descr_index) else {
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
     };
+    inline_fnaddr_call_setup_from_jc(ctx, pc, &jc, int_args, ref_args, float_args)
+}
+
+fn inline_fnaddr_call_setup_binary_helper<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+) -> Result<InlineFnaddrCall, DispatchError> {
+    let Some(jc) = super::specialize::binary_value_from_tag_jitcode() else {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
+    };
+    inline_fnaddr_call_setup_from_jc(ctx, pc, &jc, int_args, ref_args, &[])
+}
+
+fn inline_fnaddr_call_setup_from_jc<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    jc: &majit_metainterp::jitcode::JitCode,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+    float_args: &[OpRef],
+) -> Result<InlineFnaddrCall, DispatchError> {
     let fnaddr = jc.fnaddr;
     if fnaddr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(fnaddr) {
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
@@ -14238,7 +14261,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     if dst_bank == 'r'
         && int_args.len() == 1
         && ref_args.len() == 2
-        && super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body)
         && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
         && matches!(
             pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
@@ -14246,6 +14268,29 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         )
     {
         let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+        // Residual BINARY_OP runs the full tuple/str/list/dict fold.
+        // Flatten must not keep only list-int: `t[i]` / `s[i]` would
+        // residualize (`pure_tupleload`, `str_subscr_hot`).  Identify
+        // SUBSCR by the I-list tag, not `get_jitcode_ref_by_index` —
+        // that lookup is a global index and misses the per-fn pool.
+        if let Ok(setup) =
+            inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
+            && let Some(call_descr) = setup.descr.as_call_descr()
+            && spec_gate(SpecFold::Subscr, || {
+                super::specialize::try_walker_specialize_subscr(
+                    ctx,
+                    op.pc,
+                    &ref_args,
+                    &setup.allboxes,
+                    call_descr,
+                    dst,
+                    dst_bank,
+                )
+            })?
+            .is_some()
+        {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::Subscr, || {
@@ -14294,8 +14339,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // Inplace tags (`a += i`) lower as a named `inplace_add` body, not
     // `binary_value_from_tag`.  Without the I-list / helper-name tag
     // those calls never reached `try_emit_exact_int_binop`.
-    let is_binary_from_tag =
-        super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body);
+    let is_binary_from_tag = ctx
+        .raw_descrs
+        .runtime_jitcode_at(descr_index)
+        .is_some_and(|jc| jc.name().contains("binary_value_from_tag"))
+        || super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body);
     let op_tag = match int_arg_concretes.first() {
         Some(ConcreteValue::Int(tag)) if is_binary_from_tag => Some(*tag),
         Some(ConcreteValue::Int(tag)) if inplace_int_arith_tag(*tag) => Some(*tag),
@@ -14380,6 +14428,63 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
             write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // Residual BINARY_OP's long/int family. Flatten lands bigint
+        // `//` `%` `**` here, so the same folds must fire.
+        if let Ok(setup) =
+            inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
+            && let Some(call_descr) = setup.descr.as_call_descr()
+        {
+            if spec_gate(SpecFold::BinaryOpLongInt, || {
+                super::specialize::try_walker_specialize_binary_op_long_int(
+                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                )
+            })?
+            .is_some()
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            if let Some(outcome) = spec_gate(SpecFold::BinaryOpLongIntShift, || {
+                super::specialize::try_walker_specialize_binary_op_long_int_shift(
+                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                )
+            })? {
+                return Ok((outcome, op.next_pc));
+            }
+            if let Some(outcome) = spec_gate(SpecFold::BinaryOpLongIntDiv, || {
+                super::specialize::try_walker_specialize_binary_op_long_int_div(
+                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                )
+            })? {
+                return Ok((outcome, op.next_pc));
+            }
+            if spec_gate(SpecFold::BinaryOpLongIntPow, || {
+                super::specialize::try_walker_specialize_binary_op_long_int_pow(
+                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                )
+            })?
+            .is_some()
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            if spec_gate(SpecFold::BinaryOpLong, || {
+                super::specialize::try_walker_specialize_binary_op_long(
+                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                )
+            })?
+            .is_some()
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            if spec_gate(SpecFold::TruedivOpLong, || {
+                super::specialize::try_walker_specialize_truediv_op_long(
+                    ctx, op.pc, op_tag, &ref_args, &setup.allboxes, call_descr, dst, dst_bank,
+                )
+            })?
+            .is_some()
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
         }
         // Residual BINARY_OP used to admit a Python forward dunder here.
         // Flatten now lowers BINARY to `inline_call` of
