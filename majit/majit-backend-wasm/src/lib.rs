@@ -3402,13 +3402,21 @@ impl WasmBackend {
             for region in &inputs.inlined_bridges {
                 let count = codegen::guard_exit_count(&region.inputargs, &region.ops);
                 let exits = &guard_exits[offset..offset + count];
-                let (prev_homes, prev_labels) = metas
+                let (prev_homes, prev_labels, retained_cells_base) = metas
                     .get(&region.trace_id)
-                    .map(|m| (m.num_ref_homes, m.used_label_homes))
+                    .map(|m| {
+                        let retained = if m.retained_cells_base != 0 {
+                            m.retained_cells_base
+                        } else {
+                            m.cells_base
+                        };
+                        (m.num_ref_homes, m.used_label_homes, retained)
+                    })
                     .unwrap_or_else(|| {
                         (
                             codegen::count_ref_homes(&region.inputargs, &region.ops),
                             codegen::label_ref_capture_slots(&region.inputargs, &region.ops),
+                            0,
                         )
                     });
                 // `RefHomes::collect` reassigns across the merged stream, so
@@ -3424,22 +3432,25 @@ impl WasmBackend {
                     // was just reallocated. Replay still-valid nested
                     // sub-bridges into the new cells; unreplayed, a guard
                     // deopts and retraces a bridge it can never reach.
-                    #[cfg(target_arch = "wasm32")]
                     for (&(trace_id, fail_index), &bridge_slot) in
                         compiled.chained_bridge_slots.borrow().iter()
                     {
                         if trace_id != region.trace_id || fail_index as usize >= count {
                             continue;
                         }
-                        let cell = (new_cells_base as usize + (offset + fail_index as usize) * 4)
-                            as *mut u32;
-                        unsafe { core::ptr::write(cell, bridge_slot) };
+                        crate::failguard::write_bridge_cell_aliases(
+                            new_cells_base + offset as u32 * 4,
+                            retained_cells_base,
+                            fail_index,
+                            bridge_slot,
+                        );
                     }
                 }
                 metas.insert(
                     region.trace_id,
                     ChainedTraceMeta {
                         cells_base: new_cells_base + offset as u32 * 4,
+                        retained_cells_base,
                         num_cells: count,
                         guard_fail_arg_advanced: guard_fail_args_advanced(&region.ops, exits),
                         guard_fail_arg_counts: exits
@@ -4742,6 +4753,7 @@ impl majit_backend::Backend for WasmBackend {
             let guard = if is_direct {
                 Some((
                     source_loop.bridge_cells_base.get(),
+                    0u32,
                     source_loop.num_guard_cells.get(),
                     source_loop
                         .guard_fail_arg_advanced
@@ -4762,6 +4774,7 @@ impl majit_backend::Backend for WasmBackend {
                     .map(|m| {
                         (
                             m.cells_base,
+                            m.retained_cells_base,
                             m.num_cells,
                             m.guard_fail_arg_advanced
                                 .get(source_fail_index as usize)
@@ -4791,6 +4804,7 @@ impl majit_backend::Backend for WasmBackend {
         // installing an unreachable bridge module.
         let Some((
             source_cells_base,
+            source_retained_cells_base,
             source_num_cells,
             source_fail_arg_advanced,
             source_fail_arg_count,
@@ -5526,6 +5540,7 @@ impl majit_backend::Backend for WasmBackend {
                 trace_id,
                 ChainedTraceMeta {
                     cells_base: bridge_cells_base,
+                    retained_cells_base: 0,
                     num_cells: guard_exits.len(),
                     guard_fail_arg_advanced: guard_fail_args_advanced(ops, &guard_exits),
                     guard_fail_arg_counts: guard_exits
@@ -5623,9 +5638,12 @@ impl majit_backend::Backend for WasmBackend {
             if unsafe { core::ptr::read(cell) } != 0 {
                 diag_bump(29); // this guard already had a reachable bridge
             }
-            unsafe {
-                core::ptr::write(cell, bridge_slot);
-            }
+            crate::failguard::write_bridge_cell_aliases(
+                source_cells_base,
+                source_retained_cells_base,
+                source_fail_index,
+                bridge_slot,
+            );
             // Retained module replacement and loop-closing bridge inlining
             // restore this cell after allocating a fresh dispatch array.
             if reemit_enabled() || inline_bridge_enabled() {
@@ -5649,7 +5667,7 @@ impl majit_backend::Backend for WasmBackend {
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = (source_cells_base, bridge_slot);
+        let _ = (source_cells_base, source_retained_cells_base, bridge_slot);
 
         let code_size = wasm_bytes.len();
         // `asmmemmgr.py:37`, as in `compile_loop` above: a bridge's module is a

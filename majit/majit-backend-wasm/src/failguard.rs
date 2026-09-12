@@ -1091,6 +1091,23 @@ pub fn retract_label_target_if_handle(descr_id: usize, func_handle: u32) {
     }
 }
 
+pub(crate) fn write_bridge_cell(base: u32, fail_index: u32, slot: u32) {
+    #[cfg(target_arch = "wasm32")]
+    if base != 0 {
+        let cell = (base as usize + fail_index as usize * 4) as *mut u32;
+        unsafe { core::ptr::write(cell, slot) };
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (base, fail_index, slot);
+}
+
+pub(crate) fn write_bridge_cell_aliases(primary: u32, retained: u32, fail_index: u32, slot: u32) {
+    write_bridge_cell(primary, fail_index, slot);
+    if retained != 0 && retained != primary {
+        write_bridge_cell(retained, fail_index, slot);
+    }
+}
+
 /// Point retired table slots at `wasm_bytes` so a caller that baked
 /// `return_call_indirect(slot)` enters the replacement module.
 /// `assembler.py` `patch_jump_for_descr` rewrites the jump; wasm
@@ -1126,6 +1143,11 @@ pub struct ChainedTraceMeta {
     /// Base address of the bridge's per-guard bridge-slot cell array
     /// (`CompiledWasmLoop::bridge_cells_base` analog); `0` = no dispatch.
     pub cells_base: u32,
+    /// Cell array baked into a retained standalone copy of this bridge
+    /// after it was inlined. `reemit_loop` points `cells_base` at the
+    /// merged-region slice; inbound JUMPs still run the old module, which
+    /// reads this alias. `0` = no retained copy.
+    pub retained_cells_base: u32,
     /// Cell count = the bridge's own guard count.
     pub num_cells: usize,
     /// Per-guard, per-fail-arg induction-advance flags
