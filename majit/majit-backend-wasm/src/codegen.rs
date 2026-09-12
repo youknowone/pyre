@@ -24,6 +24,102 @@ use wasm_encoder::{
     Module, RefType, TableType, TypeSection, ValType,
 };
 
+/// Insert GETARRAYITEM loads for LABEL args that have no producer.
+///
+/// `patch_new_loop_to_load_virtualizable_fields` rewrites root inputarg
+/// slots only. A body LABEL still carries virtualstate boxes for
+/// `locals_cells_stack_w` items the peel never wrote. Native regalloc
+/// binds those boxes to the same location the heap load would use; wasm
+/// locals start at zero, so a later deopt writes a null local back as
+/// bytecode state. Clone an existing array load in this trace — same
+/// descr, same array pointer — and store into the missing LABEL id.
+pub fn materialize_unbound_label_args(inputargs: &[InputArg], ops: &mut Vec<Op>) {
+    let produced: std::collections::HashSet<u32> = ops
+        .iter()
+        .filter_map(|op| {
+            let r = op.pos.get();
+            (!r.is_none() && !r.is_constant()).then_some(r.raw())
+        })
+        .chain(inputargs.iter().map(|ia| ia.index))
+        .collect();
+    let Some(label) = ops.iter().find(|op| op.opcode == OpCode::Label) else {
+        return;
+    };
+    let label_args: Vec<OpRef> = label.getarglist().iter().map(|a| a.to_opref()).collect();
+    let mut missing: Vec<(usize, u32)> = Vec::new();
+    for (i, opref) in label_args.iter().enumerate() {
+        // Peeled live-ins are InputArg* block parameters, not residual
+        // virtualizable slots. Do not replace them with a heap load.
+        if opref.is_none() || opref.is_constant() || opref.is_input_arg() {
+            continue;
+        }
+        let raw = opref.raw();
+        if !produced.contains(&raw) {
+            missing.push((i, raw));
+        }
+    }
+    if missing.is_empty() {
+        return;
+    }
+    // Only a GETARRAYITEM whose result is already a LABEL arg is the
+    // frame-locals array. A list/tuple items load in the same trace is the
+    // wrong array; cloning it writes a foreign object into a vable slot.
+    let mut template: Option<(Op, i64, usize)> = None;
+    for (i, opref) in label_args.iter().enumerate() {
+        if opref.is_none() || opref.is_constant() {
+            continue;
+        }
+        let raw = opref.raw();
+        let Some(op) = ops.iter().find(|op| {
+            matches!(
+                op.opcode,
+                OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcF
+            ) && op.pos.get() != OpRef::NONE
+                && !op.pos.get().is_constant()
+                && op.pos.get().raw() == raw
+        }) else {
+            continue;
+        };
+        if op.num_args() < 2 {
+            continue;
+        }
+        let Some(index) = op.arg(1).to_opref().inline_const_bits() else {
+            continue;
+        };
+        template = Some((op.clone(), index, i));
+        break;
+    }
+    let Some((template, template_index, template_label_i)) = template else {
+        return;
+    };
+    let insert_at = ops
+        .iter()
+        .position(|op| op.opcode == OpCode::Label)
+        .unwrap_or(0);
+    let mut loads = Vec::new();
+    for (label_i, raw) in missing {
+        let array_index = template_index + (label_i as i64 - template_label_i as i64);
+        if array_index < 0 {
+            continue;
+        }
+        let load = template.clone();
+        load.setarg(
+            1,
+            majit_ir::operand::Operand::const_from_value(majit_ir::Value::Int(array_index)),
+        );
+        let result_ty = match template.opcode {
+            OpCode::GetarrayitemGcI => Type::Int,
+            OpCode::GetarrayitemGcF => Type::Float,
+            _ => Type::Ref,
+        };
+        load.pos.set(OpRef::op_typed(raw, result_ty));
+        loads.push(load);
+    }
+    if !loads.is_empty() {
+        ops.splice(insert_at..insert_at, loads);
+    }
+}
+
 /// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
 pub const FRAME_SLOT_BASE: u64 = 8;
 const SLOT_SIZE: u64 = 8;
@@ -1389,6 +1485,20 @@ impl LabelResumeData {
             {
                 *v = true;
             }
+            if op.opcode == OpCode::Label {
+                for a in op.getarglist().iter() {
+                    let opref = a.to_opref();
+                    // Peeled InputArgRef live-ins are real LABEL params.
+                    // A producerless RefOp is a residual virtualizable slot.
+                    if opref != OpRef::NONE
+                        && !opref.is_constant()
+                        && !matches!(opref, OpRef::RefOp(_))
+                        && let Some(v) = has_producer.get_mut(opref.raw() as usize)
+                    {
+                        *v = true;
+                    }
+                }
+            }
         }
         let mut per_label = Vec::new();
         let mut uncapturable = Vec::new();
@@ -1405,11 +1515,36 @@ impl LabelResumeData {
         {
             let mut available = vec![false; num_vars as usize];
             let mut defined_before = vec![false; num_vars as usize];
-            // Producer-less value ids are folded constant-pool seeds. Codegen
-            // binds them before the entry dispatch, so they dominate both the
-            // key-0 path and every LABEL resume and need no frame capture.
+            // Producer-less int/float ids are folded constant-pool seeds.
+            // Codegen binds them before the entry dispatch, so they dominate
+            // both the key-0 path and every LABEL resume and need no frame
+            // capture. A producerless LABEL RefOp is a residual
+            // virtualizable slot, not a seed — wasm would bind it to a
+            // null local. Peeled InputArgRef live-ins stay seeds.
+            let mut unbound_label_ref = vec![false; num_vars as usize];
+            for op in ops {
+                if op.opcode != OpCode::Label {
+                    continue;
+                }
+                for a in op.getarglist() {
+                    let opref = a.to_opref();
+                    if opref == OpRef::NONE
+                        || opref.is_constant()
+                        || !matches!(opref, OpRef::RefOp(_))
+                    {
+                        continue;
+                    }
+                    let id = opref.raw() as usize;
+                    if !has_producer.get(id).copied().unwrap_or(false)
+                        && !is_input.get(id).copied().unwrap_or(false)
+                        && let Some(v) = unbound_label_ref.get_mut(id)
+                    {
+                        *v = true;
+                    }
+                }
+            }
             for (id, produced) in has_producer.iter().copied().enumerate() {
-                if !produced && !is_input[id] {
+                if !produced && !is_input[id] && !unbound_label_ref[id] {
                     available[id] = true;
                     defined_before[id] = true;
                 }
@@ -10560,10 +10695,21 @@ fn unbound_pool_const_seeds(
         // skipped the prologue seed, so the local stayed the zero wasm
         // initializes it to. Seed those; only treat a LABEL arg as
         // defined when the pool has nothing to materialize.
+        //
+        // A producerless LABEL *RefOp* is a residual virtualizable
+        // slot, not a phi. wasm locals start at zero; treating it as
+        // defined compiles a null that failarg writeback stores as
+        // bytecode state. Leave it unresolved so the trace declines.
+        // A peeled InputArgRef live-in is a real LABEL parameter
+        // (`consider_label`) and must stay defined.
         if op.opcode == OpCode::Label {
             for a in op.getarglist() {
                 let r = a.to_opref();
-                if r != OpRef::NONE && !r.is_constant() && !constants.contains_key(&r.raw()) {
+                if r != OpRef::NONE
+                    && !r.is_constant()
+                    && !constants.contains_key(&r.raw())
+                    && !matches!(r, OpRef::RefOp(_))
+                {
                     defined.insert(r.raw());
                 }
             }
