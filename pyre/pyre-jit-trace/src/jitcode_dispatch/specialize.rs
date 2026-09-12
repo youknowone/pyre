@@ -17679,6 +17679,243 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `BaseException.descr_reduce`: `(cls, args)` when `w_dict` is unset or
+/// empty.  The residual `bh_call_fn(__reduce__)` forces a virtual exception
+/// every iteration; this emit keeps the 2-tuple virtual so the constructor
+/// DCEs (`exception_reduce`).
+pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (callable_op, self_op, concrete_self, from_bound_method) = match r_args.len() {
+        2 => {
+            let (ConcreteValue::Ref(callable), ConcreteValue::Ref(second)) =
+                (arg_concretes[0], arg_concretes[1])
+            else {
+                return Ok(None);
+            };
+            if callable.is_null() {
+                return Ok(None);
+            }
+            if second.is_null() {
+                // Bound method, no extra args: `bh_call_fn(method, NULL)`.
+                if !unsafe { pyre_object::function::is_method(callable) } {
+                    return Ok(None);
+                }
+                let inner_func = unsafe { pyre_object::function::w_method_get_func(callable) };
+                let inner_self = unsafe { pyre_object::function::w_method_get_self(callable) };
+                if inner_func.is_null()
+                    || inner_self.is_null()
+                    || !pyre_interpreter::builtins::is_builtin_base_exception_reduce_function(
+                        inner_func,
+                    )
+                {
+                    return Ok(None);
+                }
+                (r_args[0], r_args[0], inner_self, true)
+            } else if pyre_interpreter::builtins::is_builtin_base_exception_reduce_function(
+                callable,
+            ) && unsafe { pyre_object::is_exception(second) }
+            {
+                (r_args[0], r_args[1], second, false)
+            } else {
+                return Ok(None);
+            }
+        }
+        3 => {
+            let (
+                ConcreteValue::Ref(callable),
+                ConcreteValue::Ref(null_or_self),
+                ConcreteValue::Ref(self_obj),
+            ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+            else {
+                return Ok(None);
+            };
+            if callable.is_null() || !null_or_self.is_null() || self_obj.is_null() {
+                return Ok(None);
+            }
+            if !pyre_interpreter::builtins::is_builtin_base_exception_reduce_function(callable) {
+                return Ok(None);
+            }
+            (r_args[0], r_args[2], self_obj, false)
+        }
+        _ => return Ok(None),
+    };
+    if !unsafe { pyre_object::is_exception(concrete_self) } {
+        return Ok(None);
+    }
+    let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(concrete_self) };
+    if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
+        return Ok(None);
+    }
+    let stored_args =
+        unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(concrete_self) };
+    if stored_args.is_null() || !unsafe { pyre_object::is_list(stored_args) } {
+        return Ok(None);
+    }
+    let list = unsafe { &*(stored_args as *const pyre_object::listobject::W_ListObject) };
+    if list.strategy != pyre_object::listobject::ListStrategy::Object {
+        return Ok(None);
+    }
+    // `descr_reduce` does `space.newtuple(self.args_w)` then
+    // `space.newtuple([cls, args])`.  `newtuple` specialises arity 2, so
+    // settle both representations before any guard: emitting the
+    // array-backed shape for an arity the runtime specialises leaves
+    // `len(r)` guarding a vtable this trace never builds
+    // (`emit_specialised_tuple_oo_inline`).
+    let args_len = unsafe { pyre_object::w_list_len(stored_args) };
+    let mut concrete_items = Vec::with_capacity(args_len);
+    for index in 0..args_len {
+        let item = unsafe { pyre_object::w_list_getitem(stored_args, index as i64) }
+            .unwrap_or(pyre_object::PY_NULL);
+        if item.is_null() {
+            return Ok(None);
+        }
+        concrete_items.push(item);
+    }
+    let concrete_args_tuple = pyre_object::w_tuple_new(concrete_items);
+    let args_specialised_oo = if args_len == 2 {
+        let ob_type = unsafe { (*concrete_args_tuple).ob_type };
+        if std::ptr::eq(
+            ob_type,
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
+        ) {
+            true
+        } else if std::ptr::eq(ob_type, &pyre_object::TUPLE_TYPE) {
+            false
+        } else {
+            return Ok(None);
+        }
+    } else {
+        false
+    };
+    let kind = unsafe { pyre_object::w_exception_get_kind(concrete_self) };
+    let phys_type = unsafe { (*concrete_self).ob_type as i64 };
+    let w_class = unsafe { (*concrete_self).w_class };
+
+    let self_box = if from_bound_method {
+        let method_op = callable_op;
+        let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+        if !method_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(method_op) {
+            let type_const = ctx.trace_ctx.const_int(method_type_addr);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardClass,
+                &[method_op, type_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(method_op, method_type_addr);
+        }
+        crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            method_op,
+            crate::descr::method_w_self_descr(),
+        )
+    } else {
+        self_op
+    };
+
+    if !ctx.trace_ctx.heap_cache().is_class_known(self_box) {
+        let type_const = ctx.trace_ctx.const_int(phys_type);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardClass,
+            &[self_box, type_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(self_box, phys_type);
+    }
+    let (_, _, w_class_descr, args_descr) = crate::descr::w_exception_descrs(kind);
+    let dict_descr = crate::descr::w_exception_dict_descr(kind);
+    let dict_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, dict_descr);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[dict_ref])?;
+
+    let cls_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, w_class_descr);
+    let cls_const = ctx.trace_ctx.const_ref(w_class as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[cls_ref, cls_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(cls_ref, cls_const);
+
+    let args_list = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, args_descr);
+    let list_type = &pyre_object::LIST_TYPE as *const pyre_object::PyType as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(args_list) {
+        let type_const = ctx.trace_ctx.const_int(list_type);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardClass,
+            &[args_list, type_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(args_list, list_type);
+    }
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        args_list,
+        crate::descr::list_strategy_descr(),
+    );
+    let object_strategy = ctx
+        .trace_ctx
+        .const_int(pyre_object::listobject::ListStrategy::Object as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op.pc,
+        OpCode::GuardValue,
+        &[strategy, object_strategy],
+    )?;
+    let length = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        args_list,
+        crate::descr::list_length_descr(),
+    );
+    let len_const = ctx.trace_ctx.const_int(args_len as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[length, len_const])?;
+    let block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        args_list,
+        crate::descr::list_items_descr(),
+    );
+    let mut items = Vec::with_capacity(args_len);
+    for index in 0..args_len {
+        let index_op = ctx.trace_ctx.const_int(index as i64);
+        items.push(crate::state::trace_items_block_getitem_value(
+            ctx.trace_ctx,
+            block,
+            index_op,
+        ));
+    }
+    let args_tuple = if args_specialised_oo {
+        crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, items[0], items[1])
+    } else {
+        crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &items)
+    };
+    ctx.trace_ctx.set_opref_concrete(
+        args_tuple,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_args_tuple as usize)),
+    );
+    // `(cls, args)` is always arity 2 and never a plain-int / plain-float
+    // pair, so `makespecialisedtuple2` builds `Cls_oo`.
+    let result =
+        crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, cls_const, args_tuple);
+    let concrete_result = pyre_object::w_tuple_new(vec![w_class, concrete_args_tuple]);
+    ctx.trace_ctx.set_opref_concrete(
+        result,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_result as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+    Ok(Some(()))
+}
+
 /// Walker-native RAISE_VARARGS inline-built-exception fast path. The
 /// `RaiseVarargs` residual is `normalize_raise_varargs_jit(frame, exc,
 /// cause)` — `r_args = [frame, exc, cause]`.  When `exc` was built inline by

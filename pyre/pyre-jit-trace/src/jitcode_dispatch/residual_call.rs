@@ -7683,6 +7683,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    // `BaseException.descr_reduce`: `(cls, args)` when `w_dict` is empty.
+    // The residual `bh_call_fn(__reduce__, NULL, exc)` otherwise forces
+    // the virtual exception every iteration (`exception_reduce`).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::ExceptionReduce, || {
+            try_walker_specialize_exception_reduce(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::RaiseVarargs

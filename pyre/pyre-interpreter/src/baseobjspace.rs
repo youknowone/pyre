@@ -11517,12 +11517,14 @@ pub unsafe fn bound_method_attr_fast_path_wtf8(
     // that `name` is absent from it.  A mapdict instance is admitted on those
     // terms because the caller has a guard for the precondition — pinning the
     // map makes a later `obj.<name> = ...` grow the chain and side-exit — and
-    // is reported as owing it.  Every other layout keeps its instance
-    // attributes where no such guard reaches, so a receiver with no dictionary
-    // at all is the only other admission: nothing can shadow the type lookup,
-    // and the non-data-descriptor branch of `object.__getattribute__` is the
-    // only reachable one.
-    let owes_shadow_guard = is_instance(w_obj);
+    // is reported as owing it.  An exception is the other layout with a
+    // matching guard (`ExceptionDictIsNull` on the still-unallocated `w_dict`
+    // slot).  `instance_dict_does_not_shadow_wtf8` peeks that slot; calling
+    // `getdict` here would allocate it and then decline the very receiver the
+    // guard was written for (`e.__reduce__()`).  Every other layout keeps its
+    // instance attributes where no such guard reaches, so a receiver with no
+    // dictionary at all is the only remaining admission.
+    let owes_shadow_guard = is_instance(w_obj) || pyre_object::is_exception(w_obj);
     if owes_shadow_guard {
         unsafe { instance_dict_does_not_shadow_wtf8(w_obj, name)? };
     } else if !getdict_backing_native(w_obj).is_null() {
@@ -21800,6 +21802,39 @@ mod tests {
         assert!(std::ptr::eq(fp_descr, w_descr));
         assert_ne!(fp_version_tag, 0);
         assert!(!owes_shadow_guard, "a list has no mapdict shadow guard");
+    }
+
+    /// An exception is not a mapdict instance, but it still has a shadowing
+    /// guard (`w_dict` still null).  The predicate must peek that slot rather
+    /// than call `getdict`, which would allocate a dict and then decline
+    /// `e.__reduce__()`.
+    #[test]
+    fn bound_method_fast_path_admits_exception_reduce_without_allocating_dict() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let exc =
+            pyre_object::w_exception_new(pyre_object::interp_exceptions::ExcKind::ValueError, "x");
+        assert!(
+            unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(exc) }.is_null(),
+            "premise: a fresh exception has no instance dict",
+        );
+        let (fp_type, fp_version_tag, fp_descr, owes_shadow_guard) =
+            unsafe { bound_method_attr_fast_path(exc, "__reduce__") }
+                .expect("a dict-less exception's __reduce__ must fold");
+        assert!(owes_shadow_guard, "the tracer owes ExceptionDictIsNull");
+        assert_ne!(fp_version_tag, 0);
+        assert!(
+            unsafe { crate::function::is_function(fp_descr) },
+            "ValueError.__reduce__ must be a bindable function descriptor",
+        );
+        assert!(
+            unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(exc) }.is_null(),
+            "the predicate must not allocate w_dict",
+        );
+        let w_type = crate::typedef::r#type(exc)
+            .expect("ValueError has a type")
+            .as_ptr();
+        assert!(std::ptr::eq(fp_type, w_type));
     }
 
     /// typeobject.py:293-301 — under the interpreter (`we_are_jitted()`
