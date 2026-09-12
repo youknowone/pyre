@@ -1,4 +1,8 @@
 # pyre-check: max-pypy-ratio=2.6
+# pyre-check: max-wasm-ratio=5.0
+# leftover-empty GETFIELD tails vs native loads; darwin-arm64 measured
+# 4.3x against dynasm after rebase onto origin/main. 5.0x is that
+# reading plus WASM_RATIO_FIT_HEADROOM (15%).
 # Run 33300212586, dynasm and cranelift over all three hosts: 0.6-1.9x.  Twice
 # the slowest would be 3.8, but `PERF_GATE_FLOOR_DIVISOR` derives the floor
 # from this same number and 3.8/6 sits above the 0.6x windows reads, so the
