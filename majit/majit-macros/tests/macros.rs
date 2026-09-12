@@ -1,3 +1,16 @@
+mod source_call_location {
+    #[majit_macros::specialize_call_location]
+    fn probe(value: usize) -> bool {
+        let _ = value;
+        false
+    }
+
+    #[test]
+    fn call_location_attribute_preserves_the_native_call() {
+        assert!(!probe(1));
+    }
+}
+
 mod source_memo {
     #[majit_macros::specialize_memo]
     fn memo(value: usize) -> usize {
