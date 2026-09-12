@@ -3985,9 +3985,13 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
         }
         _ => dict.dstrategy.switch_to_object_strategy(obj),
     }
-    let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
     let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
     let w_key = crate::gc_roots::pin_root(crate::w_str_from_wtf8_managed(key.to_wtf8_buf()));
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
     let removed = entries.remove(&object_key_for(w_key)).is_some();
     if removed {
         dict.keys_version = dict.keys_version.wrapping_add(1);

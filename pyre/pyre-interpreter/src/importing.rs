@@ -6897,12 +6897,14 @@ pub fn import_all_from_w(
 ) -> Result<(), crate::PyError> {
     import_all_from_each(module, |name, value| {
         let _name_roots = pyre_object::gc_roots::push_roots();
+        let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(into_locals);
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(value);
         crate::baseobjspace::setitem(
-            into_locals,
+            pyre_object::gc_roots::shadow_stack_get(locals_slot),
             pyre_object::gc_roots::shadow_stack_get(name_slot),
             pyre_object::gc_roots::shadow_stack_get(value_slot),
         )?;

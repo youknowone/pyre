@@ -3076,11 +3076,18 @@ fn new_typeobject_with_metatype_and_layout(
     if named.is_none()
         && let Some((module, _)) = name.rsplit_once('.')
     {
-        // Allocate the value first: reading `ns` before `w_str_new` would hand
+        // Allocate the value first: reading `ns` before the mint would hand
         // the store an address the allocation is free to move.
-        let w_module = w_str_new(module);
+        let module_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(module));
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__module__", w_module) };
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__module__",
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+            )
+        };
     }
     // The namespace is complete, so every method descriptor in it can be
     // bound to the type that defines it before the type goes live.
@@ -16198,7 +16205,7 @@ fn descr_reduce(descr: PyObjectRef) -> crate::PyResult {
     let owner = unsafe { crate::function::fget_func_objclass(descr)? };
     let mut args = pyre_object::gc_roots::RootedItems::new();
     args.push(owner);
-    args.push(pyre_object::w_str_new(unsafe {
+    args.push(pyre_object::w_str_new_managed(unsafe {
         crate::function::function_get_name(descr)
     }));
     let args = pyre_object::w_tuple_new(args.take());
@@ -17620,7 +17627,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                     let owner = unsafe { pyre_object::w_member_get_cls(member) };
                     let mut args = pyre_object::gc_roots::RootedItems::new();
                     args.push(owner);
-                    args.push(pyre_object::w_str_new(unsafe {
+                    args.push(pyre_object::w_str_new_managed(unsafe {
                         pyre_object::w_member_get_name(member)
                     }));
                     let args = pyre_object::w_tuple_new(args.take());

@@ -1730,11 +1730,17 @@ pub(crate) fn wtf8_display_string(rendered: Wtf8Buf, fallback: &str) -> String {
     if let Ok(s) = rendered.as_str() {
         return s.to_owned();
     }
-    let s_obj = pyre_object::w_str_from_wtf8_managed(rendered);
-    crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")
-        .ok()
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| fallback.to_string())
+    let _roots = pyre_object::gc_roots::push_roots();
+    let s_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(rendered));
+    crate::type_methods::encode_object(
+        pyre_object::gc_roots::shadow_stack_get(s_slot),
+        "utf-8",
+        "backslashreplace",
+    )
+    .ok()
+    .and_then(|b| String::from_utf8(b).ok())
+    .unwrap_or_else(|| fallback.to_string())
 }
 
 /// The encoded length of the character a WTF-8 lead byte opens.

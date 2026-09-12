@@ -5835,6 +5835,7 @@ fn parse_single_required(
     if kwargs.is_none() && positional.len() == 1 {
         return Ok(positional[0]);
     }
+    let pos_base = pyre_object::gc_roots::pin_roots(positional);
     let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
     let mut keywords_w: Vec<PyObjectRef> = Vec::new();
     if let Some(dict) = kwargs {
@@ -5844,14 +5845,26 @@ fn parse_single_required(
             .collect();
         let values: Vec<PyObjectRef> = entries.iter().map(|(_, val)| *val).collect();
         let values_base = pyre_object::gc_roots::pin_roots(&values);
-        for (index, (key, _)) in entries.into_iter().enumerate() {
-            let w_name = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(key));
-            keyword_names_w.push(w_name);
-            keywords_w.push(pyre_object::gc_roots::shadow_stack_get(values_base + index));
+        let mut name_slots = Vec::with_capacity(entries.len());
+        for (key, _) in entries {
+            let name_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(key));
+            name_slots.push(name_slot);
         }
+        keyword_names_w = name_slots
+            .iter()
+            .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+            .collect();
+        keywords_w = (0..name_slots.len())
+            .map(|index| pyre_object::gc_roots::shadow_stack_get(values_base + index))
+            .collect();
     }
+    let refreshed_pos: Vec<PyObjectRef> = (0..positional.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(pos_base + index))
+        .collect();
     let signature = crate::gateway::Signature::new(vec![name], None, None, 0, 0);
-    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
+    let arguments =
+        crate::argument::Arguments::with_kw(&refreshed_pos, &keyword_names_w, &keywords_w);
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(PY_NULL, &mut scope_w, fn_name, &signature, None, PY_NULL)?;
     Ok(scope_w[0])
@@ -11419,6 +11432,10 @@ pub(crate) fn parse_int_from_str(
     s: &str,
     base: u32,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let _source_roots = pyre_object::gc_roots::push_roots();
+    let source_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_source);
+    let w_source = || pyre_object::gc_roots::shadow_stack_get(source_slot);
     // rarithmetic.py `string_to_int` first handles short, plain
     // decimal strings without constructing a NumberStringParser.
     const OVF_DIGITS: usize = 19; // len(str(sys.maxint)) on pyre's i64 target
@@ -11459,7 +11476,7 @@ pub(crate) fn parse_int_from_str(
         majit_rlib::rbigint::NumberStringParser::new(s, base as i64, true, true, 0, None, 0, true)
             .map_err(|error| match error {
                 majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
-                _ => invalid_int_literal(w_source, base),
+                _ => invalid_int_literal(w_source(), base),
             })?;
 
     // NumberStringParser performs this check immediately after its structural
@@ -11483,7 +11500,7 @@ pub(crate) fn parse_int_from_str(
     loop {
         let digit = parser.next_digit().map_err(|error| match error {
             majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
-            _ => invalid_int_literal(w_source, base),
+            _ => invalid_int_literal(w_source(), base),
         })?;
         if digit < 0 {
             return Ok(w_int_new(machine_value));
@@ -11502,7 +11519,7 @@ pub(crate) fn parse_int_from_str(
     let value = BigInt::_from_numberstring_parser(&mut parser).map_err(|error| match error {
         majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
         majit_rlib::rbigint::RBigIntError::MaxStrDigits => unreachable!("limit checked above"),
-        _ => invalid_int_literal(w_source, base),
+        _ => invalid_int_literal(w_source(), base),
     })?;
     Ok(w_long_new(value))
 }

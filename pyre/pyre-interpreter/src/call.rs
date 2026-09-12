@@ -3281,17 +3281,22 @@ fn call_with_kwargs_in_ctx_impl(
                     // is handed to the profiling call, so the profiled frame is
                     // read back out of the anchor rather than from this local.
                     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
-                    let mut keyword_names_w: Vec<pyre_object::PyObjectRef> =
-                        Vec::with_capacity(kwargs.len());
+                    let mut name_slots = Vec::with_capacity(kwargs.len());
                     for (k, _) in kwargs.iter() {
-                        keyword_names_w.push(pyre_object::gc_roots::pin_root(
+                        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(
                             pyre_object::w_str_from_wtf8_managed(k.clone()),
-                        ));
+                        );
+                        name_slots.push(name_slot);
                     }
                     // Name mints can move the positionals, keyword values, and
                     // the earlier `bound` slice. Reload from the entry bracket
                     // and rebind before the profiled call, as the marker
                     // branch below does.
+                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = name_slots
+                        .iter()
+                        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                        .collect();
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
                         (0..kwargs.len()).map(current_kwarg).collect();
                     let refreshed_pos: Vec<pyre_object::PyObjectRef> =
@@ -3310,7 +3315,7 @@ fn call_with_kwargs_in_ctx_impl(
                     );
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
                         unsafe { &mut *frame_anchor.live() },
-                        callable,
+                        current_callable(),
                         &mut arguments,
                         &bound,
                     );
@@ -3403,17 +3408,22 @@ fn call_with_kwargs_in_ctx_impl(
                     // is handed to the profiling call, so the profiled frame is
                     // read back out of the anchor rather than from this local.
                     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
-                    let mut keyword_names_w: Vec<pyre_object::PyObjectRef> =
-                        Vec::with_capacity(kwargs.len());
+                    let mut name_slots = Vec::with_capacity(kwargs.len());
                     for (k, _) in kwargs.iter() {
-                        keyword_names_w.push(pyre_object::gc_roots::pin_root(
+                        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(
                             pyre_object::w_str_from_wtf8_managed(k.clone()),
-                        ));
+                        );
+                        name_slots.push(name_slot);
                     }
                     // `keyword_names_w` allocated a string per keyword, so
                     // everything read before it — the positionals, the keyword
                     // values, and the dict `full_args` carries — may have moved
                     // since. Everything below reloads from the roots.
+                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = name_slots
+                        .iter()
+                        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                        .collect();
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
                         (0..kwargs.len()).map(current_kwarg).collect();
                     let refreshed_pos: Vec<pyre_object::PyObjectRef> =
@@ -3430,7 +3440,7 @@ fn call_with_kwargs_in_ctx_impl(
                         .collect();
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
                         unsafe { &mut *frame_anchor.live() },
-                        callable,
+                        current_callable(),
                         &mut arguments,
                         &full_args,
                     );

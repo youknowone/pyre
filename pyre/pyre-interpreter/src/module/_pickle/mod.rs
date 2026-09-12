@@ -178,7 +178,15 @@ pub(crate) fn call_meth(
 fn pickle_exc(class_name: &str, msg: rustpython_wtf8::Wtf8Buf) -> PyError {
     let mut err = PyError::value_error(msg.clone());
     if let Some(cls) = crate::builtins::lookup_exc_class(class_name) {
-        let args = [cls, pyre_object::w_str_from_wtf8_managed(msg)];
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(msg));
+        let args = [
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+            pyre_object::gc_roots::shadow_stack_get(msg_slot),
+        ];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }

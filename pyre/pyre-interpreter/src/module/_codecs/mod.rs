@@ -801,10 +801,20 @@ fn call_codec(
     errors: Option<&str>,
 ) -> Result<PyObjectRef, crate::PyError> {
     // PyPy `interp_codecs.py _call_codec`.
+    let roots = pyre_object::gc_roots::push_roots();
+    let coder_slot = roots.base();
+    let _ = roots.pin_root(w_coder);
+    let obj_slot = coder_slot + 1;
+    let _ = roots.pin_root(w_obj);
     let call = if let Some(errors) = errors {
-        crate::call::call_function_impl_result(w_coder, &[w_obj, w_str_new_managed(errors)])
+        let err_slot = coder_slot + 2;
+        let _ = roots.pin_root(w_str_new_managed(errors));
+        crate::call::call_function_impl_result(
+            roots.get(coder_slot),
+            &[roots.get(obj_slot), roots.get(err_slot)],
+        )
     } else {
-        crate::call::call_function_impl_result(w_coder, &[w_obj])
+        crate::call::call_function_impl_result(roots.get(coder_slot), &[roots.get(obj_slot)])
     };
     // A codec that raises gets one line of context naming the operation and
     // the encoding, and is re-raised otherwise unchanged:

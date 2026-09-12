@@ -748,10 +748,16 @@ pub(super) fn call_cfunction_in_class(
             fastcall_slots.push(pyobject::make_ref(value_slot(index)));
         }
         if flags.contains(MethFlags::METH_KEYWORDS) && !keywords.is_empty() {
-            let mut names = Vec::with_capacity(keywords.len());
+            let mut name_slots = Vec::with_capacity(keywords.len());
             for (name, _) in keywords.iter() {
-                names.push(roots.pin_root(pyre_object::w_str_new_managed(name)));
+                let name_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
+                name_slots.push(name_slot);
             }
+            let names: Vec<PyObjectRef> = name_slots
+                .iter()
+                .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                .collect();
             keywords_arg = pyobject::make_ref(pyre_object::tupleobject::w_tuple_new(names));
         }
     } else if !flags.intersects(MethFlags::METH_NOARGS | MethFlags::METH_O) {
