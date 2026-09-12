@@ -6714,6 +6714,167 @@ mod tests {
         }
     }
 
+    /// Build a one-call caller graph naming `callee_segments`, with no body
+    /// registered for the callee.
+    fn caller_graph_calling(callee_segments: &[&str]) -> LegacyGraph {
+        let mut graph = LegacyGraph::new("caller");
+        let vars = mint_vars(&mut graph, 3);
+        let arg = vars[0].clone();
+        let result = vars[1].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: callee_segments.iter().map(|s| s.to_string()).collect(),
+                    },
+                    args: crate::model::call_args(vec![arg]),
+                    result_ty: ValueType::Ref(None),
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result)],
+                graph.returnblock,
+            )],
+            dead: false,
+            framestate: None,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            dead: false,
+            framestate: None,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        graph
+    }
+
+    /// A callee the JIT policy rejects (`policy.py _reject_function`:
+    /// "explicitly elidable functions are always opaque") is reached only
+    /// through its caller's lift, so the `function_graphs` residualize arm in
+    /// [`populate_call_registry_from_call_graphs`] — which walks entries the
+    /// MIR loop already lowered — never sees it.  Its stub therefore has to
+    /// come from the declaration carrier
+    /// (`front::mir::collect_policy_opaque_fn_stubs_from_llbc`), the
+    /// `register_external` analog, or the caller fails its own lift with
+    /// "not registered in CallRegistry" and every subject downstream of that
+    /// caller inherits the failure.
+    #[test]
+    fn a_lazily_reached_opaque_callee_lifts_its_caller_with_the_declared_result() {
+        use crate::annotator::model::SomeValue;
+        use crate::codewriter::call::GraphStore;
+        use crate::parse::CallPath;
+
+        let callee = ["owner_crate", "opaque_leaf", "read_opaque_slot"];
+        let mut graphs = GraphStore::default();
+        graphs.insert(
+            CallPath::from_segments(["owner_crate", "caller_mod", "caller"]),
+            caller_graph_calling(&callee),
+        );
+        let caller_key = FunctionPathKey::from_segments(["owner_crate", "caller_mod", "caller"]);
+        let callee_key = FunctionPathKey::from_segments(callee);
+
+        // Without the declaration stub the caller cannot be annotated past
+        // the call — the baseline this regression pins.
+        let bare = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &bare).unwrap();
+        let bare_error = bare
+            .lookup(&caller_key)
+            .expect("caller registers regardless")
+            .lift_error()
+            .expect("an unregistered callee must fail the caller's lift");
+        assert!(
+            bare_error.contains("not registered in CallRegistry"),
+            "{bare_error}"
+        );
+        assert!(bare.lookup(&callee_key).is_none());
+
+        // The collector yields `(segments, signature, FUNC.RESULT token)` for
+        // an opaque declaration whatever became of its body; the token is the
+        // `*mut PyObject` this callee declares.
+        let stubs = vec![(
+            callee.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            Signature::new(vec!["kind".to_string()], None, None),
+            Some(OBJECTPTR_RETURN_TYPE.to_string()),
+        )];
+        let registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &registry).unwrap();
+
+        let caller = registry.lookup(&caller_key).expect("caller entry");
+        assert_eq!(
+            caller.lift_error(),
+            None,
+            "the declared residual must let the caller lift"
+        );
+        let callee_entry = registry.lookup(&callee_key).expect("callee entry");
+        assert!(
+            callee_entry.lift_error().is_none(),
+            "a declaration stub has no body to fail on"
+        );
+
+        // The call stays residual, resolved to the stub's own callable.
+        let caller_pygraph = caller
+            .function_desc
+            .borrow()
+            .cache
+            .borrow()
+            .get(&crate::annotator::description::GraphCacheKey::None)
+            .cloned()
+            .expect("caller body lifted into the default cache");
+        let callable = {
+            let graph = caller_pygraph.graph.borrow();
+            let start = graph.startblock.borrow();
+            let op = start
+                .operations
+                .iter()
+                .find(|op| op.opname == "simple_call")
+                .expect("the opaque callee must remain a residual simple_call");
+            match &op.args[0] {
+                Hlvalue::Constant(c) => match &c.value {
+                    ConstValue::HostObject(host) => host.clone(),
+                    other => panic!("callable must be a HostObject, got {other:?}"),
+                },
+                other => panic!("args[0] must be the callable Constant, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            callable, callee_entry.host_object,
+            "the residual call must bind the stub's own callable"
+        );
+
+        // And it carries the callee's declared result, not a Void shell.
+        let stub = callee_entry
+            .function_desc
+            .borrow()
+            .cache
+            .borrow()
+            .get(&crate::annotator::description::GraphCacheKey::None)
+            .cloned()
+            .expect("the declaration stub is prefilled as the default cache entry");
+        let graph = stub.graph.borrow();
+        let start = graph.startblock.borrow();
+        let link = start.exits[0].borrow();
+        let Some(Hlvalue::Variable(ret)) = link.args[0].as_ref() else {
+            panic!("stub return arg must be a pre-annotated Variable");
+        };
+        let annotation = ret.annotation.borrow();
+        let annotation = annotation.as_ref().expect("stub return is pre-annotated");
+        assert!(
+            matches!(&**annotation, SomeValue::Ptr(_)),
+            "the object-pointer token must annotate as the declared pointer, got {annotation:?}"
+        );
+    }
+
     #[test]
     fn cachedgraph_hit_registers_callee_graph_into_translator_graphs() {
         let _lock = anchor_lock();
