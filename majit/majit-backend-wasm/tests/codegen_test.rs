@@ -131,14 +131,21 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
         .unwrap_or_else(|err| panic!("invalid {name}= in wasm JIT stats: {err}\n{stderr}"))
 }
 
-/// CALL_ASSEMBLER must not refill a frame. The inline bump leaves
-/// `jf_gcmap` unset; the callee prologue nulls the frozen home region
-/// and then publishes the map. Expected `memory.fill`s are that entry
-/// home clear, and the nursery-payload zeros `emit_zero_bytes` writes
-/// for `New*` (`rewrite` no longer fills the whole nursery on wasm32
-/// reset).
+/// CALL_ASSEMBLER must not refill a frame on the bump path. The inline
+/// bump leaves `jf_gcmap` unset. Expected `memory.fill`s are the entry
+/// home clear, `emit_zero_bytes` New* payload zeros, and the CA caller
+/// nulling the callee home range from the dispatch snapshot before
+/// publishing that snapshot's gcmap.
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
+    let home_base = format!(
+        "i32.load offset={}",
+        majit_backend_wasm::failguard::WASM_CA_TARGET_HOME_SLOT_BASE_OFS
+    );
+    let home_slots = format!(
+        "i32.load offset={}",
+        majit_backend_wasm::failguard::WASM_CA_TARGET_HOME_SLOTS_OFS
+    );
     let lines: Vec<_> = stderr.lines().map(str::trim).collect();
     for (index, line) in lines.iter().enumerate() {
         if *line != "memory.fill" {
@@ -162,8 +169,18 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3].starts_with("local.get ")
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
+        // dest = cfp + target.home_slot_base, size = home_slots * SLOT_SIZE.
+        let is_ca_callee_home_null = index >= 8
+            && lines[index - 1] == "i32.mul"
+            && lines[index - 2] == "i32.const 8"
+            && lines[index - 3] == home_slots
+            && lines[index - 4].starts_with("local.get ")
+            && lines[index - 5] == "i32.const 0"
+            && lines[index - 6] == "i32.add"
+            && lines[index - 7] == home_base
+            && lines[index - 8].starts_with("local.get ");
         assert!(
-            is_entry_home_clear || is_headered_payload || is_object_zero,
+            is_entry_home_clear || is_headered_payload || is_object_zero || is_ca_callee_home_null,
             "recursive CA filled a nursery frame on the bump path:\n{stderr}"
         );
     }
