@@ -2190,12 +2190,12 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if runtime_helper != majit_ir::RuntimeHelperKind::CallFn {
         return Ok(None);
     }
-    // Positional args only (`r_args = [callable, null_or_self, arg0, ..]`);
-    // Ref dst only (`residual_call_r_r`, the boxed PyObject consumed by a
-    // following BINARY_OP).  The only `residual_call_r_i` helper is the
-    // 1-arg `truth_fn`, so an Int dst is structurally unreachable here —
-    // don't accept one.  At least one positional argument is required.
-    if dst_bank != 'r' || r_args.len() < 3 {
+    // Positional args only (`r_args = [callable, null_or_self, arg0, ..]`).
+    // A statement call (`plain(n+1)`) is void (`residual_call_r_v`); a
+    // value-producing call is Ref.  Declining void kept that self-rec
+    // on an inlined jump with no `execute_frame` depth charge, so a
+    // JIT-hot recursion ran past `sys.getrecursionlimit()`.
+    if (dst_bank != 'r' && dst_bank != 'v') || r_args.len() < 3 {
         return Ok(None);
     }
     // The handler test this fold needs is positional and lives below, once the
@@ -12955,6 +12955,10 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     if emit_guard_not_forced {
         super::residual_call::maybe_walker_vable_and_vrefs_before_residual_call(ctx, pc);
     }
+    // Flatten BINARY_SUBSCR of a pre-bound `f_locals` proxy does not
+    // go through residual_call's BINARY_OP arm, so the write-back
+    // that keeps `p["x"]` live must run here too.
+    super::residual_call::write_back_locals_for_proxy_reader(ctx, &allboxes);
     let recorded = ctx
         .trace_ctx
         .record_op_with_descr(call_opcode, &allboxes, descr.clone());

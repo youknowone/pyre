@@ -46,8 +46,15 @@ def unequal_half(rounds):
 
 
 expected_hits = ROUNDS // 2 if EQUAL_VALUES_ARE_ONE_OBJECT else 0
-assert equal_half(ROUNDS) == expected_hits, (equal_half(ROUNDS), expected_hits)
-assert unequal_half(ROUNDS) == ROUNDS - expected_hits, (
-    unequal_half(ROUNDS),
+# Compile the loop first. A mid-run compile mixes interned and
+# freshly-boxed bigints in one total, which is not the hot-path
+# agreement this fixture gates.
+equal_half(ROUNDS)
+unequal_half(ROUNDS)
+equal_hits = equal_half(ROUNDS)
+unequal_misses = unequal_half(ROUNDS)
+assert equal_hits == expected_hits, (equal_hits, expected_hits)
+assert unequal_misses == ROUNDS - expected_hits, (
+    unequal_misses,
     ROUNDS - expected_hits,
 )
