@@ -2339,7 +2339,11 @@ impl HomeLiveness {
                     continue;
                 }
                 last_use[a.raw() as usize] = i as i32;
-                if op.opcode == OpCode::Label {
+                // A LABEL arg is a phi def (`consider_label`). A
+                // producerless RefOp is a residual virtualizable slot,
+                // not a phi: dating it here would hide the unwritten
+                // local from the post-collection reload.
+                if op.opcode == OpCode::Label && !matches!(a, OpRef::RefOp(_)) {
                     let d = &mut def_pos[a.raw() as usize];
                     *d = (*d).min(i as i32);
                 }
