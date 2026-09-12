@@ -21955,18 +21955,48 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     if !is_plain_int {
         return Ok(false);
     }
-    // A bridge walk resets the heapcache.  The boxed int is still a
-    // concrete exact int (`is_plain_int` above), so unbox it the same
-    // way `try_emit_exact_int_binop` does instead of residualizing
-    // `bh_store_name` (`inline_multiframe_branchy_carrier` odd arm).
-    let raw_int = match ctx
+    // A bridge walk resets the heapcache, or leaves a getfield whose
+    // raw int has no `box_value`.  The boxed int is still a concrete
+    // exact int (`is_plain_int` above); stamp the raw from that box
+    // instead of residualizing `bh_store_name`
+    // (`inline_multiframe_branchy_carrier` odd arm).
+    let cached = ctx
         .trace_ctx
-        .heapcache_getfield_cached(value_opref, crate::descr::int_intval_descr().index())
-    {
-        Some(raw) => raw,
-        None => {
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            walker_unbox_int(ctx, op_pc, value_opref, int_type_addr)?
+        .heapcache_getfield_cached(value_opref, crate::descr::int_intval_descr().index());
+    let raw_int = match cached {
+        Some(raw)
+            if matches!(
+                ctx.trace_ctx.box_value(raw),
+                Some(majit_ir::Value::Int(_))
+            ) =>
+        {
+            raw
+        }
+        cached => {
+            let raw = match cached {
+                Some(raw) => raw,
+                None => {
+                    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+                    walker_unbox_int(ctx, op_pc, value_opref, int_type_addr)?
+                }
+            };
+            if !matches!(
+                ctx.trace_ctx.box_value(raw),
+                Some(majit_ir::Value::Int(_))
+            ) {
+                if let Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) =
+                    ctx.trace_ctx.box_value(value_opref)
+                {
+                    if p != 0 {
+                        let v = unsafe {
+                            pyre_object::w_int_get_value(p as pyre_object::PyObjectRef)
+                        };
+                        ctx.trace_ctx
+                            .set_opref_concrete(raw, majit_ir::Value::Int(v));
+                    }
+                }
+            }
+            raw
         }
     };
     // The eager concrete write needs the raw int the store applies; a
