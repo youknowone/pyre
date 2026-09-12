@@ -7108,7 +7108,7 @@ impl OptContext {
     /// Number the assembled Vm inputarg, not a Phase-2 remap that import
     /// forwarded onto a Scope. `densify_root_loop_inputargs` then maps
     /// that InputArg onto the dense loc the backend allocated.
-    fn pin_vm_red_in_snapshot(&self, boxes: &mut Vec<crate::resume::SnapshotBox>) {
+    fn pin_vm_red_in_snapshot(&self, boxes: &mut [crate::resume::SnapshotBox]) {
         let Some(vm) = self.declared_vm_red() else {
             return;
         };
@@ -7308,7 +7308,7 @@ impl OptContext {
         let mut snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position())
             .cloned()
             .unwrap_or_default();
-        self.pin_vm_red_in_snapshot(&mut snapshot_boxes);
+        self.pin_vm_red_in_snapshot(snapshot_boxes.as_mut_slice());
         let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position())
             .map(|v| v.as_slice())
             .unwrap_or_default();
@@ -7474,7 +7474,7 @@ impl OptContext {
             self.signal_invalid_loop("resume numbering: TagOverflow");
             return;
         };
-        drop((memo, env));
+        drop(env);
         self.recover_stack_reds_into_liveboxes(op, &mut liveboxes, &mut livebox_types);
 
         if crate::callee_rca_enabled() {
