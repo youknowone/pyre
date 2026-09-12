@@ -242,20 +242,18 @@ impl QuasiImmutField {
         qmut.invalidate();
     }
 
-    /// Unlink the current instance, run `store`, then sweep. `store` runs
-    /// while [`Self::get_current_qmut_instance`] is blocked on this field's
-    /// lock, so a tracer cannot install a fresh watcher against the old
-    /// value between the unlink and the published write.
+    /// Unlink, sweep, then run `store`, all under this field's lock.
+    /// Sweeping first means `GUARD_NOT_INVALIDATED` is already patched
+    /// when the new value is published; the lock keeps
+    /// [`Self::get_current_qmut_instance`] from installing a watcher
+    /// against the old value in between.
     pub fn invalidate_then_store<F: FnOnce()>(&self, store: F) {
-        let qmut_ptr = {
-            let _guard = self.lock.lock();
-            let qmut_ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
-            store();
-            qmut_ptr
-        };
+        let _guard = self.lock.lock();
+        let qmut_ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !qmut_ptr.is_null() {
             unsafe { Arc::from_raw(qmut_ptr) }.invalidate();
         }
+        store();
     }
 
     /// Unlink the instance and hand the field's reference to the caller, who
@@ -432,10 +430,13 @@ mod tests {
                 !field.is_installed(),
                 "store must see the watcher already unlinked"
             );
+            assert!(
+                flag.load(Ordering::Acquire),
+                "GUARD_NOT_INVALIDATED must be patched before the store"
+            );
             published.store(true, Ordering::Release);
         });
         assert!(published.load(Ordering::Acquire));
-        assert!(flag.load(Ordering::Acquire));
         assert!(!field.is_installed());
     }
 
