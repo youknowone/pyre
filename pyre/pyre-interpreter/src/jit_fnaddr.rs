@@ -949,9 +949,13 @@ pub fn is_frame_anchor_word_residual(addr: usize) -> bool {
             .into_iter()
             .filter(|(path, _)| {
                 path.ends_with("::FrameAnchor::live")
+                    || path.ends_with("::FrameAnchor::drop_in_place")
+                    || path.ends_with("::FrameAnchor::drop")
                     || path.ends_with("::frame_anchor_live")
                     || path.ends_with("::frame_anchor_release")
                     || *path == "eval::FrameAnchor::live"
+                    || *path == "eval::FrameAnchor::drop_in_place"
+                    || *path == "eval::FrameAnchor::drop"
             })
             .map(|(_, fnaddr)| fnaddr)
             .collect()
@@ -4102,6 +4106,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "eval::FrameAnchor::live",
         "pyre_interpreter::eval::FrameAnchor::live",
         crate::eval::frame_anchor_live_method_jit_abi,
+    );
+    cpa1(
+        &mut entries,
+        "eval::FrameAnchor::drop_in_place",
+        "pyre_interpreter::eval::FrameAnchor::drop_in_place",
+        crate::eval::frame_anchor_drop_in_place_jit_abi,
+    );
+    cpa1(
+        &mut entries,
+        "eval::FrameAnchor::drop",
+        "pyre_interpreter::eval::FrameAnchor::drop",
+        crate::eval::frame_anchor_drop_jit_abi,
     );
     cp1(
         &mut entries,
