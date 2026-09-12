@@ -5130,6 +5130,24 @@ mod tests {
         assert!(!is_known_unported(msg));
     }
 
+    /// Callee-half twin of
+    /// [`an_unclassified_translated_op_fails_the_build_instead_of_skipping`].
+    /// `unported_category` may Skip a recorded call-path class
+    /// (`call-registry-miss`).  A new class string must stay unclassified
+    /// so it cannot hide as a skip.
+    #[test]
+    fn a_new_call_path_class_is_not_skip_classified() {
+        let recorded = unported_category("not registered in CallRegistry");
+        assert_eq!(recorded, Some("call-registry-miss"));
+        let novel = "call-path-class: unexpected-new-taxonomy-entry";
+        assert_eq!(
+            unported_category(novel),
+            None,
+            "a call-path class outside the recorded taxonomy must fail the build"
+        );
+        assert!(!is_known_unported(novel));
+    }
+
     /// Graph carrying one `UnaryOp` under `op`, both operand and result
     /// pre-bound `Int`, returning the result.  `op` decides whether
     /// `flowspace_adapter::normalize_unary_op_name` accepts the graph, so a
