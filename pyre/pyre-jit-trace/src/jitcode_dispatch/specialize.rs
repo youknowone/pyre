@@ -544,12 +544,6 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
         (Some(lhs), Some(rhs)) => (lhs, rhs),
         _ => return Ok(None),
     };
-    if pyre_object::tagged_int::CAN_BE_TAGGED
-        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
-            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
-    {
-        return Ok(None);
-    }
     let (long, int, long_obj, int_obj) = unsafe {
         if pyre_object::is_long(lhs_obj) && pyre_object::is_int(rhs_obj) {
             (r_args[0], r_args[1], lhs_obj, rhs_obj)
@@ -559,13 +553,27 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
             return Ok(None);
         }
     };
-    let (Some(long_class), Some(int_class)) = (unsafe {
-        (
-            walker_exact_builtin_class(long_obj),
-            walker_exact_builtin_class(int_obj),
-        )
-    }) else {
+    // A tagged immediate is a valid `int` operand (`acc = 0` after warmup).
+    // Declining it forced `0 + overflowing_mul` onto a residual that
+    // GuardValued each new `acc` long (`int_mul_ovf_bignum_promote`).
+    // `walker_unbox_int_typed` already handles the tag; longs are never tagged.
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && pyre_object::tagged_int::is_tagged_int(long_obj)
+    {
         return Ok(None);
+    }
+    let Some(long_class) = (unsafe { walker_exact_builtin_class(long_obj) }) else {
+        return Ok(None);
+    };
+    let int_class = if pyre_object::tagged_int::CAN_BE_TAGGED
+        && pyre_object::tagged_int::is_tagged_int(int_obj)
+    {
+        pyre_object::PY_NULL
+    } else {
+        match unsafe { walker_exact_builtin_class(int_obj) } {
+            Some(cls) => cls,
+            None => return Ok(None),
+        }
     };
     let int_value = unsafe { pyre_object::w_int_get_value(int_obj) };
 
@@ -9319,6 +9327,75 @@ pub(crate) fn binary_op_tag_for_helper_index(
 /// call would otherwise become `CallMayForce`.  Does not walk
 /// `binary_value_from_tag` — that re-enters the same `add` inline and
 /// recurses.
+/// `int_add` / `int_sub` / `int_mul` overflow arm: after `INT_*_OVF`
+/// records overflow, emit `GUARD_OVERFLOW` and the same
+/// `w_long_new(bigint_*_int_int(va, vb))` the interpreter takes
+/// (`descroperation.rs int_mul`).
+fn emit_int_ovf_to_long<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    opcode: OpCode,
+    lhs_raw: OpRef,
+    rhs_raw: OpRef,
+    la: i64,
+    rb: i64,
+    lhs_obj: pyre_object::PyObjectRef,
+    rhs_obj: pyre_object::PyObjectRef,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    use pyre_interpreter::bytecode::BinaryOperator as B;
+    use pyre_interpreter::objspace::descroperation as desc;
+    let (helper, binop) = match opcode {
+        OpCode::IntAddOvf => (desc::jit_bigint_add_int_int as *const (), B::Add),
+        OpCode::IntSubOvf => (desc::jit_bigint_sub_int_int as *const (), B::Subtract),
+        OpCode::IntMulOvf => (desc::jit_bigint_mul_int_int as *const (), B::Multiply),
+        _ => return Ok(None),
+    };
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardOverflow, &[])?;
+    let Ok(boxed_obj) = pyre_interpreter::opcode_ops::binary_value(lhs_obj, rhs_obj, binop) else {
+        return Ok(None);
+    };
+    if boxed_obj.is_null() || unsafe { !pyre_object::is_long(boxed_obj) } {
+        return Ok(None);
+    }
+    let raw_concrete = unsafe {
+        *((boxed_obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET) as *const i64)
+    };
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+        OpCode::CallR,
+        helper,
+        &[lhs_raw, rhs_raw],
+        &[majit_ir::Type::Int, majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(helper as usize as i64),
+            majit_ir::Value::Int(la),
+            majit_ir::Value::Int(rb),
+        ],
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        raw,
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete as usize)),
+    );
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
+    let boxed = crate::helpers::emit_box_long_inline(
+        ctx.trace_ctx,
+        raw,
+        crate::descr::w_long_size_descr(),
+        crate::descr::long_value_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_obj as usize)),
+    );
+    Ok(Some(DispatchOutcome::SubReturn {
+        result: Some(boxed),
+    }))
+}
+
 pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9389,9 +9466,24 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         opcode,
         OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
     ) {
-        let Some(raw) = record_int_ovf_guarded(ctx, op_pc, opcode, lhs_raw, rhs_raw)? else {
-            return Ok(None);
+        let (raw, ovf_flag) = record_int_ovf(ctx, op_pc, opcode, lhs_raw, rhs_raw)?;
+        let heap_ovf = match opcode {
+            OpCode::IntAddOvf => la.checked_add(rb).is_none(),
+            OpCode::IntSubOvf => la.checked_sub(rb).is_none(),
+            OpCode::IntMulOvf => la.checked_mul(rb).is_none(),
+            _ => false,
         };
+        // A bridge InputArg for the unbox may have no sidecar stamp, so
+        // `record_int_ovf` reports overflow=false and takes the sequential
+        // arm. The heap objects still overflow (`a * a` with a≈5e9).
+        if ovf_flag || heap_ovf {
+            return emit_int_ovf_to_long(
+                ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj,
+            );
+        }
+        if !raw.is_constant() {
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
+        }
         let concrete = match opcode {
             OpCode::IntAddOvf => la.checked_add(rb),
             OpCode::IntSubOvf => la.checked_sub(rb),
