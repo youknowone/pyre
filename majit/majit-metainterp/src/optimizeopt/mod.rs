@@ -10334,6 +10334,7 @@ mod boxref_forwarding_tests {
             OpRef::input_arg_typed(0, Type::Ref),
             OpRef::input_arg_typed(1, Type::Ref),
         ];
+        ctx.bridge_vm_red = Some(OpRef::input_arg_typed(1, Type::Ref));
         ctx.ensure_inputarg_bindings();
         let vm = OpRef::input_arg_typed(1, Type::Ref);
         let scope = OpRef::input_arg_typed(6, Type::Ref);
