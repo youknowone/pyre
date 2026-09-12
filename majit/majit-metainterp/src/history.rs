@@ -9,6 +9,15 @@ use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Va
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+/// Field descr of `W_ListIterObject.seq` / `W_TupleIterObject.seq` /
+/// `W_SeqIterObject.seq`. The FOR_ITER list specialize inlines a
+/// Getfield of this field; leftover-empty must bind the receiver
+/// (the iterator), not the stored list.
+pub(crate) fn is_list_iter_seq_field(f: &dyn majit_ir::descr::FieldDescr) -> bool {
+    let n = f.field_name();
+    n.ends_with(".seq") || n.ends_with("::seq") || n == "seq"
+}
+
 /// history.py get_const_ptr_for_string(s)
 ///
 /// Creates a constant GcRef from byte-string character values.
@@ -2726,6 +2735,24 @@ impl TraceCtx {
         args: &[OpRef],
         descr: DescrRef,
     ) -> OpRef {
+        if opcode.is_call()
+            && descr.as_call_descr().is_some_and(|cd| {
+                cd.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::GetIter
+            })
+        {
+            self.note_getiter_iterable(args);
+        } else if opcode == OpCode::GetfieldGcR
+            && !args.is_empty()
+            && descr.as_field_descr().is_some_and(is_list_iter_seq_field)
+        {
+            // pip `_compile` never records `RuntimeHelperKind::GetIter`.
+            // The inlined path is FOR_ITER of an exact list
+            // (`try_walker_specialize_for_iter_list`): GuardClass(ListIter)
+            // then Getfield of `W_ListIterObject.seq`. The receiver is the
+            // iterator leftover leftover-empty must GETFIELD — not the list
+            // (`SetfieldGc seq` would record the list and alias next() onto it).
+            self.note_getiter_iterable(&[args[0]]);
+        }
         Self::do_record_op_with_descr(&mut self.recorder, opcode, args, descr)
     }
 

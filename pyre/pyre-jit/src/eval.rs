@@ -7913,6 +7913,33 @@ fn drive_unpack_iterable_trace(
     }
 }
 
+unsafe extern "C" fn leftover_is_listiter(p: *const u8) -> i32 {
+    if p.is_null() {
+        return 0;
+    }
+    unsafe { pyre_object::iterobject::is_list_iter(p as pyre_object::PyObjectRef) as i32 }
+}
+
+/// Publish EC top (`vref_referent`, never a vref) so leftover_peel_tos can
+/// find the inlined `_compile` listiter when the leftover-empty red is the
+/// portal caller (TOS = ZipInfo).
+fn publish_leftover_scan_frame() {
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() {
+        majit_metainterp::register_leftover_scan_frame(std::ptr::null());
+        return;
+    }
+    let raw = unsafe { (*ec).topframeref };
+    let top = pyre_interpreter::executioncontext::vref_referent(raw);
+    if top.is_null()
+        || unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(top as *const u8) }
+    {
+        majit_metainterp::register_leftover_scan_frame(std::ptr::null());
+        return;
+    }
+    majit_metainterp::register_leftover_scan_frame(top as *const u8);
+}
+
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
 /// like `sys.settrace` see the JIT side from the very first user call,
 /// not only after the first JIT-eligible eval.  Idempotent (the
@@ -7928,6 +7955,10 @@ pub fn init_jit_hooks() {
     // dispatch (object crate included) can read it without depending on
     // the metainterp.
     majit_rlib::jit::install_we_are_jitted(majit_backend::we_are_jitted);
+    majit_metainterp::register_listiter_type_word(
+        &pyre_object::iterobject::LIST_ITER_TYPE as *const _ as usize,
+    );
+    majit_metainterp::register_listiter_pred(leftover_is_listiter);
     // Phase A: build the GC and install it into the backend + pyre-object
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
@@ -11231,7 +11262,8 @@ fn execute_assembler(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    let mut frame_root = FrameRoot::new(frame);
+    let mut frame_root = FrameRoot::new(loop_red_frame(frame));
+    publish_leftover_scan_frame();
     frame_root.frame().set_last_instr_from_next_instr(entry_pc);
 
     // Convert tagged-immediate frame locals to heap `W_IntObject` before the
@@ -11536,7 +11568,15 @@ fn compile_and_run_once(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    let mut frame_root = FrameRoot::new(frame);
+    // Back-edge: leftover-empty GETFIELDs the red. An inlined `_compile`
+    // is EC top while `can_enter_jit` still holds the portal. Function
+    // entry's red is the callee being entered, not a deeper top frame.
+    let red = match start {
+        CompileOnceStart::BackEdge => loop_red_frame(frame),
+        CompileOnceStart::FunctionEntry => frame,
+    };
+    let mut frame_root = FrameRoot::new(red);
+    publish_leftover_scan_frame();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     majit_metainterp::mc_diag_bump(match start {
         CompileOnceStart::BackEdge => 18,
@@ -11731,7 +11771,8 @@ fn bound_reached(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    let mut frame_root = FrameRoot::new(frame);
+    let mut frame_root = FrameRoot::new(loop_red_frame(frame));
+    publish_leftover_scan_frame();
     if majit_metainterp::majit_log_enabled() {
         let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame_root.frame()).len().min(5))
             .map(|i| {
@@ -14520,6 +14561,46 @@ fn replay_pending_fields(
             );
         }
     }
+}
+
+/// One red frame per frame (`AGENTS.md`). leftover-empty GETFIELDs
+/// `inputargs[index_of_virtualizable]`, the red `execute_assembler` passes.
+/// `portal_frame_reg` aliases the outermost caller for an inlined callee, so
+/// `can_enter_jit` can still hold the portal while the leftover iterator
+/// lives on the inlined `_compile`.
+///
+/// `topframeref` is a `jit.virtual_ref`. Do not `force_vref` here:
+/// `execute_assembler` is about to run compiled code against this vable,
+/// and `force_virtual` clears `TOKEN_TRACING_RESCALL`. Read the named
+/// frame only (`vref_referent`); a still-virtual vref stays on the
+/// dispatch red.
+fn loop_red_frame(dispatch: &mut PyFrame) -> &mut PyFrame {
+    let dispatch_ptr = dispatch as *mut PyFrame;
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() {
+        return dispatch;
+    }
+    let raw = unsafe { (*ec).topframeref };
+    let top = pyre_interpreter::executioncontext::vref_referent(raw);
+    if top.is_null() || top == dispatch_ptr {
+        return dispatch;
+    }
+    if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(top as *const u8) } {
+        return dispatch;
+    }
+    // Same function only: recursive `_compile` inlined into itself.
+    // A different pycode is another activation (importlib, pip) whose
+    // vable layout is not this loop's leftover-empty prologue.
+    if unsafe { (*top).pycode } != dispatch.pycode {
+        return dispatch;
+    }
+    if unsafe { (*top).locals_cells_stack_w }.is_null() {
+        return dispatch;
+    }
+    if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+        eprintln!("loop-red dispatch={dispatch_ptr:p} top={top:p} pycode={:p}", dispatch.pycode);
+    }
+    unsafe { &mut *top }
 }
 
 // dont_look_inside: JIT-state construction machinery the tracer must not enter.

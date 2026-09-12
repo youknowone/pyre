@@ -206,6 +206,8 @@ mod residual_host {
             [obj, attr, w_code_ptr, name_idx] => pyre_jit::call_jit::bh_load_method_self_fn,
             [namespace_ptr, w_code_ptr, frame_ptr, namei] =>
                 pyre_jit::call_jit::bh_load_global_fn,
+            [vable, vsd_off, array_off, ptr_off, len_off, items_off, kind] =>
+                pyre_jit::leftover_peel_tos_i64,
         ]
     }
 

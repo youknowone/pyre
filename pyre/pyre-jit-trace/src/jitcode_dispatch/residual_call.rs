@@ -7105,6 +7105,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // Range GET_ITER: virtualize exact machine-word `range` into the same
     // `W_IntRangeIterator` shape PyPy's inlined `descr_iter` would trace.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::GetIter {
+        ctx.trace_ctx.note_getiter_iterable(&r_args);
+    }
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::GetIter
     {
@@ -7140,6 +7143,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::ForIterNext
     {
+        // pip `_compile` traces FOR_ITER as this helper, not GetIter.
+        // The iterator arg is the getarrayitem_vable TOS box; record its
+        // mint index so leftover-empty GETFIELDs that slot, not a frame.
+        if r_args.first().is_some_and(|&iter_op| {
+            walker_concrete_ref_object(ctx, iter_op)
+                .is_some_and(|obj| unsafe { pyre_object::is_list_iter(obj) })
+        }) {
+            ctx.trace_ctx.note_getiter_iterable(&r_args);
+        }
         if let Some(item_op) = spec_gate(SpecFold::ForIterNext, || {
             try_walker_specialize_for_iter_next(ctx, op.pc, &r_args, dst, dst_bank)
         })? {

@@ -28,6 +28,7 @@ cover the condition they diagnose.
 | `MAJIT_GC_FREELIST_DIAG` | OFF | Reports GC freelist allocation and reuse; remove when freelist accounting has sufficient invariant tests. |
 | `MAJIT_GC_ITEMSBLOCK` | ON | Selects GC-managed list item blocks; `0`, `off`, or `false` restores the fallback, which can be removed after deleting the alternate representation. |
 | `MAJIT_JTRANSFORM_SHADOW` | OFF | Compares shadow and primary jtransform results; remove after deleting the shadow implementation. |
+| `MAJIT_LEFTOVER` | OFF | Prints leftover-empty / leftover_peel_tos compile and runtime dumps; remove when leftover-empty FOR_ITER reload is covered by ordinary tests. |
 | `MAJIT_MIR_FRAMESTATE` | ON | Selects framestate-threaded MIR lowering; `0` or `false` restores the older lowering, and the escape hatch retires with that path. |
 | `MAJIT_MIR_FRAMESTATE_DEBUG` | OFF | Prints framestate merge diagnostics; remove when merge failures are covered by focused tests. |
 | `MAJIT_MIR_FRAMESTATE_STRICT` | OFF | Turns framestate fallback into a hard failure; remove after deleting the fallback. |
@@ -330,6 +331,13 @@ cover the condition they diagnose.
 - Accessor: `leaf3_prov_enabled()`
 - What it does: Emits the resume tag, value, and null status of the virtualizable identity slot consumed by `consume_vable_info()`.
 - Retirement condition: Remove after the unseeded-snapshot route into `_number_boxes()` is rejected or proven unreachable.
+
+### `MAJIT_LEFTOVER`
+
+- Read sites: 3 — `majit/majit-metainterp/src/compile.rs`, `majit/majit-metainterp/src/pyjitpl.rs`, `pyre/pyre-jit/src/eval.rs`
+- Accessor: `std::env::var_os("MAJIT_LEFTOVER")` at leftover-empty compile dumps, leftover_peel_tos, and `loop_red_frame`
+- What it does: Prints leftover-empty field-walk / leftover_peel_tos compile and runtime dumps so a FOR_ITER leftover remapped onto a non-iterator portal TOS (ZipInfo) can be distinguished from a live listiter reload.
+- Retirement condition: Remove when leftover-empty FOR_ITER reload is covered by ordinary tests (`compile::tests` leftover_peel_tos / reject) and ensurepip no longer needs the dump.
 
 ### `MAJIT_LLBC_EXTRACTION`
 

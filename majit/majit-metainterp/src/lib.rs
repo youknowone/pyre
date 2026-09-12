@@ -188,7 +188,8 @@ pub use call_descr::{
 pub use compile::{
     make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,
     make_resume_guard_descr_instance_next_foriter, make_resume_guard_descr_range_foriter,
-    raw_exit_values,
+    leftover_peel_tos_i64, raw_exit_values, register_leftover_scan_frame,
+    register_listiter_pred, register_listiter_type_word, take_leftover_empty_reject,
 };
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,

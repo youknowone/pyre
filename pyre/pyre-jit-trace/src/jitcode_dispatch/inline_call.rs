@@ -5435,8 +5435,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // this frame reg (see the `*_vable_via_metainterp` short-circuits).
     // `u16::MAX` for a non-portal callee keeps the strict predicate
     // byte-identical (`inline_resolvable_seeded_frame_op` declines).
+    // Own-frame red, not the caller's `metadata.portal_frame_reg`.
+    // `built_as_portal` records the Portal *input shape* on every drained
+    // per-code jitcode; do not require it here. A missing filter left
+    // non-portal-shaped callees on `u16::MAX` so leftover-empty GETFIELD
+    // the portal and never saw the New `_compile` box.
     let callee_portal_frame_reg = crate::state::ensure_jitcode_index(callee_code_key as *const ())
-        .filter(|&jc| crate::state::built_as_portal_at(jc))
         .map(|jc| crate::state::portal_red_regs_at(jc).0)
         .unwrap_or(u16::MAX);
     let strict_inlinable =
@@ -6730,6 +6734,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
 
         callee_regs_r.set(frame_reg as usize, callee_frame);
+        ctx.trace_ctx.set_inline_vable_box(callee_frame);
         // `perform_call` creates one concrete frame per MIFrame before
         // `setup_call` installs the argument boxes (pyjitpl.py,
         // 1862-1874).  Mirror that recording-time object.  `setup_call`
@@ -7165,6 +7170,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     .registers_r
                     .get(callee_portal_frame_reg as usize)
                     .expect("ref register in range");
+                if shadow.frame_box != OpRef::NONE {
+                    sub_wc.trace_ctx.set_inline_vable_box(shadow.frame_box);
+                }
             }
             if !try_multiframe {
                 let mut state = sub_wc.frame_state.borrow_mut();

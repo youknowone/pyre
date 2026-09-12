@@ -1497,7 +1497,9 @@ fn normalize_root_loop_entry_contract(
 fn densify_root_loop_inputargs(
     args: &[OpRef],
     ops: Vec<majit_ir::OpRc>,
-) -> (Vec<InputArg>, Vec<majit_ir::OpRc>) {
+    mint_fields: &[OpRef],
+    getiter_vable_fields: &[u32],
+) -> (Vec<InputArg>, Vec<majit_ir::OpRc>, Vec<(OpRef, u32)>) {
     let mut replacements: indexmap::IndexMap<OpRef, majit_ir::InputArgRc> =
         indexmap::IndexMap::new();
     let inputargs = args
@@ -1519,35 +1521,188 @@ fn densify_root_loop_inputargs(
         })
         .collect();
 
-    let remap = |operand: &majit_ir::operand::Operand| {
-        // Only the renamed root boxes. Following `get_box_replacement`
-        // here remaps a leftover range-iterator (or any body Ref the
-        // optimizer parked on the vable red) onto the frame:
-        // `TypeError: 'frame' object is not an iterator`. Leftover
-        // *field* InputArgs are remapped in
-        // `patch_new_loop_to_load_virtualizable_fields`, which knows
-        // the vable mint list.
-        replacements
-            .get(&operand.to_opref())
-            .map(majit_ir::operand::Operand::from_bound_inputarg)
-            .unwrap_or_else(|| operand.clone())
+    // RPython Box identity: a body-LABEL list-iterator is not the
+    // entry field box at the same renamed slot. Mapping both onto
+    // dense InputArg(k) lets leftover-empty GETFIELD reload that
+    // vable local (`'frame' object is not an iterator`). Keep a
+    // distinct live InputArg outside the entry vector.
+    let is_list_or_iter_field = |op: &majit_ir::OpRc| -> bool {
+        op.opcode == OpCode::GetfieldGcR
+            && op.getdescr().is_some_and(|d| {
+                d.as_field_descr().is_some_and(|f| {
+                    let n = f.field_name();
+                    n.contains("IterObject")
+                        || n.contains("ListIter")
+                        || n.contains("ListObject")
+                        || n.contains("W_List")
+                        || n.contains("W_Tuple")
+                })
+            })
     };
-    let ops = ops
-        .into_iter()
-        .map(|op| {
-            let args = op
-                .getarglist()
-                .iter()
-                .map(&remap)
-                .collect::<smallvec::SmallVec<[_; 3]>>();
-            let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
-            if let Some(failargs) = op.guard_fail_args() {
-                cloned.setfailargs(failargs.iter().map(&remap).collect());
+    let n_renamed = args.len() as u32;
+    let mint_of = |src: OpRef| -> Option<u32> {
+        let j = mint_fields.iter().position(|&m| m == src)?;
+        if src.is_input_arg() && src.raw() < n_renamed {
+            return None;
+        }
+        Some(j as u32)
+    };
+    let mut listiter_boxes: rustc_hash::FxHashSet<OpRef> = rustc_hash::FxHashSet::default();
+    for op in &ops {
+        if is_list_or_iter_field(op) {
+            if let Some(recv) = op.getarglist().first().map(|a| a.to_opref()) {
+                if replacements.contains_key(&recv) && mint_of(recv).is_some() {
+                    listiter_boxes.insert(recv);
+                }
             }
-            cloned
+        }
+    }
+    let mut live_idents: indexmap::IndexMap<OpRef, majit_ir::InputArgRc> =
+        indexmap::IndexMap::new();
+    let mut next_live = args.len() as u32;
+    let mut seen_label = 0usize;
+    let mut remapped = Vec::with_capacity(ops.len());
+    for op in ops {
+        if op.opcode == OpCode::Label {
+            seen_label += 1;
+        }
+        let split_live = seen_label >= 2
+            || matches!(op.opcode, OpCode::GuardClass | OpCode::GuardNonnullClass)
+            || is_list_or_iter_field(&op);
+        let mut remap_one = |operand: &majit_ir::operand::Operand| {
+            // Only the renamed root boxes. Following `get_box_replacement`
+            // here remaps a leftover range-iterator (or any body Ref the
+            // optimizer parked on the vable red) onto the frame:
+            // `TypeError: 'frame' object is not an iterator`. Leftover
+            // *field* InputArgs are remapped in
+            // `patch_new_loop_to_load_virtualizable_fields`, which knows
+            // the vable mint list.
+            let src = operand.to_opref();
+            if split_live && listiter_boxes.contains(&src) {
+                if let Some(dense) = replacements.get(&src) {
+                    let live = live_idents
+                        .entry(src)
+                        .or_insert_with(|| {
+                            let minted = InputArgRc::new(InputArg::from_type(dense.tp, next_live));
+                            next_live += 1;
+                            minted
+                        })
+                        .clone();
+                    return majit_ir::operand::Operand::from_bound_inputarg(&live);
+                }
+            }
+            replacements
+                .get(&src)
+                .map(majit_ir::operand::Operand::from_bound_inputarg)
+                .unwrap_or_else(|| operand.clone())
+        };
+        let new_args = op
+            .getarglist()
+            .iter()
+            .map(&mut remap_one)
+            .collect::<smallvec::SmallVec<[_; 3]>>();
+        let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&new_args), None));
+        if let Some(failargs) = op.guard_fail_args() {
+            cloned.setfailargs(failargs.iter().map(&mut remap_one).collect());
+        }
+        remapped.push(cloned);
+    }
+    // Mint identity: renamed[p] == mint[j] means dense InputArg(p) is
+    // field j, even when p != prefix+j. leftover-empty applies this
+    // after the positional walk so GET_ITER of that slot reloads the
+    // mint field (the per-function list/iterator), not the valuestack
+    // slot at the same dense index.
+    //
+    // GET_ITER leftovers whose renamed box is a new virtualstate
+    // InputArg still bind to the field recorded at trace time.
+    // pip `_compile` does not emit `RuntimeHelperKind::GetIter`; the
+    // inlined FOR_ITER path is Getfield of `W_ListIterObject.seq`.
+    let is_iter_cursor = |op: &majit_ir::OpRc| -> bool {
+        let is_getiter = op.opcode.is_call()
+            && op.getdescr().is_some_and(|d| {
+                d.as_call_descr().is_some_and(|cd| {
+                    cd.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::GetIter
+                })
+            });
+        if is_getiter {
+            return true;
+        }
+        op.opcode == OpCode::GetfieldGcR
+            && op.getdescr().is_some_and(|d| {
+                d.as_field_descr()
+                    .is_some_and(crate::history::is_list_iter_seq_field)
+            })
+    };
+    let mut live_from_entry: Vec<(OpRef, u32)> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(p, &src)| {
+            let j = mint_fields.iter().position(|&m| m == src)?;
+            let tp = src.ty().unwrap_or(Type::Ref);
+            Some((OpRef::input_arg_typed(p as u32, tp), j as u32))
         })
         .collect();
-    (inputargs, ops)
+    let mut getiter_next = 0usize;
+    for op in &remapped {
+        if !is_iter_cursor(op) {
+            continue;
+        }
+        for arg in op.getarglist() {
+            let src = arg.to_opref();
+            if !src.is_input_arg() || src.ty() != Some(Type::Ref) {
+                continue;
+            }
+            if live_from_entry.iter().any(|&(r, _)| r == src) {
+                continue;
+            }
+            let j = mint_of(src).or_else(|| {
+                let field = *getiter_vable_fields.get(getiter_next)?;
+                getiter_next += 1;
+                Some(field)
+            });
+            if let Some(j) = j {
+                live_from_entry.push((src, j));
+            }
+        }
+    }
+    // Split leftovers bind to the same mint field when the source is
+    // the mint box itself. A match against a dense entry InputArg
+    // (`InputArg(k)` with k < renamed.len()) is the expanded-tail
+    // numbering alias — that GETFIELD is a value-stack frame.
+    for (src, live) in &live_idents {
+        if let Some(j) = mint_fields.iter().position(|&m| m == *src) {
+            if !(src.is_input_arg() && src.raw() < n_renamed) {
+                live_from_entry.push((live.opref(), j as u32));
+            }
+        }
+    }
+    // FOR_ITER leftover is the iterator at TOS. Expanded-tail mint
+    // identity maps it onto a local (`_compile.p`). leftover-empty
+    // reloads `valuestackdepth - 1` from the live frame instead.
+    let is_listiter_seq = |op: &majit_ir::OpRc| -> bool {
+        op.opcode == OpCode::GetfieldGcR
+            && op.getdescr().is_some_and(|d| {
+                d.as_field_descr()
+                    .is_some_and(crate::history::is_list_iter_seq_field)
+            })
+    };
+    for op in &remapped {
+        if !is_listiter_seq(op) {
+            continue;
+        }
+        for arg in op.getarglist() {
+            let src = arg.to_opref();
+            if !src.is_input_arg() || src.ty() != Some(Type::Ref) {
+                continue;
+            }
+            if let Some(slot) = live_from_entry.iter_mut().find(|(r, _)| *r == src) {
+                slot.1 = crate::compile::LISTITER_TOS_RELOAD;
+            } else {
+                live_from_entry.push((src, crate::compile::LISTITER_TOS_RELOAD));
+            }
+        }
+    }
+    (inputargs, remapped, live_from_entry)
 }
 
 pub(crate) struct CompiledEntry<M> {
@@ -2116,6 +2271,18 @@ pub struct MetaInterp<M: Clone> {
     /// GETFIELD preamble when virtualstate has already dropped them from
     /// `inputargs`.
     pub(crate) vable_entry_oprefs: Vec<OpRef>,
+    /// GET_ITER vable field indices copied off `TraceCtx` before
+    /// `compile_loop` takes the recorder. densify binds leftovers to these
+    /// when the virtualstate box is a new InputArg.
+    pub(crate) getiter_vable_fields: Vec<u32>,
+    /// Live boxes densify split off an entry field slot (ListIter /
+    /// ListObject). leftover-empty GETFIELD reloads that slot and
+    /// forwards these boxes the GETFIELD result so first entry is
+    /// not an uninitialized InputArg.
+    pub(crate) densify_live_from_entry: Vec<(OpRef, u32)>,
+    /// IR box whose concrete is the inlined `_compile` frame (`orig_vable`
+    /// when that is not the portal red). leftover-empty GETFIELDs this.
+    pub(crate) inline_vable_opref: Option<OpRef>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
     pub(crate) result_type: Type,
     /// PyPy warmspot.py max_unroll_recursion (default 7).
@@ -3781,6 +3948,9 @@ impl<M: Clone> MetaInterp<M> {
             vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
             vable_entry_oprefs: Vec::new(),
+            getiter_vable_fields: Vec::new(),
+            densify_live_from_entry: Vec::new(),
+            inline_vable_opref: None,
             result_type: Type::Ref,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
             force_finish_trace: false,
@@ -4823,6 +4993,8 @@ impl<M: Clone> MetaInterp<M> {
         // and drop InputArgRefs the snapshot still names.
         self.set_vable_array_lengths(array_lengths);
         self.vable_entry_oprefs = vable_oprefs;
+        self.getiter_vable_fields.clear();
+        self.inline_vable_opref = None;
     }
 
     /// warmstate.py: set_param_trace_eagerness — delegates to warmstate.
@@ -6968,7 +7140,8 @@ impl<M: Clone> MetaInterp<M> {
                 .map(|i| unsafe { vinfo.get_array_length(orig_vable_ptr, i) })
                 .collect()
         };
-        compile::patch_new_loop_to_load_virtualizable_fields(
+        let live_tos = unsafe { crate::compile::live_tos_for_vable(vinfo, orig_vable_ptr) };
+        compile::patch_new_loop_to_load_virtualizable_fields_with_vable(
             ops,
             inputargs,
             vinfo,
@@ -6977,6 +7150,10 @@ impl<M: Clone> MetaInterp<M> {
             index_of_vable,
             constants,
             &self.vable_entry_oprefs,
+            &self.densify_live_from_entry,
+            live_tos,
+            orig_vable_ptr,
+            self.inline_vable_opref,
         );
         // compile.py `patch_new_loop_to_load_virtualizable_fields`
         // only touches `loop.inputargs`; it does not rewrite any LABEL/JUMP
@@ -7415,6 +7592,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
+        self.getiter_vable_fields = ctx.getiter_vable_fields.clone();
         // Cache driver descriptor before ctx is partially consumed below;
         // mirrors the FINISH-path capture pattern (see `finish_and_compile`).
         let driver_descriptor = ctx.driver_descriptor().cloned();
@@ -7439,6 +7617,16 @@ impl<M: Clone> MetaInterp<M> {
         // (compile.py:443).
         let orig_vable_ptr_loop =
             self.orig_vable_ptr_for_cut(cut_merge_point, &ctx, driver_descriptor.as_ref());
+        let portal_idx = driver_descriptor
+            .as_ref()
+            .and_then(|d| d.virtualizable_arg_index())
+            .unwrap_or(0);
+        self.inline_vable_opref = ctx.inline_vable_box().or_else(|| {
+            ctx.opref_with_concrete_ref(
+                orig_vable_ptr_loop as usize,
+                OpRef::input_arg_ref(portal_idx as u32),
+            )
+        });
         let cross_loop_cut = cut_merge_point.map(|mp| {
             (
                 mp.green_boxes.clone(),
@@ -8034,8 +8222,29 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         let (root_inputargs, mut optimized_ops) = match renamed_root_args {
-            Some(args) => densify_root_loop_inputargs(&args, optimized_ops),
-            None => (trace.inputargs_cloned(), optimized_ops),
+            Some(args) => {
+                let getiter_fields = if !self.getiter_vable_fields.is_empty() {
+                    self.getiter_vable_fields.as_slice()
+                } else {
+                    self.tracing
+                        .as_ref()
+                        .or(self.compile_tracing.as_ref())
+                        .map(|ctx| ctx.getiter_vable_fields.as_slice())
+                        .unwrap_or(&[])
+                };
+                let (inputargs, ops, live) = densify_root_loop_inputargs(
+                    &args,
+                    optimized_ops,
+                    &self.vable_entry_oprefs,
+                    getiter_fields,
+                );
+                self.densify_live_from_entry = live;
+                (inputargs, ops)
+            }
+            None => {
+                self.densify_live_from_entry.clear();
+                (trace.inputargs_cloned(), optimized_ops)
+            }
         };
         if retried_without_unroll
             && !optimized_ops
@@ -8371,6 +8580,12 @@ impl<M: Clone> MetaInterp<M> {
             driver_descriptor.as_ref(),
             orig_vable_ptr_loop,
         );
+        if crate::compile::take_leftover_empty_reject() {
+            if crate::majit_log_enabled() || std::env::var_os("MAJIT_LEFTOVER").is_some() {
+                eprintln!("[jit] leftover-empty reject: portal TOS is not a listiter");
+            }
+            return CompileOutcome::Aborted;
+        }
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] pre-backend: {} ops, {} inputargs",
@@ -10492,6 +10707,9 @@ impl<M: Clone> MetaInterp<M> {
         // Taking it out of `tracing` stops a re-entrant record; dropping it
         // before compile intern would reopen the nursery-ConstPtr window.
         self.compile_tracing = self.tracing.take();
+        if let Some(ctx) = self.compile_tracing.as_ref() {
+            self.getiter_vable_fields = ctx.getiter_vable_fields.clone();
+        }
         let compile_tracing_slot = &raw mut self.compile_tracing;
         struct CompileTracingGuard(*mut Option<TraceCtx>);
         impl Drop for CompileTracingGuard {
@@ -10512,6 +10730,19 @@ impl<M: Clone> MetaInterp<M> {
             let ctx = self.compile_tracing.as_ref().unwrap();
             self.orig_vable_ptr_from_trace_ctx(ctx, driver_descriptor.as_ref())
         };
+        {
+            let ctx = self.compile_tracing.as_ref().unwrap();
+            let portal_idx = driver_descriptor
+                .as_ref()
+                .and_then(|d| d.virtualizable_arg_index())
+                .unwrap_or(0);
+            self.inline_vable_opref = ctx.inline_vable_box().or_else(|| {
+                ctx.opref_with_concrete_ref(
+                    orig_vable_ptr as usize,
+                    OpRef::input_arg_ref(portal_idx as u32),
+                )
+            });
+        }
         // pyjitpl.py compile_done_with_this_frame parity:
         // `store_token_in_vable` (SetfieldGc on vable_token + the
         // accompanying GUARD_NOT_FORCED_2) is recorded by the pyre
@@ -25019,7 +25250,8 @@ mod tests {
                 .map(majit_ir::operand::Operand::bound_from_opref)
                 .collect(),
         );
-        let (inputargs, ops) = densify_root_loop_inputargs(&renamed, vec![guard]);
+        let (inputargs, ops, live) = densify_root_loop_inputargs(&renamed, vec![guard], &[], &[]);
+        assert!(live.is_empty());
         assert_eq!(
             inputargs.iter().map(InputArg::opref).collect::<Vec<_>>(),
             vec![
@@ -25056,13 +25288,239 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let (inputargs, ops) = densify_root_loop_inputargs(&renamed, vec![guard]);
+        let (inputargs, ops, live) = densify_root_loop_inputargs(&renamed, vec![guard], &[], &[]);
+        assert!(live.is_empty());
         assert_eq!(inputargs.len(), 1);
         assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(0));
         assert_eq!(
             ops[0].getfailargs().unwrap()[0].to_opref(),
             OpRef::input_arg_ref(98),
             "a leftover body Ref must not become the vable red"
+        );
+    }
+
+    #[test]
+    fn test_densify_keeps_body_label_listiter_off_entry_field_slots() {
+        // renamed entry is frame + field. Body LABEL / GuardClass carry
+        // the same renamed Ref as the field slot. Densify must not put
+        // that ListIter on dense InputArg(1): leftover-empty GETFIELD
+        // would reload the vable local (`'frame' object is not an iterator`).
+        let renamed = vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(50)];
+        let start = std::rc::Rc::new(mk_op(
+            OpCode::Label,
+            &[renamed[0], renamed[1]],
+            OpRef::NONE.raw(),
+        ));
+        let guard = std::rc::Rc::new(mk_op(
+            OpCode::GuardClass,
+            &[renamed[1], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
+            OpRef::NONE.raw(),
+        ));
+        let mut seq = mk_op(OpCode::GetfieldGcR, &[renamed[1]], 99);
+        seq.setdescr(std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_ListIterObject.seq".into(),
+                "seq".into(),
+            ),
+        ));
+        let seq = std::rc::Rc::new(seq);
+        let body = std::rc::Rc::new(mk_op(
+            OpCode::Label,
+            &[renamed[0], renamed[1]],
+            OpRef::NONE.raw(),
+        ));
+        let (inputargs, ops, live) = densify_root_loop_inputargs(
+            &renamed,
+            vec![start, guard, seq, body],
+            &[renamed[1]],
+            &[],
+        );
+        assert_eq!(inputargs.len(), 2);
+        assert!(
+            live.iter()
+                .any(|&(r, j)| r.is_input_arg()
+                    && r.raw() >= 2
+                    && j == crate::compile::LISTITER_TOS_RELOAD),
+            "ListIter leftover must bind to live TOS reload, got {live:?}"
+        );
+        assert_eq!(ops[0].arg(1).to_opref(), OpRef::input_arg_ref(1));
+        let live = ops[1].arg(0).to_opref();
+        assert!(
+            live.is_input_arg() && live.raw() >= 2,
+            "ListIter must sit outside the entry vector, got {live:?}"
+        );
+        assert_eq!(ops[2].arg(0).to_opref(), live);
+        assert_eq!(ops[3].arg(1).to_opref(), live);
+        assert_ne!(live, OpRef::input_arg_ref(1));
+    }
+
+    #[test]
+    fn test_densify_does_not_bind_listiter_to_an_aliased_dense_slot() {
+        // renamed[1] is a fresh entry InputArg, not the mint field box.
+        // leftover-empty must not treat dense slot 1 as the iterator field
+        // (that GETFIELD is a value-stack frame).
+        let renamed = vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(50)];
+        let start = std::rc::Rc::new(mk_op(
+            OpCode::Label,
+            &[renamed[0], renamed[1]],
+            OpRef::NONE.raw(),
+        ));
+        let guard = std::rc::Rc::new(mk_op(
+            OpCode::GuardClass,
+            &[renamed[1], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
+            OpRef::NONE.raw(),
+        ));
+        let mut seq = mk_op(OpCode::GetfieldGcR, &[renamed[1]], 99);
+        seq.setdescr(std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_ListIterObject.seq".into(),
+                "seq".into(),
+            ),
+        ));
+        let seq = std::rc::Rc::new(seq);
+        let mint = vec![OpRef::input_arg_ref(80)];
+        let (_inputargs, _ops, live) =
+            densify_root_loop_inputargs(&renamed, vec![start, guard, seq], &mint, &[]);
+        assert!(
+            !live.iter().any(|&(r, _)| r.is_input_arg() && r.raw() >= 2),
+            "ListIter aliased onto a dense slot must not bind to that slot's GETFIELD, got {live:?}"
+        );
+
+        let renamed_dense = vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)];
+        let start2 = std::rc::Rc::new(mk_op(
+            OpCode::Label,
+            &[renamed_dense[0], renamed_dense[1]],
+            OpRef::NONE.raw(),
+        ));
+        let guard2 = std::rc::Rc::new(mk_op(
+            OpCode::GuardClass,
+            &[renamed_dense[1], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
+            OpRef::NONE.raw(),
+        ));
+        let mut seq2 = mk_op(OpCode::GetfieldGcR, &[renamed_dense[1]], 99);
+        seq2.setdescr(std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_ListIterObject.seq".into(),
+                "seq".into(),
+            ),
+        ));
+        let (_ia, _ops, live_dense) = densify_root_loop_inputargs(
+            &renamed_dense,
+            vec![start2, guard2, std::rc::Rc::new(seq2)],
+            &[renamed_dense[1]],
+            &[],
+        );
+        assert!(
+            !live_dense.iter().any(|&(r, _)| r.is_input_arg() && r.raw() >= 2),
+            "expanded-tail ListIter leftover must not bind to the aliased slot, got {live_dense:?}"
+        );
+    }
+
+    #[test]
+    fn test_densify_records_mint_identity_when_the_field_is_not_at_its_dense_index() {
+        // pattern is mint field 0 sitting at renamed[2], not at prefix+0.
+        // leftover-empty must GETFIELD field 0 for InputArg(2), not field 2.
+        let renamed = vec![
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(10),
+            OpRef::input_arg_ref(50),
+        ];
+        let start = std::rc::Rc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
+        let (_ia, _ops, live) =
+            densify_root_loop_inputargs(&renamed, vec![start], &[renamed[2]], &[]);
+        assert!(
+            live.iter()
+                .any(|&(r, j)| r == OpRef::input_arg_ref(2) && j == 0),
+            "dense InputArg(2) is mint field 0, got {live:?}"
+        );
+    }
+
+    #[test]
+    fn test_densify_binds_getiter_to_trace_time_vable_field() {
+        // After virtualstate the GET_ITER arg is a new InputArg, not the
+        // mint box. leftover-empty must still GETFIELD the field recorded
+        // when the residual GetIter was traced.
+        let renamed = vec![
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(10),
+            OpRef::input_arg_ref(99),
+        ];
+        let mut effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        effect.runtime_helper = majit_ir::RuntimeHelperKind::GetIter;
+        let descr = majit_ir::descr::make_call_descr(vec![Type::Ref], Type::Ref, effect);
+        let mut call = mk_op(OpCode::CallR, &[renamed[2]], 40);
+        call.setdescr(descr);
+        let start = std::rc::Rc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
+        let (_ia, _ops, live) = densify_root_loop_inputargs(
+            &renamed,
+            vec![start, std::rc::Rc::new(call)],
+            &[OpRef::input_arg_ref(50)],
+            &[5],
+        );
+        assert!(
+            live.iter()
+                .any(|&(r, j)| r == OpRef::input_arg_ref(2) && j == 5),
+            "GET_ITER leftover InputArg(2) must bind to traced field 5, got {live:?}"
+        );
+    }
+
+    #[test]
+    fn test_densify_binds_listiter_seq_to_trace_time_vable_field() {
+        // pip `_compile` leftover is the FOR_ITER ListIter, a new
+        // virtualstate InputArg. leftover-empty must GETFIELD the
+        // iterator slot recorded when Getfield(W_ListIterObject.seq)
+        // was traced, not the dense position (a valuestack frame).
+        let renamed = vec![
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(10),
+            OpRef::input_arg_ref(99),
+        ];
+        let mut seq = mk_op(OpCode::GetfieldGcR, &[renamed[2]], 40);
+        seq.setdescr(std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_ListIterObject.seq".into(),
+                "seq".into(),
+            ),
+        ));
+        let start = std::rc::Rc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
+        let mint: Vec<OpRef> = (0..8).map(|i| OpRef::input_arg_ref(50 + i)).collect();
+        let (_ia, _ops, live) = densify_root_loop_inputargs(
+            &renamed,
+            vec![start, std::rc::Rc::new(seq)],
+            &mint,
+            &[7],
+        );
+        assert!(
+            live.iter().any(|&(r, j)| r == OpRef::input_arg_ref(2)
+                && j == crate::compile::LISTITER_TOS_RELOAD),
+            "ListIter leftover InputArg(2) must bind to live TOS reload, got {live:?}"
         );
     }
 
