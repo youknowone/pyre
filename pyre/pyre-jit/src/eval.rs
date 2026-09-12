@@ -14956,7 +14956,10 @@ fn loop_red_frame(dispatch: &mut PyFrame) -> &mut PyFrame {
         return dispatch;
     }
     if std::env::var_os("MAJIT_LEFTOVER").is_some() {
-        eprintln!("loop-red dispatch={dispatch_ptr:p} top={top:p} pycode={:p}", dispatch.pycode);
+        eprintln!(
+            "loop-red dispatch={dispatch_ptr:p} top={top:p} pycode={:p}",
+            dispatch.pycode
+        );
     }
     unsafe { &mut *top }
 }
