@@ -683,7 +683,7 @@ fn sparse_value_ids_declare_only_addressable_value_locals() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 3 + 6 + 1,
+        inputargs.len() as u32 + 3 + 6 + 3,
         "two input values and three sparse ids, plus fixed i64 and i32 locals"
     );
 }
@@ -709,7 +709,7 @@ fn same_as_reuses_its_source_local() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 1 + 6 + 1,
+        inputargs.len() as u32 + 1 + 6 + 3,
         "SameAsI shares input 0's local; only IntAdd allocates a result local"
     );
 }
@@ -736,7 +736,7 @@ fn same_as_does_not_alias_a_mutable_label_local() {
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
-        inputargs.len() as u32 + 2 + 6 + 1,
+        inputargs.len() as u32 + 2 + 6 + 3,
         "SameAs must not share the phi local that JUMP rebinds"
     );
 }

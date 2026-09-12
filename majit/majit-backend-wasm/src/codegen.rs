@@ -2633,39 +2633,124 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
 /// Publish `build_home_gcmap` on the live frame (`local 0` is the items
 /// base). `ptr == 0` is the test path that never installs a map.
 ///
-/// `only_if_null` is for an out-of-line bridge: the owner already published
-/// a used-home map, and replacing it with this module's (possibly shorter)
-/// prefix would unmark homes the owner grew after this bridge was compiled.
-/// `push_gcmap` writes the live set; a later module must not shrink it.
-fn emit_publish_home_gcmap(sink: &mut PeepSink<'_, '_>, ptr: i64, only_if_null: bool) {
-    if ptr == 0 {
+/// Store is monotonic in the marked-bit set: a later module publishes only
+/// when the live `jf_gcmap` is null or this map covers every bit the live
+/// map marks. `push_gcmap` writes the live set; ABI (`bridge_entry_arity`)
+/// is not a proxy for that extent — a parameter bridge can mark more homes
+/// than its source, and a retained frame-entry bridge can mark fewer than
+/// an owner that grew after it was compiled.
+fn emit_publish_home_gcmap(
+    sink: &mut PeepSink<'_, '_>,
+    ptr: i64,
+    map: &[usize],
+    old_local: u32,
+    idx_local: u32,
+) {
+    if ptr == 0 || map.len() < 2 {
         return;
     }
     use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_GCMAP_OFS, SIZEOFSIGNED};
+    let word = std::mem::size_of::<usize>() as u32;
+    let n_new = map[0];
+    let new_words = &map[1..];
     let emit_hdr = |sink: &mut PeepSink<'_, '_>| {
         sink.local_get(0);
         sink.i32_const(FIRST_ITEM_OFFSET as i32);
         sink.i32_sub();
     };
-    if only_if_null {
-        emit_hdr(sink);
-        if SIZEOFSIGNED == 4 {
-            sink.i32_load(memarg(JF_GCMAP_OFS as u64, 2));
-            sink.i32_eqz();
+    let load_usize = |sink: &mut PeepSink<'_, '_>, offset: u64| {
+        if word == 4 {
+            sink.i32_load(memarg(offset, 2));
         } else {
-            sink.i64_load(memarg(JF_GCMAP_OFS as u64, 3));
-            sink.i64_eqz();
+            sink.i64_load(memarg(offset, 3));
         }
-        sink.if_(BlockType::Empty);
+    };
+    let const_usize = |sink: &mut PeepSink<'_, '_>, value: usize| {
+        if word == 4 {
+            sink.i32_const(value as i32);
+        } else {
+            sink.i64_const(value as i64);
+        }
+    };
+    let publish = |sink: &mut PeepSink<'_, '_>| {
         emit_hdr(sink);
         sink.i64_const(ptr);
         emit_word_store(sink, JF_GCMAP_OFS as u64);
-        sink.end();
-        return;
-    }
+    };
     emit_hdr(sink);
-    sink.i64_const(ptr);
-    emit_word_store(sink, JF_GCMAP_OFS as u64);
+    if SIZEOFSIGNED == 4 {
+        sink.i32_load(memarg(JF_GCMAP_OFS as u64, 2));
+    } else {
+        sink.i64_load(memarg(JF_GCMAP_OFS as u64, 3));
+        sink.i32_wrap_i64();
+    }
+    sink.local_tee(old_local);
+    sink.i32_eqz();
+    sink.if_(BlockType::Empty);
+    publish(sink);
+    sink.else_();
+    // `old_local` is the live map. Cover-check each of its words against
+    // this module's map; leftover bits mean the live map is wider.
+    sink.block(BlockType::Empty); // $keep
+    sink.block(BlockType::Empty); // $publish_ok
+    for (i, &new_word) in new_words.iter().enumerate() {
+        sink.local_get(old_local);
+        load_usize(sink, 0);
+        if word == 8 {
+            sink.i32_wrap_i64();
+        }
+        sink.i32_const(i as i32);
+        sink.i32_gt_u();
+        sink.if_(BlockType::Empty);
+        sink.local_get(old_local);
+        load_usize(sink, (1 + i as u32) as u64 * word as u64);
+        const_usize(sink, !new_word);
+        if word == 4 {
+            sink.i32_and();
+        } else {
+            sink.i64_and();
+            sink.i64_eqz();
+            sink.i32_eqz();
+        }
+        sink.br_if(2);
+        sink.end();
+    }
+    sink.i32_const(n_new as i32);
+    sink.local_set(idx_local);
+    sink.loop_(BlockType::Empty);
+    sink.local_get(idx_local);
+    sink.local_get(old_local);
+    load_usize(sink, 0);
+    if word == 8 {
+        sink.i32_wrap_i64();
+    }
+    sink.i32_lt_u();
+    sink.i32_eqz();
+    sink.br_if(1);
+    sink.local_get(old_local);
+    sink.local_get(idx_local);
+    sink.i32_const(1);
+    sink.i32_add();
+    sink.i32_const(word.trailing_zeros() as i32);
+    sink.i32_shl();
+    sink.i32_add();
+    load_usize(sink, 0);
+    if word == 8 {
+        sink.i64_eqz();
+        sink.i32_eqz();
+    }
+    sink.br_if(2);
+    sink.local_get(idx_local);
+    sink.i32_const(1);
+    sink.i32_add();
+    sink.local_set(idx_local);
+    sink.br(0);
+    sink.end();
+    sink.br(0);
+    sink.end();
+    publish(sink);
+    sink.end();
+    sink.end();
 }
 
 fn emit_word_store(sink: &mut PeepSink<'_, '_>, offset: u64) {
@@ -5668,6 +5753,8 @@ fn build_function(
     // it and branch back into the dispatch; without it the key is consumed
     // straight off the frame load.
     let resume_key_local = trace_entry_key_local + u32::from(trace_entry_needs_key_local);
+    let gcmap_old_local = resume_key_local + u32::from(resume_dispatch);
+    let gcmap_idx_local = gcmap_old_local + 1;
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
@@ -5732,7 +5819,8 @@ fn build_function(
         base_i32_locals
             + extra_alloc_i32
             + u32::from(trace_entry_needs_key_local)
-            + u32::from(resume_dispatch),
+            + u32::from(resume_dispatch)
+            + 2,
         ValType::I32,
     ));
     let mut func = Function::new(locals);
@@ -5755,9 +5843,10 @@ fn build_function(
     // that after the entry stores. A keyed LABEL resume branches past
     // those stores, so it publishes in the resume loader after the
     // grown-slot null below.
+    let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
+    let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
+    let publish_map = build_home_gcmap(frame, used_ordinary, used_labels);
     let publish_ptr = if ca.compute_home_gcmap {
-        let used_ordinary = ref_homes.len().max(ca.home_gcmap_min_ordinary);
-        let used_labels = label_resume.ref_slots.max(ca.home_gcmap_min_labels);
         // A first compile has no prior map. A re-emission or bridge may
         // grow past a previous floor of zero, so `min > 0` is not the
         // signal — `has_prior` is.
@@ -5971,8 +6060,13 @@ fn build_function(
     }
     // assembler.py `push_gcmap`: the map goes up once the slots it marks
     // are live or null. Keyed resume publishes in the loader instead.
-    // A bridge keeps a map the owner already published.
-    emit_publish_home_gcmap(&mut sink, publish_ptr, bridge_entry_arity.is_some());
+    emit_publish_home_gcmap(
+        &mut sink,
+        publish_ptr,
+        &publish_map,
+        gcmap_old_local,
+        gcmap_idx_local,
+    );
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
     if let Some((probe, type_idx)) = inline_trip {
@@ -6059,7 +6153,13 @@ fn build_function(
             // nulled before `br_table`; remaining marked homes already
             // hold the previous module's values. Publish before the
             // loader stores, matching `push_gcmap` at a live safepoint.
-            emit_publish_home_gcmap(&mut sink, publish_ptr, false);
+            emit_publish_home_gcmap(
+                &mut sink,
+                publish_ptr,
+                &publish_map,
+                gcmap_old_local,
+                gcmap_idx_local,
+            );
             // Resume loader: a loop-closing bridge wrote each label arg into
             // frame slot i (positionally, matching the in-loop JUMP move);
             // load them into the label-arg locals and refresh their Ref

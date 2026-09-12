@@ -3144,11 +3144,11 @@ impl WasmBackend {
                 // code never loads and a mutated field leaves the fold in place.
                 owner.record_bridge_invalidation_flag(owner.invalidation_flag());
                 // `bridge_slots` no longer names these — they were removed
-                // above so re-emission cannot replay them. Retract their
-                // LABEL_TARGETS rows here; `reemit_loop` only sees slots
-                // that are still attached. The replacement bytes were
-                // already written into those slots inside re-emission.
-                source_loop.retract_bridge_label_targets_for_slots(extra_retire);
+                // above so re-emission cannot replay them. Keep their
+                // LABEL_TARGETS rows: inbound JUMPs still enter the old
+                // module, whose LABEL dest the replacement owner does not
+                // recreate.
+                let _ = extra_retire;
                 return true;
             }
             Err(error) => {
@@ -3186,7 +3186,7 @@ impl WasmBackend {
     fn reemit_loop_retiring(
         &mut self,
         token: &JitCellToken,
-        extra_retire_slots: &[u32],
+        _extra_retire_slots: &[u32],
     ) -> Result<(), BackendError> {
         let compiled = token
             .compiled
@@ -3312,19 +3312,17 @@ impl WasmBackend {
         let widened = merged_ref_homes.max(old_homes);
         let widened_labels = merged_labels.max(old_labels);
         let owner_extent_grew = old_homes < widened || old_labels < widened_labels;
-        // Bridges removed before re-emission (inlined regions) still have
-        // compiled callers that baked `return_call_indirect` to those
-        // slots. Point the slots at this replacement so they pick up the
-        // new map; x86 patches the jump instead.
-        crate::failguard::retarget_slots_to_module(
-            extra_retire_slots.iter().copied(),
-            old_handle,
-            &wasm_bytes,
-        );
-        // Keep already-compiled bridges. They no longer overwrite a wider
-        // owner map (`emit_publish_home_gcmap` only_if_null). Dropping them
-        // here forced `trace_eagerness` (200) extra guard failures and a
-        // new compile — the SNAPDIFF on this PR.
+        // Leave retired bridge slots pointing at the old module. Callers
+        // baked `return_call_indirect` with that bridge's LABEL key; the
+        // replacement owner's `br_table` interprets the same key against
+        // its own resumable-label prefix. `assembler.py` `patch_jump_for_descr`
+        // rewrites the jump in place; wasm cannot, so the old module stays
+        // the destination. The source-guard cell is already zero, so the
+        // inlined region is not also dispatched.
+        // Keep already-compiled bridges. Publication is monotonic in the
+        // marked-bit set, so a narrower bridge map cannot unmark homes
+        // the owner grew. Dropping them here forced `trace_eagerness`
+        // (200) extra guard failures and a new compile.
         #[cfg(target_arch = "wasm32")]
         if new_cells_base != 0 {
             for (&fail_index, &bridge_slot) in compiled.bridge_slots.borrow().iter() {
