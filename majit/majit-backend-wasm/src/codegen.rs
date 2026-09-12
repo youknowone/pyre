@@ -2633,18 +2633,18 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
 /// Publish `build_home_gcmap` on the live frame (`local 0` is the items
 /// base). `ptr == 0` is the test path that never installs a map.
 ///
-/// Store is monotonic in the marked-bit set: a later module publishes only
-/// when the live `jf_gcmap` is null or this map covers every bit the live
-/// map marks. `push_gcmap` writes the live set; ABI (`bridge_entry_arity`)
-/// is not a proxy for that extent — a parameter bridge can mark more homes
-/// than its source, and a retained frame-entry bridge can mark fewer than
-/// an owner that grew after it was compiled.
+/// Ordinary homes and LABEL captures grow independently, so the live map
+/// and this module's map can be incomparable. With a residual type family
+/// the store is their bitwise union (`wasm_jit_union_gcmap`). Without one
+/// (host tests) the store is still monotonic: publish this map only when
+/// it covers every live bit.
 fn emit_publish_home_gcmap(
     sink: &mut PeepSink<'_, '_>,
     ptr: i64,
     map: &[usize],
     old_local: u32,
     idx_local: u32,
+    residual_type_base: Option<u32>,
 ) {
     if ptr == 0 || map.len() < 2 {
         return;
@@ -2689,8 +2689,21 @@ fn emit_publish_home_gcmap(
     sink.if_(BlockType::Empty);
     publish(sink);
     sink.else_();
-    // `old_local` is the live map. Cover-check each of its words against
-    // this module's map; leftover bits mean the live map is wider.
+    if let Some(base) = residual_type_base {
+        // `(i64, i64) -> i64` at `residual_type_base + 2`.
+        let union_fn = crate::wasm_jit_union_gcmap as *const () as usize as i64;
+        emit_hdr(sink);
+        sink.local_get(old_local);
+        sink.i64_extend_i32_u();
+        sink.i64_const(ptr);
+        sink.i32_const(union_fn as i32);
+        sink.call_indirect(0, base + 2);
+        emit_word_store(sink, JF_GCMAP_OFS as u64);
+        sink.end();
+        return;
+    }
+    // Host-test fallback: no residual type family. Cover-check each live
+    // word against this module's map; leftover bits keep the live map.
     sink.block(BlockType::Empty); // $keep
     sink.block(BlockType::Empty); // $publish_ok
     for (i, &new_word) in new_words.iter().enumerate() {
@@ -6066,6 +6079,7 @@ fn build_function(
         &publish_map,
         gcmap_old_local,
         gcmap_idx_local,
+        residual_type_base,
     );
     // Past the entry loader, so the count is one per entry on the same path
     // the inputs are loaded on.
@@ -6159,6 +6173,7 @@ fn build_function(
                 &publish_map,
                 gcmap_old_local,
                 gcmap_idx_local,
+                residual_type_base,
             );
             // Resume loader: a loop-closing bridge wrote each label arg into
             // frame slot i (positionally, matching the in-loop JUMP move);

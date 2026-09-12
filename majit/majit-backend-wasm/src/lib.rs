@@ -2260,6 +2260,61 @@ fn leak_home_gcmap(
         as usize
 }
 
+/// Bitwise union of two GCMAP arrays (`[n, word0, ...]`).
+///
+/// Ordinary homes and LABEL captures grow independently, so two live maps
+/// can be incomparable: a retained bridge may mark more LABEL bits while a
+/// re-emitted owner marks more ordinary bits. Returning either pointer
+/// unmarks the other region. `None` of either argument is treated as empty.
+/// When one already covers the other the covered pointer is returned so a
+/// comparable publish does not leak.
+pub extern "C" fn wasm_jit_union_gcmap(old: i64, new: i64) -> i64 {
+    const MAX_WORDS: usize = 64;
+    let old_ptr = old as usize as *const usize;
+    let new_ptr = new as usize as *const usize;
+    if old_ptr.is_null() {
+        return new;
+    }
+    if new_ptr.is_null() {
+        return old;
+    }
+    unsafe {
+        let n_old = (*old_ptr).min(MAX_WORDS);
+        let n_new = (*new_ptr).min(MAX_WORDS);
+        let n_overlap = n_old.min(n_new);
+        let mut old_extra = false;
+        let mut new_extra = false;
+        for i in 0..n_overlap {
+            let o = *old_ptr.add(1 + i);
+            let n = *new_ptr.add(1 + i);
+            old_extra |= o & !n != 0;
+            new_extra |= n & !o != 0;
+        }
+        for i in n_overlap..n_old {
+            old_extra |= *old_ptr.add(1 + i) != 0;
+        }
+        for i in n_overlap..n_new {
+            new_extra |= *new_ptr.add(1 + i) != 0;
+        }
+        if !old_extra {
+            return new;
+        }
+        if !new_extra {
+            return old;
+        }
+        let n = n_old.max(n_new);
+        let mut buf = vec![0usize; 1 + n];
+        buf[0] = n;
+        for i in 0..n_old {
+            buf[1 + i] |= *old_ptr.add(1 + i);
+        }
+        for i in 0..n_new {
+            buf[1 + i] |= *new_ptr.add(1 + i);
+        }
+        Box::leak(buf.into_boxed_slice()).as_ptr() as usize as i64
+    }
+}
+
 /// Allocate the immutable guard-token gcmap which PyPy's
 /// `store_force_descr` retains as `_finish_gcmap`.
 fn leak_gcmap_for_indices(indices: &[u32]) -> usize {
@@ -6139,6 +6194,32 @@ mod tests {
         assert!(
             !gcmap_marks(&narrow, idx(129)),
             "reserved unused label slot"
+        );
+    }
+
+    #[test]
+    fn union_gcmap_covers_incomparable_ordinary_and_label_maps() {
+        let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
+        let owner = codegen::build_home_gcmap(frame, 8, 0);
+        let bridge = codegen::build_home_gcmap(frame, 3, 2);
+        let union = wasm_jit_union_gcmap(
+            owner.as_ptr() as usize as i64,
+            bridge.as_ptr() as usize as i64,
+        ) as usize as *const usize;
+        assert!(!union.is_null());
+        let n = unsafe { *union };
+        let words = unsafe { std::slice::from_raw_parts(union, 1 + n) };
+        let sign = std::mem::size_of::<isize>();
+        let idx = |h: usize| (frame.home_slot_base as usize + h * 8) / sign;
+        for h in 0..8 {
+            assert!(gcmap_marks(words, idx(h)), "owner ordinary home {h}");
+        }
+        assert!(gcmap_marks(words, idx(128)), "bridge label 0");
+        assert!(gcmap_marks(words, idx(129)), "bridge label 1");
+        assert_eq!(
+            wasm_jit_union_gcmap(union as usize as i64, owner.as_ptr() as usize as i64),
+            union as usize as i64,
+            "owner is a subset of the union"
         );
     }
 
