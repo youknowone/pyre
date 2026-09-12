@@ -5598,8 +5598,9 @@ fn assemble_peeled_trace_with_jump_args(
         .filter(|a| is_trace_runtime_ref(*a, constants))
         .collect();
     for op in &result {
-        if !op.pos.get().is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
-            stream_defs.insert(op.pos.get());
+        if !op.pos().get().is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void
+        {
+            stream_defs.insert(op.pos().get());
         }
     }
     {
@@ -8629,7 +8630,7 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::IntAdd);
         assert_eq!(combined[1].opcode, OpCode::SameAsI);
-        assert_eq!(combined[1].pos.get(), OpRef::int_op(50));
+        assert_eq!(combined[1].pos().get(), OpRef::int_op(50));
         assert_eq!(
             combined[1]
                 .getarglist()

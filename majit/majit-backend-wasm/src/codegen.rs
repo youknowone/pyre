@@ -12390,7 +12390,7 @@ mod tests {
             OpCode::IntAdd,
             &[rb(OpRef::int_op(50)), rb(OpRef::const_int(1))],
         );
-        add.pos.set(OpRef::int_op(200));
+        add.pos().set(OpRef::int_op(200));
         let ops = vec![
             Op::new(
                 OpCode::Label,

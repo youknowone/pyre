@@ -6631,7 +6631,7 @@ mod tests {
         // stays a constant; the table still records it so deopt can
         // rematerialize a forwarded address.
         let cond = Op::new(OpCode::IntLt, &[ro(OpRef::int_op(1)), ro(OpRef::int_op(2))]);
-        cond.pos.set(OpRef::int_op(3));
+        cond.pos().set(OpRef::int_op(3));
         let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(3))]);
         guard.setfailargs(vec![Operand::const_from_value(Value::Ref(GcRef(0x1000)))].into());
         let (out, gcrefs) = remove_ref_constants(&[cond, guard], 4);

@@ -6503,9 +6503,9 @@ mod tests {
             majit_ir::OpCode::SameAsR,
             &[rb(majit_ir::OpRef::const_ptr(root))],
         );
-        constant.pos.set(majit_ir::OpRef::ref_op(1));
+        constant.pos().set(majit_ir::OpRef::ref_op(1));
         let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[rb(majit_ir::OpRef::ref_op(1))]);
-        finish.pos.set(majit_ir::OpRef::void_op(2));
+        finish.pos().set(majit_ir::OpRef::void_op(2));
         finish.set_fail_arg_types(vec![majit_ir::Type::Ref]);
         finish.setfailargs(vec![rb(majit_ir::OpRef::ref_op(1))].into());
 
