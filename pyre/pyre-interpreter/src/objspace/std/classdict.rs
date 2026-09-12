@@ -88,6 +88,7 @@ static CLASS_DICT_SLOT: ClassDictStrategySlot = ClassDictStrategySlot;
 
 /// The [`DictStrategyRef`] holder a class-dict's `dstrategy` slot points at.
 pub static CLASS_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    kind: pyre_object::dictmultiobject::StrategyKind::Class,
     imp: &CLASS_DICT_SLOT,
     owner: std::ptr::null_mut(),
 };

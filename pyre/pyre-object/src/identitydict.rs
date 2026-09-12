@@ -219,6 +219,7 @@ pub static IDENTITY_DICT_STRATEGY: IdentityDictStrategy = IdentityDictStrategy;
 /// slot points at.
 pub static IDENTITY_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
     crate::dictmultiobject::DictStrategyRef {
+        kind: crate::dictmultiobject::StrategyKind::Identity,
         imp: &IDENTITY_DICT_STRATEGY,
         owner: std::ptr::null_mut(),
     };
