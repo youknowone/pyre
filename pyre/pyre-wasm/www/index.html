@@ -15,12 +15,12 @@
 <body>
   <h1>pyre - Python interpreter in WebAssembly</h1>
   <p id="status">Loading wasm module...</p>
-  <textarea id="source">def fib(n):
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
+  <textarea id="source">import json
+import datetime
+import random
 
-print(fib(30))</textarea>
+print(json.dumps({"n": 8, "now": datetime.date.today().isoformat()}))
+print(random.Random(0).sample(range(10), 3))</textarea>
   <br>
   <button id="run" disabled>Run</button>
   <h3>Output:</h3>

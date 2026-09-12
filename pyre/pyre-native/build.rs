@@ -2,25 +2,88 @@
 
 use std::path::Path;
 
-/// Pure-Python files reachable from `import re`.  The C-level dependencies
-/// (`_sre`, `_abc`, `_weakref`, `itertools`, `_collections`, `_thread`,
-/// `operator`) are builtin modules and are not embedded.
+/// Pure-Python files for the browser VFS.  Seeded from the modules a
+/// Pyodide-style playground actually imports (`re`, `json`, `datetime`,
+/// `random`, `pathlib`, `dataclasses`, `typing`, …) and their import
+/// closure, minus heavy optional trees (`asyncio`, `pdb`, `email`,
+/// `ssl`, `ctypes`, `unittest`, `tarfile`, …).  C-level dependencies
+/// (`_sre`, `_json`, `_random`, `_abc`, `_weakref`, `itertools`,
+/// `_collections`, `_thread`, `operator`) are builtin and not embedded.
 #[cfg(feature = "wasm_vfs")]
-const RE_CLOSURE: &[&str] = &[
+const STDLIB_CLOSURE: &[&str] = &[
+    "__future__.py",
     "_collections_abc.py",
+    "_compat_pickle.py",
+    "_py_abc.py",
+    "_py_warnings.py",
+    "_pydatetime.py",
+    "_pydecimal.py",
+    "_strptime.py",
+    "_threading_local.py",
+    "_weakrefset.py",
     "abc.py",
+    "ast.py",
+    "base64.py",
+    "bisect.py",
+    "calendar.py",
     "collections/__init__.py",
+    "contextlib.py",
+    "contextvars.py",
+    "copy.py",
     "copyreg.py",
+    "csv.py",
+    "dataclasses.py",
+    "datetime.py",
+    "decimal.py",
     "enum.py",
+    "fnmatch.py",
+    "fractions.py",
     "functools.py",
+    "genericpath.py",
+    "getopt.py",
+    "glob.py",
+    "heapq.py",
+    "html/__init__.py",
+    "html/entities.py",
+    "io.py",
+    "json/__init__.py",
     "keyword.py",
+    "linecache.py",
+    "logging/__init__.py",
+    "ntpath.py",
+    "numbers.py",
+    "os.py",
+    "pathlib/__init__.py",
+    "pathlib/_os.py",
+    "pickle.py",
+    "posixpath.py",
+    "pprint.py",
+    "random.py",
     "re/__init__.py",
     "re/_casefix.py",
     "re/_compiler.py",
     "re/_constants.py",
     "re/_parser.py",
     "reprlib.py",
+    "shutil.py",
+    "stat.py",
+    "statistics.py",
+    "string/__init__.py",
+    "struct.py",
+    "tempfile.py",
+    "textwrap.py",
+    "threading.py",
+    "token.py",
+    "tokenize.py",
+    "traceback.py",
     "types.py",
+    "typing.py",
+    "urllib/error.py",
+    "urllib/parse.py",
+    "urllib/request.py",
+    "urllib/response.py",
+    "warnings.py",
+    "weakref.py",
 ];
 
 fn main() {
@@ -75,8 +138,8 @@ fn build_stdlib_vfs() {
     // [count: u32 LE], followed by repeated
     // [name_len: u32 LE][name][src_len: u32 LE][source].
     let mut raw = Vec::new();
-    raw.extend_from_slice(&(RE_CLOSURE.len() as u32).to_le_bytes());
-    for rel in RE_CLOSURE {
+    raw.extend_from_slice(&(STDLIB_CLOSURE.len() as u32).to_le_bytes());
+    for rel in STDLIB_CLOSURE {
         let path = stdlib_root.join(rel);
         println!("cargo:rerun-if-changed={}", path.display());
         let source = std::fs::read(&path)

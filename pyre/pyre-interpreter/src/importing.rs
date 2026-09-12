@@ -367,8 +367,9 @@ impl SourceProvider for NullSourceProvider {
 }
 
 // ── embedded-stdlib VFS (wasm_vfs) ───────────────────────────────────
-// The browser/web wasm target has no filesystem, so the pure-Python stdlib
-// closure that `import re` needs is compiled into the binary (see build.rs)
+// The browser/web wasm target has no filesystem, so a playground-sized
+// pure-Python stdlib closure (`re`, `json`, `datetime`, `pathlib`, …) is
+// compiled into the binary (see pyre-native/build.rs `STDLIB_CLOSURE`)
 // and served from this in-memory map.  Keys are `mount.join(<relpath>)`, so the
 // SAME `find_in_dirs` probes (`<dir>/re/__init__.py`, `<dir>/enum.py`, …) that
 // hit a real FS on native resolve here once `mount` is on sys.path.
