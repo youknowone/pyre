@@ -489,6 +489,24 @@ pub fn compute_vars_longevity<T: AsRef<Op>>(
         }
     }
 
+    // Loop-carried Ref reds keep their assembled home for the whole
+    // trace. A mid-opcode guard that still names the InputArg would
+    // otherwise dump a reused colour (a Scope sitting in the Vm slot).
+    let last = operations.len() as i32 - 1;
+    if last >= 0 {
+        for iarg in inputargs {
+            if iarg.tp != Type::Ref {
+                continue;
+            }
+            let opref = iarg.opref();
+            if let Some(lt) = longevity.get_mut(opref)
+                && lt.last_usage < last
+            {
+                lt.last_usage = last;
+            }
+        }
+    }
+
     // regalloc.py:1224-1231 reverse real_usages and check invariants
     // We need to iterate over all lifetimes; collect keys first to avoid borrow issues
     let keys: Vec<OpRef> = longevity.lifetimes.keys().copied().collect();
@@ -6478,6 +6496,28 @@ mod tests {
         assert_eq!(lt_i1.definition_pos, 0);
         assert_eq!(lt_i1.last_usage, 2);
         assert_eq!(lt_i1.real_usages.as_ref().unwrap().as_slice(), &[1]);
+    }
+
+    #[test]
+    fn ref_inputarg_longevity_spans_the_trace() {
+        let i0 = OpRef::input_arg_typed(0, Type::Int);
+        let vm = OpRef::input_arg_typed(1, Type::Ref);
+        let add = OpRef::int_op(0);
+        let inputargs = vec![
+            InputArg::from_type(Type::Int, 0),
+            InputArg::from_type(Type::Ref, 1),
+        ];
+        let ops = vec![
+            make_op(OpCode::IntAdd, 0, &[i0, i0]),
+            make_guard(OpCode::GuardTrue, 1, &[add], &[vm]),
+            make_op(OpCode::Jump, 2, &[add]),
+        ];
+        let longevity = compute_vars_longevity(&inputargs, &ops);
+        assert_eq!(
+            longevity.get(vm).unwrap().last_usage,
+            2,
+            "a Ref red stays allocated through the last op so a guard dump reads it"
+        );
     }
 
     #[test]
