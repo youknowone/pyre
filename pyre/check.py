@@ -1937,12 +1937,14 @@ def synth_skip_backends(path):
     )
 
 
-def synth_jitstats_bands(path):
+def synth_jitstats_bands(path, backend=None):
     """Read an optional per-fixture jit-stats band from its header:
         # pyre-check: jitstats-band=guard_failures=8
+        # pyre-check: jitstats-band=guard_failures=1@wasm
 
-    The band is symmetric around the recorded baseline and absorbs moves in
-    both directions: a delta within the band is not signal either way. An
+    `field=width@backend` applies only on that backend. The band is
+    symmetric around the recorded baseline and absorbs moves in both
+    directions: a delta within the band is not signal either way. An
     absorbed move is reported on that run rather than swallowed, so the
     allowance is visible whenever it is used and not only in the fixture
     header. It is only for schedule-sensitive counters; badness counters must
@@ -1959,7 +1961,13 @@ def synth_jitstats_bands(path):
             raise ValueError(f"duplicate jit-stats band directive in {path}: {line.strip()}")
         bands = {}
         for entry in line[len(prefix):].strip().split(","):
-            parts = entry.split("=")
+            scoped = entry
+            only_backend = None
+            if "@" in entry:
+                scoped, only_backend = (part.strip() for part in entry.rsplit("@", 1))
+                if not scoped or not only_backend:
+                    raise ValueError(f"invalid jit-stats band in {path}: {line.strip()}")
+            parts = scoped.split("=")
             if len(parts) != 2 or not all(part.strip() for part in parts):
                 raise ValueError(f"invalid jit-stats band in {path}: {line.strip()}")
             field, raw_width = (part.strip() for part in parts)
@@ -1981,6 +1989,12 @@ def synth_jitstats_bands(path):
                 raise ValueError(
                     f"jit-stats band width must be positive in {path}: {line.strip()}"
                 )
+            if (
+                only_backend is not None
+                and backend is not None
+                and only_backend != backend
+            ):
+                continue
             bands[field] = width
     return bands if bands is not None else {}
 
@@ -3641,7 +3655,7 @@ class Check:
         if ungated:
             self.jitstats_ungated.append(f"{backend}/{name}: {', '.join(ungated)}")
         jitstats = _jit_stats_snapshot(stderr, ungated)
-        jitstats_bands = synth_jitstats_bands(script)
+        jitstats_bands = synth_jitstats_bands(script, backend)
 
         # The jit-stats gate — enforced on EVERY run, so a structural JIT change
         # reddens the default `pyre/check.py` (locally, and in the bare CI

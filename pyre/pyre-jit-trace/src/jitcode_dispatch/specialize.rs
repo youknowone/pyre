@@ -13723,18 +13723,20 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // Until every app-level frame getter is lowered through its own red frame,
     // admitting an arbitrary positive-depth result would expose it to a
     // generic residual whose single live-coordinate slot cannot describe a
-    // nested caller chain.  The completed landings are the outer standard
-    // frame and an inlined ancestor that `walker_ec_enter` published a
-    // virtual_ref for: `f_code`, `f_lasti` and `f_lineno` all name that same
-    // red box.  A hop whose concrete frame is neither still declines here.
+    // nested caller chain.  `walker_frame_executing_py_pc` only knows the
+    // portal CALL and THIS level's immediate caller CALL.  A hop that lands
+    // on a farther inlined ancestor has a red box but no tracked pc, so
+    // `f_lasti` / `f_lineno` would fall through to the heap reader.
+    // Admit the portal and the immediate caller (`depth == 1`) only.
     if inline_level && depth_value > 0 {
         let landing_ptr = final_concrete_frame as usize;
         let standard_frame = landing_ptr == standard_vable_ptr;
-        let inlined_ancestor = ctx
-            .trace_ctx
-            .virtualref_virtual_for_object_ptr(landing_ptr)
-            .is_some();
-        let known_red = (standard_frame || inlined_ancestor)
+        let immediate_caller = depth_value == 1
+            && ctx
+                .trace_ctx
+                .virtualref_virtual_for_object_ptr(landing_ptr)
+                .is_some();
+        let known_red = (standard_frame || immediate_caller)
             && unsafe { (*final_concrete_frame).ob_header.ob_type }
                 == &pyre_interpreter::pyframe::FRAME_TYPE
             && unsafe {

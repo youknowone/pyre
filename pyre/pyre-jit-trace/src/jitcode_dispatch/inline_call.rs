@@ -4681,6 +4681,15 @@ fn immediate_inline_caller_py_pc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     call_jitcode_pc: usize,
 ) -> Option<u32> {
+    // A canonical helper has no Python pc. Remapping its CALL through the
+    // portal snapshot would stamp the surrounding user frame with an
+    // unrelated offset. Inherit the Python caller's coordinate instead.
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        return ctx
+            .fbw_mode
+            .immediate_inline_caller_py_pc
+            .or(ctx.fbw_mode.inline_caller_py_pc);
+    }
     if let Some(consts) = ctx.inline_callee_consts {
         crate::py_coord::containing_py_pc_for_jitcode_pc_public(
             consts.jitcode_index,
