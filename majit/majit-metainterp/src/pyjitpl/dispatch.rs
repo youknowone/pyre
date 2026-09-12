@@ -1723,7 +1723,19 @@ where
                 /* after_residual_call */ true,
             );
             if materialized {
-                ctx.reload_tokenless_virtualizable_after_residual_call();
+                if let (Some(info), Some(ptr)) = (
+                    ctx.virtualizable_info().cloned(),
+                    ctx.standard_virtualizable_ptr(),
+                ) && ctx.vable_heap_static_diverged(&info, ptr as *const u8)
+                {
+                    // Residual wrote the frame (exception push / vsd)
+                    // without forcing the token. Reload only when the
+                    // heap actually moved; a blanket reload breaks the
+                    // peel (shadow_stack / FrameAnchor).
+                    ctx.load_fields_from_virtualizable(&info, ptr as *const u8);
+                } else {
+                    ctx.reload_tokenless_virtualizable_after_residual_call();
+                }
             }
             TraceAction::Continue
         }
@@ -3175,6 +3187,7 @@ where
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+        crate::jitdriver::mark_interpret_shadow_base();
         // A previous walk may have left a committed-residual latch.
         let _ = crate::take_residual_committed();
         // Same latch class: a blackhole residual that refused a walk-local
@@ -4403,6 +4416,21 @@ where
                     {
                         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
                     }
+                    let shadow = match bytecode {
+                        jitcode::insns::BC_SETFIELD_GC_R => {
+                            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize))
+                        }
+                        jitcode::insns::BC_SETFIELD_GC_F => {
+                            majit_ir::Value::Float(f64::from_bits(concrete as u64))
+                        }
+                        _ => majit_ir::Value::Int(concrete),
+                    };
+                    ctx.sync_shadow_if_vable_heap_store(
+                        struct_ptr,
+                        offset,
+                        value_opref,
+                        shadow,
+                    );
                 }
             }
             jitcode::insns::BC_RAW_STORE_I => {
@@ -8451,13 +8479,18 @@ where
                             let frame = self.frames.current_mut();
                             eprintln!(
                                 "[interpret] residual may_force jitcode={} last_op={} cursor={} \
-                                 extraeffect={:?} can_raise={} next={:?}",
+                                 extraeffect={:?} can_raise={} next={:?} fnaddr={:#x} classes={:?} \
+                                 ret={} last_exc={:#x}",
                                 frame.jitcode.name(),
                                 frame.last_opcode_position,
                                 frame.code_cursor,
                                 effectinfo.extraeffect,
                                 effectinfo.check_can_raise(false),
                                 frame.jitcode.code.get(frame.code_cursor),
+                                concrete_ptr as usize,
+                                calldescr.arg_classes,
+                                concrete,
+                                crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
                             );
                         }
                         if matches!(
@@ -11127,8 +11160,20 @@ where
     fn read_ref_reg(&mut self, reg: usize) -> (OpRef, i64) {
         let frame = self.frames.current_mut();
         (
-            frame.ref_regs[reg].expect("jitcode ref register was uninitialized"),
-            frame.ref_values[reg].expect("jitcode concrete ref register was uninitialized"),
+            frame.ref_regs[reg].unwrap_or_else(|| {
+                panic!(
+                    "jitcode ref register {reg} was uninitialized (pc={} jitcode={})",
+                    frame.pc,
+                    frame.jitcode.name()
+                )
+            }),
+            frame.ref_values[reg].unwrap_or_else(|| {
+                panic!(
+                    "jitcode concrete ref register {reg} was uninitialized (pc={} jitcode={})",
+                    frame.pc,
+                    frame.jitcode.name()
+                )
+            }),
         )
     }
 
@@ -12034,6 +12079,23 @@ where
             }
             bank_regs[index] = Some(reg.opref);
             bank_values[index] = Some(reg.value);
+        }
+        // A register the guard did not keep live is absent from resume
+        // data. The first opcode after the guard can still read it as an
+        // INLINE_CALL arg (from_exc_object's completed body is one such
+        // site). Seed a null/zero so interpret does not panic; a later
+        // use of a truly-live missing box is a liveness bug to fix.
+        for r in 0..frame.ref_regs.len() {
+            if frame.ref_regs[r].is_none() {
+                frame.ref_regs[r] = Some(ctx.const_ref(0));
+                frame.ref_values[r] = Some(0);
+            }
+        }
+        for r in 0..frame.int_regs.len() {
+            if frame.int_regs[r].is_none() {
+                frame.int_regs[r] = Some(ctx.const_int(0));
+                frame.int_values[r] = Some(0);
+            }
         }
         // The walker reads from `code_cursor`; `pc` is what a snapshot taken
         // inside this frame reports. `setup_resume_at_op` is both.

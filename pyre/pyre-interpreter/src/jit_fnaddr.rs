@@ -69,6 +69,7 @@ impl ResidualSlot for crate::objspace::descroperation::BinopDunder {}
 impl ResidualSlot for crate::objspace::descroperation::UnaryDunder {}
 impl ResidualSlot for crate::objspace::descroperation::SeqBase {}
 impl ResidualSlot for crate::objspace::descroperation::RepeatDunder {}
+impl ResidualSlot for crate::eval::ContextSource {}
 
 impl<T> ResidualSlot for &T {}
 impl<T> ResidualSlot for &mut T {}
@@ -4262,6 +4263,90 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pycode::w_code_get_ptr",
         "pyre_interpreter::w_code_get_ptr",
         crate::pycode::w_code_get_ptr,
+    );
+    // `get_w_globals` promotes then reads this field. Unbound, interpret
+    // aborts the exception-handler bridge on the symbolic path hash.
+    upa1(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_get_w_globals",
+        "pyre_interpreter::w_code_get_w_globals",
+        crate::pycode::w_code_get_w_globals,
+    );
+    // Portal residual-calls these (no extracted jitcode). i64 return is
+    // one word so interpret can take the handler pc and enter `except`.
+    pa2(
+        &mut entries,
+        "pyre_interpreter::eval::handle_exception",
+        "pyre_interpreter::handle_exception",
+        crate::eval::handle_exception,
+    );
+    pa3(
+        &mut entries,
+        "pyre_interpreter::eval::dispatch_exception_handler",
+        "pyre_interpreter::dispatch_exception_handler",
+        crate::eval::dispatch_exception_handler,
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::eval::is_valid_check_exc_match_class",
+        "pyre_interpreter::is_valid_check_exc_match_class",
+        crate::eval::is_valid_check_exc_match_class,
+    );
+    pa2(
+        &mut entries,
+        "pyre_interpreter::eval::check_exc_match_against",
+        "pyre_interpreter::check_exc_match_against",
+        crate::eval::check_exc_match_against,
+    );
+    pa2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::exception_match",
+        "pyre_interpreter::exception_match",
+        crate::baseobjspace::exception_match,
+    );
+    pa2(
+        &mut entries,
+        "pyre_interpreter::eval::load_global_nameindex_w",
+        "pyre_interpreter::load_global_nameindex_w",
+        crate::eval::load_global_nameindex_w,
+    );
+    let exception_is_valid_class_w: unsafe fn(pyre_object::PyObjectRef) -> bool =
+        crate::baseobjspace::exception_is_valid_class_w;
+    upa1(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::exception_is_valid_class_w",
+        "pyre_interpreter::exception_is_valid_class_w",
+        exception_is_valid_class_w,
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::builtins::lookup_exc_class_obj",
+        "pyre_interpreter::lookup_exc_class_obj",
+        crate::builtins::lookup_exc_class_obj,
+    );
+    pa3(
+        &mut entries,
+        "pyre_interpreter::call::call_type_one_arg",
+        "pyre_interpreter::call_type_one_arg",
+        crate::call::call_type_one_arg,
+    );
+    cpa3(
+        &mut entries,
+        "pyre_interpreter::call::call_one_arg_in_frame",
+        "pyre_interpreter::call_one_arg_in_frame",
+        crate::call::call_one_arg_in_frame,
+    );
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::eval::raise_prepared_exc",
+        "pyre_interpreter::raise_prepared_exc",
+        crate::eval::raise_prepared_exc,
+    );
+    pa3(
+        &mut entries,
+        "pyre_interpreter::eval::handle_exception_with_context",
+        "pyre_interpreter::handle_exception_with_context",
+        crate::eval::handle_exception_with_context,
     );
 
     cpa2(

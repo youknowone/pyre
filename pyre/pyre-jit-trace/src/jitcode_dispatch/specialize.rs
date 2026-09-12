@@ -19398,7 +19398,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_root = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc);
-    let msg = pyre_object::w_str_from_wtf8(err.message.clone());
+    let msg = pyre_object::w_str_from_wtf8(err.message_wtf8());
     // The root keeps the exception alive across that allocation but does not
     // fix its address: a minor collection moves the object and rewrites the
     // slot, which leaves this local naming a forwarded corpse.  Read the
@@ -19655,7 +19655,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_root = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc);
-    let msg = pyre_object::w_str_from_wtf8(err.message.clone());
+    let msg = pyre_object::w_str_from_wtf8(err.message_wtf8());
     // The allocation may move the exception and leave the local pointer naming
     // its forwarded corpse; the shadow slot contains the live address.
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_root);

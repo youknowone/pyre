@@ -990,6 +990,18 @@ pub fn opcode_return_value<H: ControlFlowOpcodeHandler + ?Sized>(
 }
 
 pub trait OpcodeStepExecutor: SharedOpcodeHandler {
+    /// Dispatch coordinate for `RAISE_VARARGS`. Default `-1` so non-frame
+    /// handlers do not invent a pc. `PyFrame` returns the vable `last_instr`.
+    fn last_instr(&self) -> isize {
+        -1
+    }
+
+    /// Word view of the live frame for residual helpers. Default 0 so a
+    /// non-frame handler cannot invent a pointer. `PyFrame` returns `self`.
+    fn as_pyframe_ptr(&self) -> i64 {
+        0
+    }
+
     fn load_const(&mut self, constant: &ConstantData) -> Result<(), PyError>
     where
         Self: ConstantOpcodeHandler,
@@ -2309,8 +2321,21 @@ pub fn execute_pop_except<E: OpcodeStepExecutor>(
 
 pub fn execute_check_exc_match<E: OpcodeStepExecutor>(
     executor: &mut E,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    executor.check_exc_match()?;
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
+    // Do not call the trait default stub — portal interpret residual-calls
+    // `OpcodeStepExecutor::check_exc_match` and raises TypeError.
+    let exc_type = executor.pop_value()?;
+    let exc_value = executor.peek_at(0)?;
+    // Residual-safe word gate: `validate_check_exc_match_class` returns
+    // `Result` and aborts portal interpret as an unbound residual.
+    if !crate::eval::is_valid_check_exc_match_class(exc_type) {
+        return Err(PyError::type_error(crate::eval::CANNOT_CATCH_MSG));
+    }
+    let matched = crate::eval::check_exc_match_against(exc_value, exc_type);
+    executor.push_value(pyre_object::w_bool_from(matched))?;
     Ok(StepResult::Continue)
 }
 
@@ -3105,11 +3130,30 @@ pub fn execute_raise_varargs<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,
     op_arg: OpArg,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     let Instruction::RaiseVarargs { argc } = instruction else {
         unreachable!()
     };
-    executor.raise_varargs(raise_kind_arg_as_usize(argc, op_arg))?;
+    let argc = raise_kind_arg_as_usize(argc, op_arg);
+    // argc=1 (`raise inst`) must not go through the trait default stub
+    // the translator residual-calls. Pop the operand as a word and
+    // residual-call the concrete helper.
+    if argc == 1 {
+        let w_value = executor.pop_value()?;
+        let exc = crate::eval::raise_prepared_exc(w_value);
+        if exc.is_null() {
+            return Err(crate::PyError::type_error(
+                "exceptions must derive from BaseException",
+            ));
+        }
+        let mut err = unsafe { crate::PyError::from_exc_object(exc) };
+        err.reraise_lasti = executor.last_instr() as i32;
+        return Err(err);
+    }
+    executor.raise_varargs(argc)?;
     Ok(StepResult::Continue)
 }
 
@@ -3117,12 +3161,30 @@ pub fn execute_reraise<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,
     op_arg: OpArg,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     let Instruction::Reraise { depth } = instruction else {
         unreachable!()
     };
-    executor.reraise(depth.get(op_arg))?;
-    Ok(StepResult::Continue)
+    // Same stub problem as `raise_varargs` / `check_exc_match`.
+    let oparg = depth.get(op_arg);
+    let reraise_lasti: i32 = if oparg != 0 {
+        crate::baseobjspace::int_w(executor.peek_at(oparg as usize)?)? as i32
+    } else {
+        -1
+    };
+    let w_exc = executor.pop_value()?;
+    if w_exc.is_null() || !unsafe { pyre_object::is_exception(w_exc) } {
+        return Err(PyError::type_error(
+            "exception must derive from BaseException",
+        ));
+    }
+    let mut err = unsafe { PyError::from_exc_object(w_exc) };
+    err.attach_tb = false;
+    err.reraise_lasti = reraise_lasti;
+    Err(err)
 }
 
 pub fn execute_list_extend<E: OpcodeStepExecutor>(
@@ -3422,7 +3484,7 @@ pub fn execute_load_global<E: OpcodeStepExecutor>(
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
 where
-    E: NamespaceOpcodeHandler,
+    E: NamespaceOpcodeHandler<Value = PyObjectRef>,
 {
     let Instruction::LoadGlobal { namei } = instruction else {
         unreachable!()
@@ -3430,7 +3492,20 @@ where
     let raw = u32_as_usize(namei.get(op_arg));
     let name_idx = raw >> 1;
     let push_null = (raw & 1) != 0;
-    executor.load_global(code.names[name_idx].as_ref(), name_idx, push_null)?;
+    // Residual-safe word helper: `load_global` takes `&str` and looks
+    // inside the dict strategy, which compiles to `CallMayForceR(0)`.
+    let value = crate::eval::load_global_nameindex_w(executor.as_pyframe_ptr(), name_idx as i64);
+    if value.is_null() {
+        let name = code.names[name_idx].as_ref();
+        return Err(PyError::name_error_with_name(
+            format!("name '{name}' is not defined"),
+            name,
+        ));
+    }
+    executor.push_value(value)?;
+    if push_null {
+        executor.push_value(pyre_object::PY_NULL)?;
+    }
     Ok(StepResult::Continue)
 }
 
@@ -3613,7 +3688,7 @@ pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     next_instr: usize,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
 where
-    E: SharedOpcodeHandler
+    E: SharedOpcodeHandler<Value = PyObjectRef>
         + ConstantOpcodeHandler
         + LocalOpcodeHandler
         + NamespaceOpcodeHandler

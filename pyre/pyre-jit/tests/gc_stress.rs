@@ -124,7 +124,7 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     set_last_exec_ctx(Rc::as_ptr(&execution_context));
 
     let mut frame = PyFrame::new_with_context(code, execution_context)
-        .map_err(|e| format!("frame setup error: {}", e.message))?;
+        .map_err(|e| format!("frame setup error: {}", e.message_text()))?;
 
     // Reuse the canonical globals dict as the __main__ module's dict so
     // `globals()` / `function.__globals__` share one identity
@@ -135,7 +135,7 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
 
     // An uncaught `assert` in the program surfaces here as `Err`, so a
     // successful return means every read-back assertion held.
-    eval_with_jit(&mut frame, None).map_err(|e| format!("execution error: {}", e.message))?;
+    eval_with_jit(&mut frame, None).map_err(|e| format!("execution error: {}", e.message_text()))?;
 
     // Non-vacuity: the stable instance allocator hook is installed by the
     // `JIT_DRIVER` initializer (`driver_pair` -> `init_gc_subsystem` ->

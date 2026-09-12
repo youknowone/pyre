@@ -44,6 +44,16 @@ pub trait SharedOpcodeHandler {
         callable: Self::Value,
         args: &[Self::Value],
     ) -> OpcodeResult<Self::Value>;
+    /// One-arg CALL as two word values so portal interpret never rebuilds
+    /// a `&[T]` residual and dereferences a symbolic pointer.
+    ///
+    /// No default: a default that writes `&[arg]` is what the translator
+    /// monomorphises for `opcode_call`, and that slice is the SIGBUS path.
+    fn call_callable_one(
+        &mut self,
+        callable: Self::Value,
+        arg: Self::Value,
+    ) -> OpcodeResult<Self::Value>;
     fn build_list(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
     fn build_tuple(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
     fn build_map(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
@@ -101,7 +111,7 @@ pub fn opcode_call<H: SharedOpcodeHandler + ?Sized>(
             let _null_or_self = handler.pop_value()?;
             let callable = handler.pop_value()?;
             let anchor = handler.anchor();
-            let result = handler.call_callable(callable, &[a0])?;
+            let result = handler.call_callable_one(callable, a0)?;
             H::push_anchored(&anchor, result)
         }
         2 => {

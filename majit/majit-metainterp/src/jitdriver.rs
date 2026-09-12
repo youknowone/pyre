@@ -1,6 +1,28 @@
 use majit_backend::ExitValueSourceLayout;
 
 thread_local! {
+    /// Shadow-stack depth at the start of a portal interpret walk.
+    /// Residual calls during the walk can leak GcRef roots; rewind to this
+    /// depth after a successful compile so the compiled residual does not
+    /// overflow (`call_one_arg_in_frame` → `register_frame_locals_slot`).
+    static INTERPRET_SS_BASE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn mark_interpret_shadow_base() {
+    INTERPRET_SS_BASE.with(|c| {
+        if c.get().is_none() {
+            c.set(Some(majit_gc::shadow_stack::depth()));
+        }
+    });
+}
+
+pub(crate) fn rewind_interpret_shadow() {
+    if let Some(base) = INTERPRET_SS_BASE.with(|c| c.take()) {
+        majit_gc::shadow_stack::try_pop_to(base);
+    }
+}
+
+thread_local! {
     /// Set while a full-body-walk trace executes a residual may-force call
     /// concretely (`pyre-jit-trace`'s `try_execute_residual_call_via_walker`).
     /// A Python-level callee re-enters the interpreter (`eval_loop_jit` →
@@ -3511,6 +3533,7 @@ impl<S: JitState> JitDriver<S> {
             );
         }
         if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
+            rewind_interpret_shadow();
             if let (Some(gk), Some(hp)) = (loop_green_key, loop_header_pc) {
                 self.meta.record_loop_header_pc(gk, hp);
             }
@@ -4241,6 +4264,7 @@ impl<S: JitState> JitDriver<S> {
                                 );
                                 match result {
                                     crate::pyjitpl::BridgeCompileResult::Compiled => {
+                                        rewind_interpret_shadow();
                                         self.sym = None;
                                         self.meta.clear_trace_session();
                                         // pyjitpl.py raise_if_successful():
@@ -5674,26 +5698,16 @@ impl<S: JitState> JitDriver<S> {
             // `opencoder.py SnapshotIterator.__init__` reverses on the WRITER
             // side, so the sections are already caller-first and
             // `rebuild_from_resumedata` just appends them as it reads.
-            let resume_frames: &[majit_ir::resumedata::RebuiltFrame] = if dispatch.is_none()
-                && resume.frames.len() > 1
-            {
-                // Portal traces stamp the residual-call helper chain
-                // (opcode step, binary_op, mod_impl, …) as extra
-                // sections. Those are not `BC_INLINE_CALL` frames, so
-                // the multi-frame seeder cannot recover their result
-                // slots. Walk the portal section alone — the user
-                // bytecode pc — and let interpret residual-call the
-                // helpers.
-                if crate::bridge_debug_enabled() {
-                    eprintln!(
-                        "[bridgeB] portal: keep root section only ({} helper frames dropped)",
-                        resume.frames.len() - 1
-                    );
-                }
-                &resume.frames[..1]
-            } else {
-                &resume.frames
-            };
+            //
+            // Portal traces stamp the residual-call helper chain as extra
+            // sections. Those are not `BC_INLINE_CALL` frames, so the
+            // seeder cannot recover their result slots from that opcode;
+            // `result_slot_at_pc` recovers them the way
+            // `make_result_of_lastop` does (`_resulttypes[pc]` + last
+            // bytecode byte). Dropping the helpers would restart the
+            // innermost body at pc=0 and miss the registers the guard
+            // actually held.
+            let resume_frames: &[majit_ir::resumedata::RebuiltFrame] = &resume.frames;
             let mut sections: Vec<(std::sync::Arc<crate::jitcode::JitCode>, usize)> =
                 Vec::with_capacity(resume_frames.len());
             for frame in resume_frames {
@@ -5952,11 +5966,22 @@ impl<S: JitState> JitDriver<S> {
                     }
                     eprintln!();
                 }
+                // Innermost is suspended in a guard, not a call. Every
+                // caller is sitting at the far side of its call, so
+                // `_resulttypes[pc]` names the dest even when the
+                // encoding is a residual CALL rather than BC_INLINE_CALL.
+                let result_slot = if depth + 1 < resume_frames.len() {
+                    call_sites[depth]
+                        .and_then(|site| site.result_slot())
+                        .or_else(|| jitcode.result_slot_at_pc(pc))
+                } else {
+                    None
+                };
                 frames.push(crate::jit_state::GuardResumeFrame {
                     jitcode,
                     pc,
                     regs,
-                    result_slot: call_sites[depth].and_then(|site| site.result_slot()),
+                    result_slot,
                     // The `descrs` slot the call that pushed THIS frame named —
                     // it lives on the caller's site, one level out.
                     sub_idx: depth

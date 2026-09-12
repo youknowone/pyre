@@ -1545,7 +1545,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                     } else if unsafe { pyre_object::is_tuple(value) } {
                         let values = seq_items(value).unwrap_or_default();
                         crate::call::type_call_instantiate(proto, &values)
-                            .map_err(|error| crate::PyError::runtime_error(error.message))?
+                            .map_err(|error| crate::PyError::runtime_error(error.message_wtf8()))?
                     } else {
                         return Err(crate::PyError::type_error("incompatible types"));
                     };
