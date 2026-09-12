@@ -14,8 +14,6 @@ mod codegen_cache;
 mod llbc_fingerprint;
 #[path = "../src/pypyjit_driver_layout.rs"]
 mod pypyjit_driver_layout;
-#[path = "../src/ullbc_semantic.rs"]
-mod ullbc_semantic;
 #[path = "../src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
@@ -31,7 +29,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v20";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v19";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
@@ -2446,18 +2444,19 @@ fn rustc_version_string() -> String {
 }
 
 fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &std::path::Path) {
-    // Hash the LLBC by semantic content, not by (len, mtime) and not by the
-    // raw JSON. The analysis derives every generated artefact from the graph
-    // bodies; span line/col, `files[].contents`, and `dest_file` move when a
-    // comment is edited or the checkout path changes, and hashing those
-    // re-ran the prepass over an unchanged translation. `source_text` stays
-    // inside the semantic feed (the translator reads `static mut` off it).
-    // The `.ullbc` set is ~660 MB, so the read costs under a second — still
+    // Hash the LLBC by content, not by (len, mtime) signature. The
+    // analysis (`analyze_multiple_pipeline_with_modules`) derives every
+    // generated artefact from these graph bodies, so a content change that
+    // happens to preserve size and mtime — `git checkout`, a cache restore
+    // that keeps timestamps, an in-place rewrite of equal length — must
+    // still rekey the cache. A signature would let `restore_codegen_cache`
+    // serve stale output and skip re-analysis. The `.ullbc` set is ~660 MB
+    // (89 % of it `fun_decls`), so the read costs under a second — still
     // negligible next to the tens of seconds of analysis it gates.
     if let Some(paths) = std::env::var_os("MAJIT_MIR_FRONTEND_LLBC") {
         for path in std::env::split_paths(&paths) {
             if !path.as_os_str().is_empty() {
-                hash_ullbc_file(h, repo_root, &path);
+                hash_file_content(h, repo_root, &path);
             }
         }
         return;
@@ -2465,7 +2464,7 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &std::path::Path) {
     // Same single source of truth as `emit_rerun_directives`: a crate missing
     // from this hash keys the codegen cache on a stale snapshot of it.
     for crate_name in LLBC_CRATES {
-        hash_ullbc_file(
+        hash_file_content(
             h,
             repo_root,
             &repo_root
@@ -2481,22 +2480,12 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &std::path::Path) {
     // `restore_codegen_cache` would serve the descrs built from the old
     // offsets.  Empty on a native build.
     for sidecar in llbc_layout_sidecars() {
-        hash_ullbc_file(
+        hash_file_content(
             h,
             repo_root,
             &repo_root.join("build").join("llbc").join(&sidecar),
         );
     }
-}
-
-fn hash_ullbc_file(h: &mut CacheHasher, repo_root: &std::path::Path, path: &std::path::Path) {
-    h.write_str(&codegen_cache::repo_relative(repo_root, path));
-    let Ok(bytes) = std::fs::read(path) else {
-        h.write_str("missing");
-        return;
-    };
-    h.write_str("semantic");
-    ullbc_semantic::feed_semantic_ullbc(&bytes, &mut |chunk| h.write_bytes(chunk));
 }
 
 fn hash_rs_dir_content(h: &mut CacheHasher, repo_root: &std::path::Path, dir: &std::path::Path) {

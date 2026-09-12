@@ -1645,184 +1645,6 @@ def stamp_skip_ok(recorded_text: str, expected: str) -> tuple[bool, bool]:
     return gates_match, closure_moved
 
 
-# Charon embeds three things the JIT never reads as identity:
-# `files[].contents` (the whole source, comments included), span
-# `beg`/`end` line/col, and `dest_file` (the absolute output path).
-# `source_text` stays: the translator uses it to tell `static mut` from
-# `static`. A comment-only edit therefore changes the raw artefact
-# bytes while leaving this digest still.
-_SPAN_LOC = re.compile(
-    rb'^\{[ \t]*"line"[ \t]*:[ \t]*\d+[ \t]*,[ \t]*"col"[ \t]*:[ \t]*\d+[ \t]*\}$'
-)
-
-
-def _skip_ws(data: bytes, index: int) -> int:
-    length = len(data)
-    while index < length and data[index] in (32, 9, 10, 13):
-        index += 1
-    return index
-
-
-def _skip_json_string(data: bytes, index: int) -> int:
-    """`index` is on the opening quote. Returns the position after the close."""
-    index += 1
-    length = len(data)
-    while index < length:
-        byte = data[index]
-        if byte == 92:
-            index += 2
-            continue
-        if byte == 34:
-            return index + 1
-        index += 1
-    return length
-
-
-def _skip_json_container(data: bytes, index: int) -> int:
-    """`index` is on `{` or `[`. Strings are skipped so nested braces inside them do not count."""
-    depth = 0
-    length = len(data)
-    while index < length:
-        byte = data[index]
-        if byte == 34:
-            index = _skip_json_string(data, index)
-            continue
-        if byte in (123, 91):
-            depth += 1
-        elif byte in (125, 93):
-            depth -= 1
-            index += 1
-            if depth == 0:
-                return index
-            continue
-        index += 1
-    return length
-
-
-def _skip_json_value(data: bytes, index: int) -> int:
-    index = _skip_ws(data, index)
-    if index >= len(data):
-        return index
-    byte = data[index]
-    if byte == 34:
-        return _skip_json_string(data, index)
-    if byte in (123, 91):
-        return _skip_json_container(data, index)
-    if byte == 110 and data.startswith(b"null", index):
-        return index + 4
-    if byte == 116 and data.startswith(b"true", index):
-        return index + 4
-    if byte == 102 and data.startswith(b"false", index):
-        return index + 5
-    if byte == 45:
-        index += 1
-    length = len(data)
-    while index < length and 48 <= data[index] <= 57:
-        index += 1
-    if index < length and data[index] == 46:
-        index += 1
-        while index < length and 48 <= data[index] <= 57:
-            index += 1
-    if index < length and data[index] in (101, 69):
-        index += 1
-        if index < length and data[index] in (43, 45):
-            index += 1
-        while index < length and 48 <= data[index] <= 57:
-            index += 1
-    return index
-
-
-def feed_semantic_ullbc(update, data: bytes) -> None:
-    """Emit ullbc JSON with source dumps, dest_file, and span locs removed."""
-    contents_key = b'"contents":'
-    dest_key = b'"dest_file":'
-    beg_key = b'"beg":'
-    end_key = b'"end":'
-    index = 0
-    length = len(data)
-    while index < length:
-        found_contents = data.find(contents_key, index)
-        found_dest = data.find(dest_key, index)
-        found_beg = data.find(beg_key, index)
-        found_end = data.find(end_key, index)
-        hits = [pos for pos in (found_contents, found_dest, found_beg, found_end) if pos >= 0]
-        if not hits:
-            update(data[index:])
-            return
-        next_hit = min(hits)
-        update(data[index:next_hit])
-        if next_hit == found_contents:
-            update(contents_key)
-            update(b'""')
-            index = _skip_json_value(data, next_hit + len(contents_key))
-        elif next_hit == found_dest:
-            update(dest_key)
-            update(b'""')
-            index = _skip_json_value(data, next_hit + len(dest_key))
-        else:
-            key = beg_key if next_hit == found_beg else end_key
-            after = _skip_ws(data, next_hit + len(key))
-            if after < length and data[after] == 123:
-                obj_end = _skip_json_value(data, after)
-                if _SPAN_LOC.match(data[after:obj_end]):
-                    update(key)
-                    update(b'{"line":0,"col":0}')
-                    index = obj_end
-                    continue
-            update(key)
-            index = next_hit + len(key)
-
-
-def ullbc_semantic_digest(data: bytes) -> str:
-    """SHA-256 hex of the semantic (span/source-dump-free) ullbc bytes."""
-    digest = hashlib.sha256()
-    feed_semantic_ullbc(digest.update, data)
-    return digest.hexdigest()
-
-
-def ullbc_bodies_unchanged(previous: Path, current: Path) -> bool:
-    """True when two artefacts differ only in spans, source dumps, or dest_file."""
-    return ullbc_semantic_digest(previous.read_bytes()) == ullbc_semantic_digest(
-        current.read_bytes()
-    )
-
-
-def stash_previous_artefact(dest: Path) -> Path | None:
-    """Move `dest` aside so Charon can overwrite it. None if there was nothing to keep."""
-    if dest.exists() and dest.stat().st_size > 0:
-        previous = dest.with_suffix(dest.suffix + ".previous")
-        dest.replace(previous)
-        return previous
-    return None
-
-
-def keep_previous_if_bodies_unchanged(
-    previous: Path | None, dest: Path, label: str
-) -> None:
-    """Put `previous` back when the new artefact's bodies did not move."""
-    if previous is None or not previous.exists():
-        return
-    if dest.exists() and dest.stat().st_size > 0 and ullbc_bodies_unchanged(previous, dest):
-        dest.unlink()
-        previous.replace(dest)
-        print(
-            f"    kept previous {label} "
-            "(bodies unchanged; spans/source dump moved)"
-        )
-        return
-    previous.unlink(missing_ok=True)
-
-
-def restore_stashed_if_dest_bad(previous: Path | None, dest: Path) -> None:
-    """On a failed write, put the previous artefact back rather than leave a hole."""
-    if previous is None or not previous.exists():
-        return
-    if not dest.exists() or dest.stat().st_size == 0:
-        previous.replace(dest)
-        return
-    previous.unlink(missing_ok=True)
-
-
 def file_mtime(path: Path) -> str:
     return datetime.datetime.fromtimestamp(path.stat().st_mtime).isoformat(
         timespec="seconds"
@@ -2655,10 +2477,6 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # rustc whatever cargo's cache says; see `invalidate_cargo_unit`.
         # Dependency crates stay cached (their MIR reaches Charon via rlib
         # metadata), so re-runs remain cheap.
-        previous_dest = None
-        host_adopted = False
-        previous_sidecars: list[tuple[Path | None, Path]] = []
-        host_pass = None
         target_dir, package = cargo_unit_location(path)
         invalidate_cargo_unit(target_dir, charon_host, package)
 
@@ -2684,9 +2502,8 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # lands with one timestamp and the figures in the text are the only
         # record of where the minutes went.
         phase_started = time.monotonic()
+        host_pass = subprocess.Popen(command, cwd=path, env=host_env)
         try:
-            previous_dest = stash_previous_artefact(dest)
-            host_pass = subprocess.Popen(command, cwd=path, env=host_env)
             # One extra extraction per cross target, reduced to its type
             # declarations. Charon's own `--targets` aggregation would fold
             # every target's layouts into this one artefact, but it aggregates
@@ -2774,8 +2591,6 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                 host_pass = None
                 print(f"    host pass: {time.monotonic() - phase_started:.0f} s")
                 phase_started = time.monotonic()
-            keep_previous_if_bodies_unchanged(previous_dest, dest, "artefact")
-            host_adopted = True
 
             layout_tables: dict[str, set[Path]] = {}
             for target, sidecar, full, proc, log, launched in layout_passes:
@@ -2799,12 +2614,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     raise SystemExit(
                         f"extract-llbc.py: Charon emitted no {target} artefact at {full}"
                     )
-                previous_sidecar = stash_previous_artefact(sidecar)
-                previous_sidecars.append((previous_sidecar, sidecar))
                 write_layout_sidecar(full, sidecar)
-                keep_previous_if_bodies_unchanged(
-                    previous_sidecar, sidecar, f"{target} sidecar"
-                )
                 # This artefact was compiled on its own, so its file table names
                 # sources the host build never reaches: everything behind a
                 # `cfg(target_arch)`, such as the wasm backend `pyre-interpreter`
@@ -2831,10 +2641,6 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     pending.kill()
             if host_pass is not None and host_pass.poll() is None:
                 host_pass.kill()
-            if not host_adopted:
-                restore_stashed_if_dest_bad(previous_dest, dest)
-            for previous_sidecar, sidecar in previous_sidecars:
-                restore_stashed_if_dest_bad(previous_sidecar, sidecar)
         # Persist the read set before computing the stamp it governs. The
         # artefacts are the oracle: repo-relative Local entries are exactly the
         # Rust sources Charon parsed, across the host translation and every

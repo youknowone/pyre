@@ -268,85 +268,6 @@ def run_stamp_skip(engine) -> int:
     return failures
 
 
-def run_semantic_ullbc(engine) -> int:
-    """Span/source-dump/dest_file moves keep the digest; body moves do not."""
-    failures = 0
-
-    def expect(name, condition):
-        nonlocal failures
-        if condition:
-            print(f"ok   {name}")
-        else:
-            failures += 1
-            print(f"FAIL {name}")
-
-    base = (
-        b'{"charon_version":"t","options":{"dest_file":"/abs/a.ullbc"},'
-        b'"translated":{"files":[{"id":0,"name":{"Local":"a.rs"},'
-        b'"contents":"fn a() {\\n  // c1\\n}"}],'
-        b'"fun_decls":[{"item_meta":{"source_text":"fn a() {}","span":'
-        b'{"data":{"file_id":0,"beg":{"line":10,"col":4},"end":{"line":12,"col":1}}'
-        b'}}}]}}'
-    )
-    span_moved = base.replace(b'"line":10', b'"line":99').replace(
-        b'"line":12', b'"line":101'
-    )
-    contents_moved = base.replace(b"// c1", b"// c2")
-    dest_moved = base.replace(b"/abs/a.ullbc", b"/other/b.ullbc")
-    source_text_moved = base.replace(b"fn a() {}", b"static mut X: u8 = 0;")
-    body_moved = base.replace(b'"fun_decls":[', b'"fun_decls":[{"changed":true},')
-    range_end = (
-        b'{"end":{"Unsigned":["U64","0"]},"beg":{"line":1,"col":2}}'
-    )
-    range_end_moved = (
-        b'{"end":{"Unsigned":["U64","1"]},"beg":{"line":1,"col":2}}'
-    )
-    digest = engine.ullbc_semantic_digest
-    expect("identical ullbc has a stable digest", digest(base) == digest(base))
-    expect("span line/col move keeps the digest", digest(base) == digest(span_moved))
-    expect("files[].contents move keeps the digest", digest(base) == digest(contents_moved))
-    expect("dest_file move keeps the digest", digest(base) == digest(dest_moved))
-    expect(
-        "source_text move changes the digest",
-        digest(base) != digest(source_text_moved),
-    )
-    expect("fun_decls move changes the digest", digest(base) != digest(body_moved))
-    expect(
-        "non-span end is not zeroed",
-        digest(range_end) != digest(range_end_moved),
-    )
-    expect(
-        "non-span end still zeros a sibling span loc",
-        digest(range_end)
-        == digest(b'{"end":{"Unsigned":["U64","0"]},"beg":{"line":9,"col":8}}'),
-    )
-
-    root = pathlib.Path(tempfile.mkdtemp()).resolve()
-    try:
-        dest = root / "crate.ullbc"
-        dest.write_bytes(base)
-        previous = engine.stash_previous_artefact(dest)
-        expect("stash moves a present artefact aside", previous is not None and not dest.exists())
-        dest.write_bytes(span_moved)
-        engine.keep_previous_if_bodies_unchanged(previous, dest, "artefact")
-        expect(
-            "keep restores previous bytes when only spans moved",
-            dest.read_bytes() == base,
-        )
-        dest.write_bytes(base)
-        previous = engine.stash_previous_artefact(dest)
-        dest.write_bytes(body_moved)
-        engine.keep_previous_if_bodies_unchanged(previous, dest, "artefact")
-        expect(
-            "keep leaves the new artefact when bodies moved",
-            dest.read_bytes() == body_moved,
-        )
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
-
-    return failures
-
-
 def main() -> None:
     engine = load_engine()
     failures = (
@@ -354,7 +275,6 @@ def main() -> None:
         + run_fingerprint(engine)
         + run_layout_sidecar(engine)
         + run_stamp_skip(engine)
-        + run_semantic_ullbc(engine)
     )
     if failures:
         raise SystemExit(f"llbc_extract_selftest: {failures} failed")

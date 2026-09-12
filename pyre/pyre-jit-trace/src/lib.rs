@@ -144,8 +144,6 @@ pub mod runtime_fnaddr_patch;
 pub mod state;
 pub mod super_inst_expand;
 mod trace_opcode;
-#[cfg(test)]
-mod ullbc_semantic;
 pub mod unpack_state;
 pub use pyjitcode::{PyJitCode, PyJitCodeMetadata};
 pub mod trace;
