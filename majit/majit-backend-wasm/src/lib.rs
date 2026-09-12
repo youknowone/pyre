@@ -3346,6 +3346,11 @@ impl WasmBackend {
                 ));
             }
             compiled.func_handle.set(new_handle);
+            if compiled.retained_owner_cells_base.get() == 0 {
+                compiled
+                    .retained_owner_cells_base
+                    .set(compiled.bridge_cells_base.get());
+            }
             new_handle
         } else if glue::replace_module(old_handle, &wasm_bytes) != old_handle {
             return Err(BackendError::Unsupported(
@@ -4561,6 +4566,7 @@ impl majit_backend::Backend for WasmBackend {
             frame,
             home_gcmap_ptr: std::cell::Cell::new(home_gcmap_ptr),
             bridge_cells_base: std::cell::Cell::new(bridge_cells_base),
+            retained_owner_cells_base: std::cell::Cell::new(0),
             module_bytes: std::cell::Cell::new(code_size as u32),
             num_guard_cells: std::cell::Cell::new(guard_exits.len()),
             has_preamble,
@@ -4794,7 +4800,7 @@ impl majit_backend::Backend for WasmBackend {
             let guard = if is_direct {
                 Some((
                     source_loop.bridge_cells_base.get(),
-                    0u32,
+                    source_loop.retained_owner_cells_base.get(),
                     source_loop.num_guard_cells.get(),
                     source_loop
                         .guard_fail_arg_advanced

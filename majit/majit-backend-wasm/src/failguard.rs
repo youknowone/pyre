@@ -1227,6 +1227,11 @@ pub struct CompiledWasmLoop {
     /// table slot here. `0` when the trace has no in-module dispatch (native, or
     /// a guardless / straight-line trace).
     pub bridge_cells_base: Cell<u32>,
+    /// Cell array of a retained pre-growth owner module. When the LABEL
+    /// tail grows, the replacement is installed at a new table slot and
+    /// this stays the array the old module still reads. `0` until that
+    /// split. `compile_bridge` writes both aliases.
+    pub retained_owner_cells_base: Cell<u32>,
     /// Byte length of the module this loop was last emitted as, own ops and
     /// every merged region together. A merge re-emits the whole owner, so this
     /// is what the next merge charges cranelift, and
