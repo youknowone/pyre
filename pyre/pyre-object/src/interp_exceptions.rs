@@ -643,7 +643,7 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
         // exception before `w_exception_set_args` writes through it.
         let _roots = crate::gc_roots::push_roots();
         let exc = crate::gc_roots::pin_root(exc);
-        let arg = crate::unicodeobject::w_str_new(message);
+        let arg = crate::gc_roots::pin_root(crate::unicodeobject::w_str_new_managed(message));
         unsafe { w_exception_set_args(exc, w_exception_args_new(vec![arg])) };
     }
     exc
@@ -657,7 +657,9 @@ pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
         // See `w_exception_new`: pin `exc` across the allocating arg build.
         let _roots = crate::gc_roots::push_roots();
         let exc = crate::gc_roots::pin_root(exc);
-        let arg = crate::unicodeobject::w_str_from_wtf8(message.to_wtf8_buf());
+        let arg = crate::gc_roots::pin_root(crate::unicodeobject::w_str_from_wtf8_managed(
+            message.to_wtf8_buf(),
+        ));
         unsafe { w_exception_set_args(exc, w_exception_args_new(vec![arg])) };
     }
     exc

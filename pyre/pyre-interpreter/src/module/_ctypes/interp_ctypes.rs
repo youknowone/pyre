@@ -992,7 +992,7 @@ pub(super) fn carg_type() -> pyre_object::PyObjectRef {
                     let value = unsafe { pyre_object::w_dict_getitem_str(d, "_obj") }
                         .unwrap_or_else(pyre_object::w_none);
                     let rendered = unsafe { crate::display::py_repr_wtf8(value) }?;
-                    Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!("<cparam ", rendered, ">")))
+                    Ok(pyre_object::w_str_from_wtf8_managed(crate::display::wtf8_format!("<cparam ", rendered, ">")))
                 }),
             );
         });

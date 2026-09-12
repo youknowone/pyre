@@ -1317,7 +1317,7 @@ pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult
         result.push(args);
         return Ok(pyre_object::w_tuple_new(result.take()));
     }
-    Ok(pyre_object::w_str_from_wtf8(unsafe {
+    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
         function_get_qualname(obj)
     }))
 }

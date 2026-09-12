@@ -4748,7 +4748,7 @@ impl OpcodeStepExecutor for PyFrame {
                 let mut qualname =
                     unsafe { crate::function::function_get_qualname(roots.get(func_slot)) };
                 qualname.push_str(".__annotate__");
-                let w_qualname = pyre_object::w_str_from_wtf8(qualname);
+                let w_qualname = pyre_object::w_str_from_wtf8_managed(qualname);
                 unsafe {
                     crate::function::function_set_qualname(roots.get(attr_slot), w_qualname);
                     crate::function::function_set_annotate_unchecked(

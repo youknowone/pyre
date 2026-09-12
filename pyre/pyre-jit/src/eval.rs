@@ -1744,7 +1744,7 @@ use pyre_object::lowlevel_string::{
     LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_UNICODE_BASE_SIZE, bh_alloc_lowlevel_string,
     bh_read_lowlevel_string, bh_write_lowlevel_char,
 };
-use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
+use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new_managed, w_tuple_new};
 
 // rlib/jit.py PARAMETERS default: loop hot-count threshold. Read from
 // the parameter table rather than restated — upstream a jitdriver that does
@@ -6702,13 +6702,13 @@ pub fn get_location(
             }
         };
     let _ = opcode;
-    w_tuple_new(vec![
-        w_str_new(&filename),
-        w_int_new(line as i64),
-        w_str_new(&name),
-        w_int_new(next_instr as i64),
-        w_str_new(&opcode),
-    ])
+    let mut fields = gc_roots::RootedItems::new();
+    fields.push(w_str_new_managed(&filename));
+    fields.push(w_int_new(line as i64));
+    fields.push(w_str_new_managed(&name));
+    fields.push(w_int_new(next_instr as i64));
+    fields.push(w_str_new_managed(&opcode));
+    w_tuple_new(fields.take())
 }
 
 /// RPython interp_jit.py helper: should_unroll_one_iteration.

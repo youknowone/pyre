@@ -465,7 +465,7 @@ fn frozen_name(
 fn frozen_error(message: String, name: &Wtf8) -> crate::PyError {
     crate::PyError::import_error_name_path(
         message,
-        pyre_object::w_str_from_wtf8(name.to_owned()),
+        pyre_object::w_str_from_wtf8_managed(name.to_owned()),
         pyre_object::w_none(),
     )
 }
@@ -1287,9 +1287,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     any(target_os = "macos", target_os = "linux")
                 ))]
                 {
-                    Ok(pyre_object::w_list_new(vec![pyre_object::w_str_new(
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let suffix_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(
                         crate::cpyext::extension_suffix(),
-                    )]))
+                    ));
+                    Ok(pyre_object::w_list_new(vec![
+                        pyre_object::gc_roots::shadow_stack_get(suffix_slot),
+                    ]))
                 }
                 #[cfg(not(all(
                     feature = "cpyext",

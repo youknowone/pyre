@@ -1946,8 +1946,8 @@ fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
         pyre_object::w_dict_setitem_str(ns_roots.get(ns_slot), "_type_", elem);
         pyre_object::w_dict_setitem_str(ns_roots.get(ns_slot), "_length_", w_length);
     }
-    let bases = pyre_object::w_tuple_new(vec![array_type()]);
-    let w_name = pyre_object::w_str_new(&name);
+    let bases = ns_roots.pin_root(pyre_object::w_tuple_new(vec![array_type()]));
+    let w_name = ns_roots.pin_root(pyre_object::w_str_new_managed(&name));
     let new_cls = crate::call::type_call_instantiate(
         pycarraytype_type(),
         &[w_name, bases, ns_roots.get(ns_slot)],

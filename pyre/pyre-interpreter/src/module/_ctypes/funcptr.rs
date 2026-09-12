@@ -1902,7 +1902,7 @@ fn internal_wstring_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // `PyUnicode_FromWideChar` copies nothing for a zero size, so the address
     // is never dereferenced and need not be readable at all.
     if size == 0 {
-        return Ok(pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::new()));
+        return Ok(pyre_object::w_str_new(""));
     }
     // A negative size other than `-1` reaches `find_maxchar_surrogates` as the
     // range `[ptr, ptr + size)`, whose end precedes its start, so nothing is
@@ -1926,7 +1926,7 @@ fn internal_wstring_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             return Err(crate::PyError::overflow_error("size too large"));
         }
     };
-    Ok(pyre_object::w_str_from_wtf8(value))
+    Ok(pyre_object::w_str_from_wtf8_managed(value))
 }
 
 fn internal_memoryview_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

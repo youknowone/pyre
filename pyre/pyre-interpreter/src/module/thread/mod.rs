@@ -2424,7 +2424,7 @@ fn thread_excepthook_file(
         let rendered = unsafe {
             crate::display::py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(name_slot))?
         };
-        thread_excepthook_write(file_slot, w_str_from_wtf8(rendered))?;
+        thread_excepthook_write(file_slot, w_str_from_wtf8_managed(rendered))?;
     } else {
         thread_excepthook_write(file_slot, w_str_new_managed(&current_ident().to_string()))?;
     }
@@ -2442,7 +2442,7 @@ fn thread_excepthook_file(
     .map_err(|err| crate::PyError::runtime_error(format!("failed to display exception: {err}")))?;
     let rendered = rustpython_wtf8::Wtf8Buf::from_bytes(rendered)
         .map_err(|_| crate::PyError::runtime_error("invalid WTF-8 exception display"))?;
-    thread_excepthook_write(file_slot, pyre_object::w_str_from_wtf8(rendered))?;
+    thread_excepthook_write(file_slot, pyre_object::w_str_from_wtf8_managed(rendered))?;
 
     // `_PyFile_Flush(file)`.
     call_method_result(
@@ -2577,7 +2577,7 @@ fn current_thread_name() -> Result<PyObjectRef, crate::PyError> {
             len += 1;
         }
     }
-    let name = pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(unsafe {
+    let name = pyre_object::w_str_from_wtf8_managed(rustpython_wtf8::Wtf8Buf::from_wide(unsafe {
         std::slice::from_raw_parts(raw, len)
     }));
     unsafe { LocalFree(raw.cast()) };

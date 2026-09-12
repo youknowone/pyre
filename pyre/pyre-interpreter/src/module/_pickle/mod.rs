@@ -178,7 +178,15 @@ pub(crate) fn call_meth(
 fn pickle_exc(class_name: &str, msg: rustpython_wtf8::Wtf8Buf) -> PyError {
     let mut err = PyError::value_error(msg.clone());
     if let Some(cls) = crate::builtins::lookup_exc_class(class_name) {
-        let args = [cls, pyre_object::w_str_from_wtf8(msg)];
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(msg));
+        let args = [
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+            pyre_object::gc_roots::shadow_stack_get(msg_slot),
+        ];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }
@@ -602,7 +610,7 @@ pub(crate) fn parse_int_text(s: &str) -> Result<PyObjectRef, PyError> {
     // interp_pickle.py:2201 calls the ordinary `int` constructor.  Reuse its
     // NumberStringParser consumer so the digit limit, MemoryError edge, and
     // literal diagnostics do not diverge for protocol-0 INT/LONG opcodes.
-    crate::builtins::parse_int_from_str(pyre_object::w_str_new(s), s, 10)
+    crate::builtins::parse_int_from_str(pyre_object::w_str_new_managed(s), s, 10)
 }
 
 pub(crate) fn read_int_le(data: &[u8]) -> i64 {

@@ -441,10 +441,11 @@ fn surrogatepass_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             }
             let mut replacement = Wtf8Buf::new();
             replacement.push(CodePoint::from_u32(code).unwrap());
-            Ok(codec_result(
-                w_str_from_wtf8(replacement),
-                w_int_new((exc.start + byte_len) as i64),
-            ))
+            let _roots = gc_roots::push_roots();
+            let repl_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(w_str_from_wtf8_managed(replacement));
+            let pos = w_int_new((exc.start + byte_len) as i64);
+            Ok(codec_result(gc_roots::shadow_stack_get(repl_slot), pos))
         }
         _ => Err(crate::PyError::type_error(
             "don't know how to handle exception in error callback",
@@ -486,10 +487,11 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if consumed == 0 {
                 return Err(unsafe { crate::PyError::from_exc_object(exc.w_exc) });
             }
-            Ok(codec_result(
-                w_str_from_wtf8(replacement),
-                w_int_new((exc.start + consumed) as i64),
-            ))
+            let _roots = gc_roots::push_roots();
+            let repl_slot = gc_roots::shadow_stack_len();
+            let _ = gc_roots::pin_root(w_str_from_wtf8_managed(replacement));
+            let pos = w_int_new((exc.start + consumed) as i64);
+            Ok(codec_result(gc_roots::shadow_stack_get(repl_slot), pos))
         }
         _ => Err(crate::PyError::type_error(
             "don't know how to handle exception in error callback",
@@ -541,7 +543,9 @@ pub(crate) fn validate_encoding(encoding: &str) -> Result<(), crate::PyError> {
     if with_codec_state(|state| state.codec_need_encodings) {
         return Ok(());
     }
-    lookup_codec(&[w_str_new(encoding)]).map(|_| ())
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    lookup_codec(&[w_encoding]).map(|_| ())
 }
 
 /// `interp_codecs.py lookup_error`.  The direct codec loops implement
@@ -772,7 +776,9 @@ pub(crate) fn lookup_text_codec(
     action: &str,
     encoding: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let w_codec_info = lookup_codec(&[w_str_new(encoding)])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let w_codec_info = lookup_codec(&[w_encoding])?;
     match crate::baseobjspace::getattr_str(w_codec_info, "_is_text_encoding") {
         Ok(w_flag) if !crate::baseobjspace::is_true(w_flag)? => {
             return Err(crate::PyError::new(
@@ -797,10 +803,20 @@ fn call_codec(
     errors: Option<&str>,
 ) -> Result<PyObjectRef, crate::PyError> {
     // PyPy `interp_codecs.py _call_codec`.
+    let roots = pyre_object::gc_roots::push_roots();
+    let coder_slot = roots.base();
+    let _ = roots.pin_root(w_coder);
+    let obj_slot = coder_slot + 1;
+    let _ = roots.pin_root(w_obj);
     let call = if let Some(errors) = errors {
-        crate::call::call_function_impl_result(w_coder, &[w_obj, w_str_new(errors)])
+        let err_slot = coder_slot + 2;
+        let _ = roots.pin_root(w_str_new_managed(errors));
+        crate::call::call_function_impl_result(
+            roots.get(coder_slot),
+            &[roots.get(obj_slot), roots.get(err_slot)],
+        )
     } else {
-        crate::call::call_function_impl_result(w_coder, &[w_obj])
+        crate::call::call_function_impl_result(roots.get(coder_slot), &[roots.get(obj_slot)])
     };
     // A codec that raises gets one line of context naming the operation and
     // the encoding, and is re-raised otherwise unchanged:
@@ -878,7 +894,8 @@ fn codec_encode_or_decode(
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     let encoding = crate::baseobjspace::str_utf8_w(w_encoding)?.to_string();
-    let w_codec_info = lookup_codec(&[w_str_new(&encoding)])?;
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(&encoding));
+    let w_codec_info = lookup_codec(&[w_encoding])?;
     let w_coder = unsafe {
         pyre_object::w_tuple_getitem(w_codec_info, i64::from(!encode)).unwrap_or_else(w_none)
     };
@@ -985,10 +1002,11 @@ fn encode_with_name(
     // PyPy `make_encoder_wrapper`: convert to unicode, call unicodehelper
     // encoder, return `(bytes, unicode_length)`.
     let encode_method = crate::baseobjspace::getattr_str(w_obj, "encode")?;
-    let encoded = crate::call::call_function_impl_result(
-        encode_method,
-        &[w_str_new(encoding), w_str_new(&errors)],
-    )?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let encode_method = pyre_object::gc_roots::pin_root(encode_method);
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let w_errors = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
+    let encoded = crate::call::call_function_impl_result(encode_method, &[w_encoding, w_errors])?;
     Ok(rooted_tuple()
         .arg(encoded)
         .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
@@ -1013,10 +1031,10 @@ fn decode_with_name(
     let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&data));
     let decode_method =
         crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "decode")?;
-    let decoded = crate::call::call_function_impl_result(
-        decode_method,
-        &[w_str_new(encoding), w_str_new(&errors)],
-    )?;
+    let decode_method = pyre_object::gc_roots::pin_root(decode_method);
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let w_errors = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
+    let decoded = crate::call::call_function_impl_result(decode_method, &[w_encoding, w_errors])?;
     Ok(rooted_tuple()
         .arg(decoded)
         .arg(w_int_new(consumed as i64))
@@ -1389,7 +1407,7 @@ fn charmap_decode_impl(
             chars.get(b as usize).copied().map(|cp| {
                 let mut one = rustpython_wtf8::Wtf8Buf::new();
                 one.push(cp);
-                w_str_from_wtf8(one)
+                w_str_from_wtf8_managed(one)
             })
         } else {
             charmap_decode_lookup(pyre_object::gc_roots::shadow_stack_get(sp), b)?

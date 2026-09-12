@@ -293,7 +293,7 @@ fn ast_repr(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn ast_warn(message: rustpython_wtf8::Wtf8Buf) -> Result<(), crate::PyError> {
     crate::warn::warn_category_w(
-        pyre_object::w_str_from_wtf8(message),
+        pyre_object::w_str_from_wtf8_managed(message),
         "DeprecationWarning",
         2,
     )

@@ -676,7 +676,7 @@ fn exec_query(args: &[PyObjectRef]) -> crate::PyResult {
     }
 
     let result = execute_query(std::mem::take(&mut wide))?;
-    Ok(pyre_object::w_str_from_wtf8(
+    Ok(pyre_object::w_str_from_wtf8_managed(
         rustpython_wtf8::Wtf8Buf::from_wide(&result),
     ))
 }

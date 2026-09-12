@@ -737,7 +737,7 @@ fn positioned_syntax_error(
     };
     let _roots = gc_roots::push_roots();
     let _ = gc_roots::pin_root(class);
-    let _ = gc_roots::pin_root(w_str_new(message));
+    let _ = gc_roots::pin_root(w_str_new_managed(message));
     let base = gc_roots::shadow_stack_len() - 2;
     let exc = match crate::builtins::call_and_check(
         gc_roots::shadow_stack_get(base),
@@ -753,10 +753,10 @@ fn positioned_syntax_error(
         let _ = crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(exc_slot), name, value);
     }
     for (name, value) in [("msg", message), ("filename", "<string>")] {
-        let value = w_str_new(value);
+        let value = w_str_new_managed(value);
         let _ = crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(exc_slot), name, value);
     }
-    let text_value = text.map(w_str_new).unwrap_or_else(w_none);
+    let text_value = text.map(w_str_new_managed).unwrap_or_else(w_none);
     let _ =
         crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(exc_slot), "text", text_value);
     unsafe { crate::PyError::from_exc_object(gc_roots::shadow_stack_get(exc_slot)) }

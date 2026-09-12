@@ -205,7 +205,7 @@ mod process {
         }
         buffer[MAX_PATH - 1] = 0;
         let filename = &buffer[..buffer.iter().position(|&u| u == 0).unwrap_or(MAX_PATH)];
-        Ok(pyre_object::w_str_from_wtf8(
+        Ok(pyre_object::w_str_from_wtf8_managed(
             rustpython_wtf8::Wtf8Buf::from_wide(filename),
         ))
     }

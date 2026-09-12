@@ -274,7 +274,7 @@ fn add_pickle_object_note(
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     if let Ok(type_name) = pickle_type_name(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
-        let w_note = pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
+        let w_note = pyre_object::w_str_from_wtf8_managed(crate::display::wtf8_format!(
             format!("when serializing {type_name} "),
             role
         ));

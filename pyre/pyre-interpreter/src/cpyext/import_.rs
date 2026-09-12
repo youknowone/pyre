@@ -20,7 +20,7 @@ pub(super) fn import_module(name: &str) -> Result<PyObjectRef, crate::PyError> {
     let import_slot = pyre_object::gc_roots::shadow_stack_len();
     let import = roots.pin_root(import);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_str_new(name));
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
     // `__import__` answers with the top-level package, so the submodule is
     // read back out of `sys.modules` afterwards.
     crate::call::call_function_impl_result(

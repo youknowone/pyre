@@ -839,7 +839,7 @@ impl PywrapKind for &str {
 impl PywrapKind for String {
     #[inline]
     fn into_py(self) -> ::pyre_object::PyObjectRef {
-        ::pyre_object::w_str_new(&self)
+        ::pyre_object::w_str_new_managed(&self)
     }
 }
 impl PywrapKind for ::pyre_object::PyObjectRef {

@@ -1351,7 +1351,7 @@ pub(crate) fn seed_main_loader(
                 ty,
                 &[
                     pyre_object::w_str_new("__main__"),
-                    pyre_object::w_str_new(path),
+                    pyre_object::w_str_new_managed(path),
                 ],
             )
             .ok()
@@ -2234,13 +2234,12 @@ fn runpy_run_module_as_main(
 ) -> Result<(), pyre_interpreter::PyError> {
     let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
     let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_module = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(module));
     let args = if alter_argv {
-        vec![pyre_object::w_str_new(module)]
+        vec![w_module]
     } else {
-        vec![
-            pyre_object::w_str_new(module),
-            pyre_object::w_bool_from(false),
-        ]
+        vec![w_module, pyre_object::w_bool_from(false)]
     };
     let res = pyre_interpreter::call_function(func, &args);
     if res.is_null() {

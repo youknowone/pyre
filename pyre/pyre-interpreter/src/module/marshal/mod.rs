@@ -819,7 +819,7 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_str(&self, value: &Wtf8) -> Rooted {
-        Rooted::new(w_str_from_wtf8(value.to_owned()))
+        Rooted::new(w_str_from_wtf8_managed(value.to_owned()))
     }
 
     fn make_interned_str(&self, value: &Wtf8) -> Rooted {

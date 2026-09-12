@@ -518,9 +518,9 @@ pub(crate) fn register_interactive_code(
     let register_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // Each `w_str_new` can collect, so the earlier string is rooted before
     // the next one is built rather than left in a temporary.
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(source));
     let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(filename));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(filename));
     let filename_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     pyre_interpreter::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(register_slot),

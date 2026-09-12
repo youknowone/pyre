@@ -1187,7 +1187,7 @@ mod win_nt {
         if as_bytes {
             pyre_object::w_bytes_from_bytes(&crate::gateway::fs_result_bytes(text.as_bytes()))
         } else {
-            pyre_object::w_str_from_wtf8(text)
+            pyre_object::w_str_from_wtf8_managed(text)
         }
     }
 
@@ -1232,7 +1232,7 @@ mod win_nt {
             // argument was: `os__findfirstfile_impl` reports `cFileName`
             // through `PyUnicode_FromWideChar` and asks no codec for a
             // `bytes` spelling of it.
-            Ok(name) => Ok(pyre_object::w_str_from_wtf8(
+            Ok(name) => Ok(pyre_object::w_str_from_wtf8_managed(
                 crate::gateway::fsdecode_os_str_wtf8(&name),
             )),
             Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
@@ -9163,10 +9163,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::_structseq::new_instance_with_extra(
                 statvfs_result_seq_type(),
                 fields.take(),
-                vec![(
-                    "f_fsid",
-                    pyre_object::gc_roots::shadow_stack_get(fsid_slot),
-                )],
+                vec![("f_fsid", pyre_object::gc_roots::shadow_stack_get(fsid_slot))],
             )
         }
         #[cfg(not(target_os = "redox"))]

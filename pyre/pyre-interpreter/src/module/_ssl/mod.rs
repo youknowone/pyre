@@ -213,7 +213,7 @@ fn ssl_error_str(args: &[PyObjectRef]) -> crate::PyResult {
         };
         crate::builtins::builtin_str(&[message])
     } else {
-        Ok(pyre_object::w_str_from_wtf8(unsafe {
+        Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
             crate::display::base_exception_str_wtf8(args[0])?
         }))
     }

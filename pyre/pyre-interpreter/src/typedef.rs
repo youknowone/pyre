@@ -3076,11 +3076,18 @@ fn new_typeobject_with_metatype_and_layout(
     if named.is_none()
         && let Some((module, _)) = name.rsplit_once('.')
     {
-        // Allocate the value first: reading `ns` before `w_str_new` would hand
+        // Allocate the value first: reading `ns` before the mint would hand
         // the store an address the allocation is free to move.
-        let w_module = w_str_new(module);
+        let module_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(module));
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__module__", w_module) };
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__module__",
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+            )
+        };
     }
     // The namespace is complete, so every method descriptor in it can be
     // bound to the type that defines it before the type goes live.
@@ -6035,8 +6042,8 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // of which the collector rewrites, and each keyword name allocated below
     // can move a `list` or `dict` still waiting in them.  Both columns are
     // published before the first of those allocations and read back where the
-    // `Arguments` copy is taken; a keyword name is a `str` and never moves, so
-    // its pin is liveness only.
+    // `Arguments` copy is taken. Managed keyword names move, so each mint
+    // is pinned before the next allocation.
     let _roots = pyre_object::gc_roots::push_roots();
     let positional_base = pyre_object::gc_roots::pin_roots(positional);
     let (keyword_names_w, keyword_values_base) = match kwargs {
@@ -6049,7 +6056,7 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let base = pyre_object::gc_roots::pin_roots(&values);
             let mut names = Vec::with_capacity(entries.len());
             for (key, _) in entries {
-                let w_name = pyre_object::w_str_from_wtf8(key);
+                let w_name = pyre_object::w_str_from_wtf8_managed(key);
                 let w_name = pyre_object::gc_roots::pin_root(w_name);
                 names.push(w_name);
             }
@@ -6741,7 +6748,7 @@ fn init_str_type(ns: PyObjectRef) {
                     {
                         Ok(obj)
                     } else {
-                        Ok(pyre_object::w_str_from_wtf8(
+                        Ok(pyre_object::w_str_from_wtf8_managed(
                             unsafe { pyre_object::w_str_get_wtf8(obj) }.to_wtf8_buf(),
                         ))
                     }
@@ -8559,7 +8566,7 @@ fn init_dict_view_common_slots(
                     if args.is_empty() {
                         return Ok(pyre_object::w_str_new(""));
                     }
-                    Ok(pyre_object::w_str_from_wtf8(unsafe {
+                    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
                         crate::display::py_repr_wtf8(args[0])?
                     }))
                 },
@@ -13257,7 +13264,7 @@ fn init_type_type(ns: PyObjectRef) {
         |args| unsafe {
             let w_type = args[1];
             if let Some(signature) = pyre_object::w_type_get_text_signature(w_type) {
-                return Ok(pyre_object::w_str_new(signature));
+                return Ok(pyre_object::w_str_new_managed(signature));
             }
             // typeobject.py `extract_txtsig`.
             let w_doc = crate::baseobjspace::getattr_str(w_type, "__doc__")?;
@@ -13276,7 +13283,7 @@ fn init_type_type(ns: PyObjectRef) {
                 if let Some(end) = raw_doc.find(MARKER.as_ref())
                     && end > 0
                 {
-                    return Ok(pyre_object::w_str_from_wtf8(
+                    return Ok(pyre_object::w_str_from_wtf8_managed(
                         raw_doc[name.len()..end + 1].to_wtf8_buf(),
                     ));
                 }
@@ -13450,11 +13457,10 @@ fn init_type_type(ns: PyObjectRef) {
             }
             // Builtin-name dot split fallback (`typeobject.py:619-624`).
             let name = unsafe { pyre_object::w_type_get_name(cls) };
-            let mod_name = match name.rfind('.') {
-                Some(dot) => name[..dot].to_string(),
-                None => "builtins".to_string(),
-            };
-            Ok(pyre_object::w_str_new(&mod_name))
+            Ok(match name.rfind('.') {
+                Some(dot) => pyre_object::w_str_new_managed(&name[..dot]),
+                None => pyre_object::w_str_new("builtins"),
+            })
         },
         2,
     );
@@ -15586,7 +15592,7 @@ fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
         // (`stamp_method_owners`), which is also what `bool.from_bytes`
         // reporting `int.from_bytes` requires.
         if unsafe { pyre_object::is_type(instance) } {
-            return Ok(pyre_object::w_str_from_wtf8(unsafe {
+            return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
                 crate::function::function_get_qualname(descr)
             }));
         }
@@ -15602,13 +15608,11 @@ fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
         // qualname, which is a `str` the read has to keep rather than reject.
         let type_qualname = unsafe { pyre_object::w_str_get_wtf8(type_qualname) };
         let name = unsafe { crate::function::function_get_name(descr) };
-        Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
-            type_qualname,
-            ".",
-            name,
-        )))
+        Ok(pyre_object::w_str_from_wtf8_managed(
+            crate::display::wtf8_format!(type_qualname, ".", name,),
+        ))
     } else {
-        Ok(pyre_object::w_str_from_wtf8(unsafe {
+        Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
             crate::function::function_get_qualname(obj)
         }))
     }
@@ -16114,15 +16118,17 @@ fn init_builtin_code_type(ns: PyObjectRef) {
     let varnames_getter = make_builtin_function_with_arity(
         "co_varnames",
         |args| {
-            let names = code_sig(args)
-                .map(|s| {
-                    s.getallvarnames()
-                        .iter()
-                        .map(|n| pyre_object::w_str_new(n))
-                        .collect()
-                })
-                .unwrap_or_default();
-            Ok(pyre_object::w_tuple_new(names))
+            let names = match code_sig(args) {
+                Some(s) => {
+                    let mut names = pyre_object::gc_roots::RootedItems::new();
+                    for n in s.getallvarnames() {
+                        names.push(pyre_object::w_str_new_managed(n));
+                    }
+                    pyre_object::w_tuple_new(names.take())
+                }
+                None => pyre_object::w_tuple_new(vec![]),
+            };
+            Ok(names)
         },
         2,
     );
@@ -16199,7 +16205,7 @@ fn descr_reduce(descr: PyObjectRef) -> crate::PyResult {
     let owner = unsafe { crate::function::fget_func_objclass(descr)? };
     let mut args = pyre_object::gc_roots::RootedItems::new();
     args.push(owner);
-    args.push(pyre_object::w_str_new(unsafe {
+    args.push(pyre_object::w_str_new_managed(unsafe {
         crate::function::function_get_name(descr)
     }));
     let args = pyre_object::w_tuple_new(args.take());
@@ -17541,7 +17547,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 return Ok(pyre_object::w_none());
             }
             match unsafe { pyre_object::w_member_get_doc(member) } {
-                Some(doc) => Ok(pyre_object::w_str_new(doc)),
+                Some(doc) => Ok(pyre_object::w_str_new_managed(doc)),
                 None => Ok(pyre_object::w_none()),
             }
         },
@@ -17621,7 +17627,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                     let owner = unsafe { pyre_object::w_member_get_cls(member) };
                     let mut args = pyre_object::gc_roots::RootedItems::new();
                     args.push(owner);
-                    args.push(pyre_object::w_str_new(unsafe {
+                    args.push(pyre_object::w_str_new_managed(unsafe {
                         pyre_object::w_member_get_name(member)
                     }));
                     let args = pyre_object::w_tuple_new(args.take());
@@ -25275,7 +25281,7 @@ pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
         .unwrap_or(0);
     Err(unicode_encode_error(
         "utf-8",
-        pyre_object::w_str_from_wtf8(text),
+        pyre_object::w_str_from_wtf8_managed(text),
         position as i64,
         (position + 1) as i64,
         "surrogates not allowed",
@@ -26476,7 +26482,7 @@ fn bytearray_reduce_impl(
         // unicode string plus the explicit codec name.
         let latin1: String = data.iter().map(|&b| char::from(b)).collect();
         let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_str_new(&latin1));
+        fields.push(w_str_new_managed(&latin1));
         fields.push(w_str_new("latin-1"));
         w_tuple_new(fields.take())
     };
@@ -31041,8 +31047,8 @@ fn itertools_constructor_scope_kwonly(
     // rewrites, and the names and defaults dict allocated below can move a
     // `list` or `dict` waiting in either.  Both columns are published before
     // the first of those allocations and read back where the `Arguments` copy
-    // is taken; a keyword name is a `str` and never moves, so its pin is
-    // liveness only.
+    // is taken. Managed keyword names move, so each mint is pinned before
+    // the next allocation.
     let positional_base = pyre_object::gc_roots::pin_roots(positional);
     let (keyword_names_w, keyword_values_base) = match kwargs {
         Some(dict) => {
@@ -31054,7 +31060,7 @@ fn itertools_constructor_scope_kwonly(
             let base = pyre_object::gc_roots::pin_roots(&values);
             let mut names = Vec::with_capacity(entries.len());
             for (key, _) in entries {
-                let w_name = pyre_object::w_str_from_wtf8(key);
+                let w_name = pyre_object::w_str_from_wtf8_managed(key);
                 let w_name = pyre_object::gc_roots::pin_root(w_name);
                 names.push(w_name);
             }
@@ -31178,7 +31184,7 @@ fn count_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         let step = unsafe { crate::display::py_repr_wtf8(w_step)? };
         crate::display::wtf8_format!(cls_name, "(", c, ", ", step, ")")
     };
-    Ok(w_str_from_wtf8(text))
+    Ok(w_str_from_wtf8_managed(text))
 }
 
 /// [3.14-spec] CPython `count_slots` publishes `Py_tp_getattro`, while PyPy's
@@ -31314,7 +31320,7 @@ fn repeat_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     } else {
         crate::display::wtf8_format!(cls_name, "(", objrepr, ")")
     };
-    Ok(w_str_from_wtf8(text))
+    Ok(w_str_from_wtf8_managed(text))
 }
 
 /// [3.14-spec] CPython `repeat_slots` publishes `Py_tp_getattro`, while PyPy's
@@ -31899,8 +31905,8 @@ fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // collector rewrites, and every allocation between here and the parse can
     // move a value sitting in it.  The value column is published as one root
     // set before the first of those allocations and read back where the
-    // `Arguments` copy is taken; a keyword name is a `str` and never moves, so
-    // its pin is liveness only.
+    // `Arguments` copy is taken. Managed keyword names move, so each mint
+    // is pinned before the next allocation.
     let (keyword_names_w, keyword_values_base) = match kwargs {
         Some(dict) => {
             let entries: Vec<_> = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
@@ -31911,7 +31917,7 @@ fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             let base = pyre_object::gc_roots::pin_roots(&values);
             let mut names = Vec::with_capacity(entries.len());
             for (key, _) in entries {
-                let w_name = pyre_object::w_str_from_wtf8(key);
+                let w_name = pyre_object::w_str_from_wtf8_managed(key);
                 let w_name = pyre_object::gc_roots::pin_root(w_name);
                 names.push(w_name);
             }

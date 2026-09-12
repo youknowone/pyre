@@ -3963,9 +3963,9 @@ unsafe fn terminator_read_checked<O: MapdictObject>(
             let backing = crate::type_methods::resolve_dict_backing(w_dict);
             unsafe { pyre_object::dictmultiobject::w_dict_getitem_wtf8_checked(backing, name) }
                 .map_err(|_| {
-                    crate::baseobjspace::take_pending_dict_key_error(pyre_object::w_str_from_wtf8(
-                        name.to_wtf8_buf(),
-                    ))
+                    crate::baseobjspace::take_pending_dict_key_error(
+                        pyre_object::w_str_from_wtf8_managed(name.to_wtf8_buf()),
+                    )
                 })
         }
         // Terminator / DictTerminator / NoDictTerminator read nothing.
@@ -4178,7 +4178,7 @@ unsafe fn node_delete<O: MapdictObject>(
                     pyre_object::gc_roots::pin_roots(&[crate::type_methods::resolve_dict_backing(
                         w_dict,
                     )]);
-                let w_key = pyre_object::w_str_from_wtf8(name.to_owned());
+                let w_key = pyre_object::w_str_from_wtf8_managed(name.to_owned());
                 unsafe {
                     pyre_object::w_dict_delitem(
                         pyre_object::gc_roots::shadow_stack_get(backing_slot),

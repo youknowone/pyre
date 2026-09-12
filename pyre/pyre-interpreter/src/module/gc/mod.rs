@@ -1340,7 +1340,7 @@ fn write_typeids_sidecar(
     let data_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(match payload {
         TypeidsPayload::Binary(bytes) => w_bytes_from_bytes(bytes),
-        TypeidsPayload::Text(text) => w_str_new(text),
+        TypeidsPayload::Text(text) => w_str_new_managed(text),
     });
     let written = gc_call_method(
         pyre_object::gc_roots::shadow_stack_get(opened_slot),

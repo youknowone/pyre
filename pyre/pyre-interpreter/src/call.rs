@@ -3281,20 +3281,41 @@ fn call_with_kwargs_in_ctx_impl(
                     // is handed to the profiling call, so the profiled frame is
                     // read back out of the anchor rather than from this local.
                     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
-                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
+                    let mut name_slots = Vec::with_capacity(kwargs.len());
+                    for (k, _) in kwargs.iter() {
+                        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(
+                            pyre_object::w_str_from_wtf8_managed(k.clone()),
+                        );
+                        name_slots.push(name_slot);
+                    }
+                    // Name mints can move the positionals, keyword values, and
+                    // the earlier `bound` slice. Reload from the entry bracket
+                    // and rebind before the profiled call, as the marker
+                    // branch below does.
+                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = name_slots
                         .iter()
-                        .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
+                        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
                         .collect();
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
-                        kwargs.iter().map(|(_, v)| *v).collect();
+                        (0..kwargs.len()).map(current_kwarg).collect();
+                    let refreshed_pos: Vec<pyre_object::PyObjectRef> =
+                        (0..pos_args.len()).map(current_pos_arg).collect();
+                    let refreshed_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = kwargs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (name, _))| (name.clone(), current_kwarg(index)))
+                        .collect();
+                    let bound =
+                        bind_kwargs_to_signature(sig, &fname, &refreshed_pos, &refreshed_kwargs)?;
                     let mut arguments = crate::argument::Arguments::with_kw(
-                        pos_args,
+                        &refreshed_pos,
                         &keyword_names_w,
                         &keywords_w,
                     );
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
                         unsafe { &mut *frame_anchor.live() },
-                        callable,
+                        current_callable(),
                         &mut arguments,
                         &bound,
                     );
@@ -3387,14 +3408,22 @@ fn call_with_kwargs_in_ctx_impl(
                     // is handed to the profiling call, so the profiled frame is
                     // read back out of the anchor rather than from this local.
                     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
-                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
-                        .iter()
-                        .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
-                        .collect();
+                    let mut name_slots = Vec::with_capacity(kwargs.len());
+                    for (k, _) in kwargs.iter() {
+                        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(
+                            pyre_object::w_str_from_wtf8_managed(k.clone()),
+                        );
+                        name_slots.push(name_slot);
+                    }
                     // `keyword_names_w` allocated a string per keyword, so
                     // everything read before it — the positionals, the keyword
                     // values, and the dict `full_args` carries — may have moved
                     // since. Everything below reloads from the roots.
+                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = name_slots
+                        .iter()
+                        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                        .collect();
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
                         (0..kwargs.len()).map(current_kwarg).collect();
                     let refreshed_pos: Vec<pyre_object::PyObjectRef> =
@@ -3411,7 +3440,7 @@ fn call_with_kwargs_in_ctx_impl(
                         .collect();
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
                         unsafe { &mut *frame_anchor.live() },
-                        callable,
+                        current_callable(),
                         &mut arguments,
                         &full_args,
                     );

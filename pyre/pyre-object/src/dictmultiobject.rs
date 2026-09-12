@@ -271,7 +271,11 @@ impl crate::rordereddict::Equivalent<ObjectKey> for StrLookupKey<'_> {
                 // `dict_keys_equal` does.  The materialized str is the rare-path
                 // cost (a str-subclass dict key); the common exact-str arm
                 // above allocates nothing.
-                dict_keys_equal(k.obj, crate::w_str_new(self.key))
+                {
+                    let _roots = crate::gc_roots::push_roots();
+                    let w_key = crate::gc_roots::pin_root(crate::w_str_new_managed(self.key));
+                    dict_keys_equal(k.obj, w_key)
+                }
             } else {
                 // ObjectDictStrategy uses the ordinary object equality hook
                 // for every hash collision.  A non-str key is allowed to
@@ -281,7 +285,9 @@ impl crate::rordereddict::Equivalent<ObjectKey> for StrLookupKey<'_> {
                 // on this rare collision path, matching
                 // `object_key_for(w_str_new(key))`.  Pass the stored key first,
                 // the order `keyeq(checkingkey, key)` uses (`rordereddict.py:1055`).
-                dict_keys_equal(k.obj, crate::w_str_new(self.key))
+                let _roots = crate::gc_roots::push_roots();
+                let w_key = crate::gc_roots::pin_root(crate::w_str_new_managed(self.key));
+                dict_keys_equal(k.obj, w_key)
             }
         }
     }
@@ -3837,7 +3843,7 @@ pub unsafe fn wtf8_key_as_str_unchecked(key: &rustpython_wtf8::Wtf8) -> &str {
 /// `Wtf8Buf`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn wtf8_surrogate_key_str_object(key: &rustpython_wtf8::Wtf8) -> PyObjectRef {
-    crate::w_str_from_wtf8(key.to_wtf8_buf())
+    crate::w_str_from_wtf8_managed(key.to_wtf8_buf())
 }
 
 pub unsafe fn w_dict_getitem_wtf8(
@@ -3847,7 +3853,11 @@ pub unsafe fn w_dict_getitem_wtf8(
     if wtf8_key_is_utf8(key) {
         w_dict_getitem_str(obj, wtf8_key_as_str_unchecked(key))
     } else {
-        w_dict_lookup(obj, wtf8_surrogate_key_str_object(key))
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        let w_key = crate::gc_roots::pin_root(wtf8_surrogate_key_str_object(key));
+        w_dict_lookup(crate::gc_roots::shadow_stack_get(obj_slot), w_key)
     }
 }
 
@@ -3884,7 +3894,11 @@ pub unsafe fn w_dict_getitem_wtf8_checked(
     if wtf8_key_is_utf8(key) {
         w_dict_getitem_str_checked(obj, wtf8_key_as_str_unchecked(key))
     } else {
-        w_dict_lookup_checked(obj, wtf8_surrogate_key_str_object(key))
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        let w_key = crate::gc_roots::pin_root(wtf8_surrogate_key_str_object(key));
+        w_dict_lookup_checked(crate::gc_roots::shadow_stack_get(obj_slot), w_key)
     }
 }
 
@@ -3904,7 +3918,14 @@ pub unsafe fn w_dict_setitem_wtf8(
     if wtf8_key_is_utf8(key) {
         w_dict_setitem_str(obj, wtf8_key_as_str_unchecked(key), value);
     } else {
-        w_dict_store(obj, wtf8_surrogate_key_str_object(key), value);
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::pin_roots(&[obj, value]);
+        let w_key = crate::gc_roots::pin_root(wtf8_surrogate_key_str_object(key));
+        w_dict_store(
+            crate::gc_roots::shadow_stack_get(obj_slot),
+            w_key,
+            crate::gc_roots::shadow_stack_get(obj_slot + 1),
+        );
     }
 }
 
@@ -3935,7 +3956,8 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
         }
         let obj = _dict_guard.root(0);
         let entries = w_module_dict_object_storage_mut(obj);
-        let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
+        let _roots = crate::gc_roots::push_roots();
+        let w_key = crate::gc_roots::pin_root(crate::w_str_from_wtf8_managed(key.to_wtf8_buf()));
         let removed = entries.remove(&object_key_for(w_key)).is_some();
         if removed {
             w_dict_bump_keys_version(obj);
@@ -3952,13 +3974,24 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
         StrategyKind::Empty => return false,
         StrategyKind::Object => {}
         StrategyKind::Map | StrategyKind::Class => {
-            let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
+            let _roots = crate::gc_roots::push_roots();
+            let obj_slot = crate::gc_roots::shadow_stack_len();
+            let _ = crate::gc_roots::pin_root(obj);
+            let w_key =
+                crate::gc_roots::pin_root(crate::w_str_from_wtf8_managed(key.to_wtf8_buf()));
+            let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+            let dict = &mut *(obj as *mut W_DictObject);
             return dict.dstrategy.delitem(obj, w_key);
         }
         _ => dict.dstrategy.switch_to_object_strategy(obj),
     }
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let w_key = crate::gc_roots::pin_root(crate::w_str_from_wtf8_managed(key.to_wtf8_buf()));
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-    let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
     let removed = entries.remove(&object_key_for(w_key)).is_some();
     if removed {
         dict.keys_version = dict.keys_version.wrapping_add(1);

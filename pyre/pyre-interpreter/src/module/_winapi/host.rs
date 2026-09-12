@@ -103,7 +103,7 @@ pub(super) fn wide_units(w_text: PyObjectRef) -> Vec<u16> {
 
 /// Wide characters back as a `str`.
 fn w_wide(units: &[u16]) -> PyObjectRef {
-    pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(units))
+    pyre_object::w_str_from_wtf8_managed(rustpython_wtf8::Wtf8Buf::from_wide(units))
 }
 
 /// A `DWORD` argument `None` leaves alone.
