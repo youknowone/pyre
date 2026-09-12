@@ -391,7 +391,7 @@ impl OptimizationInfoItem for OpRc {
         let producers = self
             .getarglist()
             .into_iter()
-            .chain(self.getfailargs().into_iter().flatten());
+            .chain(self.guard_fail_args().into_iter().flatten().cloned());
         for arg in producers {
             if arg.is_bound() {
                 arg.clear_forwarded();
@@ -25274,11 +25274,11 @@ mod tests {
     #[test]
     fn test_densify_does_not_follow_forwarded_leftover_onto_the_frame() {
         let renamed = vec![OpRef::input_arg_ref(425)];
-        let canonical = std::rc::Rc::new(InputArg::new_ref(425));
-        let leftover = std::rc::Rc::new(InputArg::new_ref(98));
+        let canonical = InputArgRc::new(InputArg::new_ref(425));
+        let leftover = InputArgRc::new(InputArg::new_ref(98));
         majit_ir::operand::Operand::from_bound_inputarg(&leftover)
             .set_forwarded_inputarg(&canonical);
-        let guard = std::rc::Rc::new(mk_op(
+        let guard = OpRc::new(mk_op(
             OpCode::GuardClass,
             &[renamed[0], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
             OpRef::NONE.raw(),
@@ -25293,7 +25293,7 @@ mod tests {
         assert_eq!(inputargs.len(), 1);
         assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(0));
         assert_eq!(
-            ops[0].getfailargs().unwrap()[0].to_opref(),
+            ops[0].guard_fail_args().unwrap()[0].to_opref(),
             OpRef::input_arg_ref(98),
             "a leftover body Ref must not become the vable red"
         );
@@ -25306,12 +25306,12 @@ mod tests {
         // that ListIter on dense InputArg(1): leftover-empty GETFIELD
         // would reload the vable local (`'frame' object is not an iterator`).
         let renamed = vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(50)];
-        let start = std::rc::Rc::new(mk_op(
+        let start = OpRc::new(mk_op(
             OpCode::Label,
             &[renamed[0], renamed[1]],
             OpRef::NONE.raw(),
         ));
-        let guard = std::rc::Rc::new(mk_op(
+        let guard = OpRc::new(mk_op(
             OpCode::GuardClass,
             &[renamed[1], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
             OpRef::NONE.raw(),
@@ -25329,8 +25329,8 @@ mod tests {
                 "seq".into(),
             ),
         ));
-        let seq = std::rc::Rc::new(seq);
-        let body = std::rc::Rc::new(mk_op(
+        let seq = OpRc::new(seq);
+        let body = OpRc::new(mk_op(
             OpCode::Label,
             &[renamed[0], renamed[1]],
             OpRef::NONE.raw(),
@@ -25365,12 +25365,12 @@ mod tests {
         // leftover-empty must not treat dense slot 1 as the iterator field
         // (that GETFIELD is a value-stack frame).
         let renamed = vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(50)];
-        let start = std::rc::Rc::new(mk_op(
+        let start = OpRc::new(mk_op(
             OpCode::Label,
             &[renamed[0], renamed[1]],
             OpRef::NONE.raw(),
         ));
-        let guard = std::rc::Rc::new(mk_op(
+        let guard = OpRc::new(mk_op(
             OpCode::GuardClass,
             &[renamed[1], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
             OpRef::NONE.raw(),
@@ -25388,7 +25388,7 @@ mod tests {
                 "seq".into(),
             ),
         ));
-        let seq = std::rc::Rc::new(seq);
+        let seq = OpRc::new(seq);
         let mint = vec![OpRef::input_arg_ref(80)];
         let (_inputargs, _ops, live) =
             densify_root_loop_inputargs(&renamed, vec![start, guard, seq], &mint, &[]);
@@ -25398,12 +25398,12 @@ mod tests {
         );
 
         let renamed_dense = vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)];
-        let start2 = std::rc::Rc::new(mk_op(
+        let start2 = OpRc::new(mk_op(
             OpCode::Label,
             &[renamed_dense[0], renamed_dense[1]],
             OpRef::NONE.raw(),
         ));
-        let guard2 = std::rc::Rc::new(mk_op(
+        let guard2 = OpRc::new(mk_op(
             OpCode::GuardClass,
             &[renamed_dense[1], OpRef::const_ptr(majit_ir::GcRef(0x1234))],
             OpRef::NONE.raw(),
@@ -25423,7 +25423,7 @@ mod tests {
         ));
         let (_ia, _ops, live_dense) = densify_root_loop_inputargs(
             &renamed_dense,
-            vec![start2, guard2, std::rc::Rc::new(seq2)],
+            vec![start2, guard2, OpRc::new(seq2)],
             &[renamed_dense[1]],
             &[],
         );
@@ -25444,7 +25444,7 @@ mod tests {
             OpRef::input_arg_ref(10),
             OpRef::input_arg_ref(50),
         ];
-        let start = std::rc::Rc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
+        let start = OpRc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
         let (_ia, _ops, live) =
             densify_root_loop_inputargs(&renamed, vec![start], &[renamed[2]], &[]);
         assert!(
@@ -25472,10 +25472,10 @@ mod tests {
         let descr = majit_ir::descr::make_call_descr(vec![Type::Ref], Type::Ref, effect);
         let mut call = mk_op(OpCode::CallR, &[renamed[2]], 40);
         call.setdescr(descr);
-        let start = std::rc::Rc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
+        let start = OpRc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
         let (_ia, _ops, live) = densify_root_loop_inputargs(
             &renamed,
-            vec![start, std::rc::Rc::new(call)],
+            vec![start, OpRc::new(call)],
             &[OpRef::input_arg_ref(50)],
             &[5],
         );
@@ -25510,10 +25510,10 @@ mod tests {
                 "seq".into(),
             ),
         ));
-        let start = std::rc::Rc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
+        let start = OpRc::new(mk_op(OpCode::Label, &renamed, OpRef::NONE.raw()));
         let mint: Vec<OpRef> = (0..8).map(|i| OpRef::input_arg_ref(50 + i)).collect();
         let (_ia, _ops, live) =
-            densify_root_loop_inputargs(&renamed, vec![start, std::rc::Rc::new(seq)], &mint, &[7]);
+            densify_root_loop_inputargs(&renamed, vec![start, OpRc::new(seq)], &mint, &[7]);
         assert!(
             live.iter()
                 .any(|&(r, j)| r == OpRef::input_arg_ref(2)

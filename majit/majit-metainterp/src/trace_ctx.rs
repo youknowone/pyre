@@ -3664,7 +3664,7 @@ impl TraceCtx {
             }
         }
         for op in self.recorder.ops() {
-            let pos = op.pos.get();
+            let pos = op.pos().get();
             if !pos.is_none() && pos != skip && is_addr(pos) {
                 return Some(pos);
             }
