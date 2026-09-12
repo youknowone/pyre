@@ -37,7 +37,7 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArg], ops: &mut Vec<Op>)
     let produced: std::collections::HashSet<u32> = ops
         .iter()
         .filter_map(|op| {
-            let r = op.pos.get();
+            let r = op.pos().get();
             (!r.is_none() && !r.is_constant()).then_some(r.raw())
         })
         .chain(inputargs.iter().map(|ia| ia.index))
@@ -74,9 +74,9 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArg], ops: &mut Vec<Op>)
             matches!(
                 op.opcode,
                 OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcF
-            ) && op.pos.get() != OpRef::NONE
-                && !op.pos.get().is_constant()
-                && op.pos.get().raw() == raw
+            ) && op.pos().get() != OpRef::NONE
+                && !op.pos().get().is_constant()
+                && op.pos().get().raw() == raw
         }) else {
             continue;
         };
@@ -112,7 +112,7 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArg], ops: &mut Vec<Op>)
             OpCode::GetarrayitemGcF => Type::Float,
             _ => Type::Ref,
         };
-        load.pos.set(OpRef::op_typed(raw, result_ty));
+        load.pos().set(OpRef::op_typed(raw, result_ty));
         loads.push(load);
     }
     if !loads.is_empty() {
