@@ -1540,14 +1540,165 @@ pub struct VectorizationInfo {
     pub count: i16,
 }
 
+/// `GuardResOp._fail_args` lives on the ResOperation in the nursery
+/// upstream. Exact-size `Rc<[Operand]>` (32/48/64/72/128 B) was the
+/// regex `and`/`or` leaf; reserved 8- and 16-operand chunks keep that
+/// list off the process allocator. Clone / stamp share the slot.
+const FAILARG_SMALL: usize = 8;
+const FAILARG_LARGE: usize = 16;
+const FAILARG_CHUNK: usize = 1024;
+const FAILARG_EMPTY: *mut FailArgHeader = 1 as *mut FailArgHeader;
+
+#[repr(C)]
+struct FailArgHeader {
+    strong: std::cell::Cell<u32>,
+    len: u16,
+    cap: u16,
+}
+
+struct FailArgHeap {
+    chunks: Vec<(*mut u8, usize)>,
+    free: Vec<*mut FailArgHeader>,
+}
+
+unsafe impl Send for FailArgHeap {}
+unsafe impl Sync for FailArgHeap {}
+
+static FAILARG8_HEAP: std::sync::Mutex<FailArgHeap> = std::sync::Mutex::new(FailArgHeap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+static FAILARG16_HEAP: std::sync::Mutex<FailArgHeap> = std::sync::Mutex::new(FailArgHeap {
+    chunks: Vec::new(),
+    free: Vec::new(),
+});
+
+fn failarg_slot_size(cap: usize) -> usize {
+    std::mem::size_of::<FailArgHeader>() + std::mem::size_of::<Operand>() * cap
+}
+
+fn failarg_data(h: *mut FailArgHeader) -> *mut Operand {
+    unsafe { (h as *mut u8).add(std::mem::size_of::<FailArgHeader>()) as *mut Operand }
+}
+
+fn alloc_failarg_class(heap: &std::sync::Mutex<FailArgHeap>, cap: usize) -> *mut FailArgHeader {
+    let mut heap = heap.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = heap.free.pop() {
+        return p;
+    }
+    let slot = failarg_slot_size(cap);
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < FAILARG_CHUNK
+    {
+        let p = unsafe { (*base).add(*used * slot) as *mut FailArgHeader };
+        *used += 1;
+        return p;
+    }
+    let layout =
+        std::alloc::Layout::from_size_align(FAILARG_CHUNK * slot, 8).expect("fail_args slot chunk");
+    let base = unsafe { std::alloc::alloc(layout) };
+    assert!(!base.is_null(), "fail_args slot chunk alloc failed");
+    heap.chunks.push((base, 1));
+    base as *mut FailArgHeader
+}
+
+fn alloc_failarg_header(n: usize) -> *mut FailArgHeader {
+    let (h, cap) = if n <= FAILARG_SMALL {
+        (
+            alloc_failarg_class(&FAILARG8_HEAP, FAILARG_SMALL),
+            FAILARG_SMALL,
+        )
+    } else if n <= FAILARG_LARGE {
+        (
+            alloc_failarg_class(&FAILARG16_HEAP, FAILARG_LARGE),
+            FAILARG_LARGE,
+        )
+    } else {
+        let layout = std::alloc::Layout::from_size_align(failarg_slot_size(n), 8)
+            .expect("fail_args overflow slot");
+        let h = unsafe { std::alloc::alloc(layout) as *mut FailArgHeader };
+        assert!(!h.is_null(), "fail_args overflow slot alloc failed");
+        (h, n)
+    };
+    unsafe {
+        h.write(FailArgHeader {
+            strong: std::cell::Cell::new(1),
+            len: n as u16,
+            cap: cap as u16,
+        });
+    }
+    h
+}
+
+fn retain_failargs(h: *mut FailArgHeader) {
+    if h.is_null() || h == FAILARG_EMPTY {
+        return;
+    }
+    unsafe {
+        let strong = &(*h).strong;
+        strong.set(strong.get() + 1);
+    }
+}
+
+fn release_failargs(h: *mut FailArgHeader) {
+    if h.is_null() || h == FAILARG_EMPTY {
+        return;
+    }
+    unsafe {
+        let strong = (*h).strong.get() - 1;
+        if strong != 0 {
+            (*h).strong.set(strong);
+            return;
+        }
+        let len = (*h).len as usize;
+        let cap = (*h).cap as usize;
+        let data = failarg_data(h);
+        for i in 0..len {
+            data.add(i).drop_in_place();
+        }
+        if cap <= FAILARG_SMALL {
+            FAILARG8_HEAP
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .free
+                .push(h);
+        } else if cap <= FAILARG_LARGE {
+            FAILARG16_HEAP
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .free
+                .push(h);
+        } else {
+            let layout = std::alloc::Layout::from_size_align(failarg_slot_size(cap), 8)
+                .expect("fail_args overflow slot");
+            std::alloc::dealloc(h as *mut u8, layout);
+        }
+    }
+}
+
+fn clone_failargs_unique(h: *mut FailArgHeader) -> *mut FailArgHeader {
+    if h.is_null() || h == FAILARG_EMPTY {
+        return h;
+    }
+    unsafe {
+        let n = (*h).len as usize;
+        let src = failarg_data(h);
+        let out = alloc_failarg_header(n);
+        let dst = failarg_data(out);
+        for i in 0..n {
+            dst.add(i).write((*src.add(i)).clone());
+        }
+        out
+    }
+}
+
 /// `resoperation.py GuardResOp` extras — `_fail_args`, the pyre
 /// `fail_arg_types` cache, and `rd_resume_position`. Allocated only
 /// when the op is a guard (`GuardResOp` owns the field upstream).
 pub(crate) struct GuardExtra {
-    /// Shared `_fail_args` list. `Rc<[Operand]>` is a fat pointer (16 B)
-    /// so clone/stamp share the slice instead of allocating another
-    /// 4×16 or 6×16 payload.
-    fail_args: Option<std::rc::Rc<[Operand]>>,
+    /// Shared `_fail_args` list. Null is unset; [`FAILARG_EMPTY`] is
+    /// `setfailargs([])`. Occupied slots are refcounted nursery chunks.
+    fail_args: *mut FailArgHeader,
     /// `-1` unset, `0..=4` inline in `types`, `-2` whole list in
     /// [`FAIL_ARG_TYPES_OVERFLOW`]. A fat `Rc<[Type]>` would push
     /// GuardExtra (and then BothPayload) into the 56-byte class.
@@ -1561,7 +1712,7 @@ pub(crate) struct GuardExtra {
 impl GuardExtra {
     fn new() -> Self {
         GuardExtra {
-            fail_args: None,
+            fail_args: std::ptr::null_mut(),
             n_types: -1,
             types: [Type::Void; 4],
             overflow: 0,
@@ -1570,27 +1721,89 @@ impl GuardExtra {
     }
 
     pub(crate) fn fail_args(&self) -> Option<&[Operand]> {
-        self.fail_args.as_deref()
+        if self.fail_args.is_null() {
+            None
+        } else if self.fail_args == FAILARG_EMPTY {
+            Some(&[])
+        } else {
+            unsafe {
+                let n = (*self.fail_args).len as usize;
+                Some(std::slice::from_raw_parts(failarg_data(self.fail_args), n))
+            }
+        }
     }
 
-    pub(crate) fn fail_args_rc(&self) -> Option<std::rc::Rc<[Operand]>> {
-        self.fail_args.clone()
+    pub(crate) fn share_fail_args_from(&mut self, src: &Self) {
+        if src.fail_args == self.fail_args {
+            return;
+        }
+        release_failargs(self.fail_args);
+        self.fail_args = src.fail_args;
+        retain_failargs(src.fail_args);
     }
 
     pub(crate) fn fail_args_mut(&mut self) -> Option<&mut [Operand]> {
-        self.fail_args.as_mut().map(std::rc::Rc::make_mut)
+        if self.fail_args.is_null() {
+            return None;
+        }
+        if self.fail_args == FAILARG_EMPTY {
+            return Some(&mut []);
+        }
+        unsafe {
+            if (*self.fail_args).strong.get() > 1 {
+                let unique = clone_failargs_unique(self.fail_args);
+                release_failargs(self.fail_args);
+                self.fail_args = unique;
+            }
+            let n = (*self.fail_args).len as usize;
+            Some(std::slice::from_raw_parts_mut(
+                failarg_data(self.fail_args),
+                n,
+            ))
+        }
     }
 
     pub(crate) fn set_fail_args(&mut self, args: impl IntoIterator<Item = Operand>) {
-        self.fail_args = Some(std::rc::Rc::from_iter(args));
+        let mut iter = args.into_iter();
+        let (lo, hi) = iter.size_hint();
+        let n = if hi == Some(lo) {
+            lo
+        } else {
+            let collected: OpArgVec = iter.by_ref().collect();
+            release_failargs(self.fail_args);
+            self.install_fail_args(collected.len(), collected.into_iter());
+            return;
+        };
+        release_failargs(self.fail_args);
+        self.install_fail_args(n, iter);
     }
 
-    pub(crate) fn set_fail_args_rc(&mut self, args: std::rc::Rc<[Operand]>) {
-        self.fail_args = Some(args);
+    fn install_fail_args(&mut self, n: usize, mut items: impl Iterator<Item = Operand>) {
+        if n == 0 {
+            self.fail_args = FAILARG_EMPTY;
+            return;
+        }
+        assert!(
+            n <= u16::MAX as usize,
+            "fail_args length {n} exceeds u16 (GuardResOp._fail_args)"
+        );
+        let h = alloc_failarg_header(n);
+        let data = failarg_data(h);
+        for i in 0..n {
+            let item = items
+                .next()
+                .expect("fail_args iterator shorter than size_hint");
+            unsafe {
+                data.add(i).write(item);
+            }
+        }
+        debug_assert!(items.next().is_none());
+        self.fail_args = h;
     }
 
     pub(crate) fn clear_fail_args(&mut self) {
-        self.fail_args = None;
+        release_failargs(self.fail_args);
+        self.fail_args = std::ptr::null_mut();
     }
 
     pub(crate) fn fail_arg_types(&self) -> Option<&[Type]> {
@@ -1620,13 +1833,21 @@ impl GuardExtra {
 
 impl Clone for GuardExtra {
     fn clone(&self) -> Self {
+        retain_failargs(self.fail_args);
         GuardExtra {
-            fail_args: self.fail_args.clone(),
+            fail_args: self.fail_args,
             n_types: self.n_types,
             types: self.types,
             overflow: self.overflow,
             rd_resume_position: self.rd_resume_position,
         }
+    }
+}
+
+impl Drop for GuardExtra {
+    fn drop(&mut self) {
+        release_failargs(self.fail_args);
+        self.fail_args = std::ptr::null_mut();
     }
 }
 
@@ -3833,17 +4054,18 @@ impl Op {
     /// compile.py: ResumeGuardDescr.store_final_boxes(guard_op, boxes, metainterp_sd)
     ///   guard_op.setfailargs(boxes)
     /// compile.py store_final_boxes
-    pub fn store_final_boxes(&self, boxes: Vec<Operand>) {
+    pub fn store_final_boxes(&self, boxes: impl IntoIterator<Item = Operand>) {
         // optimizer.py:745-749: check no duplicates (debug only).
         // history.py/251 — `Const.same_constant` defines Const equality
         // by value (e.g. `ConstInt(7) == ConstInt(7)`), not identity. The
         // duplicate detector uses `Operand::same_box` (ptr identity for
         // bound producers, `same_constant` for inline-Const operands), matching
         // the value-based semantics RPython's `op in seen` check relies on.
+        self.ensure_guard_extra().set_fail_args(boxes);
         #[cfg(debug_assertions)]
-        {
+        if let Some(stored) = self.guard_fail_args() {
             let mut seen: Vec<&Operand> = Vec::new();
-            for b in &boxes {
+            for b in stored {
                 if !b.is_none() {
                     debug_assert!(
                         !seen.iter().any(|s| s.same_box(b)),
@@ -3853,8 +4075,6 @@ impl Op {
                 }
             }
         }
-        self.ensure_guard_extra()
-            .set_fail_args_rc(std::rc::Rc::from(boxes));
     }
 
     pub fn guard_fail_args(&self) -> Option<&[Operand]> {
@@ -6076,6 +6296,47 @@ mod tests {
                 std::mem::size_of::<ThinStamp>()
             );
         }
+    }
+
+    #[test]
+    fn guard_fail_args_cover_slab_lengths() {
+        // GuardResOp._fail_args is a nursery list upstream. The reserved
+        // 8- and 16-operand slots plus the overflow heap must keep
+        // setfailargs / clone / copy_failargs_shared for the regex
+        // and/or lengths (4, 8, 9, 16) and an empty list distinct from
+        // unset.
+        fn boxes(n: usize) -> OpArgVec {
+            (0..n)
+                .map(|i| crate::forwarding::test_support::bound_resop_operand(Type::Int, i as u32))
+                .collect()
+        }
+        fn guard() -> Op {
+            Op::new(
+                OpCode::GuardTrue,
+                &[crate::forwarding::test_support::bound_resop_operand(
+                    Type::Int,
+                    0,
+                )],
+            )
+        }
+        for n in [0usize, 4, 8, 9, 16, 20] {
+            let op = guard();
+            op.setfailargs(boxes(n));
+            let fa = op.guard_fail_args().expect("setfailargs stored a list");
+            assert_eq!(fa.len(), n);
+            if n > 0 {
+                assert_eq!(fa[n - 1].to_opref(), OpRef::int_op((n - 1) as u32));
+            }
+            let clone = op.clone();
+            assert_eq!(clone.guard_fail_args().map(|s| s.len()), Some(n));
+            let other = guard();
+            other.copy_failargs_shared(&op);
+            assert_eq!(other.guard_fail_args().map(|s| s.len()), Some(n));
+        }
+        let unset = guard();
+        assert!(unset.guard_fail_args().is_none());
+        unset.setfailargs(OpArgVec::new());
+        assert_eq!(unset.guard_fail_args(), Some(&[][..]));
     }
 
     #[test]
