@@ -3438,44 +3438,25 @@ pub(crate) unsafe fn vable_write_array_item_at(
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
 pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
-    // A machine with no real `vable_token` field (`has_vable_token`) keeps an
-    // inert token protocol: writing to offset 0 would clobber the struct's
-    // first live field (e.g. a `Vec`'s data pointer).
-    if !vinfo.has_vable_token() {
-        return;
-    }
-    unsafe {
-        let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
-        let token = *token_ptr;
-        if token == 0 {
-            return;
-        }
-        if token == token_tracing_rescall() as usize {
-            // virtualizable.py:250-255: the values are already correct during
-            // tracing; the marker only tells the tracer this one escaped.
-            *token_ptr = 0;
-            return;
-        }
+    // virtualizable.py `clear_vable_token`: if token: force_now(); assert not token.
+    vinfo.clear_vable_token(obj_ptr, |_token| {
         let Some(clear_vable_ptr) = vinfo.clear_vable_ptr else {
             // A machine that registered no force helper has no compiled
-            // activation to write back either: `emit_force_virtualizable`
-            // `expect`s this same field, so a trace that could have parked an
-            // Active token here could not have been built.  Clear it, matching
-            // the post-state `force_now` guarantees.
-            *token_ptr = 0;
+            // activation to write back. `force_now`'s else arm must still
+            // leave TOKEN_NONE.
+            unsafe {
+                let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
+                *token_ptr = 0;
+            }
             return;
         };
         // `make_clear_vable_descr` declares `[Ref] -> Void` and
         // `frame_layout.rs` registers a function taking that word as `i64`;
         // spelling the pointee any other way mismatches the wasm32 signature
         // and traps on call.
-        let force: unsafe extern "C" fn(i64) = std::mem::transmute(clear_vable_ptr);
-        force(obj_ptr as i64);
-        assert_eq!(
-            *token_ptr, 0,
-            "virtualizable.py:222 — force_now must leave TOKEN_NONE behind"
-        );
-    }
+        let force: unsafe extern "C" fn(i64) = unsafe { std::mem::transmute(clear_vable_ptr) };
+        unsafe { force(obj_ptr as i64) };
+    });
 }
 
 #[cfg(test)]
