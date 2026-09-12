@@ -5893,6 +5893,34 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return resolved_inline_decline(op.pc, line!());
     }
+    // Inlining a self-recursive callee into a foreign caller (the
+    // module `for` around `walk(...)`) starts a sub-walk whose
+    // nested recursive CALL residualizes and then hits
+    // `fbw_abort_nested_unjournaled_residual`'s self-recursive
+    // hazard, aborting the enclosing loop
+    // (`selfrec_bridge_nontail_promote`).  Same-function unroll
+    // (`fib`) and the root-bridge admission keep the inline.
+    if !bridge_rec_root_selfrec && !recursive_portal_present {
+        let raw = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject
+        };
+        if !raw.is_null() && unsafe { pyre_interpreter::code_is_self_recursive(&*raw) } {
+            let root_code = {
+                let session = ctx.session.borrow();
+                let frame = session.recording_frame_ptr
+                    as *const pyre_interpreter::PyFrame;
+                if frame.is_null() {
+                    0
+                } else {
+                    unsafe { (*frame).pycode as usize }
+                }
+            };
+            if root_code != 0 && root_code != callee_code_key {
+                return resolved_inline_decline(op.pc, line!());
+            }
+        }
+    }
     // An unseeded inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary and replays the whole callee, so a live-heap write
     // would execute twice.  A seeded callee frame answers that hazard exactly:
@@ -14274,6 +14302,36 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         _ => super::specialize::binary_op_tag_for_helper_index(sub_index, &int_arg_concretes)
             .filter(|&tag| inplace_int_arith_tag(tag)),
     };
+    // Residual BINARY_OP records the raising arm before dest-write
+    // (`try_walker_specialize_binary_op_int_zero_div`).  Flatten lands
+    // `acc //= 0` here, so the same raise must fire before a helper
+    // walk dest-writes a wrap.  Skipping `GUARD_FALSE` of a proven
+    // `int_eq(0, 0)` avoided InvalidLoop but left that wrap as the
+    // compiled result (`exception_loop_warmup`).
+    let zero_div_tag = match int_arg_concretes.first() {
+        Some(ConcreteValue::Int(tag)) => Some(*tag),
+        _ => super::specialize::binary_op_tag_for_helper_index(sub_index, &int_arg_concretes),
+    };
+    if dst_bank == 'r'
+        && ref_args.len() == 2
+        && let Some(div_tag) = zero_div_tag
+        && let Ok(setup) =
+            inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
+        && let Some(call_descr) = setup.descr.as_call_descr()
+        && let Some(outcome) = spec_gate(SpecFold::BinaryOpIntZeroDiv, || {
+            super::specialize::try_walker_specialize_binary_op_int_zero_div(
+                ctx,
+                op.pc,
+                div_tag,
+                &ref_args,
+                &setup.allboxes,
+                call_descr,
+                dst_bank,
+            )
+        })?
+    {
+        return Ok((outcome, op.next_pc));
+    }
     if dst_bank == 'r' && ref_args.len() == 2 && let Some(op_tag) = op_tag {
         let int_args_tag = int_args.first().copied().unwrap_or_else(|| ctx.trace_ctx.const_int(op_tag));
         let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
