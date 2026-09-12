@@ -803,8 +803,13 @@ impl Trace {
         // occupy `[n, …)` — the same unique numbering `record_*` handed
         // to snapshots. `get_byte_iter` seeds `_fresh` at
         // `max_num_inputargs`, which would shift every box by `n`.
-        let ops: Vec<OpRc> =
-            crate::opencoder::ByteTraceIter::new(trb, trb._start as usize, trb._pos, 0).collect();
+        let mut ops = Vec::with_capacity(self.slots.len());
+        ops.extend(crate::opencoder::ByteTraceIter::new(
+            trb,
+            trb._start as usize,
+            trb._pos,
+            0,
+        ));
         let n = self.inputargs.len() as u32;
         for op in &ops {
             for i in 0..op.num_args() {
@@ -842,12 +847,12 @@ impl Trace {
             let Some(ref fail) = slot.fail_args else {
                 continue;
             };
-            let boxed: Vec<Operand> = fail
+            let boxed: majit_ir::resoperation::OpArgVec = fail
                 .iter()
                 .copied()
                 .map(|r| self.operand_from_materialized(r, &ops))
                 .collect();
-            op.setfailargs(boxed.into());
+            op.setfailargs(boxed);
         }
         ops
     }

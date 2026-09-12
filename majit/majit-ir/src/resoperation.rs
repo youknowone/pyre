@@ -2334,6 +2334,71 @@ fn take_word(w: u64) -> (Option<DescrRef>, Option<Box<OpKindExtra>>, u64, u32) {
     }
 }
 
+/// Drop a packed slot without splitting `BothPayload` / `BothFwd` into a
+/// fresh `Box<OpKindExtra>`. `take_word` must split for live extract;
+/// using it from `Drop` minted a 32 B extra per descr+guard op at
+/// compile recycle.
+fn drop_packed_word(w: u64) {
+    if w == 0 || is_stamp_inline(w) {
+        return;
+    }
+    if is_stamp_box(w) {
+        let p = free_thin_stamp(tagged_ptr(w) as *mut ThinStamp);
+        drop_packed_word(p.inner);
+        return;
+    }
+    if is_extra_inline(w) {
+        drop(unsafe { Box::from_raw(tagged_ptr(w) as *mut OpKindExtra) });
+        return;
+    }
+    if is_both_inline(w) {
+        drop(unsafe { Box::from_raw(tagged_ptr(w) as *mut BothPayload) });
+        return;
+    }
+    if is_thin_fwd_box(w) {
+        let p = free_thin_fwd(box_payload(w) as *mut ThinFwd);
+        crate::forwarding::drop_packed_forwarded(p.forwarded);
+        return;
+    }
+    if w & SLOT_BOX_BIT != 0 {
+        let p = unsafe { Box::from_raw(box_payload(w) as *mut DescrWords) };
+        unsafe { drop_descr_extra(p.lo, p.hi) };
+        return;
+    }
+    if is_thin_descr(w) {
+        let (d, e, f, _) = take_word(w);
+        drop(d);
+        drop(e);
+        crate::forwarding::drop_packed_forwarded(f);
+        return;
+    }
+    crate::forwarding::drop_packed_forwarded(crate::forwarding::strip_fwd_stamp(w));
+}
+
+unsafe fn drop_descr_extra(lo: usize, hi: usize) {
+    unsafe {
+        match hi {
+            EXTRA_TAG => drop(Box::from_raw(lo as *mut OpKindExtra)),
+            BOTH_TAG => drop(Box::from_raw(lo as *mut BothPayload)),
+            FWD_TAG => crate::forwarding::drop_packed_forwarded(lo as u64),
+            DESCR_FWD_TAG => {
+                let p = Box::from_raw(lo as *mut DescrFwd);
+                crate::forwarding::drop_packed_forwarded(p.forwarded);
+            }
+            EXTRA_FWD_TAG => {
+                let p = Box::from_raw(lo as *mut ExtraFwd);
+                crate::forwarding::drop_packed_forwarded(p.forwarded);
+            }
+            BOTH_FWD_TAG => {
+                let p = Box::from_raw(lo as *mut BothFwd);
+                crate::forwarding::drop_packed_forwarded(p.forwarded);
+            }
+            0 => {}
+            _ => drop(descr_arc_from_bits(lo, hi)),
+        }
+    }
+}
+
 fn packed_forwarded_word(w: u64) -> u64 {
     if is_stamp_inline(w) {
         return 0;
@@ -2792,6 +2857,12 @@ impl DescrSlot {
                         crate::forwarding::drop_packed_forwarded(old);
                     }
                     EXTRA_TAG => {
+                        // `_forwarded = None` must not change the extra
+                        // representation. Boxing ExtraFwd on clear minted a
+                        // 32 B class per descr-bearing op at compile reset.
+                        if packed == 0 {
+                            return;
+                        }
                         let extra = Box::from_raw((*p).lo as *mut OpKindExtra);
                         (*p).lo = Box::into_raw(Box::new(ExtraFwd {
                             extra: *extra,
@@ -2800,6 +2871,9 @@ impl DescrSlot {
                         (*p).hi = EXTRA_FWD_TAG;
                     }
                     BOTH_TAG => {
+                        if packed == 0 {
+                            return;
+                        }
                         let both = Box::from_raw((*p).lo as *mut BothPayload);
                         (*p).lo = Box::into_raw(Box::new(BothFwd {
                             descr: Some(both.descr),
@@ -2815,6 +2889,9 @@ impl DescrSlot {
                         }
                     }
                     _ => {
+                        if packed == 0 {
+                            return;
+                        }
                         let descr = descr_arc_from_bits((*p).lo, (*p).hi);
                         (*p).lo = Box::into_raw(Box::new(DescrFwd {
                             descr,
@@ -3044,10 +3121,11 @@ impl Clone for DescrSlot {
 
 impl Drop for DescrSlot {
     fn drop(&mut self) {
-        let (descr, extra, fwd) = self.take_parts();
-        drop(descr);
-        drop(extra);
-        crate::forwarding::drop_packed_forwarded(fwd);
+        let w = self.word();
+        unsafe {
+            *self.word.get() = 0;
+        }
+        drop_packed_word(w);
     }
 }
 

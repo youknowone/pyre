@@ -942,7 +942,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             None => self._next() as usize,
         };
         // opencoder.py — read `argnum` tagged args and untag.
-        let mut args: smallvec::SmallVec<[Operand; 3]> = smallvec::SmallVec::new();
+        let mut args: smallvec::SmallVec<[Operand; 4]> = smallvec::SmallVec::new();
         for _ in 0..arity {
             let tagged = self._next();
             args.push(self._untag(tagged));
