@@ -19976,9 +19976,11 @@ fn frame_anchor_drop_glue_path(name: &str) -> bool {
 /// Drops supported by both lowering and its liveness analysis.
 fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) -> bool {
     matches!(place.kind, PlaceKind::Local(_))
-        && regular_call_name_path(fn_ptr, llbc).as_deref().is_some_and(|name| {
-            gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name)
-        })
+        && regular_call_name_path(fn_ptr, llbc)
+            .as_deref()
+            .is_some_and(|name| {
+                gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name)
+            })
 }
 
 /// Match the lowered RootScope close used by result/exception rewrites.

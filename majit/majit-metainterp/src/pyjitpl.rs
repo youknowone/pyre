@@ -6,8 +6,7 @@ pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
     StandaloneFrameStack, residual_write_effect_info, setup_frame_from_merge_point, trace_jitcode,
     trace_jitcode_at_resume_framestack, trace_jitcode_at_resume_framestack_allowing_residuals,
-    trace_jitcode_from_merge_point, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{

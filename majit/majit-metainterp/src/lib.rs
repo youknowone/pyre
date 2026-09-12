@@ -263,8 +263,7 @@ pub use pyjitpl::{
     set_record_inline_application_traceback_hook, set_resolve_exception_context_hook,
     set_symbolic_fnaddr_path_resolver, setup_frame_from_merge_point, trace_jitcode,
     trace_jitcode_at_resume_framestack, trace_jitcode_at_resume_framestack_allowing_residuals,
-    trace_jitcode_from_merge_point, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
     BridgeVirtualCache, decode_fieldnum, default_bridge_array_descr, emit_pending_field_op,
