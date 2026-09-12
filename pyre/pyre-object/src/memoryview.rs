@@ -101,7 +101,7 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         restricted: false,
         owns_export,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         <W_MemoryView as crate::lltype::GcType>::type_id(),
         <W_MemoryView as crate::lltype::GcType>::SIZE,
     );

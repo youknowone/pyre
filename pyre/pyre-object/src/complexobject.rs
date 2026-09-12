@@ -72,7 +72,7 @@ pub fn w_complex_subclass_new(real: f64, imag: f64) -> PyObjectRef {
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_COMPLEX_GC_TYPE_ID, W_COMPLEX_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_COMPLEX_GC_TYPE_ID, W_COMPLEX_OBJECT_SIZE);
     if raw.is_null() {
         crate::lltype::malloc_typed(obj) as PyObjectRef
     } else {
