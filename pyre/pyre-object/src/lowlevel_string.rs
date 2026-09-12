@@ -205,6 +205,37 @@ fn shrink_lowlevel_array(buf: i64, new_len: i64, base_size: usize, item_size: us
 ///
 /// `extern "C"` with an `(i64, i64) -> i64` ABI so the JIT residual call reaches
 /// it through the fnaddr registry.
+/// `rstr.py LLHelpers.ll_strconcat` — join two rstr `STR` payloads.
+///
+/// `@jit.elidable` + `@jit.oopspec('stroruni.concat')`.  The result is a
+/// fresh `STR` (`{ hash, len, chars }`), not a `W_UnicodeObject`.
+/// `descr_add` wraps that payload afterwards (`space.newutf8`).
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
+    if s1 == 0 || s2 == 0 {
+        return 0;
+    }
+    let n1 = bh_lowlevel_string_len(s1);
+    let n2 = bh_lowlevel_string_len(s2);
+    let Some(total) = n1.checked_add(n2) else {
+        return 0;
+    };
+    let out = bh_alloc_lowlevel_string(total, LOWLEVEL_STR_BASE_SIZE, 1);
+    if out == 0 {
+        return 0;
+    }
+    unsafe {
+        let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
+        std::ptr::copy_nonoverlapping((s1 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET), dst, n1);
+        std::ptr::copy_nonoverlapping(
+            (s2 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET),
+            dst.add(n1),
+            n2,
+        );
+    }
+    out
+}
+
 pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
     // Width discovery reads the GC type header, so it needs the same entry
     // livevar normalization as the shrink itself rather than dereferencing the
