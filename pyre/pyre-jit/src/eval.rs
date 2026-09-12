@@ -9676,8 +9676,7 @@ fn eval_loop_warmup_tick(mut f: *mut PyFrame, opcode_pc: usize) -> i64 {
             (*ec_ptr).bytecode_trace(f, pyre_interpreter::executioncontext::TICK_COUNTER_STEP)
         } {
             f = FrameView::reload(f);
-            let next_instr =
-                pyre_interpreter::eval::handle_exception(unsafe { &mut *f }, &mut err);
+            let next_instr = pyre_interpreter::eval::handle_exception(unsafe { &mut *f }, &mut err);
             if next_instr >= 0 {
                 f = FrameView::reload(f);
                 unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
