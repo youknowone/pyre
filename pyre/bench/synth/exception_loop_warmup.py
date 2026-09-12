@@ -1,7 +1,4 @@
 # pyre-check: max-pypy-ratio=6.5
-# pyre-check: max-wasm-ratio=5.9
-# darwin-arm64 measured 5.1x wasm/dynasm (1.60s / 0.31s).  5.9x is that
-# reading plus WASM_RATIO_FIT_HEADROOM (15%).
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,
