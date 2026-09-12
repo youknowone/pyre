@@ -19,6 +19,8 @@ use super::*;
 /// delayed replay. Ref-bank GC registration retains the same shared storage.
 /// Walker-only extras (vstack, callee shadow) share the same frame-owned
 /// state and are rewritten at the same time, never replayed on resume.
+/// A paused Python caller also stores those lists on `InlineParentFrame`
+/// so `replace_box` can walk `framestack` like `MetaInterp.replace_box`.
 ///
 /// Weak registration neither extends a frame's lifetime nor leaks aliases
 /// into a nested trace session. Heap-owned SubWalkFrames keep this owner
@@ -117,6 +119,18 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
     for frame in &mut session.framestack {
         for parent in &mut frame.parents {
             replace_slots(&mut parent.boxes, oldbox, newbox);
+            if let Some(state) = parent.frame_state.as_ref() {
+                state.replace_active_box(oldbox, newbox);
+            }
+            let bank = match oldbox.ty() {
+                Some(Type::Int) => parent.registers_i.as_ref(),
+                Some(Type::Ref) => parent.registers_r.as_ref(),
+                Some(Type::Float) => parent.registers_f.as_ref(),
+                _ => None,
+            };
+            if let Some(bank) = bank {
+                bank.replace_active_box(oldbox, newbox);
+            }
             if let Some(blackhole) = parent.blackhole.as_mut() {
                 for (_, value) in &mut blackhole.float_values {
                     replace_slots(std::slice::from_mut(value), oldbox, newbox);
@@ -231,6 +245,10 @@ mod frame_replacement_tests {
                 resume_coord: ParentResumeCoord::Backxlat(0),
                 resume_marker_jit_pc: None,
                 boxes: vec![old],
+                registers_r: None,
+                registers_i: None,
+                registers_f: None,
+                frame_state: None,
             }],
             entry_executed_effects: 0,
         });
@@ -354,6 +372,45 @@ mod frame_replacement_tests {
         // Re-entering after the frames die does not retain their aliases.
         let _next = FrameBoxReplacements::new(&session);
         assert_eq!(session.borrow().box_replacement_frames.len(), 1);
+    }
+
+    #[test]
+    fn replace_box_writes_parent_banks_on_framestack_without_a_mailbox() {
+        let old = OpRef::input_arg_ref(0);
+        let new = OpRef::input_arg_ref(1);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let parent_regs = RegisterBank::new([old]);
+        let parent_state = WalkFrameState::new(WalkFrameStateData {
+            vstack_boxes: vec![old],
+            vstack_last_ref: old,
+            ..Default::default()
+        });
+        session.borrow_mut().framestack.push(InlineFrame {
+            w_code: 1,
+            recursion_greenkey: true,
+            call_id: 1,
+            debug_merge_point_py_pc: None,
+            parents: vec![InlineParentFrame {
+                jitcode_index: 0,
+                call_jitcode_pc: Some(0),
+                call_stack_overrides: Vec::new(),
+                blackhole: None,
+                resume_coord: ParentResumeCoord::Backxlat(0),
+                resume_marker_jit_pc: None,
+                boxes: vec![old],
+                registers_r: Some(parent_regs.clone()),
+                registers_i: None,
+                registers_f: None,
+                frame_state: Some(parent_state.clone()),
+            }],
+            entry_executed_effects: 0,
+        });
+        assert!(session.borrow().box_replacement_frames.is_empty());
+        replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
+        assert_eq!(parent_regs.get(0), Some(new));
+        assert_eq!(parent_state.borrow().vstack_boxes, [new]);
+        assert_eq!(parent_state.borrow().vstack_last_ref, new);
+        assert_eq!(session.borrow().framestack[0].parents[0].boxes, vec![new]);
     }
 
     #[test]

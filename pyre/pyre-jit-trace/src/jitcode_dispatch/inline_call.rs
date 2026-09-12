@@ -7037,9 +7037,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     } else {
         None
     };
-    let caller_replacements = FrameBoxReplacements::new(ctx.session);
-    caller_replacements.bind_banks(ctx.registers_r, ctx.registers_i, ctx.registers_f);
-    caller_replacements.bind_frame_state(&ctx.frame_state);
+    // The paused caller's banks live on `InlineParentFrame` (`attach_live_caller`
+    // in `compute_*_caller_frame`). `replace_box` walks `framestack` the way
+    // `MetaInterp.replace_box` walks `MIFrame`s; no Weak inbox is needed here.
     let (callee_outcome, callee_class_of_last_exc_is_const) = {
         {
             let parent_state = ctx.frame_state.borrow();
@@ -7549,7 +7549,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
         (result, class_of_last_exc_is_const)
     };
-    drop(caller_replacements);
     // `executioncontext.py leave`, in the original's `finally`
     // position: the sub-walk block above is an expression that always
     // completes, so every callee exit — return, exception, or decline —

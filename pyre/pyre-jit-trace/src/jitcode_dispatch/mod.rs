@@ -6567,6 +6567,31 @@ struct InlineParentFrame {
     /// at the return point with the not-yet-produced call-result slot nulled
     /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs).
     boxes: Vec<OpRef>,
+    /// Live `MIFrame.registers_{r,i,f}` of the paused caller, plus the
+    /// walker extras on `WalkFrameState`. `MetaInterp.replace_box` writes
+    /// these in place (`pyjitpl.py replace_box` → `replace_active_box_in_frame`).
+    /// `None` on a reconstructed resume image that has no live walk
+    /// (bridge reconstruct, ctor continuation).
+    registers_r: Option<RegisterBank>,
+    registers_i: Option<RegisterBank>,
+    registers_f: Option<RegisterBank>,
+    frame_state: Option<WalkFrameState>,
+}
+
+impl InlineParentFrame {
+    fn attach_live_caller(
+        mut self,
+        registers_r: &RegisterBank,
+        registers_i: &RegisterBank,
+        registers_f: &RegisterBank,
+        frame_state: &WalkFrameState,
+    ) -> Self {
+        self.registers_r = Some(registers_r.clone());
+        self.registers_i = Some(registers_i.clone());
+        self.registers_f = Some(registers_f.clone());
+        self.frame_state = Some(frame_state.clone());
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -6622,6 +6647,10 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
         resume_coord: ParentResumeCoord::Backxlat(resume_pc),
         resume_marker_jit_pc: Some(resume_pc),
         boxes: vec![instance],
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
     })
 }
 

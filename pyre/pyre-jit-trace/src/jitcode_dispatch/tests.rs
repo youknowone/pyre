@@ -27,6 +27,10 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
         resume_coord: ParentResumeCoord::Backxlat(0),
         resume_marker_jit_pc: None,
         boxes: vec![OpRef::const_ptr(majit_ir::GcRef(word + 0x20))],
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
     };
     let frames = vec![
         InlineFrameGuard::enter(&outer, 0, false, vec![parent(0x1000)]),
