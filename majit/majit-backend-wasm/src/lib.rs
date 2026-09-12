@@ -3325,19 +3325,44 @@ impl WasmBackend {
             })
             .collect();
 
+        // When the LABEL-capture tail grows, do not replace the live
+        // handle in place. Cross-loop and entry bridges on other tokens
+        // already baked `return_call_indirect` against that slot; a
+        // replacement would publish the wider map and restore the new
+        // captures from uninitialized words. Install the grown module
+        // at a new slot. Already-baked inbound JUMPs keep the old
+        // module; `stamp_and_publish_label_targets` and CA dispatch
+        // below name the new slot for later compiles.
+        // `assembler.py` `patch_jump_for_descr` rewrites those jumps
+        // in place; wasm cannot, so the old slot stays the destination.
+        let old_labels_before = compiled.used_label_homes.get();
+        let labels_grew = old_labels_before < merged_labels.max(old_labels_before);
         #[cfg(target_arch = "wasm32")]
-        if glue::replace_module(old_handle, &wasm_bytes) != old_handle {
+        let install_handle = if labels_grew {
+            let new_handle = glue::compile_module_cached(&wasm_bytes);
+            if new_handle == 0 {
+                return Err(BackendError::Unsupported(
+                    "wasm host rejected the re-emitted trace module".into(),
+                ));
+            }
+            compiled.func_handle.set(new_handle);
+            new_handle
+        } else if glue::replace_module(old_handle, &wasm_bytes) != old_handle {
             return Err(BackendError::Unsupported(
                 "wasm host rejected the re-emitted trace module".into(),
             ));
-        }
+        } else {
+            old_handle
+        };
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = wasm_bytes;
+            let _ = (wasm_bytes, labels_grew);
             return Err(BackendError::Unsupported(
                 "wasm backend: no host replacement binding".into(),
             ));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let install_handle = old_handle;
 
         // The host has accepted the replacement, so its newly encoded global
         // indices can now be made visible in the registry and local metadata.
@@ -3491,14 +3516,14 @@ impl WasmBackend {
         // LABEL targets bake only the stable table slot, so restamp them for
         // this build. CA dispatch additionally carries the new finish index.
         let _ = stamp_and_publish_label_targets(
-            old_handle,
+            install_handle,
             compiled.frame,
             &inputs.inputargs,
             &inputs.ops,
             inputs.bridge_entry_arity,
         );
         if let Some(mut target) = call_assembler_target(token.number) {
-            target.func_handle = old_handle;
+            target.func_handle = install_handle;
             target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
             // Never clear a flag an out-of-line bridge already published:
             // re-emission can omit that bridge's ops while the attached
@@ -3507,7 +3532,7 @@ impl WasmBackend {
                 module_has_guard_not_forced_2(&inputs.ops, &inputs.inlined_bridges);
             ca_dispatch_publish(
                 token.number,
-                old_handle,
+                install_handle,
                 target.compiled_ptr as u32,
                 target.callee_frame_bytes,
                 target.dispatch_key_ofs as u32,
