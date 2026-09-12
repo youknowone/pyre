@@ -2319,7 +2319,11 @@ impl PyError {
             // display time.
             PyError {
                 kind: Self::kind_from_exc(kind),
-                message: Wtf8Buf::new(),
+                // Empty rpy_string, not `Wtf8Buf::new()`. The latter is a
+                // StringBuilder ctor+build residual on this raise path
+                // (`__majit_stringbuilder_build`), and display still comes
+                // from `exc_object` via `message_text`.
+                message: "".into(),
                 exc_object: obj,
                 attach_tb: true,
                 context_recorded: false,
