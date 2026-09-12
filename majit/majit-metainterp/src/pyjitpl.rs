@@ -14334,7 +14334,10 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
         optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
-        optimizer.bridge_vm_red = prepared.bridge_vm_red;
+        optimizer.bridge_vm_red = self
+            .second_portal_red_is_grain_vm()
+            .then_some(prepared.bridge_vm_red)
+            .flatten();
         optimizer.trace_inputargs = bridge_inputargs
             .iter()
             .enumerate()
@@ -14781,6 +14784,20 @@ impl<M: Clone> MetaInterp<M> {
         hole_filtered_vm_failarg_index(&fail_args)
     }
 
+    /// Grain declares reds `[frame, vm]`. Pyre declares `[frame, ec]`.
+    /// Both put a Ref at inputarg 1; only Grain's second red is the
+    /// stack-resident Vm the JUMP-pin / snapshot-pin exist for.
+    fn second_portal_red_is_grain_vm(&self) -> bool {
+        let Some(idx) = self.active_jitdriver_sd else {
+            return false;
+        };
+        self.staticdata
+            .jitdrivers_sd
+            .get(idx)
+            .and_then(|jd| jd.reds().get(1))
+            .is_some_and(|var| var.name == "vm")
+    }
+
     fn reminted_vm_red_for_bridge(
         &self,
         origin_key: u64,
@@ -14788,6 +14805,9 @@ impl<M: Clone> MetaInterp<M> {
         reminted: &[InputArg],
         fallback: Option<OpRef>,
     ) -> Option<OpRef> {
+        if !self.second_portal_red_is_grain_vm() {
+            return None;
+        }
         self.compiled_guard_vm_failarg_index(origin_key, fail_descr)
             .and_then(|idx| reminted.get(idx))
             .filter(|ia| ia.tp == Type::Ref)
