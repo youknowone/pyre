@@ -2945,11 +2945,8 @@ impl WasmBackend {
     ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
         let next_pos = codegen::next_value_pos(inputargs, &ops);
         let input_indices: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
-        let (ops, gcrefs) = majit_gc::rewrite::remove_ref_constants_for_inputs(
-            &ops,
-            next_pos,
-            &input_indices,
-        );
+        let (ops, gcrefs) =
+            majit_gc::rewrite::remove_ref_constants_for_inputs(&ops, next_pos, &input_indices);
         let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
         let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
         codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
