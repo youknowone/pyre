@@ -56,6 +56,7 @@ pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
 /// slot points at.
 pub static KWARGS_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
     crate::dictmultiobject::DictStrategyRef {
+        kind: crate::dictmultiobject::StrategyKind::Kwargs,
         imp: &KWARGS_DICT_STRATEGY,
         owner: std::ptr::null_mut(),
     };
