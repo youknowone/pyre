@@ -1786,8 +1786,13 @@ fn format_render(
             // `newformat.py:Template.get_value`; KeyError propagates
             // to the caller (no silent default).
             let m = pyre_object::gc_roots::shadow_stack_get(mapping_slot);
-            let w_key = pyre_object::w_str_new(name);
-            return crate::baseobjspace::getitem(m, w_key).map(Some);
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
+            return crate::baseobjspace::getitem(
+                m,
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+            )
+            .map(Some);
         }
         if kwargs_dict.is_some() {
             let dict = pyre_object::gc_roots::shadow_stack_get(kwargs_slot);
@@ -1874,7 +1879,7 @@ fn format_render(
                     Some(v) => v,
                     None => {
                         return Err(crate::PyError::key_error_with_key(
-                            pyre_object::w_str_from_wtf8(name),
+                            pyre_object::w_str_from_wtf8_managed(name.clone()),
                         ));
                     }
                 }
@@ -1888,13 +1893,25 @@ fn format_render(
         // `_resolve_lookups` — walk the `.attr` / `[element]` chain; a
         // bracketed all-digit element is an integer index, anything else a
         // string key (already classified by `FieldNamePart`).
+        //
+        // Each hop can collect. Keep the current value in one shadow-stack
+        // slot and reload it before the next getattr/getitem, the same way
+        // the nested-spec arm already republishes `val`.
+        let val_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(val);
         for name_part in &parts {
-            val = match name_part {
+            let receiver = pyre_object::gc_roots::shadow_stack_get(val_slot);
+            let next = match name_part {
                 FieldNamePart::Attribute(attr) => {
-                    crate::baseobjspace::getattr_str(val, attr.as_str().unwrap_or(""))?
+                    crate::baseobjspace::getattr_str(receiver, attr.as_str().unwrap_or(""))?
                 }
                 FieldNamePart::Index(idx) => {
-                    crate::baseobjspace::getitem(val, pyre_object::w_int_new(*idx as i64))?
+                    let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(*idx as i64));
+                    crate::baseobjspace::getitem(
+                        pyre_object::gc_roots::shadow_stack_get(val_slot),
+                        pyre_object::gc_roots::shadow_stack_get(idx_slot),
+                    )?
                 }
                 FieldNamePart::StringIndex(key) => {
                     // An all-digit bracket element that reached here overflowed
@@ -1909,10 +1926,19 @@ fn format_render(
                             "Too many decimal digits in format string",
                         ));
                     }
-                    crate::baseobjspace::getitem(val, pyre_object::w_str_from_wtf8(key.clone()))?
+                    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
+                        key.clone(),
+                    ));
+                    crate::baseobjspace::getitem(
+                        pyre_object::gc_roots::shadow_stack_get(val_slot),
+                        pyre_object::gc_roots::shadow_stack_get(key_slot),
+                    )?
                 }
             };
+            pyre_object::gc_roots::shadow_stack_set(val_slot, next);
         }
+        let mut val = pyre_object::gc_roots::shadow_stack_get(val_slot);
 
         // A spec containing `{` is itself a template: render it (sharing the
         // numbering state and the recursion budget) before applying it.

@@ -6154,6 +6154,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
     // non-proxy operand, costing only one ptr-equality check on the hot
     // path.
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+    // `ObjSpace.getattr` keeps `w_obj` live across the lookup and the
+    // `get_and_call_function` / `w_method_new` allocations below. Pin the
+    // receiver here; each later collecting call reloads from this slot.
+    let _getattr_roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
 
     if name == "__dict__"
         && let Some(obj_type) = crate::typedef::r#type(obj)
@@ -6268,7 +6275,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 let func_obj = crate::make_builtin_function_with_arity(sname, func, arity);
                 return Ok(pyre_object::w_method_new(
                     func_obj,
-                    obj,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     pyre_object::PY_NULL,
                 ));
             }
@@ -6305,7 +6312,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 unsafe { crate::typedef::stamp_builtin_owner(func_obj, "range") };
                 return Ok(pyre_object::w_method_new(
                     func_obj,
-                    obj,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     pyre_object::PY_NULL,
                 ));
             }
@@ -6341,7 +6348,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 let func_obj = crate::make_builtin_function_with_arity(sname, func, 1);
                 return Ok(pyre_object::w_method_new(
                     func_obj,
-                    obj,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     pyre_object::PY_NULL,
                 ));
             }
@@ -6458,7 +6465,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 let func_obj = crate::make_builtin_function_with_arity(sname, func, arity);
                 return Ok(pyre_object::w_method_new(
                     func_obj,
-                    obj,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     pyre_object::PY_NULL,
                 ));
             }
@@ -6502,7 +6509,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
                 match get_and_call_function(
                     slot,
-                    obj,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     w_type,
                     &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
                 ) {
@@ -6513,7 +6520,12 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                     // back to the receiver type's `__getattr__` (and
                     // re-raises when there is none).
                     Err(e) if e.kind == PyErrorKind::AttributeError => {
-                        return instance_getattr_hook_or_err(w_type, obj, name, e);
+                        return instance_getattr_hook_or_err(
+                            w_type,
+                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                            name,
+                            e,
+                        );
                     }
                     Err(e) => return Err(e),
                 }
@@ -6702,13 +6714,18 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 // bind the `__getattribute__` slot through `__get__`.
                 match get_and_call_function(
                     slot,
-                    obj,
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     w_type,
                     &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
                 ) {
                     Ok(v) => return Ok(v),
                     Err(e) if e.kind == PyErrorKind::AttributeError => {
-                        return instance_getattr_hook_or_err(w_type, obj, name, e);
+                        return instance_getattr_hook_or_err(
+                            w_type,
+                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                            name,
+                            e,
+                        );
                     }
                     Err(e) => return Err(e),
                 }
@@ -6828,7 +6845,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                     // the attribute name.
                     match get_and_call_function(
                         slot,
-                        obj,
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
                         w_metatype.as_ptr(),
                         &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
                     ) {

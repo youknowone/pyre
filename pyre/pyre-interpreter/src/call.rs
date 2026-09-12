@@ -5551,8 +5551,14 @@ fn build_class_inner(
             // walked here; only `__classcell__` is consumed locally, for the
             // post-metaclass cell validation below, so lift just that one key
             // via `space.getitem` rather than calling the mapping's `keys()`.
-            let w_cellkey = pyre_object::w_str_new("__classcell__");
-            match crate::baseobjspace::getitem(w_ns, w_cellkey) {
+            let cellkey_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(
+                pyre_object::unicodeobject::intern_str_value("__classcell__"),
+            );
+            match crate::baseobjspace::getitem(
+                w_ns,
+                pyre_object::gc_roots::shadow_stack_get(cellkey_slot),
+            ) {
                 Ok(value) if !value.is_null() => {
                     let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
                     unsafe {
@@ -5605,11 +5611,15 @@ fn build_class_inner(
             )
         };
         if let Some(w_ns) = mapping_namespace {
-            // `w_str_new` allocates, so the value is read back after it.
-            let key = pyre_object::w_str_new("__orig_bases__");
+            // Interning the key still allocates on a first sighting, so
+            // the value is read back after it.
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
+                "__orig_bases__",
+            ));
             crate::baseobjspace::setitem(
                 w_ns,
-                key,
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
                 pyre_object::gc_roots::shadow_stack_get(orig_bases_slot),
             )?;
         }
