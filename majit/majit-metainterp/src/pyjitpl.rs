@@ -6969,11 +6969,13 @@ impl<M: Clone> MetaInterp<M> {
     /// Pyre's structure matches RPython compile.py:312/320/327 — `inputargs`
     /// (entry contract) and `start_label.args` carry the trace's ROOT
     /// expanded shape ([0..num_inputs)), while the body `LABEL`/`JUMP`
-    /// inside `compiled_ops` use virtualstate-allocated OpRefs that are
-    /// outside the forwarding map. Truncating `inputargs` to `num_red_args`
-    /// and prepending GETFIELD_GC / GETARRAYITEM_GC therefore only rewrites
-    /// the entry contract and `start_label.args`; body LABEL/JUMP arities
-    /// stay independent.
+    /// inside `compiled_ops` use the compact virtualstate arglist
+    /// (`loop_info.label_op`). Truncating `inputargs` to `num_red_args`
+    /// and prepending GETFIELD_GC / GETARRAYITEM_GC rewrites every operand
+    /// that is the same Box as a stripped inputarg — start LABEL, body
+    /// LABEL/JUMP, and residual remints that still forward to that
+    /// inputarg (`compile.py emit_op` / `get_box_replacement`). Arity of
+    /// the compact body LABEL is independent of the entry prefix.
     pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         &self,
         inputargs: &mut Vec<InputArg>,
@@ -7045,15 +7047,13 @@ impl<M: Clone> MetaInterp<M> {
             constants,
         );
         // compile.py `patch_new_loop_to_load_virtualizable_fields`
-        // only touches `loop.inputargs`; it does not rewrite any LABEL/JUMP
-        // arity inside `loop.operations`. The helper's forwarding map is
-        // ROOT inputarg OpRef → fresh GETFIELD result OpRef, so any op that
-        // referenced a removed inputarg slot (start_label, preamble ops, and
-        // any guard fail_args reaching back to it) gets rewritten in place;
-        // body LABEL/JUMP carry virtualstate-allocated OpRefs outside that
-        // map and stay untouched. Both `compile_loop_body` and
-        // `finish_and_compile` invoke this helper, mirroring RPython's
-        // unconditional `send_loop_to_backend` wiring (compile.py).
+        // does not change LABEL/JUMP *arity*. `emit_op` still rewrites
+        // any operand that is the same Box as a stripped inputarg —
+        // start LABEL, body LABEL/JUMP, fail_args, and reminted residual
+        // slots that still forward to that inputarg. Both
+        // `compile_loop_body` and `finish_and_compile` invoke this helper,
+        // mirroring RPython's unconditional `send_loop_to_backend` wiring
+        // (compile.py).
     }
 
     /// compile.py:510 `vable = orig_inpargs[index_of_virtualizable].getref_base()`
@@ -8422,14 +8422,11 @@ impl<M: Clone> MetaInterp<M> {
         // field reload for every loop. Mirrors the FINISH-path call in
         // `finish_and_compile`; see `MetaInterp::patch_new_loop_to_load_virtualizable_fields`
         // for the shared helper. RPython's `loop.inputargs` is independent
-        // from the inner body LABEL/JUMP arity (compile.py:312/320/327 — entry
-        // contract is `start_state.renamed_inputargs`, body LABEL is
-        // `loop_info.label_op`); pyre's `start_label.args` and `inputargs`
-        // are at the trace's ROOT inputarg shape ([0..num_inputs)), and the
-        // body LABEL inside `compiled_ops` carries virtualstate-allocated
-        // OpRefs that the helper's forwarding map does not touch. Truncating
-        // `inputargs` to `num_red_args` and prepending GETFIELD_GC /
-        // GETARRAYITEM_GC therefore leaves body LABEL/JUMP arities intact.
+        // from the inner body LABEL/JUMP *arity* (`compile_loop`
+        // `loop.inputargs` / `start_label` / `loop_info.label_op` —
+        // entry contract is `start_state.renamed_inputargs`, body LABEL is
+        // `loop_info.label_op`). `emit_op` still rewrites residual body
+        // LABEL args that share Box identity with a stripped inputarg.
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut compiled_ops,
