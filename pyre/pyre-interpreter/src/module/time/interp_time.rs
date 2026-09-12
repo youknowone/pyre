@@ -467,7 +467,7 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false),
         _ => return Err(crate::PyError::value_error("unknown clock")),
     };
-    crate::baseobjspace::setattr_str(info, "implementation", w_str_new(implementation))?;
+    crate::baseobjspace::setattr_str(info, "implementation", w_str_new_managed(implementation))?;
     crate::baseobjspace::setattr_str(info, "monotonic", w_bool_from(monotonic))?;
     crate::baseobjspace::setattr_str(info, "adjustable", w_bool_from(adjustable))?;
     crate::baseobjspace::setattr_str(

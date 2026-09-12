@@ -271,7 +271,11 @@ impl crate::rordereddict::Equivalent<ObjectKey> for StrLookupKey<'_> {
                 // `dict_keys_equal` does.  The materialized str is the rare-path
                 // cost (a str-subclass dict key); the common exact-str arm
                 // above allocates nothing.
-                dict_keys_equal(k.obj, crate::w_str_new(self.key))
+                {
+                    let _roots = crate::gc_roots::push_roots();
+                    let w_key = crate::gc_roots::pin_root(crate::w_str_new_managed(self.key));
+                    dict_keys_equal(k.obj, w_key)
+                }
             } else {
                 // ObjectDictStrategy uses the ordinary object equality hook
                 // for every hash collision.  A non-str key is allowed to
@@ -281,7 +285,9 @@ impl crate::rordereddict::Equivalent<ObjectKey> for StrLookupKey<'_> {
                 // on this rare collision path, matching
                 // `object_key_for(w_str_new(key))`.  Pass the stored key first,
                 // the order `keyeq(checkingkey, key)` uses (`rordereddict.py:1055`).
-                dict_keys_equal(k.obj, crate::w_str_new(self.key))
+                let _roots = crate::gc_roots::push_roots();
+                let w_key = crate::gc_roots::pin_root(crate::w_str_new_managed(self.key));
+                dict_keys_equal(k.obj, w_key)
             }
         }
     }

@@ -1598,7 +1598,7 @@ pub unsafe fn builtin_code_call_name(obj: PyObjectRef, receiver: Option<PyObject
 pub unsafe fn builtin_code_get_docstring(obj: PyObjectRef) -> PyObjectRef {
     let func_obj = obj as *const BuiltinCode;
     match unsafe { (*func_obj).docstring } {
-        Some(s) => pyre_object::w_str_new(s),
+        Some(s) => pyre_object::w_str_new_managed(s),
         None => pyre_object::w_none(),
     }
 }

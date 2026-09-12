@@ -541,7 +541,9 @@ pub(crate) fn validate_encoding(encoding: &str) -> Result<(), crate::PyError> {
     if with_codec_state(|state| state.codec_need_encodings) {
         return Ok(());
     }
-    lookup_codec(&[w_str_new(encoding)]).map(|_| ())
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    lookup_codec(&[w_encoding]).map(|_| ())
 }
 
 /// `interp_codecs.py lookup_error`.  The direct codec loops implement
@@ -772,7 +774,9 @@ pub(crate) fn lookup_text_codec(
     action: &str,
     encoding: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let w_codec_info = lookup_codec(&[w_str_new(encoding)])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let w_codec_info = lookup_codec(&[w_encoding])?;
     match crate::baseobjspace::getattr_str(w_codec_info, "_is_text_encoding") {
         Ok(w_flag) if !crate::baseobjspace::is_true(w_flag)? => {
             return Err(crate::PyError::new(
@@ -798,7 +802,7 @@ fn call_codec(
 ) -> Result<PyObjectRef, crate::PyError> {
     // PyPy `interp_codecs.py _call_codec`.
     let call = if let Some(errors) = errors {
-        crate::call::call_function_impl_result(w_coder, &[w_obj, w_str_new(errors)])
+        crate::call::call_function_impl_result(w_coder, &[w_obj, w_str_new_managed(errors)])
     } else {
         crate::call::call_function_impl_result(w_coder, &[w_obj])
     };
@@ -985,10 +989,11 @@ fn encode_with_name(
     // PyPy `make_encoder_wrapper`: convert to unicode, call unicodehelper
     // encoder, return `(bytes, unicode_length)`.
     let encode_method = crate::baseobjspace::getattr_str(w_obj, "encode")?;
-    let encoded = crate::call::call_function_impl_result(
-        encode_method,
-        &[w_str_new(encoding), w_str_new(&errors)],
-    )?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let encode_method = pyre_object::gc_roots::pin_root(encode_method);
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let w_errors = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
+    let encoded = crate::call::call_function_impl_result(encode_method, &[w_encoding, w_errors])?;
     Ok(rooted_tuple()
         .arg(encoded)
         .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
@@ -1013,10 +1018,10 @@ fn decode_with_name(
     let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&data));
     let decode_method =
         crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "decode")?;
-    let decoded = crate::call::call_function_impl_result(
-        decode_method,
-        &[w_str_new(encoding), w_str_new(&errors)],
-    )?;
+    let decode_method = pyre_object::gc_roots::pin_root(decode_method);
+    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let w_errors = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
+    let decoded = crate::call::call_function_impl_result(decode_method, &[w_encoding, w_errors])?;
     Ok(rooted_tuple()
         .arg(decoded)
         .arg(w_int_new(consumed as i64))

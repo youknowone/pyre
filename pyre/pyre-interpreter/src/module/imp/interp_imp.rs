@@ -1287,7 +1287,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     any(target_os = "macos", target_os = "linux")
                 ))]
                 {
-                    Ok(pyre_object::w_list_new(vec![pyre_object::w_str_new(
+                    Ok(pyre_object::w_list_new(vec![pyre_object::w_str_new_managed(
                         crate::cpyext::extension_suffix(),
                     )]))
                 }

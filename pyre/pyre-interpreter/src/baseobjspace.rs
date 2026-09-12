@@ -8576,7 +8576,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
         && unsafe { pyre_object::is_member(obj) }
         && let Some(doc) = unsafe { pyre_object::w_member_get_doc(obj) }
     {
-        return Ok(w_str_new(doc));
+        return Ok(w_str_new_managed(doc));
     }
     // Type objects: look up in type's own dict → base dicts
     // PyPy: typeobject.py lookup_where → MRO search + descriptor unwrap

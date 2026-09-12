@@ -257,7 +257,7 @@ unsafe fn w_memoryview_cast_1d(mv_src: PyObjectRef, fmt: &str, itemsize: i64) ->
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(mv_src);
-        let _ = pyre_object::gc_roots::pin_root(w_str_new(fmt));
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(fmt));
         let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
         let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
         let r_fmt = pyre_object::gc_roots::shadow_stack_get(sp + 1);
@@ -305,7 +305,7 @@ unsafe fn w_memoryview_cast_nd(
         // Build each geometry object and pin it as produced: a later allocation
         // may relocate an earlier one, so the pinned shadow slot (re-read below)
         // is the source of truth, not the stale local.
-        let _ = pyre_object::gc_roots::pin_root(w_str_new(fmt));
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(fmt));
         let _ = pyre_object::gc_roots::pin_root(memoryview_wrap_dims(shape));
         let _ = pyre_object::gc_roots::pin_root(memoryview_wrap_dims(strides));
         let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
@@ -371,7 +371,7 @@ unsafe fn w_memoryview_new_plain(
         let _ = pyre_object::gc_roots::pin_root(w_obj);
         // A Raw view keeps its explicit format object; a Simple view derives 'B'.
         if is_array {
-            let _ = pyre_object::gc_roots::pin_root(w_str_new(fmt));
+            let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(fmt));
         }
         // Root view over an exporter: it owns the backing's buffer export.
         let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
@@ -10816,11 +10816,12 @@ pub fn finalization_error(message: Option<&str>) -> crate::PyError {
             message.unwrap_or("Operation blocked during Python finalization."),
         );
     };
-    let args = match message {
-        Some(message) => vec![cls, pyre_object::w_str_new_managed(message)],
-        None => vec![cls],
-    };
-    match exc_exception_new(&args) {
+    let mut args = pyre_object::gc_roots::RootedItems::new();
+    args.push(cls);
+    if let Some(message) = message {
+        args.push(pyre_object::w_str_new_managed(message));
+    }
+    match exc_exception_new(&args.take()) {
         Ok(exc) => unsafe { crate::PyError::from_exc_object(exc) },
         Err(err) => err,
     }

@@ -438,7 +438,7 @@ fn missing_init_error(name: &str, path: &Path) -> crate::PyError {
 fn extension_import_error(message: String, name: &str, path: &Path) -> crate::PyError {
     let roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_str_new(name));
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
     let path_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
     crate::PyError::import_error_name_path(
@@ -748,10 +748,10 @@ pub(super) fn call_cfunction_in_class(
             fastcall_slots.push(pyobject::make_ref(value_slot(index)));
         }
         if flags.contains(MethFlags::METH_KEYWORDS) && !keywords.is_empty() {
-            let names: Vec<PyObjectRef> = keywords
-                .iter()
-                .map(|(name, _)| pyre_object::w_str_new(name))
-                .collect();
+            let mut names = Vec::with_capacity(keywords.len());
+            for (name, _) in keywords.iter() {
+                names.push(roots.pin_root(pyre_object::w_str_new_managed(name)));
+            }
             keywords_arg = pyobject::make_ref(pyre_object::tupleobject::w_tuple_new(names));
         }
     } else if !flags.intersects(MethFlags::METH_NOARGS | MethFlags::METH_O) {

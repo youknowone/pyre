@@ -602,7 +602,7 @@ pub(crate) fn parse_int_text(s: &str) -> Result<PyObjectRef, PyError> {
     // interp_pickle.py:2201 calls the ordinary `int` constructor.  Reuse its
     // NumberStringParser consumer so the digit limit, MemoryError edge, and
     // literal diagnostics do not diverge for protocol-0 INT/LONG opcodes.
-    crate::builtins::parse_int_from_str(pyre_object::w_str_new(s), s, 10)
+    crate::builtins::parse_int_from_str(pyre_object::w_str_new_managed(s), s, 10)
 }
 
 pub(crate) fn read_int_le(data: &[u8]) -> i64 {

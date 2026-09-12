@@ -13257,7 +13257,7 @@ fn init_type_type(ns: PyObjectRef) {
         |args| unsafe {
             let w_type = args[1];
             if let Some(signature) = pyre_object::w_type_get_text_signature(w_type) {
-                return Ok(pyre_object::w_str_new(signature));
+                return Ok(pyre_object::w_str_new_managed(signature));
             }
             // typeobject.py `extract_txtsig`.
             let w_doc = crate::baseobjspace::getattr_str(w_type, "__doc__")?;
@@ -16112,15 +16112,17 @@ fn init_builtin_code_type(ns: PyObjectRef) {
     let varnames_getter = make_builtin_function_with_arity(
         "co_varnames",
         |args| {
-            let names = code_sig(args)
-                .map(|s| {
-                    s.getallvarnames()
-                        .iter()
-                        .map(|n| pyre_object::w_str_new(n))
-                        .collect()
-                })
-                .unwrap_or_default();
-            Ok(pyre_object::w_tuple_new(names))
+            let names = match code_sig(args) {
+                Some(s) => {
+                    let mut names = pyre_object::gc_roots::RootedItems::new();
+                    for n in s.getallvarnames() {
+                        names.push(pyre_object::w_str_new_managed(n));
+                    }
+                    pyre_object::w_tuple_new(names.take())
+                }
+                None => pyre_object::w_tuple_new(vec![]),
+            };
+            Ok(names)
         },
         2,
     );
@@ -17539,7 +17541,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 return Ok(pyre_object::w_none());
             }
             match unsafe { pyre_object::w_member_get_doc(member) } {
-                Some(doc) => Ok(pyre_object::w_str_new(doc)),
+                Some(doc) => Ok(pyre_object::w_str_new_managed(doc)),
                 None => Ok(pyre_object::w_none()),
             }
         },

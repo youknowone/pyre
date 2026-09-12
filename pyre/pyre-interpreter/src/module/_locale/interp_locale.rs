@@ -118,8 +118,10 @@ fn locale_error(message: &str) -> crate::PyError {
     let cls = crate::builtins::lookup_exc_class("locale.Error")
         .or_else(|| crate::builtins::lookup_exc_class("Exception"))
         .expect("Exception must be installed");
-    let args = vec![cls, pyre_object::w_str_new_managed(message)];
-    let exc = crate::builtins::exc_exception_new(&args)
+    let mut args = pyre_object::gc_roots::RootedItems::new();
+    args.push(cls);
+    args.push(pyre_object::w_str_new_managed(message));
+    let exc = crate::builtins::exc_exception_new(&args.take())
         .expect("exc_exception_new is infallible for str args");
     let mut err = crate::PyError::value_error(message);
     err.exc_object = exc;
