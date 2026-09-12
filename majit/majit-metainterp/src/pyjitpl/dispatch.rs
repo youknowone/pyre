@@ -10204,13 +10204,15 @@ where
         // `descr_at` resolves the callee from the per-jitcode `exec.descrs`
         // pool (runtime-built jitcodes) or the shared global build-time pool
         // (LLBC-extracted jitcodes, whose per-jitcode pool is empty).
+        // `as_jitcode_owned`, so a recursive helper's back edge upgrades
+        // the same way `BC_INLINE_CALL` does. `as_jitcode` is owning-edges
+        // only and would abort a self-call.
         let sub_jitcode = self
             .frames
             .current_mut()
             .jitcode
             .descr_at(sub_idx)
-            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
-            .cloned();
+            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned);
         let Some(sub_jitcode) = sub_jitcode else {
             // The callee is in neither pool; abort the trace instead of
             // crashing the process.
