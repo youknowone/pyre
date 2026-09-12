@@ -4873,6 +4873,15 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
+        // Skip-path graphs never run `rtype_type`. Flatten's raise tail
+        // reads only evalue (`flatten.py make_return`), so fold
+        // `op.type(v)` to the operand and leave no residual call.
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.as_slice() == ["type"]
+            && args.len() == 1
+        {
+            return RewriteResult::Identity(args[0].clone());
+        }
         // `__cast_instance_intrinsic` — front::mir's pointer-downcast
         // narrow (`cast_instance_call`: operand + const(root)).  The rtyper
         // lowers it to `cast_pointer` (`rbuiltin.rs rtype_cast_instance_intrinsic`,
@@ -14666,6 +14675,37 @@ mod tests {
             std::slice::from_ref(&arg),
             &result_ty,
             "cast_ptr_marker",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    #[test]
+    fn type_op_elides_to_operand_on_the_skip_path() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("type_skip");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["type"]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "type_skip",
             &mut graph,
         );
         match rewritten {
