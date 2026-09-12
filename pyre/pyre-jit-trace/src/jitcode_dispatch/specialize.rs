@@ -3048,6 +3048,123 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `pyframe.py fget_f_back` → `get_f_back` → `getnextframe_nohidden`.
+///
+/// The first hop is `f_backref` (unforced). When that names the standard
+/// virtualizable, `_do_jit_force_virtual` short-circuits on identity and
+/// `opimpl_getfield_vable` never runs. Emit that hop plus the identity
+/// guard; a farther or hidden hop still falls through.
+fn try_walker_specialize_frame_f_back<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if walker_prove_owned_frame_pc(ctx, op_pc, obj, concrete_obj)?.is_none() {
+        return Ok(None);
+    }
+    let frame = concrete_obj as *mut pyre_interpreter::PyFrame;
+    let raw_ptr = unsafe { (*frame).f_backref };
+    if raw_ptr.is_null() {
+        let none = ctx.trace_ctx.const_null();
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, none)?;
+        return Ok(Some(()));
+    }
+    let Some(standard_ptr) = ctx.trace_ctx.standard_virtualizable_ptr() else {
+        return Ok(None);
+    };
+    let Some(standard_op) = ctx.trace_ctx.standard_virtualizable_box() else {
+        return Ok(None);
+    };
+    let raw_is_vref =
+        unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw_ptr as *const u8) };
+    let next_ptr = if raw_is_vref {
+        unsafe {
+            majit_metainterp::virtualref::vref_forced(raw_ptr as *const u8)
+                as *mut pyre_interpreter::PyFrame
+        }
+    } else {
+        raw_ptr
+    };
+    if next_ptr.is_null() || next_ptr as usize != standard_ptr || unsafe { (*next_ptr).hide() } {
+        return Ok(None);
+    }
+    let raw_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        obj,
+        crate::descr::pyframe_f_backref_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        raw_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(raw_ptr as usize)),
+    );
+    if raw_is_vref {
+        let live_pair = ctx.trace_ctx.live_virtualref_pair_for_ptr(raw_ptr as usize);
+        let virtual_op = live_pair.map(|pair| pair.0).or_else(|| {
+            ctx.trace_ctx
+                .virtualref_virtual_for_object_ptr(next_ptr as usize)
+        });
+        let Some(virtual_op) = virtual_op else {
+            return Ok(None);
+        };
+        if virtual_op != standard_op {
+            return Ok(None);
+        }
+        let force_arg = if let Some((_, vref_op)) = live_pair {
+            if raw_op != vref_op {
+                let is_tracked_vref = ctx.trace_ctx.record_op(OpCode::PtrEq, &[raw_op, vref_op]);
+                ctx.trace_ctx
+                    .set_opref_concrete(is_tracked_vref, majit_ir::Value::Int(1));
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardTrue,
+                    &[is_tracked_vref],
+                )?;
+            }
+            vref_op
+        } else {
+            raw_op
+        };
+        maybe_walker_vable_and_vrefs_before_residual_call(ctx, op_pc);
+        ctx.trace_ctx.vrefs_before_residual_call();
+        let _ = pyre_interpreter::executioncontext::force_vref(raw_ptr);
+        ctx.trace_ctx.vrefs_after_residual_call();
+        let forced_op = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallMayForceR,
+            crate::helpers::jit_force_vref as *const (),
+            &[force_arg],
+            &[majit_ir::Type::Ref],
+            majit_ir::Type::Ref,
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+                majit_ir::OopSpecIndex::JitForceVirtual,
+            ),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            forced_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(next_ptr as usize)),
+        );
+        ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, virtual_op)?;
+        return Ok(Some(()));
+    }
+    if raw_op != standard_op {
+        let is_standard = ctx
+            .trace_ctx
+            .record_op(OpCode::PtrEq, &[raw_op, standard_op]);
+        ctx.trace_ctx
+            .set_opref_concrete(is_standard, majit_ir::Value::Int(1));
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_standard])?;
+    }
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[standard_op])?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, standard_op)?;
+    Ok(Some(()))
+}
+
 /// The two operands `builtins.rs super_operands_from_frame` reads off the
 /// frame, resolved as SSA values: `localsplus[0]` and the `__class__` freevar
 /// cell.
@@ -3641,6 +3758,15 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
         && spec_gate(SpecFold::FrameLineno, || {
             try_walker_specialize_frame_lineno(ctx, op_pc, obj, concrete_obj, dst, dst_bank)
+        })?
+        .is_some()
+    {
+        return Ok(Some(()));
+    }
+    if name == "f_back"
+        && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
+        && spec_gate(SpecFold::FrameFback, || {
+            try_walker_specialize_frame_f_back(ctx, op_pc, obj, concrete_obj, dst, dst_bank)
         })?
         .is_some()
     {

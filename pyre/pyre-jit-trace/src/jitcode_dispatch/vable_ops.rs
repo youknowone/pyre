@@ -494,6 +494,31 @@ mod frame_replacement_tests {
     }
 
     #[test]
+    fn replace_box_writes_helper_live_regs_without_a_mailbox() {
+        let old = OpRef::input_arg_ref(0);
+        let new = OpRef::input_arg_ref(1);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let regs = RegisterBank::new([old]);
+        let state = WalkFrameState::new(WalkFrameStateData {
+            vstack_boxes: vec![old],
+            ..Default::default()
+        });
+        push_helper_live(
+            &session,
+            &regs,
+            &RegisterBank::default(),
+            &RegisterBank::default(),
+            &state,
+        );
+        assert_eq!(session.borrow().helper_live.len(), 1);
+        replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
+        assert_eq!(regs.get(0), Some(new));
+        assert_eq!(state.borrow().vstack_boxes, [new]);
+        pop_helper_live(&session);
+        assert!(session.borrow().helper_live.is_empty());
+    }
+
+    #[test]
     fn paused_replacement_retains_and_updates_all_typed_banks() {
         let old = [
             OpRef::input_arg_ref(0),
