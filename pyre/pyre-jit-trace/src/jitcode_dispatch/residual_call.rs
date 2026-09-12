@@ -4365,6 +4365,35 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
+    // A Ref result is a nursery object. The next residual in this walk
+    // (`abs(x - y)` after complex subtract) allocates and can collect it
+    // before `set_opref_concrete` roots the recorded op. Pin the live
+    // word now and stamp that word below.
+    let mut residual_result_scope = None;
+    let exec_result = match exec_result {
+        Ok(result_i64)
+            if !is_void
+                && call_descr.result_type() == majit_ir::Type::Ref
+                && result_i64 != 0 =>
+        {
+            let obj = result_i64 as usize as pyre_object::PyObjectRef;
+            if obj.is_null() {
+                Ok(result_i64)
+            } else {
+                let live = if let Some((ref roots, _, _)) = residual_locals_roots {
+                    roots.pin_root(obj)
+                } else {
+                    let scope = pyre_object::gc_roots::push_roots();
+                    let live = scope.pin_root(obj);
+                    residual_result_scope = Some(scope);
+                    live
+                };
+                Ok(live as i64)
+            }
+        }
+        other => other,
+    };
+    let _residual_result_scope = residual_result_scope;
     // Declared only now, so this residual constrains the residuals that FOLLOW
     // it inside the same opcode and never itself: the gate above read the
     // window, and a force inside the callee reads it again from

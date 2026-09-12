@@ -8841,6 +8841,12 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     let Some(concrete_receiver) = walker_concrete_ref_object(ctx, r_args[2]) else {
         return Ok(None);
     };
+    // `is_exception` → `ll_isinstance` reads `ob_type`. A walk concrete
+    // that has already been collected (or never had a header) is not
+    // an exception override target.
+    if unsafe { (*concrete_receiver).ob_type.is_null() } {
+        return Ok(None);
+    }
     if !unsafe { pyre_object::is_exception(concrete_receiver) } {
         return Ok(None);
     }
