@@ -2939,6 +2939,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // calls this.
     cpa2(
         &mut entries,
+        "pyre_object::lowlevel_string::jit_ll_strconcat",
+        "pyre_object::jit_ll_strconcat",
+        pyre_object::lowlevel_string::jit_ll_strconcat,
+    );
+    cpa2(
+        &mut entries,
         "pyre_object::lowlevel_string::jit_ll_shrink_array",
         "pyre_object::jit_ll_shrink_array",
         pyre_object::lowlevel_string::jit_ll_shrink_array,

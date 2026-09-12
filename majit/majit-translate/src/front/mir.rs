@@ -1483,7 +1483,7 @@ fn tuple_field_value_type(type_name: &str) -> ValueType {
         // (`valuetype_to_someshell(Str)`) rather than the classdef-less
         // `Ref(None)` instance that walled `str ∪ Instance(classdef-less)`.
         // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
-        "String" | "str" | "Wtf8" | "Wtf8Buf" => ValueType::Str,
+        "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" | "Utf8Str" => ValueType::Str,
         _ => ValueType::Ref(None),
     }
 }
@@ -22256,7 +22256,7 @@ fn node_is_string_value(node: &serde_json::Value, llbc: &Llbc) -> bool {
             np == "alloc::string::String"
                 || matches!(
                     np.rsplit("::").next(),
-                    Some("Wtf8" | "Wtf8Buf" | "BytesBlock")
+                    Some("Wtf8" | "Wtf8Buf" | "BytesBlock" | "Utf8Str")
                 )
         })
 }

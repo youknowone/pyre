@@ -6,11 +6,11 @@ use crate::object_array::{
     items_block_items_base,
 };
 use crate::pyobject::PyObjectRef;
-use rustpython_wtf8::Wtf8Buf;
+use crate::unicodeobject::UnicodeValueStorage;
 
 /// PyPy `AsciiListStrategy`'s erased `[rpython str]` storage.
 ///
-/// Each entry is the GC pointer to a `Wtf8Buf`, not a boxed
+/// Each entry is the GC pointer to an rstr `STR` (`Utf8Str`), not a boxed
 /// `W_UnicodeObject`.  `ItemsBlock` is the runtime's `GcArray(GCREF)` shape, so
 /// its existing varsize trace forwards both the backing block and every raw
 /// string pointer it contains.
@@ -64,7 +64,7 @@ impl UnicodeArray {
         }
     }
 
-    pub fn from_vec(values: Vec<*const Wtf8Buf>) -> Self {
+    pub fn from_vec(values: Vec<*const UnicodeValueStorage>) -> Self {
         let mut refs = Vec::with_capacity(values.len());
         for value in values {
             refs.push(value as PyObjectRef);
@@ -175,7 +175,7 @@ impl UnicodeArray {
         }
     }
 
-    pub fn push(&mut self, value: *const Wtf8Buf) {
+    pub fn push(&mut self, value: *const UnicodeValueStorage) {
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
@@ -197,23 +197,29 @@ impl UnicodeArray {
         self.len_relaxed() == 0
     }
 
-    pub fn as_slice(&self) -> &[*const Wtf8Buf] {
+    pub fn as_slice(&self) -> &[*const UnicodeValueStorage] {
         unsafe {
-            std::slice::from_raw_parts(self.base() as *const *const Wtf8Buf, self.len_relaxed())
+            std::slice::from_raw_parts(
+                self.base() as *const *const UnicodeValueStorage,
+                self.len_relaxed(),
+            )
         }
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [*const Wtf8Buf] {
+    pub fn as_mut_slice(&mut self) -> &mut [*const UnicodeValueStorage] {
         unsafe {
-            std::slice::from_raw_parts_mut(self.base() as *mut *const Wtf8Buf, self.len_relaxed())
+            std::slice::from_raw_parts_mut(
+                self.base() as *mut *const UnicodeValueStorage,
+                self.len_relaxed(),
+            )
         }
     }
 
-    pub fn to_vec(&self) -> Vec<*const Wtf8Buf> {
+    pub fn to_vec(&self) -> Vec<*const UnicodeValueStorage> {
         self.as_slice().to_vec()
     }
 
-    pub fn insert(&mut self, index: usize, value: *const Wtf8Buf) {
+    pub fn insert(&mut self, index: usize, value: *const UnicodeValueStorage) {
         assert!(index <= self.len_relaxed());
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
@@ -229,7 +235,7 @@ impl UnicodeArray {
         self.set_len_relaxed(self.len_relaxed() + 1);
     }
 
-    pub fn set(&mut self, index: usize, value: *const Wtf8Buf) {
+    pub fn set(&mut self, index: usize, value: *const UnicodeValueStorage) {
         assert!(index < self.len_relaxed());
         let _roots = crate::gc_roots::push_roots();
         let slot = crate::gc_roots::shadow_stack_len();
@@ -238,7 +244,7 @@ impl UnicodeArray {
         unsafe { *self.base().add(index) = crate::gc_roots::shadow_stack_get(slot) };
     }
 
-    pub fn remove(&mut self, index: usize) -> *const Wtf8Buf {
+    pub fn remove(&mut self, index: usize) -> *const UnicodeValueStorage {
         assert!(index < self.len_relaxed());
         let value = self.as_slice()[index];
         self.before_move_barrier();
@@ -251,7 +257,7 @@ impl UnicodeArray {
         value
     }
 
-    pub fn pop(&mut self) -> *const Wtf8Buf {
+    pub fn pop(&mut self) -> *const UnicodeValueStorage {
         assert!(self.len_relaxed() > 0);
         let value = self.as_slice()[self.len_relaxed() - 1];
         self.set_len_relaxed(self.len_relaxed() - 1);
@@ -263,7 +269,12 @@ impl UnicodeArray {
         self.as_mut_slice().reverse();
     }
 
-    pub fn splice(&mut self, start: usize, remove_count: usize, values: &[*const Wtf8Buf]) {
+    pub fn splice(
+        &mut self,
+        start: usize,
+        remove_count: usize,
+        values: &[*const UnicodeValueStorage],
+    ) {
         let old_len = self.len_relaxed();
         let start = start.min(old_len);
         let removed = remove_count.min(old_len - start);
@@ -336,7 +347,7 @@ impl Drop for UnicodeArray {
 }
 
 impl Index<usize> for UnicodeArray {
-    type Output = *const Wtf8Buf;
+    type Output = *const UnicodeValueStorage;
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.as_slice()[index]

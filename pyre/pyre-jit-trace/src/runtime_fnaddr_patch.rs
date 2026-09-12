@@ -384,16 +384,13 @@ const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 
 /// Materialize one immortal runtime `W_UnicodeObject` for a prebuilt-string
 /// constant, returning its address.  `box_str_constant` leaks (never freed,
-/// outside the nursery) a `W_UnicodeObject` whose `value: *mut Wtf8Buf`
-/// indirection at `UNICODE_VALUE_OFFSET` is exactly what the trace readers
-/// follow: `bh_strlen` / `bh_strgetitem` (`pyre_cpu.rs`) and the compiled
-/// `PyreStrDescr` fast path both dereference that pointer, so the block is
-/// indistinguishable from a `bh_newstr` result.  It is the same builder
-/// `pyre-jit`'s `flatten.rs` uses for runtime string literals, and interns
-/// identical literals by content (the runtime analog of the assembler's
-/// per-jitcode dedup).  `precomputed_hash` is unused at runtime —
-/// `W_UnicodeObject` carries no hash slot, so `ll_strhash` recomputes it from
-/// `value` on demand.
+/// outside the nursery) a `W_UnicodeObject` whose `_utf8` is an rstr `STR`.
+/// `bh_strlen` / `bh_strgetitem` (`pyre_cpu.rs`) read that payload, matching
+/// `llmodel.py`.  It is the same builder `pyre-jit`'s `flatten.rs` uses for
+/// runtime string literals, and interns identical literals by content (the
+/// runtime analog of the assembler's per-jitcode dedup).  `precomputed_hash`
+/// is unused at runtime — `W_UnicodeObject` carries the Python `hash()`
+/// cache, so `ll_strhash` recomputes from the `STR` on demand.
 fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
     let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
         .expect("prebuilt STR constant bytes are not valid WTF-8");
@@ -570,15 +567,14 @@ mod tests {
             0,
             "a real W_UnicodeObject address must have the sentinel high bits clear",
         );
-        // Validate against the exact readers a live trace uses — the
-        // `W_UnicodeObject.value` indirection at `UNICODE_VALUE_OFFSET`.  This is the
-        // test that would have caught the old low-level-block layout bug:
-        // `bh_strlen` follows the value pointer, so a non-`W_UnicodeObject` block
-        // would read garbage / fault here.
+        // `bh_strlen` / `bh_strgetitem` read rstr `STR` (`llmodel.py`),
+        // the `_utf8` payload, not the `W_UnicodeObject` wrapper.
         let cpu = crate::pyre_cpu::PyreCpu::new();
-        assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(5));
+        let payload =
+            unsafe { pyre_object::unicodeobject::w_str_storage(addr as pyre_object::PyObjectRef) };
+        assert_eq!(cpu.bh_strlen(GcRef(payload as usize)), Some(5));
         let got: Vec<u8> = (0..5)
-            .map(|i| cpu.bh_strgetitem(GcRef(addr as usize), i).unwrap() as u8)
+            .map(|i| cpu.bh_strgetitem(GcRef(payload as usize), i).unwrap() as u8)
             .collect();
         assert_eq!(got, b"hello");
     }
@@ -754,6 +750,8 @@ mod tests {
         materialize_str_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
         let cpu = crate::pyre_cpu::PyreCpu::new();
-        assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(0));
+        let payload =
+            unsafe { pyre_object::unicodeobject::w_str_storage(addr as pyre_object::PyObjectRef) };
+        assert_eq!(cpu.bh_strlen(GcRef(payload as usize)), Some(0));
     }
 }

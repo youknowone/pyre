@@ -16160,14 +16160,14 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
 /// `setarrayitem_gc` + `bh_build_string_from_array`.  Recover the
 /// fragment boxes from the backing-array heap-cache (the same
 /// [`try_walker_specialize_newtuple`] read) and left-fold
-/// `descr_add` (`jit_str_concat`), the channel
-/// [`try_walker_specialize_binary_op_str`] already records for
-/// `BINARY_OP ADD` of two exact `str`s.  A one-fragment BUILD_STRING
+/// `descr_add` (`getfield _utf8` + `OS_STR_CONCAT` + `new_with_vtable`),
+/// the channel [`try_walker_specialize_binary_op_str`] already records
+/// for `BINARY_OP ADD` of two exact `str`s.  A one-fragment BUILD_STRING
 /// is the operand itself.
 ///
 /// `Utf8StringBuilder` look-inside (`rutf8.py`) remains the next port
-/// for a single virtualized build.  This fold does not stamp
-/// `OS_STR_CONCAT`: see [`try_walker_specialize_binary_op_str`].
+/// for a single virtualized build.  The left-fold uses the same
+/// `descr_add` split as [`try_walker_specialize_binary_op_str`].
 pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -16219,7 +16219,6 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    let helper = pyre_object::unicodeobject::jit_str_concat as *const ();
     let mut acc = fragments[0];
     for i in 1..fragments.len() {
         let prefix = if i + 1 == fragments.len() {
@@ -16227,17 +16226,7 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         } else {
             pyre_interpreter::runtime_ops::build_string_from_refs(&concretes[..=i])
         };
-        let concat = ctx.trace_ctx.call_ref_typed_with_effect(
-            helper,
-            &[acc, fragments[i]],
-            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-            majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
-        );
-        ctx.trace_ctx.set_opref_concrete(
-            concat,
-            majit_ir::Value::Ref(majit_ir::GcRef(prefix as usize)),
-        );
-        acc = concat;
+        acc = emit_walker_descr_add(ctx, op_pc, acc, fragments[i], prefix)?;
     }
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, acc)?;
     Ok(Some(()))
@@ -21578,20 +21567,12 @@ pub(crate) fn try_walker_specialize_compare_op_str<Sym: WalkSym>(
 /// place of the residual drops a `CallMayForce`, so the operand loads around
 /// it keep their heap-cache entries and no virtualizable is forced.
 ///
-/// The call is recorded NON-elidable: the result is a `str` of length > 1,
-/// which carries storage identity, so letting the pure pass share one call
-/// between two `a + b` sites would answer `(a + b) is (a + b)` True where
-/// every other implementation answers False — the same reason `jit_int_str`
-/// gives for its own effect class.
-///
-/// Not tagged `OS_STR_CONCAT` even though `STR_CONCAT_TARGETS` would:
-/// `vstring.py opt_call_stroruni_STR_CONCAT` virtualizes the call and
-/// `force_box` later emits `newstr` + `copystrcontent` at the RPython
-/// `rstr.STR` layout (`bh_copystrcontent` / `rewrite.py` basesize).  A
-/// walker `str + str` is a `W_UnicodeObject`; memcpy at those offsets
-/// is a SIGBUS.  Resume already rematerializes via
-/// `callinfo_for_oopspec(OS_STR_CONCAT)` → `jit_str_concat`; optimizer
-/// force has to speak the same object before the oopspec can land.
+/// `descr_add` (unicodeobject.py) is `W_UnicodeObject(self._utf8 +
+/// w_other._utf8, self._len() + w_other._len())`.  Record that split:
+/// `getfield _utf8` + `ll_strconcat` (`OS_STR_CONCAT`,
+/// `EF_ELIDABLE_OR_MEMORYERROR`) + `new_with_vtable` wrap
+/// (`W_UnicodeObject.__init__`).  Two `a + b` sites allocate two
+/// wrappers (`is_w` of `_len() > 1`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -21635,19 +21616,69 @@ pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
     // --- emit the specialized IR (walker-native) ---
     walker_guard_exact_str(ctx, op_pc, lhs)?;
     walker_guard_exact_str(ctx, op_pc, rhs)?;
-    let helper = pyre_object::unicodeobject::jit_str_concat as *const ();
-    let concat = ctx.trace_ctx.call_ref_typed_with_effect(
+    let wrapped = emit_walker_descr_add(ctx, op_pc, lhs, rhs, boxed_result)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, wrapped)?;
+    Ok(Some(()))
+}
+
+/// `descr_add` body: getfield `_utf8` + `ll_strconcat` + `newutf8`
+/// wrap (`w_str_from_storage_and_length`).  The wrap is a residual so a
+/// loop-carried result is a concrete `W_UnicodeObject`; inlining it as
+/// `new_with_vtable` leaves `_utf8` (`_immutable_fields_`) folded to the
+/// preamble payload across the jump.
+fn emit_walker_descr_add<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    lhs: OpRef,
+    rhs: OpRef,
+    boxed_result: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let utf8_descr = crate::descr::unicode_utf8_descr();
+    let lhs_utf8 = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, lhs, utf8_descr.clone());
+    let rhs_utf8 = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, rhs, utf8_descr);
+    let helper = pyre_object::lowlevel_string::jit_ll_strconcat as *const ();
+    let concat = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
         helper,
-        &[lhs, rhs],
+        &[lhs_utf8, rhs_utf8],
         &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_ir::Type::Ref,
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::ElidableOrMemoryError,
+            majit_ir::OopSpecIndex::StrConcat,
+        ),
+    );
+    let payload = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
+    ctx.trace_ctx.set_opref_concrete(
+        concat,
+        majit_ir::Value::Ref(majit_ir::GcRef(payload as usize)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+
+    let len_descr = crate::descr::str_len_descr();
+    let lhs_len = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, lhs, len_descr.clone());
+    let rhs_len = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, rhs, len_descr);
+    let total_len = ctx.trace_ctx.record_op(OpCode::IntAdd, &[lhs_len, rhs_len]);
+    let concrete_len = unsafe {
+        (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(total_len, majit_ir::Value::Int(concrete_len));
+
+    let wrap = pyre_object::unicodeobject::jit_w_str_from_storage_and_length as *const ();
+    let wrapped = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
+        wrap,
+        &[concat, total_len],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        majit_ir::Type::Ref,
         majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
     );
     ctx.trace_ctx.set_opref_concrete(
-        concat,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+        wrapped,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
     );
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, concat)?;
-    Ok(Some(()))
+    Ok(wrapped)
 }
 
 /// #62 LoadGlobal cell-cache fold — walker mirror of the retired trait

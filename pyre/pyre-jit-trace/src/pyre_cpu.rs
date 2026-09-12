@@ -8,44 +8,39 @@
 //! the `Cpu` trait so `protect_speculative_string`, `bh_strlen` and
 //! `bh_strgetitem` all reach the same descr.
 //!
-//! Python 3 unifies `str` and `unicode` into one `W_UnicodeObject`
-//! (UTF-8), but the RPython-level STR / UNICODE split is preserved:
-//! `str_descr()` returns `PyreStrDescr` (len_descr → byte_len) and
-//! `unicode_descr()` returns `PyreUnicodeDescr` (len_descr → codepoint len).
-//!
-//! `W_UnicodeObject` (pyre-object) stores char data behind a
-//! `*mut Wtf8Buf` pointer at `UNICODE_VALUE_OFFSET`; the default
-//! `bh_getarrayitem_gc_i(base + index)` path would read wrong memory,
-//! so `bh_strgetitem` is overridden to follow the indirection.
+//! `str_descr` is rstr `STR` (`{hash, len, chars}`, `rstr.py`) — the
+//! `_utf8` payload `descr_add` concatenates. `unicode_descr` stays the
+//! `W_UnicodeObject` wrapper for `UNICODELEN` / `UNICODEGETITEM` until
+//! those ops are retargeted the same way.
 
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::operand::Operand;
 use majit_ir::{ArrayDescr, Descr, FieldDescr, GcRef, Type};
-use majit_metainterp::cpu::{Cpu, DefaultCpu};
+use majit_metainterp::cpu::{Cpu, DefaultCpu, SpeculativeError};
+use pyre_object::lowlevel_string::{
+    LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_STRING_LEN_OFFSET, bh_lowlevel_string_len,
+    lowlevel_str_gc_type_id,
+};
 use pyre_object::rutf8::Utf8IndexStorage;
+use pyre_object::unicodeobject::utf8_payload_bytes;
 use pyre_object::unicodeobject::{
     UNICODE_BYTE_LEN_OFFSET, UNICODE_INDEX_STORAGE_OFFSET, UNICODE_LEN_OFFSET,
     UNICODE_VALUE_OFFSET, W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE,
 };
-use rustpython_wtf8::Wtf8Buf;
 
-/// FieldDescr for `W_UnicodeObject.byte_len` — UTF-8 byte count.
-/// RPython STR is `Array(Char)` byte string (`rstr.py`);
-/// `llmodel.py bh_strlen` reads byte count.
+/// FieldDescr for rstr `STR.length` — `rstr.py` varsize `len` word.
+/// `llmodel.py bh_strlen` reads `len(s.chars)`.
 #[derive(Debug)]
-struct PyreStrByteLenFieldDescr;
+struct PyreStrLenFieldDescr;
 
-impl Descr for PyreStrByteLenFieldDescr {}
+impl Descr for PyreStrLenFieldDescr {}
 
-impl FieldDescr for PyreStrByteLenFieldDescr {
+impl FieldDescr for PyreStrLenFieldDescr {
     fn offset(&self) -> usize {
-        UNICODE_BYTE_LEN_OFFSET
+        LOWLEVEL_STRING_LEN_OFFSET
     }
     fn field_size(&self) -> usize {
-        // `W_UnicodeObject.byte_len` is a `usize`: 8 bytes on 64-bit, 4 on
-        // wasm32. A hardcoded 8 reads the adjacent field into the high
-        // half on a 32-bit target.
         std::mem::size_of::<usize>()
     }
     fn field_type(&self) -> Type {
@@ -55,7 +50,7 @@ impl FieldDescr for PyreStrByteLenFieldDescr {
         true
     }
     fn field_name(&self) -> &'static str {
-        "W_UnicodeObject.byte_len"
+        "rstr.STR.length"
     }
 }
 
@@ -88,8 +83,8 @@ impl FieldDescr for PyreUnicodeLenFieldDescr {
     }
 }
 
-/// ArrayDescr for STR (byte string per `rstr.py Array(Char)`).
-/// `len_descr` → `byte_len` field.
+/// ArrayDescr for rstr `STR` (`rstr.py GcStruct('rpy_string', …)`).
+/// `len_descr` → the varsize `len` word at [`LOWLEVEL_STRING_LEN_OFFSET`].
 #[derive(Debug)]
 struct PyreStrDescr;
 
@@ -98,7 +93,7 @@ struct PyreStrDescr;
 #[derive(Debug)]
 struct PyreUnicodeDescr;
 
-const PYRE_STR_BYTE_LEN_DESCR: PyreStrByteLenFieldDescr = PyreStrByteLenFieldDescr;
+const PYRE_STR_LEN_DESCR: PyreStrLenFieldDescr = PyreStrLenFieldDescr;
 const PYRE_UNICODE_LEN_DESCR: PyreUnicodeLenFieldDescr = PyreUnicodeLenFieldDescr;
 const PYRE_STR_DESCR: PyreStrDescr = PyreStrDescr;
 const PYRE_UNICODE_DESCR: PyreUnicodeDescr = PyreUnicodeDescr;
@@ -107,13 +102,13 @@ impl Descr for PyreStrDescr {}
 
 impl ArrayDescr for PyreStrDescr {
     fn base_size(&self) -> usize {
-        W_UNICODE_OBJECT_SIZE
+        LOWLEVEL_STR_BASE_SIZE
     }
     fn item_size(&self) -> usize {
         1
     }
     fn type_id(&self) -> u32 {
-        W_UNICODE_GC_TYPE_ID as u32
+        lowlevel_str_gc_type_id()
     }
     fn item_type(&self) -> Type {
         Type::Int
@@ -122,7 +117,7 @@ impl ArrayDescr for PyreStrDescr {
         false
     }
     fn len_descr(&self) -> Option<&dyn FieldDescr> {
-        Some(&PYRE_STR_BYTE_LEN_DESCR)
+        Some(&PYRE_STR_LEN_DESCR)
     }
 }
 
@@ -201,49 +196,53 @@ impl Cpu for PyreCpu {
         Some(&PYRE_UNICODE_DESCR)
     }
 
+    fn protect_speculative_string(&self, gcptr: GcRef) -> Result<(), SpeculativeError> {
+        // `llmodel.py protect_speculative_string` → `protect_speculative_array`
+        // with `gc_ll_descr.str_descr` (rstr `STR` tid).
+        if gcptr.is_null() {
+            return Err(SpeculativeError);
+        }
+        if !majit_gc::supports_guard_gc_type() {
+            return Ok(());
+        }
+        if majit_gc::gc_owns_object(gcptr.0) {
+            let actual = majit_gc::get_actual_typeid(gcptr).ok_or(SpeculativeError)?;
+            let want = lowlevel_str_gc_type_id();
+            if want != 0 && actual == want {
+                return Ok(());
+            }
+            return Err(SpeculativeError);
+        }
+        // Immortal `_utf8` is a raw STR (`alloc_raw_utf8_payload`) so an
+        // immortal header never greys a young box.  No GC header, so
+        // `get_actual_typeid` would read `hash` as a vtable.  Accept an
+        // aligned non-null payload; the length word is the allocation we
+        // wrote.  Convergence: register immortal STR as a prebuilt root
+        // so `get_actual_typeid` answers the STR tid.
+        if gcptr.0 % std::mem::align_of::<usize>() != 0 {
+            return Err(SpeculativeError);
+        }
+        Ok(())
+    }
+
     fn bh_strlen(&self, string: GcRef) -> Option<i64> {
-        // RPython STR is `Array(Char)` byte string (`rstr.py`);
-        // `llmodel.py bh_strlen` returns the byte count.
-        // `str_descr().len_descr()` reads `W_UnicodeObject.byte_len` for the
-        // compiled path; this override follows the `*mut Wtf8Buf` indirection
-        // directly for the blackhole interpreter path.
+        // `llmodel.py bh_strlen`: `len(s.chars)` on rstr `STR`.
         if string.is_null() {
             return None;
         }
-        let value_addr = string.0 + UNICODE_VALUE_OFFSET;
-        let value_ptr = unsafe { *(value_addr as *const *const Wtf8Buf) };
-        if value_ptr.is_null() {
-            return None;
-        }
-        let s = unsafe { &*value_ptr };
-        Some(s.len() as i64)
+        Some(bh_lowlevel_string_len(string.0 as i64) as i64)
     }
 
     fn bh_strgetitem(&self, string: GcRef, index: i64) -> Option<i64> {
-        // RPython STR is `Array(Char)` byte string (`rstr.py`);
-        // STRGETITEM returns `ord(char)` = byte value.
-        // `intbounds.rs`'s `propagate_postprocess` narrows the result to `[0, 255]`
-        // (`vstring.py:393-400 IntBound.make_ge(0).make_lt(256)`).
-        // `W_UnicodeObject.value: *mut Wtf8Buf` at `UNICODE_VALUE_OFFSET` —
-        // follow the indirection and read the WTF-8 byte at `index`.
-        // PyPy's STR stores chars in-line at `base + item_size * index`;
-        // pyre diverges structurally so this override replaces the
-        // default `bh_getarrayitem_gc_i` routing.
+        // `llmodel.py bh_strgetitem`: `ord(s.chars[index])` on rstr `STR`.
         if string.is_null() {
             return None;
         }
-        let value_addr = string.0 + UNICODE_VALUE_OFFSET;
-        let value_ptr = unsafe { *(value_addr as *const *const Wtf8Buf) };
-        if value_ptr.is_null() {
-            return None;
-        }
-        let s = unsafe { &*value_ptr };
-        let bytes = s.as_bytes();
+        let bytes = unsafe {
+            utf8_payload_bytes(string.0 as *const pyre_object::unicodeobject::UnicodeValueStorage)
+        };
         let i = item_index(index)?;
-        if i >= bytes.len() {
-            return None;
-        }
-        Some(bytes[i] as i64)
+        bytes.get(i).map(|&b| b as i64)
     }
 
     fn bh_unicodegetitem(&self, unicode: GcRef, index: i64) -> Option<i64> {
@@ -261,11 +260,13 @@ impl Cpu for PyreCpu {
             return None;
         }
         let value_addr = unicode.0 + UNICODE_VALUE_OFFSET;
-        let value_ptr = unsafe { *(value_addr as *const *const Wtf8Buf) };
+        let value_ptr = unsafe {
+            *(value_addr as *const *const pyre_object::unicodeobject::UnicodeValueStorage)
+        };
         if value_ptr.is_null() {
             return None;
         }
-        let s = unsafe { &*value_ptr };
+        let s = unsafe { pyre_object::unicodeobject::utf8_payload_wtf8(value_ptr) };
         let i = item_index(index)?;
         let len = unsafe { *((unicode.0 + UNICODE_LEN_OFFSET) as *const usize) };
         if i >= len {
@@ -348,6 +349,22 @@ mod tests {
         assert_eq!(item_index(PAST_U32), None);
         #[cfg(target_pointer_width = "64")]
         assert_eq!(item_index(PAST_U32), Some(PAST_U32 as usize));
+    }
+
+    #[test]
+    fn bh_strlen_reads_the_str_payload() {
+        let obj = pyre_object::w_str_new("hello");
+        let payload = unsafe { pyre_object::unicodeobject::w_str_storage(obj) };
+        let cpu = PyreCpu::new();
+        assert_eq!(cpu.bh_strlen(GcRef(payload as usize)), Some(5));
+        assert_eq!(
+            cpu.bh_strgetitem(GcRef(payload as usize), 1),
+            Some(b'e' as i64)
+        );
+        assert!(
+            cpu.protect_speculative_string(GcRef(payload as usize))
+                .is_ok()
+        );
     }
 
     #[test]

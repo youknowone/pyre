@@ -1333,7 +1333,7 @@ static W_UNICODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| 
             (
                 "value",
                 pyre_object::unicodeobject::UNICODE_VALUE_OFFSET,
-                std::mem::size_of::<*mut rustpython_wtf8::Wtf8Buf>(),
+                std::mem::size_of::<*mut pyre_object::unicodeobject::UnicodeValueStorage>(),
                 Type::Ref,
                 false,
                 true,
@@ -4847,6 +4847,23 @@ pub fn str_len_descr() -> DescrRef {
     field_descr_from_group(&W_UNICODE_DESCR_GROUP, 2)
 }
 
+/// `W_UnicodeObject.value` — `_utf8`, the rstr `STR` payload
+/// `descr_add` concatenates.
+pub fn unicode_utf8_descr() -> DescrRef {
+    field_descr_from_group(&W_UNICODE_DESCR_GROUP, 0)
+}
+
+/// `W_UnicodeObject.byte_len` — cached `len(_utf8)`, the rstr `STR` length.
+pub fn unicode_byte_len_descr() -> DescrRef {
+    field_descr_from_group(&W_UNICODE_DESCR_GROUP, 1)
+}
+
+/// `W_UnicodeObject.index_storage` — `_index_storage`, `rutf8.null_storage()`
+/// until the first non-ASCII index.
+pub fn unicode_index_storage_descr() -> DescrRef {
+    field_descr_from_group(&W_UNICODE_DESCR_GROUP, 4)
+}
+
 // Object header and allocation descriptors.
 
 /// `PyCode.code_ptr` — the host `CodeObject` every code-field getter resolves
@@ -5003,6 +5020,12 @@ pub fn pycode_hidden_applevel_descr() -> DescrRef {
 /// vtable = &INT_TYPE (ob_type for virtual materialization).
 pub fn w_int_size_descr() -> DescrRef {
     W_INT_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_UnicodeObject` allocation via NewWithVtable.
+/// vtable = &STR_TYPE (`unicodeobject.py W_UnicodeObject.__init__`).
+pub fn w_unicode_size_descr() -> DescrRef {
+    W_UNICODE_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for W_BoolObject allocation via NewWithVtable.
