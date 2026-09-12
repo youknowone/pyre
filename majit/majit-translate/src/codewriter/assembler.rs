@@ -5342,7 +5342,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             "bitxor" => "int_xor".into(),
             // RPython `jtransform.py:1243-1255` produces these opnames as-is —
             // do not prefix with `int_`.
-            "ptr_eq" | "ptr_ne" => op.clone(),
+            "ptr_eq" | "ptr_ne" | "instance_ptr_eq" | "instance_ptr_ne" => op.clone(),
             // jtransform-rewritten float operands carry the full RPython
             // opname (`float_add` / `float_lt` / etc.) — preserve as-is.
             s if s.starts_with("float_") => op.clone(),
@@ -6127,6 +6127,21 @@ mod tests {
         };
 
         assert_eq!(op_kind_to_opname_with_kinds(&identity, "rr"), "ptr_eq");
+    }
+
+    #[test]
+    fn instance_ptr_eq_is_not_prefixed_as_an_int_binop() {
+        let lhs = crate::flowspace::model::Variable::new();
+        let rhs = crate::flowspace::model::Variable::new();
+        for name in ["instance_ptr_eq", "instance_ptr_ne", "ptr_eq", "ptr_ne"] {
+            let kind = crate::model::OpKind::BinOp {
+                op: name.into(),
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                result_ty: crate::model::ValueType::Int,
+            };
+            assert_eq!(op_kind_to_opname(&kind), name);
+        }
     }
 
     #[test]
