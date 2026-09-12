@@ -758,6 +758,7 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                 forward(&mut t.ob_header.w_class);
                 forward(&mut t.w_name);
                 forward(&mut t.w_qualname);
+                forward(&mut t.w_doc);
                 // Heap and builtin types both hold a managed W_DictObject.
                 // Forward the field itself; the dict's custom trace walks its
                 // keys and values during a major collection. During a minor,

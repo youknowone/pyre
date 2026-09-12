@@ -142,6 +142,9 @@ impl ClassDictMethods {
     }
 
     unsafe fn setitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8, w_value: PyObjectRef) {
+        // `setitem_str` additionally catches the TypeError and stores raw
+        // into `dict_w` when `w_type.is_cpytype()`; pyre has no cpytype
+        // concept, so the refusal propagates unconditionally.
         if let Err(err) = type_setdictvalue_wtf8(unerase(w_dict), key, w_value) {
             crate::call::set_call_error(err);
         }
@@ -251,6 +254,11 @@ unsafe fn type_setdictvalue_wtf8(
             pyre_object::w_type_get_name(w_type),
         )));
     }
+    // Upstream `setdictvalue` first offers the store to `write_cell` and
+    // returns without `mutated` when the existing MutableCell absorbs it.
+    // Pyre's type dicts hold raw values everywhere (cells are module-dict
+    // only; `object_setattr`'s type arm stores raw too), so the read-side
+    // `unwrap_cell` is a no-op and the cell step has nothing to update.
     crate::baseobjspace::mutated(w_type, name.as_str().ok());
     crate::type_dict_store_wtf8(w_type, name, w_value);
     Ok(())

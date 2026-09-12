@@ -5342,7 +5342,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             "bitxor" => "int_xor".into(),
             // RPython `jtransform.py:1243-1255` produces these opnames as-is —
             // do not prefix with `int_`.
-            "ptr_eq" | "ptr_ne" => op.clone(),
+            "ptr_eq" | "ptr_ne" | "instance_ptr_eq" | "instance_ptr_ne" => op.clone(),
             // jtransform-rewritten float operands carry the full RPython
             // opname (`float_add` / `float_lt` / etc.) — preserve as-is.
             s if s.starts_with("float_") => op.clone(),
@@ -5568,33 +5568,6 @@ impl Assembler {
     /// assembled. Pending inline-call descriptors are lowered here to the
     /// final `(jitcode_index, fnaddr, calldescr)` form that runtime
     /// consumers expect.
-    /// Publish every known field of a raw (non-GC) struct into the shared
-    /// descr pool. OBJECT_VTABLE-shaped storage keeps `instantiate` as a
-    /// pointer slot; the only source reader may be an atomic residual, so
-    /// no FieldRead is emitted unless the pool already names the slot.
-    pub(crate) fn publish_raw_struct_fields(
-        &mut self,
-        call_control: &crate::codewriter::call::CallControl,
-        owner: &str,
-    ) {
-        let Some(fields) = call_control.struct_field_entries(owner) else {
-            return;
-        };
-        for (name, type_str) in fields {
-            let (_, ir_type, _) = crate::codewriter::call::get_type_flag(type_str);
-            if ir_type == majit_ir::value::Type::Void {
-                continue;
-            }
-            let ty = match ir_type {
-                majit_ir::value::Type::Float => crate::model::ValueType::Float,
-                majit_ir::value::Type::Int => crate::model::ValueType::Int,
-                _ => crate::model::ValueType::Ref(None),
-            };
-            let field = crate::model::FieldDescriptor::new(name.clone(), Some(owner.to_string()));
-            self.emit_ready_descr(fielddescrof(&field, &ty, Some(call_control)));
-        }
-    }
-
     pub fn snapshot_descrs(&self) -> Vec<crate::jitcode::BhDescr> {
         self.descrs
             .iter()
@@ -6154,6 +6127,21 @@ mod tests {
         };
 
         assert_eq!(op_kind_to_opname_with_kinds(&identity, "rr"), "ptr_eq");
+    }
+
+    #[test]
+    fn instance_ptr_eq_is_not_prefixed_as_an_int_binop() {
+        let lhs = crate::flowspace::model::Variable::new();
+        let rhs = crate::flowspace::model::Variable::new();
+        for name in ["instance_ptr_eq", "instance_ptr_ne", "ptr_eq", "ptr_ne"] {
+            let kind = crate::model::OpKind::BinOp {
+                op: name.into(),
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                result_ty: crate::model::ValueType::Int,
+            };
+            assert_eq!(op_kind_to_opname(&kind), name);
+        }
     }
 
     #[test]

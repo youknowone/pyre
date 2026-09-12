@@ -99,17 +99,22 @@ fn atomic_load_real_acquire_readers_preserve_the_diagnostic() {
         "/../../build/llbc/pyre-object.ullbc"
     ))
     .expect("load fresh pyre-object corpus");
-    // get_instantiate publishes the cached W_TypeObject to allocators, whereas
-    // the version tag publishes class mutations. Neither load may become a
-    // scalar field read just because its enclosing caller can be traced.
-    // In particular, a missing instantiate descriptor is not permission to
+    // The version tag publishes class mutations across threads: its Acquire
+    // load may not become a scalar field read just because its enclosing
+    // caller can be traced. A missing descriptor is not permission to
     // recover the old ordering-erasing lowering to satisfy a layout test.
-    for reader in ["w_type_get_version_tag", "get_instantiate"] {
-        let result = lower_function(&llbc, reader);
-        assert!(
-            matches!(result, Err(LowerError::Unsupported(ref message))
-                if message.contains("atomic load ordering Acquire")),
-            "{reader}: the real Acquire reader must not become a plain field value: {result:?}"
-        );
-    }
+    let result = lower_function(&llbc, "w_type_get_version_tag");
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic load ordering Acquire")),
+        "w_type_get_version_tag: the real Acquire reader must not become a plain field value: {result:?}"
+    );
+    // get_instantiate publishes the cached W_TypeObject to allocators. Its
+    // readers and late writers are all GIL-serialized, so the source spells a
+    // Relaxed load — the one ordering the frontend lowers to a plain read.
+    let result = lower_function(&llbc, "get_instantiate");
+    assert!(
+        result.is_ok(),
+        "get_instantiate: the Relaxed reader must keep lowering: {result:?}"
+    );
 }

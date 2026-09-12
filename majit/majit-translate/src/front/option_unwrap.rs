@@ -130,23 +130,17 @@ fn rewire_one_unwrap_site(
         .position(|op| op.result.as_ref() == Some(&site.result_var))
         .expect("result var producer resolved to block A above");
     let last_idx = graph.blocks[a].operations.len() - 1;
-    let (cast, out_var): (Option<(Vec<String>, ValueType)>, Variable) = if call_idx == last_idx {
+    let (cast, out_var): (Option<(String, ValueType)>, Variable) = if call_idx == last_idx {
         (None, site.result_var.clone())
     } else if call_idx == last_idx - 1 {
         let tail = &graph.blocks[a].operations[last_idx];
-        match (&tail.kind, tail.result.clone()) {
-            (
-                OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath { segments },
-                    args,
-                    result_ty,
-                },
-                Some(narrowed),
-            ) if segments.first().map(String::as_str)
-                == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                && args.as_slice() == std::slice::from_ref(&site.result_var) =>
+        match tail.result.clone() {
+            Some(narrowed)
+                if let Some(root) =
+                    crate::model::cast_instance_of(&tail.kind, &site.result_var)
+                    && let OpKind::Call { result_ty, .. } = &tail.kind =>
             {
-                (Some((segments.clone(), result_ty.clone())), narrowed)
+                (Some((root.to_string(), result_ty.clone())), narrowed)
             }
             _ => {
                 return Err(format!(
@@ -204,7 +198,7 @@ fn rewire_one_unwrap_site(
     // serves as the branch link args.
     let mut payload_sources = carried.clone();
     if !payload_sources.contains(&recv) {
-        payload_sources.push(recv.clone());
+        payload_sources.push(recv.clone().into_variable());
     }
     let (payload_bb, payload_inputs) = graph.create_block_with_arg_vars(payload_sources.len());
     let (failure_bb, _failure_inputs) = graph.create_block_with_arg_vars(0);
@@ -269,7 +263,7 @@ fn rewire_one_unwrap_site(
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
                 op: "ne".to_string(),
-                lhs: recv.clone(),
+                lhs: recv.clone().into_variable(),
                 rhs: nullc,
                 result_ty: ValueType::Int,
             },
@@ -278,7 +272,7 @@ fn rewire_one_unwrap_site(
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::FieldRead {
-                base: recv.clone(),
+                base: recv.clone().into_variable(),
                 field: FieldDescriptor {
                     name: "__discriminant".to_string(),
                     owner_root: Some(site.enum_owner.clone()),
@@ -336,7 +330,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_target(),
-                    args: vec![opt.clone()],
+                    args: crate::model::call_args(vec![opt.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -409,7 +403,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_target(),
-                    args: vec![opt],
+                    args: crate::model::call_args(vec![opt]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -418,16 +412,7 @@ mod tests {
         let narrowed = g
             .push_op_var(
                 a,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
-                            "Tuple<f64,f64>".to_string(),
-                        ],
-                    },
-                    args: vec![result.clone()],
-                    result_ty: ValueType::Ref(Some("Tuple<f64,f64>".into())),
-                },
+                crate::model::cast_instance_call("Tuple<f64,f64>", result.clone()),
                 true,
             )
             .unwrap();
@@ -489,7 +474,7 @@ mod tests {
                     } else {
                         unwrap_target()
                     },
-                    args,
+                    args: crate::model::call_args(args),
                     result_ty: ValueType::Unsigned,
                 },
                 true,
@@ -558,7 +543,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: unwrap_target(),
-                    args: vec![opt, extra],
+                    args: crate::model::call_args(vec![opt, extra]),
                     result_ty: ValueType::Int,
                 },
                 true,

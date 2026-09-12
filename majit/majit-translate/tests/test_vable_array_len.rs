@@ -137,7 +137,7 @@ fn vable_array_len_lowers_to_arraylen_not_a_call() {
                     target: CallTarget::FunctionPath { segments },
                     args,
                     ..
-                } if segments == &["__len".to_string()] && args.contains(&array_var) => {
+                } if segments == &["__len".to_string()] && args.iter().any(|a| a == &array_var) => {
                     panic!(
                         "the virtualizable array reaches a `__len` call as an argument, \
                          which trips `_check_no_vable_array` via `handle_residual_call`"
@@ -432,7 +432,7 @@ fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
                     }
                     for o in &b.operations {
                         if let OpKind::Call { args, .. } = &o.kind
-                            && args.contains(result)
+                            && args.iter().any(|a| a == result)
                         {
                             escapes.push(format!("{:?}: call argument in block {bi}", graph.name));
                         }

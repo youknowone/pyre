@@ -848,11 +848,8 @@ fn header_read_narrows_to_a_typed_field_read() {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments },
                     ..
-                } if segments.as_slice()
-                    == [
-                        "__cast_instance_intrinsic".to_string(),
-                        "ObjectHeader".to_string(),
-                    ] =>
+                } if majit_translate::model::cast_instance_root(&op.kind)
+                    == Some("ObjectHeader") =>
                 {
                     narrows += 1
                 }
@@ -1044,17 +1041,15 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
     for b in &add_graph.blocks {
         for op in &b.operations {
             let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
-                args,
-                result_ty,
+                args, result_ty, ..
             } = &op.kind
             else {
                 continue;
             };
-            if segments.first().map(String::as_str) != Some("__cast_instance_intrinsic") {
+            let Some(root) = majit_translate::model::cast_instance_root(&op.kind) else {
                 continue;
-            }
-            let root = segments.get(1).cloned().unwrap_or_default();
+            };
+            let root = root.to_string();
             *narrow_roots.entry(root.clone()).or_insert(0usize) += 1;
             assert_eq!(
                 result_ty,
@@ -1068,7 +1063,10 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
                 .iter()
                 .flat_map(|b| &b.operations)
                 .any(|p| {
-                    p.result.as_ref() == args.first()
+                    p.result.as_ref()
+                        == args
+                            .first()
+                            .and_then(majit_translate::model::LinkArg::as_variable)
                         && matches!(p.kind, OpKind::ConstRefAddr(a) if a == CLASS_ADDR)
                 });
             if narrows_class_addr {

@@ -4953,4 +4953,92 @@ mod tests {
         reset_swap_fallback_hits();
         assert_eq!(swap_fallback_hits(), 0);
     }
+
+    fn objectptr_type() -> crate::translator::rtyper::lltypesystem::lltype::Ptr {
+        match crate::translator::rtyper::rclass::OBJECTPTR.clone() {
+            LowLevelType::Ptr(p) => *p,
+            other => panic!("OBJECTPTR must be Ptr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rtype_cast_ptr_to_int_with_ptrrepr_does_not_swap() {
+        use crate::annotator::model::SomePtr;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rmodel::PtrRepr;
+        use std::rc::Rc;
+
+        let hop = dummy_hop();
+        let ptr = objectptr_type();
+        let var = Variable::named("p");
+        var.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
+        var.annotation
+            .replace(Some(Rc::new(SomeValue::Ptr(SomePtr::new(ptr.clone())))));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new(ptr.clone())));
+        let ptr_repr: Arc<dyn Repr> = Arc::new(PtrRepr::new(ptr));
+        let args_r_before = Arc::as_ptr(&ptr_repr);
+        hop.args_r.borrow_mut().push(Some(ptr_repr));
+
+        let result = rtype_cast_ptr_to_int(&hop, &HashMap::new())
+            .unwrap()
+            .expect("cast_ptr_to_int returns a Signed variable");
+        let args_r_after = hop.args_r.borrow()[0].as_ref().map(Arc::as_ptr);
+        assert_eq!(
+            args_r_after,
+            Some(args_r_before),
+            "orthodox PtrRepr must not be replaced by the InstanceRepr swap"
+        );
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(result, last.result);
+        assert_eq!(last.opname, "cast_ptr_to_int");
+        match &last.result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("expected Signed result, got {other:?}"),
+        }
+        assert!(
+            llops._called_exception_is_here_or_cannot_occur,
+            "rbuiltin.py rtype_cast_ptr_to_int calls exception_cannot_occur"
+        );
+    }
+
+    #[test]
+    fn rtype_cast_ptr_to_int_swaps_instancerepr_with_ptr_concretetype() {
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let inst = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("root InstanceRepr");
+        let ptr = objectptr_type();
+        let var = Variable::named("inst");
+        var.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr))));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_s.borrow_mut().push(SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(None, false, Default::default()),
+        ));
+        hop.args_r.borrow_mut().push(Some(inst as Arc<dyn Repr>));
+        assert_eq!(
+            hop.args_r.borrow()[0].as_ref().map(|r| r.repr_class_id()),
+            Some(ReprClassId::InstanceRepr)
+        );
+
+        let result = rtype_cast_ptr_to_int(&hop, &HashMap::new())
+            .unwrap()
+            .expect("swap still emits cast_ptr_to_int");
+        assert_eq!(
+            hop.args_r.borrow()[0].as_ref().map(|r| r.repr_class_id()),
+            Some(ReprClassId::PtrRepr),
+            "the fallback relabels InstanceRepr to PtrRepr"
+        );
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(result, last.result);
+        assert_eq!(last.opname, "cast_ptr_to_int");
+    }
 }

@@ -655,7 +655,7 @@ fn transduce_op(
                 block,
                 OpKind::Call {
                     target,
-                    args,
+                    args: crate::model::call_args(args),
                     result_ty,
                 },
                 result,
@@ -1643,7 +1643,7 @@ mod tests {
             result: None,
             kind: OpKind::Call {
                 target,
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Void,
             },
         };

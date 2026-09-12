@@ -471,6 +471,21 @@ fn lookup_operand(
         })
 }
 
+/// RPython `SpaceOperation.args` is a mixed `Variable | Constant` list
+/// (`flowspace/model.py`).  `LinkArg::Const` is already the flowspace
+/// Constant — lift it as `Hlvalue::Constant` with no SSA lookup.
+fn lookup_link_arg(
+    value_map: &HashMap<Variable, Hlvalue>,
+    operand: &LinkArg,
+    op: &SpaceOperation,
+    arg_role: &str,
+) -> Result<Hlvalue, TyperError> {
+    match operand {
+        LinkArg::Value(var) => lookup_operand(value_map, var, op, arg_role),
+        LinkArg::Const(c) => Ok(Hlvalue::Constant(c.clone())),
+    }
+}
+
 /// Resolve the `Hlvalue` result slot for a legacy op. When the op has
 /// no result (`Option::None`), allocate a fresh anonymous Variable per
 /// RPython convention (every `SpaceOperation.result` slot is non-None
@@ -1896,7 +1911,7 @@ pub fn translate_op(
                 .enumerate()
                 .map(|(i, v)| {
                     let role = format!("args[{i}]");
-                    lookup_operand(value_map, v, op, &role)
+                    lookup_link_arg(value_map, v, op, &role)
                 })
                 .collect();
             let arg_hls = arg_hls?;
@@ -1910,6 +1925,34 @@ pub fn translate_op(
                 // by the registry) and routes through
                 // `FunctionRepr::call(hop)` (`rpbc.py`).
                 CallTarget::FunctionPath { segments } => {
+                    // RPython `SimpleCall.opname = 'simple_call'`
+                    // (`flowspace/operation.py`); `SimpleCall.eval`
+                    // reads `w_callable, args_w = self.args[0],
+                    // self.args[1:]`.  `front::exc_from_raise` emits
+                    // that mixed list directly (`const(exc_class)` at
+                    // args[0]).  The path names the op, not a second
+                    // callable — do not wrap it again.
+                    if segments.as_slice() == ["type"] {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(
+                                "translate_op: FunctionPath [\"type\"] requires \
+                                 one operand (flowspace/operation.py Type)"
+                                    .to_string(),
+                            ));
+                        }
+                        return Ok(vec![FlowspaceOp::new("type", arg_hls, result)]);
+                    }
+                    if segments.as_slice() == ["simple_call"] {
+                        if arg_hls.is_empty() {
+                            return Err(TyperError::message(
+                                "translate_op: FunctionPath [\"simple_call\"] \
+                                 requires args[0] as the callable \
+                                 (flowspace/operation.py SimpleCall.eval)"
+                                    .to_string(),
+                            ));
+                        }
+                        return Ok(vec![FlowspaceOp::new("simple_call", arg_hls, result)]);
+                    }
                     // RPython `VirtualizableInstanceRepr.hook_access_field`
                     // inserts the `jit_force_virtualizable` LLOp during
                     // rtyping; it never asks the annotator to traverse a
@@ -2111,19 +2154,20 @@ pub fn translate_op(
                             return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                         }
                     }
-                    // `__cast_pointer/<Root>` marker (`front::mir`
-                    // `cast_pointer_marker_op`) — pyre's carrier for the
+                    // `__cast_pointer` marker (`front::mir`
+                    // `cast_pointer_call`) — pyre's carrier for the
                     // upstream `cast_pointer(PTRTYPE, ptr)` downcast
-                    // (lltype.py:964-968).  Same path-encoded-constant
-                    // reconstruction as the `simple_call(<exc class>)`
-                    // raise marker (Branch 3c below): rebuild the 2-arg
-                    // upstream shape with the target class as the
-                    // constant first argument.  The class is interned by
-                    // qualname so every cast site shares one `HostObject`
-                    // Arc (`getdesc` dedups on Arc identity — fresh Arcs
-                    // would mint one ClassDesc per cast site).
-                    if segments.len() == 2 && segments[0] == "__cast_pointer" && arg_hls.len() == 1
-                    {
+                    // (lltype.py).  The root is a trailing ByteStr
+                    // Constant; intern it by qualname so every cast
+                    // site shares one `HostObject` Arc (`getdesc`
+                    // dedups on Arc identity).
+                    if segments.as_slice() == ["__cast_pointer"] {
+                        if arg_hls.len() != 2 {
+                            return Err(TyperError::message(format!(
+                                "__cast_pointer requires (operand, constant_root), got {}",
+                                arg_hls.len()
+                            )));
+                        }
                         let callable_host = HOST_ENV
                             .import_module("rpython.rtyper.lltypesystem.lltype")
                             .and_then(|m| m.module_get("cast_pointer"))
@@ -2132,40 +2176,42 @@ pub fn translate_op(
                                     "HOST_ENV lltype module must expose cast_pointer".to_string(),
                                 )
                             })?;
-                        let class_host = call_registry
-                            .bookkeeper()
-                            .intern_class_by_qualname(&segments[1]);
-                        let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+                        let root = match &arg_hls[1] {
+                            Hlvalue::Constant(c) => c.value.as_pystr().ok_or_else(|| {
+                                TyperError::message(
+                                    "__cast_pointer root must be a constant string".to_string(),
+                                )
+                            })?,
+                            _ => {
+                                return Err(TyperError::message(
+                                    "__cast_pointer root must be a Constant".to_string(),
+                                ));
+                            }
+                        };
+                        let class_host = call_registry.bookkeeper().intern_class_by_qualname(root);
+                        let mut call_args = Vec::with_capacity(3);
                         call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
                             callable_host,
                         ))));
                         call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
                             class_host,
                         ))));
-                        call_args.extend(arg_hls);
+                        call_args.push(arg_hls[0].clone());
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
                     // `__cast_instance_intrinsic` — front-end pointer-downcast
-                    // narrow (#298).  `front::mir` emits a synthetic
-                    // `Call(["__cast_instance_intrinsic", <root>], [operand])`
-                    // for `obj as *const RegisteredStruct`, stashing the
-                    // target struct root in `segments[1]` because the
-                    // `Vec<Variable>` arg carrier cannot hold a `Constant`
-                    // (same carrier limitation as the Branch-3c
-                    // `simple_call(<exc class>)` reconstruction below).
-                    // Reconstruct it here as `simple_call(callable,
-                    // operand, Constant(root))`: the analyzer reads the
-                    // trailing `ByteStr` root to type the result
+                    // narrow (#298).  `front::mir` emits
+                    // `Call(["__cast_instance_intrinsic"], [operand, const(root)])`
+                    // for `obj as *const RegisteredStruct`.  The analyzer
+                    // reads the trailing `ByteStr` root to type the result
                     // `SomeInstance(root)`, and the typer lowers the call
                     // to a `cast_pointer`.  The callable resolves through
                     // the `__cast_instance_intrinsic` HOST_ENV singleton so its
                     // Arc identity matches the `BUILTIN_TYPER` key.
-                    if segments.len() == 2
-                        && segments[0] == crate::runtime_names::shims::CAST_INSTANCE
-                    {
-                        if arg_hls.len() != 1 {
+                    if segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE] {
+                        if arg_hls.len() != 2 {
                             return Err(TyperError::message(format!(
-                                "__cast_instance_intrinsic requires exactly one operand, got {}",
+                                "__cast_instance_intrinsic requires (operand, constant_root), got {}",
                                 arg_hls.len()
                             )));
                         }
@@ -2179,12 +2225,9 @@ pub fn translate_op(
                             })?;
                         let callable =
                             Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
-                        let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                         call_args.push(callable);
                         call_args.extend(arg_hls);
-                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                            &segments[1],
-                        ))));
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
                     // `__cast_address_intrinsic` — the erasing twin of the narrow
@@ -2745,48 +2788,13 @@ pub fn translate_op(
                         // the PRE-EXISTING-ADAPTATION is item `3b.` of this
                         // arm's Layer 3 resolution-order list.
                         attr
-                    } else if segments.len() == 2
-                        && segments[0] == "simple_call"
-                        && let Some(exc_class) = HOST_ENV.lookup_builtin(&segments[1])
-                    {
-                        // Branch 3c — PRE-EXISTING-ADAPTATION closure
-                        // for `front::exc_from_raise::lower_exc_from_raise`
-                        // (~`exc_from_raise.rs`).  Upstream RPython
-                        // `flowcontext.py:614/623` emits
-                        // `op.simple_call(const(exc_class), *args)`
-                        // with the class as `args[0]`; pyre stashes
-                        // the class name in `path[1]` of the
-                        // `FunctionPath` because its `Vec<Variable>`
-                        // arg carrier cannot hold a
-                        // `Constant(HostObject(class))` alongside
-                        // `Variable`s — holding it would require a
-                        // `Vec<Variable>` → `Vec<LinkArg>` carrier (see the
-                        // "TODO: `Constant` SSA carrier shape" section of
-                        // `front/exc_from_raise.rs`'s module preamble for
-                        // the three attempts that failed).  The downstream
-                        // reconstruction is documented at
-                        // `exc_from_raise.rs`:
-                        // > any downstream reader can reconstruct
-                        // > `(op, const_class, args…)` from
-                        // > `(path[0], path[1], op.args)`
-                        // This branch is exactly that
-                        // reconstruction: resolve `path[1]`
-                        // (the exception class name) as a builtin
-                        // HostObject and use it as the simple_call
-                        // callable, leaving `op.args` as the
-                        // trailing message arguments.  No longer
-                        // needed once the arg carrier can hold a
-                        // `Constant` directly.
-                        exc_class
                     } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
                         // Fuzzy leaf-match is the last registry fallback.
-                        // Exact registry entries, HOST_ENV
-                        // module paths, and the `simple_call(<exc class>)`
-                        // raise reconstruction must win first so external
+                        // Exact registry entries and HOST_ENV
+                        // module paths must win first so external
                         // stubs such as `BigInt::from`, `Vec::new`, and
-                        // `Box::new` — and exception classes sharing a leaf —
-                        // cannot be captured by an unrelated user function
-                        // with the same leaf.
+                        // `Box::new` cannot be captured by an unrelated
+                        // user function with the same leaf.
                         //
                         // This is the resting point for the former
                         // caller-scoped `use`-import resolution: MIR callsites
@@ -5427,7 +5435,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["a".into(), "b".into()],
                 },
-                args: vec![vars[1].clone()],
+                args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
             },
         };
@@ -5466,7 +5474,7 @@ mod tests {
                         "jit_force_virtualizable".into(),
                     ],
                 },
-                args: vec![vars[1].clone()],
+                args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Void,
             },
         };
@@ -5511,7 +5519,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__array_repeat".into()],
                 },
-                args: vec![vars[1].clone(), vars[2].clone()],
+                args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
             },
         };
@@ -5545,7 +5553,7 @@ mod tests {
                         "try_pyobject_vec_with_capacity".into(),
                     ],
                 },
-                args: vec![vars[0].clone()],
+                args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -5626,7 +5634,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
                 },
-                args: vec![vars[0].clone()],
+                args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -5663,7 +5671,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
                 },
-                args: vec![vars[0].clone(), vars[1].clone()],
+                args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -5697,7 +5705,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangefrom".into()],
                 },
-                args: vec![vars[0].clone(), vars[1].clone()],
+                args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -5750,7 +5758,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["othermod".into(), "shared_leaf".into()],
                 },
-                args: vec![vars[1].clone()],
+                args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
             },
         };
@@ -5775,14 +5783,36 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_call_function_path_simple_call_exc_class_beats_leaf_match() {
-        // Branch 3c (`simple_call(<exc class>)` raise reconstruction)
-        // must win over the leaf-match registry fallback so an exception
-        // class sharing a leaf with a registered user function still
-        // resolves to the builtin class HostObject, not the user fn.
-        // Without the ordering, `["simple_call", "ValueError"]` would be
-        // captured by a registered `[mymod, ValueError]` free fn through
-        // `lookup_with_leaf_match`.
+    fn translate_op_call_type_lowers_to_type_spaceop() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        let operand = Variable::new();
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(operand.clone()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::function_path(["type"]),
+                args: crate::model::call_args(vec![vars[1].clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("FunctionPath [type] must lower to the type op");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "type");
+        assert_eq!(translated[0].args.len(), 1);
+        assert!(matches!(&translated[0].args[0], Hlvalue::Variable(v) if *v == operand));
+    }
+
+    #[test]
+    fn translate_op_call_simple_call_uses_const_callable_at_args_0() {
+        // RPython `flowcontext.py exc_from_raise` emits
+        // `op.simple_call(const(exc_class), *args)`.  The frontend
+        // now carries that Constant at `Call.args[0]`; FunctionPath
+        // `["simple_call"]` is the op name, not a second callable.
+        // A colliding registry leaf must not be prepended.
         use crate::flowspace::argument::Signature;
         use crate::translator::rtyper::call_registry::FunctionPathKey;
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -5791,52 +5821,44 @@ mod tests {
         value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
         value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let registry = empty_call_registry();
-        // Free-fn-shaped (snake_case module) candidate whose leaf
-        // `ValueError` collides with the exception class name.
         registry.get_or_register(
-            FunctionPathKey::from_segments(["mymod", "ValueError"]),
+            FunctionPathKey::from_segments(["mymod", "simple_call"]),
             Signature::new(vec!["msg".into()], None, None),
         );
-        // Sanity: leaf-match alone would resolve the colliding user fn.
-        let leaf_hit = registry
-            .lookup_with_leaf_match(&FunctionPathKey::from_segments([
-                "simple_call",
-                "ValueError",
-            ]))
-            .expect("leaf-match must find the colliding user fn");
-        assert!(
-            leaf_hit.host_object.is_user_function(),
-            "leaf-match fallback resolves the registered user fn"
-        );
+        let expected = HOST_ENV
+            .lookup_builtin("ValueError")
+            .expect("bootstrap_builtin_exceptions must register ValueError");
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["simple_call".into(), "ValueError".into()],
+                    segments: vec!["simple_call".into()],
                 },
-                args: vec![vars[1].clone()],
+                args: vec![
+                    LinkArg::from(ConstValue::HostObject(expected.clone())),
+                    LinkArg::from(vars[1].clone()),
+                ],
                 result_ty: ValueType::Ref(None),
             },
         };
         let translated =
-            translate_op(&op, &value_map, &registry).expect("simple_call(<exc class>) must lower");
+            translate_op(&op, &value_map, &registry).expect("simple_call(const(class)) must lower");
         assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(translated[0].args.len(), 2);
         let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
             panic!("simple_call callable must be a Constant");
         };
         let ConstValue::HostObject(ref host) = callable.value else {
             panic!("callable must be ConstValue::HostObject");
         };
-        assert!(
-            !host.is_user_function(),
-            "exc_class branch must resolve the builtin class, not the leaf-match user fn"
-        );
-        let expected = HOST_ENV
-            .lookup_builtin("ValueError")
-            .expect("bootstrap_builtin_exceptions must register ValueError");
         assert_eq!(
             host, &expected,
-            "callable must be the builtin ValueError class HostObject"
+            "callable must be the args[0] class Constant, not a wrapped path"
+        );
+        assert!(
+            matches!(&translated[0].args[1], Hlvalue::Variable(_)),
+            "message arg must stay a Variable"
         );
     }
 
@@ -5861,7 +5883,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["int".into()],
                 },
-                args: vec![vars[1].clone()],
+                args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
             },
         };
@@ -5913,7 +5935,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__builtin__".into(), "float".into()],
                 },
-                args: vec![vars[1].clone()],
+                args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Float,
             },
         };
@@ -5962,7 +5984,7 @@ mod tests {
                         "cast_ptr_to_int".into(),
                     ],
                 },
-                args: vec![vars[1].clone()],
+                args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
             },
         };
@@ -6008,7 +6030,7 @@ mod tests {
                         "path".into(),
                     ],
                 },
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Int,
             },
         };
@@ -6023,11 +6045,11 @@ mod tests {
 
     #[test]
     fn translate_op_cast_pointer_marker_rebuilds_two_arg_upstream_call() {
-        // `__cast_pointer/<Root>` marker (front::mir
-        // `cast_pointer_marker_op`) reconstructs the upstream 2-arg
+        // `__cast_pointer` marker reconstructs the upstream 2-arg
         // `cast_pointer(PTRTYPE, ptr)` shape (lltype.py):
-        // constant callable + constant interned target class, then the
-        // pointer operand.
+        // constant callable + interned target class, then the
+        // pointer operand.  The frontend carries the root as a
+        // trailing ByteStr Constant.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 10);
@@ -6036,13 +6058,7 @@ mod tests {
         value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__cast_pointer".into(), "W_CastTarget".into()],
-                },
-                args: vec![vars[1].clone()],
-                result_ty: ValueType::Ref(Some("W_CastTarget".into())),
-            },
+            kind: crate::model::cast_pointer_call("W_CastTarget", vars[1].clone()),
         };
         let registry = empty_call_registry();
         let translated = translate_op(&op, &value_map, &registry)
@@ -6078,6 +6094,46 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_cast_instance_uses_trailing_root_constant() {
+        // `cast_instance_call` puts the target root at args[1] as a
+        // ByteStr Constant.  The adapter prepends the HOST_ENV
+        // callable and leaves that mixed list intact.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 10);
+        let operand = Variable::new();
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(operand.clone()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: crate::model::cast_instance_call("W_CastTarget", vars[1].clone()),
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("cast_instance_call must lower to simple_call");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(translated[0].args.len(), 3);
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be HostObject");
+        };
+        let expected = HOST_ENV
+            .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+            .expect("HOST_ENV must register __cast_instance_intrinsic");
+        assert_eq!(host, &expected);
+        assert!(
+            matches!(&translated[0].args[1], Hlvalue::Variable(v) if *v == operand),
+            "operand stays args[1] of simple_call"
+        );
+        let Hlvalue::Constant(ref root) = translated[0].args[2] else {
+            panic!("root must stay a trailing Constant");
+        };
+        assert_eq!(root.value.as_pystr(), Some("W_CastTarget"));
+    }
+
+    #[test]
     fn translate_op_call_synthetic_transparent_ctor_lowers_to_simple_call() {
         // Call::SyntheticTransparentCtor mirrors Rust's `Class { fields }`
         // ctor.  Flowspace still receives `simple_call(class_const, fields)`,
@@ -6092,7 +6148,7 @@ mod tests {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::synthetic_transparent_ctor("Point"),
-                args: vec![vars[1].clone()],
+                args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -6132,7 +6188,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_NEW.into()],
                 },
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -6163,7 +6219,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__majit_stringbuilder_new".into()],
                 },
-                args: vec![vars[2].clone()],
+                args: crate::model::call_args(vec![vars[2].clone()]),
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -6195,7 +6251,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_APPEND.into()],
                 },
-                args: vec![vars[1].clone(), vars[2].clone()],
+                args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Void,
             },
         };
@@ -6238,7 +6294,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.into()],
                 },
-                args: vec![vars[1].clone()],
+                args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -6339,7 +6395,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: segments.clone(),
                     },
-                    args: vars[..arity].to_vec(),
+                    args: crate::model::call_args(vars[..arity].iter().cloned()),
                     result_ty: ValueType::Bool,
                 },
             };
@@ -6407,7 +6463,7 @@ mod tests {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::method("push", Some("Vec".into())),
-                args: vec![vars[1].clone(), vars[2].clone()],
+                args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
             },
         };
@@ -6463,7 +6519,7 @@ mod tests {
                     trait_root: "MyTrait".into(),
                     method_name: "do_it".into(),
                 },
-                args: vec![vars[1].clone(), vars[2].clone()],
+                args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
             },
         };
@@ -6815,7 +6871,7 @@ mod tests {
             target: crate::model::CallTarget::FunctionPath {
                 segments: segs.iter().map(|s| s.to_string()).collect(),
             },
-            args: (0..argc).map(|_| Variable::new()).collect(),
+            args: crate::model::call_args((0..argc).map(|_| Variable::new())),
             result_ty: ValueType::Int,
         };
         assert!(!op_canraise(&core_call(
@@ -7062,7 +7118,7 @@ mod tests {
                     result: Some(vars[4].clone()),
                     kind: OpKind::Call {
                         target: crate::model::CallTarget::synthetic_transparent_ctor("Array"),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(Some("Array".to_string())),
                     },
                 },
@@ -7409,7 +7465,7 @@ mod tests {
                 result: Some(vars[2].clone()),
                 kind: OpKind::Call {
                     target: crate::model::CallTarget::UnsupportedExpr,
-                    args: vec![arg_var],
+                    args: crate::model::call_args(vec![arg_var]),
                     result_ty: ValueType::Int,
                 },
             }],

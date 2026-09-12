@@ -166,7 +166,7 @@ fn rewire_one_saturating_sub_site(
     let mut else_sources = carried.clone();
     for v in [&minuend, &subtrahend] {
         if !else_sources.contains(v) {
-            else_sources.push(v.clone());
+            else_sources.push(v.clone().into_variable());
         }
     }
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(carried.len());
@@ -225,8 +225,8 @@ fn rewire_one_saturating_sub_site(
         result: Some(cond.clone()),
         kind: OpKind::BinOp {
             op: "lt".to_string(),
-            lhs: minuend,
-            rhs: subtrahend,
+            lhs: minuend.into_variable(),
+            rhs: subtrahend.into_variable(),
             result_ty: ValueType::Unsigned,
         },
     });
@@ -255,7 +255,7 @@ mod tests {
                         "saturating_sub".into(),
                     ],
                 },
-                args,
+                args: crate::model::call_args(args),
                 result_ty: ValueType::Unsigned,
             },
             true,

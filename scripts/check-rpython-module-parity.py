@@ -1397,7 +1397,7 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "VirtualizableArrayField": "represented by Transformer.vable_array_vars metadata plus assertion diagnostics rather than a standalone exception payload",
         },
         "functions": {
-            "constant_fold_ll_issubclass": "Pyre has no cpu.rtyper.exceptiondata ll_issubclass direct-call shape in this transform pass; exception matching is lowered through typed Rust paths",
+            "constant_fold_ll_issubclass": "ported as constant_fold_ll_issubclass + constant_fold_ll_issubclass_flowgraph; identity is LowLevelFunction graph_key, not the helper name. Matcher is threaded from exceptiondata.fn_exception_match",
             "is_test_calldescr": "Rust tests use typed CallDescriptor values, not upstream's string/_for_tests_only calldescr sentinel",
         },
     },

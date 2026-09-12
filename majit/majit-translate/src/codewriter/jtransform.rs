@@ -416,6 +416,120 @@ pub fn transform_graph(
     transformer.transform(graph)
 }
 
+/// RPython `jtransform.py constant_fold_ll_issubclass(graph, cpu)` on
+/// the codewriter model graph. `cpu is None` here: the flowspace
+/// counterpart [`constant_fold_ll_issubclass_flowgraph`] is the one
+/// that sees `direct_call` Constants.
+pub fn constant_fold_ll_issubclass(
+    _graph: &mut FunctionGraph,
+    excmatch: Option<&crate::translator::rtyper::rtyper::LowLevelFunction>,
+) {
+    let Some(_) = excmatch else {
+        return;
+    };
+}
+
+/// RPython `jtransform.py constant_fold_ll_issubclass(graph, cpu)` on
+/// a flowspace graph — the shape `direct_call` still has
+/// `args[0].value._obj`.
+///
+/// Identity is `funcobj.graph == excmatch.graph_key()`, not the helper
+/// name. Evaluation is `rclass.ll_issubclass` on the two constant
+/// vtables. A match becomes `same_as` of a Bool constant; if that
+/// result is the exitswitch, the block is reclosed onto the taken
+/// exit.
+pub fn constant_fold_ll_issubclass_flowgraph(
+    graph: &crate::flowspace::model::FunctionGraph,
+    excmatch: Option<&crate::translator::rtyper::rtyper::LowLevelFunction>,
+) {
+    use crate::flowspace::model::{BlockRefExt, ConstValue, Constant, Hlvalue, SpaceOperation};
+    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+    let Some(excmatch) = excmatch else {
+        return;
+    };
+    let Some(excmatch_id) = excmatch.graph_key() else {
+        return;
+    };
+    let blocks = graph.iterblocks();
+    for block in blocks {
+        let n = block.borrow().operations.len();
+        for i in 0..n {
+            let op = block.borrow().operations[i].clone();
+            if op.opname != "direct_call" {
+                continue;
+            }
+            if op.args.is_empty() || !op.args.iter().all(|a| matches!(a, Hlvalue::Constant(_))) {
+                continue;
+            }
+            let Hlvalue::Constant(func_c) = &op.args[0] else {
+                continue;
+            };
+            let ConstValue::LLPtr(func_ptr) = &func_c.value else {
+                continue;
+            };
+            let Ok(_ptr_obj::Func(funcobj)) = func_ptr._obj() else {
+                continue;
+            };
+            if funcobj.graph != Some(excmatch_id) {
+                continue;
+            }
+            let mut vtables = Vec::new();
+            let mut all_vtables = true;
+            for arg in op.args.iter().skip(1) {
+                let Hlvalue::Constant(c) = arg else {
+                    all_vtables = false;
+                    break;
+                };
+                let ConstValue::LLPtr(p) = &c.value else {
+                    all_vtables = false;
+                    break;
+                };
+                vtables.push(p.clone());
+            }
+            if !all_vtables || vtables.len() != 2 {
+                continue;
+            }
+            let Ok(constant_result) =
+                crate::translator::rtyper::rclass::ll_issubclass(&vtables[0], &vtables[1])
+            else {
+                continue;
+            };
+            let same_as = SpaceOperation::new(
+                "same_as",
+                vec![Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::Bool(constant_result),
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                ))],
+                op.result.clone(),
+            );
+            block.borrow_mut().operations[i] = same_as;
+            let exitswitch_is_result = match &block.borrow().exitswitch {
+                Some(sw) => sw == &op.result,
+                None => false,
+            };
+            if exitswitch_is_result {
+                let kept: Vec<_> = block
+                    .borrow()
+                    .exits
+                    .iter()
+                    .filter(|link| {
+                        matches!(
+                            &link.borrow().exitcase,
+                            Some(Hlvalue::Constant(c))
+                                if c.value == ConstValue::Bool(constant_result)
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                block.borrow_mut().exitswitch = None;
+                if !kept.is_empty() {
+                    block.recloseblock(kept);
+                }
+            }
+        }
+    }
+}
+
 /// `jtransform.py integer_bounds(size, unsigned)`.
 pub fn integer_bounds(size: usize, unsigned: bool) -> (i128, i128) {
     if unsigned {
@@ -485,6 +599,10 @@ pub struct Transformer<'a> {
     /// RPython: DependencyTracker — caches transitive analysis results.
     /// Shared across all getcalldescr() calls within this transform pass.
     analysis_cache: crate::call::AnalysisCache,
+    /// RPython `Transformer.cpu.rtyper.exceptiondata.fn_exception_match`.
+    /// Threaded for `constant_fold_ll_issubclass`; `None` is the
+    /// `cpu is None` no-op arm.
+    excmatch: Option<&'a crate::translator::rtyper::rtyper::LowLevelFunction>,
 }
 
 /// RPython: jtransform.py vable_flags values
@@ -1247,7 +1365,18 @@ impl<'a> Transformer<'a> {
             vable_rewrites: 0,
             calls_classified: 0,
             analysis_cache: crate::call::AnalysisCache::default(),
+            excmatch: None,
         }
+    }
+
+    /// RPython `Transformer.__init__(cpu=...)` — only
+    /// `cpu.rtyper.exceptiondata.fn_exception_match` is consulted.
+    pub fn with_excmatch(
+        mut self,
+        excmatch: Option<&'a crate::translator::rtyper::rtyper::LowLevelFunction>,
+    ) -> Self {
+        self.excmatch = excmatch;
+        self
     }
 
     /// Set the CallControl for call kind dispatch.
@@ -1290,16 +1419,12 @@ impl<'a> Transformer<'a> {
         let mut rewritten = graph.clone();
         join_blocks(&mut rewritten);
 
-        // PRE-EXISTING-ADAPTATION: jtransform.py transform_graph starts with
-        // constant_fold_ll_issubclass(graph, cpu), folding constant calls to
-        // exceptiondata.fn_exception_match. Its counterpart remains unported.
-        // Class helper bodies now use ordinary registration/translation; the
-        // old name-based body exclusions and high-level call rewrites are gone.
-        // Convergence still needs the actual exception-match callable identity
-        // and prebuilt vtable representation, plus inline.py's
-        // rewire_exceptblock_with_guard / generic_exception_matching path
-        // currently refused by Inliner::inline_once. Do not replace the fold
-        // with a name-based class-helper shortcut.
+        // jtransform.py transform_graph starts with
+        // constant_fold_ll_issubclass(graph, cpu). The model-graph
+        // walk is a no-op unless a matcher is threaded in; residual
+        // `direct_call` Constants live on the flowspace graph and
+        // are folded by `constant_fold_ll_issubclass_flowgraph`.
+        constant_fold_ll_issubclass(&mut rewritten, self.excmatch);
 
         // RPython `rtyper/rpbc.py::SingleFrozenPBCRepr` resolves
         // zero-arg unit-variant PBC ctors to a singleton
@@ -1993,14 +2118,16 @@ impl<'a> Transformer<'a> {
             OpKind::Call { target, args, .. } if classify_hint_target(target).is_some() => {
                 let kind = classify_hint_target(target).expect("guard checked Some");
                 let label = target.to_string();
-                self.rewrite_op_hint(op, kind, args, &label, graph_name)
+                let args = crate::model::call_arg_vars(args);
+                self.rewrite_op_hint(op, kind, &args, &label, graph_name)
             }
             // `jtransform.py rewrite_op_jit_force_virtualizable`: the
             // rtyper-injected op, not `hint(x, force_virtualizable=True)`.
             // The front lowers the stand-in helper as a Call; dispatch it
             // here so it never reaches residual `CallMayForce`.
             OpKind::Call { target, args, .. } if is_jit_force_virtualizable_target(target) => {
-                self.rewrite_op_jit_force_virtualizable(args, graph_name)
+                let args = crate::model::call_arg_vars(args);
+                self.rewrite_op_jit_force_virtualizable(&args, graph_name)
             }
             // RPython `Transformer.rewrite_op_cast_opaque_ptr` aliases
             // only the explicit low-level operation. A ptr/int roundtrip
@@ -2078,7 +2205,8 @@ impl<'a> Transformer<'a> {
                 args,
                 result_ty,
             } if self.config.classify_calls => {
-                self.rewrite_op_direct_call(op, target, args, result_ty, graph_name, graph)
+                let args = crate::model::call_arg_vars(args);
+                self.rewrite_op_direct_call(op, target, &args, result_ty, graph_name, graph)
             }
             // ── rewrite_op_indirect_call ──
             // RPython jtransform.py:410-412. Pyre's rtyper-equivalent
@@ -2399,13 +2527,10 @@ impl<'a> Transformer<'a> {
                 }])
             }
             // RPython `jtransform.py` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`
-            // + `_rewrite_cmp_ptrs`: equality/inequality of two Ref operands is
-            // `ptr_eq`/`ptr_ne` (wired at `blackhole.py:585-590`), not `int_eq`/
-            // `int_ne`. Pyre's front-end emits a unified `BinOp { op: "eq"/"ne" }`
+            // + `_is_rclass_instance` → `instance_ptr_eq`/`instance_ptr_ne`.
+            // Pyre's front-end emits a unified `BinOp { op: "eq"/"ne" }`
             // because Rust's `==`/`!=` is one AST node regardless of operand type;
-            // the jtransform layer is where RPython branches on operand kind.
-            // Both operands Ref → rewrite to `ptr_eq`/`ptr_ne`. Mixed/Int operands
-            // stay as `int_eq`/`int_ne`.
+            // this arm is that rewrite. Mixed/Int operands stay as `int_eq`.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -2415,10 +2540,32 @@ impl<'a> Transformer<'a> {
                 && self.get_value_kind_var(lhs) == 'r'
                 && self.get_value_kind_var(rhs) == 'r' =>
             {
-                let new_op = if binop_name == "eq" {
-                    "ptr_eq"
+                let new_op = self.ptr_equality_opname(binop_name, lhs, rhs);
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::BinOp {
+                        op: new_op.into(),
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        result_ty: result_ty.clone(),
+                    },
+                }])
+            }
+            // Already-named `ptr_eq`/`ptr_ne` from rtyper `PtrRepr.rtype_eq`.
+            // `rewrite_op_ptr_eq` still promotes rclass instances.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if matches!(binop_name.as_str(), "ptr_eq" | "ptr_ne")
+                && self.is_rclass_instance(lhs)
+                && self.is_rclass_instance(rhs) =>
+            {
+                let new_op = if binop_name == "ptr_eq" {
+                    "instance_ptr_eq"
                 } else {
-                    "ptr_ne"
+                    "instance_ptr_ne"
                 };
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -2543,92 +2690,20 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Replace(ops)
             }
-            // PRE-EXISTING-ADAPTATION (no direct RPython precedent): pyre-
-            // side recovery when integer comparisons reach jtransform with
-            // a Ref-typed operand because the rtyper-equivalent did not
-            // stamp the operand's `concretetype` (or an `lltype.
-            // cast_ptr_to_int` was elided from the SSA chain).  RPython's
-            // rtyper inserts the cast at the rtyper layer
-            // (`rpython/rtyper/rint.py`), so by the time `jtransform.py`
-            // observes the comparison the operands are uniformly `Signed`;
-            // pyre's lighter rtyper leaves the generic `BinOp` in place
-            // with one or both operands defaulting to `'r'` kind, so the
-            // unconditional `int_<op>` prefix at
-            // `assembler.rs`'s `op_kind_to_opname_with_kinds` would emit `int_eq/ir>i` /
-            // `int_le/ri>i` opnames that no RPython blackhole handler
-            // registers (see
-            // `default_bh_builder_unwired_set_matches_task_85_snapshot`).
-            //
-            // Coverage covers all six
-            // comparison ops (`eq`/`ne`/`lt`/`le`/`gt`/`ge`).  The
-            // earlier "eq/ne only" restriction surfaced `int_le/r*`
-            // as unwired blackhole opnames, breaking the expected-empty
-            // snapshot.  RPython has no `ptr_lt` family,
-            // but `cast_ptr_to_int` followed by `int_lt`/`int_le`
-            // matches what `rpython/rtyper/rint.py` emits for any
-            // comparison whose operands cross the ptr/int boundary —
-            // the cast is rtyper-orthodox, the resulting `int_<cmp>/ii>i`
-            // opname is wired by the blackhole.  Producer-side fix
-            // for the missing rtyper cast remains the canonical
-            // convergence path; this jtransform recovery is the
-            // bridge until that lands.
-            // eq/ne with BOTH operands ref-kind → emit ptr_eq / ptr_ne
-            // directly.  PyPy `rpython/rtyper/rptr.py:167-184
-            // pairtype(PtrRepr, Repr).rtype_eq/ne` calls
-            // `hop.inputargs(r_ptr, r_ptr)` (both already ptr-typed in
-            // this branch — no cast) and emits `ptr_eq` / `ptr_ne`.
-            // Pyre's blackhole has `bhimpl_ptr_eq` / `bhimpl_ptr_ne`
-            // wired at `bh_binop_r_to_i`, so the resulting
-            // `ptr_eq/rr>i` opname dispatches without going through
-            // `cast_ptr_to_int`.
+            // Ordered compare with a Ref operand. RPython has no `ptr_lt`
+            // family (`rptr.py` registers only eq/ne). The producer is
+            // `front::mir` `BinaryOp`: `p < q` lowers to
+            // `simple_call(lltype.cast_ptr_to_int)` then `int_lt`
+            // (`rbuiltin.py rtype_cast_ptr_to_int`). Graphs that still
+            // arrive bare (Skip arm, elided cast, hand-built fixtures)
+            // are coerced here so assembler does not emit the unwired
+            // `int_le/r*` blackhole names. Do not add `ptr_lt`.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
                 rhs,
                 result_ty,
-            } if matches!(binop_name.as_str(), "eq" | "ne")
-                && self.get_value_kind_var(lhs) == 'r'
-                && self.get_value_kind_var(rhs) == 'r' =>
-            {
-                self.stamp_value_kind(
-                    graph,
-                    op.result.clone(),
-                    crate::codewriter::type_state::ConcreteType::Signed,
-                );
-                let ptr_op = if binop_name == "eq" {
-                    "ptr_eq"
-                } else {
-                    "ptr_ne"
-                };
-                RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::BinOp {
-                        op: ptr_op.into(),
-                        lhs: lhs.clone(),
-                        rhs: rhs.clone(),
-                        result_ty: result_ty.clone(),
-                    },
-                }])
-            }
-            // Mixed-kind eq/ne (one ref + one int) or any ordered
-            // ref-cmp (lt/le/gt/ge with a ref operand) — PRE-EXISTING
-            // ADAPTATION: pyre's frontend admits source patterns
-            // RPython does not (PyPy `rptr.py` only registers eq/ne for
-            // PtrRepr pairtype, never `<`/`<=`/`>`/`>=`; mixed
-            // ref+int eq/ne would surface as a TyperError at PyPy's
-            // `inputargs(r_ptr, r_ptr)` convertfromrepr step).  Pyre
-            // bridges by coercing every ref operand through
-            // `cast_ptr_to_int` and emitting `int_<op>`.  The canonical
-            // PyPy-orthodox close is fixing the source patterns
-            // upstream (use `is_null()` / explicit `as` cast) or
-            // moving the cast emission into pyre's rtyper rint
-            // compare-template; this is not yet implemented.
-            OpKind::BinOp {
-                op: binop_name,
-                lhs,
-                rhs,
-                result_ty,
-            } if matches!(binop_name.as_str(), "eq" | "ne" | "lt" | "le" | "gt" | "ge")
+            } if matches!(binop_name.as_str(), "lt" | "le" | "gt" | "ge")
                 && matches!(self.get_value_kind_var(lhs), 'i' | 'r')
                 && matches!(self.get_value_kind_var(rhs), 'i' | 'r')
                 && (self.get_value_kind_var(lhs) == 'r' || self.get_value_kind_var(rhs) == 'r') =>
@@ -2897,25 +2972,16 @@ impl<'a> Transformer<'a> {
                 } else {
                     "floordiv"
                 };
-                // TODO: no direct RPython precedent:
-                // pyre-side recovery when an explicit
-                // `lltype.cast_ptr_to_int` (`rbuiltin.py
-                // genop('cast_ptr_to_int', vlist, resulttype=Signed)`)
-                // emitted by the front-end is elided from the SSA chain
-                // before reaching jtransform.  The gate accepts a
-                // Ref-typed LHS/RHS and rebuilds the missing cast here
-                // so the residual call sees Signed operands.  RPython
-                // `rint.py rtype_mod` does NOT auto-cast
-                // arbitrary Ref operands; its `hop.inputargs(repr,
-                // repr)` assumes the rtyper has already inserted
-                // explicit casts at lltype / rbuiltin boundaries.  The
-                // wider tolerance here is therefore strictly broader
-                // than the RPython contract and exists only to keep the
-                // dispatch table closed while the upstream cast-
-                // elision is traced and fixed (the convergence path is
-                // to find which simplify / inline pass drops the cast
-                // and preserve it instead, then narrow this gate back
-                // to `'i' && 'i'`).
+                // The producer is `front::mir` `BinaryOp`: `%` / `/`
+                // over a Ref operand lowers to
+                // `simple_call(lltype.cast_ptr_to_int)` then the
+                // integer op (`rbuiltin.py rtype_cast_ptr_to_int`),
+                // with the result stamped Signed. An `Unknown`
+                // stamp used to make `get_value_kind_var` report
+                // `'r'` and look like the cast had been dropped.
+                // `rint.py rtype_mod` does not auto-cast Refs.
+                // Graphs that still arrive bare (Skip arm,
+                // hand-built fixtures) are coerced here.
                 let (lhs_var, lhs_pre_ops) = self.coerce_operand_to_int(graph, lhs);
                 let (rhs_var, rhs_pre_ops) = self.coerce_operand_to_int(graph, rhs);
                 let mut ops = Vec::with_capacity(lhs_pre_ops.len() + rhs_pre_ops.len() + 2);
@@ -3299,6 +3365,45 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// RPython `Transformer._is_rclass_instance`
+    /// (`jtransform.py`): `lltype._castdepth(v.concretetype.TO, rclass.OBJECT) >= 0`.
+    fn is_rclass_instance(&self, var: &crate::flowspace::model::Variable) -> bool {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        use crate::translator::rtyper::rclass::OBJECT;
+        let Some(ct) = var.concretetype() else {
+            return false;
+        };
+        let LowLevelType::Ptr(ptr) = ct else {
+            return false;
+        };
+        let PtrTarget::Struct(outside) = &ptr.TO else {
+            return false;
+        };
+        let LowLevelType::Struct(object) = &*OBJECT else {
+            return false;
+        };
+        crate::translator::rtyper::lltypesystem::lltype::_castdepth(outside, object) >= 0
+    }
+
+    /// `rewrite_op_ptr_eq` / `rewrite_op_ptr_ne` opname after the
+    /// rclass-instance promotion.
+    fn ptr_equality_opname(
+        &self,
+        eq_or_ne: &str,
+        lhs: &crate::flowspace::model::Variable,
+        rhs: &crate::flowspace::model::Variable,
+    ) -> &'static str {
+        match (
+            eq_or_ne,
+            self.is_rclass_instance(lhs) && self.is_rclass_instance(rhs),
+        ) {
+            ("eq", true) => "instance_ptr_eq",
+            ("ne", true) => "instance_ptr_ne",
+            ("eq", false) => "ptr_eq",
+            _ => "ptr_ne",
+        }
+    }
+
     fn get_value_type(&self, var: &crate::flowspace::model::Variable) -> Option<ValueType> {
         // RPython `jit/codewriter/jtransform.py`: `getkind(v.concretetype)`
         // — read kind off the Variable.concretetype slot directly.
@@ -3424,18 +3529,13 @@ impl<'a> Transformer<'a> {
         )
     }
 
-    /// TODO: recovery helper — no direct RPython
-    /// precedent.  Inserts an explicit `cast_ptr_to_int` op for a
-    /// Ref-typed operand reaching an arithmetic site that requires
-    /// Int operands.  Upstream RPython does NOT auto-cast arbitrary
-    /// Ref to Signed at the rtyper boundary; ptr→int conversions come
-    /// from explicit `lltype.cast_ptr_to_int` builtins emitted at the
-    /// rbuiltin layer.  Pyre's analyzer/simplify chain may elide an
-    /// emitted cast before jtransform sees it, leaving a bare Ref at
-    /// the binop callsite; this helper rebuilds the missing cast so
-    /// the residual call sees Signed operands.  The convergence path
-    /// is to fix the cast elision upstream and retire this helper.
-    /// Non-Ref operands are returned unchanged.
+    /// Recovery helper — no direct RPython precedent. Inserts
+    /// `cast_ptr_to_int` for a Ref operand at an integer site.
+    /// The producer is `front::mir` `BinaryOp` (`simple_call` to
+    /// `lltype.cast_ptr_to_int`, `rbuiltin.py rtype_cast_ptr_to_int`).
+    /// This rebuilds a cast that was elided or never lowered (Skip
+    /// arm, hand-built fixtures). Retire once those graphs stop
+    /// arriving. Non-Ref operands are unchanged.
     fn coerce_operand_to_int(
         &mut self,
         graph: &mut FunctionGraph,
@@ -4394,7 +4494,7 @@ impl<'a> Transformer<'a> {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
                     },
-                    args: args.to_vec(),
+                    args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
                 },
             };
@@ -4768,15 +4868,22 @@ impl<'a> Transformer<'a> {
         // upstream `cast_pointer` op, see `cast_pointer_marker_op`)
         // folds back to the operand alias and emits no jitcode op.
         if let CallTarget::FunctionPath { segments } = target
-            && segments.len() == 2
-            && segments[0] == "__cast_pointer"
+            && segments.as_slice() == ["__cast_pointer"]
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
         }
-        // `__cast_instance_intrinsic/<Root>` — front::mir's pointer-downcast
-        // narrow (#298, `mir.rs` emits `Call(["__cast_instance_intrinsic",
-        // root], [v])` for a `Ref → *Struct` reinterpret).  The rtyper
+        // Skip-path graphs never run `rtype_type`. Flatten's raise tail
+        // reads only evalue (`flatten.py make_return`), so fold
+        // `op.type(v)` to the operand and leave no residual call.
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.as_slice() == ["type"]
+            && args.len() == 1
+        {
+            return RewriteResult::Identity(args[0].clone());
+        }
+        // `__cast_instance_intrinsic` — front::mir's pointer-downcast
+        // narrow (`cast_instance_call`: operand + const(root)).  The rtyper
         // lowers it to `cast_pointer` (`rbuiltin.rs rtype_cast_instance_intrinsic`,
         // `exception_cannot_occur`), which jtransform folds to `same_as`;
         // the charon front-end skips the rtyper, so fold the marker to the
@@ -4788,10 +4895,10 @@ impl<'a> Transformer<'a> {
         // from its erasure than from its downcast, so it folds the same
         // way: the operand alias, no jitcode op.
         if let CallTarget::FunctionPath { segments } = target
-            && ((segments.len() == 2 && segments[0] == crate::runtime_names::shims::CAST_INSTANCE)
-                || (segments.len() == 1
-                    && segments[0] == crate::runtime_names::shims::CAST_ADDRESS))
-            && args.len() == 1
+            && ((segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE]
+                && args.len() == 1)
+                || (segments.as_slice() == [crate::runtime_names::shims::CAST_ADDRESS]
+                    && args.len() == 1))
         {
             return RewriteResult::Identity(args[0].clone());
         }
@@ -6582,7 +6689,7 @@ impl<'a> Transformer<'a> {
                     graph,
                     op,
                     target,
-                    &original_args,
+                    &crate::model::call_arg_vars(&original_args),
                     result_ty,
                     graph_name,
                     OopSpecIndex::NotInTrace,
@@ -6722,7 +6829,7 @@ impl<'a> Transformer<'a> {
             result: op.result.clone(),
             kind: OpKind::Call {
                 target: func_target.clone(),
-                args: func_args.to_vec(),
+                args: crate::model::call_args(func_args.iter().cloned()),
                 result_ty: result_ty.clone(),
             },
         };
@@ -8673,14 +8780,14 @@ fn remap_op(
             target,
             args,
             result_ty,
-        } => {
-            let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
-            OpKind::Call {
-                target: target.clone(),
-                args: args.iter().map(remap_var).collect(),
-                result_ty: result_ty.clone(),
-            }
-        }
+        } => OpKind::Call {
+            target: target.clone(),
+            args: args
+                .iter()
+                .map(|arg| arg.map_value(|var| remap_value(var, aliases)))
+                .collect(),
+            result_ty: result_ty.clone(),
+        },
         OpKind::GuardTrue { cond } => OpKind::GuardTrue {
             cond: remap_value(cond, aliases),
         },
@@ -9003,7 +9110,7 @@ fn fold_we_are_jitted_calls(graph: &mut crate::model::FunctionGraph) {
             else {
                 continue;
             };
-            if !is_we_are_jitted_path(segments, args) {
+            if !is_we_are_jitted_path(segments, &crate::model::call_arg_vars(args)) {
                 continue;
             }
             op.kind = OpKind::ConstSymbolic {
@@ -11753,7 +11860,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_fresh_virtualizable"]),
-                args: vec![frame_var],
+                args: crate::model::call_args(vec![frame_var]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -11897,7 +12004,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_fresh_virtualizable"]),
-                args: vec![frame_var],
+                args: crate::model::call_args(vec![frame_var]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -12104,7 +12211,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_fresh_virtualizable"]),
-                args: vec![frame_var],
+                args: crate::model::call_args(vec![frame_var]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -12165,7 +12272,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_fresh_virtualizable"]),
-                args: vec![frame],
+                args: crate::model::call_args(vec![frame]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -12408,7 +12515,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::method("do_call", Some("Frame".into())),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -12442,7 +12549,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::function_path(["unknown_external_int"]),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -12813,7 +12920,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: target.clone(),
-                args: vec![arg_var],
+                args: crate::model::call_args(vec![arg_var]),
                 result_ty: ValueType::Ref(None),
             },
             true,
@@ -12862,7 +12969,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::function_path(["__builtin__", "float"]),
-                    args: vec![arg],
+                    args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Float,
                 },
                 true,
@@ -12893,7 +13000,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["custom_reader"]),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
             },
             true,
@@ -12945,7 +13052,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: target.clone(),
-                args: vec![arg],
+                args: crate::model::call_args(vec![arg]),
                 result_ty: ValueType::Void,
             },
             false,
@@ -13011,7 +13118,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_access_directly"]),
-                args: vec![frame_var],
+                args: crate::model::call_args(vec![frame_var]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -13069,7 +13176,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_force_virtualizable"]),
-                args: vec![frame_var.clone()],
+                args: crate::model::call_args(vec![frame_var.clone()]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -13142,7 +13249,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["jit_force_virtualizable"]),
-                args: vec![frame_var.clone()],
+                args: crate::model::call_args(vec![frame_var.clone()]),
                 result_ty: ValueType::Void,
             },
             false,
@@ -13253,7 +13360,7 @@ mod tests {
             startblock,
             OpKind::Call {
                 target,
-                args: vec![x.clone(), y.clone()],
+                args: crate::model::call_args(vec![x.clone(), y.clone()]),
                 result_ty: ValueType::Void,
             },
             false,
@@ -13297,7 +13404,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote"]),
-                args: vec![v_var.clone()],
+                args: crate::model::call_args(vec![v_var.clone()]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -13364,7 +13471,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote"]),
-                args: vec![v_var.clone()],
+                args: crate::model::call_args(vec![v_var.clone()]),
                 result_ty: ValueType::Void,
             },
             false,
@@ -13621,7 +13728,7 @@ mod tests {
                         "jit_merge_point",
                         Some("UnpackIterableJitDriver".into()),
                     ),
-                    args: vec![receiver.clone(), green.clone()],
+                    args: crate::model::call_args(vec![receiver.clone(), green.clone()]),
                     result_ty: ValueType::Void,
                 },
             });
@@ -13895,7 +14002,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::method("can_enter_jit", Some("PyPyJitDriver".into())),
-                    args: vec![receiver],
+                    args: crate::model::call_args(vec![receiver]),
                     result_ty: ValueType::Bool,
                 },
                 true,
@@ -14556,13 +14663,40 @@ mod tests {
         let mut graph = FunctionGraph::new("cast_ptr_marker");
         let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let target = CallTarget::function_path(["__cast_pointer", "W_CastTarget"]);
+        let target = CallTarget::function_path(["__cast_pointer"]);
         let result_ty = ValueType::Ref(Some("W_CastTarget".into()));
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: crate::model::cast_pointer_call("W_CastTarget", arg.clone()),
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "cast_ptr_marker",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    #[test]
+    fn type_op_elides_to_operand_on_the_skip_path() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("type_skip");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["type"]);
+        let result_ty = ValueType::Ref(None);
         let op = SpaceOperation {
             result: Some(result_var),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![arg.clone()],
+                args: crate::model::call_args(vec![arg.clone()]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -14571,7 +14705,7 @@ mod tests {
             &target,
             std::slice::from_ref(&arg),
             &result_ty,
-            "cast_ptr_marker",
+            "type_skip",
             &mut graph,
         );
         match rewritten {
@@ -14665,7 +14799,7 @@ mod tests {
                 result: Some(result),
                 kind: OpKind::Call {
                     target: target.clone(),
-                    args: vec![operand.clone()],
+                    args: crate::model::call_args(vec![operand.clone()]),
                     result_ty: result_ty.clone(),
                 },
             };
@@ -14706,7 +14840,7 @@ mod tests {
             result: Some(result_var),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![arg.clone()],
+                args: crate::model::call_args(vec![arg.clone()]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -14752,7 +14886,7 @@ mod tests {
             result: Some(as_int.clone()),
             kind: OpKind::Call {
                 target: to_int.clone(),
-                args: vec![ptr.clone()],
+                args: crate::model::call_args(vec![ptr.clone()]),
                 result_ty: ValueType::Int,
             },
         };
@@ -14768,7 +14902,7 @@ mod tests {
             result: Some(as_ptr),
             kind: OpKind::Call {
                 target: to_ptr.clone(),
-                args: vec![as_int.clone()],
+                args: crate::model::call_args(vec![as_int.clone()]),
                 result_ty: ValueType::Ref(None),
             },
         };
@@ -14807,7 +14941,7 @@ mod tests {
                 result: Some(result_var),
                 kind: OpKind::Call {
                     target: target.clone(),
-                    args: vec![arg.clone()],
+                    args: crate::model::call_args(vec![arg.clone()]),
                     result_ty: result_ty.clone(),
                 },
             };
@@ -14861,7 +14995,7 @@ mod tests {
             result: Some(result_var),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![arg.clone()],
+                args: crate::model::call_args(vec![arg.clone()]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -15046,7 +15180,7 @@ mod tests {
             result: Some(result_var.clone()),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -15111,7 +15245,7 @@ mod tests {
             result: Some(result_var.clone()),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -15167,7 +15301,7 @@ mod tests {
             result: Some(result_var.clone()),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -15205,7 +15339,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target,
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Bool,
                 },
                 true,
@@ -15239,7 +15373,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target,
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Bool,
                 },
                 true,
@@ -15278,7 +15412,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target,
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Bool,
                 },
                 true,
@@ -15325,7 +15459,7 @@ mod tests {
                     entry,
                     OpKind::Call {
                         target: CallTarget::function_path(path),
-                        args: vec![],
+                        args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Ref(None),
                     },
                     true,
@@ -15362,7 +15496,7 @@ mod tests {
             result: Some(result_var.clone()),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -15402,7 +15536,7 @@ mod tests {
             result: Some(result_var.clone()),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -15438,7 +15572,7 @@ mod tests {
             result: Some(result_var),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -15472,7 +15606,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: target.clone(),
-                    args: vec![],
+                    args: crate::model::call_args(vec![]),
                     result_ty: result_ty.clone(),
                 },
                 true,
@@ -15535,7 +15669,7 @@ mod tests {
             result: Some(result_var.clone()),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -15577,7 +15711,7 @@ mod tests {
             result: Some(result_var.clone()),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: vec![],
+                args: crate::model::call_args(vec![]),
                 result_ty: result_ty.clone(),
             },
         };
@@ -15738,7 +15872,7 @@ mod tests {
             entry,
             OpKind::Call {
                 target: target.clone(),
-                args: vec![value.clone()],
+                args: crate::model::call_args(vec![value.clone()]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -15794,7 +15928,7 @@ mod tests {
             entry,
             OpKind::Call {
                 target: target.clone(),
-                args: vec![value.clone()],
+                args: crate::model::call_args(vec![value.clone()]),
                 result_ty: ValueType::Float,
             },
             false,
@@ -15850,7 +15984,7 @@ mod tests {
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["libffi_call"]),
-                args: vec![cif, func, buffer],
+                args: crate::model::call_args(vec![cif, func, buffer]),
                 result_ty: ValueType::Void,
             },
             false,
@@ -16097,7 +16231,7 @@ mod tests {
             result: Some(result_var),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: args.clone(),
+                args: crate::model::call_args(args.clone()),
                 result_ty: result_ty.clone(),
             },
         };
@@ -16162,7 +16296,7 @@ mod tests {
             result: Some(result_var),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: args.clone(),
+                args: crate::model::call_args(args.clone()),
                 result_ty: result_ty.clone(),
             },
         };
@@ -16230,7 +16364,7 @@ mod tests {
             result: Some(result_var),
             kind: OpKind::Call {
                 target: target.clone(),
-                args: args.clone(),
+                args: crate::model::call_args(args.clone()),
                 result_ty: result_ty.clone(),
             },
         };
@@ -16289,7 +16423,7 @@ mod tests {
             result: None,
             kind: OpKind::Call {
                 target: CallTarget::function_path(["ll_arraymove"]),
-                args: args.clone(),
+                args: crate::model::call_args(args.clone()),
                 result_ty: ValueType::Void,
             },
         };
@@ -16434,7 +16568,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("Handler", "run"),
-                args: vec![receiver_var],
+                args: crate::model::call_args(vec![receiver_var]),
                 result_ty: ValueType::Void,
             },
             true,
@@ -16528,7 +16662,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("Handler", "run"),
-                args: vec![receiver_var],
+                args: crate::model::call_args(vec![receiver_var]),
                 result_ty: ValueType::Void,
             },
             true,
@@ -16690,7 +16824,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("T", "m"),
-                args: args_vars,
+                args: crate::model::call_args(args_vars),
                 result_ty,
             },
             has_result,
@@ -16948,7 +17082,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("T", "m"),
-                args: args_vars,
+                args: crate::model::call_args(args_vars),
                 result_ty,
             },
             has_result,
@@ -17095,7 +17229,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_or_string"]),
-                args: vec![v_var],
+                args: crate::model::call_args(vec![v_var]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -17126,7 +17260,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_or_string"]),
-                args: vec![v_var.clone()],
+                args: crate::model::call_args(vec![v_var.clone()]),
                 result_ty: ValueType::Int,
             },
             false,
@@ -17166,7 +17300,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_string"]),
-                args: vec![v_var],
+                args: crate::model::call_args(vec![v_var]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -17201,7 +17335,7 @@ mod tests {
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_unicode"]),
-                args: vec![v_var],
+                args: crate::model::call_args(vec![v_var]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -17473,7 +17607,7 @@ mod tests {
             startblock,
             OpKind::Call {
                 target,
-                args: vec![count.clone()],
+                args: crate::model::call_args(vec![count.clone()]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -17530,7 +17664,7 @@ mod tests {
             startblock,
             OpKind::Call {
                 target,
-                args: vec![lhs.clone(), rhs.clone()],
+                args: crate::model::call_args(vec![lhs.clone(), rhs.clone()]),
                 result_ty: ValueType::Int,
             },
             false,
@@ -17594,7 +17728,7 @@ mod tests {
             startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["_ll_alloc_and_clear"]),
-                args: vec![count.clone()],
+                args: crate::model::call_args(vec![count.clone()]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -17652,7 +17786,7 @@ mod tests {
             startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["_ll_fixed_alloc_and_clear"]),
-                args: vec![count.clone()],
+                args: crate::model::call_args(vec![count.clone()]),
                 result_ty: ValueType::Ref(None),
             },
             false,
@@ -18455,6 +18589,405 @@ mod tests {
                 "`x == 5` stays a binary compare: {ops:?}"
             );
         }
+
+        #[test]
+        fn an_ordered_compare_over_refs_inserts_cast_ptr_to_int() {
+            let mut graph = FunctionGraph::new("ordered_ref_lt");
+            let lhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "a".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let rhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "b".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "lt".into(),
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
+            FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::GcRef);
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            let casts: Vec<_> = ops
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::UnaryOp { op, operand, .. } if op == "cast_ptr_to_int" => {
+                        Some(operand.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                casts.len(),
+                2,
+                "each Ref operand must become a Signed address: {ops:?}"
+            );
+            let (op, _, _) = binary_op(ops).expect("the compare must survive");
+            assert_eq!(op, "lt", "do not invent ptr_lt: {ops:?}");
+        }
+
+        #[test]
+        fn a_mod_over_refs_inserts_cast_ptr_to_int() {
+            let mut graph = FunctionGraph::new("mod_ref");
+            let lhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "a".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let rhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "b".into(),
+                        ty: ValueType::Int,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "mod".into(),
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
+            FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::Signed);
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            let casts = ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"
+                    )
+                })
+                .count();
+            assert_eq!(
+                casts, 1,
+                "the Ref operand must become a Signed address: {ops:?}"
+            );
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(&op.kind, OpKind::CallResidual { .. })),
+                "mod over ints is the C-trunc residual, not ptr_mod: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn two_rclass_instance_refs_become_instance_ptr_eq() {
+            let mut graph = FunctionGraph::new("instance_ptr_eq");
+            let lhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "a".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let rhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "b".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "eq".into(),
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
+            FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::GcRef);
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            let (op, _, _) = binary_op(ops).expect("the compare must survive");
+            assert_eq!(
+                op, "instance_ptr_eq",
+                "OBJECTPTR-stamped refs are rclass instances: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_fold_ll_issubclass_is_a_noop_without_the_matcher() {
+        let mut graph = FunctionGraph::new("no_cpu");
+        let before = graph.clone();
+        super::constant_fold_ll_issubclass(&mut graph, None);
+        assert_eq!(
+            graph.blocks.len(),
+            before.blocks.len(),
+            "jtransform.py returns immediately when cpu is None"
+        );
+    }
+
+    /// Allocate a vtable and write `subclassrange_{min,max}`.
+    /// Mirrors `rtyper.rs` test helper `make_const_etype`.
+    fn make_const_etype(min: i64, max: i64) -> crate::flowspace::model::Hlvalue {
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, LowLevelValue, MallocFlavor, malloc,
+        };
+        let vtable_lltype = match crate::translator::rtyper::rclass::OBJECT_VTABLE.clone() {
+            LowLevelType::ForwardReference(fwd) => fwd
+                .resolved()
+                .expect("OBJECT_VTABLE forward-reference must be resolved"),
+            other => other,
+        };
+        let mut vtable_ptr =
+            malloc(vtable_lltype, None, MallocFlavor::Raw, true).expect("malloc OBJECT_VTABLE");
+        vtable_ptr
+            .setattr("subclassrange_min", LowLevelValue::Signed(min))
+            .expect("setattr subclassrange_min");
+        vtable_ptr
+            .setattr("subclassrange_max", LowLevelValue::Signed(max))
+            .expect("setattr subclassrange_max");
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(vtable_ptr)),
+            crate::translator::rtyper::rclass::CLASSTYPE.clone(),
+        ))
+    }
+
+    fn fold_direct_call_to_matcher(
+        matcher: &crate::translator::rtyper::rtyper::LowLevelFunction,
+        func_ptr: crate::translator::rtyper::lltypesystem::lltype::_ptr,
+        sub: crate::flowspace::model::Hlvalue,
+        cls: crate::flowspace::model::Hlvalue,
+    ) -> crate::flowspace::model::SpaceOperation {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, Hlvalue, Link,
+            SpaceOperation, Variable,
+        };
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let result = Hlvalue::Variable(Variable::named("r"));
+        let start = Block::shared(vec![]);
+        let if_false = Block::shared(vec![]);
+        let if_true = Block::shared(vec![]);
+        if_false.borrow_mut().mark_final();
+        if_true.borrow_mut().mark_final();
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(func_ptr.clone())),
+                    LowLevelType::Ptr(Box::new(func_ptr._TYPE.clone())),
+                )),
+                sub,
+                cls,
+            ],
+            result.clone(),
+        ));
+        start.borrow_mut().exitswitch = Some(result.clone());
+        start.closeblock(vec![
+            Link::new(
+                vec![],
+                Some(if_false),
+                Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+            )
+            .into_ref(),
+            Link::new(
+                vec![],
+                Some(if_true),
+                Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+            )
+            .into_ref(),
+        ]);
+        let graph = FlowGraph::new("fold_ll_issubclass", start.clone());
+        super::constant_fold_ll_issubclass_flowgraph(&graph, Some(matcher));
+        let start_b = start.borrow();
+        assert!(
+            start_b.exitswitch.is_none(),
+            "jtransform.py clears exitswitch when the folded result is the switch"
+        );
+        assert_eq!(
+            start_b.exits.len(),
+            1,
+            "recloseblock keeps only the taken exit"
+        );
+        start_b.operations[0].clone()
+    }
+
+    #[test]
+    fn constant_fold_ll_issubclass_folds_constant_vtables() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{ConstValue, Hlvalue};
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper
+            .exceptiondata()
+            .expect("exceptiondata")
+            .make_helpers(&rtyper)
+            .expect("make_helpers");
+        let ed = rtyper.exceptiondata().expect("exceptiondata");
+        let matcher = ed
+            .fn_exception_match
+            .borrow()
+            .clone()
+            .expect("fn_exception_match after make_helpers");
+        let func_ptr = rtyper
+            .getcallable(matcher.graph.as_ref().expect("matcher graph"))
+            .expect("getcallable(fn_exception_match)");
+
+        // cls.min=0, cls.max=10, sub.min=1 → 0 <= 1 < 10
+        let folded = fold_direct_call_to_matcher(
+            &matcher,
+            func_ptr.clone(),
+            make_const_etype(1, 2),
+            make_const_etype(0, 10),
+        );
+        assert_eq!(folded.opname, "same_as");
+        match &folded.args[0] {
+            Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::Bool(true)),
+            other => panic!("expected Bool(true), got {other:?}"),
+        }
+
+        // cls.min=0, cls.max=10, sub.min=20 → 0 <= 20 < 10 is false
+        let folded = fold_direct_call_to_matcher(
+            &matcher,
+            func_ptr,
+            make_const_etype(20, 21),
+            make_const_etype(0, 10),
+        );
+        assert_eq!(folded.opname, "same_as");
+        match &folded.args[0] {
+            Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::Bool(false)),
+            other => panic!("expected Bool(false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constant_fold_ll_issubclass_ignores_a_different_funcptr() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{
+            Block, ConstValue, Constant, FunctionGraph as FlowGraph, Hlvalue, SpaceOperation,
+            Variable,
+        };
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, functionptr_for_graph_with_type,
+        };
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper
+            .exceptiondata()
+            .expect("exceptiondata")
+            .make_helpers(&rtyper)
+            .expect("make_helpers");
+        let ed = rtyper.exceptiondata().expect("exceptiondata");
+        let matcher = ed
+            .fn_exception_match
+            .borrow()
+            .clone()
+            .expect("fn_exception_match after make_helpers");
+
+        // A different helper graph — identity is the graph key, not the
+        // string `ll_issubclass`.
+        let other = rtyper
+            .lowlevel_helper_function(
+                "ll_both_none",
+                vec![
+                    crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+                    crate::translator::rtyper::rclass::NONGCOBJECTPTR.clone(),
+                ],
+                LowLevelType::Bool,
+            )
+            .expect("ll_both_none helper");
+        let other_ptr = functionptr_for_graph_with_type(
+            &other.graph.as_ref().expect("other graph").graph,
+            FuncType {
+                args: vec![
+                    crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+                    crate::translator::rtyper::rclass::NONGCOBJECTPTR.clone(),
+                ],
+                result: LowLevelType::Bool,
+            },
+        );
+
+        let result = Hlvalue::Variable(Variable::named("r"));
+        let start = Block::shared(vec![]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(other_ptr.clone())),
+                    LowLevelType::Ptr(Box::new(other_ptr._TYPE.clone())),
+                )),
+                make_const_etype(1, 2),
+                make_const_etype(0, 10),
+            ],
+            result,
+        ));
+        let graph = FlowGraph::new("not_excmatch", start.clone());
+        super::constant_fold_ll_issubclass_flowgraph(&graph, Some(&matcher));
+        assert_eq!(
+            start.borrow().operations[0].opname,
+            "direct_call",
+            "a funcptr whose graph is not fn_exception_match must stay"
+        );
     }
 
     /// `goto_if_not_fusable` names the RPython opnames (`int_lt`), but the

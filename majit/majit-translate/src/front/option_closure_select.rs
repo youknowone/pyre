@@ -185,20 +185,12 @@ fn rewire_one_closure_select_site(
         (site.result_var.clone(), None, ci)
     } else if ci + 2 == ops_len {
         let cast = &graph.blocks[a].operations[ci + 1];
-        match (&cast.kind, cast.result.as_ref()) {
-            (
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    args,
-                    ..
-                },
-                Some(narrowed),
-            ) if segments.len() == 2
-                && segments[0] == crate::runtime_names::shims::CAST_INSTANCE
-                && args.len() == 1
-                && args[0] == site.result_var =>
+        match cast.result.as_ref() {
+            Some(narrowed)
+                if let Some(root) =
+                    crate::model::cast_instance_of(&cast.kind, &site.result_var) =>
             {
-                (narrowed.clone(), Some(segments[1].clone()), ci + 1)
+                (narrowed.clone(), Some(root.to_string()), ci + 1)
             }
             _ => {
                 return Err(format!(
@@ -259,14 +251,14 @@ fn rewire_one_closure_select_site(
     );
     let mut then_sources = carried.clone();
     if !then_sources.contains(&opt) {
-        then_sources.push(opt.clone());
+        then_sources.push(opt.clone().into_variable());
     }
     if closure_on_some && !then_sources.contains(&env) {
-        then_sources.push(env.clone());
+        then_sources.push(env.clone().into_variable());
     }
     let mut else_sources = carried.clone();
     if !closure_on_some && !else_sources.contains(&env) {
-        else_sources.push(env.clone());
+        else_sources.push(env.clone().into_variable());
     }
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, else_inputs) = graph.create_block_with_arg_vars(else_sources.len());
@@ -457,7 +449,7 @@ fn rewire_one_closure_select_site(
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
                 op: "ne".to_string(),
-                lhs: opt.clone(),
+                lhs: opt.clone().into_variable(),
                 rhs: nullc,
                 result_ty: ValueType::Int,
             },
@@ -470,7 +462,7 @@ fn rewire_one_closure_select_site(
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
                 op: "ne".to_string(),
-                lhs: opt.clone(),
+                lhs: opt.clone().into_variable(),
                 rhs: none,
                 result_ty: ValueType::Int,
             },
@@ -479,7 +471,7 @@ fn rewire_one_closure_select_site(
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::FieldRead {
-                base: opt.clone(),
+                base: opt.clone().into_variable(),
                 field: FieldDescriptor {
                     name: "__discriminant".to_string(),
                     owner_root: Some(site.option_owner.clone()),
@@ -588,7 +580,7 @@ pub(crate) fn emit_call_once(
         result: Some(call_result.clone()),
         kind: OpKind::Call {
             target: CallTarget::method("call_once", Some(call_once_owner.to_string())),
-            args: vec![env, args_tuple],
+            args: crate::model::call_args(vec![env, args_tuple]),
             result_ty,
         },
     });
@@ -649,7 +641,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::method(method, Some(RECV_OPTION.into())),
-                    args: vec![opt, env],
+                    args: crate::model::call_args(vec![opt, env]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -748,7 +740,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
                         ..
-                    } if segments == &[crate::runtime_names::shims::CAST_INSTANCE, "PyObject"]
+                    } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
                 )
         }));
     }
@@ -795,7 +787,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::method("map", Some(RECV_OPTION.into())),
-                    args: vec![opt, env],
+                    args: crate::model::call_args(vec![opt, env]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -899,7 +891,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::method(method, Some(RECV_OPTION.into())),
-                    args: vec![opt, env],
+                    args: crate::model::call_args(vec![opt, env]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -953,7 +945,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::method("map", Some(RECV_OPTION.into())),
-                    args: vec![opt, env],
+                    args: crate::model::call_args(vec![opt, env]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -1123,7 +1115,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::method("map", Some(RECV_OPTION.into())),
-                    args: vec![opt, env],
+                    args: crate::model::call_args(vec![opt, env]),
                     result_ty: ValueType::Int,
                 },
                 true,

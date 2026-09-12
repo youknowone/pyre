@@ -148,11 +148,11 @@ fn rewire_one(
 
     let mut ok_sources = carried.clone();
     if !ok_sources.contains(&receiver) {
-        ok_sources.push(receiver.clone());
+        ok_sources.push(receiver.clone().into_variable());
     }
     let mut err_sources = ok_sources.clone();
     if !err_sources.contains(&env) {
-        err_sources.push(env.clone());
+        err_sources.push(env.clone().into_variable());
     }
     // Validate the complete exception destination before adding any blocks.
     // Like ExceptionTransformer.transform_block / insert_matching, a rejected
@@ -350,7 +350,7 @@ fn rewire_one(
     graph.block_mut(a_id).operations.push(SpaceOperation {
         result: Some(disc.clone()),
         kind: OpKind::FieldRead {
-            base: receiver,
+            base: receiver.into_variable(),
             field: FieldDescriptor {
                 name: "__discriminant".to_string(),
                 owner_root: Some(site.receiver_owner.clone()),
@@ -495,7 +495,7 @@ mod tests {
                     entry,
                     OpKind::Call {
                         target: CallTarget::method("map_err", Some("Result".into())),
-                        args: vec![receiver, env],
+                        args: crate::model::call_args(vec![receiver, env]),
                         result_ty: ValueType::Ref(None),
                     },
                     true,
@@ -584,7 +584,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::method("map_err", Some("Result".into())),
-                    args: vec![receiver, env],
+                    args: crate::model::call_args(vec![receiver, env]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -658,7 +658,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::method("map_err", Some("Result".into())),
-                    args: vec![receiver, env],
+                    args: crate::model::call_args(vec![receiver, env]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -672,7 +672,7 @@ mod tests {
                 catch,
                 OpKind::Call {
                     target: CallTarget::method("from_exc_object", Some("Error".into())),
-                    args: vec![catch_inputs[2].clone()],
+                    args: crate::model::call_args(vec![catch_inputs[2].clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -775,7 +775,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::method("map_err", Some("Result".into())),
-                    args: vec![receiver, env],
+                    args: crate::model::call_args(vec![receiver, env]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,

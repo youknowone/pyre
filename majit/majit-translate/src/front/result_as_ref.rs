@@ -49,7 +49,7 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultAsRefSite) -> Result<(), S
         return Err("as_ref is not last".into());
     }
     let receiver = match &op.kind {
-        OpKind::Call { args, .. } if args.len() == 1 => args[0].clone(),
+        OpKind::Call { args, .. } if args.len() == 1 => args[0].clone().into_variable(),
         _ => return Err("as_ref does not have one argument".into()),
     };
     let [exit] = graph.blocks[a].exits.as_slice() else {
@@ -119,7 +119,7 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultAsRefSite) -> Result<(), S
         .push_op_var(
             a_id,
             OpKind::FieldRead {
-                base: receiver,
+                base: receiver.clone(),
                 field: FieldDescriptor::new("__discriminant", Some(site.receiver_owner.clone())),
                 ty: ValueType::Int,
                 pure: true,
@@ -148,7 +148,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::method("as_ref", Some("Result".into())),
-                    args: vec![receiver],
+                    args: crate::model::call_args(vec![receiver]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,

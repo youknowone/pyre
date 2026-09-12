@@ -184,8 +184,10 @@ pub fn _cast_whatever() -> Result<(), TyperError> {
     Err(deferred("_cast_whatever"))
 }
 
-pub fn _castdepth() -> Result<(), TyperError> {
-    Err(deferred("_castdepth"))
+/// RPython `lltype._castdepth(outside, inside)` — signed parent-chain
+/// distance used by `jtransform.py Transformer._is_rclass_instance`.
+pub fn _castdepth(outside: &Struct, inside: &Struct) -> i32 {
+    castdepth(outside, inside)
 }
 
 pub fn ann_cast_pointer() -> Result<(), TyperError> {
@@ -7587,6 +7589,9 @@ mod tests {
         let (name, child) = outer._first_struct().expect("leading gc struct expected");
         assert_eq!(name, "head");
         assert_eq!(child._name, "Inner");
+        assert_eq!(_castdepth(&outer, &inner), 1);
+        assert_eq!(_castdepth(&outer, &outer), 0);
+        assert_eq!(_castdepth(&inner, &outer), -1);
     }
 
     #[test]

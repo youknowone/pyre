@@ -165,20 +165,12 @@ fn rewire_one_slice_first_site(
         (site.result_var.clone(), None, ci)
     } else if ci + 2 == ops_len {
         let cast = &graph.blocks[a].operations[ci + 1];
-        match (&cast.kind, cast.result.as_ref()) {
-            (
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    args,
-                    ..
-                },
-                Some(narrowed),
-            ) if segments.len() == 2
-                && segments[0] == crate::runtime_names::shims::CAST_INSTANCE
-                && args.len() == 1
-                && args[0] == site.result_var =>
+        match cast.result.as_ref() {
+            Some(narrowed)
+                if let Some(root) =
+                    crate::model::cast_instance_of(&cast.kind, &site.result_var) =>
             {
-                (narrowed.clone(), Some(segments[1].clone()), ci + 1)
+                (narrowed.clone(), Some(root.to_string()), ci + 1)
             }
             _ => {
                 return Err(format!(
@@ -194,11 +186,13 @@ fn rewire_one_slice_first_site(
 
     // Capture the slice receiver and validate the recorded access operand.
     let slice = match (&graph.blocks[a].operations[ci].kind, &site.access) {
-        (OpKind::Call { args, .. }, SliceAccess::First) if args.len() == 1 => args[0].clone(),
+        (OpKind::Call { args, .. }, SliceAccess::First) if args.len() == 1 => {
+            args[0].clone().into_variable()
+        }
         (OpKind::Call { args, .. }, SliceAccess::RangeFrom { range, .. })
             if args.len() == 2 && args[1] == *range =>
         {
-            args[0].clone()
+            args[0].clone().into_variable()
         }
         other => {
             return Err(format!(
@@ -299,7 +293,7 @@ fn rewire_one_slice_first_site(
                     target: CallTarget::FunctionPath {
                         segments: vec!["__getslice_rangefrom".to_string()],
                     },
-                    args: vec![slice_in_then, start_in_then],
+                    args: crate::model::call_args(vec![slice_in_then, start_in_then]),
                     result_ty: site.payload_ty.clone(),
                 },
             });
@@ -363,7 +357,7 @@ fn rewire_one_slice_first_site(
             target: CallTarget::FunctionPath {
                 segments: vec!["__len".to_string()],
             },
-            args: vec![slice.clone()],
+            args: crate::model::call_args(vec![slice.clone()]),
             result_ty: ValueType::Int,
         },
     });
@@ -383,7 +377,7 @@ fn rewire_one_slice_first_site(
                         "r_uint".to_string(),
                     ],
                 },
-                args: vec![len],
+                args: crate::model::call_args(vec![len]),
                 result_ty: ValueType::Unsigned,
             },
         });
@@ -472,7 +466,7 @@ mod tests {
                             "first".into(),
                         ],
                     },
-                    args: vec![slice.clone()],
+                    args: crate::model::call_args(vec![slice.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -554,7 +548,7 @@ mod tests {
                             "first".into(),
                         ],
                     },
-                    args: vec![slice.clone()],
+                    args: crate::model::call_args(vec![slice.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -563,16 +557,7 @@ mod tests {
         let narrowed = g
             .push_op_var(
                 a,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::shims::CAST_INSTANCE.into(),
-                            "PyObject".into(),
-                        ],
-                    },
-                    args: vec![opt.clone()],
-                    result_ty: ValueType::Ref(Some("PyObject".into())),
-                },
+                crate::model::cast_instance_call("PyObject", opt.clone()),
                 true,
             )
             .unwrap();
@@ -630,7 +615,7 @@ mod tests {
                             "first".into(),
                         ],
                     },
-                    args: vec![slice],
+                    args: crate::model::call_args(vec![slice]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,

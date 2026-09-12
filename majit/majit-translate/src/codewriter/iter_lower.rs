@@ -93,7 +93,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         let Some(result) = &op.result else {
             return Err("iter constructor has no result".into());
         };
-        (result.clone(), args[0].clone())
+        (result.clone(), args[0].clone().into_variable())
     };
     if !in_scope(graph, d, &x) {
         return Err("iterated container out of scope".into());
@@ -532,13 +532,15 @@ fn is_slice_iter_call(kind: &OpKind) -> bool {
         && segments.last().is_some_and(|s| s == "iter"))
 }
 
-fn is_marker_call<'op>(kind: &'op OpKind, name: &str, arity: usize) -> Option<&'op [Variable]> {
+fn is_marker_call(kind: &OpKind, name: &str, arity: usize) -> Option<Vec<Variable>> {
     match kind {
         OpKind::Call {
             target: CallTarget::FunctionPath { segments },
             args,
             ..
-        } if segments.len() == 1 && segments[0] == name && args.len() == arity => Some(args),
+        } if segments.len() == 1 && segments[0] == name && args.len() == arity => {
+            Some(crate::model::call_arg_vars(args))
+        }
         _ => None,
     }
 }
@@ -564,7 +566,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: segments.iter().map(|s| s.to_string()).collect(),
             },
-            args,
+            args: crate::model::call_args(args),
             result_ty: ValueType::Ref(None),
         }
     }

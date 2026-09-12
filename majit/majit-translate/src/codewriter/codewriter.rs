@@ -601,11 +601,21 @@ impl CodeWriter {
         // `concretetype` cell, and `Variable::clone` Rc-shares that
         // cell so jtransform's internal `rewritten = graph.clone()`
         // carries it through.
+        //
+        // `cpu.rtyper.exceptiondata.fn_exception_match` is cloned out
+        // of the dual-gate session before the `&mut CallControl`
+        // borrow, matching `transform_graph(graph, cpu, ...)`.
+        let excmatch = self
+            .dual_gate_registry(callcontrol)
+            .session_if_started()
+            .and_then(|(_, rt)| rt.exceptiondata().ok())
+            .and_then(|ed| ed.fn_exception_match.borrow().clone());
         let mut rewritten =
             crate::codewriter::transform_profile::time_phase("step1_jtransform_transform", || {
                 let mut transformer = crate::jtransform::Transformer::new(config)
                     .with_callcontrol(callcontrol)
-                    .with_portal_jd(portal_jd_index);
+                    .with_portal_jd(portal_jd_index)
+                    .with_excmatch(excmatch.as_ref());
                 transformer.transform(graph)
             });
         // Transformer is dropped here, releasing the &mut CallControl borrow.
@@ -953,6 +963,16 @@ impl CodeWriter {
         verbose: bool,
         index: usize,
     ) {
+        // jtransform.py transform_graph starts with
+        // constant_fold_ll_issubclass(graph, cpu) on the flowspace
+        // graph. Spine B is the remaining entry that still holds
+        // `direct_call` Constants.
+        if let Some((_, rt)) = self.dual_gate_registry(callcontrol).session_if_started()
+            && let Ok(ed) = rt.exceptiondata()
+        {
+            let matcher = ed.fn_exception_match.borrow();
+            crate::jtransform::constant_fold_ll_issubclass_flowgraph(flow_graph, matcher.as_ref());
+        }
         let mut lowered = crate::codewriter::jtransform_opname::lower_graph(flow_graph);
         self.finalize_rewritten_graph_to_jitcode(
             &mut lowered,
@@ -1341,7 +1361,7 @@ mod stamp_classdef_hints_tests {
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::method("push_value", Some("H".to_string())),
-                    args: vec![recv_var.clone()],
+                    args: crate::model::call_args(vec![recv_var.clone()]),
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -1374,7 +1394,7 @@ mod stamp_classdef_hints_tests {
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::method("push_value", Some("H".to_string())),
-                    args: vec![recv_var.clone()],
+                    args: crate::model::call_args(vec![recv_var.clone()]),
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -1468,7 +1488,7 @@ mod stamp_classdef_hints_tests {
                 graph.startblock,
                 OpKind::Call {
                     target: CallTarget::method("push_value", Some("H".to_string())),
-                    args: vec![recv_var.clone()],
+                    args: crate::model::call_args(vec![recv_var.clone()]),
                     result_ty: ValueType::Unknown,
                 },
                 true,

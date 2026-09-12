@@ -1418,7 +1418,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::function_path(["scope_from_frame"]),
-                    args: vec![frame.clone()],
+                    args: crate::model::call_args(vec![frame.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
