@@ -7164,13 +7164,17 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         return pyre_object::w_bool_from(matched) as i64;
     }
 
-    // op_code 6 = CONTAINS_OP `in`, 7 = `not in` (from compare_op_tag).
+    // CONTAINS_OP `in` / `not in` (from compare_op_tag).
     // lhs = needle/item, rhs = container/haystack (flatten lowers the args
     // as `[item, container]`).
-    if op_code == 6 || op_code == 7 {
+    if pyre_interpreter::runtime_ops::compare_op_tag_is_contains(op_code) {
         match pyre_interpreter::baseobjspace::contains(rhs, lhs) {
             Ok(found) => {
-                let result = if op_code == 7 { !found } else { found };
+                let result = if op_code == pyre_interpreter::runtime_ops::COMPARE_OP_NOT_CONTAINS {
+                    !found
+                } else {
+                    found
+                };
                 return pyre_object::w_bool_from(result) as i64;
             }
             Err(mut err) => {
@@ -7181,14 +7185,18 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         }
     }
 
-    // op_code 8 = IS_OP `is`, 9 = `is not` (from compare_op_tag).
+    // IS_OP `is` / `is not` (from compare_op_tag).
     // `space.is_w`, not raw pointer identity: `W_AbstractIntObject.is_w`
     // (`intobject.py`) and `W_FloatObject.is_w` (`floatobject.py`)
     // compare two plain `int`s / `float`s by value, so a freshly boxed equal
     // value is identical.  Infallible — never publishes BH_LAST_EXC_VALUE.
-    if op_code == 8 || op_code == 9 {
+    if pyre_interpreter::runtime_ops::compare_op_tag_is_identity(op_code) {
         let same = pyre_interpreter::baseobjspace::is_w(lhs, rhs);
-        let result = if op_code == 9 { !same } else { same };
+        let result = if op_code == pyre_interpreter::runtime_ops::COMPARE_OP_IS_NOT {
+            !same
+        } else {
+            same
+        };
         return pyre_object::w_bool_from(result) as i64;
     }
 

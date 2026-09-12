@@ -95,6 +95,15 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
     }
 }
 
+/// The runtime address published for `path` in `jit_trace_fnaddrs`, or
+/// `None` when the path is not published.  A walker fold that recognises a
+/// residual by its callee compares the call's funcbox against this.
+pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
+    static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
+        LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
+    RUNTIME_FNADDRS.get(path).copied()
+}
+
 static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
     let build_bindings = build_time_fnaddr_bindings();
     let runtime_bindings = pyre_interpreter::jit_trace_fnaddrs();
