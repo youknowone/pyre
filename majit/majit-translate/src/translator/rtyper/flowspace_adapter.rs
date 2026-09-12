@@ -1932,6 +1932,16 @@ pub fn translate_op(
                     // that mixed list directly (`const(exc_class)` at
                     // args[0]).  The path names the op, not a second
                     // callable — do not wrap it again.
+                    if segments.as_slice() == ["type"] {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(
+                                "translate_op: FunctionPath [\"type\"] requires \
+                                 one operand (flowspace/operation.py Type)"
+                                    .to_string(),
+                            ));
+                        }
+                        return Ok(vec![FlowspaceOp::new("type", arg_hls, result)]);
+                    }
                     if segments.as_slice() == ["simple_call"] {
                         if arg_hls.is_empty() {
                             return Err(TyperError::message(
@@ -5770,6 +5780,30 @@ mod tests {
             host, &mymod_entry.host_object,
             "must not resolve to the colliding-leaf sibling"
         );
+    }
+
+    #[test]
+    fn translate_op_call_type_lowers_to_type_spaceop() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        let operand = Variable::new();
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(operand.clone()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::function_path(["type"]),
+                args: crate::model::call_args(vec![vars[1].clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("FunctionPath [type] must lower to the type op");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "type");
+        assert_eq!(translated[0].args.len(), 1);
+        assert!(matches!(&translated[0].args[0], Hlvalue::Variable(v) if *v == operand));
     }
 
     #[test]

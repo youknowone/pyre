@@ -41,20 +41,18 @@
 //!
 //! ```text
 //! evalue = op.simple_call(const(exc_class), *message_args)
-//! graph.set_raise_values(block, evalue, evalue)
+//! etype  = op.type(evalue)
+//! graph.set_raise_values(block, etype, evalue)
 //! ```
 //!
 //! ### The `etype` link arg
 //!
-//! Upstream's tail line is `w_type = op.type(w_value)`, but that value never
-//! reaches a jitcode. `make_bytecode_block` hands the `exceptblock`'s
-//! `inputargs` to `make_return` (`flatten.py`), whose 2-arg arm emits
-//! `-live-` + `raise self.getcolor(args[1])` and never touches `args[0]`
-//! (`flatten.py:139-143`, mirrored at `flatten.rs`). So the slot the
-//! `etype` link arg feeds has no consumer in any emitted bytecode.
-//! `set_raise_values` therefore receives `evalue` for both slots instead of a
-//! synthesised `type(evalue)` call, which would be a residual with a dead
-//! result register on every raise tail.
+//! Flatten's 2-arg `make_return` reads only `args[1]` (`flatten.py`).
+//! The rtyper sees the link first: `setup_block_entry` forces
+//! exceptblock slot 0 to `ExceptionData.r_exception_type`
+//! (`RootClassRepr`).  `op.type(evalue)` is the upstream producer of
+//! that class/vtable value (`unaryop.py type_SomeObject` →
+//! `SomeTypeOf`; `InstanceRepr.rtype_type` → `__class__` / `ll_type`).
 //!
 //! ### Operand shape
 //!
@@ -89,10 +87,33 @@
 use crate::flowspace::model::{ConstValue, HOST_ENV, Variable};
 use crate::model::{BlockId, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
+/// `op.type(w_value)` (`flowcontext.py exc_from_raise`).  The result
+/// is class/vtable-shaped (`SomeTypeOf` / `RootClassRepr`), which
+/// `setup_block_entry` requires on exceptblock slot 0.
+pub(crate) fn push_type_of(graph: &mut FunctionGraph, block: BlockId, value: Variable) -> Variable {
+    graph
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: CallTarget::function_path(["type"]),
+                args: crate::model::call_args(vec![value]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .expect("op.type(evalue) must produce a Ref type object")
+}
+
+/// Close `block` with `FSException(type(evalue), evalue)`.
+pub(crate) fn set_raise_from_instance(graph: &mut FunctionGraph, block: BlockId, evalue: Variable) {
+    let etype = push_type_of(graph, block, evalue.clone());
+    graph.set_raise_values(block, etype, evalue);
+}
+
 /// Close `block` with an `(etype, evalue)` Link to `exceptblock`
 /// whose value comes from the canonical RPython `exc_from_raise` op
-/// sequence (`op.simple_call(const(exc_class), *args)`).  The `etype`
-/// slot reuses `evalue` — see the module-level "etype link arg" note.
+/// sequence (`op.simple_call(const(exc_class), *args)` then
+/// `op.type(w_value)`).
 ///
 /// `exc_class_name` is the Python-layer exception class name
 /// (`"AssertionError"`, `"ValueError"`, …).  It is resolved through
@@ -132,21 +153,11 @@ pub(crate) fn lower_exc_from_raise(
             true,
         )
         .expect("op.simple_call(exc_class, ...) must produce a Ref exception instance");
-    // `flowspace/flowcontext.py Raise.nomoreblocks` — close the block
-    // with the `(etype, evalue)` Link to the graph's `exceptblock`.
-    //
-    // Upstream's `w_type = op.type(w_value)` (`flowcontext.py`) lives at
-    // flow-space level only — see the module-level "etype link arg" note: the
-    // 2-arg `make_return` arm emits `raise <args[1]>` and never reads
-    // `args[0]`, and `make_exception_link` drops both for a direct `reraise`.
-    // So the `etype` link arg is write-only in every emitted jitcode. The
-    // emitted drain tail is `-live-` + `raise <evalue>` and nothing else.
-    // Materialising it as a `type(evalue)` call left a residual whose
-    // result register is dead by construction on every raise tail, and
-    // made the raise arm unwalkable in the blackhole (canonical
-    // `inline_call_*` on a callee with no runtime address). Reuse
-    // `evalue`: same ref kind, no new op.
-    graph.set_raise_values(block, evalue_var.clone(), evalue_var);
+    // `w_type = op.type(w_value)` then `FSException(w_type, w_value)`
+    // (`flowcontext.py exc_from_raise`).  Slot 0 must be class-shaped
+    // so `_convert_link` / `setup_block_entry` can assign
+    // `ExceptionData.r_exception_type` (`RootClassRepr`).
+    set_raise_from_instance(graph, block, evalue_var);
 }
 
 #[cfg(test)]
@@ -162,16 +173,20 @@ mod tests {
         lower_exc_from_raise(&mut graph, start, "ValueError", vec![msg.clone()]);
         let op = graph.blocks[start.0]
             .operations
-            .last()
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.as_slice() == ["simple_call"]
+                )
+            })
             .expect("simple_call must be emitted");
-        let OpKind::Call { target, args, .. } = &op.kind else {
+        let OpKind::Call { args, .. } = &op.kind else {
             panic!("expected Call, got {:?}", op.kind);
         };
-        assert_eq!(
-            target,
-            &CallTarget::function_path(["simple_call"]),
-            "FunctionPath is the op name, not the class"
-        );
         assert_eq!(args.len(), 2);
         let LinkArg::Const(class) = &args[0] else {
             panic!("args[0] must be the class Constant");
@@ -184,5 +199,42 @@ mod tests {
             "args[0] must be HOST_ENV ValueError"
         );
         assert_eq!(args[1], LinkArg::from(msg));
+        let evalue = graph.blocks[start.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.as_slice() == ["simple_call"] => op.result.clone(),
+                _ => None,
+            })
+            .expect("simple_call result");
+        let type_op = graph.blocks[start.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } if segments.as_slice() == ["type"] => Some((op.result.clone(), args.clone())),
+                _ => None,
+            })
+            .expect("op.type(evalue) must follow simple_call");
+        let (etype, type_args) = type_op;
+        assert_eq!(type_args.as_slice(), &[LinkArg::from(evalue.clone())]);
+        let raise_link = graph.blocks[start.0]
+            .exits
+            .iter()
+            .find(|l| l.target == graph.exceptblock)
+            .expect("raise link");
+        assert_eq!(raise_link.args.len(), 2);
+        assert_eq!(
+            raise_link.args[0].as_variable(),
+            etype.as_ref(),
+            "etype must be type(evalue), not the instance"
+        );
+        assert_eq!(raise_link.args[1].as_variable(), Some(&evalue));
     }
 }

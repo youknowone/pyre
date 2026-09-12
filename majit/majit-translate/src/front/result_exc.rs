@@ -33,9 +33,8 @@
 //!   (`PyError::to_exc_object` — the trace-level exception value
 //!   domain is the `W_BaseException` ref, the same value
 //!   `BH_LAST_EXC_VALUE` carries) and closes the block towards
-//!   `exceptblock` with `(exc, exc)`, exactly the
-//!   `lower_exc_from_raise` tail shape (`flowcontext.py:600`) — whose
-//!   `etype` slot is write-only, see that module's "etype link arg" note.
+//!   `exceptblock` with `(type(exc), exc)`, the
+//!   `exc_from_raise` tail (`flowcontext.py`).
 //!
 //! - **Caller rule** ([`rewire_result_exc_call_sites`]): a `?` on a
 //!   call to a scoped callee lowers in MIR as a
@@ -766,12 +765,7 @@ fn lower_result_exc_returns_inner(
             for close in root_scope_closes {
                 graph.push_op_var(block_id, close, true);
             }
-            // `graph.set_raise_values(block, etype, evalue)`. The `etype`
-            // link arg is write-only: `make_return`'s 2-arg arm emits
-            // `raise <args[1]>` and never reads `args[0]`
-            // (`flatten.rs`, `flatten.py:139-143`). Pass the evalue
-            // for it — see `front::exc_from_raise`'s "etype link arg" note.
-            graph.set_raise_values(block_id, v_exc.clone(), v_exc);
+            crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, v_exc);
         } else {
             // `return Ok(v)` → forward the payload itself.
             for link in &mut graph.blocks[bi].exits {
@@ -1559,7 +1553,7 @@ fn rewire_one_option_ok_or_else_try_site(
         "",
     );
     let exc = materialize_error_to_exc_object(graph, none_bb, error, spec);
-    graph.set_raise_values(none_bb, exc.clone(), exc);
+    crate::front::exc_from_raise::set_raise_from_instance(graph, none_bb, exc);
 
     graph.blocks[a].operations.truncate(call_idx);
     let disc = graph.alloc_value_var();
@@ -2821,7 +2815,7 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
             true,
         );
     }
-    graph.set_raise_values(r_id, r_vb.clone(), r_vb);
+    crate::front::exc_from_raise::set_raise_from_instance(graph, r_id, r_vb);
 
     // Break edge args in H scope (all forwarded Variables; the dead threads
     // were pruned, so no const rides the surviving edge).
