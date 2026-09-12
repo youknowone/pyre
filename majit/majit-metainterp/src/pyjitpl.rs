@@ -1528,11 +1528,8 @@ fn densify_root_loop_inputargs(
     let ops = ops
         .into_iter()
         .map(|op| {
-            let args = op
-                .getarglist()
-                .iter()
-                .map(&remap)
-                .collect::<smallvec::SmallVec<[_; 3]>>();
+            let args: majit_ir::resoperation::OpArgVec =
+                op.getarglist().iter().map(&remap).collect();
             let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
             if let Some(failargs) = op.guard_fail_args() {
                 cloned.setfailargs(failargs.iter().map(&remap).collect());

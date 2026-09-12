@@ -519,7 +519,7 @@ where
         // — a fresh object, not a clone of the recorded op. Cloning copied
         // `Box<OpKindExtra>` (32 B) on every guard; minting writes
         // remapped args/fail_args onto a new `Op` the way `cls()` does.
-        let mut args: smallvec::SmallVec<[Operand; 4]> = smallvec::SmallVec::new();
+        let mut args: majit_ir::resoperation::OpArgVec = smallvec::SmallVec::new();
         for i in 0..src.num_args() {
             let a = src.arg(i);
             args.push(if a.is_constant() {
@@ -960,7 +960,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             None => self._next() as usize,
         };
         // opencoder.py — read `argnum` tagged args and untag.
-        let mut args: smallvec::SmallVec<[Operand; 4]> = smallvec::SmallVec::new();
+        let mut args: majit_ir::resoperation::OpArgVec = smallvec::SmallVec::new();
         for _ in 0..arity {
             let tagged = self._next();
             args.push(self._untag(tagged));

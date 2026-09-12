@@ -1808,11 +1808,11 @@ fn unpack_stamp(stamp: u32) -> Option<crate::value::Value> {
     }
 }
 
-/// Inline operand capacity. Two `Operand`s are 16 B so `Op` is 32 B
-/// and `Rc<Op>` leaves the 64-byte class. Recorded SETFIELD / GETFIELD
-/// / INT_* are 1–2 args; rewrite `GC_STORE` (four args) heap-grows 32 B
-/// instead of keeping a fourth slot on every op.
-pub type OpArgVec = SmallVec<[Operand; 4]>;
+/// Temporary arg/fail-arg list. Eight inline `Operand`s keep JUMP and
+/// guard fail-args on the regex `and`/`or` leaf off the 64 B
+/// `SmallVec` grow. `Op` itself still stores two inline plus the 32 B
+/// slab (`ARG_INLINE` / `ARG_SLAB`); this type is not embedded in `Op`.
+pub type OpArgVec = SmallVec<[Operand; 8]>;
 
 const ARG_INLINE: usize = 2;
 /// Extra-arg slab holds four `Operand`s (32 B). Lengths 3–4 use it;
