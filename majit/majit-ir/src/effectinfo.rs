@@ -981,6 +981,12 @@ pub enum RuntimeHelperKind {
     /// the f-string's format spec.  Recognised for the same receiver-pinned
     /// `__format__` inline; `spec` is threaded to the callee as its second
     /// parameter.
+    ///
+    /// The walker also folds an exact `int` plus a constant decimal spec
+    /// (`:d` / `:05d` / `:5d`) to `ll_int2dec` + optional `ll_strconcat` pad
+    /// + residual `newutf8` — `newformat.py` `format_int_or_long` /
+    /// `_int_to_base` / `_fill_number`.  A bool, subclass, sign-interior
+    /// pad, or Python `__format__` stays residual or takes the inline.
     FormatWithSpec,
     /// `bh_unpack_sequence_fn(count, seq)` — the UNPACK_SEQUENCE validator
     /// emitted by the codewriter UNPACK_SEQUENCE arm.  Validates the exact
@@ -1259,6 +1265,15 @@ pub enum RuntimeHelperKind {
     /// (`pyjitpl.py _establish_nullity`).  A guard failure resumes at the
     /// opcode, where the interpreter re-runs it and raises.
     LoadFastCheck,
+    /// `bh_convert_value_fn(value, conv)` — the CONVERT_VALUE helper
+    /// (`runtime_ops::convert_value`: `!s`/`!r`/`!a`).  A user `__str__` /
+    /// `__repr__` runs Python here, so the generic residual is opaque.
+    ///
+    /// The walker folds an exact `int` to `ll_int2dec` + `newutf8`
+    /// (`intobject.py` `descr_str` / `descr_repr`, which share a body) and
+    /// an exact `str` `!s` to identity (`unicodeobject.py` `descr_str`).
+    /// A bool, subclass, or Python `__str__` / `__repr__` stays residual.
+    ConvertValue,
 }
 
 impl EffectInfo {
