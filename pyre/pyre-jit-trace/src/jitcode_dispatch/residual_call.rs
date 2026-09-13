@@ -10000,6 +10000,26 @@ fn cond_record_concrete_args<Sym: WalkSym>(
     Some(concrete_args)
 }
 
+fn cond_record_arg_values<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) -> Option<Vec<majit_ir::Value>> {
+    let mut values = Vec::with_capacity(allboxes.len());
+    for &boxref in allboxes {
+        values.push(ctx.trace_ctx.box_value(boxref)?);
+    }
+    Some(values)
+}
+
+fn cond_record_pure_result(concrete: ConcreteValue) -> Option<majit_ir::Value> {
+    match concrete {
+        ConcreteValue::Int(n) => Some(majit_ir::Value::Int(n)),
+        ConcreteValue::Ref(p) => Some(majit_ir::Value::Ref(majit_ir::GcRef(p as usize))),
+        ConcreteValue::Null => None,
+        _ => None,
+    }
+}
+
 fn concrete_from_box_value(value: Option<majit_ir::Value>) -> ConcreteValue {
     match value {
         Some(majit_ir::Value::Int(n)) => ConcreteValue::Int(n),
@@ -10139,6 +10159,11 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
     ctx.trace_ctx
         .profiler()
         .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+    // `do_conditional_call(is_value=True)` → `execute_varargs(..., pure=True)`:
+    // snapshot the recorder so `record_result_of_call_pure` can cut an
+    // all-constant COND_CALL_VALUE back out.
+    let patch_pos = ctx.trace_ctx.get_trace_position();
+    let descr_for_pure = descr.clone();
     let recorded = ctx.trace_ctx.record_op_with_descr(opcode, &allboxes, descr);
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(opcode, Some(&ei), &allboxes);
@@ -10204,6 +10229,27 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
             first,
             concrete_from_box_value(ctx.trace_ctx.box_value(first)),
         )
+    };
+    // `execute_varargs(..., pure=True)` then `record_result_of_call_pure`.
+    // Skip when the walk had no concrete result (non-authoritative /
+    // symbolic target): folding a Null would invent a constant.
+    let result = match cond_record_pure_result(concrete) {
+        Some(result_value) => {
+            if let Some(arg_values) = cond_record_arg_values(ctx, &allboxes) {
+                ctx.trace_ctx.record_result_of_call_pure(
+                    recorded,
+                    &allboxes,
+                    &arg_values,
+                    descr_for_pure,
+                    patch_pos,
+                    opcode,
+                    result_value,
+                )
+            } else {
+                result
+            }
+        }
+        None => result,
     };
     match dst_bank {
         'i' => write_int_reg(ctx, op.pc, dst, result, concrete)?,
