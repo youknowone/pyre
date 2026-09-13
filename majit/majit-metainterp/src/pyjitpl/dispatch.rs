@@ -1622,10 +1622,23 @@ where
             *raw_i.last().unwrap_or(&i64::MIN)
         };
         let (opcode, ovf) = crate::box_trace::int_binary_op_kind(tag)?;
-        if opcode == majit_ir::OpCode::IntMod
-            && matches!(ctx.box_value(args[1]), Some(majit_ir::Value::Int(0)))
-        {
-            return None;
+        if opcode == majit_ir::OpCode::IntMod {
+            // `box_value` of a wrapint NewWithVtable is the heap Ref, not
+            // the intval. Read the payload so rem-by-zero stays residual
+            // (ZeroDivision would abort the peel).
+            let rhs_int = match ctx.box_value(args[1]) {
+                Some(majit_ir::Value::Int(n)) => Some(n),
+                Some(majit_ir::Value::Ref(r)) => ctx
+                    .field_sanity_load(r.0 as i64, &spec.intval_descr, majit_ir::Type::Int)
+                    .and_then(|v| match v {
+                        majit_ir::Value::Int(n) => Some(n),
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            if rhs_int == Some(0) || rhs_int.is_none() {
+                return None;
+            }
         }
         if concrete_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr)
         {
