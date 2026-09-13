@@ -2256,10 +2256,6 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) pending_token: Option<(u64, Arc<JitCellToken>)>,
     /// Cumulative statistics counters.
     pub(crate) stats: JitStatsCounters,
-    /// Pointer to the live virtualizable object at trace entry.
-    /// Used to derive lengths from the actual object when the interpreter
-    /// does not provide them explicitly.
-    pub(crate) vable_ptr: *const u8,
     /// `compile.py` — the virtual cache `handle_async_forcing`
     /// produced, kept for the `GUARD_NOT_FORCED` failure that must follow.
     ///
@@ -4063,7 +4059,6 @@ impl<M: Clone> MetaInterp<M> {
             hooks: JitHooks::default(),
             pending_token: None,
             stats: JitStatsCounters::default(),
-            vable_ptr: std::ptr::null(),
             forced_virtuals: Vec::new(),
             vable_array_lengths: Vec::new(),
             result_type: Type::Ref,
@@ -4635,22 +4630,29 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_frontend_boxes.as_deref()
     }
 
-    /// Cache the current virtualizable object pointer for trace-entry setup.
-    /// Mirrored onto `TraceCtx::virtualizable_heap_ptr` so
-    /// `synchronize_virtualizable` can reach the live frame without a
-    /// callback back into MetaInterp.
+    /// Seed the live heap pointer on the active `TraceCtx`.
+    /// `vinfo.unwrap_virtualizable_box` is the reader; this only publishes
+    /// the host's current object so initialize / residual can unwrap it.
     pub(crate) fn set_vable_ptr(&mut self, ptr: *const u8) {
-        self.vable_ptr = ptr;
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.set_virtualizable_heap_ptr(ptr);
         }
     }
 
-    /// `pyjitpl.py:3326-3334` keeps exactly one standard virtualizable
-    /// identity in `virtualizable_boxes[-1]`; `vable_ptr` is its concrete
-    /// heap counterpart.
+    /// `vinfo.unwrap_virtualizable_box(virtualizable_boxes[-1])`.
+    pub fn unwrap_standard_virtualizable(&self) -> *const u8 {
+        let Some(ctx) = self.tracing.as_ref() else {
+            return std::ptr::null();
+        };
+        if let Some(ptr) = ctx.standard_virtualizable_ptr() {
+            return ptr as *const u8;
+        }
+        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null())
+    }
+
+    /// `pyjitpl.py` unwrap of the standard virtualizable identity.
     pub fn standard_virtualizable_heap_ptr(&self) -> *const u8 {
-        self.vable_ptr
+        self.unwrap_standard_virtualizable()
     }
 
     /// Cache fallback virtualizable array lengths for trace-entry box setup.
@@ -4664,10 +4666,9 @@ impl<M: Clone> MetaInterp<M> {
         // heap object; RPython does not consult any interpreter-supplied
         // "trace-entry cache" for lengths. Match that here when the layout
         // exposes a readable header (the common case).
-        if !self.vable_ptr.is_null() && info.can_read_all_array_lengths_from_heap() {
-            // Safety: vable_ptr is cached from JitState::virtualizable_heap_ptr()
-            // for the currently active interpreter state.
-            return unsafe { info.read_array_lengths_from_heap(self.vable_ptr) };
+        let vable = self.unwrap_standard_virtualizable();
+        if !vable.is_null() && info.can_read_all_array_lengths_from_heap() {
+            return unsafe { info.read_array_lengths_from_heap(vable) };
         }
         // Fallback for layouts that cannot expose array length on the heap
         // object alone (header-less embedded arrays) and for unit tests that
@@ -4809,8 +4810,6 @@ impl<M: Clone> MetaInterp<M> {
         // two force_now arms and reaches the host's ResumeGuardForcedDescr
         // force hook for an Active token.
         // `virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)`.
-        // `vable_ptr` is only the state-field identity when the red at
-        // `index` is not the frame pointer.
         let mut virtualizable_ptr = {
             let unwrapped = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(
                 original_boxes.get(index).copied(),
@@ -4818,7 +4817,7 @@ impl<M: Clone> MetaInterp<M> {
             if !unwrapped.is_null() {
                 unwrapped as *mut u8
             } else {
-                self.vable_ptr as *mut u8
+                self.unwrap_standard_virtualizable() as *mut u8
             }
         };
         if !virtualizable_ptr.is_null() {
@@ -4832,8 +4831,8 @@ impl<M: Clone> MetaInterp<M> {
             }
             virtualizable_ptr = majit_gc::shadow_stack::get(root).0 as *mut u8;
             majit_gc::shadow_stack::pop_to(root);
-            if !self.vable_ptr.is_null() {
-                self.vable_ptr = virtualizable_ptr;
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
             }
             // `initial_inputarg_consts` was copied from `live_values` before
             // this force. `ctx` is not in `self.tracing` yet, so
@@ -4914,7 +4913,7 @@ impl<M: Clone> MetaInterp<M> {
         // `initialize_virtualizable` always `read_boxes` (possibly empty)
         // and `virtualizable_boxes.append(virtualizable_box)`.
         let _has_expanded_tail_outer = live_values.len() >= num_reds + total_vable;
-        if !_has_expanded_tail_outer && self.vable_ptr.is_null() {
+        if !_has_expanded_tail_outer && virtualizable_ptr.is_null() {
             return;
         }
         // pyjitpl.py:3317-3319: index = num_green_args + index_of_virtualizable.
@@ -4959,7 +4958,7 @@ impl<M: Clone> MetaInterp<M> {
         // `extract_live`.  A host that declares no position, or whose reds do
         // not agree with it, falls back to matching the pointer.
         let identity_index = if info.identity_ref_bank_index.is_some() {
-            Self::identity_live_position(info, live_values, self.vable_ptr)
+            Self::identity_live_position(info, live_values, virtualizable_ptr as *const u8)
         } else {
             None
         };
@@ -6624,7 +6623,7 @@ impl<M: Clone> MetaInterp<M> {
             Some(info) => info,
             None => return,
         };
-        let vable_ptr = self.vable_ptr;
+        let vable_ptr = self.unwrap_standard_virtualizable();
         let Some(ctx) = self.tracing.as_mut() else {
             return;
         };
@@ -7343,9 +7342,6 @@ impl<M: Clone> MetaInterp<M> {
         // virtualizable inputarg's ConstPtr.  `vable_ptr` is retained only as
         // the legacy/test fallback when neither the rebuilt boxes nor their
         // heap mirror were installed.
-        if !self.vable_ptr.is_null() {
-            return self.vable_ptr;
-        }
         std::ptr::null()
     }
 
@@ -17497,17 +17493,19 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             if handled {
+                let vable = self.unwrap_standard_virtualizable();
                 let frame = self.framestack.current_mut();
                 if frame.jitcode.code[frame.last_opcode_position]
                     != crate::jitcode::insns::BC_RERAISE
                 {
-                    record_application_traceback(excvalue, self.vable_ptr, frame);
+                    record_application_traceback(excvalue, vable, frame);
                 }
                 return Err(FinishframeExceptionSignal::ChangeFrame);
             }
             {
+                let vable = self.unwrap_standard_virtualizable();
                 let frame = self.framestack.current_mut();
-                record_application_traceback(excvalue, self.vable_ptr, frame);
+                record_application_traceback(excvalue, vable, frame);
             }
             self.popframe(true);
         }
@@ -18945,7 +18943,7 @@ impl<M: Clone> MetaInterp<M> {
         if !vinfo.has_vable_token() {
             return;
         }
-        let vable_ptr = self.vable_ptr;
+        let vable_ptr = self.unwrap_standard_virtualizable();
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
             None => return,
@@ -19007,7 +19005,7 @@ impl<M: Clone> MetaInterp<M> {
             Some(info) => info,
             None => return Ok(()),
         };
-        let vable_ptr = self.vable_ptr;
+        let vable_ptr = self.unwrap_standard_virtualizable();
         if vable_ptr.is_null() {
             return Ok(());
         }
@@ -19144,7 +19142,7 @@ impl<M: Clone> MetaInterp<M> {
         //                                                              None,
         //                                                              vref_box,
         //                                                              standard_box)
-        let standard_concrete = self.vable_ptr as usize as i64;
+        let standard_concrete = self.unwrap_standard_virtualizable() as usize as i64;
         let isstandard_int = if vref_concrete == standard_concrete {
             1
         } else {
@@ -27394,8 +27392,8 @@ mod tests {
 
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert_eq!(obj.token, 0);
-        assert_ne!(meta.vable_ptr as usize, old as usize);
-        let forwarded = meta.vable_ptr as usize;
+        assert_ne!(meta.unwrap_standard_virtualizable() as usize, old as usize);
+        let forwarded = meta.unwrap_standard_virtualizable() as usize;
         let ctx = meta.trace_ctx().expect("expected active trace context");
         assert_eq!(
             ctx.initial_inputarg_consts.first().copied(),

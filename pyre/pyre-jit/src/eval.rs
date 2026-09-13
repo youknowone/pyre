@@ -714,7 +714,7 @@ unsafe fn pycode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 ///     collector does not own and must never be handed; such a pointer
 ///     is left alone and is never dereferenced.  A tracer snapshot used
 ///     to land here too — the walk records tracebacks against it
-///     (`pyjitpl.rs record_application_traceback(.., self.vable_ptr, ..)`)
+///     (`pyjitpl.rs record_application_traceback` unwraps the standard vable)
 ///     — but `snapshot_for_tracing` is GC-owned now, so that traceback
 ///     keeps its frame alive instead of dangling.
 unsafe fn pytraceback_object_custom_trace(
