@@ -28,7 +28,8 @@ fn pyre_probe_bh_startup_enabled() -> bool {
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
     PyResult, function_get_closure, function_get_defaults, function_get_globals_obj,
-    function_get_name, is_function, register_jit_exc_raiser, register_jit_function_caller,
+    function_get_name, is_function, register_jit_exc_clearer, register_jit_exc_raiser,
+    register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
@@ -554,6 +555,10 @@ pub(crate) fn store_jit_exception(value: i64) {
 /// the GuardNoException after the call detects it.
 extern "C" fn jit_exc_raise_shim(value: i64) {
     store_jit_exception(value);
+}
+
+extern "C" fn jit_exc_clear_shim() {
+    drain_backend_jit_exc();
 }
 
 /// Publish a raise from a may-force residual helper to BOTH executors.
@@ -1898,6 +1903,7 @@ pub fn install_jit_call_bridge() {
         majit_ir::descr::set_w_class_obj_resolver(pyre_jit_trace::descr::w_class_obj_for_vtable);
         register_jit_function_caller(jit_call_user_function_from_frame);
         register_jit_exc_raiser(jit_exc_raise_shim);
+        register_jit_exc_clearer(jit_exc_clear_shim);
         // compile.py `memory_error = MemoryError()` parity — give
         // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
         // pyre's lazy `W_BaseException(MemoryError, "")` singleton
@@ -7112,123 +7118,6 @@ pub extern "C" fn bh_truth_fn(value: i64) -> i64 {
             // A raising `__bool__` / `__len__` publishes for the trailing
             // GuardNoException, then returns 0.
             publish_residual_call_exception(err.to_exc_object() as i64);
-            0
-        }
-    }
-}
-
-/// RPython: bhimpl_int_lt, bhimpl_int_eq, etc. — comparison helper.
-///
-/// Performs a Python-level comparison and returns a boolean PyObject.
-/// op_code encodes the CompareOp tag from CPython 3.13 COMPARE_OP.
-pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
-    let lhs = lhs as PyObjectRef;
-    let rhs = rhs as PyObjectRef;
-    if lhs.is_null() || rhs.is_null() {
-        let mut err = pyre_interpreter::PyError::new(
-            pyre_interpreter::PyErrorKind::TypeError,
-            "comparison on null operand".to_string(),
-        );
-        publish_residual_call_exception(err.to_exc_object() as i64);
-        return 0;
-    }
-
-    // op_code 10 = CHECK_EXC_MATCH isinstance check (from codewriter CheckExcMatch).
-    // lhs = exception value, rhs = exception type (or tuple of types) to match.
-    // Mirror the interpreter's `check_exc_match_against` =
-    // `exception_match(type(exc), match_class)` (eval.rs) so the match
-    // walks the exception class MRO and accepts a tuple of classes.  The
-    // earlier bespoke `ExcKind`-vs-type-name model only handled str / builtin
-    // function match specs and fell through to an unconditional `true` for a
-    // proper exception type object, which made every `except SomeError:`
-    // appear to match — wrong for any clause beyond the first.
-    if op_code == pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG {
-        // Validate the match target is an exception class / tuple of exception
-        // classes first (`cmp_exc_match`, pyopcode.py), raising
-        // TypeError otherwise.  The BC handler runs
-        // `validate_check_exc_match_class` before the bool-returning
-        // `check_exc_match_against`, so the residual path must too — `except 5:`
-        // (or a tuple with a non-exception member) raises instead of silently
-        // producing a bool.
-        if let Err(mut err) = pyre_interpreter::eval::validate_check_exc_match_class(rhs) {
-            publish_residual_call_exception(err.to_exc_object() as i64);
-            return 0;
-        }
-        let matched = pyre_interpreter::eval::check_exc_match_against(lhs, rhs);
-        return pyre_object::w_bool_from(matched) as i64;
-    }
-
-    // op_code 6 = CONTAINS_OP `in`, 7 = `not in` (from compare_op_tag).
-    // lhs = needle/item, rhs = container/haystack (flatten lowers the args
-    // as `[item, container]`).
-    if op_code == 6 || op_code == 7 {
-        match pyre_interpreter::baseobjspace::contains(rhs, lhs) {
-            Ok(found) => {
-                let result = if op_code == 7 { !found } else { found };
-                return pyre_object::w_bool_from(result) as i64;
-            }
-            Err(mut err) => {
-                let exc_obj = err.to_exc_object();
-                publish_residual_call_exception(exc_obj as i64);
-                return 0;
-            }
-        }
-    }
-
-    // op_code 8 = IS_OP `is`, 9 = `is not` (from compare_op_tag).
-    // `space.is_w`, not raw pointer identity: `W_AbstractIntObject.is_w`
-    // (`intobject.py`) and `W_FloatObject.is_w` (`floatobject.py`)
-    // compare two plain `int`s / `float`s by value, so a freshly boxed equal
-    // value is identical.  Infallible — never publishes BH_LAST_EXC_VALUE.
-    if op_code == 8 || op_code == 9 {
-        let same = pyre_interpreter::baseobjspace::is_w(lhs, rhs);
-        let result = if op_code == 9 { !same } else { same };
-        return pyre_object::w_bool_from(result) as i64;
-    }
-
-    // op_code is the compact tag from compare_op_tag (0-5), NOT the raw
-    // ComparisonOperator discriminant. Reverse the mapping to get the enum.
-    let Some(op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_code) else {
-        let mut err = pyre_interpreter::PyError::new(
-            pyre_interpreter::PyErrorKind::TypeError,
-            format!("unknown compare op tag {op_code}"),
-        );
-        publish_residual_call_exception(err.to_exc_object() as i64);
-        return 0;
-    };
-    match pyre_interpreter::opcode_ops::compare_value(lhs, rhs, op) {
-        Ok(result) => result as i64,
-        Err(mut err) => {
-            let exc_obj = err.to_exc_object();
-            publish_residual_call_exception(exc_obj as i64);
-            0
-        }
-    }
-}
-
-/// RPython: bhimpl_int_add, bhimpl_int_sub, etc. — binary op helper.
-///
-/// Performs a Python-level binary operation.
-/// op_code is the BinaryOperator tag from CPython 3.13 BINARY_OP.
-pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
-    let lhs = lhs as PyObjectRef;
-    let rhs = rhs as PyObjectRef;
-
-    // op_code is the compact tag from binary_op_tag (0-12), NOT the raw
-    // BinaryOperator discriminant. Reverse the mapping to get the enum.
-    let Some(op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_code) else {
-        let mut err = pyre_interpreter::PyError::new(
-            pyre_interpreter::PyErrorKind::TypeError,
-            format!("unknown binary op tag {op_code}"),
-        );
-        publish_residual_call_exception(err.to_exc_object() as i64);
-        return 0;
-    };
-    match pyre_interpreter::opcode_ops::binary_value(lhs, rhs, op) {
-        Ok(result) => result as i64,
-        Err(mut err) => {
-            let exc_obj = err.to_exc_object();
-            publish_residual_call_exception(exc_obj as i64);
             0
         }
     }

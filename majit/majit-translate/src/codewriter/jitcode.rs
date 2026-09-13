@@ -344,6 +344,12 @@ pub struct DescentBlockerSummary {
     /// scan never enters reports no blocker — so this cannot be expressed as
     /// one of the two above and declines on its own.
     pub body_not_walked: bool,
+    /// The byte position of the first op of this body that made some path
+    /// effectful — a residual call, a heap write, or an `inline_call` into a
+    /// callee that may execute an effect (a cycle or an unread body answers
+    /// so too).  Diagnostic only: it names what turned a body's blockers into
+    /// declines.
+    pub first_effect_pc: Option<usize>,
 }
 
 /// Answers computed on demand from an assembled [`JitCode`] body.
@@ -356,7 +362,18 @@ pub struct DerivedBodyFacts {
     /// by the symbolic hash standing in for its funcbox. Read through
     /// [`JitCode::descent_blocker_summary`].
     descent_blocker_summary: OnceLock<DescentBlockerSummary>,
+    /// The same answer computed with the argument-array length a call site
+    /// knows, indexed by that length. Read through
+    /// [`JitCode::descent_blocker_summary_for_entry_len`].
+    descent_blocker_summary_by_entry_len:
+        [OnceLock<DescentBlockerSummary>; DESCENT_ENTRY_LEN_SLOTS],
 }
+
+/// How many distinct entry argument-array lengths
+/// [`JitCode::descent_blocker_summary_for_entry_len`] caches. A generated
+/// gateway is called with the arity its signature names, so the lengths a body
+/// is ever asked about form a short prefix; a longer one recomputes.
+pub const DESCENT_ENTRY_LEN_SLOTS: usize = 8;
 
 mod oncelock_usize_serde {
     use std::sync::OnceLock;
@@ -470,6 +487,40 @@ impl JitCode {
         compute: impl FnOnce() -> DescentBlockerSummary,
     ) -> DescentBlockerSummary {
         *self.derived.descent_blocker_summary.get_or_init(compute)
+    }
+
+    /// The already-computed answer of [`Self::descent_blocker_summary`], or
+    /// `None` when nothing has asked for it yet.
+    ///
+    /// A caller that must decide whether its answer may be stored reads the
+    /// slot without filling it: `get_or_init` would take a closure it is not
+    /// yet entitled to commit.
+    pub fn descent_blocker_summary_if_computed(&self) -> Option<DescentBlockerSummary> {
+        self.derived.descent_blocker_summary.get().copied()
+    }
+
+    /// The same answer as [`Self::descent_blocker_summary`], for a caller that
+    /// knows the length of the argument array the body is entered with.
+    ///
+    /// The scan reads the assembled body and the build-time descr / jitcode
+    /// tables, so its answer is a function of the body and that length alone
+    /// and one slot per length is a complete cache. Without it the gate pays a
+    /// whole-body worklist dataflow — which recurses into callee bodies
+    /// uncached, so a shared callee is re-walked once per path — on every call
+    /// site, every walk.
+    pub fn descent_blocker_summary_for_entry_len(
+        &self,
+        entry_len: usize,
+        compute: impl FnOnce() -> DescentBlockerSummary,
+    ) -> DescentBlockerSummary {
+        match self
+            .derived
+            .descent_blocker_summary_by_entry_len
+            .get(entry_len)
+        {
+            Some(slot) => *slot.get_or_init(compute),
+            None => compute(),
+        }
     }
 
     /// Commit the body once assembly has produced it. Panics on second

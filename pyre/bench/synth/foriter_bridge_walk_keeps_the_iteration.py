@@ -3,8 +3,10 @@
 # Three spellings of one loop over four values.  They differ only in the
 # expression the `for` iterates, so the three totals must agree.
 #
-# `trace_limit` is sized so one traced iteration overflows it and the walk
-# aborts with the iterator already advanced.  A bridge/retrace recording that
+# `trace_limit` is sized so the walk overflows it before it can close the
+# loop (one iteration records ~225 ops here, so the first attempt runs into a
+# second pass) and aborts with the iterator already advanced; the retry then
+# crosses the merge point past 0.8x the limit and segments.  A bridge/retrace recording that
 # does not commit restores the cursor it advanced eagerly, but only the range
 # and zip FOR_ITER specializations journalled theirs: the list and tuple
 # iterators reach the generic `for_iter_next` residual, so nothing was recorded
@@ -17,7 +19,10 @@
 try:
     import pypyjit
 
-    pypyjit.set_param("trace_limit=300")
+    # The 0.8x window is a raw-op-count property; every backend records the
+    # same raw op count for this body, and the sweep put the window around
+    # 220-260.
+    pypyjit.set_param("trace_limit=240")
     pypyjit.set_param("threshold=20")
 except ImportError:
     pass

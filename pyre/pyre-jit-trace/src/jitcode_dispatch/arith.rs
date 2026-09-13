@@ -188,22 +188,36 @@ pub(crate) fn record_int_ovf<Sym: WalkSym>(
     b2: OpRef,
 ) -> Result<(OpRef, bool), DispatchError> {
     let v1 = match ctx.trace_ctx.concrete_of_opref(b1) {
-        Some(Value::Int(value)) => value,
-        _ => {
-            return Err(DispatchError::IntOvfOperandNotConcrete { pc, value: b1 });
-        }
+        Some(Value::Int(value)) => Some(value),
+        _ => match ctx.trace_ctx.box_value(b1) {
+            Some(Value::Int(value)) => Some(value),
+            _ => None,
+        },
     };
     let v2 = match ctx.trace_ctx.concrete_of_opref(b2) {
-        Some(Value::Int(value)) => value,
-        _ => {
-            return Err(DispatchError::IntOvfOperandNotConcrete { pc, value: b2 });
-        }
+        Some(Value::Int(value)) => Some(value),
+        _ => match ctx.trace_ctx.box_value(b2) {
+            Some(Value::Int(value)) => Some(value),
+            _ => None,
+        },
     };
-    let (wrapping_result, overflow) = match opcode {
+    let Some((wrapping_result, overflow)) = v1.zip(v2).map(|(v1, v2)| match opcode {
         OpCode::IntAddOvf => (v1.wrapping_add(v2), v1.checked_add(v2).is_none()),
         OpCode::IntSubOvf => (v1.wrapping_sub(v2), v1.checked_sub(v2).is_none()),
         OpCode::IntMulOvf => (v1.wrapping_mul(v2), v1.checked_mul(v2).is_none()),
         _ => unreachable!("record_int_ovf requires an IntAddOvf/IntSubOvf/IntMulOvf opcode"),
+    }) else {
+        // `pyjitpl.py opimpl_int_add_jump_if_ovf` records `INT_*_OVF`
+        // via `execute` and then `handle_possible_overflow_error`.
+        // A bridge InputArg may have no sidecar stamp even though the
+        // helper walk is on the sequential (no-overflow) arm.  Record
+        // the op and take that arm instead of aborting the except
+        // bridge (`total += 2` after a caught raise).
+        let _ = pc;
+        count_ops_executed(ctx, opcode);
+        count_ops_recorded(ctx, opcode);
+        let resbox = ctx.trace_ctx.record_op(opcode, &[b1, b2]);
+        return Ok((resbox, false));
     };
     count_ops_executed(ctx, opcode);
     if b1.is_constant() && b2.is_constant() {

@@ -2239,6 +2239,10 @@ pub fn handle_exception_with_context(
         // has to land on the frame the materialisation left live.
         let frame = unsafe { &mut *frame_anchor.live() };
         frame.push(exc_obj);
+        // The exception is now on this frame's handler.  Drop the backend
+        // `_store_exception` cells so a later compiled `GUARD_NO_EXCEPTION`
+        // does not re-deliver the value this except already consumed.
+        crate::runtime_ops::jit_clear_published_exception();
         // The decoded `target` is a byte offset; pyre's `next_instr` is a
         // code-unit index, so divide by 2.
         *next_instr = (target_bytes / 2) as usize;
@@ -6063,13 +6067,13 @@ mod tests {
     }
 
     // `check_exc_match_against` is called here directly: the residual
-    // `bh_compare_fn` reaches it on a path an `except` clause cannot select.
+    // `compare_value_from_tag` reaches it on a path an `except` clause cannot select.
     #[test]
     fn test_check_exc_match_against_matches_by_actual_type() {
         // pyopcode.py `return space.exception_match(space.type(w_1), w_2)`:
         // the left operand is matched by its *actual* type, never treated as
         // an unconditional success.  Guards the three shapes the residual
-        // `bh_compare_fn` (call_jit.rs) and the BC `check_exc_match` share:
+        // `compare_value_from_tag` (call_jit.rs) and the BC `check_exc_match` share:
         //   * a matching exception instance   -> true
         //   * a non-matching exception class  -> false (an `except` clause
         //     past the first must not spuriously match)

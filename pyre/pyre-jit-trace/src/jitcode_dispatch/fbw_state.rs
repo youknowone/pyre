@@ -1544,6 +1544,9 @@ fn census_report_pending(outcome: super::ForiterInflightOutcome) {
 /// Report that the item the take handed out was pushed and the frame
 /// repositioned to its body pc — the one outcome that costs no iteration.
 pub fn fbw_foriter_report_delivered() {
+    // The delivered item owns the advanced cursor.  Drop the pre-advance
+    // snapshot so a later refuse cannot roll this consume back.
+    fbw_bridge_iter_journal_clear();
     census_report_pending(super::ForiterInflightOutcome::Delivered);
 }
 
@@ -1651,6 +1654,15 @@ pub fn fbw_foriter_inflight_take(
         || cell_store_len != 0
         || namespace_rolled_back
     {
+        // Same cursor restore as `fbw_foriter_report_refused_header`.
+        // A root walk's non-commit epilogue leaves the journal in place
+        // so a delivery can push the consumed item; refusing here
+        // without putting the cursor back loses that iteration
+        // (`fbw_foriter_item_dropped`).  The body of this consume has
+        // not run to its stores — the abort that reaches this refuse
+        // is `GotoIfNotValueNotConcrete` on the first body opcode —
+        // so re-consuming cannot double a committed acc update.
+        fbw_bridge_iter_journal_rollback();
         crate::trace::fbw_diag::record_foriter_item_dropped();
         if let Some((code_ptr, body_pc)) = key {
             super::census_record_foriter_inflight(
@@ -1665,7 +1677,7 @@ pub fn fbw_foriter_inflight_take(
                  body_effect={body_effect} store_journal_len={store_len} \
                  append_journal_len={append_len} unjournaled={unjournaled} \
                  namespace_rolled_back={namespace_rolled_back} \
-                 — keeping legacy drop-on-abort to avoid a double-apply (R1)",
+                 — restored the iterator cursor so resume re-consumes",
                 body_pc
             );
         }
@@ -2622,11 +2634,14 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
                 hazardous_callee.map(|(_, why)| why).unwrap_or("false"),
             );
         }
-        return Err(fbw_decline_inline_callee(
-            ctx,
-            pc,
-            hazardous_callee.map(|(callee_code_key, _)| callee_code_key),
-        ));
+        // A self-recursive body that already unrolled one level residualizes
+        // its deeper CALL as `bh_call_fn`, not CALL_ASSEMBLER.  Aborting
+        // that residual discarded the enclosing function-entry trace
+        // (`selfrec_bridge_nontail_promote`: abort=1, bridges 4→3).  The
+        // wasm CA trampoline hazard is the CALL_ASSEMBLER fold, which is
+        // already exempt via `SELFREC_CA_FOLD_ACTIVE`.  Record the residual
+        // and keep the enclosing walk.
+        return Ok(());
     }
     Ok(())
 }
@@ -4004,6 +4019,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 let defer_truth_or_method_self = match ei.runtime_helper {
                     majit_ir::RuntimeHelperKind::LoadMethodSelf => method_form_deferred_helpers,
                     majit_ir::RuntimeHelperKind::Truth => true,
+                    majit_ir::RuntimeHelperKind::UnaryNot => true,
                     _ => false,
                 };
                 let defer_helper = defer_truth_or_method_self
@@ -4126,11 +4142,37 @@ pub(crate) fn fbw_callee_body_replay_scan(
             if !target_fresh {
                 replay_poison!(poison, "SetarrayitemGcTargetNotFresh", d.pc, d.opname);
             }
+        } else if d.opname.starts_with("inline_call") {
+            // Flatten lowered BINARY_OP is `inline_call_ir_r`, not
+            // `residual_call`.  The residual exemption above never
+            // fires, so admit the same proven-numeric tags here.
+            match crate::jitcode_dispatch::residual_call::inline_call_specialized_plain_numeric_binop(
+                body_code,
+                &numeric_ref_regs,
+                &plain_int_ref_regs,
+                &d,
+                num_regs_i,
+                constants_i,
+                callee_descr_refs,
+            ) {
+                Some(SpecializedBinop::Numeric) => {
+                    dst_exact_numeric = true;
+                }
+                Some(SpecializedBinop::PlainInt) => {
+                    dst_exact_numeric = true;
+                    dst_exact_plain_int = true;
+                }
+                Some(SpecializedBinop::Compare) => {
+                    dst_exact_bool = true;
+                }
+                None => {
+                    replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
+                }
+            }
         } else if d.opname.starts_with("setinteriorfield_gc")
             || d.opname.starts_with("raw_store")
             || d.opname.starts_with("cond_call")
             || d.opname.starts_with("call_assembler")
-            || d.opname.starts_with("inline_call")
         {
             // Interior/raw stores and non-residual call forms cannot be proven
             // replay-safe from this single callee body.
@@ -4273,6 +4315,18 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
                 })
         {
             return true;
+        }
+        // Flatten lowered BINARY to `inline_call_ir_r` of
+        // `binary_value_from_tag` (tag + two refs).  Without this the
+        // root-bridge self-rec admission (`bridge_rec_root_selfrec`)
+        // never sees a BinaryOp and the nested recursive CALL aborts
+        // the enclosing bridge (`selfrec_bridge_nontail_promote`).
+        if op.opname.starts_with("inline_call_ir_r") {
+            let i_len = body_code.get(op.pc + 3).copied().unwrap_or(0);
+            let r_len_pc = op.pc + 3 + 1 + i_len as usize;
+            if i_len == 1 && body_code.get(r_len_pc) == Some(&2) {
+                return true;
+            }
         }
         pc = op.next_pc;
     }

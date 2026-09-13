@@ -614,6 +614,17 @@ pub const BC_ASSERT_NOT_NONE: u8 = 200;
 // `blackhole.py @arguments("r", "i")`.
 pub const BC_RECORD_EXACT_CLASS: u8 = 201;
 
+// `guard_class/r>i` and `guard_class/r>r` — RPython `blackhole.py`
+// `bhimpl_guard_class(cpu, struct): return cpu.bh_classof(struct)`, emitted
+// by `jtransform.py handle_getfield_typeptr` for every read of the
+// object header's class word.  Upstream's result is `Ptr(OBJECT_VTABLE)`;
+// pyre's `PyObject.ob_type` is read as a raw word in some graphs and as a
+// GC ref in others, and the guard keeps the bank of the read it replaced.
+// Distinct from `BC_REF_ISCONSTANT` (237) / `BC_REF_ISVIRTUAL` (238)
+// / `BC_INT_ISCONSTANT` (239).  `Assembler.insns` is 1:1.
+pub const BC_GUARD_CLASS: u8 = 240;
+pub const BC_GUARD_CLASS_R: u8 = 241;
+
 pub const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// Lookup a bytecode opcode by its `opname/argcodes` key.
@@ -1090,6 +1101,9 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("ref_isconstant/r>i", BC_REF_ISCONSTANT);
     m.insert("ref_isvirtual/r>i", BC_REF_ISVIRTUAL);
     m.insert("record_exact_class/ri", BC_RECORD_EXACT_CLASS);
+    // `guard_class` — `blackhole.py bhimpl_guard_class`; see `BC_GUARD_CLASS`.
+    m.insert("guard_class/r>i", BC_GUARD_CLASS);
+    m.insert("guard_class/r>r", BC_GUARD_CLASS_R);
 
     // Float comparisons — `blackhole.py:721-746`
     // `bhimpl_float_{lt,le,eq,ne,gt,ge}` — float pair → int (0/1).

@@ -162,6 +162,10 @@ fn operator_symbol(op: BinaryOperator) -> &'static str {
     }
 }
 
+/// `inline(never)` is load-bearing: rustc otherwise folds this body into its
+/// one-call wrapper and the codewriter never mints the graph a trace descends
+/// (`specialize.rs try_walker_orthodox_binary_op`).
+#[inline(never)]
 pub fn binary_value_from_tag(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -214,11 +218,20 @@ pub fn compare_value(
     compare(a, b, cmp_op)
 }
 
+/// `inline(never)` for the same reason as [`binary_value_from_tag`]: the
+/// codewriter must mint the graph a trace descends.
+#[inline(never)]
 pub fn compare_value_from_tag(
     a: PyObjectRef,
     b: PyObjectRef,
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
+    // A compiled force that has not written a local yet hands a NULL
+    // here.  It must raise, or the inlined path returns a NULL result
+    // without an exception (`ValueError: call failed`).
+    if a.is_null() || b.is_null() {
+        return Err(PyError::type_error("comparison on null operand"));
+    }
     // CONTAINS_OP routes through the compare-residual machinery.
     // `a` is the needle, `b` the container (flatten lowers the args
     // as `[item, container]`).
@@ -231,8 +244,17 @@ pub fn compare_value_from_tag(
         };
         return Ok(w_bool_from(result));
     }
-    // IS_OP: `space.is_w`, not raw pointer identity — same contract as
-    // `bh_compare_fn`. Infallible.
+    // CHECK_EXC_MATCH (tag 10): `except T:` is `exception_match(type(exc), T)`.
+    // The codewriter residualises that as `compare_fn(exc, T, 10)`, and
+    // `cpu.compare_fn` is this helper (`jit_compare_value_from_tag`).
+    // Without this arm the residual TypeErrors ("unsupported compare op
+    // tag: 10"), Truth sees NULL, and the handler takes the mismatch
+    // re-raise — a caught `ValueError` escapes the frame.
+    if op_tag == crate::runtime_ops::ISINSTANCE_OP_TAG {
+        crate::eval::validate_check_exc_match_class(b)?;
+        return Ok(w_bool_from(crate::eval::check_exc_match_against(a, b)));
+    }
+    // IS_OP: `space.is_w`, not raw pointer identity.  Infallible.
     if crate::runtime_ops::compare_op_tag_is_identity(op_tag) {
         let same = crate::baseobjspace::is_w(a, b);
         let result = if op_tag == crate::runtime_ops::COMPARE_OP_IS_NOT {
@@ -1007,15 +1029,7 @@ pub fn dict_merge_value(
 pub extern "C" fn jit_truth_value(value: i64) -> i64 {
     match truth_value(value as PyObjectRef) {
         Ok(truth) => truth as i64,
-        Err(mut err) => {
-            // A raising `__bool__` / `__len__` publishes into the backend
-            // exception cells so the trailing GuardNoException deopts and
-            // re-raises through the blackhole (llmodel.py:194-199
-            // _store_exception).  Return 0 — the guard fires before the
-            // truth is consumed.
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }
 
@@ -1032,14 +1046,7 @@ pub extern "C" fn jit_bool_value_from_truth(value: i64) -> i64 {
 pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
     match binary_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
-        Err(mut err) => {
-            // llmodel.py _store_exception: publish into the backend
-            // exception cells so the trailing GuardNoException deopts and
-            // re-raises through the blackhole.  Return null — the guard fires
-            // before the result is used.
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }
 
@@ -1047,12 +1054,7 @@ pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 
 pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
     match compare_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
-        Err(mut err) => {
-            // Publish + null so the trailing GuardNoException deopts and
-            // re-raises (llmodel.py _store_exception).
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }
 
@@ -1060,12 +1062,7 @@ pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64
 pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
     match unary_negative_value(value as PyObjectRef) {
         Ok(result) => result as i64,
-        Err(mut err) => {
-            // Publish + null so the trailing GuardNoException deopts and
-            // re-raises (llmodel.py _store_exception).
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }
 
@@ -1073,12 +1070,7 @@ pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
 pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
     match unary_invert_value(value as PyObjectRef) {
         Ok(result) => result as i64,
-        Err(mut err) => {
-            // Publish + null so the trailing GuardNoException deopts and
-            // re-raises (llmodel.py _store_exception).
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }
 
@@ -1086,26 +1078,39 @@ pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
 pub extern "C" fn jit_unary_positive_value(value: i64) -> i64 {
     match unary_positive_value(value as PyObjectRef) {
         Ok(result) => result as i64,
-        Err(mut err) => {
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
+}
+
+// `CallControl.get_jitcode` gives each inlined graph its own callable
+// `JitCode.fnaddr`.  The source graphs below are Rust `PyResult` functions,
+// whose native ABI is not the one-word Ref ABI used by codewriter
+// `inline_call_r_r`.  Publish distinct C-ABI entry points for those graph
+// paths, just as translation supplies callable addresses for RPython graphs.
+// Keep these as separate functions from the opcode residual bridges: the
+// fnaddr registry deliberately rejects unrelated path names sharing one
+// address, because address-keyed runtime rebinding would otherwise be
+// ambiguous.
+#[inline(never)]
+pub extern "C" fn jit_descroperation_neg(value: i64) -> i64 {
+    jit_unary_negative_value(value)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_invert(value: i64) -> i64 {
+    jit_unary_invert_value(value)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_pos(value: i64) -> i64 {
+    jit_unary_positive_value(value)
 }
 
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     match getitem(obj as PyObjectRef, index as PyObjectRef) {
         Ok(value) => value as i64,
-        Err(mut err) => {
-            // llmodel.py _store_exception: publish the exception into
-            // the backend pos_exception cells so the GuardNoException recorded
-            // after BINARY_SUBSCR (instruction_may_raise) deopts and re-raises
-            // through the blackhole resume instead of crashing.  Return null —
-            // the guard fires before the result ref is used.
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }
 
@@ -1119,12 +1124,8 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
         // STORE_SUBSCR drops `space.setitem`'s result; this void shim does
         // the same so the recorded residual is a void `CALL_N`.
         Ok(_) => {}
-        Err(mut err) => {
-            // llmodel.py _store_exception: publish the exception into
-            // the backend pos_exception cells so the GuardNoException recorded
-            // after STORE_SUBSCR (instruction_may_raise) deopts and re-raises
-            // through the blackhole resume instead of crashing.
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+        Err(err) => {
+            let _ = crate::runtime_ops::jit_publish_residual_error(err);
         }
     }
 }
@@ -1135,15 +1136,7 @@ pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
     match crate::getattr_str(obj as PyObjectRef, name) {
         Ok(value) => value as i64,
-        Err(mut err) => {
-            // llmodel.py _store_exception: publish the exception into
-            // the backend pos_exception cells so the GuardNoException recorded
-            // after LOAD_ATTR (instruction_may_raise) deopts and re-raises
-            // through the blackhole resume instead of crashing.  Return null —
-            // the guard fires before the result ref is used.
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }
 
@@ -1153,15 +1146,7 @@ pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64
     let name = std::str::from_utf8(bytes).expect("invalid attr name in JIT");
     match crate::setattr_str(obj as PyObjectRef, name, value as PyObjectRef) {
         Ok(_) => 0,
-        Err(mut err) => {
-            // llmodel.py _store_exception: publish the exception into
-            // the backend pos_exception cells so the GuardNoException recorded
-            // after STORE_ATTR (instruction_may_raise) deopts and re-raises
-            // through the blackhole resume instead of crashing.  Return garbage
-            // — the guard fires before the result is used.
-            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-            0
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }
 
@@ -1377,6 +1362,47 @@ mod tests {
             assert_eq!(w_int_get_value(neg), -4);
             assert!(w_bool_get_value(cmp));
         }
+    }
+
+    #[test]
+    fn test_compare_value_from_tag_identity_uses_is_w() {
+        let two = w_int_new(2);
+        let two_again = w_int_new(2);
+        let seven = w_int_new(7);
+        let is_same = compare_value_from_tag(two, two_again, 8).expect("is tag 8");
+        let is_not_same = compare_value_from_tag(two, seven, 9).expect("is_not tag 9");
+        let is_diff = compare_value_from_tag(two, seven, 8).expect("is tag 8 on unequal");
+        unsafe {
+            assert!(w_bool_get_value(is_same));
+            assert!(w_bool_get_value(is_not_same));
+            assert!(!w_bool_get_value(is_diff));
+        }
+    }
+
+    #[test]
+    fn test_compare_value_from_tag_rejects_null_operands() {
+        let err = compare_value_from_tag(std::ptr::null_mut(), w_int_new(1), 5).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert!(err.to_string().contains("comparison on null operand"));
+    }
+
+    #[test]
+    fn test_jit_compare_exc_match_invalid_class_publishes_both_channels() {
+        // Residual CHECK_EXC_MATCH (tag 10) against a non-exception target
+        // must fill BH_LAST_EXC_VALUE as well as the backend cells.  Backend
+        // only leaves blackhole/FBW seeing no standing exception, so Truth
+        // of the NULL result takes the mismatch re-raise and the original
+        // ValueError escapes the outer `except TypeError`.
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
+        let exc = crate::PyError::value_error("x").to_exc_object();
+        let result = jit_compare_value_from_tag(
+            exc as i64,
+            w_int_new(5) as i64,
+            crate::runtime_ops::ISINSTANCE_OP_TAG,
+        );
+        assert_eq!(result, 0);
+        let published = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.get());
+        assert_ne!(published, 0, "TypeError must reach BH_LAST_EXC_VALUE");
     }
 
     #[test]

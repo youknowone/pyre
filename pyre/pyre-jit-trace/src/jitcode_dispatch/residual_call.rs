@@ -1893,6 +1893,9 @@ fn report_post_residual_shadow<Sym: WalkSym>(
 /// from the residual's own arguments hides it from the compiled call too.
 fn proxy_viewed_frame(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
     use pyre_interpreter::pyframe::frame_locals_proxy::viewed_frame;
+    if obj.is_null() || unsafe { (*obj).ob_type.is_null() } {
+        return None;
+    }
     if let Some(frame) = viewed_frame(obj) {
         return Some(frame);
     }
@@ -1900,6 +1903,41 @@ fn proxy_viewed_frame(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyOb
         .then(|| unsafe { pyre_object::w_method_get_self(obj) })
         .filter(|recv| !recv.is_null())?;
     viewed_frame(receiver)
+}
+
+/// Whether a residual's Ref-bank operands may hold something other than an
+/// object, so reading a type off one is not sound.
+///
+/// The operand list carries one word per `arg_types()` entry, which is a list
+/// of objects only where every parameter is one machine word wide.  Two
+/// families break that, and neither call is executed by the walk:
+///
+/// * a helper published with a parameter wider than a slot, which
+///   [`pyre_interpreter::is_abi_unsound_argument_residual`] names;
+/// * an un-lowered helper, whose funcbox is a symbolic hash rather than an
+///   address and whose Rust signature nothing checked — `get_and_call_function`
+///   takes `args_w: &[PyObjectRef]`, so its fourth Ref slot holds half of a
+///   slice rather than an object.
+///
+/// [`try_execute_residual_call_via_executor`] declines both on the same test,
+/// but it runs after this write-back, so the scan cannot wait for its answer.
+fn residual_operands_are_not_all_objects<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) -> bool {
+    let Some(&funcbox) = allboxes.first() else {
+        return false;
+    };
+    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcbox) else {
+        // A funcbox the walk cannot read is one it cannot classify, and the
+        // executor declines on the same condition.
+        return true;
+    };
+    majit_translate::codewriter::call::is_symbolic_fnaddr(addr)
+        || pyre_interpreter::is_abi_unsound_argument_residual(addr as usize)
+        || pyre_interpreter::jit_trace_fnaddrs()
+            .iter()
+            .any(|(n, a)| *a == addr && n.contains("bigint"))
 }
 
 /// Write the traced frame's locals region out before a residual that reads it
@@ -1944,7 +1982,7 @@ fn proxy_viewed_frame(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyOb
 /// one on 1479 of the 2958 iterations past the compile point on dynasm, and
 /// none on cranelift.  Emitted here the stores sit between the token store and
 /// the call, where the residual reads them.
-fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
+pub(crate) fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
 ) {
@@ -1954,6 +1992,9 @@ fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
     ) else {
         return;
     };
+    if residual_operands_are_not_all_objects(ctx, allboxes) {
+        return;
+    }
     let mut reads_traced_frame = false;
     for &arg in allboxes {
         let Some(obj) = walker_concrete_ref_object(ctx, arg) else {
@@ -3109,6 +3150,33 @@ pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
     }
 }
 
+/// Whether the callable's frame needs cells. The self-rec CALL_ASSEMBLER
+/// fold is Branch A (`ncells == 0`); a closure or cell-bearing body
+/// declines there and must not be inlined past `execute_frame` either.
+fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    callable: OpRef,
+) -> bool {
+    let Some(majit_ir::Value::Ref(callable_ref)) = ctx.trace_ctx.box_value(callable) else {
+        return false;
+    };
+    if callable_ref == majit_ir::GcRef::NO_CONCRETE || callable_ref.as_usize() == 0 {
+        return false;
+    }
+    let obj = callable_ref.as_usize() as pyre_object::PyObjectRef;
+    unsafe {
+        let Some((w_code, _nparams, has_closure)) = resolve_inlinable_callee(obj) else {
+            return false;
+        };
+        if has_closure {
+            return true;
+        }
+        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject;
+        !raw.is_null() && pyre_interpreter::ncells(&*raw) != 0
+    }
+}
+
 /// The symbolic decline, minted in one place so it carries provenance.
 ///
 /// Ten preconditions inside [`try_execute_residual_call_via_executor`] end in
@@ -3452,6 +3520,27 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
+            // The refusal names the helper and slot it fired on, because the
+            // repair for a helper that does check its NULL is a row in
+            // `mayforce_null_ref_arg_is_checked_sentinel` and the row needs
+            // both coordinates.  A call the effect info gives no
+            // `RuntimeHelperKind` for has only the funcbox to name it by, so
+            // resolve that against the published registry too.
+            if fbw_debug_abort_enabled() {
+                let target = match allboxes.first().and_then(|&b| ctx.trace_ctx.box_value(b)) {
+                    Some(majit_ir::Value::Int(addr)) => addr,
+                    _ => 0,
+                };
+                let name = pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .find(|&(_, addr)| addr == target)
+                    .map_or("-", |(name, _)| name);
+                eprintln!(
+                    "[nullref-refusal] helper={helper:?} target={name}/{target:#x} \
+                     arg_index={i} nargs={} pc={op_pc} opcode={call_opcode:?}",
+                    args.len()
+                );
+            }
             return Ok(declined_symbolic(call_opcode));
         }
     }
@@ -3803,6 +3892,53 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             let operand = args[2] as pyre_object::PyObjectRef;
             !operand.is_null() && unsafe { pyre_object::pyobject::is_int_or_long(operand) }
         };
+    // `do_residual_call` (`pyjitpl.py`) runs at any framestack depth.
+    // Exact-int `BINARY_OP` / `COMPARE_OP` has no user dunder and is not
+    // the self-recursive `CALL_ASSEMBLER` trampoline the nested-decline
+    // hazard names.  Refusing it inside `rec` aborted the inline before
+    // `sys._getframe` could force a multi-frame carrier.
+    // Name the helper first.  A descended `jit_bigint_*` residual also
+    // has two Ref slots, but those are `*mut BigInt` payloads, not
+    // `PyObject`s; `is_int` must not see them.
+    let opcode_binop_or_compare_fnaddr =
+        pyre_interpreter::jit_trace_fnaddrs().iter().any(|(n, a)| {
+            *a == func_ptr as i64
+                && (n.ends_with("binary_value_from_tag") || n.ends_with("compare_value_from_tag"))
+        });
+    let binop_or_compare_helper = matches!(
+        helper,
+        majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
+    ) || opcode_binop_or_compare_fnaddr;
+    let is_exact_int_word = |word: i64| {
+        let obj = word as pyre_object::PyObjectRef;
+        !obj.is_null()
+            && (word as usize).is_multiple_of(std::mem::align_of::<usize>())
+            && unsafe {
+                pyre_object::is_int(obj)
+                    && !pyre_object::is_bool(obj)
+                    && pyre_object::is_exact_builtin_instance(obj)
+            }
+    };
+    let exact_int_binop_operands = binop_or_compare_helper && {
+        let ref_operand_words: Vec<i64> = call_descr
+            .arg_types()
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| **ty == majit_ir::Type::Ref)
+            .filter_map(|(i, _)| args.get(i).copied())
+            .collect();
+        ref_operand_words.len() == 2
+            && is_exact_int_word(ref_operand_words[0])
+            && is_exact_int_word(ref_operand_words[1])
+    };
+    let observed_exact_int_binop = matches!(
+        helper,
+        majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
+    ) && exact_int_binop_operands;
+    // A codewriter residual of the same helper can arrive with
+    // `RuntimeHelperKind::None`.  The fnaddr only names the helper;
+    // user `__add__` / `__eq__` still mutate, so keep the exact-int gate.
+    let opcode_binop_or_compare = opcode_binop_or_compare_fnaddr && exact_int_binop_operands;
     // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
     // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
     // cannot mutate an object visible before the call.  Upstream records list
@@ -3829,7 +3965,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         || observed_replay_safe_isinstance
         || replay_safe_fresh_allocation
         || replay_safe_tuple_from_list
-        || observed_exact_int_index;
+        || observed_exact_int_index
+        || observed_exact_int_binop
+        || opcode_binop_or_compare;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
         || (helper == majit_ir::RuntimeHelperKind::CallFn && !replay_safe_tuple_from_list)
         || helper_kind_writes_live_heap(helper);
@@ -3930,55 +4068,69 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // on.  [`LiveLastInstrGuard`] makes the matching retarget for the
         // concrete store, publishing onto the callee's own frame instead.
         if current_inline_concrete_frame() == 0 {
-            let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
-            // Scope the box half to the residual just as
-            // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
-            // leaves both halves equal (`pyjitpl.py:1188-1199`), and
-            // `check_synchronized_virtualizable` asserts that invariant
-            // (`pyjitpl.py:3463-3468`).
-            if let Some(idx) = info.static_field_index_by_name("last_instr")
-                && let Some((prev_op, prev_val)) = ctx.trace_ctx.virtualizable_entry_at(idx)
-            {
-                saved_last_instr_shadow = Some((prev_op, prev_val));
-            }
-            crate::trace_opcode::mirror_vable_static_to_boxes(
-                ctx.trace_ctx,
-                "last_instr",
-                last_instr,
-                majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
-            );
-            // Record the runtime heap half of the same `_opimpl_setfield_vable`
-            // shape.  The mirror above synchronizes the tracing-time shadow
-            // and live frame; this store keeps compiled execution paired too.
-            //
-            // Upstream needs neither at a residual call: its frame readers are
-            // traced in and read `last_instr` off the virtual frame.  pyre
-            // residualizes them and reads the heap, and the frame-chain walk no
-            // longer forces (`ExecutionContext::force_frame`), so without this
-            // store nothing keeps the field current in compiled code: left at
-            // the last resume point, `_warnings::setup_context` keys its
-            // registry on the wrong line and re-issues a warning the
-            // interpreted run already deduplicated.
-            if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
-                && let Some(idx) = info.static_field_index_by_name("last_instr")
-            {
-                // Record under the PARENT-STRUCT field descr, the resolution
-                // `vable_setfield` applies through `vable_static_record_descr`;
-                // `vable_setfield_descr` is a raw pass-through and does not.
-                // The vinfo's own `static_field_descrs[i]` numbers the field by
-                // the vinfo `[token, statics, arrays]` order, which diverges
-                // from PyFrame's struct declaration order, so the store pairs
-                // against the wrong slot.  `virtualizable.py:71` builds the
-                // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so
-                // upstream's vinfo descr and the descr an ordinary
-                // `setfield_gc` carries are one object and the question cannot
-                // arise there.  Here it decides whether this publish and
-                // `emit_traceback_node`'s store — same frame, same offset —
-                // supersede each other or survive as two independent
-                // locations flushed in an arbitrary order.
-                let descr = info.static_field_struct_descr(idx);
-                ctx.trace_ctx
-                    .vable_setfield_descr(vable_ref, last_instr, descr);
+            // A transparent helper is not a Python frame: its
+            // `vstack_cur_pypc` stays 0.  Publish the CALL-site opcode
+            // instead of writing last_instr=0 over the portal coordinate.
+            let py_pc = if ctx.fbw_mode.transparent_helper_subwalk {
+                ctx.fbw_mode
+                    .inline_caller_py_pc
+                    .unwrap_or(ctx.vstack_cur_pypc)
+            } else {
+                ctx.vstack_cur_pypc
+            };
+            if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
+                // Keep the last portal store rather than clobber it with 0.
+            } else {
+                let last_instr = ctx.trace_ctx.const_int(py_pc as i64);
+                // Scope the box half to the residual just as
+                // `LiveLastInstrGuard` scopes the heap half.  `_opimpl_setfield_vable`
+                // leaves both halves equal (`pyjitpl.py:1188-1199`), and
+                // `check_synchronized_virtualizable` asserts that invariant
+                // (`pyjitpl.py:3463-3468`).
+                if let Some(idx) = info.static_field_index_by_name("last_instr")
+                    && let Some((prev_op, prev_val)) = ctx.trace_ctx.virtualizable_entry_at(idx)
+                {
+                    saved_last_instr_shadow = Some((prev_op, prev_val));
+                }
+                crate::trace_opcode::mirror_vable_static_to_boxes(
+                    ctx.trace_ctx,
+                    "last_instr",
+                    last_instr,
+                    majit_ir::Value::Int(py_pc as i64),
+                );
+                // Record the runtime heap half of the same `_opimpl_setfield_vable`
+                // shape.  The mirror above synchronizes the tracing-time shadow
+                // and live frame; this store keeps compiled execution paired too.
+                //
+                // Upstream needs neither at a residual call: its frame readers are
+                // traced in and read `last_instr` off the virtual frame.  pyre
+                // residualizes them and reads the heap, and the frame-chain walk no
+                // longer forces (`ExecutionContext::force_frame`), so without this
+                // store nothing keeps the field current in compiled code: left at
+                // the last resume point, `_warnings::setup_context` keys its
+                // registry on the wrong line and re-issues a warning the
+                // interpreted run already deduplicated.
+                if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
+                    && let Some(idx) = info.static_field_index_by_name("last_instr")
+                {
+                    // Record under the PARENT-STRUCT field descr, the resolution
+                    // `vable_setfield` applies through `vable_static_record_descr`;
+                    // `vable_setfield_descr` is a raw pass-through and does not.
+                    // The vinfo's own `static_field_descrs[i]` numbers the field by
+                    // the vinfo `[token, statics, arrays]` order, which diverges
+                    // from PyFrame's struct declaration order, so the store pairs
+                    // against the wrong slot.  `virtualizable.py:71` builds the
+                    // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so
+                    // upstream's vinfo descr and the descr an ordinary
+                    // `setfield_gc` carries are one object and the question cannot
+                    // arise there.  Here it decides whether this publish and
+                    // `emit_traceback_node`'s store — same frame, same offset —
+                    // supersede each other or survive as two independent
+                    // locations flushed in an arbitrary order.
+                    let descr = info.static_field_struct_descr(idx);
+                    ctx.trace_ctx
+                        .vable_setfield_descr(vable_ref, last_instr, descr);
+                }
             }
         }
         unsafe {
@@ -4219,6 +4371,33 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
+    // A Ref result is a nursery object. The next residual in this walk
+    // (`abs(x - y)` after complex subtract) allocates and can collect it
+    // before `set_opref_concrete` roots the recorded op. Pin the live
+    // word now and stamp that word below.
+    let mut residual_result_scope = None;
+    let exec_result = match exec_result {
+        Ok(result_i64)
+            if !is_void && call_descr.result_type() == majit_ir::Type::Ref && result_i64 != 0 =>
+        {
+            let obj = result_i64 as usize as pyre_object::PyObjectRef;
+            if obj.is_null() {
+                Ok(result_i64)
+            } else {
+                let live = if let Some((ref roots, _, _)) = residual_locals_roots {
+                    roots.pin_root(obj)
+                } else {
+                    let scope = pyre_object::gc_roots::push_roots();
+                    let live = scope.pin_root(obj);
+                    residual_result_scope = Some(scope);
+                    live
+                };
+                Ok(live as i64)
+            }
+        }
+        other => other,
+    };
+    let _residual_result_scope = residual_result_scope;
     // Declared only now, so this residual constrains the residuals that FOLLOW
     // it inside the same opcode and never itself: the gate above read the
     // window, and a force inside the callee reads it again from
@@ -5382,42 +5561,33 @@ pub(crate) enum SpecializedBinop {
 /// Non-numeric operands stay an impure residual, so admitting them here would
 /// trigger the nested-residual 6421 abort storm.
 ///
-/// The accepted set is every tag a specialization table lowers with no runtime
-/// decline path left, so nothing survives as a residual.  Both tables key the
-/// in-place tag to the SAME arm as its plain form, so the two forms are
-/// admitted together:
+/// The accepted set is every tag handled either by the generated exact-int
+/// descent or by the remaining float specialization without an unsafe replay
+/// residual.  In-place tags select the same concrete builtin arithmetic as
+/// their plain forms, so the two forms are admitted together:
 ///
-/// - `Add` / `Subtract` / `Multiply` (+ in-place) — `IntAddOvf` / `IntSubOvf` /
-///   `IntMulOvf` in `try_walker_specialize_binary_op_int`, `FloatAdd` /
-///   `FloatSub` / `FloatMul` in `try_walker_specialize_binary_op_float`.  In
-///   both tables `needs_concrete_check` is false, so either argument width
-///   lowers unconditionally.
+/// - `Add` / `Subtract` / `Multiply` (+ in-place) — the generated
+///   `binary_value_from_tag` descent for exact ints, and `FloatAdd` /
+///   `FloatSub` / `FloatMul` in `try_walker_specialize_binary_op_float`.
 /// - `And` / `Or` / `Xor` (+ in-place) — `IntAnd` / `IntOr` / `IntXor`, also
 ///   unconditional, but *int-only*: the float table falls through to
 ///   `_ => return Ok(None)` for them.  Hence the separate
 ///   [`SpecializedBinop::PlainInt`] arm, which additionally demands both
 ///   operands be proven plain ints.
-/// - `FloorDivide` / `Remainder` (+ in-place) — `IntFloorDiv` / `IntMod`,
-///   int-only for the same reason (neither has a `FLOAT_*` opcode).  These two
-///   are the one accepted pair whose lowering *can* decline — on a zero divisor
-///   or on `i64::MIN` by `-1` — but a surviving residual is still replay-safe
-///   on its own merits: `int.__floordiv__` / `int.__mod__` read two immutable
-///   boxes and either allocate a fresh result or raise `ZeroDivisionError`,
-///   which commits nothing a replay would double.  The `plain_int` proof is
-///   what rules out a user `__mod__`.  `i % k` in an `if` is the common shape
-///   that would otherwise residualize the whole callee
-///   (`bench/synth/gc_bug_bridge_flavor_traceback_names`).
+/// - `FloorDivide` / `Remainder` (+ in-place) — exact-int-only generated
+///   descent.  Its success arm records the `int.py_div` / `int.py_mod`
+///   oopspec, and its zero-divisor arm propagates the materialised
+///   `W_BaseException` as `SubRaise`.  The `plain_int` proof rules out a user
+///   `__mod__`.
 ///
 /// Every other tag is excluded because its lowering can still decline and
 /// leave a residual that is NOT replay-safe on its own:
 ///
 /// - `TrueDivide` (+ in-place) — float-table only, and it declines a zero
 ///   divisor so the raising `descr_truediv` stays recorded.
-/// - `Lshift` (+ in-place) — the int table declines it outright (the reused
-///   trace would bake a count the x86 `SHL` masks mod 64, and the guarded form
-///   breaks the cranelift bridge).
-/// - `Rshift` (+ in-place) — declines a negative or `>= LONG_BIT` count rather
-///   than baking intobject.py's fold-to-`0`/`-1`.
+/// - shifts (+ in-place) — the generated descent handles exact-int sites, but
+///   this replay admission remains conservative around the count-dependent
+///   exception and large-count arms.
 /// - `Power` (+ in-place) — the int table has no arm; the float table inlines
 ///   `_pow` but keeps a cold-path residual for nan/inf/negative-base operands.
 /// - `Subscr`, `MatrixMultiply` (+ in-place) — no arm in either table.
@@ -5491,6 +5661,87 @@ pub(crate) fn residual_call_specialized_plain_numeric_binop(
             .is_some()
             .then_some(SpecializedBinop::Compare);
     }
+    use pyre_interpreter::bytecode::BinaryOperator;
+    match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {
+        Some(
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::InplaceAdd
+            | BinaryOperator::InplaceSubtract
+            | BinaryOperator::InplaceMultiply,
+        ) => Some(SpecializedBinop::Numeric),
+        Some(
+            BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Xor
+            | BinaryOperator::InplaceAnd
+            | BinaryOperator::InplaceOr
+            | BinaryOperator::InplaceXor
+            | BinaryOperator::FloorDivide
+            | BinaryOperator::Remainder
+            | BinaryOperator::InplaceFloorDivide
+            | BinaryOperator::InplaceRemainder,
+        ) => (plain_int_ref_regs[lhs_reg as usize] && plain_int_ref_regs[rhs_reg as usize])
+            .then_some(SpecializedBinop::PlainInt),
+        _ => None,
+    }
+}
+
+/// Flatten lowered `BINARY_OP` to `inline_call_ir_r/dIR>r` of
+/// `binary_value_from_tag` / named `add`.  The residual-call exemption
+/// above never sees that form, so a one-line `return a + i` body was
+/// `Dirty` (`UnprovableStoreOrCallForm`) and stayed a per-iteration
+/// residual (`inlined_helper_arith_hot`).
+pub(crate) fn inline_call_specialized_plain_numeric_binop(
+    body_code: &[u8],
+    numeric_ref_regs: &[bool; u8::MAX as usize + 1],
+    plain_int_ref_regs: &[bool; u8::MAX as usize + 1],
+    d: &DecodedOp,
+    num_regs_i: usize,
+    constants_i: &[i64],
+    callee_descr_refs: &[DescrRef],
+) -> Option<SpecializedBinop> {
+    if !d.opname.starts_with("inline_call_ir_r") {
+        return None;
+    }
+    let descr_index = {
+        let lo = *body_code.get(d.pc + 1)? as usize;
+        let hi = *body_code.get(d.pc + 2)? as usize;
+        lo | (hi << 8)
+    };
+    let sub_index = callee_descr_refs
+        .get(descr_index)
+        .and_then(|descr| descr.as_jitcode_descr())
+        .map(|jc| jc.jitcode_index());
+    let &i_len = body_code.get(d.pc + 3)?;
+    let r_len_pc = d.pc + 3 + 1 + i_len as usize;
+    if body_code.get(r_len_pc) != Some(&2) {
+        return None;
+    }
+    let lhs_reg = *body_code.get(r_len_pc + 1)?;
+    let rhs_reg = *body_code.get(r_len_pc + 2)?;
+    if !numeric_ref_regs[lhs_reg as usize] || !numeric_ref_regs[rhs_reg as usize] {
+        return None;
+    }
+    let int_concretes: Vec<ConcreteValue> = if i_len == 0 {
+        Vec::new()
+    } else {
+        let tag_reg = *body_code.get(d.pc + 4)?;
+        (tag_reg as usize)
+            .checked_sub(num_regs_i)
+            .and_then(|index| constants_i.get(index).copied())
+            .map(|tag| vec![ConcreteValue::Int(tag)])
+            .unwrap_or_default()
+    };
+    // Prefer the I-list tag.  Flatten's per-fn descr index can name a
+    // different jitcode (`dict_write_barrier` at descr 109) while the
+    // I-list still carries BINARY_OP Add=0; the helper-name lookup then
+    // declines a body the walker will specialize.
+    let tag = match int_concretes.first() {
+        Some(ConcreteValue::Int(tag)) => *tag,
+        _ => super::specialize::binary_op_tag_for_helper_index(sub_index?, &int_concretes)?,
+    };
     use pyre_interpreter::bytecode::BinaryOperator;
     match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {
         Some(
@@ -6639,25 +6890,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // `len(x)` on an exact canonical list: inline the strategy-guarded
-    // length read (guard_value callable + guard_class + exact w_class +
-    // guard_value strategy + length getfield + wrapint) instead of the
-    // opaque `bh_call_fn(len_builtin, NULL, x)` residual — the shape the
-    // meta-tracer produces upstream (descroperation.py `_len` →
-    // `W_ListObject.length()`).  Read-only like the SUBSCR fold, so no
-    // sub-walk restriction; any non-matching shape falls through to the
-    // generic residual (SAFE).
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::BuiltinLen, || {
-            try_walker_specialize_builtin_len(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // `isinstance(x, C)` for a class whose metaclass is exactly `type`: the
     // answer is `issubtype`'s elidable MRO test on two promoted types
     // (typeobject.py), so pin both and bake it instead of leaving the opaque
@@ -6713,19 +6945,33 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // calls sub-walk the callee body in place of the residual; ineligible
     // calls (including every non-`call_fn` helper, gated on `runtime_helper`)
     // fall through with no IR emitted.
-    if let Some(inlined) = try_walker_inline_user_call(
-        ctx,
-        op,
-        code,
-        1,
-        funcptr,
-        &r_args,
-        call_descr,
-        foldable_runtime_helper,
-        dst_bank,
-        dst,
-    )? {
-        return Ok(inlined);
+    //
+    // A nested self-rec (`plain` closing over `best`) cannot take
+    // CALL_ASSEMBLER (that fold is Branch A: no cells). Inlining it
+    // instead compiles a function-entry call that skips
+    // `execute_frame`'s depth charge, so a JIT-hot run rides the
+    // native stack budget (~8000) past `sys.getrecursionlimit()`.
+    // Leave those on the residual so `execute_frame` still charges.
+    // Module-level self-rec (`fib`) has no cells and still unrolls.
+    let skip_cell_self_rec = r_args.first().is_some_and(|&callable| {
+        residual_callee_is_walk_self_recursive(ctx, &[funcptr, callable], foldable_runtime_helper)
+            && residual_callable_has_closure_or_cells(ctx, callable)
+    });
+    if !skip_cell_self_rec {
+        if let Some(inlined) = try_walker_inline_user_call(
+            ctx,
+            op,
+            code,
+            1,
+            funcptr,
+            &r_args,
+            call_descr,
+            foldable_runtime_helper,
+            dst_bank,
+            dst,
+        )? {
+            return Ok(inlined);
+        }
     }
 
     if ctx.is_authoritative_executor
@@ -6977,91 +7223,31 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // UNARY_POSITIVE.  Descend `pos_inner` -- `pos` past the override probe --
-    // rather than re-emit its identity arm by hand, the same shape the invert
-    // and neg descents take.  Sits ahead of the `unary_positive_int` fold so
-    // that fold's `consulted` count reads whether the descent took the site.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
-        && spec_gate(SpecFold::UnaryPositiveDescent, || {
-            try_walker_orthodox_unary_positive(ctx, op.pc, r_args[0], dst, dst_bank)
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNot
+        && spec_gate(SpecFold::UnaryNot, || {
+            try_walker_specialize_unary_not(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
         .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // #61: UNARY_POSITIVE `+int` identity fold.  Kept behind the descent so a
-    // build whose `pos_inner` jitcode is missing or unlowered still forwards
-    // an exact-int operand.  A bool (`+True` is int `1`) / non-int operand
-    // declines to the generic leg so its `__pos__` still runs.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
-        && spec_gate(SpecFold::UnaryPositiveInt, || {
-            try_walker_specialize_unary_positive_int(ctx, op.pc, r_args[0], dst, dst_bank)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // UNARY_NEGATIVE.  Descend `neg_inner` -- `neg` past the override probe --
-    // rather than re-emit its integer arm by hand, the same shape the invert
-    // descent below takes.  The translated body owns the ordinary int arm and
-    // the exact `long` operand. Bool, subclass and non-int operands still fall
-    // through to the generic residual so their override semantics are
-    // preserved, and the `INT_MIN` promotion declines to the fold below.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
-        && spec_gate(SpecFold::UnaryNegativeDescent, || {
-            try_walker_orthodox_unary_negative(ctx, op.pc, r_args[0], dst, dst_bank)
-        })?
-        .is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // #61: UNARY_NEGATIVE `-int`.  Kept behind the descent, which declines the
-    // one operand `descr_neg` promotes: the fold pins that operand with
-    // `guard_value` and takes the `_make_ovf2long` tail, so the `2**63` long is
-    // a constant the ops reading it fold against.  It also serves an exact-int
-    // operand in a build whose `neg_inner` jitcode is missing or unlowered.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
-        && spec_gate(SpecFold::UnaryNegativeInt, || {
-            try_walker_specialize_unary_negative_int(
-                ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
-            )
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // UNARY_INVERT.  Descend `invert_inner` -- `invert` past the override probe
-    // and the bool slot -- rather than re-emit its integer arm by hand.  This
-    // replaced `unary_invert_int`, whose site it took whole: with the descent
-    // in, that fold measured `consulted=0` on every fixture that exercises `~`.
-    // Falls through to the generic residual when the body is absent from this
-    // build or reaches a helper the build did not lower.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
-        && spec_gate(SpecFold::UnaryInvertDescent, || {
-            try_walker_orthodox_unary_invert(ctx, op.pc, r_args[0], dst, dst_bank)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::UnaryNeg, || {
+            try_emit_exact_int_uneg(ctx, op.pc, &r_args, dst, dst_bank)
+        })? {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
     }
 
     // #62: specialize STORE_SUBSCR `list[int] = value` (int / float storage,
@@ -7944,7 +8130,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
         // pyjitpl.py `execute_and_record_varargs`; may-force
         // calls use `history.record_nospec` and therefore count nothing.
-        if matches!(
+        let profiled_call = matches!(
             call_opcode,
             OpCode::CallI
                 | OpCode::CallR
@@ -7958,13 +8144,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN
-        ) {
+        );
+        if profiled_call {
             ctx.trace_ctx
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::OPS);
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
         // Always record `list_write_barrier` on the Object strategy's in-place
         // append arm.  Dropping it in favour of the backend's
@@ -7999,6 +8183,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             patch_pos,
             recorded,
         );
+        // `_record_helper_varargs` counts RECORDED_OPS as it records; a
+        // may-force call takes `history.record_nospec` and counts nothing.
+        // An all-const pure fold cuts the call back out (`record_result_of_call_pure`),
+        // so only a standing call op is a recorded op.
+        if profiled_call && recorded.inline_const_to_value().is_none() {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
 
         // pyjitpl.py `_opimpl_residual_call{1,2,3}` parity
         // for the remaining shapes.  PyPy
@@ -9169,6 +9362,12 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // (BoxInt exec, generic residual below) requires every box bound.
     ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
+    // `w_bool_from(truth)` inside a descended body: guard the truth and take
+    // the singleton, as `space.newbool` traces.
+    if try_walker_fold_newbool_call(ctx, op.pc, &allboxes, &i_args, dst, dst_bank)?.is_some() {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // BoxInt fold (#62): `box_int_fn(raw)` allocates a fresh `PyLong`.  The
     // opaque CanRaise residual the generic leg would record blocks the
     // optimizer (no DCE of an unused/round-tripped box).  Emit the
@@ -9199,15 +9398,30 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // CALL_MAY_FORCE, matching the retired trait-side int binop / compare
     // paths.  Falls through to the generic record for
     // non-int operands / deferred operators.
-    if matches!(
-        foldable_runtime_helper,
-        majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
-    ) {
+    //
+    // The eval-loop codewriter residual can arrive with
+    // `RuntimeHelperKind::None`; identify the helper by fnaddr so
+    // `binary_op_descent` still runs after `binary_op_int` retired.
+    let func_addr = match ctx.trace_ctx.box_value(funcptr) {
+        Some(majit_ir::Value::Int(n)) => n,
+        _ => 0,
+    };
+    let opcode_binary_fnaddr = func_addr != 0
+        && pyre_interpreter::jit_trace_fnaddrs()
+            .iter()
+            .any(|(n, a)| *a == func_addr && n.ends_with("binary_value_from_tag"));
+    let opcode_compare_fnaddr = func_addr != 0
+        && pyre_interpreter::jit_trace_fnaddrs()
+            .iter()
+            .any(|(n, a)| *a == func_addr && n.ends_with("compare_value_from_tag"));
+    let is_binary_op =
+        foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp || opcode_binary_fnaddr;
+    let is_compare_op =
+        foldable_runtime_helper == majit_ir::RuntimeHelperKind::CompareOp || opcode_compare_fnaddr;
+    if is_binary_op || is_compare_op {
         if let Some(&tag_opref) = i_args.first() {
             if let Some(majit_ir::Value::Int(op_tag)) = ctx.trace_ctx.box_value(tag_opref) {
-                let specialized = if foldable_runtime_helper
-                    == majit_ir::RuntimeHelperKind::BinaryOp
-                {
+                let specialized = if is_binary_op {
                     let is_subscr = matches!(
                         pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
                         Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
@@ -9242,15 +9456,33 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             )
                         })?
                     } else {
-                        // int specialization first; float (incl. mixed int/float)
-                        // as a fallback so two-int operands keep int arithmetic.
-                        if let Some(outcome) = spec_gate(SpecFold::BinaryOpInt, || {
-                            try_walker_specialize_binary_op_int(
-                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
+                        // The exact-int zero-divisor raise runs BEFORE the
+                        // descent: the descended body reaches its
+                        // `ZeroDivisionError` through an opaque published
+                        // materialiser, whose concrete result no longer
+                        // virtualizes (see
+                        // `try_walker_specialize_binary_op_int_zero_div`).
+                        if let Some(outcome) = spec_gate(SpecFold::BinaryOpIntZeroDiv, || {
+                            try_walker_specialize_binary_op_int_zero_div(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst_bank,
                             )
                         })? {
                             return Ok((outcome, op.next_pc));
                         }
+                        // Descend the helper whole ahead of the hand folds, so
+                        // their `consulted` counts read whether the descent
+                        // took the site.
+                        if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
+                            try_walker_orthodox_binary_op(
+                                ctx, op.pc, op_tag, tag_opref, &r_args, dst, dst_bank,
+                            )
+                        })? {
+                            return Ok((outcome, op.next_pc));
+                        }
+                        // Float (including mixed int/float) remains a hand
+                        // fallback.  Exact int pairs have already been taken
+                        // whole by `binary_op_descent`, including overflow and
+                        // zero-division exception arms.
                         // longobject.py `_make_generic_descr_binop` and
                         // `descr_sub` use the rbigint.int_* family for
                         // mixed Long/Int operands.
@@ -9346,7 +9578,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
                     // `op_tag == 10` is CHECK_EXC_MATCH
-                    // (`bh_compare_fn(exc, match_type, 10)`,
+                    // (`compare_value_from_tag(exc, match_type, 10)`,
                     // `call_jit.rs`).  Fold the match concretely to a
                     // const bool (the immortal TRUE/FALSE singleton) so the
                     // exception stays virtual and DCEs, eliding the may-force
@@ -9377,6 +9609,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     // operand layout whose class compares `is_w` by value.
                     try_walker_fold_is_op(ctx, op.pc, op_tag, &r_args, dst, dst_bank)?
                 } else {
+                    // Descend the helper whole ahead of the hand folds, so
+                    // their `consulted` counts read whether the descent
+                    // took the site.
+                    if let Some(outcome) = spec_gate(SpecFold::CompareOpDescent, || {
+                        try_walker_orthodox_compare_op(
+                            ctx, op.pc, op_tag, tag_opref, &r_args, dst, dst_bank,
+                        )
+                    })? {
+                        return Ok((outcome, op.next_pc));
+                    }
                     // int compare first; then long (two-bigint operands keep
                     // bigint comparison); float (incl. mixed int/float) last.
                     match spec_gate(SpecFold::CompareOpInt, || {
@@ -9423,14 +9665,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 if specialized.is_some() {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
-                if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp {
+                if is_binary_op {
                     if let Some(inlined) = try_walker_inline_user_binop(
                         ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
                     )? {
                         return Ok(inlined);
                     }
                 }
-                if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CompareOp {
+                if is_compare_op {
                     if let Some(inlined) = try_walker_inline_user_compareop(
                         ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
                     )? {
@@ -9531,7 +9773,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
-        if matches!(
+        let profiled_call = matches!(
             call_opcode,
             OpCode::CallI
                 | OpCode::CallR
@@ -9545,13 +9787,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN
-        ) {
+        );
+        if profiled_call {
             ctx.trace_ctx
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::OPS);
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
         // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
         // `record_result_of_call_pure` can cut it back out.
@@ -9571,6 +9811,12 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             patch_pos,
             recorded,
         );
+        // See `dispatch_residual_call_iRd_kind`: count only a standing call.
+        if profiled_call && recorded.inline_const_to_value().is_none() {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
 
         // Non-elidable concrete-execute parity — see
         // `dispatch_residual_call_iRd_kind` for the full citation.
@@ -9819,7 +10065,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
-        if matches!(
+        let profiled_call = matches!(
             call_opcode,
             OpCode::CallI
                 | OpCode::CallR
@@ -9833,13 +10079,11 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN
-        ) {
+        );
+        if profiled_call {
             ctx.trace_ctx
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::OPS);
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
         // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
         // `record_result_of_call_pure` can cut it back out.
@@ -9859,6 +10103,12 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             patch_pos,
             recorded,
         );
+        // See `dispatch_residual_call_iRd_kind`: count only a standing call.
+        if profiled_call && recorded.inline_const_to_value().is_none() {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
         // `boxes3`-shaped may-force residual (`CallMayForce{R,I,F,N}`):
         // execute concretely under the authoritative walk and stamp the
         // result, identically to the `iRd` / `iIRd` siblings.

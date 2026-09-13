@@ -1,5 +1,7 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=root:rec,root:step
+# pyre-check: selfcheck-compiles=root:rec
+# `step` inlines into the module loop once `rec`'s self-rec CALL residualizes
+# instead of aborting the enclosing walk. `rec` stays the compiled root.
 # A self-recursive callee reached through a multi-frame adopt returned `None`
 # from a function whose every path returns an `int` (gh#1444).
 #
