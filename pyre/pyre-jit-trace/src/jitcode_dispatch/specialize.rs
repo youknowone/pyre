@@ -9632,6 +9632,44 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     if is_py_div && (rb == 0 || (la == i64::MIN && rb == -1)) {
         return Ok(None);
     }
+    // `int / int` is a float (`intobject.py _truediv` → `as_float / as_float`
+    // + `w_float_new`).  Orthodox descent of that body walks `w_float_new`
+    // and does not finish (`listcomp_float_element_regression` hung past
+    // the 20s gate).  Emit the same CastIntToFloat + FloatTrueDiv the float
+    // fold uses.  Wide ints (mantissa overflow) stay on the rbigint arm.
+    if matches!(op, Some(B::TrueDivide | B::InplaceTrueDivide)) {
+        if rb == 0 || (la.unsigned_abs() >> 53) != 0 || (rb.unsigned_abs() >> 53) != 0 {
+            return Ok(None);
+        }
+        let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
+        let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
+        let lhs_raw = walker_unbox_int_typed(ctx, op_pc, r_args[0], lhs_type, lhs_descr)?;
+        walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(lhs_obj))?;
+        let rhs_raw = walker_unbox_int_typed(ctx, op_pc, r_args[1], rhs_type, rhs_descr)?;
+        walker_guard_exact_w_class(ctx, op_pc, r_args[1], walker_numeric_builtin_class(rhs_obj))?;
+        let lhs_f = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[lhs_raw]);
+        ctx.trace_ctx
+            .set_opref_concrete(lhs_f, majit_ir::Value::Float(la as f64));
+        let rhs_f = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[rhs_raw]);
+        ctx.trace_ctx
+            .set_opref_concrete(rhs_f, majit_ir::Value::Float(rb as f64));
+        let rhs_zero = walker_float_eq_const(ctx, rhs_f, 0.0, 0);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
+        let raw = ctx
+            .trace_ctx
+            .record_op(OpCode::FloatTrueDiv, &[lhs_f, rhs_f]);
+        let result_val = (la as f64) / (rb as f64);
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Float(result_val));
+        let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+        let boxed_ptr = pyre_object::w_float_new(result_val) as usize;
+        ctx.trace_ctx
+            .set_opref_concrete(boxed, majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr)));
+        let _ = (dst, dst_bank);
+        return Ok(Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }));
+    }
     let opcode = match op {
         Some(B::Add | B::InplaceAdd) => OpCode::IntAddOvf,
         Some(B::Subtract | B::InplaceSubtract) => OpCode::IntSubOvf,
@@ -10219,7 +10257,10 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         Some(B::Multiply | B::InplaceMultiply) => B::Multiply,
         Some(B::FloorDivide | B::InplaceFloorDivide) => B::FloorDivide,
         Some(B::Remainder | B::InplaceRemainder) => B::Remainder,
-        Some(B::TrueDivide | B::InplaceTrueDivide) => B::TrueDivide,
+        // `int / int` is a float.  The body ends in `w_float_new`, which
+        // this walk does not lower (see the float-admission note below), so
+        // descending it hung `listcomp_float_element_regression`.
+        Some(B::TrueDivide | B::InplaceTrueDivide) => return Ok(None),
         Some(B::Lshift | B::InplaceLshift) => B::Lshift,
         Some(B::Rshift | B::InplaceRshift) => B::Rshift,
         Some(B::And | B::InplaceAnd) => B::And,
