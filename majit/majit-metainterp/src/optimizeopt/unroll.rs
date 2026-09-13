@@ -9615,7 +9615,8 @@ mod tests {
             },
         ];
         let mut ctx = assemble_test_context(&[], &p2_ops, 2);
-        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops.iter().cloned().map(majit_ir::OpRc::new).collect();
+        let p2_ops_rc: Vec<majit_ir::OpRc> =
+            p2_ops.iter().cloned().map(majit_ir::OpRc::new).collect();
         let start = [OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)];
         let combined = assemble_peeled_trace_with_jump_args(
             &[],
