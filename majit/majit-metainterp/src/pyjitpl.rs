@@ -4,9 +4,9 @@ mod frame;
 pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    StandaloneFrameStack, residual_write_effect_info, setup_frame_from_merge_point, trace_jitcode,
-    trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    RecycleFramestackOnDrop, StandaloneFrameStack, recycle_framestack, residual_write_effect_info,
+    setup_frame_from_merge_point, trace_jitcode, trace_jitcode_at_resume_framestack,
+    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{
@@ -10661,7 +10661,10 @@ impl<M: Clone> MetaInterp<M> {
     pub fn abort_trace_live(&mut self, permanent: bool) {
         self.force_finish_trace = false;
         self.clear_retrace_state();
-        if let Some(ctx) = self.tracing.take() {
+        if let Some(mut ctx) = self.tracing.take() {
+            if let Some(stack) = ctx.aborted_framestack.take() {
+                crate::pyjitpl::recycle_framestack(stack);
+            }
             let green_key = ctx.green_key;
             if crate::majit_log_enabled() {
                 eprintln!(

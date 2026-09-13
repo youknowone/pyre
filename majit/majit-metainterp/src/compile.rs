@@ -35,8 +35,8 @@ use crate::blackhole::ExceptionState;
 use crate::history::TreeLoop;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout};
 use crate::resume::{
-    ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
-    ResumeLayoutSummary, ResumeStorage, ResumeValueSource,
+    ResumeData, ResumeFrameLayoutSummary, ResumeLayoutSummary, ResumeStorage, ResumeValueKind,
+    ResumeValueLayoutSummary,
 };
 use crate::trace_ctx::{MergePoint, TraceCtx};
 
@@ -618,6 +618,129 @@ pub(crate) fn stamp_guard_descr_trace_positions<T: AsRef<majit_ir::Op>>(ops: &[T
     }
 }
 
+/// Project a `ResumeLayoutSummary` from `rebuild_from_numbering` frames.
+///
+/// `resume.py ResumeDataVirtualAdder.finish` / `compile.py ResumeGuardDescr`
+/// already stored `rd_numb` on the descr. Consumers walk that stream; they do
+/// not call `ResumeDataLoopMemo.number` a second time. The previous
+/// `encode_shared` + `layout_summary` path rebuilt a `ResumeData`, numbered it
+/// into a fresh memo, then decoded the encoding — a second numbering RPython
+/// does not run.
+fn rebuilt_value_layout(val: &majit_ir::resumedata::RebuiltValue) -> ResumeValueLayoutSummary {
+    use majit_ir::resumedata::RebuiltValue;
+    match val {
+        RebuiltValue::Box(idx, _) => ResumeValueLayoutSummary {
+            kind: ResumeValueKind::FailArg,
+            fail_arg_index: *idx,
+            raw_fail_arg_position: Some(*idx),
+            constant: None,
+            constant_type: None,
+            virtual_index: None,
+        },
+        RebuiltValue::Const(c) => ResumeValueLayoutSummary {
+            kind: ResumeValueKind::Constant,
+            fail_arg_index: 0,
+            raw_fail_arg_position: None,
+            constant: Some(c.as_raw_i64()),
+            constant_type: Some(c.get_type()),
+            virtual_index: None,
+        },
+        RebuiltValue::Virtual(vidx) => ResumeValueLayoutSummary {
+            kind: ResumeValueKind::Virtual,
+            fail_arg_index: 0,
+            raw_fail_arg_position: None,
+            constant: None,
+            constant_type: None,
+            virtual_index: Some(*vidx),
+        },
+        // `ResumeDataVirtualAdder.set_slot_uninitialized` for Unassigned.
+        RebuiltValue::Unassigned => ResumeValueLayoutSummary {
+            kind: ResumeValueKind::Uninitialized,
+            fail_arg_index: 0,
+            raw_fail_arg_position: None,
+            constant: None,
+            constant_type: None,
+            virtual_index: None,
+        },
+    }
+}
+
+fn resume_layout_from_rebuilt_frames(
+    frames: &[majit_ir::resumedata::RebuiltFrame],
+    const_pool_size: usize,
+) -> ResumeLayoutSummary {
+    let frame_layouts: Vec<ResumeFrameLayoutSummary> = frames
+        .iter()
+        .map(|frame| {
+            let slot_layouts: Vec<ResumeValueLayoutSummary> =
+                frame.values.iter().map(rebuilt_value_layout).collect();
+            let slot_sources: Vec<ResumeValueKind> =
+                slot_layouts.iter().map(|slot| slot.kind).collect();
+            ResumeFrameLayoutSummary {
+                trace_id: None,
+                header_pc: None,
+                source_guard: None,
+                jitcode_index: frame.jitcode_index,
+                pc: frame.pc as u64,
+                slot_sources,
+                slot_layouts,
+                slot_types: None,
+            }
+        })
+        .collect();
+    ResumeLayoutSummary {
+        num_frames: frame_layouts.len(),
+        frame_pcs: frame_layouts.iter().map(|frame| frame.pc).collect(),
+        frame_slot_counts: frame_layouts
+            .iter()
+            .map(|frame| frame.slot_layouts.len())
+            .collect(),
+        frame_layouts,
+        num_virtuals: 0,
+        virtual_kinds: Vec::new(),
+        virtual_layouts: Vec::new(),
+        pending_field_count: 0,
+        pending_field_layouts: Vec::new(),
+        const_pool_size,
+    }
+}
+
+fn resume_layout_identity_frame(pc: u64, num_slots: usize) -> ResumeLayoutSummary {
+    let slot_layouts: Vec<ResumeValueLayoutSummary> = (0..num_slots)
+        .map(|index| ResumeValueLayoutSummary {
+            kind: ResumeValueKind::FailArg,
+            fail_arg_index: index,
+            raw_fail_arg_position: Some(index),
+            constant: None,
+            constant_type: None,
+            virtual_index: None,
+        })
+        .collect();
+    let slot_sources: Vec<ResumeValueKind> = slot_layouts.iter().map(|slot| slot.kind).collect();
+    let frame = ResumeFrameLayoutSummary {
+        trace_id: None,
+        header_pc: None,
+        source_guard: None,
+        jitcode_index: 0,
+        pc,
+        slot_sources,
+        slot_layouts,
+        slot_types: None,
+    };
+    ResumeLayoutSummary {
+        num_frames: 1,
+        frame_pcs: vec![pc],
+        frame_slot_counts: vec![num_slots],
+        frame_layouts: vec![frame],
+        num_virtuals: 0,
+        virtual_kinds: Vec::new(),
+        virtual_layouts: Vec::new(),
+        pending_field_count: 0,
+        pending_field_layouts: Vec::new(),
+        const_pool_size: 0,
+    }
+}
+
 /// Build guard metadata for a compiled trace.
 ///
 /// The backend numbers every guard and finish in a single exit table, so this
@@ -641,7 +764,6 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         indexmap::IndexMap::new();
     let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
     let mut fail_index = 0u32;
-    let mut resume_memo = ResumeDataLoopMemo::new();
     // The driver-scoped override wins: a driver whose frames are numbered
     // outside the process-global liveness pool must not decode against it (see
     // `JitDriverStaticData::frame_value_count_fn`).
@@ -781,74 +903,35 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         };
         let resume_layout;
         let storage = if is_guard {
-            let mut builder = ResumeDataVirtualAdder::new();
-
-            // store_final_boxes parity: when rd_numb is present, fail_args
-            // are normalized to liveboxes only (no constants/virtuals).
-            // Build resume_layout from rd_numb so that TAGCONST/TAGINT
-            // slots produce Constant entries in the reconstructed state.
-            // Multi-frame: push_frame per frame with correct pc.
+            // store_final_boxes / ResumeGuardDescr: when rd_numb is present,
+            // fail_args are liveboxes only. Project the frontend
+            // ResumeLayoutSummary from that stream so TAGCONST/TAGINT slots
+            // stay Constant. Do not ResumeDataLoopMemo.encode_shared a
+            // rebuilt ResumeData — RPython walks storage.rd_numb.
             //
-            // `resolved_rd_*` chases `descr.prev` (compile.py:849
-            // ResumeGuardCopiedDescr.get_resumestorage) so a shared guard
-            // reads the donor's resume data without an owned copy.
-            if let Some((_num_failargs, vable_values, _vref_values, frames)) =
+            // `resolved_rd_*` chases `descr.prev`
+            // (compile.py ResumeGuardCopiedDescr.get_resumestorage) so a
+            // shared guard reads the donor without an owned copy.
+            //
+            // After opencoder.py framestack.reverse(), rd_numb and
+            // ResumeData.frames are outermost-first. vable_array / vref_array
+            // stay their own sections (resume.py); they are not merged into
+            // the innermost frame here.
+            let layout = if let Some((_num_failargs, _vable_values, _vref_values, frames)) =
                 decoded_numbering.as_ref()
             {
-                use majit_ir::resumedata::RebuiltValue;
-                let vable_array = vable_values
-                    .iter()
-                    .map(|val| match val {
-                        RebuiltValue::Box(idx, _) => ResumeValueSource::FailArg(*idx),
-                        RebuiltValue::Const(c) => ResumeValueSource::Constant(*c),
-                        RebuiltValue::Virtual(vidx) => ResumeValueSource::Virtual(*vidx),
-                        RebuiltValue::Unassigned => ResumeValueSource::Unavailable,
-                    })
-                    .collect::<Vec<_>>();
-                builder.set_vable_array(vable_array);
-                let add_slot =
-                    |builder: &mut ResumeDataVirtualAdder, slot_idx: usize, val: &RebuiltValue| {
-                        match val {
-                            RebuiltValue::Box(idx, _) => {
-                                builder.map_slot(slot_idx, *idx);
-                            }
-                            RebuiltValue::Const(c) => {
-                                builder.set_slot_constant(slot_idx, *c);
-                            }
-                            RebuiltValue::Virtual(vidx) => {
-                                builder.set_slot_virtual(slot_idx, *vidx);
-                            }
-                            RebuiltValue::Unassigned => {
-                                builder.set_slot_uninitialized(slot_idx);
-                            }
-                        }
-                    };
-                // After `opencoder.py` `framestack.reverse()` parity,
-                // both rd_numb and `ResumeData.frames` agree on outermost-
-                // first ordering, so push frames in stream order.
-                //
-                // RPython resume.py keeps vable_array/vref_array/framestack
-                // as separate sections. Do not merge vable_array entries into
-                // the innermost frame slots here.
-                for frame in frames.iter() {
-                    builder.push_frame(frame.jitcode_index, frame.pc as u64, frame.py_pc);
-                    for (slot_idx, val) in frame.values.iter().enumerate() {
-                        add_slot(&mut builder, slot_idx, val);
-                    }
-                }
+                resume_layout_from_rebuilt_frames(
+                    frames,
+                    op.resolved_rd_consts().map_or(0, |pool| pool.len()),
+                )
             } else {
                 // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
-                builder.push_frame(0, pc, -1);
                 let num_slots = op
                     .guard_fail_args()
                     .map(|fa| fa.len())
                     .unwrap_or(exit_types.len());
-                for slot_idx in 0..num_slots {
-                    builder.map_slot(slot_idx, slot_idx);
-                }
-            }
-
-            let layout = resume_memo.encode_shared(&builder.build()).layout_summary();
+                resume_layout_identity_frame(pc, num_slots)
+            };
             resume_layout = Some(layout.clone());
             // compile.py `ResumeGuardDescr` storage — build the shared
             // Arc once from the guard op's `rd_*` fields so every reader
@@ -2872,7 +2955,12 @@ mod tests {
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
-        let rd_consts = memo.consts().to_vec();
+        // An unused extra pool slot: encode_shared on a fresh
+        // ResumeDataLoopMemo would not count it. The layout must report
+        // the guard's own rd_consts length (compile.py storage.rd_consts).
+        let mut rd_consts = memo.consts().to_vec();
+        rd_consts.push(majit_ir::Const::Int(123_456_789));
+        let rd_consts_len = rd_consts.len();
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 1)]);
@@ -2900,6 +2988,10 @@ mod tests {
                 .map(|slot| slot.fail_arg_index)
                 .collect::<Vec<_>>(),
             vec![1]
+        );
+        assert_eq!(
+            resume_layout.const_pool_size, rd_consts_len,
+            "layout reads the guard rd_consts pool; it does not re-number into a fresh memo"
         );
 
         let recovery = exit.recovery_layout.as_ref().expect("recovery_layout");

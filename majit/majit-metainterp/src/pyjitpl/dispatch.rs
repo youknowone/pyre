@@ -1537,17 +1537,39 @@ impl StandaloneFrameStack {
 
 impl Drop for StandaloneFrameStack {
     fn drop(&mut self) {
-        while let Some(frame) = self.frames.pop() {
-            self.frames.recycle_frame(frame);
-        }
-        let parked = self.frames.take_free_frames();
-        if parked.is_empty() {
-            return;
-        }
-        STANDALONE_FREE_FRAMES.with(|free| {
-            free.borrow_mut().extend(parked);
-        });
+        recycle_framestack(std::mem::replace(&mut self.frames, MIFrameStack::empty()));
     }
+}
+
+/// `pyjitpl.py MetaInterp.popframe` `free_frames_list.append(frame)`.
+///
+/// A standalone walk parks its frames on [`STANDALONE_FREE_FRAMES`] (the
+/// `MetaInterp.free_frames_list` for walks that have no MetaInterp). Abort
+/// used to `mem::take` the stack onto `TraceCtx.aborted_framestack` and then
+/// drop it, so the next `StandaloneFrameStack::new` allocated a fresh
+/// `MIFrame` (`vec![None; num_regs_and_consts_i]`, 72 B for nine int
+/// slots) every deopt. Recycle through the same pool `new` reads.
+/// Return `stack` to the standalone pool when the owner is done with it,
+/// including early `return`s from `run_pending_abort_blackhole`.
+pub struct RecycleFramestackOnDrop(pub MIFrameStack);
+
+impl Drop for RecycleFramestackOnDrop {
+    fn drop(&mut self) {
+        recycle_framestack(std::mem::replace(&mut self.0, MIFrameStack::empty()));
+    }
+}
+
+pub fn recycle_framestack(mut stack: MIFrameStack) {
+    while let Some(frame) = stack.pop() {
+        stack.recycle_frame(frame);
+    }
+    let parked = stack.take_free_frames();
+    if parked.is_empty() {
+        return;
+    }
+    STANDALONE_FREE_FRAMES.with(|free| {
+        free.borrow_mut().extend(parked);
+    });
 }
 
 impl Default for StandaloneFrameStack {
@@ -13097,6 +13119,36 @@ mod tests {
 
     extern "C" fn scale_f64(x: f64, k: i64) -> f64 {
         x * k as f64
+    }
+
+    #[test]
+    fn recycle_framestack_returns_abort_stolen_frames_to_the_standalone_pool() {
+        // pyjitpl.py popframe `free_frames_list.append(frame)`: publish_walk_abort_handoff
+        // mem::take's the stack onto aborted_framestack. Without recycle, the
+        // next StandaloneFrameStack::new allocates a fresh MIFrame.
+        let mut builder = JitCodeBuilder::new();
+        builder.set_name("recycle_canary");
+        for i in 0..9u16 {
+            builder.load_const_i_value(i, 0);
+        }
+        let jitcode = std::sync::Arc::new(builder.finish());
+
+        let mut standalone = StandaloneFrameStack::new();
+        let _ = standalone.frames.take_free_frames();
+        let frame = standalone.frames.take_frame(jitcode.clone(), 0, None, None);
+        standalone.frames.push(frame);
+        let stolen = std::mem::take(&mut standalone.frames);
+        recycle_framestack(stolen);
+        drop(standalone);
+
+        let mut next = StandaloneFrameStack::new();
+        let parked = next.frames.take_free_frames();
+        assert!(
+            parked
+                .iter()
+                .any(|frame| frame.jitcode.name() == "recycle_canary"),
+            "abort-stolen frames must return to the standalone free_frames_list"
+        );
     }
 
     /// A `BhDescr::Field` naming `field` of a parent that carries a flattened
