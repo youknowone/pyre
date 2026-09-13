@@ -260,6 +260,10 @@ pub struct ExactLayout {
 #[derive(Debug, Clone, Default)]
 pub struct SemanticProgram {
     pub functions: Vec<SemanticFunction>,
+    /// JIT-hint markers harvested from LLBC, keyed by crate-stripped
+    /// function path. Applied even when no `SemanticFunction` was
+    /// lowered (a `dont_look_inside` residual has no graph).
+    pub harvested_hints: HashMap<String, Vec<String>>,
     /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
     pub known_struct_names: std::collections::HashSet<String>,
     /// Known trait names used to canonicalize local `dyn Trait` family keys.

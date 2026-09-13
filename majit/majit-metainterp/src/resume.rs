@@ -5724,6 +5724,98 @@ mod tests {
     }
 
     #[test]
+    fn finish_emits_the_numbered_inputarg_when_the_operand_collapses() {
+        // Phase-2 remap names InputArgRef(231). Numbering TAGBOXes that
+        // opref, but LiveboxMap keys by Operand and `to_opref` can still
+        // be Phase-1 InputArgRef(1). finish() must emit 231.
+        use majit_ir::OpRef;
+
+        struct KeepNumberedInputArgEnv {
+            inner: SimpleBoxEnv,
+            numbered: OpRef,
+            collapsed: OpRef,
+            collapsed_operand: majit_ir::operand::Operand,
+        }
+
+        impl BoxEnv for KeepNumberedInputArgEnv {
+            fn get_box_replacement(&self, opref: OpRef) -> OpRef {
+                if opref == self.numbered {
+                    return self.numbered;
+                }
+                self.inner.get_box_replacement(opref)
+            }
+
+            fn get_box_replacement_operand(&self, opref: OpRef) -> majit_ir::operand::Operand {
+                if opref == self.numbered {
+                    return self.collapsed_operand.clone();
+                }
+                self.inner.get_box_replacement_operand(opref)
+            }
+
+            fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
+                if opref == self.numbered {
+                    return self.collapsed;
+                }
+                self.inner.get_box_replacement_not_const(opref)
+            }
+
+            fn is_const(&self, opref: OpRef) -> bool {
+                self.inner.is_const(opref)
+            }
+            fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
+                self.inner.get_const(opref)
+            }
+            fn get_type(&self, opref: OpRef) -> majit_ir::Type {
+                self.inner.get_type(opref)
+            }
+            fn is_virtual_ref(&self, opref: OpRef) -> bool {
+                self.inner.is_virtual_ref(opref)
+            }
+            fn is_virtual_raw(&self, opref: OpRef) -> bool {
+                self.inner.is_virtual_raw(opref)
+            }
+            fn get_virtual_fields(&self, opref: OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
+                self.inner.get_virtual_fields(opref)
+            }
+        }
+
+        let numbered = OpRef::input_arg_ref(231);
+        let collapsed = OpRef::input_arg_ref(1);
+        let env = KeepNumberedInputArgEnv {
+            inner: SimpleBoxEnv::new(),
+            numbered,
+            collapsed,
+            collapsed_operand: crate::history::test_support::rooted_operand_from_opref(collapsed),
+        };
+        assert_eq!(env.get_box_replacement(numbered), numbered);
+        assert_eq!(
+            env.get_box_replacement_operand(numbered).to_opref(),
+            collapsed
+        );
+        assert_eq!(env.get_box_replacement_not_const(numbered), collapsed);
+
+        let mut memo = ResumeDataLoopMemo::new();
+        let snapshot = Snapshot::single_frame(0, 8, vec![numbered]);
+        let numb_state = memo.number(&snapshot, &env, -1).unwrap();
+        assert_eq!(
+            numb_state
+                .livebox_types
+                .get_index(0)
+                .map(|(opref, _)| *opref),
+            Some(numbered),
+        );
+        let (_rd_numb, _rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
+            memo.finish(numb_state, &env, &mut [], None).unwrap();
+
+        // Numbering keeps 231 in `livebox_types`. finish() still materializes
+        // the Operand key (`to_opref` → 1): emitting 231 as the dump home
+        // SIGSEGVs Grain, because the compiled failarg locs are the
+        // forwarded box. Do not switch finish() onto `livebox_types`
+        // until the backend names a loc for that numbering opref.
+        assert_eq!(liveboxes, vec![collapsed]);
+    }
+
+    #[test]
     fn guard_storages_share_the_memos_growing_const_pool() {
         let mut memo = ResumeDataLoopMemo::new();
         let env = SimpleBoxEnv::new();
@@ -6735,7 +6827,23 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
         let size = ad
             .base_size()
             .saturating_add(length.saturating_mul(ad.item_size()));
-        llmodel_alloc(ad.type_id(), size)
+        let ptr = llmodel_alloc(ad.type_id(), size);
+        if ptr != 0 {
+            if let Some(ld) = ad.len_descr() {
+                // `llmodel.py bh_new_array` → `gc_malloc_array` writes
+                // `length` at `arraydescr.lendescr`. Dynasm does the same
+                // via `dynasm_alloc_oldgen_varsize_typed_and_set_len`.
+                unsafe {
+                    majit_backend::llmodel::write_int_at_mem(
+                        ptr as usize,
+                        ld.offset(),
+                        ld.field_size(),
+                        length as i64,
+                    );
+                }
+            }
+        }
+        ptr
     }
 
     fn bh_new_array_clear(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
@@ -6759,6 +6867,9 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
         if struct_ptr == 0 {
             return;
         }
+        // Barrier first: `gc_write_barrier` must run before the store so
+        // a concurrent minor cannot miss the young referent.
+        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
         unsafe {
             majit_backend::llmodel::write_ref_at_mem(
                 struct_ptr as usize,
@@ -6812,6 +6923,7 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
         let ofs = ad
             .base_size()
             .wrapping_add(index.wrapping_mul(ad.item_size()));
+        majit_gc::gc_write_barrier(majit_ir::GcRef(array as usize));
         unsafe {
             majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize);
         }

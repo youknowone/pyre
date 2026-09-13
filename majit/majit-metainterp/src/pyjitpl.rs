@@ -815,9 +815,55 @@ impl Drop for CompileSnapshotRootsGuard {
     }
 }
 
+/// A stack-resident red (Grain's `Vm` / frame) recorded as `ConstPtr`
+/// must number as TAGBOX. `make_constant_box` already refuses that fold
+/// in the optimizer; the tracer can still snapshot the concrete address
+/// as `SnapshotTagged::Const`. Resume then TAGCONSTs it and the next
+/// `Vm::new` has no failarg to rebind. Map the address back to the
+/// InputArg that already carries those bits.
+fn snapshot_inputarg_for_stack_ptr(
+    inputargs: &[majit_ir::InputArgRc],
+    addr: usize,
+) -> Option<majit_ir::OpRef> {
+    if !crate::optimizeopt::OptContext::ref_addr_is_stack_resident(addr) {
+        return None;
+    }
+    inputargs.iter().find_map(|ia| {
+        (ia.tp == majit_ir::Type::Ref
+            && matches!(ia.get_value(), Some(majit_ir::Value::Ref(g)) if g.0 == addr))
+        .then_some(majit_ir::OpRef::input_arg_typed(
+            ia.index,
+            majit_ir::Type::Ref,
+        ))
+    })
+}
+
+fn snapshot_tagged_to_box(
+    tagged: &crate::recorder::SnapshotTagged,
+    inputargs: &[majit_ir::InputArgRc],
+) -> SnapshotBox {
+    match tagged {
+        crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
+            let tp = opref.ty().unwrap_or(*fallback_tp);
+            SnapshotBox::typed(*opref, tp)
+        }
+        crate::recorder::SnapshotTagged::Const(val, tp) => {
+            if *tp == majit_ir::Type::Ref
+                && let Some(ia) = snapshot_inputarg_for_stack_ptr(inputargs, *val as usize)
+            {
+                return SnapshotBox::typed(ia, *tp);
+            }
+            let value = heap_value_for(*tp, *val);
+            let opref = majit_ir::OpRef::const_inline_from_value(&value);
+            SnapshotBox::typed(opref, *tp)
+        }
+    }
+}
+
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
+    inputargs: &[majit_ir::InputArgRc],
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -847,36 +893,7 @@ fn snapshot_map_from_trace_snapshots(
     // Box's OpRef. SnapshotTagged carries no `Virtual` variant (see the
     // `SnapshotTagged` docstring in `recorder.rs`) so this match is
     // exhaustive over the two recorder-side cases.
-    let tagged_to_box = |t: &crate::recorder::SnapshotTagged| -> SnapshotBox {
-        match t {
-            crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
-                // history.py:182/220/261/307 + resoperation.py:719/727/739/
-                // 564-638: `box.type` lives on the Box. Pyre's typed
-                // OpRef variants carry it intrinsically; the explicit
-                // `fallback_tp` is the lockstep authority for the
-                // narrow `OpRef::None` / Void-tagged corner case where
-                // `opref.ty()` returns `None`.
-                let tp = opref.ty().unwrap_or(*fallback_tp);
-                SnapshotBox::typed(*opref, tp)
-            }
-            crate::recorder::SnapshotTagged::Const(val, tp) => {
-                // history.py/268/314 `Const{Int,Float,Ptr}.value` is
-                // inline on the Box itself; mint the inline-Const OpRef
-                // directly so the value travels on the OpRef into resume
-                // numbering. The former pool-indexed Const path required
-                // `OptContext::const_pool` seeding from `constants`, now
-                // retired (see
-                // `merge_backend_constants_from_ctx`'s `const_pool.is_empty()`
-                // assert) — without seeding, the encoder's
-                // `OptBoxEnv::get_const` fallthrough resolved a Ref-typed
-                // null slot as `(0, Type::Int)`, encoding a vable_array
-                // NULL pointer as TAGINT(0) instead of NULLREF.
-                let value = heap_value_for(*tp, *val);
-                let opref = majit_ir::OpRef::const_inline_from_value(&value);
-                SnapshotBox::typed(opref, *tp)
-            }
-        }
-    };
+    let tagged_to_box = |t: &crate::recorder::SnapshotTagged| snapshot_tagged_to_box(t, inputargs);
     for snap in trace_snapshots {
         let boxes: crate::optimizeopt::SnapshotBoxList = snap
             .frames
@@ -919,7 +936,8 @@ fn snapshot_maps_from_ctx(
     if ctx.recorder.has_byte_buffer() {
         return snapshot_map_from_byte_recorder(&ctx.recorder, constants);
     }
-    snapshot_map_from_trace_snapshots(ctx.snapshots(), constants)
+    let inputargs = ctx.recorder.inputargs().to_vec();
+    snapshot_map_from_trace_snapshots(ctx.snapshots(), constants, &inputargs)
 }
 
 fn snapshot_map_from_byte_recorder(
@@ -940,18 +958,9 @@ fn snapshot_map_from_byte_recorder(
     let mut vable_map = Vec::with_capacity(n);
     let mut vref_map = Vec::with_capacity(n);
     let mut frame_pcs_map = Vec::with_capacity(n);
+    let inputargs = recorder.inputargs();
     let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
-        match t {
-            crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
-                let tp = opref.ty().unwrap_or(fallback_tp);
-                SnapshotBox::typed(opref, tp)
-            }
-            crate::recorder::SnapshotTagged::Const(val, tp) => {
-                let value = heap_value_for(tp, val);
-                let opref = majit_ir::OpRef::const_inline_from_value(&value);
-                SnapshotBox::typed(opref, tp)
-            }
-        }
+        snapshot_tagged_to_box(&t, inputargs)
     };
     recorder.for_each_captured_snapshot_arrays(|vable_t, vref_t, frames_t, py_pcs| {
         let n_boxes: usize = frames_t.iter().map(|(_, _, tagged)| tagged.len()).sum();
@@ -998,6 +1007,12 @@ struct PreparedBridgeTrace {
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
     runtime_boxes: Vec<OpRef>,
+    /// Reminted name of the parent loop's second Ref red (Grain's `Vm`).
+    /// Failargs keep that box as assembled `InputArg(1)`; the iterator
+    /// cache maps it into `[bridge_inputarg_base..)`. The closing JUMP
+    /// is still `collect_jump_args` order, so JUMP[1] must use this
+    /// name — assembled `InputArg(1)` has no loc in the bridge backend.
+    bridge_vm_red: Option<OpRef>,
 }
 
 #[cfg(feature = "jit-audits")]
@@ -1196,6 +1211,7 @@ fn prepare_bridge_trace_from_owned(
     }
     finish_prepared_bridge(
         bridge_ops,
+        bridge_inputargs,
         reminted_inputargs,
         cache,
         snapshot_boxes,
@@ -1287,8 +1303,28 @@ fn assert_prepared_cache_bank(where_: &str, opref: OpRef, found_ty: Option<Type>
     }
 }
 
+fn reminted_loop_vm_red(original: &[InputArg], reminted: &[InputArg]) -> Option<OpRef> {
+    let assembled = OpRef::input_arg_typed(1, Type::Ref);
+    original.iter().zip(reminted.iter()).find_map(|(old, new)| {
+        (old.opref() == assembled && old.tp == Type::Ref).then_some(new.opref())
+    })
+}
+
+/// Compact live index of the assembled loop Vm in a guard's fail_args.
+/// Resume holes (`None`) are dropped the same way
+/// `initialize_state_from_guard_failure` filters History.inputargs, so
+/// the index lines up with `prepare_bridge` reminted inputargs.
+fn hole_filtered_vm_failarg_index(fail_args: &[majit_ir::operand::Operand]) -> Option<usize> {
+    let assembled = OpRef::input_arg_typed(1, Type::Ref);
+    fail_args
+        .iter()
+        .filter(|a| !a.is_none())
+        .position(|a| a.to_opref() == assembled)
+}
+
 fn finish_prepared_bridge(
     ops: Vec<majit_ir::OpRc>,
+    original_inputargs: &[InputArg],
     inputargs: Vec<InputArg>,
     cache: Vec<Option<majit_ir::operand::Operand>>,
     snapshot_boxes: SnapshotBoxes,
@@ -1314,6 +1350,7 @@ fn finish_prepared_bridge(
         .into_iter()
         .map(|opref| translate_trace_iter_opref(opref, &cache))
         .collect();
+    let bridge_vm_red = reminted_loop_vm_red(original_inputargs, &inputargs);
     PreparedBridgeTrace {
         ops,
         inputargs,
@@ -1324,6 +1361,7 @@ fn finish_prepared_bridge(
         snapshot_frame_pcs,
         pending_bridge_rd,
         runtime_boxes,
+        bridge_vm_red,
     }
 }
 
@@ -1385,7 +1423,7 @@ where
             dst.set_value(value);
         }
     }
-    let inputargs = bridge_inputargs
+    let inputargs: Vec<InputArg> = bridge_inputargs
         .iter()
         .zip(iter.inputargs.iter())
         .map(|(arg, ia)| {
@@ -1420,6 +1458,7 @@ where
         .into_iter()
         .map(|opref| translate_trace_iter_opref(opref, &cache))
         .collect();
+    let bridge_vm_red = reminted_loop_vm_red(bridge_inputargs, &inputargs);
     PreparedBridgeTrace {
         ops,
         inputargs,
@@ -1430,6 +1469,7 @@ where
         snapshot_frame_pcs,
         pending_bridge_rd,
         runtime_boxes,
+        bridge_vm_red,
     }
 }
 
@@ -7741,7 +7781,11 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = snapshot_map_from_trace_snapshots(
+            &trace_snapshots,
+            &mut constants,
+            preamble_data.base.inputargs(),
+        );
         // history.py/261/307 — `Const{Int,Float,Ptr}.type` is an
         // intrinsic attribute on the Box itself, so no raw-u32 type
         // side-table propagation is needed; callers recover the type
@@ -9686,7 +9730,7 @@ impl<M: Clone> MetaInterp<M> {
             mut retrace_snapshot_vable_boxes,
             mut retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants);
+        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants, &trace.inputargs);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut retrace_snapshot_boxes,
             &mut retrace_snapshot_vable_boxes,
@@ -10673,7 +10717,7 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants, &trace.inputargs);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
             &mut snapshot_vable_map,
@@ -11174,7 +11218,7 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants, &trace.inputargs);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_map,
             &mut snapshot_vable_map,
@@ -14286,6 +14330,10 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
         optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
+        optimizer.bridge_vm_red = self
+            .second_portal_red_is_grain_vm()
+            .then_some(prepared.bridge_vm_red)
+            .flatten();
         optimizer.trace_inputargs = bridge_inputargs
             .iter()
             .enumerate()
@@ -14707,6 +14755,61 @@ impl<M: Clone> MetaInterp<M> {
     /// reads and charges, is the one the closing JUMP *enters* — never the loop
     /// the bridge hangs from.  A JUMP target with no compiled loop has no
     /// `target_tokens` to scan, so it degrades to the origin.
+    /// Compact index of the assembled loop Vm among the parent guard's
+    /// live failargs. Resume compact numbering names failarg 1 `InputArg(1)`
+    /// even when that slot is a Scope; the compiled guard still has the
+    /// SSA name `InputArg(1)` on the Vm. That index is the reminted
+    /// inputarg JUMP[1] must use.
+    fn compiled_guard_vm_failarg_index(
+        &self,
+        origin_key: u64,
+        fail_descr: &dyn majit_ir::FailDescr,
+    ) -> Option<usize> {
+        let compiled = self.compiled_loops.get(&origin_key)?;
+        // The owning compiled trace, not the root loop. A missing
+        // bridge id must not reuse root ops at a bridge-relative index.
+        let trace = compiled.traces.get(&fail_descr.trace_id())?;
+        let op_idx = fail_descr.source_op_index().or_else(|| {
+            trace
+                .exit_layouts
+                .get(&fail_descr.fail_index_per_trace())
+                .and_then(|layout| layout.source_op_index)
+        })?;
+        let fail_args = trace.ops.get(op_idx)?.getfailargs()?;
+        hole_filtered_vm_failarg_index(&fail_args)
+    }
+
+    /// Grain declares reds `[frame, vm]`. Pyre declares `[frame, ec]`.
+    /// Both put a Ref at inputarg 1; only Grain's second red is the
+    /// stack-resident Vm the JUMP-pin / snapshot-pin exist for.
+    fn second_portal_red_is_grain_vm(&self) -> bool {
+        let Some(idx) = self.active_jitdriver_sd else {
+            return false;
+        };
+        self.staticdata
+            .jitdrivers_sd
+            .get(idx)
+            .and_then(|jd| jd.reds().get(1))
+            .is_some_and(|var| var.name == "vm")
+    }
+
+    fn reminted_vm_red_for_bridge(
+        &self,
+        origin_key: u64,
+        fail_descr: &dyn majit_ir::FailDescr,
+        reminted: &[InputArg],
+        fallback: Option<OpRef>,
+    ) -> Option<OpRef> {
+        if !self.second_portal_red_is_grain_vm() {
+            return None;
+        }
+        self.compiled_guard_vm_failarg_index(origin_key, fail_descr)
+            .and_then(|idx| reminted.get(idx))
+            .filter(|ia| ia.tp == Type::Ref)
+            .map(InputArg::opref)
+            .or(fallback)
+    }
+
     pub(crate) fn bridge_cell_token_key(&self, origin_key: u64, jump_target_key: u64) -> u64 {
         if jump_target_key != origin_key && self.compiled_loops.contains_key(&jump_target_key) {
             jump_target_key
@@ -14977,6 +15080,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_pcs,
             pending_bridge_rd,
             runtime_boxes: prepared_runtime_boxes,
+            bridge_vm_red,
         } = prepared;
         // `TreeLoop::from_oprc` preserves the TraceIterator identities rather
         // than wrapping a second copy of every operation.  The inputargs on
@@ -15042,6 +15146,12 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
         optimizer.snapshot_vref_boxes = snapshot_vref_boxes;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
+        optimizer.bridge_vm_red = self.reminted_vm_red_for_bridge(
+            green_key,
+            fail_descr,
+            &prepared_inputargs,
+            bridge_vm_red,
+        );
         // Store bridge inputarg types so export_state can mint typed
         // `renamed_inputargs` OpRefs that carry their type intrinsically
         // (history.py:220 InputArg{Int,Ref,Float}.type Box parity).
@@ -25281,6 +25391,80 @@ mod tests {
         assert_eq!(
             prepared.runtime_boxes,
             vec![OpRef::ref_op(12), OpRef::int_op(13)]
+        );
+        assert_eq!(
+            prepared.bridge_vm_red,
+            Some(OpRef::input_arg_ref(11)),
+            "assembled InputArg(1) remints to the fresh Ref inputarg"
+        );
+    }
+
+    #[test]
+    fn prepare_bridge_remints_assembled_vm_even_when_it_is_not_failarg_one() {
+        // Loop fail_args order: frame, Scope, vm (assembled InputArg(1) last).
+        let bridge_inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(2),
+            InputArg::new_ref(1),
+        ];
+        let bridge_ops = vec![mk_op(
+            OpCode::Jump,
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            OpRef::NONE.raw(),
+        )];
+        let prepared = prepare_bridge_trace_for_optimizer(
+            &bridge_ops,
+            &bridge_inputargs,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            556,
+        );
+        assert_eq!(
+            prepared
+                .inputargs
+                .iter()
+                .map(|arg| (arg.index, arg.tp))
+                .collect::<Vec<_>>(),
+            vec![(556, Type::Ref), (557, Type::Ref), (558, Type::Ref)]
+        );
+        assert_eq!(
+            prepared.bridge_vm_red,
+            Some(OpRef::input_arg_ref(558)),
+            "the last failarg was assembled InputArg(1); remint is base+2"
+        );
+        assert_eq!(
+            prepared.ops[0]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(556), OpRef::input_arg_ref(558)],
+            "JUMP[1] remints through the cache onto the Vm failarg"
+        );
+    }
+
+    #[test]
+    fn hole_filtered_vm_index_skips_none_and_finds_assembled_inputarg() {
+        let frame = bound_operand(OpRef::input_arg_ref(0));
+        let scope = bound_operand(OpRef::input_arg_ref(2));
+        let vm = bound_operand(OpRef::input_arg_ref(1));
+        let hole = majit_ir::operand::Operand::None;
+        let args = vec![
+            frame,
+            scope,
+            bound_operand(OpRef::input_arg_int(3)),
+            hole,
+            vm,
+        ];
+        assert_eq!(
+            hole_filtered_vm_failarg_index(&args),
+            Some(3),
+            "None is dropped; assembled InputArg(1) is the fourth live failarg"
         );
     }
 

@@ -6481,6 +6481,28 @@ mod tests {
     }
 
     #[test]
+    fn ref_inputarg_longevity_follows_failargs() {
+        let i0 = OpRef::input_arg_typed(0, Type::Int);
+        let vm = OpRef::input_arg_typed(1, Type::Ref);
+        let add = OpRef::int_op(0);
+        let inputargs = vec![
+            InputArg::from_type(Type::Int, 0),
+            InputArg::from_type(Type::Ref, 1),
+        ];
+        let ops = vec![
+            make_op(OpCode::IntAdd, 0, &[i0, i0]),
+            make_guard(OpCode::GuardTrue, 1, &[add], &[vm]),
+            make_op(OpCode::Jump, 2, &[add]),
+        ];
+        let longevity = compute_vars_longevity(&inputargs, &ops);
+        assert_eq!(
+            longevity.get(vm).unwrap().last_usage,
+            1,
+            "compute_vars_longevity: last_usage is the last failarg/arg use"
+        );
+    }
+
+    #[test]
     fn test_lifetime_next_real_usage() {
         let mut lt = Lifetime::new(0, 10);
         lt.real_usages = Some(SmallVec::from_slice(&[2, 5, 8]));

@@ -350,6 +350,7 @@ fn merge_hints_from_llbcs(
     llbcs: &[majit_charon_reader::Llbc],
 ) {
     let hints_by_path = front::llbc_hints::harvest_hints_from_llbcs(llbcs);
+    program.harvested_hints.clone_from(&hints_by_path);
     for f in &mut program.functions {
         let path = if f.module_path.is_empty() {
             f.name.clone()
@@ -2139,6 +2140,35 @@ fn analyze_pipeline_from_module_paths(
                     _ => {}
                 }
             }
+        }
+    }
+    // A `dont_look_inside` helper is residualized and may never appear in
+    // `program.functions`. Its harvested `cannot_raise` mark must still
+    // reach `getcalldescr`, or the residual records GUARD_NO_EXCEPTION.
+    for (path_str, hints) in &program.harvested_hints {
+        if !hints.iter().any(|h| h == "cannot_raise") {
+            continue;
+        }
+        let segs: Vec<&str> = path_str.split("::").collect();
+        let Some((name, module_segs)) = segs.split_last() else {
+            continue;
+        };
+        // `Type::method` is not a free function. Aliasing it as bare
+        // `method` would share the GraphStore row with an unrelated
+        // `module::method` (e.g. `RootStackGuard::get` vs
+        // `baseobjspace::get`).
+        if module_segs
+            .last()
+            .is_some_and(|s| s.starts_with(|c: char| c.is_uppercase()))
+        {
+            call_control.mark_cannot_raise_assertion(crate::parse::CallPath::from_segments(
+                segs.iter().copied(),
+            ));
+            continue;
+        }
+        let module = module_segs.join("::");
+        for p in free_function_alias_paths(name, &module) {
+            call_control.mark_cannot_raise_assertion(p);
         }
     }
 

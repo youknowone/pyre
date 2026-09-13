@@ -3098,8 +3098,32 @@ impl CallControl {
 
     /// Resolve a call target to its [`FuncEffects`](crate::model::FuncEffects).
     fn target_func_effects(&self, target: &CallTarget) -> Option<&crate::model::FuncEffects> {
-        self.target_to_path(target)
-            .and_then(|p| self.func_effects(&p))
+        if let Some(path) = self.target_to_path(target) {
+            return self.func_effects_with_crate_alias(&path);
+        }
+        // `target_to_path` returns None for `__fn_const::path` so a
+        // residual function-pointer call would miss the
+        // `#[dont_look_inside_cannot_raise]` mark registered on `path`.
+        let segments = crate::model::fn_const_segments(target)?;
+        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+        self.func_effects_with_crate_alias(&path)
+    }
+
+    /// Look up effects on `path`, then on the crate-stripped spelling
+    /// `harvest_hints_from_llbcs` uses (`rhai::grain::…` → `grain::…`).
+    fn func_effects_with_crate_alias(&self, path: &CallPath) -> Option<&crate::model::FuncEffects> {
+        if let Some(effects) = self.func_effects(path) {
+            return Some(effects);
+        }
+        if path.segments.len() > 1 {
+            let root = path.segments[0].as_str();
+            if root == "crate" || crate::local_crates::is_local_crate_root(root) {
+                let stripped =
+                    CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
+                return self.func_effects(&stripped);
+            }
+        }
+        None
     }
 
     /// Register a free function graph.
@@ -7147,6 +7171,20 @@ impl CallControl {
         }
         let extraeffect = extraeffect.unwrap_or(ExtraEffect::CanRaise);
 
+        // `#[dont_look_inside_cannot_raise]` is a pyre assertion because
+        // `_canraise` / `RandomEffectsAnalyzer` cannot prove a residual
+        // that calls host code is exception-free. Honour it after the
+        // analyzer so `RandomEffects` does not emit GUARD_NO_EXCEPTION.
+        // Elidable assertions stay in the elidable arm (`EF_ELIDABLE_*`).
+        let extraeffect = match shape {
+            CallShape::Direct(target)
+                if !elidable && !loopinvariant && self.declares_cannot_raise(target) =>
+            {
+                ExtraEffect::CannotRaise
+            }
+            _ => extraeffect,
+        };
+
         // RPython call.py:249-251: loopinvariant functions must have no args.
         if loopinvariant && !arg_types.is_empty() {
             let target = match shape {
@@ -10824,6 +10862,98 @@ mod tests {
                 .is_some_and(|bits| bits.iter().any(|&byte| byte != 0)),
             "cannot-raise must not erase the graph's write set"
         );
+    }
+
+    #[test]
+    fn crate_prefixed_residual_honours_cannot_raise_assertion() {
+        let mut cc = CallControl::new();
+        cc.mark_cannot_raise_assertion(CallPath::from_segments([
+            "grain",
+            "vm",
+            "jit",
+            "track_operation_abi",
+        ]));
+        let target =
+            CallTarget::function_path(["rhai", "grain", "vm", "jit", "track_operation_abi"]);
+        crate::local_crates::with_local_crate_root("rhai", || {
+            let mut cache = AnalysisCache::default();
+            let descriptor = cc.getcalldescr(
+                &direct_call_op(target),
+                vec![Type::Ref, Type::Int],
+                Type::Void,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            );
+            assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        });
+    }
+
+    #[test]
+    fn fn_const_residual_honours_cannot_raise_assertion() {
+        let mut cc = CallControl::new();
+        let marked = CallPath::from_segments(["grain", "vm", "jit", "track_operation_abi"]);
+        cc.mark_cannot_raise_assertion(marked);
+        let target = CallTarget::function_path([
+            crate::model::FN_CONST_HEAD,
+            "rhai",
+            "grain",
+            "vm",
+            "jit",
+            "track_operation_abi",
+        ]);
+        crate::local_crates::with_local_crate_root("rhai", || {
+            let mut cache = AnalysisCache::default();
+            let descriptor = cc.getcalldescr(
+                &direct_call_op(target),
+                vec![Type::Ref, Type::Int],
+                Type::Void,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            );
+            assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        });
+    }
+
+    #[test]
+    fn cannot_raise_assertion_overrides_random_effects() {
+        let mut cc = CallControl::new();
+        let callee = CallPath::from_segments(["engine", "Engine", "track_operation"]);
+        let helper = CallPath::from_segments(["grain", "vm", "jit", "track_operation_abi"]);
+        let mut graph = FunctionGraph::new("track_operation_abi");
+        let start = graph.startblock;
+        graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path([
+                "engine",
+                "Engine",
+                "track_operation",
+            ])));
+        graph.set_return(start, None);
+        cc.register_function_graph(helper.clone(), graph);
+        cc.mark_external_gc_effects(callee);
+        cc.mark_cannot_raise_assertion(helper.clone());
+        cc.find_all_graphs_for_tests();
+
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path([
+                "grain",
+                "vm",
+                "jit",
+                "track_operation_abi",
+            ])),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
     }
 
     #[test]

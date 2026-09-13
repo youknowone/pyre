@@ -5017,9 +5017,22 @@ impl<'a> Transformer<'a> {
                         .ir_type;
                     let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
                     let classified = classify_call(target, &self.config.call_effects);
-                    let extraeffect = classified
-                        .as_ref()
-                        .map(|(descriptor, _)| descriptor.extra_info.extraeffect);
+                    // `call.py getcalldescr` computes extraeffect only when
+                    // the caller did not set one. A `Declared` override is
+                    // that caller-set row. `describe_call`'s graph-analyzed
+                    // CanRaise is not: passing it here skips
+                    // `declares_cannot_raise` and a
+                    // `#[dont_look_inside_cannot_raise]` residual emits
+                    // GUARD_NO_EXCEPTION.
+                    let extraeffect = match classified.as_ref() {
+                        Some((
+                            descriptor,
+                            CallEffectKind::Declared(_)
+                            | CallEffectKind::MayForce
+                            | CallEffectKind::Elidable,
+                        )) => Some(descriptor.extra_info.extraeffect),
+                        _ => None,
+                    };
                     let mut descriptor = cc_ref.getcalldescr(
                         op,
                         non_void_args,
@@ -5029,7 +5042,13 @@ impl<'a> Transformer<'a> {
                         &mut self.analysis_cache,
                         None,
                     );
-                    if let Some((declared, CallEffectKind::Declared(_))) = classified {
+                    if let Some((
+                        declared,
+                        CallEffectKind::Declared(_)
+                        | CallEffectKind::MayForce
+                        | CallEffectKind::Elidable,
+                    )) = classified
+                    {
                         descriptor.extra_info = declared.extra_info;
                     }
                     self.handle_residual_call(

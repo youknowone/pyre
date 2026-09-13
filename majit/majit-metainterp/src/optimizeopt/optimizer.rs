@@ -450,6 +450,10 @@ pub struct Optimizer {
     /// is NON-fatal (exported_loop_state = None) instead of escaping as an
     /// InvalidLoop that discards the bridge (the pi guard-9 infinite-deopt hang).
     building_bridge: bool,
+    /// Reminted parent-loop Vm red for a Grain-style 2-ref portal.
+    /// Set from `prepare_bridge_trace_*` so JUMP[1] can name a box the
+    /// bridge backend actually allocated.
+    pub(crate) bridge_vm_red: Option<OpRef>,
     /// Whether this call is the one `compile.py`'s `SimpleCompileData.optimize`
     /// makes. That one runs `Optimizer.optimize_loop`, whose result is a
     /// `BasicLoopInfo` and the operations; the short-preamble export and the
@@ -1536,6 +1540,7 @@ impl Optimizer {
             final_ctx: None,
             pending_bridge_rd: None,
             building_bridge: false,
+            bridge_vm_red: None,
             simple_compile: false,
             all_descrs: Arc::new(Vec::new()),
             constant_fold_alloc: None,
@@ -2570,6 +2575,7 @@ impl Optimizer {
         );
         ctx.skip_flush_mode = self.skip_flush;
         ctx.building_bridge = self.building_bridge;
+        ctx.bridge_vm_red = self.bridge_vm_red;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
         // Seed the canonical `find_producer_op` surface (`input_ops`) with
         // the input ops' producers so they resolve directly; `find_producer_op`
@@ -3057,6 +3063,21 @@ impl Optimizer {
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
                 let resolved = ctx.resolve_operand_operand(&arg).to_opref();
+                // The Vm red is a loop-carried identity. Walking it onto a
+                // Scope (another Ref) would put that Scope in the reserved
+                // home; a mid-opcode guard dump then has no live Vm.
+                if inputargs_are_the_jump_target
+                    && ctx
+                        .inputargs
+                        .get(i)
+                        .is_some_and(|&ia| ctx.is_vm_red_name(ia))
+                {
+                    if !ctx.is_vm_red_name(resolved) {
+                        let ia = ctx.inputargs[i];
+                        terminal_op.setarg(i, majit_ir::operand::Operand::bound_from_opref(ia));
+                    }
+                    continue;
+                }
                 let expected_ref = inputargs_are_the_jump_target
                     && i < inputargs.len()
                     && inputargs[i].ty() == Some(majit_ir::Type::Ref);
@@ -3120,6 +3141,7 @@ impl Optimizer {
                 };
                 terminal_op.setarg(i, b_forced);
             }
+            ctx.pin_vm_red_jump_arg(&terminal_op);
             if self.skip_flush {
                 // flush=False: store for caller to consume.
                 self.terminal_op = Some(terminal_op);
@@ -4421,6 +4443,7 @@ impl Optimizer {
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
+                ctx.bridge_vm_red = self.bridge_vm_red;
                 // unroll.py: jump_to_preamble →
                 //   jump_op = jump_op.copy_and_change(rop.JUMP,
                 //                 descr=cell_token.target_tokens[0])
@@ -4454,6 +4477,7 @@ impl Optimizer {
                 .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
             OptContext::with_inputarg_types(32, &types)
         });
+        ctx.bridge_vm_red = self.bridge_vm_red;
 
         // unroll.py:148-158 `_optimize_unrolled_loop` ordering:
         //
@@ -4892,6 +4916,7 @@ impl Optimizer {
             };
             op_rc.setarg(i, resolved);
         }
+        ctx.pin_vm_red_jump_arg(op_rc);
 
         // Borrowed until a pass replaces the operation; `Replace` and
         // `Restart` mint their own, and only those need an owned copy.
@@ -5155,6 +5180,7 @@ impl Optimizer {
             );
             op.setarg(i, resolved);
         }
+        ctx.pin_vm_red_jump_arg(&op);
         // force_box may force a virtual whose materialization defers an
         // `InvalidLoop`; abort before the emit / `expect` sites below.
         if let Some(e) = ctx.take_invalid_loop() {

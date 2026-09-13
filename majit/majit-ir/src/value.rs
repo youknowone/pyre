@@ -437,6 +437,9 @@ impl InputArg {
             tp: self.tp,
             index: self.index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
+            // A new InputArg object has no payload yet
+            // (`resoperation.py InputArgInt/Float/Ref`). Remint that
+            // must keep stack bits uses the original box, not this copy.
             value: std::cell::Cell::new(None),
         }
     }
