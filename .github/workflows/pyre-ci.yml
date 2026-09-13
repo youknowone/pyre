@@ -184,6 +184,21 @@ jobs:
         retention-days: 1
         include-hidden-files: true
         if-no-files-found: error
+    # Charon's rustc is a different compiler from the stable rust-cache
+    # toolchain. Its rlibs cannot live in `target/` or every extract
+    # rebuilds the graph. `extract-llbc.py` writes them under
+    # `.pyre-build/charon-target` (`CHARON_TARGET_DIR`). Restore before
+    # Extract; save only when Charon actually rewrote a crate, under a
+    # lockfile key so a second extract of the same lock is an exact hit
+    # and does not clone the dir.
+    - name: Restore Charon cargo target
+      id: charon-target-cache
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: .pyre-build/charon-target
+        key: charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
     - name: Compute LLBC fingerprints
       id: llbc-fingerprint
       shell: bash
@@ -364,6 +379,19 @@ jobs:
           build/llbc/pyre-jit.ullbc.fingerprint
           build/llbc/pyre-jit.ullbc.readfiles
         key: llbc3-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
+    - name: Save Charon cargo target
+      # The directory is only populated when extract ran Charon. An exact
+      # hit on this key already has the deps; saving again is refused.
+      if: >-
+        steps.charon-target-cache.outputs.cache-hit != 'true' &&
+        (steps.llbc-extract.outputs.majit_rlib_rewrote == '1' ||
+         steps.llbc-extract.outputs.pyre_object_rewrote == '1' ||
+         steps.llbc-extract.outputs.pyre_interpreter_rewrote == '1' ||
+         steps.llbc-extract.outputs.pyre_jit_rewrote == '1')
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: .pyre-build/charon-target
+        key: charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ hashFiles('Cargo.lock') }}
     - name: Upload LLBC artifact
       # Hand the ullbc set (freshly extracted, or restored from the cache
       # above) to the downstream jobs as a run-scoped artifact. Unlike

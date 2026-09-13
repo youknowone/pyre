@@ -268,6 +268,51 @@ def run_stamp_skip(engine) -> int:
     return failures
 
 
+def run_charon_target_dir(engine) -> int:
+    """Charon's cargo target is not the workspace `target/`."""
+    failures = 0
+
+    def expect(name, condition):
+        nonlocal failures
+        if condition:
+            print(f"ok   {name}")
+        else:
+            failures += 1
+            print(f"FAIL {name}")
+
+    import os
+
+    root = pathlib.Path(tempfile.mkdtemp()).resolve()
+    saved = {
+        key: os.environ.pop(key, None)
+        for key in ("CHARON_TARGET_DIR", "PYRE_SHARED_BUILD")
+    }
+    try:
+        default = engine.charon_cargo_target_dir(root)
+        expect(
+            "default target sits under the shared build dir",
+            default == root.parent / ".pyre-build" / "charon-target",
+        )
+        os.environ["PYRE_SHARED_BUILD"] = str(root / "shared")
+        expect(
+            "PYRE_SHARED_BUILD relocates the target",
+            engine.charon_cargo_target_dir(root) == root / "shared" / "charon-target",
+        )
+        os.environ["CHARON_TARGET_DIR"] = str(root / "explicit")
+        expect(
+            "CHARON_TARGET_DIR wins over the shared dir",
+            engine.charon_cargo_target_dir(root) == root / "explicit",
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
+    return failures
+
+
 def main() -> None:
     engine = load_engine()
     failures = (
@@ -275,6 +320,7 @@ def main() -> None:
         + run_fingerprint(engine)
         + run_layout_sidecar(engine)
         + run_stamp_skip(engine)
+        + run_charon_target_dir(engine)
     )
     if failures:
         raise SystemExit(f"llbc_extract_selftest: {failures} failed")
