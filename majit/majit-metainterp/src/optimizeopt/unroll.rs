@@ -2293,8 +2293,8 @@ impl UnrollOptimizer {
         // vable input layout is `[frame, static scalars.., array items..]`, so
         // an appended static-scalar slot is exactly `GetfieldGc*(frame, descr)`
         // — the load the preamble itself performed before the optimizer folded
-        // it onto the seeded slot. Appends outside that window record nothing
-        // and keep reaching `compile_bridge`'s arity giveup.
+        // it onto the seeded slot. Appends outside that window record nothing;
+        // the LABEL/JUMP contract is `vable_label_arg_recipes`.
         //
         // The list is all-or-nothing: the recipes rebuild a contiguous LABEL
         // tail, so one append with no recipe leaves the close short anyway and
@@ -5676,6 +5676,18 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
+    // compile.py emit_op / get_box_replacement: a residual virtualizable
+    // slot on the body LABEL is the same Box as `loop.inputargs[i]`. A
+    // reminted producerless RefOp loses that identity — recover it when
+    // the arg still forwards to an InputArg so `patch_new_loop` can
+    // rewrite the slot to the GETARRAYITEM it installs on that inputarg.
+    for a in &mut full_label_args {
+        let resolved = ctx.get_replacement_opref(*a);
+        if resolved.is_input_arg() {
+            *a = resolved;
+        }
+    }
+
     // SameAs for every LABEL arg that is a forwarded preamble box, not
     // only extras discovered from a body use-before-def. Base label_args
     // sit in `label_set` from the start, so the scan above never saw them.
@@ -8744,6 +8756,72 @@ mod tests {
             "SameAs must not be sourced from a Phase-2 inputarg absent from the preamble stream"
         );
         assert_eq!(combined[1].opcode, OpCode::Label);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_resolves_residual_label_refop_to_inputarg() {
+        // compile.py emit_op / get_box_replacement: a reminted residual
+        // slot on the body LABEL is the same Box as the expanded inputarg.
+        let p1_ops = vec![{
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
+                ],
+            );
+            op.pos().set(OpRef::int_op(3));
+            op
+        }];
+        let p2_ops = vec![Op::new(
+            OpCode::Jump,
+            &[rooted_resop_operand(Type::Ref, 85)],
+        )];
+        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
+            .iter()
+            .map(|op| majit_ir::OpRc::new(op.clone()))
+            .collect();
+        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
+            .iter()
+            .map(|op| majit_ir::OpRc::new(op.clone()))
+            .collect();
+        let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
+        let reminted = ctx.materialize_operand_at(OpRef::ref_op(85));
+        let input = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        ctx.make_equal_to(&reminted, &input);
+
+        let combined = assemble_peeled_trace_with_jump_args(
+            &p1_ops_rc,
+            &p2_ops_rc,
+            &[OpRef::ref_op(85)],
+            &[OpRef::input_arg_ref(0)],
+            &[],
+            &[],
+            1,
+            0,
+            true,
+            &[],
+            &majit_ir::ConstMap::default(),
+            None,
+            None,
+            &[],
+            &mut Vec::new(),
+            &mut ctx,
+        );
+
+        let label = combined
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("assembled peel has a body LABEL");
+        assert_eq!(
+            label
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0)],
+            "residual LABEL RefOp must recover the forwarded InputArg identity"
+        );
     }
 
     #[test]

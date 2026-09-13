@@ -24,6 +24,7 @@ use majit_backend::{
     Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, ExitFrameLayout,
     ExitRecoveryLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
+use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{
     AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op, OpCode,
@@ -385,14 +386,12 @@ pub struct DeadFrameArtifacts {
 
 /// `compile.py` `class CompileData(object)`.
 ///
-/// PYRE-ADAPTATION: RPython's `CompileData.optimize_trace()` builds the
-/// optimizer chain, logs, dispatches to the subclass `optimize()`, and clears
-/// forwarded boxes in one Python method. Pyre's optimizer entry points borrow
-/// `MetaInterp`, backend state, constant pools, and snapshot side tables
-/// directly in `pyjitpl.rs`, so that dispatch remains flattened there.
-/// These structs intentionally model the RPython constructor payloads only;
-/// call sites must still pass the same trace/runtime/resume/call-pure/opts
-/// state that RPython would store on the corresponding object.
+/// `optimize_trace` is the compile.py method: run subclass `optimize()`,
+/// then `forget_optimization_info`. Logging / `build_opt_chain` stay at the
+/// flattened call site in `pyjitpl.rs` because the optimizer borrows
+/// `MetaInterp`, backend state, constant pools, and snapshot side tables.
+/// Call sites still pass the same trace/runtime/resume/call-pure/opts state
+/// that RPython would store on the corresponding object.
 pub struct CompileData<'a> {
     pub trace: &'a TreeLoop,
 }
@@ -400,6 +399,22 @@ pub struct CompileData<'a> {
 impl<'a> CompileData<'a> {
     pub fn new(trace: &'a TreeLoop) -> Self {
         Self { trace }
+    }
+
+    /// compile.py `CompileData.forget_optimization_info`:
+    /// `for arg in self.trace.inputargs: arg.set_forwarded(None)`.
+    pub fn forget_optimization_info(&self) {
+        for arg in self.inputargs() {
+            arg.clear_forwarded();
+        }
+    }
+
+    /// compile.py `CompileData.optimize_trace`: run the subclass
+    /// `optimize()` body, then `forget_optimization_info`.
+    pub fn optimize_trace<T, E>(&self, optimize: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let result = optimize();
+        self.forget_optimization_info();
+        result
     }
 
     pub fn inputargs(&self) -> &'a [majit_ir::InputArgRc] {
@@ -465,6 +480,14 @@ impl<'a> SimpleCompileData<'a> {
             enable_opts,
         }
     }
+
+    /// compile.py `CompileData.optimize_trace` + `SimpleCompileData.optimize`.
+    pub fn optimize_trace<T, E>(
+        &self,
+        optimize: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.base.optimize_trace(|| optimize(self))
+    }
 }
 
 /// `compile.py` `class BridgeCompileData(CompileData)`.
@@ -474,7 +497,9 @@ pub struct BridgeCompileData<'a> {
     pub runtime_boxes: &'a [OpRef],
     #[allow(dead_code)]
     pub resumestorage: Option<&'a ResumeStorage>,
+    #[allow(dead_code)]
     pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
+    #[allow(dead_code)]
     pub inline_short_preamble: bool,
     #[allow(dead_code)]
     pub enable_opts: &'a [String],
@@ -497,6 +522,14 @@ impl<'a> BridgeCompileData<'a> {
             inline_short_preamble,
             enable_opts,
         }
+    }
+
+    /// compile.py `CompileData.optimize_trace` + `BridgeCompileData.optimize`.
+    pub fn optimize_trace<T, E>(
+        &self,
+        optimize: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.base.optimize_trace(|| optimize(self))
     }
 }
 
@@ -1945,6 +1978,34 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         }
     }
 
+    /// `compile.py emit_op` / `get_box_replacement`: a residual body-LABEL
+    /// `RefOp` is a reminted virtualizable slot that still forwards to the
+    /// expanded inputarg Box. Key the local table by that reminted raw so
+    /// the walk below rewrites it to the GETFIELD/GETARRAYITEM just as
+    /// RPython rewrites a LABEL arg that *is* the forwarded inputarg.
+    fn forward_residual_args_sharing_inputarg(
+        ops: &[majit_ir::OpRc],
+        forwarding: &mut Vec<Option<Operand>>,
+        old_opref: OpRef,
+        target: &Operand,
+    ) {
+        if !old_opref.is_input_arg() {
+            return;
+        }
+        for op in ops {
+            let args = op
+                .getarglist()
+                .into_iter()
+                .chain(op.getfailargs().into_iter().flatten());
+            for arg in args {
+                let via = arg.get_box_replacement(false);
+                if via.to_opref() == old_opref || arg.to_opref() == old_opref {
+                    set_local_forwarded(forwarding, arg.to_opref(), target.clone());
+                }
+            }
+        }
+    }
+
     fn emit_forwarded_patch_op(
         extra_ops: &mut Vec<majit_ir::OpRc>,
         op: &Op,
@@ -2085,7 +2146,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         op.pos().set(new_opref);
         op.setdescr(descr);
         let op = OpRc::new(op);
-        set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&op));
+        let target = Operand::from_bound_op(&op);
+        set_local_forwarded(&mut forwarding, old_opref, target.clone());
+        forward_residual_args_sharing_inputarg(ops, &mut forwarding, old_opref, &target);
         extra_ops.push(op);
         i += 1;
     }
@@ -2234,7 +2297,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             elem_op.pos().set(new_opref);
             elem_op.setdescr(item_descr.clone());
             let elem_op = OpRc::new(elem_op);
-            set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&elem_op));
+            let target = Operand::from_bound_op(&elem_op);
+            set_local_forwarded(&mut forwarding, old_opref, target.clone());
+            forward_residual_args_sharing_inputarg(ops, &mut forwarding, old_opref, &target);
             extra_ops.push(elem_op);
             i += 1;
         }
@@ -3040,6 +3105,66 @@ mod tests {
                 ops[2].pos().get(),
                 ops[3].pos().get()
             ]
+        );
+    }
+
+    /// Residual body-LABEL `RefOp`s that still forward to an expanded
+    /// inputarg are the same Box as `loop.inputargs[i]`. `emit_op` must
+    /// rewrite them to the GETARRAYITEM, not leave a producerless hole.
+    #[test]
+    fn test_patch_new_loop_rewrites_residual_label_refop_forwarded_to_inputarg() {
+        use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
+
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            8,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let slot = rooted_inputarg_operand(Type::Ref, 1);
+        let reminted = rooted_resop_operand(Type::Ref, 85);
+        reminted.set_forwarded_inputarg(
+            &slot
+                .bound_inputarg()
+                .expect("rooted inputarg must carry its InputArgRc"),
+        );
+
+        let mut ops: Vec<majit_ir::OpRc> = vec![OpRc::new(Op::new(
+            OpCode::Label,
+            &[rooted_inputarg_operand(Type::Ref, 0), reminted],
+        ))];
+        let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            1,
+            0,
+            &mut constants,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        let label = ops.iter().find(|op| op.opcode == OpCode::Label).unwrap();
+        let getitem = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::GetarrayitemRawR)
+            .unwrap();
+        assert_eq!(
+            label
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), getitem.pos().get()]
         );
     }
 

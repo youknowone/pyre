@@ -4204,6 +4204,50 @@ impl Optimizer {
         Ok(ops)
     }
 
+    /// compile.py `SimpleCompileData.optimize` → `Optimizer.optimize_loop`.
+    ///
+    /// The caller has already done `trace.get_iter()` (`prepare_bridge_trace`).
+    /// `resumestorage` arrives as `pending_bridge_rd` and is deserialized
+    /// inside `optimize_with_constants_and_inputs_at`, matching
+    /// `optimize_loop`'s `if resumestorage: deserialize_optimizer_knowledge`.
+    /// `BasicLoopInfo.final()` is always True, so there is no retrace.
+    pub(crate) fn optimize_loop(
+        &mut self,
+        ops: &[majit_ir::OpRc],
+        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
+        num_inputs: usize,
+        pending_bridge_rd: Option<PendingBridgeRd>,
+        inputarg_base: u32,
+    ) -> Result<Vec<majit_ir::OpRc>, crate::optimize::InvalidLoop> {
+        self.simple_compile = true;
+        self.pending_bridge_rd = pending_bridge_rd;
+        // Bridge ops are a fresh TraceIterator's reminted slots; producer
+        // lookup runs off `resop_refs` after `bind_input_resops`.
+        self.explicit_input_ops_seed = Some(Vec::new());
+        let max_op_pos = ops
+            .iter()
+            .filter_map(|op| {
+                if op.pos().get().is_none() || op.pos().get().is_constant() {
+                    None
+                } else {
+                    Some(op.pos().get().raw())
+                }
+            })
+            .max();
+        let start_next_pos = max_op_pos
+            .map(|p| p + 1)
+            .unwrap_or(inputarg_base + num_inputs as u32)
+            .max(inputarg_base + num_inputs as u32);
+        self.optimize_with_constants_and_inputs_at(
+            ops,
+            constants,
+            num_inputs,
+            inputarg_base,
+            start_next_pos,
+            false,
+        )
+    }
+
     /// unroll.py: optimize_bridge()
     ///
     /// Optimizes a bridge trace and redirects its terminal JUMP to the
@@ -4323,7 +4367,7 @@ impl Optimizer {
         );
         self.building_bridge = building_bridge_saved;
         self.skip_flush = skip_flush_saved;
-        let optimized_ops = optimized_ops?;
+        let mut optimized_ops = optimized_ops?;
 
         // `reached_loop_header` emits the GUARD_FUTURE_CONDITION before both
         // of its closes, so upstream always has a `patchguardop`:
@@ -4359,17 +4403,28 @@ impl Optimizer {
             self.patchguardop = Some((**g).clone());
         }
 
-        // RPython flush=False: JUMP is in terminal_op, not in optimized_ops.
-        let terminal_jump = self.terminal_op.take();
-        let has_jump = terminal_jump
-            .as_ref()
-            .is_some_and(|op| op.opcode == OpCode::Jump);
+        // unroll.py optimize_bridge: `jump_op = info.jump_op`.
+        // `propagate_all_forward(..., flush=False)` parks JUMP on
+        // `info.jump_op`. Pyre's skip_flush=false path instead sends it
+        // through the passes into `new_operations`; pull it back out so
+        // `jump_to_preamble` can rewrite `descr=cell_token.target_tokens[0]`.
+        let mut terminal_jump = self
+            .terminal_op
+            .take()
+            .filter(|op| op.opcode == OpCode::Jump);
+        if terminal_jump.is_none()
+            && let Some(idx) = optimized_ops
+                .iter()
+                .rposition(|op| op.opcode == OpCode::Jump)
+        {
+            terminal_jump = Some((*optimized_ops.remove(idx)).clone());
+        }
 
         if optimized_ops.len() < 120 && crate::smallir_enabled() {
             eprintln!(
                 "@@@SMALLIR BRIDGE total={} has_jump={} front_targets={}",
                 optimized_ops.len(),
-                has_jump as i32,
+                terminal_jump.is_some() as i32,
                 front_target_tokens.len(),
             );
             for (i, op) in optimized_ops.iter().enumerate() {
@@ -4381,11 +4436,13 @@ impl Optimizer {
             }
         }
 
-        if !has_jump {
-            return Ok((optimized_ops, false));
-        }
-
-        let terminal_jump = terminal_jump.unwrap();
+        // A FINISH-only trace belongs on SimpleCompileData.optimize_loop
+        // (`compile.py compile_trace` `ends_with_jump=False`).
+        let Some(terminal_jump) = terminal_jump else {
+            return Err(crate::optimize::InvalidLoop(
+                "optimize_bridge requires a JUMP; FINISH uses optimize_loop",
+            ));
+        };
         let jump_args: Vec<OpRef> = terminal_jump
             .getarglist()
             .iter()
@@ -4421,19 +4478,12 @@ impl Optimizer {
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
-                // unroll.py: jump_to_preamble →
-                //   jump_op = jump_op.copy_and_change(rop.JUMP,
-                //                 descr=cell_token.target_tokens[0])
-                //   self.send_extra_operation(jump_op)
-                // `cell_token.target_tokens[0]` is the preamble of the jitcell
-                // the JUMP points to — i.e. terminal_jump's own (recorded)
-                // descr (`is_preamble_target`). Keep both the jump_op's forced
-                // args AND its descr; only re-send it through the pass chain.
-                let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
-                self.send_extra_operation(&jump_op, &mut ctx)?;
-                let mut result = optimized_ops;
-                result.append(&mut ctx.new_operations);
-                return Ok((result, false));
+                return self.jump_to_preamble(
+                    &terminal_jump,
+                    front_target_tokens,
+                    optimized_ops,
+                    &mut ctx,
+                );
             }
             return Ok((optimized_ops, false));
         }
@@ -4525,15 +4575,12 @@ impl Optimizer {
             // RPython: self.jump_to_preamble → send_extra_operation
             Err(_) => {
                 if !front_target_tokens.is_empty() {
-                    // unroll.py jump_to_preamble parity: the jump-to
-                    // jitcell is `jump_op.getdescr()` = terminal_jump's own
-                    // recorded descr, the preamble of the loop the trace closed
-                    // into. Keep both jump_op's forced args AND its descr.
-                    let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
-                    self.send_extra_operation(&jump_op, &mut ctx)?;
-                    let mut result = optimized_ops;
-                    result.append(&mut ctx.new_operations);
-                    return Ok((result, false));
+                    return self.jump_to_preamble(
+                        &terminal_jump,
+                        front_target_tokens,
+                        optimized_ops,
+                        &mut ctx,
+                    );
                 }
                 let mut result = optimized_ops;
                 result.append(&mut ctx.new_operations);
@@ -4565,10 +4612,38 @@ impl Optimizer {
                     &format!("Retracing ({}/{retrace_limit})", retraced_count + 1),
                 );
             }
-            // unroll.py:231-233: export the bridge's own runtime boxes for retracing.
-            if let Some(ref mut state) = self.exported_loop_state {
-                state.runtime_boxes = runtime_boxes.to_vec();
-            }
+            // unroll.py `exported_state = self.optunroll.export_state(
+            //     info.jump_op.getarglist(), info.inputargs, runtime_boxes)`
+            // after the failed virtual-state match. Reusing a JUMP-time
+            // `exported_loop_state` (or leaving it None) skips that late
+            // export; `retrace_needed` then starts without a state.
+            let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
+                .map(|i| {
+                    let pos = ctx.inputarg_base + i as u32;
+                    OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
+                })
+                .collect();
+            let exported_int_bounds = self.collect_exported_int_bounds(&jump_args, &mut ctx);
+            let mut state = crate::optimizeopt::unroll::export_state(
+                &jump_args,
+                &renamed_inputargs,
+                self,
+                &mut ctx,
+                Some(&exported_int_bounds),
+            );
+            state.runtime_boxes = runtime_boxes.to_vec();
+            // unroll.py `exported_state.quasi_immutable_deps =
+            // self.quasi_immutable_deps`
+            crate::optimizeopt::unroll::merge_quasi_immutable_deps(
+                &mut state.quasi_immutable_deps,
+                &self.quasi_immutable_deps,
+            );
+            crate::optimizeopt::unroll::merge_quasi_immutable_deps(
+                &mut state.quasi_immutable_deps,
+                &ctx.quasi_immutable_deps,
+            );
+            state.patchguardop = self.patchguardop.clone();
+            self.exported_loop_state = Some(state);
             // unroll.py:234-236 returns `self._newoperations` whole, so the
             // retrace is built on the flush + end-of-preamble force + failed
             // match guards above, not on the body alone. `retarget_close_jump`
@@ -4578,6 +4653,8 @@ impl Optimizer {
             // heap store the bridge body performed.
             let mut result = optimized_ops;
             result.append(&mut ctx.new_operations);
+            // unroll.py `_clean_optimization_info(self._newoperations)`
+            Self::clean_optimization_info(&result);
             return Ok((result, true));
         }
 
@@ -4620,23 +4697,41 @@ impl Optimizer {
             );
         }
         if !front_target_tokens.is_empty() {
-            // unroll.py jump_to_preamble parity: keep jump_op's own
-            // (forced) args so send_extra_operation's Virtualize pass forces the
-            // still-virtual ref args, AND keep its recorded descr. That descr is
-            // `cell_token.target_tokens[0]` (cell_token = jump_op.getdescr()) —
-            // the preamble of the jitcell the trace closed into. Redirecting to
-            // a token picked here instead would deliver args to the wrong frame
-            // slots whenever that jitcell's preamble has different arglocs.
-            let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
-            self.send_extra_operation(&jump_op, &mut ctx)?;
-            let mut result = optimized_ops;
-            result.append(&mut ctx.new_operations);
-            Ok((result, false))
+            self.jump_to_preamble(&terminal_jump, front_target_tokens, optimized_ops, &mut ctx)
         } else {
             let mut result = optimized_ops;
             result.append(&mut ctx.new_operations);
             Ok((result, false))
         }
+    }
+
+    /// unroll.py `UnrollOptimizer.jump_to_preamble`:
+    /// `jump_op.copy_and_change(rop.JUMP, descr=cell_token.target_tokens[0])`
+    /// then `send_extra_operation`. The recorded JUMP descr is the
+    /// `JitCellToken`; this rewrites it to the preamble TargetToken.
+    fn jump_to_preamble(
+        &mut self,
+        terminal_jump: &Op,
+        front_target_tokens: &[crate::history::TargetToken],
+        mut optimized_ops: Vec<majit_ir::OpRc>,
+        ctx: &mut OptContext,
+    ) -> Result<(Vec<majit_ir::OpRc>, bool), crate::optimize::InvalidLoop> {
+        // unroll.py: `assert cell_token.target_tokens[0].virtual_state is None`
+        if front_target_tokens
+            .first()
+            .is_some_and(|token| token.virtual_state.is_some())
+        {
+            return Err(crate::optimize::InvalidLoop(
+                "jump_to_preamble: target_tokens[0].virtual_state is not None",
+            ));
+        }
+        let preamble = front_target_tokens
+            .first()
+            .map(|token| token.as_jump_target_descr());
+        let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, Some(preamble));
+        self.send_extra_operation(&jump_op, ctx)?;
+        optimized_ops.append(&mut ctx.new_operations);
+        Ok((optimized_ops, false))
     }
 
     /// Wrapper: call jump_to_existing_trace, catch only InvalidLoop panics.
@@ -4700,6 +4795,18 @@ impl Optimizer {
             }
         }
         exported
+    }
+
+    /// optimizer.py `_clean_optimization_info(lst)` — drop `_forwarded`
+    /// on each exported op so the next optimizer (the retrace body) does
+    /// not inherit preamble forwarding.
+    fn clean_optimization_info(ops: &[majit_ir::OpRc]) {
+        use majit_ir::forwarding::ForwardingHost;
+        for op in ops {
+            if !matches!(op.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
+                op.clear_forwarded();
+            }
+        }
     }
 
     /// Send one operation through the pass chain.
@@ -7027,6 +7134,35 @@ mod tests {
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
             vec![OpRef::int_op(2)]
+        );
+    }
+
+    #[test]
+    fn test_optimize_loop_keeps_finish_and_does_not_export() {
+        // compile.py SimpleCompileData.optimize → Optimizer.optimize_loop:
+        // a DoneWithThisFrame FINISH is final (BasicLoopInfo.final is True)
+        // and must stay in the op list. optimize_bridge would park it in
+        // terminal_op / try jump matching.
+        let mut opt = Optimizer::default_pipeline();
+        let mut finish = Op::new(OpCode::Finish, &[rooted_resop_operand(Type::Int, 0)]);
+        finish.pos().set(OpRef::void_op(1));
+        let ops = vec![OpRc::new(finish)];
+        opt.trace_inputargs = OpRef::inputarg_refs(&[Type::Int]);
+        let mut constants = majit_ir::ConstMap::default();
+        let result = opt
+            .optimize_loop(&ops, &mut constants, 1, None, 0)
+            .expect("optimize_loop must accept a FINISH-only trace");
+        assert!(
+            opt.simple_compile,
+            "SimpleCompileData.optimize sets Optimizer.simple_compile"
+        );
+        assert!(
+            opt.exported_loop_state.is_none(),
+            "BasicLoopInfo.final is True; optimize_loop must not export for retrace"
+        );
+        assert!(
+            result.last().is_some_and(|op| op.opcode == OpCode::Finish),
+            "FINISH must remain in the optimized ops, got {result:?}"
         );
     }
 
