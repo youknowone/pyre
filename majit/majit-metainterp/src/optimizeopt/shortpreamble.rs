@@ -4211,6 +4211,54 @@ mod tests {
         );
     }
 
+    fn heap_oprc_strong_count(op: &PotentialShortOp) -> Option<usize> {
+        match op {
+            PotentialShortOp::Preamble(p) if p.kind == PreambleOpKind::Heap => {
+                Some(OpRc::strong_count(&p.op))
+            }
+            PotentialShortOp::Compound(c) => {
+                heap_oprc_strong_count(&c.one).or_else(|| heap_oprc_strong_count(&c.two))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn add_potential_op_moves_prev_into_compound_without_cloning_oprc() {
+        // shortpreamble.py add_potential_op: `CompoundOp(op, pop, prev_op)`
+        // stores the previous dict value. Cloning PreambleOp clones its
+        // OpRc and bumps the strong count; a move leaves the count alone.
+        let mut ctx = crate::optimizeopt::OptContext::new(256);
+        let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(30)]);
+        sb.add_short_input_arg(&mut ctx, OpRef::int_op(30), majit_ir::Type::Int);
+
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[rop(Type::Int, 30)],
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
+        );
+        heap.pos().set(OpRef::int_op(10));
+        sb.add_potential_op(&mut ctx, None, heap, PreambleOpKind::Heap);
+        let count_before = sb
+            .potential_ops
+            .values()
+            .find_map(heap_oprc_strong_count)
+            .expect("heap producer is in potential_ops");
+
+        let mut pure = Op::new(OpCode::IntAdd, &[rop(Type::Int, 30), rop(Type::Int, 30)]);
+        pure.pos().set(OpRef::int_op(10));
+        sb.add_potential_op(&mut ctx, None, pure, PreambleOpKind::Pure);
+        let count_after = sb
+            .potential_ops
+            .values()
+            .find_map(heap_oprc_strong_count)
+            .expect("heap producer is inside the CompoundOp");
+        assert_eq!(
+            count_before, count_after,
+            "add_potential_op must move prev into CompoundOp; cloning PreambleOp bumps OpRc"
+        );
+    }
+
     #[test]
     fn test_short_boxes_nested_compound_emits_multiple_invented_aliases() {
         let mut __ctx = crate::optimizeopt::OptContext::new(256);
