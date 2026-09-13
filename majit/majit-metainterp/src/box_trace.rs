@@ -205,6 +205,9 @@ pub fn wrapint_residual() -> Option<&'static WrapintResidual> {
 #[derive(Clone)]
 pub struct BinaryOpResidual {
     pub fnaddrs: Vec<i64>,
+    /// `jit_compare_value_from_tag` shares the `(Ref, Ref, Int)` shape;
+    /// its tags overlap add/sub/mul/rem and must not take this fold.
+    pub exclude_fnaddrs: Vec<i64>,
     pub size_descr: majit_ir::DescrRef,
     pub intval_descr: majit_ir::DescrRef,
     pub int_type_addr: i64,
@@ -212,7 +215,14 @@ pub struct BinaryOpResidual {
 
 impl BinaryOpResidual {
     pub fn matches(&self, fnaddr: i64) -> bool {
-        self.fnaddrs.contains(&fnaddr)
+        !self.exclude_fnaddrs.contains(&fnaddr)
+            && (self.fnaddrs.is_empty() || self.fnaddrs.contains(&fnaddr))
+    }
+
+    /// `(Ref, Ref, Int)` + an int-op tag is the BINARY_OP helper unless
+    /// `fnaddr` is a known compare residual.
+    pub fn matches_call(&self, fnaddr: i64) -> bool {
+        !self.exclude_fnaddrs.contains(&fnaddr)
     }
 }
 

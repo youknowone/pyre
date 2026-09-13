@@ -1601,7 +1601,7 @@ where
         dst: usize,
     ) -> Option<TraceAction> {
         let spec = crate::box_trace::binary_op_residual()?;
-        if !spec.matches(concrete_ptr) && !spec.matches(trace_ptr) {
+        if !spec.matches_call(concrete_ptr) && !spec.matches_call(trace_ptr) {
             return None;
         }
         if arg_types
