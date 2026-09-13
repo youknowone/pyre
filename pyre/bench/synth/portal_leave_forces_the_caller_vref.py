@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=driver,root:leaf
+# pyre-check: selfcheck-compiles=driver,entry-bridge:leaf
 # Both entries are the premise, not a relaxation. The caller whose vref goes
 # unforced is `mid_pass`, and it is only virtual because `driver`'s loop
 # compiles and inlines it; `leaf` is the residual callee whose own activation

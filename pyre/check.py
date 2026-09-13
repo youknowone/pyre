@@ -2233,8 +2233,9 @@ def synth_selfcheck_interpreted(path):
 
     It declares the empty set rather than turning a threshold off: a
     bookkeeping loop that happens to compile is neither required nor
-    forbidden. A fixture that does reach the JIT, but only as a root trace,
-    declares `selfcheck-compiles=root:<name>` rather than this.
+    forbidden. A fixture that does reach the JIT, but only as a
+    FINISH-only entry bridge, declares
+    `selfcheck-compiles=entry-bridge:<name>` rather than this.
 
     An opt-out rather than an opt-in, so a fixture that quietly stops being
     compiled is reported rather than passing on in silence.
@@ -2249,7 +2250,7 @@ def synth_selfcheck_interpreted(path):
 def synth_selfcheck_compiles(path):
     """Read what a selfcheck fixture requires the JIT to compile:
         # pyre-check: selfcheck-compiles=hot,inner
-        # pyre-check: selfcheck-compiles=root:callee_d1
+        # pyre-check: selfcheck-compiles=entry-bridge:callee_d1
 
     Each entry is a code object name — what `get_printable_location`
     (interp_jit.py) puts first in the string it renders for a green key —

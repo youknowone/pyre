@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot,root:rec
+# pyre-check: selfcheck-compiles=hot,entry-bridge:rec
 # The `root:` arm is the premise, not a relaxation: the activations this
 # fixture walks are owed precisely because `rec` compiles and its recursive
 # call is folded into `CALL_ASSEMBLER`. A `rec` that stopped compiling would

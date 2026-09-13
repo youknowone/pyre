@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=root:ForArm,root:WhileArm
+# pyre-check: selfcheck-compiles=entry-bridge:ForArm,entry-bridge:WhileArm
 # Regression guard: a class statement in a loop body used to LOSE the rest of
 # the iteration it aborted in, whenever an earlier opcode of that same body had
 # already mutated the heap.

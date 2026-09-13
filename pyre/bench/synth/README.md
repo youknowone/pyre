@@ -49,15 +49,17 @@ and declined on wasm is a wasm failure, which is the point.
 
 The arms are `loop`, `retrace`, `root` and `entry-bridge`, one per place
 `pyjitpl.rs` bumps `loops_compiled`. Only three of them close a loop:
-`finish_and_compile` attaches a root trace that ends in FINISH with no LABEL,
-so a fixture whose subject reaches the JIT that way declares it as such:
+`finish_and_compile` attaches a FINISH-only procedure through
+`ResumeFromInterpDescr.compile_and_attach` (`send_loop_to_backend(...,
+"entry bridge")`), so a fixture whose subject reaches the JIT that way
+declares it as such:
 
 ```python
-# pyre-check: selfcheck-compiles=root:callee_d1
+# pyre-check: selfcheck-compiles=entry-bridge:callee_d1
 ```
 
-That is a different claim, not a weaker one — a loop that degrades into a root
-trace is still reported.
+That is a different claim, not a weaker one — a loop that degrades into an
+entry-bridge FINISH is still reported.
 
 This used to be a count, `selfcheck-loops=8`, read off `loops_compiled`. That
 number answered a different question twice over: it counted the non-loop arms

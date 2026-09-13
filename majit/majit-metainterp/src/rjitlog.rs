@@ -9,17 +9,22 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
 
-use majit_ir::{InputArg, Op};
+use majit_ir::{InputArg, Op, OpCode};
 
 /// `rjitlog.py` mark table, `start = 0x11`.
 const MARK_BASE: u8 = 0x11;
 pub const MARK_INPUT_ARGS: u8 = MARK_BASE;
+pub const MARK_RESOP_META: u8 = MARK_BASE + 1;
 pub const MARK_RESOP: u8 = MARK_BASE + 2;
 pub const MARK_RESOP_DESCR: u8 = MARK_BASE + 3;
 pub const MARK_TRACE: u8 = MARK_BASE + 6;
 pub const MARK_TRACE_OPT: u8 = MARK_BASE + 7;
 pub const MARK_START_TRACE: u8 = MARK_BASE + 10;
+pub const MARK_JITLOG_HEADER: u8 = MARK_BASE + 13;
 pub const MARK_ABORT_TRACE: u8 = MARK_BASE + 16;
+
+/// `rjitlog.py JITLOG_VERSION`.
+const JITLOG_VERSION: u16 = 4;
 
 struct JitLogState {
     file: Option<File>,
@@ -48,9 +53,30 @@ pub fn jitlog_try_init_using_env() {
         return;
     }
     match File::create(&path) {
-        Ok(file) => state.file = Some(file),
+        Ok(file) => {
+            state.file = Some(file);
+            // rjitlog.py JitLogger.setup_once: header before any trace.
+            let header = assemble_header();
+            write_marked(&mut state, MARK_JITLOG_HEADER, &header);
+        }
         Err(err) => eprintln!("could not open '{}': {err}", path.to_string_lossy()),
     }
+}
+
+/// `rjitlog.py assemble_header`.
+fn assemble_header() -> Vec<u8> {
+    let mut content = Vec::new();
+    content.extend_from_slice(&JITLOG_VERSION.to_le_bytes());
+    content.push(0); // 64-bit
+    content.extend_from_slice(&encode_str(&std::env::consts::ARCH));
+    content.push(MARK_RESOP_META);
+    let opcodes: Vec<OpCode> = OpCode::all().collect();
+    content.extend_from_slice(&encode_le_16bit(opcodes.len() as u16));
+    for op in opcodes {
+        content.extend_from_slice(&encode_le_16bit(op.as_u16()));
+        content.extend_from_slice(&encode_str(&op.name().to_ascii_lowercase()));
+    }
+    content
 }
 
 /// `rjitlog.c jitlog_enabled`.
@@ -59,18 +85,19 @@ pub fn jitlog_enabled() -> bool {
 }
 
 /// `rjitlog.py JitLogger.start_new_trace`. Increments even when disabled.
-pub fn start_new_trace(is_bridge: bool, jd_name: &str) -> u64 {
+///
+/// `descr_or_entry` is `compute_unique_id(faildescr)` for a bridge, or
+/// `int(entry_bridge)` for a loop.
+pub fn start_new_trace(is_bridge: bool, descr_or_entry: u64, jd_name: &str) -> u64 {
     jitlog_try_init_using_env();
     let mut state = lock();
     state.trace_id += 1;
     let tid = state.trace_id;
     if state.file.is_some() {
-        // rjitlog.py: faildescr → "bridge" + unique id; else "loop" +
-        // int(entry_bridge). Callers that have no descr id write 0.
         let kind = if is_bridge { "bridge" } else { "loop" };
         let mut payload = encode_le_addr(tid).to_vec();
         payload.extend_from_slice(&encode_str(kind));
-        payload.extend_from_slice(&encode_le_addr(0));
+        payload.extend_from_slice(&encode_le_addr(descr_or_entry));
         payload.extend_from_slice(&encode_str(jd_name));
         write_marked(&mut state, MARK_START_TRACE, &payload);
     }
@@ -119,8 +146,10 @@ where
     }
 }
 
+/// `rjitlog.py LogTrace.encode_op`.
 fn write_resop(state: &mut JitLogState, op: &Op) {
-    let mark = if op.has_descr() {
+    let descr = op.getdescr();
+    let mark = if descr.is_some() {
         MARK_RESOP_DESCR
     } else {
         MARK_RESOP
@@ -131,11 +160,25 @@ fn write_resop(state: &mut JitLogState, op: &Op) {
         body.push(',');
         body.push_str(&format!("{arg:?}"));
     }
-    if let Some(descr) = op.getdescr() {
+    if let Some(ref d) = descr {
         body.push(',');
-        body.push_str(&format!("{descr:?}"));
+        body.push_str(&format!("{d:?}"));
     }
     line.extend_from_slice(&encode_str(&body));
+    if let Some(d) = descr {
+        line.extend_from_slice(&encode_le_addr(
+            std::sync::Arc::as_ptr(&d) as *const () as u64
+        ));
+    }
+    let failargs = match op.getfailargs() {
+        Some(args) => args
+            .iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        None => String::new(),
+    };
+    line.extend_from_slice(&encode_str(&failargs));
     write_marked(state, mark, &line);
 }
 
@@ -176,6 +219,7 @@ mod tests {
     fn mark_trace_is_the_seventh_mark() {
         assert_eq!(MARK_TRACE, 0x17);
         assert_eq!(MARK_START_TRACE, 0x1b);
+        assert_eq!(MARK_JITLOG_HEADER, 0x1e);
         assert_eq!(MARK_ABORT_TRACE, 0x21);
     }
 
@@ -189,7 +233,7 @@ mod tests {
     #[test]
     fn start_new_trace_increments_when_disabled() {
         let before = trace_id();
-        let tid = start_new_trace(false, "test");
+        let tid = start_new_trace(false, 0, "test");
         assert!(tid > before);
     }
 

@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot,root:callee
+# pyre-check: selfcheck-compiles=hot,entry-bridge:callee
 # The callee's `root:` arm is the premise, not a relaxation: the events this
 # fixture counts are owed precisely because compiled code enters the callee past
 # `execute_frame`'s bracket.  A callee that stopped reaching the JIT would make

@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot,level0,root:level0,root:level1,root:level2,root:level3,root:level4,root:level5,entry-bridge:level0
+# pyre-check: selfcheck-compiles=hot,level0,entry-bridge:level0,entry-bridge:level1,entry-bridge:level2,entry-bridge:level3,entry-bridge:level4,entry-bridge:level5
 # Every Python activation consumes recursion budget, not only an activation
 # whose code object is already present in the live call chain.  The six
 # distinct callees below each carry a loop so a warmed caller can cross their

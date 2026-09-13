@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=main,root:__init__
+# pyre-check: selfcheck-compiles=main,entry-bridge:__init__
 # Both names are the WORKLOAD text's, not this module's -- the module
 # defines nothing from it.  `root:__init__` is measured and belongs to the
 # declaration for the same reason the comment below says not to tidy the

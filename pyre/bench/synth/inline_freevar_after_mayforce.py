@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=<module>,root:forward
+# pyre-check: selfcheck-compiles=<module>,entry-bridge:forward
 # The module loop inlines `forward`, whose Fraction division is a forcing call.
 # The following LOAD_DEREF must recover `adjust` from the inlined callee's own
 # frame shadow after that call invalidates heap-cache facts.  Losing the callee

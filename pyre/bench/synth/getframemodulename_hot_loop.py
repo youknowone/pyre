@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=root:_callee_template
+# pyre-check: selfcheck-compiles=entry-bridge:_callee_template
 # The `root:` arm is measured, not a relaxation: this fixture's loop aborts
 # five times with ABORT_ESCAPE and what reaches the JIT is the root trace
 # `finish_and_compile` attaches. The cause is that no fold row exists for

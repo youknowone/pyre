@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=root:rec,root:step
+# pyre-check: selfcheck-compiles=entry-bridge:rec,entry-bridge:step
 # A self-recursive callee reached through a multi-frame adopt returned `None`
 # from a function whose every path returns an `int` (gh#1444).
 #

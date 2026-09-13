@@ -3396,14 +3396,14 @@ impl<M: Clone> MetaInterp<M> {
     /// rjitlog.py `JitLogger.start_new_trace`: increment even when the
     /// binary log is off. `is_bridge` is true when compile.py passes a
     /// `faildescr` (`compile_trace` / `compile_retrace`).
-    fn jitlog_start_new_trace(&mut self, is_bridge: bool) {
-        self.jitlog_trace_id = crate::rjitlog::start_new_trace(is_bridge, "");
+    fn jitlog_start_new_trace(&mut self, is_bridge: bool, descr_or_entry: u64) {
+        self.jitlog_trace_id = crate::rjitlog::start_new_trace(is_bridge, descr_or_entry, "");
     }
 
-    /// rjitlog.py `JitLogger.trace_aborted`.
+    /// rjitlog.py `JitLogger.trace_aborted`. Binary abort marker only;
+    /// warm-state abort counts stay on `abort_tracing`.
     fn jitlog_trace_aborted(&mut self) {
         crate::rjitlog::trace_aborted();
-        self.warm_state.log_trace_aborted();
     }
 
     /// Test-only accessor for the root trace_id of a compiled entry.
@@ -7304,7 +7304,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py compile_loop: jitlog.start_new_trace before the JUMP.
         // compile_retrace is a separate entry and increments itself.
         if self.partial_trace.is_none() {
-            self.jitlog_start_new_trace(false);
+            self.jitlog_start_new_trace(false, 0);
         }
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
@@ -9081,7 +9081,11 @@ impl<M: Clone> MetaInterp<M> {
         }
         // compile.py compile_trace: jitlog.start_new_trace(faildescr=resumekey).
         // After the session check, before the long tracing borrow.
-        self.jitlog_start_new_trace(true);
+        let descr_id = self
+            .bridge_info()
+            .map(|b| std::sync::Arc::as_ptr(&b.source_descr) as *const () as u64)
+            .unwrap_or(0);
+        self.jitlog_start_new_trace(true, descr_id);
         let ctx = self.tracing.as_mut().unwrap();
 
         // pyjitpl.py:3187: save position before recording JUMP/FINISH
@@ -9375,7 +9379,11 @@ impl<M: Clone> MetaInterp<M> {
     pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
         self.remember_compiled_graph_write();
         // compile.py compile_retrace: jitlog.start_new_trace(faildescr=resumekey).
-        self.jitlog_start_new_trace(true);
+        let descr_id = self
+            .bridge_info()
+            .map(|b| std::sync::Arc::as_ptr(&b.source_descr) as *const () as u64)
+            .unwrap_or(0);
+        self.jitlog_start_new_trace(true, descr_id);
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -10640,9 +10648,12 @@ impl<M: Clone> MetaInterp<M> {
             .tracing_done()
         {
             self.pending_abort_reason = Some(reason.as_int());
+            self.warm_state.abort_tracing(green_key, false);
+            self.pending_abort_green_key = Some(green_key);
+            self.pending_abort_permanent = false;
             return Err(SwitchToBlackhole::giveup());
         }
-        self.jitlog_start_new_trace(true);
+        self.jitlog_start_new_trace(true, 0);
         // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
         // downstream consumers (`trace.snapshots`) still observe the
         // captured resumedata. `recorder.get_trace()` on its own returns

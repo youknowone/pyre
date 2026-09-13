@@ -393,8 +393,8 @@ pub mod loop_census {
     ///
     /// *kind* is which compile arm minted it, because `loops_compiled` counts
     /// all of them alike and they are not all loops: `finish_and_compile`
-    /// attaches a root trace that ends in FINISH with no LABEL, and says so in
-    /// its own comment. A census that hid the arm would reproduce exactly the
+    /// attaches a FINISH-only entry bridge, and says so in its own comment.
+    /// A census that hid the arm would reproduce exactly the
     /// conflation it exists to undo, so the arm is part of the line and the
     /// reader decides what a given fixture is entitled to.
     ///

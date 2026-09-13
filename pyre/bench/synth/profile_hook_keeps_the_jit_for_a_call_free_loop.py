@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=pure,root:_callee
+# pyre-check: selfcheck-compiles=pure,entry-bridge:_callee
 # `pure` is the call-free loop of the title.  `builtin_only` and `py_callee`
 # compile no loop -- the walker declines at the call, which is the rule this
 # fixture states -- so only `_callee` reaching the JIT as a root trace is

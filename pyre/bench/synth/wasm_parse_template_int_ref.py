@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=main,root:parse_template
+# pyre-check: selfcheck-compiles=main,entry-bridge:parse_template
 # A wasm-only JIT miscompile returned the integer group index from
 # `re._parser.parse_template` as a bogus object:
 #

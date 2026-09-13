@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=outer,outer_arming,root:inner
+# pyre-check: selfcheck-compiles=outer,outer_arming,entry-bridge:inner
 # `c_call` carries the frame that made the call, and for a builtin called from
 # inside a Python callee that is the CALLEE's frame -- never the caller whose
 # compiled trace would have inlined it.

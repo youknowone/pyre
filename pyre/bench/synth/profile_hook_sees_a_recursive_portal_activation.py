@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot,root:rec
+# pyre-check: selfcheck-compiles=hot,entry-bridge:rec
 # The `root:` arm is the premise, not a relaxation: the activations this
 # fixture counts are owed precisely because `rec` reaches the JIT and its
 # recursive calls leave through the portal runner. A `rec` that stopped

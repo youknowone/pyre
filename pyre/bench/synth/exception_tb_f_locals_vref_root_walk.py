@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=drive,locs,root:locs,root:mid,entry-bridge:locs
+# pyre-check: selfcheck-compiles=drive,locs,entry-bridge:locs,entry-bridge:mid
 # A traceback node must expose the catching frame's live locals while its
 # exception handler is still running, including the exception target `e`.
 #

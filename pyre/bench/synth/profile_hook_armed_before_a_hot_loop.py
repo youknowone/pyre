@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot,root:callee
+# pyre-check: selfcheck-compiles=hot,entry-bridge:callee
 # A profile hook is installed, and a loop entered afterwards runs a tail long
 # enough that a compiled one would have taken it over.
 #
