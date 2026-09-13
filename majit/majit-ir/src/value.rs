@@ -437,10 +437,10 @@ impl InputArg {
             tp: self.tp,
             index: self.index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
-            // `_forwarded` is per-identity and must reset. The concrete
-            // bits belong to this inputarg *position* and stay with every
-            // remint so stack-resident reds can refuse a ConstPtr fold.
-            value: std::cell::Cell::new(self.value.get()),
+            // A new InputArg object has no payload yet
+            // (`resoperation.py InputArgInt/Float/Ref`). Remint that
+            // must keep stack bits uses the original box, not this copy.
+            value: std::cell::Cell::new(None),
         }
     }
 }

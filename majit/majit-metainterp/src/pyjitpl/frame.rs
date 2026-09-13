@@ -237,6 +237,14 @@ impl MIFrame {
             .find_map(|&(reg, opref)| (reg == idx).then_some(opref))
     }
 
+    /// A later PUT/copy into this register is no longer the portal red
+    /// that was seeded there. Snapshot the live SSA, not the entry InputArg.
+    fn retire_portal_red_ref(&mut self, idx: usize) {
+        if let Ok(reg) = u16::try_from(idx) {
+            self.portal_red_refs.retain(|(r, _)| *r != reg);
+        }
+    }
+
     /// `history.py AbstractValue.getref_base()` for one entry of
     /// `MIFrame.registers_r`.
     ///
@@ -622,11 +630,12 @@ impl MIFrame {
             self.int_values[slot] = Some(value);
         }
         let num_regs_r = self.jitcode.c_num_regs_r as usize;
-        for (i, slot) in self.jitcode.constants_r.iter().enumerate() {
-            let value = slot.get();
+        for i in 0..self.jitcode.constants_r.len() {
+            let value = self.jitcode.constants_r[i].get();
             let slot = num_regs_r + i;
             self.ref_regs[slot] = Some(ctx.const_ref(value));
             self.ref_values[slot] = Some(value);
+            self.retire_portal_red_ref(slot);
         }
         let num_regs_f = self.jitcode.c_num_regs_f as usize;
         for (i, &value) in self.jitcode.constants_f.iter().enumerate() {
@@ -660,6 +669,7 @@ impl MIFrame {
             self.ref_regs[i] = None;
             self.ref_values[i] = None;
         }
+        self.portal_red_refs.clear();
         self.pushed_box = None;
     }
 
@@ -728,6 +738,7 @@ impl MIFrame {
             JitArgKind::Ref => {
                 self.ref_regs[target_index] = Some(opref);
                 self.ref_values[target_index] = Some(concrete);
+                self.retire_portal_red_ref(target_index);
             }
             JitArgKind::Float => {
                 self.float_regs[target_index] = Some(opref);
@@ -831,6 +842,7 @@ impl MIFrame {
                         let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
+                        self.retire_portal_red_ref(index);
                         (None, None, None)
                     }
                     b'f' => {
@@ -1020,6 +1032,7 @@ impl MIFrame {
                         let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
+                        self.retire_portal_red_ref(index);
                     }
                     b'f' => {
                         let opref = OpRef::const_float(0.0);
@@ -1314,6 +1327,7 @@ impl MIFrame {
                 JitArgKind::Ref => {
                     self.ref_regs[count_r] = Some(*value);
                     self.ref_values[count_r] = Some(*concrete);
+                    self.retire_portal_red_ref(count_r);
                     count_r += 1;
                 }
                 JitArgKind::Float => {

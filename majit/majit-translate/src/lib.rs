@@ -2149,9 +2149,24 @@ fn analyze_pipeline_from_module_paths(
         if !hints.iter().any(|h| h == "cannot_raise") {
             continue;
         }
-        let mut segs: Vec<&str> = path_str.split("::").collect();
-        let name = segs.pop().unwrap_or(path_str.as_str());
-        let module = segs.join("::");
+        let segs: Vec<&str> = path_str.split("::").collect();
+        let Some((name, module_segs)) = segs.split_last() else {
+            continue;
+        };
+        // `Type::method` is not a free function. Aliasing it as bare
+        // `method` would share the GraphStore row with an unrelated
+        // `module::method` (e.g. `RootStackGuard::get` vs
+        // `baseobjspace::get`).
+        if module_segs
+            .last()
+            .is_some_and(|s| s.starts_with(|c: char| c.is_uppercase()))
+        {
+            call_control.mark_cannot_raise_assertion(crate::parse::CallPath::from_segments(
+                segs.iter().copied(),
+            ));
+            continue;
+        }
+        let module = module_segs.join("::");
         for p in free_function_alias_paths(name, &module) {
             call_control.mark_cannot_raise_assertion(p);
         }
