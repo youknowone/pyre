@@ -3335,6 +3335,74 @@ fn test_stray_label_inputarg_is_seeded() {
 }
 
 #[test]
+fn test_external_jump_leftover_inputarg_declines() {
+    // A leftover InputArg on a JUMP that does not land on a LABEL in this
+    // stream is a live transfer. Seeding 0 would hand the target null.
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let jump = Op::new(
+        OpCode::Jump,
+        &[
+            rb(OpRef::input_arg_ref(0)),
+            rb(OpRef::input_arg_ref(1)),
+            rb(OpRef::input_arg_ref(99)),
+        ],
+    );
+    jump.setdescr(majit_ir::descr::make_call_descr_full(
+        99,
+        vec![],
+        Type::Void,
+        false,
+        8,
+        EffectInfo::default(),
+    ));
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))],
+        ),
+        jump,
+    ];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let err = match codegen::build_wasm_module(&codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants,
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    }) {
+        Err(err) => err,
+        Ok(_) => panic!("an external JUMP leftover must decline, not seed 0"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no producing op")
+            && (msg.contains("value[99]") || msg.contains("InputArgRef(99)")),
+        "must decline the leftover JUMP InputArg, got {msg}"
+    );
+}
+
+#[test]
 fn test_stray_failarg_ref_declines() {
     // A failarg InputArg that is not a token input and not a LABEL
     // live-in has no producer. #1780 treats LABEL args as defined;

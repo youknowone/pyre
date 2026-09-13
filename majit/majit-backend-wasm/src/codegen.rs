@@ -11040,6 +11040,24 @@ fn folded_scalar_bits(arg: &Operand) -> Option<i64> {
     }
 }
 
+/// Whether this JUMP lands on a LABEL in the same stream.
+///
+/// A leftover InputArg on a self-loop is dummy plumbing (dynasm parks it in
+/// a frame slot). The same leftover on a JUMP whose descr is not a local
+/// LABEL is a live transfer into another trace; synthesizing 0 there would
+/// hand the target a null/zero instead of the runtime value.
+fn jump_targets_local_label(ops: &[Op], jump: &Op) -> bool {
+    let Some(descr) = jump.getdescr() else {
+        return true;
+    };
+    ops.iter().any(|op| {
+        op.opcode.is_label()
+            && op
+                .getdescr()
+                .is_some_and(|label| std::sync::Arc::ptr_eq(&label, &descr))
+    })
+}
+
 fn unbound_pool_const_seeds(
     inputargs: &[InputArg],
     ops: &[Op],
@@ -11167,7 +11185,7 @@ fn unbound_pool_const_seeds(
                     readers.push(format!("{:?}.{slot} {opref:?}", op.opcode));
                     return;
                 }
-                if op.opcode == OpCode::Jump {
+                if op.opcode == OpCode::Jump && jump_targets_local_label(ops, op) {
                     seeds.push((raw, 0));
                     return;
                 }
