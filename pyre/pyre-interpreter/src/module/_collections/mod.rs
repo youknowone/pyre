@@ -835,19 +835,27 @@ fn deque_compare(
     let lock_b = getlock(other);
     let snap_a = snapshot(self_obj);
     let snap_b = snapshot(other);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let a_base = pyre_object::gc_roots::pin_roots(&snap_a);
+    let b_base = pyre_object::gc_roots::pin_roots(&snap_b);
     let mut i = 0usize;
     loop {
         // next(w_it1): lock-check precedes the element.
         checklock(self_obj, lock_a)?;
-        let x1 = snap_a.get(i).copied();
+        let x1 = (i < snap_a.len()).then(|| pyre_object::gc_roots::shadow_stack_get(a_base + i));
         // next(w_it2): lock-check precedes the element.
         checklock(other, lock_b)?;
-        let x2 = snap_b.get(i).copied();
+        let x2 = (i < snap_b.len()).then(|| pyre_object::gc_roots::shadow_stack_get(b_base + i));
         match (x1, x2) {
-            (Some(a), Some(b)) => {
+            (Some(_), Some(_)) => {
+                let a = pyre_object::gc_roots::shadow_stack_get(a_base + i);
+                let b = pyre_object::gc_roots::shadow_stack_get(b_base + i);
                 if !crate::baseobjspace::eq_w(a, b)? {
                     // First differing pair decides the result; no further
-                    // `next`, so no further lock check.
+                    // `next`, so no further lock check.  Reload after `eq_w`,
+                    // which can collect and move both operands.
+                    let a = pyre_object::gc_roots::shadow_stack_get(a_base + i);
+                    let b = pyre_object::gc_roots::shadow_stack_get(b_base + i);
                     return match op {
                         CompareOp::Eq => Ok(pyre_object::w_bool_from(false)),
                         CompareOp::Ne => Ok(pyre_object::w_bool_from(true)),
@@ -1053,9 +1061,17 @@ impl W_Deque {
     fn count(&mut self, x: PyObjectRef) -> Result<i64, crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         let lock = getlock(self_obj);
+        let items = snapshot(self_obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let x_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(x);
+        let items_base = pyre_object::gc_roots::pin_roots(&items);
         let mut n = 0i64;
-        for it in snapshot(self_obj) {
-            let equal = crate::baseobjspace::eq_w(it, x)?;
+        for i in 0..items.len() {
+            let equal = crate::baseobjspace::eq_w(
+                pyre_object::gc_roots::shadow_stack_get(items_base + i),
+                pyre_object::gc_roots::shadow_stack_get(x_slot),
+            )?;
             checklock(self_obj, lock)?;
             if equal {
                 n += 1;
@@ -1065,11 +1081,18 @@ impl W_Deque {
     }
     fn remove(&mut self, x: PyObjectRef) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        let mut items = snapshot(self_obj);
+        let items = snapshot(self_obj);
         let lock = getlock(self_obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let x_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(x);
+        let items_base = pyre_object::gc_roots::pin_roots(&items);
         let mut pos = None;
-        for (i, &it) in items.iter().enumerate() {
-            let equal = crate::baseobjspace::eq_w(it, x)?;
+        for i in 0..items.len() {
+            let equal = crate::baseobjspace::eq_w(
+                pyre_object::gc_roots::shadow_stack_get(items_base + i),
+                pyre_object::gc_roots::shadow_stack_get(x_slot),
+            )?;
             // CPython 3.14's deque.remove reports re-entrant mutation as
             // IndexError (PyPy's older block-list port reports RuntimeError).
             // The comparison may have cleared or otherwise resized the live
@@ -1098,6 +1121,9 @@ impl W_Deque {
                         "deque mutated during iteration",
                     ));
                 }
+                let mut items: Vec<PyObjectRef> = (0..items.len())
+                    .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
+                    .collect();
                 items.remove(pos);
                 store(self_obj, items);
                 Ok(())
@@ -1110,8 +1136,16 @@ impl W_Deque {
     fn __contains__(&mut self, x: PyObjectRef) -> Result<bool, crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         let lock = getlock(self_obj);
-        for it in snapshot(self_obj) {
-            let equal = crate::baseobjspace::eq_w(it, x)?;
+        let items = snapshot(self_obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let x_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(x);
+        let items_base = pyre_object::gc_roots::pin_roots(&items);
+        for i in 0..items.len() {
+            let equal = crate::baseobjspace::eq_w(
+                pyre_object::gc_roots::shadow_stack_get(items_base + i),
+                pyre_object::gc_roots::shadow_stack_get(x_slot),
+            )?;
             checklock(self_obj, lock)?;
             if equal {
                 return Ok(true);
@@ -1195,6 +1229,10 @@ impl W_Deque {
     ) -> Result<i64, crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         let items = snapshot(self_obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let x_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(x);
+        let items_base = pyre_object::gc_roots::pin_roots(&items);
         let len = items.len() as i64;
         // `space.iter(self)` takes the lock before `unwrap_start_stop`,
         // so a `__index__` on start/stop that mutates the deque is caught
@@ -1218,7 +1256,10 @@ impl W_Deque {
             // `space.next(w_iter)` checks the lock before each element.
             checklock(self_obj, lock)?;
             if i >= start {
-                if crate::baseobjspace::eq_w(items[i as usize], x)? {
+                if crate::baseobjspace::eq_w(
+                    pyre_object::gc_roots::shadow_stack_get(items_base + i as usize),
+                    pyre_object::gc_roots::shadow_stack_get(x_slot),
+                )? {
                     // Match returns immediately, before the post-match
                     // `checklock`.
                     return Ok(i);

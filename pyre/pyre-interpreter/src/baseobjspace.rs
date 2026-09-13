@@ -3564,24 +3564,49 @@ pub(crate) fn dict_view_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         if reverse {
             entries.reverse();
         }
-        let mut items = pyre_object::gc_roots::RootedItems::new();
-        for (k, v) in entries.into_iter().skip(index) {
+        let rest: Vec<_> = entries.into_iter().skip(index).collect();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut flat = Vec::with_capacity(rest.len() * 2);
+        for (k, v) in &rest {
+            flat.push(*k);
+            flat.push(*v);
+        }
+        let pair_base = pyre_object::gc_roots::pin_roots(&flat);
+        let mut out_slots = Vec::with_capacity(rest.len());
+        for i in 0..rest.len() {
+            let k = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2);
+            let v = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2 + 1);
             match kind {
-                pyre_object::dictmultiobject::DictViewKind::Keys => items.push(k),
-                pyre_object::dictmultiobject::DictViewKind::Values => items.push(v),
+                pyre_object::dictmultiobject::DictViewKind::Keys => {
+                    out_slots.push(pair_base + i * 2);
+                }
+                pyre_object::dictmultiobject::DictViewKind::Values => {
+                    out_slots.push(pair_base + i * 2 + 1);
+                }
                 pyre_object::dictmultiobject::DictViewKind::Items => {
-                    items.push(w_tuple_new(vec![k, v]))
+                    let slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![k, v]));
+                    out_slots.push(slot);
                 }
             }
         }
-        let list = w_list_new(items.take());
-        let mut state = pyre_object::gc_roots::RootedItems::new();
-        state.push(list);
-        let state = w_tuple_new(state.take());
-        let mut result = pyre_object::gc_roots::RootedItems::new();
-        result.push(builtin_callable("iter"));
-        result.push(state);
-        Ok(w_tuple_new(result.take()))
+        let list = w_list_new(
+            out_slots
+                .iter()
+                .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                .collect(),
+        );
+        let list_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(list);
+        let state = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(list_slot)]);
+        let state_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(state);
+        let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(builtin_callable("iter"));
+        Ok(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(iter_slot),
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+        ]))
     }
 }
 
