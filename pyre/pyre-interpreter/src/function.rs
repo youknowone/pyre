@@ -842,7 +842,7 @@ pub(crate) fn function_new_impl(
     // functions (`PyCode`) stay GC-managed. `is_builtin` was computed above to
     // gate the name allocation on the same mortality split.
     if !is_builtin {
-        let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+        let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
             FUNCTION_GC_TYPE_ID,
             FUNCTION_OBJECT_SIZE,
         );
