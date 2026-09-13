@@ -168,7 +168,7 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
         return err;
     }
     if !err.exc_object.is_null() {
-        let exact_type_error = crate::builtins::lookup_exc_class("TypeError");
+        let exact_type_error = cached_type_error();
         let raised_type = crate::typedef::r#type(err.exc_object).map_or(PY_NULL, |p| p.as_ptr());
         if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
             return err;
@@ -192,7 +192,7 @@ pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
         return err;
     }
     if !err.exc_object.is_null() {
-        let exact_type_error = crate::builtins::lookup_exc_class("TypeError");
+        let exact_type_error = cached_type_error();
         let raised_type = crate::typedef::r#type(err.exc_object).map_or(PY_NULL, |p| p.as_ptr());
         if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
             return err;
@@ -928,6 +928,15 @@ fn cached_base_exception() -> Option<PyObjectRef> {
     Some(*BASE_EXC.get_or_init(|| base_exc as usize) as PyObjectRef)
 }
 
+fn cached_type_error() -> Option<PyObjectRef> {
+    static TYPE_ERROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&cls) = TYPE_ERROR.get() {
+        return Some(cls as PyObjectRef);
+    }
+    let cls = crate::builtins::lookup_exc_class("TypeError")?;
+    Some(*TYPE_ERROR.get_or_init(|| cls as usize) as PyObjectRef)
+}
+
 /// pypy/interpreter/baseobjspace.py `exception_getclass`.
 ///
 ///   def exception_getclass(self, w_obj):
@@ -1087,6 +1096,14 @@ unsafe fn p_recursive_isinstance_w(
 /// Do not replace it with `pyre_object::is_type_or_subtype()`: that helper
 /// inspects the static Rust `PyType` tag and is not the RPython data path.
 unsafe fn is_type_like_w(obj: PyObjectRef) -> bool {
+    // W_TypeObject (builtin and heap types, including metaclass
+    // instances) is `ob_type == TYPE_TYPE`.  That is the
+    // `exception_is_valid_class_w` / `issubtype_w` caller.  The
+    // `isinstance_w(..., w_type)` walk is only for a type-like object
+    // that is not that layout.
+    if pyre_object::is_type(obj) {
+        return true;
+    }
     let w_type = crate::typedef::w_type();
     !w_type.is_null() && isinstance_w(obj, w_type)
 }
