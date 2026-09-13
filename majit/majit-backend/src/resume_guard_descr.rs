@@ -439,14 +439,26 @@ impl FailDescr for ResumeGuardDescr {
         self.bridge_declined_terminally
             .store(true, Ordering::Release);
     }
-    #[cfg(target_arch = "wasm32")]
     fn wasm_dispatch_withdrawn(&self) -> bool {
-        self.wasm_dispatch_withdrawn.load(Ordering::Acquire)
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.wasm_dispatch_withdrawn.load(Ordering::Acquire)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            false
+        }
     }
-    #[cfg(target_arch = "wasm32")]
     fn set_wasm_dispatch_withdrawn(&self, withdrawn: bool) {
-        self.wasm_dispatch_withdrawn
-            .store(withdrawn, Ordering::Release);
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.wasm_dispatch_withdrawn
+                .store(withdrawn, Ordering::Release);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = withdrawn;
+        }
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.types.get() }

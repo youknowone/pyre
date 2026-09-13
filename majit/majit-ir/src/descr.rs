@@ -4210,13 +4210,16 @@ pub trait FailDescr: Descr {
     /// a real failure during bridge tracing, whereas withdrawal is maintenance.
     /// The remaining status bits hold the jitcounter hash or value-slot index
     /// (compile.py::AbstractResumeGuardDescr), so no unused bit is borrowed.
-    #[cfg(target_arch = "wasm32")]
+    ///
+    /// The methods stay on every target so a wasm32 layout pass can compile
+    /// against a host-built `majit-ir`. The AtomicBool field remains
+    /// `cfg(target_arch = "wasm32")` and is absent from native layouts.
     fn wasm_dispatch_withdrawn(&self) -> bool {
         false
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn set_wasm_dispatch_withdrawn(&self, _withdrawn: bool) {
+        let _ = _withdrawn;
         panic!("wasm dispatch withdrawal requires a resume guard descriptor");
     }
 
