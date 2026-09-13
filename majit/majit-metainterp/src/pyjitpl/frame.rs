@@ -230,6 +230,8 @@ impl MIFrame {
         }
     }
 
+    /// Entry InputArg still living in this Ref register, if the portal
+    /// seeded one and no later write retired it.
     fn portal_red_ref_at(&self, idx: usize) -> Option<OpRef> {
         let idx = u16::try_from(idx).ok()?;
         self.portal_red_refs

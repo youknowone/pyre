@@ -5319,21 +5319,16 @@ impl<'a> Transformer<'a> {
                     let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
                     let classified = classify_call(target, &self.config.call_effects);
                     // `call.py getcalldescr` computes extraeffect only when
-                    // the caller did not set one. A `Declared` override is
+                    // the caller did not set one. An explicit override is
                     // that caller-set row. `describe_call`'s graph-analyzed
                     // CanRaise is not: passing it here skips
                     // `declares_cannot_raise` and a
                     // `#[dont_look_inside_cannot_raise]` residual emits
                     // GUARD_NO_EXCEPTION.
-                    let extraeffect = match classified.as_ref() {
-                        Some((
-                            descriptor,
-                            CallEffectKind::Declared(_)
-                            | CallEffectKind::MayForce
-                            | CallEffectKind::Elidable,
-                        )) => Some(descriptor.extra_info.extraeffect),
-                        _ => None,
-                    };
+                    let extraeffect = classified
+                        .as_ref()
+                        .filter(|(_, _, is_override)| *is_override)
+                        .map(|(descriptor, _, _)| descriptor.extra_info.extraeffect);
                     let mut descriptor = cc_ref.getcalldescr(
                         op,
                         non_void_args,
@@ -5343,13 +5338,7 @@ impl<'a> Transformer<'a> {
                         &mut self.analysis_cache,
                         None,
                     );
-                    if let Some((
-                        declared,
-                        CallEffectKind::Declared(_)
-                        | CallEffectKind::MayForce
-                        | CallEffectKind::Elidable,
-                    )) = classified
-                    {
+                    if let Some((declared, _, true)) = classified {
                         descriptor.extra_info = declared.extra_info;
                     }
                     self.handle_residual_call(
@@ -5376,7 +5365,7 @@ impl<'a> Transformer<'a> {
 
         // Fallback when no CallControl: effect-only classification (legacy path).
         // RPython: always residual_call_*, effect only in calldescr.
-        if let Some((descriptor, _effect)) = classify_call(target, &self.config.call_effects) {
+        if let Some((descriptor, _effect, _)) = classify_call(target, &self.config.call_effects) {
             let non_void_args = resolve_non_void_arg_types_from_vars(args);
             let descriptor = descriptor.with_signature(
                 &non_void_args,
@@ -5569,7 +5558,7 @@ impl<'a> Transformer<'a> {
             // emits BC_COND_CALL_* / BC_RECORD_KNOWN_RESULT_* bytecodes.
         }
         let (oopspecindex, extraeffect_override) =
-            if let Some((descriptor, _)) = classify_call(target, &self.config.call_effects) {
+            if let Some((descriptor, _, _)) = classify_call(target, &self.config.call_effects) {
                 (
                     descriptor.extra_info.oopspecindex,
                     Some(descriptor.extra_info.extraeffect),
@@ -9852,7 +9841,7 @@ pub fn call_effect_override_census(overrides: &[CallEffectOverride]) -> Vec<Stri
 fn classify_call(
     target: &CallTarget,
     overrides: &[CallEffectOverride],
-) -> Option<(CallDescriptor, CallEffectKind)> {
+) -> Option<(CallDescriptor, CallEffectKind, bool)> {
     fn classify_effect_info(info: &majit_ir::descr::EffectInfo) -> CallEffectKind {
         if info.check_forces_virtual_or_virtualizable() {
             CallEffectKind::MayForce
@@ -9870,11 +9859,11 @@ fn classify_call(
     {
         record_override_match(&override_.target);
         let descriptor = override_.descriptor.clone();
-        return Some((descriptor, override_.effect));
+        return Some((descriptor, override_.effect, true));
     }
     let descriptor = crate::call::describe_call(target)?;
     let effect = classify_effect_info(&descriptor.get_extra_info());
-    Some((descriptor, effect))
+    Some((descriptor, effect, false))
 }
 
 #[cfg(test)]
@@ -13497,6 +13486,46 @@ mod tests {
         assert!(!descriptor.extra_info.can_invalidate);
         assert_eq!(descriptor.extra_info.write_descrs_fields, Some(Vec::new()));
         assert_eq!(descriptor.extra_info.write_descrs_arrays, Some(Vec::new()));
+    }
+
+    #[test]
+    fn mayforce_override_survives_callcontrol() {
+        let target = CallTarget::function_path(["custom_reader"]);
+        let mut graph = FunctionGraph::new("caller");
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            call_effects: vec![CallEffectOverride::new(target, CallEffectKind::MayForce)],
+            ..Default::default()
+        };
+        let mut cc = crate::call::CallControl::new();
+        let result = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let descriptor = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .expect("MayForce override must lower to CallResidual");
+        assert!(
+            descriptor
+                .extra_info
+                .check_forces_virtual_or_virtualizable()
+        );
     }
 
     #[test]

@@ -5083,6 +5083,10 @@ impl OptContext {
         }
     }
 
+    /// True when `addr` lives in this thread's stack window.
+    ///
+    /// Native: 16 MiB around a stack probe. wasm32: `__stack_low` ..
+    /// `__stack_high`, because one linear memory also holds the nursery.
     pub(crate) fn ref_addr_is_stack_resident(addr: usize) -> bool {
         if addr <= 0x1000 {
             return false;
@@ -7046,7 +7050,12 @@ impl OptContext {
         self.bridge_vm_red
     }
 
-    /// Phase-1 name (`InputArg(1)`) or the Phase-2 host at `inputarg_base+1`.
+    /// Phase-1 name (`InputArg(1)`) or, when the remint kept that
+    /// assembled name, the Phase-2 host at `inputarg_base+1`.
+    ///
+    /// A reminted bridge failarg (e.g. 561 with `inputarg_base` 556) is
+    /// not the assembled Vm; `inputarg_base+1` is failarg 1 and is often
+    /// a Scope. Do not treat that slot as the Vm.
     pub(crate) fn is_vm_red_name(&self, opref: OpRef) -> bool {
         let Some(vm) = self.declared_vm_red() else {
             return false;
@@ -7054,7 +7063,9 @@ impl OptContext {
         if opref == vm {
             return true;
         }
-        self.inputarg_base > 0 && opref == OpRef::input_arg_typed(self.inputarg_base + 1, Type::Ref)
+        vm == OpRef::input_arg_typed(1, Type::Ref)
+            && self.inputarg_base > 0
+            && opref == OpRef::input_arg_typed(self.inputarg_base + 1, Type::Ref)
     }
 
     /// A loop JUMP writes arg *i* into the target LABEL's `inputargs[i]`
@@ -10160,6 +10171,28 @@ mod boxref_forwarding_tests {
             boxes[2].opref(),
             OpRef::input_arg_typed(6, Type::Ref),
             "a later Scope failarg is not stolen when the Vm red is already present"
+        );
+    }
+
+    #[test]
+    fn pin_vm_red_does_not_rewrite_scope_when_reminted_is_not_assembled() {
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 8, 556, 564);
+        ctx.inputargs = vec![
+            OpRef::input_arg_typed(556, Type::Ref),
+            OpRef::input_arg_typed(557, Type::Ref),
+            OpRef::input_arg_typed(561, Type::Ref),
+        ];
+        ctx.bridge_vm_red = Some(OpRef::input_arg_typed(561, Type::Ref));
+        let mut boxes = vec![
+            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(556, Type::Ref), Type::Ref),
+            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(557, Type::Ref), Type::Ref),
+        ];
+        ctx.pin_vm_red_in_snapshot(&mut boxes);
+        assert_eq!(boxes[0].opref(), OpRef::input_arg_typed(556, Type::Ref));
+        assert_eq!(
+            boxes[1].opref(),
+            OpRef::input_arg_typed(557, Type::Ref),
+            "bridge remint 561 must not steal Scope at inputarg_base+1"
         );
     }
 

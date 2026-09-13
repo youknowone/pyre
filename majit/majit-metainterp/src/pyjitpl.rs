@@ -838,6 +838,8 @@ fn snapshot_inputarg_for_stack_ptr(
     })
 }
 
+/// Recorder snapshot tag to a resume box. A stack-resident Const Ref
+/// remaps to the InputArg that already carries those bits.
 fn snapshot_tagged_to_box(
     tagged: &crate::recorder::SnapshotTagged,
     inputargs: &[majit_ir::InputArgRc],
@@ -1303,6 +1305,8 @@ fn assert_prepared_cache_bank(where_: &str, opref: OpRef, found_ty: Option<Type>
     }
 }
 
+/// The reminted InputArg that occupies the assembled loop Vm slot
+/// (`InputArg(1)`). `None` when that slot was not a Ref.
 fn reminted_loop_vm_red(original: &[InputArg], reminted: &[InputArg]) -> Option<OpRef> {
     let assembled = OpRef::input_arg_typed(1, Type::Ref);
     original.iter().zip(reminted.iter()).find_map(|(old, new)| {
@@ -14929,6 +14933,9 @@ impl<M: Clone> MetaInterp<M> {
             .is_some_and(|var| var.name == "vm")
     }
 
+    /// Prefer the hole-filtered failarg index of the parent guard's
+    /// assembled Vm; fall back to the reminted loop slot when the
+    /// compiled trace has no such index.
     fn reminted_vm_red_for_bridge(
         &self,
         origin_key: u64,
