@@ -10961,18 +10961,28 @@ fn emit_resolve_f64(
 /// payload from the box; flattening to `IntOp(pos)` and looking only at the
 /// backend pool drops `_resint` / `_forwarded` (`history.py *FrontendOp`).
 fn folded_scalar_bits(arg: &Operand) -> Option<i64> {
-    let value = match arg.get_value() {
-        Some(value) => value,
-        None => match arg.get_forwarded() {
+    // InputArg.get_value() is the value observed while tracing, not a
+    // folded proof. Seeding that sample makes later iterations reuse the
+    // first loop counter (or similar) instead of the runtime argument.
+    let value = if arg.is_inputarg() {
+        match arg.get_forwarded() {
             Forwarded::Const(c) => c.get(),
-            _ => {
-                let replaced = arg.get_box_replacement(false);
-                if !replaced.is_constant() {
-                    return None;
+            _ => return None,
+        }
+    } else {
+        match arg.get_value() {
+            Some(value) => value,
+            None => match arg.get_forwarded() {
+                Forwarded::Const(c) => c.get(),
+                _ => {
+                    let replaced = arg.get_box_replacement(false);
+                    if !replaced.is_constant() {
+                        return None;
+                    }
+                    replaced.const_value()?
                 }
-                replaced.const_value()?
-            }
-        },
+            },
+        }
     };
     match value {
         Value::Ref(_) => None,
@@ -11034,7 +11044,16 @@ fn unbound_pool_const_seeds(
     let mut failarg_stray_refs: HashSet<u32> = HashSet::new();
     for op in ops {
         if let Some(fa) = op.getfailargs() {
-            for a in fa {
+            // Same live extent `emit_guard_fail_args_spill` writes. A
+            // hole (`rd_locs == 0xFFFF`) or a past-extent slot is not a
+            // read of the named box; recording it here would make a
+            // later JUMP leftover of the same id look unresolved.
+            let live = live_fail_arg_mask(op.getdescr().as_ref(), fa.len());
+            let extent = live_fail_arg_extent(op.getdescr().as_ref(), fa.len());
+            for (i, a) in fa.iter().take(extent).enumerate() {
+                if !live.get(i).copied().unwrap_or(true) {
+                    continue;
+                }
                 if a.is_constant() {
                     continue;
                 }
@@ -11863,8 +11882,15 @@ fn emit_force_bracket_before_call(
 /// `dead_frame_from_forced_frame` would read a from-space address. The home
 /// slot IS traced and holds the same value, so naming it survives the
 /// collection. Ref pointers are 8-aligned, which is what makes the low tag bit
-/// free to tell an offset from a value; `undefined` and any Ref without a home
-/// (a constant) still publish a literal, which is even.
+/// free to tell an offset from a value.
+///
+/// A non-null `ConstPtr` has no home. Publishing its compile-time address
+/// (or even the current `FAILARG_CONST_TABLE` load) into the untraced force
+/// slot goes stale if the bracketed call collects. Homes use
+/// `offset * 2 + 1` (bit 0 set; bit 1 is clear because `offset` is
+/// 8-aligned). A table slot is published as `abs_addr | 3` so consume
+/// reloads the forwarded table entry after the collection. `undefined`
+/// and a null constant still publish a literal 0.
 #[allow(clippy::too_many_arguments)]
 fn emit_force_arm(
     sink: &mut PeepSink<'_, '_>,
@@ -11894,6 +11920,20 @@ fn emit_force_arm(
         } else if let Some(home) = ref_homes.home(arg_ref) {
             let ofs = frame.home_slot_base + home as u64 * SLOT_SIZE;
             sink.i64_const((ofs as i64) * 2 + 1);
+        } else if let Some(g) = arg_ref.as_const_ptr() {
+            if g.is_null() {
+                sink.i64_const(0);
+            } else if let Some((base, index)) =
+                FAILARG_CONST_TABLE.with(|cell| cell.borrow().get(&g.0).copied())
+            {
+                // Tag the GC-table slot so `dead_frame_from_forced_frame`
+                // reloads after a collection inside the bracketed call.
+                let addr = i64::from(base)
+                    + i64::from(index) * std::mem::size_of::<majit_ir::GcRef>() as i64;
+                sink.i64_const(addr | 3);
+            } else {
+                emit_resolve(sink, constants, value_types, arg_ref);
+            }
         } else {
             emit_resolve(sink, constants, value_types, arg_ref);
         }

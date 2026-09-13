@@ -3327,7 +3327,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // memmoves from a wild address (`exception_reused_object_tb_not_doubled`
     // cranelift SIGSEGV in `try_execute_residual_call_via_executor`).
     if pyre_interpreter::is_abi_unsound_argument_residual(func_ptr as usize) {
-        return Ok(declined_symbolic(call_opcode));
+        // `declined_symbolic` skips only the tracing-time invocation and
+        // leaves the residual CALL in the trace. The backend then supplies
+        // one word per `arg_types()` entry to a helper that expects a
+        // multiword parameter. Abort the enclosing walk the same way the
+        // inline-subwalk gate above does.
+        if fbw_debug_abort_enabled() {
+            eprintln!("[subwalk-unsupported] pc={op_pc} abi-unsound-arg={func_ptr:#x}");
+        }
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc: op_pc,
+            symbolic: 0,
+        });
     }
     // A residual whose funcptr is a `PyFrame` operand-stack accessor
     // (`pop`/`push`/`peek`/`peek_at`) reads or mutates the live frame's

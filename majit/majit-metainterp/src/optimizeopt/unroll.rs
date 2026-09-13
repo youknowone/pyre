@@ -5451,6 +5451,11 @@ fn assemble_peeled_trace_with_jump_args(
         next
     };
 
+    // Retrace (`compile_retrace`) sets `emit_start_label = false` and
+    // passes no start descr. Remap and `stream_defs` must then use the
+    // loop LABEL that is actually emitted; `start_label_args` would be
+    // producerless and `stream_defs` would hide the hole.
+    let emit_start_label = start_label_descr.is_some();
     if let Some(start_label_descr) = start_label_descr {
         let mut start_label_args_box_operand: Vec<majit_ir::operand::Operand> =
             Vec::with_capacity(start_label_args.len());
@@ -5609,7 +5614,12 @@ fn assemble_peeled_trace_with_jump_args(
     // once in the label arglist.
     let mut label_set: indexmap::IndexSet<OpRef> = full_label_args.iter().copied().collect();
     let mut fallthrough_aliases = Vec::new();
-    let mut stream_defs: indexmap::IndexSet<OpRef> = start_label_args
+    let remap_dsts: &[OpRef] = if emit_start_label {
+        start_label_args
+    } else {
+        full_label_args.as_slice()
+    };
+    let mut stream_defs: indexmap::IndexSet<OpRef> = remap_dsts
         .iter()
         .copied()
         .filter(|a| is_trace_runtime_ref(*a, constants))
@@ -5631,7 +5641,7 @@ fn assemble_peeled_trace_with_jump_args(
         for i in 0..body_num_inputs {
             let tp = ctx.inputarg_type_at_strict(i);
             let src = OpRef::input_arg_typed(inputarg_base + i as u32, tp);
-            let dst = start_label_args
+            let dst = remap_dsts
                 .get(i)
                 .copied()
                 .unwrap_or_else(|| OpRef::input_arg_typed(i as u32, tp));
@@ -9653,6 +9663,92 @@ mod tests {
             .expect("assembled JUMP");
         let jump_args: Vec<OpRef> = jump.getarglist().iter().map(|a| a.to_opref()).collect();
         assert_eq!(jump_args, start.to_vec());
+    }
+
+    #[test]
+    fn test_assemble_retrace_remaps_phase2_inputs_to_emitted_label() {
+        // Retrace emits no start LABEL. Phase-2 InputArg(base+i) must land
+        // on the loop LABEL that is emitted, not on the unemitted portal
+        // start-label slots.
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
+        let base = 99u32;
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::SameAsR, &[rooted_inputarg_operand(Type::Ref, base)]);
+                op.pos().set(OpRef::ref_op(200));
+                op
+            },
+            {
+                let mut guard = Op::new(
+                    OpCode::GuardTrue,
+                    &[rooted_inputarg_operand(Type::Ref, base)],
+                );
+                guard.setfailargs(vec![rooted_inputarg_operand(Type::Ref, base)].into());
+                guard
+            },
+            {
+                let mut jump = Op::new(
+                    OpCode::Jump,
+                    &[
+                        rooted_inputarg_operand(Type::Ref, base),
+                        rooted_inputarg_operand(Type::Ref, base + 1),
+                    ],
+                );
+                jump.setdescr(loop_descr.clone());
+                jump
+            },
+        ];
+        let mut ctx = assemble_test_context(&[], &p2_ops, 2);
+        let p2_ops_rc: Vec<majit_ir::OpRc> =
+            p2_ops.iter().cloned().map(majit_ir::OpRc::new).collect();
+        let start = [OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)];
+        let loop_label = [OpRef::ref_op(10), OpRef::ref_op(11)];
+        let combined = assemble_peeled_trace_with_jump_args(
+            &[],
+            &p2_ops_rc,
+            &loop_label,
+            &start,
+            &[],
+            &[],
+            2,
+            base,
+            false,
+            &[],
+            &constants,
+            None,
+            Some(loop_descr),
+            &[],
+            &mut Vec::new(),
+            &mut ctx,
+        );
+        let same = combined
+            .iter()
+            .find(|op| op.opcode == OpCode::SameAsR)
+            .expect("assembled SameAsR");
+        assert_eq!(
+            same.arg(0).to_opref(),
+            OpRef::ref_op(10),
+            "retrace must remap Phase-2 InputArg onto the emitted loop LABEL"
+        );
+        let guard = combined
+            .iter()
+            .find(|op| op.opcode == OpCode::GuardTrue)
+            .expect("assembled guard");
+        let fa = guard.getfailargs().expect("guard failargs");
+        assert_eq!(
+            fa[0].to_opref(),
+            OpRef::ref_op(10),
+            "retrace failarg must use the emitted loop LABEL slot"
+        );
+        assert!(
+            combined
+                .iter()
+                .filter(|op| op.opcode == OpCode::Label)
+                .count()
+                == 1,
+            "retrace must emit only the loop LABEL"
+        );
     }
 
     /// A JUMP redirected onto ANOTHER trace's target token already carries the

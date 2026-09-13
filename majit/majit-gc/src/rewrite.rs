@@ -168,17 +168,29 @@ fn intern_constptr_operand(
 /// carries the object on `_resref` / `_forwarded` (`history.py
 /// *FrontendOp`). Flattening that operand to `RefOp(pos)` without a
 /// pool entry or a `LoadFromGcTable` leaves wasm reading an unbound local.
+///
+/// An `InputArg.get_value()` is only the object observed while tracing,
+/// not proof the argument is constant. Recover that shape only from
+/// `Forwarded::Const` — the same gate `remove_constptr` uses after
+/// `get_box_replacement`.
 fn leftover_folded_ref(arg: &Operand, defined: &HashSet<u32>) -> Option<GcRef> {
     let opref = arg.to_opref();
     if opref != OpRef::NONE && !opref.is_constant() && defined.contains(&opref.raw()) {
         return None;
     }
-    let value = match arg.get_value() {
-        Some(value) => value,
-        None => match arg.get_forwarded() {
+    let value = if arg.is_inputarg() {
+        match arg.get_forwarded() {
             Forwarded::Const(c) => c.get(),
             _ => return None,
-        },
+        }
+    } else {
+        match arg.get_value() {
+            Some(value) => value,
+            None => match arg.get_forwarded() {
+                Forwarded::Const(c) => c.get(),
+                _ => return None,
+            },
+        }
     };
     match value {
         Value::Ref(gcref) if !gcref.is_null() => Some(gcref),
@@ -3743,6 +3755,22 @@ mod tests {
         assert_eq!(out[0].opcode, OpCode::LoadFromGcTable);
         assert_eq!(out[1].opcode, OpCode::Label);
         assert_eq!(out[1].arg(0).to_opref(), OpRef::ref_op(0));
+    }
+
+    #[test]
+    fn remove_ref_constants_does_not_intern_inputarg_observation() {
+        // `_resref` on an InputArg is the object seen while tracing, not a
+        // folded constant. Interning it would replace every later input
+        // with that first object.
+        let ia = InputArg::new_ref_rc(99);
+        ia.set_value(Value::Ref(GcRef(0x1000)));
+        let operand = Operand::from_bound_inputarg(&ia);
+        let label = Op::new(OpCode::Label, &[operand]);
+        let (out, gcrefs) = remove_ref_constants(&[label], 0);
+        assert!(gcrefs.is_empty(), "observation must not enter the gc table");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].opcode, OpCode::Label);
+        assert_eq!(out[0].arg(0).to_opref(), OpRef::input_arg_ref(99));
     }
 
     #[test]
