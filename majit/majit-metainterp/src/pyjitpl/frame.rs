@@ -877,7 +877,9 @@ impl MIFrame {
         };
 
         // pyjitpl.py:199 `assert ord(self.jitcode.code[pc]) == op_live`.
-        debug_assert_eq!(self.jitcode.code[pc], op_live);
+        // RPython's `assert` survives translation; a debug-only check
+        // lets release decode operand bytes as an `all_liveness` offset.
+        assert_eq!(self.jitcode.code[pc], op_live);
 
         // pyjitpl.py:202-207 — decode offset + per-type lengths.
         let mut offset = decode_offset(&self.jitcode.code, pc + 1);
@@ -1061,7 +1063,8 @@ impl MIFrame {
         } else {
             self.pc - SIZE_LIVE_OP
         };
-        debug_assert_eq!(self.jitcode.code[pc], op_live);
+        // `get_list_of_active_boxes` asserts `code[pc] == op_live`.
+        assert_eq!(self.jitcode.code[pc], op_live);
 
         let mut offset = decode_offset(&self.jitcode.code, pc + 1);
         let length_i = all_liveness[offset] as u32;
