@@ -13747,21 +13747,62 @@ fn handler_call_assembler_void_ext(
 ///   - `cond_call_value_{i,r}`: if `first_reg == 0`, dst = result of
 ///     `cpu.bh_call_{i,r}(func, args)`; else dst = first_reg's value.
 ///   - `record_known_result_{i,r}`: pure marker, body is `pass`.
-fn read_cond_call_args(
+/// Leftover `call_cond_like` payload has no `d` descr byte. Split the
+/// mixed kind/reg lists into I/R/F the way `bhimpl_conditional_call_*`
+/// takes `args_i` / `args_r`, then build a `BhCallDescr` from the
+/// target's `effect_info_slot` so resume goes through `cpu.bh_call_*`.
+fn read_cond_call_irf(
     bh: &BlackholeInterpreter,
     code: &[u8],
     p: usize,
     arg_count: usize,
-) -> (Vec<i64>, usize) {
-    let mut args = Vec::with_capacity(arg_count);
+) -> (Vec<i64>, Vec<i64>, Vec<i64>, String, usize) {
     let kinds_start = p;
     let regs_start = kinds_start + arg_count;
+    let mut args_i = Vec::new();
+    let mut args_r = Vec::new();
+    let mut args_f = Vec::new();
+    let mut arg_classes = String::with_capacity(arg_count);
     for i in 0..arg_count {
         let kind = JitArgKind::decode(code[kinds_start + i]);
         let reg = code[regs_start + i];
-        args.push(bh.read_call_arg(kind, reg as u16));
+        let val = bh.read_call_arg(kind, reg as u16);
+        match kind {
+            JitArgKind::Int => {
+                args_i.push(val);
+                arg_classes.push('i');
+            }
+            JitArgKind::Ref => {
+                args_r.push(val);
+                arg_classes.push('r');
+            }
+            JitArgKind::Float => {
+                args_f.push(val);
+                arg_classes.push('f');
+            }
+        }
     }
-    (args, regs_start + arg_count)
+    (args_i, args_r, args_f, arg_classes, regs_start + arg_count)
+}
+
+fn leftover_cond_call_descr(
+    target: &crate::jitcode::JitCallTarget,
+    arg_classes: String,
+    result_type: majit_ir::Type,
+) -> majit_translate::jitcode::BhCallDescr {
+    majit_translate::jitcode::BhCallDescr::from_signature(
+        arg_classes,
+        result_type,
+        crate::call_descr::effect_info_for_slot(target.effect_info_slot),
+    )
+}
+
+fn leftover_cond_call_args_f(args_f: &[i64]) -> Option<&[i64]> {
+    if args_f.is_empty() {
+        None
+    } else {
+        Some(args_f)
+    }
 }
 
 fn handler_cond_call_void_ext(
@@ -13774,15 +13815,23 @@ fn handler_cond_call_void_ext(
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let arg_count = jitcode::read_u8(code, &mut p) as usize;
     let condition = bh.registers_i[cond_reg];
-    let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
+    let (args_i, args_r, args_f, arg_classes, p_end) = read_cond_call_irf(bh, code, p, arg_count);
     if condition != 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
         let func = target.concrete_ptr as usize as i64;
         if !is_callable_fnaddr(func) {
             return Err(reject_unresolved_call(bh, func));
         }
+        let calldescr = leftover_cond_call_descr(target, arg_classes, majit_ir::Type::Void);
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
-        call_void_function(target.concrete_ptr, &args);
+        // `blackhole.py bhimpl_conditional_call_ir_v` → `cpu.bh_call_v`.
+        bh.cpu().bh_call_v(
+            func,
+            Some(&args_i),
+            Some(&args_r),
+            leftover_cond_call_args_f(&args_f),
+            &calldescr,
+        );
         check_residual_call_exception_after(bh, p_end)?;
     }
     Ok(p_end)
@@ -13798,7 +13847,7 @@ fn handler_cond_call_value_int_ext(
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let arg_count = jitcode::read_u8(code, &mut p) as usize;
     let value = bh.registers_i[value_reg];
-    let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
+    let (args_i, args_r, args_f, arg_classes, p_end) = read_cond_call_irf(bh, code, p, arg_count);
     let dst = code[p_end] as usize;
     let result = if value == 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
@@ -13806,8 +13855,16 @@ fn handler_cond_call_value_int_ext(
         if !is_callable_fnaddr(func) {
             return Err(reject_unresolved_call(bh, func));
         }
+        let calldescr = leftover_cond_call_descr(target, arg_classes, majit_ir::Type::Int);
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
-        let r = call_int_function(target.concrete_ptr, &args);
+        // `blackhole.py bhimpl_conditional_call_value_ir_i` → `cpu.bh_call_i`.
+        let r = bh.cpu().bh_call_i(
+            func,
+            Some(&args_i),
+            Some(&args_r),
+            leftover_cond_call_args_f(&args_f),
+            &calldescr,
+        );
         check_residual_call_exception_after(bh, p_end + 1)?;
         r
     } else {
@@ -13827,7 +13884,7 @@ fn handler_cond_call_value_ref_ext(
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let arg_count = jitcode::read_u8(code, &mut p) as usize;
     let value = bh.registers_r[value_reg];
-    let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
+    let (args_i, args_r, args_f, arg_classes, p_end) = read_cond_call_irf(bh, code, p, arg_count);
     let dst = code[p_end] as usize;
     let result = if value == 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
@@ -13835,11 +13892,19 @@ fn handler_cond_call_value_ref_ext(
         if !is_callable_fnaddr(func) {
             return Err(reject_unresolved_call(bh, func));
         }
+        let calldescr = leftover_cond_call_descr(target, arg_classes, majit_ir::Type::Ref);
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
-        // RPython `blackhole.py bhimpl_conditional_call_value_ir_r`
-        // → `cpu.bh_call_r(...)` (ref ABI).  See note on
-        // `handler_call_assembler_ref_ext`.
-        let r = call_ref_function(target.concrete_ptr, &args);
+        // `blackhole.py bhimpl_conditional_call_value_ir_r` → `cpu.bh_call_r`.
+        let r = bh
+            .cpu()
+            .bh_call_r(
+                func,
+                Some(&args_i),
+                Some(&args_r),
+                leftover_cond_call_args_f(&args_f),
+                &calldescr,
+            )
+            .0 as i64;
         check_residual_call_exception_after(bh, p_end + 1)?;
         r
     } else {
