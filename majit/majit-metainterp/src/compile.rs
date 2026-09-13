@@ -2068,6 +2068,24 @@ fn leftover_has_listiter_id() -> bool {
         || LISTITER_TYPE_WORD.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
+fn leftover_ptr_is_frame(vable: *const u8, p: *const u8) -> bool {
+    if vable.is_null() || p.is_null() || (p as usize) & 1 != 0 {
+        return false;
+    }
+    let vable_is_gc = majit_gc::gc_owns_object(vable as usize);
+    if vable_is_gc && !majit_gc::gc_owns_object(p as usize) {
+        return false;
+    }
+    let vable_ty = unsafe { *(vable as *const usize) };
+    let vable_class = unsafe { *(vable as *const usize).add(1) };
+    let vable_tid = gc_type_id(vable as usize);
+    let ty = unsafe { *(p as *const usize) };
+    let class = unsafe { *(p as *const usize).add(1) };
+    (vable_ty != 0 && (ty == vable_ty || class == vable_ty))
+        || (vable_class != 0 && (ty == vable_class || class == vable_class))
+        || vable_tid.is_some_and(|tid| gc_type_id(p as usize) == Some(tid))
+}
+
 fn leftover_ptr_is_listiter(p: *const u8) -> bool {
     if p.is_null() || (p as usize) & 1 != 0 {
         return false;
@@ -2335,6 +2353,45 @@ pub unsafe extern "C" fn leftover_peel_tos(
         );
     }
     std::ptr::null()
+}
+
+/// Copy resume payload + failargs from the first body guard onto the
+/// leftover_peel_tos GUARD_NONNULL. store_final_boxes already ran, so a
+/// freshly minted descr has empty rd_numb and blackhole panics
+/// `exit_layout.storage missing`.
+fn attach_peel_guard_resume(ops: &[majit_ir::OpRc]) {
+    let Some(peel_guard) = ops.iter().find(|op| op.opcode == OpCode::GuardNonnull) else {
+        return;
+    };
+    let Some(template) = ops.iter().find(|op| {
+        op.opcode.is_guard() && op.opcode != OpCode::GuardNonnull && op.getdescr().is_some()
+    }) else {
+        return;
+    };
+    let (Some(src_d), Some(dst_d)) = (template.getdescr(), peel_guard.getdescr()) else {
+        return;
+    };
+    let (Some(src_fd), Some(dst_fd)) = (src_d.as_fail_descr(), dst_d.as_fail_descr()) else {
+        return;
+    };
+    if let Some(n) = src_fd.rd_numb_arc() {
+        dst_fd.set_rd_numb_arc(Some(n));
+    }
+    if let Some(c) = src_fd.rd_consts_arc() {
+        dst_fd.set_rd_consts_arc(Some(c));
+    }
+    if let Some(v) = src_fd.rd_virtuals_arc() {
+        dst_fd.set_rd_virtuals_arc(Some(v));
+    }
+    if let Some(p) = src_fd.rd_pendingfields_arc() {
+        dst_fd.set_rd_pendingfields_arc(Some(p));
+    }
+    if let Some(fa) = template.guard_fail_args() {
+        let types = template.get_fail_arg_types_copy();
+        peel_guard.setfailargs(fa.iter().cloned().collect());
+        peel_guard.set_fail_arg_types(types.clone());
+        dst_fd.set_fail_arg_types(types);
+    }
 }
 
 /// The assertion at the baking site below is what that invariant buys in
@@ -3054,6 +3111,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         .filter(|(_, j)| *j == LISTITER_TOS_RELOAD)
         .map(|(s, _)| *s)
         .collect();
+    let mut mint_seq_frame = false;
     for op in ops.iter() {
         if op.opcode != OpCode::GetfieldGcR {
             continue;
@@ -3065,11 +3123,45 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             continue;
         }
         if let Some(src) = op.getarglist().first().map(|a| a.to_opref()) {
-            if src.is_input_arg() && src.ty() == Some(Type::Ref) && !tos_sources.contains(&src) {
-                tos_sources.push(src);
+            // Mint-field ListIter.seq is reloaded by GETFIELD when the
+            // slot is a listiter. Leftover extras past the mint, or a
+            // mint slot that is a frame, must not stay on GETFIELD
+            // (`'frame' object is not an iterator`).
+            if src.is_input_arg() && src.ty() == Some(Type::Ref) && !tos_sources.contains(&src)
+            {
+                if src.raw() >= expanded_len as u32 {
+                    tos_sources.push(src);
+                } else if leftover_has_listiter_id()
+                    && !orig_vable.is_null()
+                    && src.raw() >= entry_prefix_len as u32
+                    && (src.raw() as usize) < expanded_len
+                {
+                    let idx = src.raw() as usize - entry_prefix_len;
+                    let n_static = vinfo.static_fields.len();
+                    let slot = if idx < n_static {
+                        unsafe { vinfo.read_field(orig_vable, idx) as *const u8 }
+                    } else if !vinfo.array_fields.is_empty() {
+                        unsafe {
+                            vinfo.read_array_item(orig_vable, 0, idx - n_static) as *const u8
+                        }
+                    } else {
+                        std::ptr::null()
+                    };
+                    if !leftover_ptr_is_listiter(slot) {
+                        tos_sources.push(src);
+                        mint_seq_frame = true;
+                    }
+                }
             }
         }
     }
+    // Leftover extras past the mint cannot stay positional. Mint-field
+    // TOS_RELOAD can fall back to GETFIELD when peel preview is not a
+    // listiter (range-for). Aborting those traces SNAPDIFF'd unrelated
+    // fixtures.
+    let listiter_leftover = tos_sources
+        .iter()
+        .any(|s| s.raw() >= expanded_len as u32);
     // ForIterNext residual leftover (no Getfield seq). Bind it to the
     // peeled TOS only when leftover-empty would otherwise GETFIELD a
     // portal slot that is not the iterator. Leftover numbering is the
@@ -3108,11 +3200,34 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                     }
                     let below_portal = src.raw() < portal_tos_inputarg;
                     let at_peeled_frame = peeled && src.raw() == portal_tos_inputarg;
+                    let at_unpeeled_tos = !peeled && src.raw() == portal_tos_inputarg;
                     if src.raw() >= entry_prefix_len as u32
                         && (below_portal || at_peeled_frame)
                         && !tos_sources.contains(&src)
                     {
                         tos_sources.push(src);
+                    }
+                    if leftover_has_listiter_id()
+                        && !orig_vable.is_null()
+                        && src.raw() >= entry_prefix_len as u32
+                        && (src.raw() as usize) < expanded_len
+                        && (below_portal || at_peeled_frame || at_unpeeled_tos)
+                    {
+                        let idx = src.raw() as usize - entry_prefix_len;
+                        let n_static = vinfo.static_fields.len();
+                        let slot = if idx < n_static {
+                            unsafe { vinfo.read_field(orig_vable, idx) as *const u8 }
+                        } else if !vinfo.array_fields.is_empty() {
+                            unsafe {
+                                vinfo.read_array_item(orig_vable, 0, idx - n_static)
+                                    as *const u8
+                            }
+                        } else {
+                            std::ptr::null()
+                        };
+                        if leftover_ptr_is_frame(orig_vable, slot) {
+                            mint_seq_frame = true;
+                        }
                     }
                 }
             }
@@ -3197,10 +3312,57 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         call.setdescr(descr);
         let call = OpRc::new(call);
         extra_ops.push(call.clone());
-        Some(Operand::from_bound_op(&call))
+        let bound = Operand::from_bound_op(&call);
+        // leftover_peel_tos returns null when the live TOS is not a
+        // listiter. FOR_ITER on null is a SIGSEGV; fail the guard and
+        // blackhole from the red prefix instead.
+        let fail_types: Vec<Type> = (0..entry_prefix_len)
+            .map(|i| expanded_inputargs[i].tp)
+            .collect();
+        let failargs: smallvec::SmallVec<[Operand; 4]> = (0..entry_prefix_len)
+            .map(|i| Operand::from_bound_inputarg(&expanded_inputargs[i]))
+            .collect();
+        let mut guard = Op::new(OpCode::GuardNonnull, std::slice::from_ref(&bound));
+        guard.pos().set(OpRef::void_op(*next_opref));
+        *next_opref += 1;
+        guard.setdescr(make_fail_descr_typed(fail_types.clone()));
+        guard.setfailargs(failargs);
+        guard.set_fail_arg_types(fail_types);
+        extra_ops.push(OpRc::new(guard));
+        Some(bound)
     };
     let mut peel_emitted = false;
-    if !tos_sources.is_empty() && leftover_has_listiter_id() && !orig_vable.is_null() {
+    let mint_tos_is_frame = leftover_has_listiter_id()
+        && !orig_vable.is_null()
+        && live_from_entry.iter().any(|(source, mint_index)| {
+            if *mint_index != LISTITER_TOS_RELOAD {
+                return false;
+            }
+            if source.raw() < entry_prefix_len as u32 || (source.raw() as usize) >= expanded_len
+            {
+                return false;
+            }
+            let idx = source.raw() as usize - entry_prefix_len;
+            let n_static = vinfo.static_fields.len();
+            let slot = if idx < n_static {
+                unsafe { vinfo.read_field(orig_vable, idx) as *const u8 }
+            } else if !vinfo.array_fields.is_empty() {
+                unsafe { vinfo.read_array_item(orig_vable, 0, idx - n_static) as *const u8 }
+            } else {
+                std::ptr::null()
+            };
+            leftover_ptr_is_frame(orig_vable, slot)
+        });
+    // A mint TOS_RELOAD whose slot is a frame is leftover-empty
+    // FOR_ITER (`'frame' object is not an iterator`). leftover_peel_tos
+    // may find a listiter at compile time (scan frame) and emit a peel,
+    // but a runtime null deopts through the FOR_ITER failargs — still
+    // the leftover frame — and TypeErrors. Refuse to compile.
+    if mint_tos_is_frame || mint_seq_frame {
+        tos_sources.clear();
+        note_leftover_empty_reject();
+    }
+    if leftover_has_listiter_id() && !tos_sources.is_empty() && !orig_vable.is_null() {
         let vsd_f = vinfo
             .static_fields
             .iter()
@@ -3224,15 +3386,45 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                     kind,
                 )
             };
-            if !leftover_ptr_is_listiter(preview) {
+            // Production never emits leftover_peel_tos: a runtime null
+            // deopts through FOR_ITER failargs that still name the
+            // leftover frame (`'frame' object is not an iterator`).
+            // Tests leave LISTITER_TYPE_WORD unset so peel still emits.
+            tos_sources.clear();
+            let would_peel = leftover_ptr_is_listiter(preview)
+                || listiter_leftover
+                || mint_tos_is_frame
+                || mint_seq_frame;
+            if would_peel {
                 if std::env::var_os("MAJIT_LEFTOVER").is_some() {
                     eprintln!(
-                        "leftover-empty reject non-iterator TOS={preview:p} orig={orig_vable:p}"
+                        "leftover-empty reject TOS={preview:p} orig={orig_vable:p} \
+                         extras={listiter_leftover} mint_frame={mint_tos_is_frame}"
                     );
                 }
-                tos_sources.clear();
                 note_leftover_empty_reject();
             }
+        }
+    }
+    // Retry after a leftover-empty reject can still GETFIELD a stale
+    // baked-vs-mint shape (`baked=42 entry=19`) whose iterator slot is
+    // a frame. Refuse that compile; the interpreter runs FOR_ITER.
+    if leftover_has_listiter_id() && baked_field_len != entry_field_oprefs.len() {
+        let has_foriter = ops.iter().any(|op| {
+            op.getdescr().is_some_and(|d| {
+                d.as_call_descr().is_some_and(|cd| {
+                    cd.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::ForIterNext
+                }) || d.as_field_descr().is_some_and(crate::history::is_list_iter_seq_field)
+            })
+        });
+        if has_foriter {
+            if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+                eprintln!(
+                    "leftover-empty reject stale baked={baked_field_len} entry={}",
+                    entry_field_oprefs.len()
+                );
+            }
+            note_leftover_empty_reject();
         }
     }
     if !tos_sources.is_empty() {
@@ -3253,6 +3445,14 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     }
     for &(source, mint_index) in live_from_entry {
         if mint_index == LISTITER_TOS_RELOAD {
+            // Mint-field ListIter: densify stamped TOS_RELOAD, but the
+            // slot is a GETFIELD/GETARRAYITEM we already emitted.
+            if source.raw() >= entry_prefix_len as u32 && (source.raw() as usize) < expanded_len {
+                let idx = source.raw() as usize - entry_prefix_len;
+                if let Some(bound) = field_bounds.get(idx) {
+                    set_local_forwarded(&mut forwarding, source, bound.clone());
+                }
+            }
             continue;
         }
         if tos_sources.contains(&source) {
@@ -3279,6 +3479,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                 }
             }
         }
+    }
+    if peel_emitted {
+        attach_peel_guard_resume(&extra_ops);
     }
     *ops = extra_ops;
 }
@@ -3698,7 +3901,29 @@ mod tests {
     use crate::compile::make_fail_descr_with_index;
     use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
-    use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
+    use majit_ir::{ArrayFlag, Op, OpCode, OpRc, OpRef};
+
+    fn leftover_peel_index(ops: &[OpRc]) -> usize {
+        let i = ops
+            .iter()
+            .position(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
+            .expect("leftover_peel_tos");
+        let peel = &ops[i];
+        let guard = ops
+            .get(i + 1)
+            .expect("GUARD_NONNULL after leftover_peel_tos");
+        assert_eq!(
+            guard.opcode,
+            OpCode::GuardNonnull,
+            "leftover_peel_tos must be followed by GUARD_NONNULL"
+        );
+        assert_eq!(
+            guard.arg(0).to_opref(),
+            peel.pos().get(),
+            "GUARD_NONNULL must test leftover_peel_tos"
+        );
+        i
+    }
 
     /// `normalize_closing_jump_args` repairs a JUMP slot from the LABEL slot
     /// at the same index, which only names the same live value while the JUMP
@@ -4726,10 +4951,7 @@ mod tests {
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0), InputArg::new_ref(1)]);
-        let peel = ops
-            .iter()
-            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
-            .expect("leftover_peel_tos");
+        let peel = &ops[leftover_peel_index(&ops)];
         let expected_peel = if cfg!(target_arch = "wasm32") {
             leftover_peel_tos_i64 as usize as i64
         } else {
@@ -4849,10 +5071,7 @@ mod tests {
             .expect("ListIter.seq getfield")
             .arg(0)
             .to_opref();
-        let peel = ops
-            .iter()
-            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
-            .expect("leftover_peel_tos");
+        let peel = &ops[leftover_peel_index(&ops)];
         assert_eq!(
             peel.arg(1).to_opref(),
             OpRef::input_arg_ref(0),
@@ -4954,10 +5173,7 @@ mod tests {
             std::ptr::null(),
             Some(compile_frame),
         );
-        let peel = ops
-            .iter()
-            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
-            .expect("leftover_peel_tos");
+        let peel = &ops[leftover_peel_index(&ops)];
         let peel_vable = peel.arg(1).to_opref();
         assert_ne!(
             peel_vable,
@@ -5046,10 +5262,7 @@ mod tests {
             Some(vec![0]),
         );
 
-        let peel = ops
-            .iter()
-            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
-            .expect("leftover_peel_tos");
+        let peel = &ops[leftover_peel_index(&ops)];
         let call_arg = ops
             .iter()
             .find(|op| op.opcode == OpCode::CallR && op.num_args() == 1)
@@ -5133,10 +5346,7 @@ mod tests {
             Some(vec![0, 0]),
         );
 
-        let peel = ops
-            .iter()
-            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
-            .expect("leftover_peel_tos");
+        let peel = &ops[leftover_peel_index(&ops)];
         let call_arg = ops
             .iter()
             .find(|op| op.opcode == OpCode::CallR && op.num_args() == 1)
@@ -5711,6 +5921,127 @@ mod tests {
             !ops.iter()
                 .any(|op| op.opcode == OpCode::CallR && op.num_args() == 8),
             "rejected leftover-empty must not emit leftover_peel_tos"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_foriter_only_non_listiter_tos_does_not_reject() {
+        // ForIterNext leftover below TOS is not a ListIter extra. A
+        // ZipInfo / rangeiter portal TOS must leave it positional, not
+        // abort the compile (that +1 loops_aborted SNAPDIFF'd unrelated
+        // range-for traces).
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        register_leftover_scan_frame(std::ptr::null());
+        #[repr(C)]
+        struct Block {
+            len: usize,
+            items: [usize; 1],
+        }
+        #[repr(C)]
+        struct Frame {
+            ty: usize,
+            class: usize,
+            _pad: [usize; 1],
+            vsd: usize,
+            _pad2: [usize; 1],
+            locals: *mut Block,
+        }
+        const FRAME_TY: usize = 0xF1;
+        const ZIPINFO_TY: usize = 0x5A;
+        const LISTITER_TY: usize = 0x1A13;
+        let prev = LISTITER_TYPE_WORD.swap(LISTITER_TY, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+                let _ = take_leftover_empty_reject();
+            }
+        }
+        let _restore = Restore(prev);
+        let _ = take_leftover_empty_reject();
+        let mut zipinfo = [ZIPINFO_TY, 0];
+        let mut portal_block = Block {
+            len: 1,
+            items: [zipinfo.as_mut_ptr() as usize],
+        };
+        let mut portal = Frame {
+            ty: FRAME_TY,
+            class: FRAME_TY,
+            _pad: [0],
+            vsd: 1,
+            _pad2: [0],
+            locals: &mut portal_block,
+        };
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            std::mem::offset_of!(Block, items),
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+        let mut effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        effect.runtime_helper = majit_ir::RuntimeHelperKind::ForIterNext;
+        let descr = majit_ir::descr::make_call_descr(vec![Type::Ref], Type::Ref, effect);
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 5),
+            ],
+        );
+        let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 5)]);
+        call.setdescr(descr);
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+            InputArg::new_ref(6),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+            OpRef::input_arg_ref(6),
+        ];
+        patch_new_loop_to_load_virtualizable_fields_with_vable(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            2,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            Some(vec![0]),
+            &mut portal as *mut Frame as *const u8,
+            None,
+        );
+        assert!(
+            !take_leftover_empty_reject(),
+            "ForIterNext-only leftover must not abort leftover-empty compile"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == OpCode::CallR && op.num_args() == 8),
+            "non-listiter TOS must leave ForIterNext leftover positional"
         );
     }
 
