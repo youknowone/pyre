@@ -13326,9 +13326,9 @@ impl CodeWriter {
                         // UNARY_NOT: pops `value`, pushes `not value` as a bool
                         // (net 0).  The graph records the object-space
                         // `not_(value)` op (`unaryoperation("not_")` →
-                        // `space.not_`); the SSARepr lowering keeps the
-                        // MayForce residual because walking `not_` currently
-                        // guards one bool singleton.
+                        // `space.not_`); the SSARepr lowering emits
+                        // `inline_call_r_r` of `baseobjspace::not_` when that
+                        // body is fully bound, otherwise the MayForce residual.
                         Instruction::UnaryNot => {
                             let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
