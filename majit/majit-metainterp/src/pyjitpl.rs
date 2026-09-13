@@ -7299,6 +7299,11 @@ impl<M: Clone> MetaInterp<M> {
                 "reached_loop_header: virtualref_boxes must be empty — missing virtual_ref_finish()?"
             );
         }
+        // compile.py compile_loop: jitlog.start_new_trace before the JUMP.
+        // compile_retrace is a separate entry and increments itself.
+        if self.partial_trace.is_none() {
+            self.jitlog_start_new_trace();
+        }
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
         // matches and dispatch to compile_retrace.
@@ -8533,6 +8538,10 @@ impl<M: Clone> MetaInterp<M> {
             Ok(r) => r,
             Err(e) => {
                 let is_invalid_loop = self.note_jit_panic_or_reraise(e, "compile_loop", green_key);
+                if is_invalid_loop {
+                    // compile.py compile_loop: jitlog.trace_aborted on InvalidLoop.
+                    self.jitlog_trace_aborted();
+                }
                 if is_invalid_loop && crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-abort",
@@ -9359,6 +9368,8 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns true if compilation succeeded.
     pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
         self.remember_compiled_graph_write();
+        // compile.py compile_retrace: jitlog.start_new_trace.
+        self.jitlog_start_new_trace();
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -9706,6 +9717,8 @@ impl<M: Clone> MetaInterp<M> {
             // A guard proven to always fail (deferred `InvalidLoop` signal):
             // abandon the retrace.
             Err(_invalid_loop) => {
+                // compile.py compile_retrace: jitlog.trace_aborted on InvalidLoop.
+                self.jitlog_trace_aborted();
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-abort",

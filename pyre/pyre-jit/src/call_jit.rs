@@ -4396,7 +4396,7 @@ fn jit_ca_handle_guard_failure(
     descr_addr: usize,
     guard_value_operand: i64,
     guard_value_operand_present: bool,
-) -> bool {
+) -> Option<i64> {
     // `compile.py AbstractResumeGuardDescr.handle_fail` has no live-value
     // precondition: it runs `must_compile` for every reported failure. A
     // GUARD_VALUE whose fail-argument vector is empty still has everything the
@@ -4407,7 +4407,7 @@ fn jit_ca_handle_guard_failure(
     // without a bridge, forever. Only a null pointer with a non-zero length is
     // unusable — that pairing cannot be turned into a slice at all.
     if deadframe.is_null() {
-        return false;
+        return None;
     }
     // `enter_profiler_tracing` is not re-entrant (pyjitpl.py:2914 — RPython's
     // `handle_guard_failure` unwinds to the top-level `execute_token` before any
@@ -4424,7 +4424,7 @@ fn jit_ca_handle_guard_failure(
     {
         let (driver, _) = crate::eval::driver_pair();
         if driver.is_tracing() {
-            return false;
+            return None;
         }
     }
 
@@ -4449,7 +4449,7 @@ fn jit_ca_handle_guard_failure(
     let Some((source_green_key, source_trace_id, source_fail_index)) =
         bridge_source_identity_from_descr(&descr_arc)
     else {
-        return false;
+        return None;
     };
     let descr_fd = descr_arc
         .as_fail_descr()
@@ -4463,7 +4463,7 @@ fn jit_ca_handle_guard_failure(
     // here would dangle by the time `trace_and_compile_from_bridge`
     // builds its `FrameRoot`.
     if fail0 == 0 {
-        return false;
+        return None;
     }
     let mut frame_root = FrameRoot::new(unsafe { &mut *(fail0 as *mut PyFrame) });
 
@@ -4487,7 +4487,7 @@ fn jit_ca_handle_guard_failure(
     };
     // compile.py: must_compile() and not stack_almost_full()
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
-        return false;
+        return None;
     }
 
     if majit_metainterp::majit_log_enabled() {
@@ -4514,7 +4514,7 @@ fn jit_ca_handle_guard_failure(
         })
     };
     let Some(exit_layout) = exit_layout else {
-        return false;
+        return None;
     };
 
     // compile.py try/finally: `start_compiling()` before
@@ -4524,11 +4524,10 @@ fn jit_ca_handle_guard_failure(
     // with the matching `start_compiling` even on panic.
     let compiled = {
         let _guard = crate::eval::GuardCompilingScope::new(&descr_arc);
-        // `allow_finish_direct_return = false`: this callback returns a bare
-        // bool to native code and has no channel for a concrete result; a
-        // walk that terminates with a kept finish-concrete stash hands it to
-        // the back-to-back blackhole hook via `CA_WALK_FINISHED_FRAME`
-        // (returned as `ResumeBlackhole` here).
+        // `allow_finish_direct_return = false`: a Finish walk still
+        // hands its stash to the blackhole hook via `CA_WALK_FINISHED_FRAME`
+        // (`ResumeBlackhole`). A JUMP attach returns `CompiledContinue`
+        // and `handle_fail` re-enters the portal instead of blackholing.
         let raw_values: Vec<i64> = (0..n_fail_args)
             .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
             .collect();
@@ -4577,7 +4576,13 @@ fn jit_ca_handle_guard_failure(
         );
     }
 
-    compiled
+    if compiled {
+        // compile.py handle_fail must_compile arm raises
+        // ContinueRunningNormally; handle_jitexception re-enters portal_ptr.
+        Some(run_frame_through_portal(fail0, PortalEntry::Resume))
+    } else {
+        None
+    }
 }
 
 /// Feed a CALL_ASSEMBLER callee guard through the normal bridge-hotness path.

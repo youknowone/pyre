@@ -2175,7 +2175,7 @@ pub fn register_call_assembler_blackhole(f: CallAssemblerBlackholeFn) {
 /// `descr_addr` (recovered to `Arc<dyn FailDescr>` by the receiver)
 /// instead of a surrogate `(green_key, trace_id, fail_index)` triple.
 static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<
-    fn(*mut majit_backend::jitframe::JitFrame, usize, i64, bool) -> bool,
+    fn(*mut majit_backend::jitframe::JitFrame, usize, i64, bool) -> Option<i64>,
 > = OnceLock::new();
 
 /// On-demand resume callback: pyre-jit registers this to
@@ -2537,7 +2537,7 @@ pub fn prologue_probe_addr() -> Option<usize> {
 }
 
 pub fn register_call_assembler_bridge(
-    f: fn(*mut majit_backend::jitframe::JitFrame, usize, i64, bool) -> bool,
+    f: fn(*mut majit_backend::jitframe::JitFrame, usize, i64, bool) -> Option<i64>,
 ) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
@@ -3763,16 +3763,15 @@ fn call_assembler_guard_failure_inner(
     // compile bridge. The bridge is attached to fail_descr for fast
     // dispatch on subsequent guard failures.  Skipped on giveup (None).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
-        if bridge_fn(
+        if let Some(result) = bridge_fn(
             frame_ptr as *mut majit_backend::jitframe::JitFrame,
             fail_descr_ptr as usize,
             0,
             false,
         ) {
-            // compile.py `_trace_and_compile_from_bridge` / dynasm
-            // parity: the hook traces and attaches the bridge; the
-            // current occurrence still resumes through blackhole
-            // instead of re-entering the new bridge.
+            // compile.py handle_fail: the must_compile arm raises;
+            // do not resume_in_blackhole.
+            return result;
         }
     }
     let _ = owning_jct;

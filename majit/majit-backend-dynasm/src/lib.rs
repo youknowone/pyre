@@ -234,7 +234,10 @@ pub type BlackholeFn = fn(usize, *mut jitframe::JitFrame, i64) -> Option<i64>;
 /// `pyjitpl.py handle_guard_failure(self, resumedescr,
 /// deadframe)`.  No surrogate triple crosses the C-ABI.
 /// `pyjitpl.py handle_guard_failure(self, resumedescr, deadframe)`.
-pub type BridgeFn = fn(*mut jitframe::JitFrame, usize, i64, bool) -> bool;
+/// `None` = compile.py `resume_in_blackhole`. `Some(result)` = the
+/// must_compile arm finished (`ContinueRunningNormally` / portal
+/// re-entry) and `handle_fail` must not blackhole.
+pub type BridgeFn = fn(*mut jitframe::JitFrame, usize, i64, bool) -> Option<i64>;
 
 /// Force callee: (callee_frame_ptr) → result
 pub type ForceFn = extern "C" fn(i64) -> i64;
@@ -633,36 +636,11 @@ fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
 ///         resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
 ///     assert 0, "unreachable"
 ///
-/// **TODO**: pyre's CA slow path runs
-/// the bridge-tracer hook (`CA_BRIDGE_FN` → `jit_ca_handle_guard_failure`
-/// in pyre-jit/src/call_jit.rs) and then the blackhole hook
-/// (`CA_BLACKHOLE_FN`) sequentially, instead of choosing one via the
-/// outer `if must_compile` branch.  The PyPy line-by-line port of
-/// must_compile / stack_almost_full / start_compiling /
-/// `_trace_and_compile_from_bridge` / done_compiling is carried out
-/// inside `jit_ca_handle_guard_failure` (call_jit.rs) — the
-/// flow IS modeled, just one layer down.
-///
-/// **Why the outer dispatch shape differs**: PyPy's
-/// `_trace_and_compile_from_bridge` (compile.py) raises
-/// `EnterJitAssembler` (warmstate.py) at success to non-locally
-/// unwind back to the JIT entry point and re-enter the newly-attached
-/// bridge.  Pyre uses Rust returns where PyPy uses Python exceptions:
-/// `jit_ca_handle_guard_failure` returns `bool` after attaching, and
-/// the trampoline cannot unwind/re-enter from this point — the next
-/// outer iteration's `eval_loop_jit` dispatch picks up the bridge
-/// instead.  Therefore blackhole always runs to finish the current
-/// frame; the next iteration runs the bridge.  End result equivalent
-/// (each CA slow entry attaches at most one bridge AND produces a
-/// resume value).
-///
-/// **Convergence path**: introducing a control-flow primitive that
-/// non-locally unwinds from `jit_ca_handle_guard_failure` back to the
-/// CALL_ASSEMBLER trampoline (Rust `panic_unwind`, `setjmp/longjmp`,
-/// or refactoring the JIT entry to be re-entrant) would let the outer
-/// dispatch read `if must_compile { trace; raise } else { blackhole }`
-/// directly.  None of these are session-scope; the deviation is
-/// retained until that mechanism lands.
+/// compile.py `handle_fail`: `if must_compile and not stack_almost_full`
+/// traces and raises; `else` is `resume_in_blackhole`. The must_compile
+/// decision and `_trace_and_compile_from_bridge` live in
+/// `jit_ca_handle_guard_failure`. A `Some` result is the raise
+/// (`ContinueRunningNormally` → portal re-entry); `None` is the else arm.
 fn handle_fail_resume_guard(
     descr: &dyn majit_ir::FailDescr,
     descr_raw: usize,
@@ -729,20 +707,20 @@ fn handle_fail_resume_guard(
         GcRootScope(slot)
     });
 
-    // compile.py `_trace_and_compile_from_bridge`.
-    // The hook compiles+attaches; it does NOT re-enter the bridge.
-    // Skipped on giveup (None). Fail args stay in `jf_frame[]`
-    // (`llmodel.py get_int_value`); `jitframe_trace` walks them.
+    // compile.py `if must_compile and not stack_almost_full`.
+    // Fail args stay in `jf_frame[]` (`llmodel.py get_int_value`).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
-        bridge_fn(
+        if let Some(result) = bridge_fn(
             frame_ptr,
             descr_raw,
             guard_value_operand.unwrap_or(0),
             guard_value_operand.is_some(),
-        );
+        ) {
+            return result;
+        }
     }
 
-    // compile.py `resume_in_blackhole(descr, deadframe)`.
+    // compile.py `else: resume_in_blackhole(descr, deadframe)`.
     let bh_result = CA_BLACKHOLE_FN
         .get()
         .and_then(|blackhole| blackhole(descr_raw, frame_ptr, guard_exc_root.0 as i64));
