@@ -1630,6 +1630,73 @@ impl Trace {
         }
     }
 
+    /// opencoder.py `Trace.get_iter()` over the live byte buffer.
+    ///
+    /// `start_fresh` seeds the reminted inputarg/op namespace
+    /// (`opencoder.py` `self.inputargs = [rop.inputarg_from_tp(...)]`).
+    /// The returned cache is keyed by recorder unique OpRefs so snapshot
+    /// maps translate the same way `prepare_bridge_trace_for_optimizer`
+    /// does after a structured remint.
+    pub fn get_iter_fresh(
+        &self,
+        start_fresh: u32,
+    ) -> Option<(
+        Vec<OpRc>,
+        Vec<InputArgRc>,
+        Vec<Option<majit_ir::operand::Operand>>,
+    )> {
+        let trb = self.trb.as_ref()?;
+        let mut iter =
+            crate::opencoder::ByteTraceIter::new(trb, trb._start as usize, trb._pos, start_fresh);
+        let mut ops = Vec::with_capacity(self.slots.len());
+        while let Some(op) = iter.next() {
+            ops.push(op);
+        }
+        for (i, op) in ops.iter().enumerate() {
+            let Some(slot) = self.slots.get(i) else {
+                continue;
+            };
+            if let Some(v) = slot.concrete.get() {
+                op.set_value(v);
+            }
+            if let Some(d) = slot.descr.clone() {
+                op.setdescr(d);
+            }
+            if slot.resume.get() >= 0 {
+                op.set_rd_resume_position(slot.resume.get());
+            }
+            if let Some(ref types) = slot.fail_arg_types {
+                op.set_fail_arg_types(types.clone());
+            }
+        }
+        let mut max_unique = self.inputargs.len() as u32;
+        for slot in &self.slots {
+            max_unique = max_unique.max(slot.unique);
+        }
+        let mut cache = vec![None; max_unique as usize + 1];
+        for (i, ia) in self.inputargs.iter().enumerate() {
+            let Some(fresh) = iter.inputargs.get(i) else {
+                continue;
+            };
+            let p = ia.index as usize;
+            if p >= cache.len() {
+                cache.resize(p + 1, None);
+            }
+            cache[p] = Some(Operand::from_bound_inputarg(fresh));
+        }
+        for (i, op) in ops.iter().enumerate() {
+            let Some(slot) = self.slots.get(i) else {
+                continue;
+            };
+            let p = slot.unique as usize;
+            if p >= cache.len() {
+                cache.resize(p + 1, None);
+            }
+            cache[p] = Some(Operand::from_bound_op(op));
+        }
+        Some((ops, iter.inputargs, cache))
+    }
+
     /// Get an operation by its raw u32 position, ignoring the variant
     /// tag. Use this when iterating a numeric position range without
     /// knowing each op's RPython `box.type` upfront — the typed lookup
