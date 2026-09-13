@@ -1458,6 +1458,44 @@ fn hole_filtered_vm_failarg_index(fail_args: &[majit_ir::operand::Operand]) -> O
         .position(|a| a.to_opref() == assembled)
 }
 
+fn prepare_bridge_from_byte_recorder(
+    recorder: &crate::recorder::Trace,
+    bridge_inputargs: &[InputArgRc],
+    snapshot_boxes: SnapshotBoxes,
+    snapshot_frame_sizes: SnapshotFrameSizes,
+    snapshot_vable_boxes: SnapshotBoxes,
+    snapshot_vref_boxes: SnapshotBoxes,
+    snapshot_frame_pcs: SnapshotFramePcs,
+    pending_bridge_rd: Option<PendingBridgeRd>,
+    runtime_boxes: Vec<OpRef>,
+    bridge_inputarg_base: u32,
+) -> Option<PreparedBridgeTrace> {
+    // unroll.py `optimize_bridge` `trace = trace.get_iter()` — one cls() walk of the
+    // live opencoder buffer. compile.py compile_trace leaves the JUMP
+    // on the buffer until this walk finishes.
+    // compile.py compile_trace / history.py InputArgInt: reuse the
+    // iterator's reminted Rc rather than minting a second object.
+    let (ops, iter_inputargs, cache) = recorder.get_iter_fresh(bridge_inputarg_base)?;
+    for (arg, ia) in bridge_inputargs.iter().zip(iter_inputargs.iter()) {
+        if let Some(value) = arg.get_value() {
+            ia.set_value(value);
+        }
+    }
+    Some(finish_prepared_bridge(
+        ops,
+        bridge_inputargs,
+        iter_inputargs,
+        cache,
+        snapshot_boxes,
+        snapshot_frame_sizes,
+        snapshot_vable_boxes,
+        snapshot_vref_boxes,
+        snapshot_frame_pcs,
+        pending_bridge_rd,
+        runtime_boxes,
+    ))
+}
+
 fn finish_prepared_bridge(
     ops: Vec<majit_ir::OpRc>,
     original_inputargs: &[InputArgRc],
@@ -9249,6 +9287,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py compile_trace: `trace.tracing_done()` then
         // `jitlog.start_new_trace` before optimize.
         if let Err(reason) = ctx.recorder.tracing_done() {
+            ctx.cut_trace(cut_at);
             self.pending_abort_reason = Some(reason.as_int());
             return CompileOutcome::Aborted;
         }
@@ -9257,17 +9296,18 @@ impl<M: Clone> MetaInterp<M> {
         self.jitlog_trace_id = crate::rjitlog::start_new_trace(true, descr_id, &jd_name);
         crate::rjitlog::set_addr2name(addr2name);
 
-        // Keep the recorded operations (including JUMP) alive while the
-        // recorder is cut below. `compile.py compile_trace` hands the live
-        // opencoder trace straight to `UnrollOptimizer.optimize_bridge`, whose
-        // `TraceIterator` is the one and only place fresh ResOperations are
-        // materialized. A deep `Op::clone` here used to materialize every op a
-        // first time merely to survive Rust's earlier cut; retaining the
-        // canonical `Rc<Op>` handles preserves the same live trace identity
-        // and lets `prepare_bridge_trace_for_optimizer` perform the sole fresh
-        // materialization, as upstream does.
-        ctx.recorder.materialize_into_ops();
-        let bridge_ops: Vec<majit_ir::OpRc> = ctx.ops().to_vec();
+        // pyjitpl.py compile_trace: `try: compile.compile_trace(...) finally:
+        // history.cut(cut_at)`. The JUMP stays on the live opencoder buffer
+        // until `optimize_bridge` / `trace.get_iter()`. The `Vec<Op>`
+        // recorder (tests) still snapshots ops; the byte path leaves
+        // `bridge_ops` empty and walks the buffer once at prepare.
+        let use_byte_iter = ctx.recorder.has_byte_buffer();
+        let bridge_ops: Vec<majit_ir::OpRc> = if use_byte_iter {
+            Vec::new()
+        } else {
+            ctx.recorder.materialize_into_ops();
+            ctx.ops().to_vec()
+        };
         // Carry the history's live input boxes, WITHOUT carrying the values
         // the recorder's own inputargs hold.
         //
@@ -9344,8 +9384,12 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_constants =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
 
-        // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
-        ctx.cut_trace(cut_at);
+        // pyjitpl.py `compile_trace` `finally: history.cut(cut_at)`. The Vec-recorder
+        // path still cuts here (ops were copied). The byte path keeps the
+        // JUMP on the buffer until `get_iter()` in compile_bridge.
+        if !use_byte_iter {
+            ctx.cut_trace(cut_at);
+        }
 
         if crate::majit_log_enabled() {
             let label = if ends_with_jump { "jump" } else { "finish" };
@@ -9358,7 +9402,7 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
-        match bridge_origin {
+        let outcome = match bridge_origin {
             Some((trace_id, fail_index)) => {
                 // compile.py — ResumeGuardDescr path: attach bridge
                 // to the existing guard that failed.
@@ -9381,11 +9425,23 @@ impl<M: Clone> MetaInterp<M> {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     crate::mc_diag_bump(30); // compile_trace: origin loop gone
+                    if use_byte_iter {
+                        if let Some(ctx) = self.tracing.as_mut() {
+                            ctx.cut_trace(cut_at);
+                        }
+                    }
                     return CompileOutcome::Cancelled;
                 }
                 let descr_arc = match self.bridge_info() {
                     Some(b) => b.source_descr.clone(),
-                    None => return CompileOutcome::Cancelled,
+                    None => {
+                        if use_byte_iter {
+                            if let Some(ctx) = self.tracing.as_mut() {
+                                ctx.cut_trace(cut_at);
+                            }
+                        }
+                        return CompileOutcome::Cancelled;
+                    }
                 };
                 let fail_descr = descr_arc
                     .as_fail_descr()
@@ -9408,6 +9464,7 @@ impl<M: Clone> MetaInterp<M> {
                     fail_descr,
                     bridge_ops,
                     &bridge_inputargs,
+                    finish_args,
                     bridge_constants,
                     snapshot_boxes,
                     snapshot_frame_sizes,
@@ -9436,6 +9493,11 @@ impl<M: Clone> MetaInterp<M> {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     crate::mc_diag_bump(32); // compile_trace: no entry-bridge data
+                    if use_byte_iter {
+                        if let Some(ctx) = self.tracing.as_mut() {
+                            ctx.cut_trace(cut_at);
+                        }
+                    }
                     return CompileOutcome::Cancelled;
                 };
                 let success = self.compile_entry_bridge(
@@ -9446,6 +9508,7 @@ impl<M: Clone> MetaInterp<M> {
                     entry_orig_vable_ptr,
                     &bridge_ops,
                     &bridge_inputargs,
+                    finish_args,
                     bridge_constants,
                     snapshot_boxes,
                     snapshot_frame_sizes,
@@ -9463,7 +9526,13 @@ impl<M: Clone> MetaInterp<M> {
                     CompileOutcome::Cancelled
                 }
             }
+        };
+        if use_byte_iter {
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.cut_trace(cut_at);
+            }
         }
+        outcome
     }
 
     /// pyjitpl.py: retrace_needed — save state from a failed
@@ -14411,6 +14480,7 @@ impl<M: Clone> MetaInterp<M> {
         orig_vable_ptr_entry: *const u8,
         bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArgRc],
+        jump_args: &[OpRef],
         bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
@@ -14483,23 +14553,46 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:1056 / unroll.py:183 parity: runtime_boxes are passed
         // separately from the trace iterator and stay as the original live
         // boxes from the closing JUMP.
-        let bridge_runtime_boxes: Vec<OpRef> =
-            Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs);
+        let bridge_runtime_boxes: Vec<OpRef> = if !jump_args.is_empty() {
+            jump_args.to_vec()
+        } else {
+            Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs)
+        };
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
-        let prepared = prepare_bridge_trace_for_optimizer(
-            bridge_ops,
-            bridge_inputargs,
-            snapshot_boxes,
-            snapshot_frame_sizes,
-            snapshot_vable_boxes,
-            snapshot_vref_boxes,
-            snapshot_frame_pcs,
-            None,
-            bridge_runtime_boxes,
-            bridge_inputarg_base,
-        );
+        let use_byte_iter = self
+            .tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
+        let prepared = if use_byte_iter {
+            prepare_bridge_from_byte_recorder(
+                &self.tracing.as_ref().expect("checked").recorder,
+                bridge_inputargs,
+                snapshot_boxes,
+                snapshot_frame_sizes,
+                snapshot_vable_boxes,
+                snapshot_vref_boxes,
+                snapshot_frame_pcs,
+                None,
+                bridge_runtime_boxes,
+                bridge_inputarg_base,
+            )
+            .expect("has_byte_buffer")
+        } else {
+            prepare_bridge_trace_for_optimizer(
+                bridge_ops,
+                bridge_inputargs,
+                snapshot_boxes,
+                snapshot_frame_sizes,
+                snapshot_vable_boxes,
+                snapshot_vref_boxes,
+                snapshot_frame_pcs,
+                None,
+                bridge_runtime_boxes,
+                bridge_inputarg_base,
+            )
+        };
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
         // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
@@ -15059,6 +15152,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_descr: &dyn majit_ir::FailDescr,
         bridge_ops: Vec<majit_ir::OpRc>,
         bridge_inputargs: &[majit_ir::InputArgRc],
+        jump_args: &[OpRef],
         bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
@@ -15277,24 +15371,47 @@ impl<M: Clone> MetaInterp<M> {
         // `bridge_ops.to_vec()` here used to allocate one throw-away `Rc<Op>`
         // for every recorded operation, immediately before TraceIterator
         // allocated the real fresh objects consumed by the optimizer.
-        let bridge_runtime_boxes: Vec<OpRef> =
-            Self::closing_jump_runtime_boxes(&bridge_ops, bridge_inputargs);
+        let bridge_runtime_boxes: Vec<OpRef> = if !jump_args.is_empty() {
+            jump_args.to_vec()
+        } else {
+            Self::closing_jump_runtime_boxes(&bridge_ops, bridge_inputargs)
+        };
         // `UnrollOptimizer.optimize_bridge`'s `trace = trace.get_iter()`: mint
         // fresh InputArg / ResOperation objects in a disjoint OpRef namespace
         // (`TraceIterator.__init__`, `opencoder.py`:
         // `self.inputargs = [rop.inputarg_from_tp(arg.type) for ...]`).
-        let prepared = prepare_bridge_trace_from_owned(
-            bridge_ops,
-            bridge_inputargs,
-            snapshot_boxes,
-            snapshot_frame_sizes,
-            snapshot_vable_boxes,
-            snapshot_vref_boxes,
-            snapshot_frame_pcs,
-            pending_bridge_rd,
-            bridge_runtime_boxes,
-            bridge_inputarg_base,
-        );
+        let use_byte_iter = self
+            .tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
+        let prepared = if use_byte_iter {
+            prepare_bridge_from_byte_recorder(
+                &self.tracing.as_ref().expect("checked").recorder,
+                bridge_inputargs,
+                snapshot_boxes,
+                snapshot_frame_sizes,
+                snapshot_vable_boxes,
+                snapshot_vref_boxes,
+                snapshot_frame_pcs,
+                pending_bridge_rd,
+                bridge_runtime_boxes,
+                bridge_inputarg_base,
+            )
+            .expect("has_byte_buffer")
+        } else {
+            prepare_bridge_trace_from_owned(
+                bridge_ops,
+                bridge_inputargs,
+                snapshot_boxes,
+                snapshot_frame_sizes,
+                snapshot_vable_boxes,
+                snapshot_vref_boxes,
+                snapshot_frame_pcs,
+                pending_bridge_rd,
+                bridge_runtime_boxes,
+                bridge_inputarg_base,
+            )
+        };
         let PreparedBridgeTrace {
             ops: prepared_ops,
             inputargs: prepared_inputargs,
@@ -25609,10 +25726,10 @@ mod tests {
             &bridge_ops,
             &bridge_inputargs,
             Vec::new(),
+            SnapshotFrameSizes::new(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            SnapshotFramePcs::new(),
             None,
             vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
             556,
@@ -28235,6 +28352,7 @@ mod tests {
             std::ptr::null(),
             &bridge_ops,
             &bridge_inputargs,
+            &[],
             majit_ir::ConstMap::default(),
             Vec::new(),
             SnapshotFrameSizes::new(),
