@@ -5102,6 +5102,23 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // computes the hidden mutate field's address, pyre unlinks the instance
     // and flips every loop flag it recorded.
     majit_metainterp::set_force_quasi_immutable_hook(Some(crate::call_jit::force_quasi_immutable));
+    // Residual wrapint: `w_int_gc_alloc` is `dont_look_inside`, so portal
+    // interpret would record `CallR`. Register the trampoline the
+    // residual actually calls so interpret emits wrapint
+    // (`new_with_vtable` + `setfield_gc`) with a concrete pointer.
+    {
+        let trampoline: extern "C" fn(i64) -> i64 =
+            pyre_object::intobject::__majit_call_target_w_int_gc_alloc;
+        majit_metainterp::register_wrapint_residual(majit_metainterp::WrapintResidual {
+            alloc_fnaddrs: vec![
+                trampoline as i64,
+                pyre_object::intobject::w_int_gc_alloc as *const () as i64,
+            ],
+            size_descr: pyre_jit_trace::descr::w_int_size_descr(),
+            intval_descr: pyre_jit_trace::descr::int_intval_descr(),
+            int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
+        });
+    }
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
     d.set_virtualizable_info(info.clone());
