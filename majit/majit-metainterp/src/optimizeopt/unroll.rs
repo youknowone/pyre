@@ -566,10 +566,10 @@ impl UnrollOptimizer {
             final_exported_state: None,
             final_exported_label_source_positions: None,
             snapshot_boxes: Vec::new(),
-            snapshot_frame_sizes: Vec::new(),
+            snapshot_frame_sizes: SnapshotFrameSizes::new(),
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
-            snapshot_frame_pcs: Vec::new(),
+            snapshot_frame_pcs: SnapshotFramePcs::new(),
             all_descrs: std::sync::Arc::new(Vec::new()),
             quasi_immutable_deps: Vec::new(),
             trace_inputargs: Vec::new(),
@@ -6502,12 +6502,8 @@ fn clone_guard_snapshot_remapped(
             remap_snapshot_boxes(&vref_boxes, ref_map),
         );
     }
-    if let Some(frame_pcs) = snapshot_get(&ctx.snapshot_frame_pcs, old_pos).cloned() {
-        snapshot_insert(&mut ctx.snapshot_frame_pcs, new_pos, frame_pcs);
-    }
-    if let Some(frame_sizes) = snapshot_get(&ctx.snapshot_frame_sizes, old_pos).cloned() {
-        snapshot_insert(&mut ctx.snapshot_frame_sizes, new_pos, frame_sizes);
-    }
+    ctx.snapshot_frame_pcs.copy_run(old_pos, new_pos);
+    ctx.snapshot_frame_sizes.copy_run(old_pos, new_pos);
     guard.set_rd_resume_position(new_pos);
 }
 

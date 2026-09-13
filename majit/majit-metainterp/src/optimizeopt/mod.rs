@@ -390,8 +390,109 @@ impl<'a> IntoIterator for &'a mut SnapshotBoxList {
 }
 
 pub type SnapshotBoxes = Vec<Option<SnapshotBoxList>>;
-pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;
-pub type SnapshotFramePcs = Vec<Option<Vec<(i32, i32, i32)>>>;
+
+/// Concatenated per-snapshot runs, matching `opencoder.py`'s flat snapshot
+/// payloads. Regex `and`/`or` inlines past eight frames
+/// (`ResumeDataLoopMemo::number_from_parts`), so a `Vec<T>` per snapshot is a
+/// 72 B malloc (9 × usize) on every compiled guard.
+#[derive(Clone, Debug)]
+pub struct SnapshotRunTable<T> {
+    data: Vec<T>,
+    /// `(start, len)` for snapshot id `i`. `len == u32::MAX` means absent.
+    spans: Vec<(u32, u32)>,
+}
+
+const SNAP_RUN_ABSENT: u32 = u32::MAX;
+
+impl<T> SnapshotRunTable<T> {
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            spans: Vec::new(),
+        }
+    }
+
+    /// `snapshots` is the snapshot count; `frames_hint` is an optional
+    /// per-snapshot depth. Prefer [`Self::reserve_frames`] with the captured
+    /// total when it is known (regex `and`/`or` inlines past eight).
+    pub fn with_capacity(snapshots: usize, frames_hint: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(snapshots.saturating_mul(frames_hint)),
+            spans: Vec::with_capacity(snapshots),
+        }
+    }
+
+    pub fn reserve_frames(&mut self, frames: usize) {
+        if frames > self.data.capacity() {
+            self.data.reserve(frames - self.data.len());
+        }
+    }
+
+    pub fn get(&self, pos: i32) -> Option<&[T]> {
+        if pos < 0 {
+            return None;
+        }
+        let &(start, len) = self.spans.get(pos as usize)?;
+        if len == SNAP_RUN_ABSENT {
+            return None;
+        }
+        let start = start as usize;
+        Some(&self.data[start..start + len as usize])
+    }
+
+    pub fn push_run(&mut self, items: impl IntoIterator<Item = T>) {
+        let start = self.data.len() as u32;
+        self.data.extend(items);
+        let len = self.data.len() as u32 - start;
+        self.spans.push((start, len));
+    }
+
+    pub fn insert_run(&mut self, pos: i32, items: impl IntoIterator<Item = T>) {
+        assert!(pos >= 0, "snapshot position must be non-negative");
+        let start = self.data.len() as u32;
+        self.data.extend(items);
+        let len = self.data.len() as u32 - start;
+        let idx = pos as usize;
+        if self.spans.len() <= idx {
+            self.spans.resize(idx + 1, (0, SNAP_RUN_ABSENT));
+        }
+        self.spans[idx] = (start, len);
+    }
+
+    /// Remap a snapshot id onto an existing run. Sizes and pcs are immutable
+    /// after capture, so the two ids share one slice (unroll.py copies the
+    /// list identity, not a second payload).
+    pub fn copy_run(&mut self, from: i32, to: i32) {
+        if from < 0 || to < 0 {
+            return;
+        }
+        let Some(&span) = self.spans.get(from as usize) else {
+            return;
+        };
+        if span.1 == SNAP_RUN_ABSENT {
+            return;
+        }
+        let idx = to as usize;
+        if self.spans.len() <= idx {
+            self.spans.resize(idx + 1, (0, SNAP_RUN_ABSENT));
+        }
+        self.spans[idx] = span;
+    }
+
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.spans.clear();
+    }
+}
+
+impl<T> Default for SnapshotRunTable<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub type SnapshotFrameSizes = SnapshotRunTable<usize>;
+pub type SnapshotFramePcs = SnapshotRunTable<(i32, i32, i32)>;
 
 #[cfg(test)]
 mod snapshot_box_list_size {
@@ -412,6 +513,18 @@ mod snapshot_box_list_size {
             "a 12-box resume frame must use the chunked slab, not a 96 B malloc"
         );
         assert!(list.capacity() >= 12);
+    }
+
+    #[test]
+    fn nine_frame_sizes_share_one_run_table() {
+        let mut sizes = super::SnapshotFrameSizes::with_capacity(2, 16);
+        sizes.push_run(0..9);
+        sizes.push_run(9..18);
+        assert_eq!(sizes.get(0), Some(&[0, 1, 2, 3, 4, 5, 6, 7, 8][..]));
+        assert_eq!(sizes.get(1), Some(&[9, 10, 11, 12, 13, 14, 15, 16, 17][..]));
+        sizes.copy_run(0, 3);
+        assert_eq!(sizes.get(3), sizes.get(0));
+        assert!(sizes.get(2).is_none());
     }
 }
 type OpRefFxIndexMap<V> = indexmap::IndexMap<OpRef, V, FxBuildHasher>;
@@ -2184,13 +2297,13 @@ impl OptContext {
             string_constant_alloc: None,
             quasi_immutable_deps: Vec::new(),
             snapshot_boxes: Vec::new(),
-            snapshot_frame_sizes: Vec::new(),
+            snapshot_frame_sizes: SnapshotFrameSizes::new(),
             snapshot_vable_boxes: Vec::new(),
             // resume.py:401-402: `-1` until an Optimizer built with a vable
             // config overwrites it in `optimize_with_constants_and_inputs_at`.
             minimum_virtualizable_size: -1,
             snapshot_vref_boxes: Vec::new(),
-            snapshot_frame_pcs: Vec::new(),
+            snapshot_frame_pcs: SnapshotFramePcs::new(),
 
             inputargs: Vec::new(),
             inputarg_refs: FxHashMap::default(),
@@ -2858,13 +2971,13 @@ impl OptContext {
             string_constant_alloc: None,
             quasi_immutable_deps: Vec::new(),
             snapshot_boxes: Vec::new(),
-            snapshot_frame_sizes: Vec::new(),
+            snapshot_frame_sizes: SnapshotFrameSizes::new(),
             snapshot_vable_boxes: Vec::new(),
             // resume.py:401-402: `-1` until an Optimizer built with a vable
             // config overwrites it in `optimize_with_constants_and_inputs_at`.
             minimum_virtualizable_size: -1,
             snapshot_vref_boxes: Vec::new(),
-            snapshot_frame_pcs: Vec::new(),
+            snapshot_frame_pcs: SnapshotFramePcs::new(),
 
             inputargs: Vec::new(),
             inputarg_refs: FxHashMap::default(),
@@ -7268,16 +7381,16 @@ impl OptContext {
         let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position())
             .map(|v| v.as_slice())
             .unwrap_or_default();
-        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position())
-            .map(Vec::as_slice)
+        let frame_pcs = self
+            .snapshot_frame_pcs
+            .get(op.rd_resume_position())
             .unwrap_or_default();
 
         // resume.py:201-202 get_box_replacement parity:
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
-        let frame_sizes =
-            snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position()).map(Vec::as_slice);
+        let frame_sizes = self.snapshot_frame_sizes.get(op.rd_resume_position());
 
         // Compare every snapshot cell's carried type with the type encoded by
         // its `OpRef` variant. `None` is an unclassified producer rather than
