@@ -540,16 +540,11 @@ impl JitFrameDeadFrame {
         }
     }
 
-    /// Present a frame that is still executing as a deadframe, without taking
-    /// its `jf_gcmap` over.
+    /// Present a frame allocated by the GC as a rooted deadframe.
     ///
     /// `llmodel.py force` casts the resolved frame to a GCREF and
-    /// returns it: the forced frame IS the deadframe, and it belongs to the
-    /// compiled run that is still on the JF shadow stack.  That run pushed the
-    /// map before the residual call it is inside and clears it with
-    /// `pop_gcmap` when the call returns, so releasing it here would leave the
-    /// frame untraced for the rest of the call while its spilled `Ref` slots
-    /// are still the only reference to their objects.
+    /// returns it: the forced frame IS the deadframe, whether it is still
+    /// executing or has returned through GUARD_NOT_FORCED_2 / FINISH.
     pub fn borrowing(
         jf_gcref: GcRef,
         fail_descr: ExitDescr,

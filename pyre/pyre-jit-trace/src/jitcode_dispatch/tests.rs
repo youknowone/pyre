@@ -616,6 +616,99 @@ fn test_outer_resume_jitcode_index() -> u32 {
 }
 
 #[test]
+fn branch_guard_snapshot_rechecks_the_condition_before_either_arm() {
+    // `guarded_branch_core` captures at `other_target` (the not-taken
+    // arm), not `goto_if_not`'s orgpc. A depth-0 branch resumes past
+    // `POP_JUMP_IF_*`; stamping the guard pc would re-run the branch
+    // and desync the decoded box layout. The condition stays live so
+    // a later shared-snapshot guard can still see it.
+    let live = crate::state::op_live();
+    let goto = insns_opname_to_byte()["goto_if_not/iL"];
+    // pc 3: goto_if_not; fall-through/taken is 7, not-taken target is 11.
+    let code = vec![live, 0, 0, goto, 0, 11, 0, live, 4, 0, 0, live, 7, 0];
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("branch_orgpc_test");
+    runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+        code: code.clone(),
+        c_num_regs_i: 1,
+        startpoints: Some([0_usize, 3, 7, 11].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut insns = indexmap::IndexMap::new();
+    insns.insert("live/".to_string(), live);
+    insns.insert("goto_if_not/iL".to_string(), goto);
+    // At orgpc the condition is live; at both arms it is dead.
+    crate::assembler::publish_state(&insns, &[1, 0, 0, 1, 0, 0, 0, 0, 0, 0], 10, 3);
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.n_py_instrs = 2;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0), (7, 1), (11, 1)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0), (7, 1), (11, 1)];
+    pyjit.metadata.resume_marker_marker_by_jit_pc =
+        vec![(0, Some(0)), (7, Some(7)), (11, Some(11))];
+    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![(0, Some(0)), (7, Some(7)), (11, Some(11))];
+    let installed = crate::state::install_jitcode_for(std::ptr::null(), std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let mut sym = crate::state::PyreSym::new_uninit(OpRef::NONE);
+    sym.jitcode = installed;
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &sym;
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut tc = TraceCtx::for_test_types(&[Type::Int]);
+    let condbox = OpRef::input_arg_int(0);
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: Vec::new(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new([condbox]),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: unsafe { (*installed).index as u32 },
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: 0,
+        live_after_jit_pc: usize::MAX,
+    };
+    let op = decode_op_at(&code, 3).unwrap();
+    goto_if_not_branch_on(&code, &op, &mut wc, condbox, 1, 11).unwrap();
+    drop(wc);
+    let guard = tc.ops().last().unwrap();
+    let snapshot = tc.get_snapshot(guard.rd_resume_position()).unwrap();
+    assert_eq!(
+        snapshot.frames[0].pc, 11,
+        "resume must enter the not-taken arm"
+    );
+    assert_eq!(
+        snapshot.frames[0].boxes.len(),
+        0,
+        "the condition is dead on the not-taken arm"
+    );
+}
+
+#[test]
 fn after_residual_guard_uses_trailing_live_before_fallthrough_twin() {
     let int_add = *insns_opname_to_byte()
         .get("int_add/ii>i")
@@ -6100,7 +6193,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
 }
 
 #[test]
-fn top_level_raise_settles_the_vable_token() {
+fn top_level_raise_arms_the_lazy_vable_token() {
     // `pyjitpl.py compile_exit_frame_with_exception` opens with
     // `store_token_in_vable()`, the same as `compile_done_with_this_frame`.
     // The exit therefore leaves a lazy, armed token rather than eagerly
@@ -6109,6 +6202,7 @@ fn top_level_raise_settles_the_vable_token() {
         .get("raise/r")
         .expect("`raise/r` must be in insns table");
     let code = [raise_byte, 0x02];
+    let outer_jitcode_index = test_outer_resume_jitcode_index();
     let mut tc = fresh_trace_ctx();
     let mut vable_buf = vec![0u8; 65536];
     bind_fake_vable(&mut tc, &mut vable_buf);
@@ -6143,7 +6237,6 @@ fn top_level_raise_settles_the_vable_token() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-
         pending_guard_snapshot_error: None,
 
         vstack_depth: 0,

@@ -384,7 +384,9 @@ pub extern "C" fn jit_bigint_and(a: i64, b: i64) -> pyre_object::longobject::Jit
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a & &*b),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                majit_rlib::rbigint::and_payloads_collecting(a, b),
+            ),
         )
     }
 }
@@ -395,7 +397,9 @@ pub extern "C" fn jit_bigint_or(a: i64, b: i64) -> pyre_object::longobject::JitB
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a | &*b),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                majit_rlib::rbigint::or_payloads_collecting(a, b),
+            ),
         )
     }
 }
@@ -406,7 +410,9 @@ pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> pyre_object::longobject::Jit
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a ^ &*b),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                majit_rlib::rbigint::xor_payloads_collecting(a, b),
+            ),
         )
     }
 }
@@ -420,7 +426,9 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> pyre_object::longobject::Jit
             return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
         }
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a - &*b),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                majit_rlib::rbigint::sub_payloads_collecting(a, b),
+            ),
         )
     }
 }
@@ -431,7 +439,9 @@ pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> pyre_object::longobject::Jit
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a * &*b),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                majit_rlib::rbigint::mul_payloads_collecting(a, b),
+            ),
         )
     }
 }
@@ -448,7 +458,9 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> pyre_object::longobject::Jit
             return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
         }
         pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a + &*b),
+            pyre_object::longobject::alloc_bigint_nursery_collecting(
+                majit_rlib::rbigint::add_payloads_collecting(a, b),
+            ),
         )
     }
 }

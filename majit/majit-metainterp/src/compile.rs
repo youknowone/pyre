@@ -1798,6 +1798,82 @@ pub(crate) fn normalize_closing_jump_args(
     ops
 }
 
+fn leftover_inputarg_refs(
+    ops: &[majit_ir::OpRc],
+    present: &rustc_hash::FxHashSet<u32>,
+) -> Vec<OpRef> {
+    let mut leftover = Vec::new();
+    let mut consider = |r: OpRef| {
+        if r.is_input_arg()
+            && !present.contains(&r.raw())
+            && leftover.iter().all(|x: &OpRef| x.raw() != r.raw())
+        {
+            leftover.push(r);
+        }
+    };
+    for op in ops {
+        for a in op.getarglist() {
+            consider(a.to_opref());
+        }
+        if let Some(fa) = op.guard_fail_args() {
+            for a in fa {
+                consider(a.to_opref());
+            }
+        }
+    }
+    leftover
+}
+
+/// Fit `lengths` so the items sum to `n_array_items`. Extra items land on
+/// the last array field; a short count zeros the tail. `n_arrays` is
+/// `vinfo.array_fields.len()` — grow a missing last slot rather than
+/// invent a field the descr walk cannot emit.
+fn fit_walk_lengths(lengths: &mut Vec<usize>, n_arrays: usize, n_array_items: usize) {
+    if n_arrays == 0 {
+        lengths.clear();
+        return;
+    }
+    if lengths.len() < n_arrays {
+        lengths.resize(n_arrays, 0);
+    }
+    let current: usize = lengths.iter().sum();
+    if current == n_array_items {
+        return;
+    }
+    if n_array_items >= current {
+        if let Some(last) = lengths.last_mut() {
+            *last += n_array_items - current;
+        }
+        return;
+    }
+    let mut remaining = n_array_items;
+    for len in lengths.iter_mut() {
+        if remaining >= *len {
+            remaining -= *len;
+        } else {
+            *len = remaining;
+            remaining = 0;
+        }
+    }
+}
+
+/// Types of the expanded virtualizable tail, in the same order
+/// `initialize_virtualizable` mints `InputArg(num_reds + i)`.
+fn expanded_vable_slot_types(
+    vinfo: &crate::virtualizable::VirtualizableInfo,
+    array_lengths: &[usize],
+) -> Vec<Type> {
+    let mut types = Vec::new();
+    for field in &vinfo.static_fields {
+        types.push(field.field_type);
+    }
+    for (ai, array) in vinfo.array_fields.iter().enumerate() {
+        let len = array_lengths.get(ai).copied().unwrap_or(0);
+        types.extend(std::iter::repeat(array.item_type).take(len));
+    }
+    types
+}
+
 /// `rpython/jit/metainterp/compile.py:425-461`
 /// `patch_new_loop_to_load_virtualizable_fields`.
 ///
@@ -1882,6 +1958,334 @@ pub(crate) fn normalize_closing_jump_args(
 /// route through this helper: it would hand such an entry a prologue that
 /// reads a stale length.
 ///
+/// Densify marks a leftover ListIter with this mint index so leftover-empty
+/// reloads the live frame TOS (`valuestackdepth - 1`) instead of a baked
+/// locals slot. Pyre's `valuestackdepth` is the absolute
+/// `locals_cells_stack_w` index (starts at `n_locals + n_cells`); TOS is
+/// one below it, i.e. `n_locals + n_cells + count - 1`.
+pub(crate) const LISTITER_TOS_RELOAD: u32 = u32::MAX;
+
+/// `W_ListIterObject` `ob_type` / `w_class` word. leftover_peel_tos
+/// scans the red frame for this type when TOS is not the iterator.
+/// Zero (tests, pre-boot) keeps the TOS-only peel.
+static LISTITER_TYPE_WORD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Production `is_list_iter` (typed `ob_type` check). Tests leave this
+/// null and use `LISTITER_TYPE_WORD`.
+static LISTITER_PRED: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// JIT boot: `&LIST_ITER_TYPE as *const _ as usize`.
+pub fn register_listiter_type_word(word: usize) {
+    LISTITER_TYPE_WORD.store(word, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// JIT boot: `is_list_iter` as a C predicate. Preferred over the type word.
+pub fn register_listiter_pred(f: unsafe extern "C" fn(*const u8) -> i32) {
+    LISTITER_PRED.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `execute_assembler`: the live EC top frame (`vref_referent`, never a vref).
+pub fn register_leftover_scan_frame(frame: *const u8) {
+    LEFTOVER_SCAN_FRAME.with(|c| c.set(frame as *mut u8));
+}
+
+fn leftover_scan_frame() -> *mut u8 {
+    LEFTOVER_SCAN_FRAME.with(|c| c.get())
+}
+
+thread_local! {
+    static LEFTOVER_SCAN_FRAME: std::cell::Cell<*mut u8> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static LEFTOVER_EMPTY_REJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// leftover-empty would leftover_peel_tos a non-iterator portal TOS
+/// (ZipInfo). compile_loop must abort rather than install that loop.
+pub fn take_leftover_empty_reject() -> bool {
+    LEFTOVER_EMPTY_REJECT.with(|c| c.replace(false))
+}
+
+fn note_leftover_empty_reject() {
+    LEFTOVER_EMPTY_REJECT.with(|c| c.set(true));
+}
+
+fn leftover_has_listiter_id() -> bool {
+    !LISTITER_PRED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .is_null()
+        || LISTITER_TYPE_WORD.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+fn leftover_ptr_is_listiter(p: *const u8) -> bool {
+    if p.is_null() || (p as usize) & 1 != 0 {
+        return false;
+    }
+    let pred = LISTITER_PRED.load(std::sync::atomic::Ordering::Relaxed);
+    if !pred.is_null() {
+        let f: unsafe extern "C" fn(*const u8) -> i32 = unsafe { std::mem::transmute(pred) };
+        return unsafe { f(p) } != 0;
+    }
+    let ty = LISTITER_TYPE_WORD.load(std::sync::atomic::Ordering::Relaxed);
+    if ty == 0 {
+        return false;
+    }
+    let obj_ty = unsafe { *(p as *const usize) };
+    let obj_class = unsafe { *(p as *const usize).add(1) };
+    obj_ty == ty || obj_class == ty
+}
+
+/// TOS slots from the portal frame down through inlined callee
+/// frames. Recursive `_compile` can stack several frames on one
+/// portal; leftover-empty must peel until TOS is not a frame.
+pub(crate) unsafe fn live_tos_for_vable(
+    vinfo: &crate::virtualizable::VirtualizableInfo,
+    vable: *const u8,
+) -> Option<Vec<usize>> {
+    if vable.is_null() {
+        return None;
+    }
+    let vsd_i = vinfo
+        .static_fields
+        .iter()
+        .position(|f| f.name == "valuestackdepth")?;
+    if vinfo.array_fields.is_empty() {
+        let vsd = unsafe { vinfo.read_field(vable, vsd_i) as usize };
+        return Some(vec![vsd.saturating_sub(1)]);
+    }
+    let vable_ty = unsafe { *(vable as *const usize) };
+    let vable_class = unsafe { *(vable as *const usize).add(1) };
+    let vable_tid = gc_type_id(vable as usize);
+    let mut ptr = vable;
+    let mut path = Vec::new();
+    for _ in 0..10 {
+        let vsd = unsafe { vinfo.read_field(ptr, vsd_i) as usize };
+        let alen = if vinfo.array_fields.is_empty() {
+            usize::MAX
+        } else {
+            unsafe { vinfo.get_array_length(ptr, 0) }
+        };
+        // Heap vsd can sit past the minted / allocated array
+        // (stale token, or a different frame than the mint).
+        // GETARRAYITEM past that length is a SIGSEGV, not a peel.
+        if vsd == 0 || (alen != usize::MAX && vsd > alen) {
+            break;
+        }
+        let tos = vsd.saturating_sub(1);
+        if alen != usize::MAX && tos >= alen {
+            break;
+        }
+        path.push(tos);
+        let next = unsafe { vinfo.read_array_item(ptr, 0, tos) as usize };
+        if next == 0 {
+            break;
+        }
+        let next_ty = unsafe { *(next as *const usize) };
+        let next_class = unsafe { *(next as *const usize).add(1) };
+        // Payload `ob_type` / `w_class` can disagree with the vable
+        // pointer if one side still names the GC header word. Cross-
+        // compare both words, then fall back to the GC type_id so two
+        // frames still peel when the header convention differs.
+        let word_match = (vable_ty != 0 && (next_ty == vable_ty || next_class == vable_ty))
+            || (vable_class != 0 && (next_ty == vable_class || next_class == vable_class));
+        let same_type = word_match || vable_tid.is_some_and(|tid| gc_type_id(next) == Some(tid));
+        if !same_type {
+            break;
+        }
+        ptr = next as *const u8;
+    }
+    if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+        let alen0 = unsafe { vinfo.get_array_length(vable, 0) };
+        eprintln!(
+            "leftover-tos path={path:?} vsd0={} alen={alen0} vable={vable:p} tid={vable_tid:?}",
+            unsafe { vinfo.read_field(vable, vsd_i) }
+        );
+    }
+    Some(path)
+}
+
+fn gc_type_id(addr: usize) -> Option<u32> {
+    if addr == 0 || !majit_gc::gc_owns_object(addr) {
+        return None;
+    }
+    let tid = unsafe { (*majit_gc::header::header_of(addr)).type_id() };
+    (tid != 0).then_some(tid)
+}
+
+/// Walk the loop-red frame's TOS through inlined callee frames and
+/// return the live iterator. `execute_assembler` passes the live EC
+/// top frame (the inlined `_compile` when `portal_frame_reg` still
+/// names the caller). Offsets are baked from `VirtualizableInfo` so
+/// this is a plain C call.
+///
+/// If TOS is not a list iterator (a leftover-empty portal TOS can be
+/// ZipInfo / Tokenizer / str after densify remaps by position), peel the
+/// EC top frame published by `register_leftover_scan_frame`. Do not scan
+/// other locals: that can return a live `frame`. The type word /
+/// `is_list_iter` predicate is registered at JIT boot so this helper
+/// stays a 7-arg CallR.
+///
+/// CallR arg0 is the function pointer (not in `CallDescr.arg_types`).
+///
+/// `kind == 0` is DirectPointer: the array field is `*[len][items…]`
+/// (`FixedObjectArray`). `kind != 0` is EmbeddedArray: `ptr_off`
+/// locates the container's data pointer. `kind` is a separate
+/// argument so a `-1` sentinel cannot lose its sign across CallR.
+/// Uniform-word CallR target. wasm `call_indirect` types residual
+/// CallR as `(i64×n)->i64`; the typed pointer signature below is
+/// `(i32, i64×6)->i32` on wasm32 and traps. Dynasm/cranelift pass
+/// Refs as machine words too, so this is the CallR ABI on every
+/// backend.
+pub extern "C" fn leftover_peel_tos_i64(
+    vable: i64,
+    vsd_off: i64,
+    array_off: i64,
+    ptr_off: i64,
+    len_off: i64,
+    items_off: i64,
+    kind: i64,
+) -> i64 {
+    unsafe {
+        leftover_peel_tos(
+            vable as *const u8,
+            vsd_off,
+            array_off,
+            ptr_off,
+            len_off,
+            items_off,
+            kind,
+        ) as i64
+    }
+}
+
+pub unsafe extern "C" fn leftover_peel_tos(
+    vable: *const u8,
+    vsd_off: i64,
+    array_off: i64,
+    ptr_off: i64,
+    len_off: i64,
+    items_off: i64,
+    kind: i64,
+) -> *const u8 {
+    if vable.is_null() {
+        return vable;
+    }
+    if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+        eprintln!(
+            "leftover-peel enter vable={vable:p} extra={:p}",
+            leftover_scan_frame()
+        );
+    }
+    let vable_ty = unsafe { *(vable as *const usize) };
+    let vable_class = unsafe { *(vable as *const usize).add(1) };
+    let vable_tid = gc_type_id(vable as usize);
+    let vable_is_gc = majit_gc::gc_owns_object(vable as usize);
+    let is_frame = |p: usize| -> bool {
+        if p == 0 || p & 1 != 0 {
+            return false;
+        }
+        if vable_is_gc && !majit_gc::gc_owns_object(p) {
+            return false;
+        }
+        let ty = unsafe { *(p as *const usize) };
+        let class = unsafe { *(p as *const usize).add(1) };
+        (vable_ty != 0 && (ty == vable_ty || class == vable_ty))
+            || (vable_class != 0 && (ty == vable_class || class == vable_class))
+            || vable_tid.is_some_and(|tid| gc_type_id(p) == Some(tid))
+    };
+    let is_listiter = |p: usize| -> bool {
+        if p == 0 || p & 1 != 0 {
+            return false;
+        }
+        let pred = LISTITER_PRED.load(std::sync::atomic::Ordering::Relaxed);
+        if !pred.is_null() {
+            let f: unsafe extern "C" fn(*const u8) -> i32 = unsafe { std::mem::transmute(pred) };
+            return unsafe { f(p as *const u8) } != 0;
+        }
+        let ty = LISTITER_TYPE_WORD.load(std::sync::atomic::Ordering::Relaxed);
+        if ty == 0 {
+            return false;
+        }
+        if vable_is_gc && !majit_gc::gc_owns_object(p) {
+            return false;
+        }
+        let obj_ty = unsafe { *(p as *const usize) };
+        let obj_class = unsafe { *(p as *const usize).add(1) };
+        obj_ty == ty || obj_class == ty
+    };
+    let items_of = |frame: *const u8| -> Option<(*const usize, usize)> {
+        let container = unsafe { *(frame.add(array_off as usize) as *const *const u8) };
+        if container.is_null() {
+            return None;
+        }
+        let alen = unsafe { *(container.add(len_off as usize) as *const usize) };
+        let items = if kind == 0 {
+            unsafe { container.add(items_off as usize) as *const usize }
+        } else {
+            unsafe { *(container.add(ptr_off as usize) as *const *const usize) }
+        };
+        if items.is_null() || alen == 0 {
+            return None;
+        }
+        Some((items, alen))
+    };
+    // Walk TOS only. Scanning other locals can return a live `frame`
+    // (or ZipInfo) and compile FOR_ITER against it.
+    let peel_one = |start: *const u8| -> *const u8 {
+        let mut ptr = start;
+        for _ in 0..10 {
+            let vsd = unsafe { *(ptr.add(vsd_off as usize) as *const usize) };
+            let Some((items, alen)) = items_of(ptr) else {
+                break;
+            };
+            if vsd == 0 {
+                break;
+            }
+            let tos = vsd.saturating_sub(1);
+            if tos >= alen {
+                break;
+            }
+            let next = unsafe { *items.add(tos) };
+            if next == 0 {
+                break;
+            }
+            if !is_frame(next) {
+                if is_listiter(next) {
+                    return next as *const u8;
+                }
+                return std::ptr::null();
+            }
+            ptr = next as *const u8;
+        }
+        std::ptr::null()
+    };
+    let found = peel_one(vable);
+    if !found.is_null() {
+        return found;
+    }
+    // Portal TOS is ZipInfo / Tokenizer / str: the live FOR_ITER
+    // iterator is on the inlined `_compile` (EC top), not this red.
+    let extra = leftover_scan_frame() as *const u8;
+    if !extra.is_null() && extra != vable {
+        let extra_found = peel_one(extra);
+        if !extra_found.is_null() {
+            if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+                eprintln!(
+                    "leftover-peel extra={extra:p} found={extra_found:p} portal_tos={found:p}"
+                );
+            }
+            return extra_found;
+        }
+    }
+    if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+        eprintln!(
+            "leftover-peel vable={vable:p} tos={found:p} extra={extra:p} ty={:#x}",
+            LISTITER_TYPE_WORD.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+    std::ptr::null()
+}
+
 /// The assertion at the baking site below is what that invariant buys in
 /// code: `compile.py assert i == len(inputargs)` requires the baked
 /// lengths to account for EXACTLY the inputargs the tracer expanded, so a
@@ -1897,7 +2301,46 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     entry_prefix_len: usize,
     index_of_virtualizable: usize,
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
+    entry_field_oprefs: &[OpRef],
+    live_from_entry: &[(OpRef, u32)],
+    // TOS slot path: portal first, then each inlined callee frame.
+    live_tos: Option<Vec<usize>>,
 ) {
+    patch_new_loop_to_load_virtualizable_fields_with_vable(
+        ops,
+        inputargs,
+        vinfo,
+        vable_array_lengths,
+        entry_prefix_len,
+        index_of_virtualizable,
+        constants,
+        entry_field_oprefs,
+        live_from_entry,
+        live_tos,
+        std::ptr::null(),
+        None,
+    );
+}
+
+pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
+    ops: &mut Vec<majit_ir::OpRc>,
+    inputargs: &mut Vec<InputArg>,
+    vinfo: &crate::virtualizable::VirtualizableInfo,
+    vable_array_lengths: &[usize],
+    entry_prefix_len: usize,
+    index_of_virtualizable: usize,
+    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
+    entry_field_oprefs: &[OpRef],
+    live_from_entry: &[(OpRef, u32)],
+    live_tos: Option<Vec<usize>>,
+    orig_vable: *const u8,
+    inline_vable: Option<OpRef>,
+) {
+    // `orig_vable` is the compile-time heap frame leftover-empty walked
+    // for lengths/TOS. Portal GETFIELDs still use the runtime red
+    // (`inputargs[index_of_virtualizable]`). leftover iterator remaps
+    // (leftover_peel_tos / Getfield seq) use `inline_vable` when that
+    // box is the inlined `_compile`, not the portal.
     // `compile.py:425-461` redirects each entry inputarg at its own
     // `_forwarded` slot — `box.set_forwarded(extra_ops[-1])` — and `emit_op`
     // walks those slots through `get_box_replacement` as it copies the body.
@@ -1914,19 +2357,61 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // which is what makes the two constructions equivalent.
     use majit_ir::{Op, OpCode, OpRef, descr::ArrayFlag};
 
-    fn set_local_forwarded(forwarding: &mut Vec<Option<Operand>>, source: OpRef, target: Operand) {
-        if source.is_none() || source.is_constant() {
-            return;
+    // compile.py `box.set_forwarded` is Box identity, not a raw number.
+    // InputArg(n) and {Int,Ref}Op(n) share `OpRef::raw()`; a single vec
+    // keyed by raw remaps a leftover last_instr mint onto a live pointer
+    // op (SIGSEGV: ldr [8, #0x18]) and the frame onto an int local.
+    struct LocalForwarding {
+        inputargs: Vec<Option<Operand>>,
+        ops: Vec<Option<Operand>>,
+    }
+
+    impl LocalForwarding {
+        fn with_op_capacity(max_runtime_ref: u32) -> Self {
+            Self {
+                inputargs: Vec::new(),
+                ops: vec![None; (max_runtime_ref as usize).saturating_add(1)],
+            }
         }
-        let idx = source.raw() as usize;
-        if idx >= forwarding.len() {
-            forwarding.resize(idx + 1, None);
+
+        fn slot_mut(&mut self, source: OpRef) -> Option<&mut Option<Operand>> {
+            if source.is_none() || source.is_constant() {
+                return None;
+            }
+            let idx = source.raw() as usize;
+            let bank = if source.is_input_arg() {
+                &mut self.inputargs
+            } else {
+                &mut self.ops
+            };
+            if idx >= bank.len() {
+                bank.resize(idx + 1, None);
+            }
+            Some(&mut bank[idx])
         }
-        forwarding[idx] = Some(target);
+
+        fn slot(&self, source: OpRef) -> Option<&Operand> {
+            if source.is_none() || source.is_constant() {
+                return None;
+            }
+            let idx = source.raw() as usize;
+            let bank = if source.is_input_arg() {
+                &self.inputargs
+            } else {
+                &self.ops
+            };
+            bank.get(idx).and_then(|s| s.as_ref())
+        }
+    }
+
+    fn set_local_forwarded(forwarding: &mut LocalForwarding, source: OpRef, target: Operand) {
+        if let Some(slot) = forwarding.slot_mut(source) {
+            *slot = Some(target);
+        }
     }
 
     fn get_local_box_replacement(
-        forwarding: &[Option<Operand>],
+        forwarding: &LocalForwarding,
         mut opref: OpRef,
     ) -> Option<Operand> {
         if opref.is_none() || opref.is_constant() {
@@ -1934,13 +2419,12 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         }
         let mut found = None;
         loop {
-            let idx = opref.raw() as usize;
-            match forwarding.get(idx) {
-                Some(Some(next)) => {
+            match forwarding.slot(opref) {
+                Some(next) => {
                     opref = next.to_opref();
                     found = Some(next.clone());
                 }
-                _ => return found,
+                None => return found,
             }
         }
     }
@@ -1948,7 +2432,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     fn emit_forwarded_patch_op(
         extra_ops: &mut Vec<majit_ir::OpRc>,
         op: &Op,
-        forwarding: &mut Vec<Option<Operand>>,
+        forwarding: &mut LocalForwarding,
         next_opref: &mut u32,
     ) {
         let mut emitted = op.clone();
@@ -1999,9 +2483,200 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         index_of_virtualizable < entry_prefix_len,
         "virtualizable must live inside the entry prefix (pyjitpl.py:3589 index_of_virtualizable < num_red_args)"
     );
-    if inputargs.len() <= entry_prefix_len {
-        // Already reduced or no virtualizable expansion in the trace.
-        return;
+    let present: rustc_hash::FxHashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
+    let leftover = leftover_inputarg_refs(ops, &present);
+    let mut walk_lengths = vable_array_lengths.to_vec();
+    let mut field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
+    let baked_field_len = field_types.len();
+    let mut expanded_len = entry_prefix_len + field_types.len();
+    // `vable_array_lengths` is `vinfo.get_array_length` at some later
+    // read (or a finish-path re-read). The boxes
+    // `initialize_virtualizable` minted are `entry_field_oprefs`. A
+    // leftover-empty rebuild that trusts the baked length treats live
+    // virtualstate boxes as last_instr (binary_slice: in=24 baked=8)
+    // or leaves field slots as incoming NULLs (exception: in=18
+    // entry=13). Prefer the mint list when it covers the statics.
+    if !entry_field_oprefs.is_empty() && entry_field_oprefs.len() >= vinfo.static_fields.len() {
+        let n_array_items = entry_field_oprefs.len() - vinfo.static_fields.len();
+        fit_walk_lengths(&mut walk_lengths, vinfo.array_fields.len(), n_array_items);
+        field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
+        expanded_len = entry_prefix_len + field_types.len();
+    }
+    let mut field_raws: rustc_hash::FxHashSet<u32> = entry_field_oprefs
+        .iter()
+        .filter(|opref| opref.is_input_arg())
+        .map(|opref| opref.raw())
+        .collect();
+    // Sequential prefix+offset ids are only the field boxes when
+    // `initialize_virtualizable` minted that dense tail (`has_expanded_tail`).
+    // The usual heap-read path mints fresh InputArgs at high ids
+    // (`vable_entry_oprefs`); filling the sequential range then classifies
+    // virtualstate body leftovers as field slots and, after rebuild, forwards
+    // `last_instr` onto a locals GETARRAYITEM (or a leftover local onto the
+    // frame). Tests that omit `entry_field_oprefs` still use the dense ids.
+    if field_raws.is_empty() {
+        for raw in entry_prefix_len as u32..expanded_len as u32 {
+            field_raws.insert(raw);
+        }
+    }
+    let leftover_fields: Vec<OpRef> = leftover
+        .iter()
+        .copied()
+        .filter(|r| field_raws.contains(&r.raw()))
+        .collect();
+    // compile.py `box.set_forwarded` on the virtualizable red — one box,
+    // `virtualizable_boxes[-1]`. Every leftover Ref that is not a field is
+    // *not* that red: virtualstate LABEL/JUMP/failargs keep their own
+    // InputArgRefs, and rewriting them all onto the frame puts `last_instr`
+    // in a pointer slot (SIGSEGV at locals_cells_stack_w) and the frame in
+    // an int local (`TypeError: 'frame' < 'int'`).
+    // compile.py forwards only `virtualizable_boxes[-1]`. That box is
+    // the red at `index_of_virtualizable` (PyFrame: InputArg 0). A
+    // leftover range-iterator or list Ref is not the identity; remapping
+    // it onto the frame is `TypeError: 'frame' object is not an iterator`.
+    let leftover_identity: Vec<OpRef> = leftover
+        .iter()
+        .copied()
+        .filter(|r| {
+            r.ty() == Some(Type::Ref)
+                && !field_raws.contains(&r.raw())
+                && r.raw() == index_of_virtualizable as u32
+        })
+        .collect();
+
+    // leftover-empty: `execute_assembler` passes only the red prefix
+    // (`warmstate.py`). GETFIELD the minted (or shorter present) tail.
+    // Growing that walk to a longer baked `get_array_length` treats live
+    // virtualstate boxes as last_instr (`'frame' object is not an
+    // iterator` in setuptools). Extra slots stay on LABEL/JUMP and must
+    // not join `loop.inputargs` (`compile.py:431 inputargs[:num_red_args]`).
+    if leftover_fields.is_empty() && leftover_identity.is_empty() {
+        let n_static = vinfo.static_fields.len();
+        let present_fields = inputargs.len().saturating_sub(entry_prefix_len);
+        if present_fields == 0 {
+            return;
+        }
+        let minted_fields =
+            if !entry_field_oprefs.is_empty() && entry_field_oprefs.len() >= n_static {
+                entry_field_oprefs.len()
+            } else {
+                baked_field_len
+            };
+        let walk_fields = present_fields.min(minted_fields);
+        if walk_fields < n_static {
+            return;
+        }
+        fit_walk_lengths(
+            &mut walk_lengths,
+            vinfo.array_fields.len(),
+            walk_fields - n_static,
+        );
+        field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
+        expanded_len = entry_prefix_len + field_types.len();
+        let types_match = inputargs
+            .get(entry_prefix_len..expanded_len)
+            .is_some_and(|tail| tail.iter().map(|ia| ia.tp).eq(field_types.iter().copied()));
+        if !types_match {
+            inputargs.truncate(entry_prefix_len);
+            return;
+        }
+    }
+
+    // `compile.py:458 assert i == len(inputargs)` requires the expanded
+    // list to be exactly prefix + statics + baked array items. Virtualstate
+    // + densify can leave a *partial* tail (some array slots still present,
+    // others dropped because they went virtual) or a *long* tail (identity
+    // leftovers still riding as inputargs). Either shape is not the
+    // RPython list: walking the live `vable_array_lengths` against it
+    // overruns or fails the equality. Rebuild to the expected shape, then
+    // remap leftover field/identity refs the same way the prefix-only
+    // reduce path already does.
+    if inputargs.len() != expanded_len {
+        // Virtualstate + densify may already have reduced `inputargs` to the
+        // red prefix (`start_state.renamed_inputargs`). Skip-unmodified
+        // store-back and short-preamble `used_boxes` leave the original
+        // InputArgRefs on LABEL/JUMP/failargs. RPython remaps them via
+        // `box.set_forwarded` because those boxes are still in
+        // `loop.inputargs`. Rebuild the expanded field list when a leftover
+        // names a field slot; a leftover Ref that is not a field is the
+        // virtualizable identity and rewrites onto the vable red.
+        if leftover_fields.is_empty() && leftover_identity.is_empty() {
+            if inputargs.len() > expanded_len {
+                inputargs.truncate(expanded_len);
+            } else if inputargs.len() <= entry_prefix_len {
+                return;
+            }
+        }
+        if leftover_fields.is_empty() && inputargs.len() <= entry_prefix_len {
+            let vable_rc =
+                majit_ir::InputArgRc::new(inputargs[index_of_virtualizable].fresh_value_copy());
+            let vable_box = Operand::from_bound_inputarg(&vable_rc);
+            let max_runtime_ref = leftover_identity
+                .iter()
+                .map(|r| r.raw())
+                .chain(ops.iter().flat_map(|op| {
+                    std::iter::once(op.pos().get())
+                        .chain(op.getarglist_copy().into_iter().map(|b| b.to_opref()))
+                        .chain(
+                            op.guard_fail_args()
+                                .into_iter()
+                                .flatten()
+                                .map(|b| b.to_opref()),
+                        )
+                        .map(|r| {
+                            if r.is_none() || r.is_constant() {
+                                0
+                            } else {
+                                r.raw()
+                            }
+                        })
+                }))
+                .max()
+                .unwrap_or(0);
+            let mut next_opref = max_runtime_ref + 1;
+            let mut forwarding = LocalForwarding::with_op_capacity(max_runtime_ref);
+            for &identity in &leftover_identity {
+                set_local_forwarded(&mut forwarding, identity, vable_box.clone());
+            }
+            let original_ops = std::mem::take(ops);
+            let mut extra_ops: Vec<majit_ir::OpRc> = Vec::new();
+            for op in original_ops.iter() {
+                emit_forwarded_patch_op(&mut extra_ops, op, &mut forwarding, &mut next_opref);
+            }
+            *ops = extra_ops;
+            return;
+        }
+        let mut expanded = Vec::with_capacity(expanded_len);
+        for i in 0..entry_prefix_len {
+            expanded.push(
+                inputargs
+                    .iter()
+                    .find(|ia| ia.index as usize == i)
+                    .map(InputArg::fresh_value_copy)
+                    .unwrap_or_else(|| InputArg::from_type(Type::Ref, i as u32)),
+            );
+        }
+        for (offset, ty) in field_types.into_iter().enumerate() {
+            // Densify numbers surviving field slots 0..N. Those ids are
+            // what LABEL/JUMP/failargs still name. `vable_entry_oprefs`
+            // keeps the pre-densify mint (often 50+). Prefer the densified
+            // slot so `box.set_forwarded` hits the ops; still snap-forward
+            // the mint below when a leftover kept that id.
+            let dense_idx = entry_prefix_len + offset;
+            let idx = inputargs
+                .get(dense_idx)
+                .map(|ia| ia.index)
+                .or_else(|| {
+                    entry_field_oprefs
+                        .get(offset)
+                        .copied()
+                        .filter(|opref| opref.is_input_arg())
+                        .map(OpRef::raw)
+                })
+                .unwrap_or(dense_idx as u32);
+            expanded.push(InputArg::from_type(ty, idx));
+        }
+        *inputargs = expanded;
     }
 
     let expanded_inputargs: Vec<majit_ir::InputArgRc> = inputargs
@@ -2046,10 +2721,10 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         .map(|m| m + 1)
         .unwrap_or(0);
 
-    let mut forwarding: Vec<Option<Operand>> =
-        vec![None; (max_runtime_ref as usize).saturating_add(1)];
+    let mut forwarding = LocalForwarding::with_op_capacity(max_runtime_ref);
     let mut extra_ops: Vec<majit_ir::OpRc> = Vec::new();
     let mut i = entry_prefix_len;
+    let mut field_bounds: Vec<Operand> = Vec::new();
 
     // compile.py:431-432 — i = jitdriver_sd.num_red_args; loop.inputargs =
     // inputargs[:i].  `entry_prefix_len` is that `i`, stated by the caller
@@ -2085,7 +2760,17 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         op.pos().set(new_opref);
         op.setdescr(descr);
         let op = OpRc::new(op);
-        set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&op));
+        let bound = Operand::from_bound_op(&op);
+        set_local_forwarded(&mut forwarding, old_opref, bound.clone());
+        field_bounds.push(bound.clone());
+        if let Some(&snap) = entry_field_oprefs.get(fi) {
+            if snap.is_input_arg()
+                && snap != old_opref
+                && leftover_fields.iter().any(|r| r.raw() == snap.raw())
+            {
+                set_local_forwarded(&mut forwarding, snap, bound);
+            }
+        }
         extra_ops.push(op);
         i += 1;
     }
@@ -2103,7 +2788,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         // this trace's GREENS, so a virtualizable with other lengths keys to
         // a different trace and never reaches this entry. See the SOUNDNESS
         // INVARIANT on this function.
-        let array_len = vable_array_lengths.get(ai).copied().unwrap_or(0);
+        let array_len = walk_lengths.get(ai).copied().unwrap_or(0);
         assert!(
             i + array_len <= expanded_inputargs.len(),
             "array {ai} length {array_len} would overrun inputargs (i={i}, len={})",
@@ -2234,7 +2919,17 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             elem_op.pos().set(new_opref);
             elem_op.setdescr(item_descr.clone());
             let elem_op = OpRc::new(elem_op);
-            set_local_forwarded(&mut forwarding, old_opref, Operand::from_bound_op(&elem_op));
+            let bound = Operand::from_bound_op(&elem_op);
+            set_local_forwarded(&mut forwarding, old_opref, bound.clone());
+            field_bounds.push(bound.clone());
+            if let Some(&snap) = entry_field_oprefs.get(i - entry_prefix_len) {
+                if snap.is_input_arg()
+                    && snap != old_opref
+                    && leftover_fields.iter().any(|r| r.raw() == snap.raw())
+                {
+                    set_local_forwarded(&mut forwarding, snap, bound);
+                }
+            }
             extra_ops.push(elem_op);
             i += 1;
         }
@@ -2252,11 +2947,257 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         expanded_inputargs.len()
     );
 
+    // compile.py `box.set_forwarded` on the virtualizable red: a leftover
+    // InputArgRef that is not a field snapshot is the identity box
+    // virtualstate left on LABEL/JUMP/failargs after densify dropped it.
+    for &identity in &leftover_identity {
+        set_local_forwarded(&mut forwarding, identity, vable_box.clone());
+    }
+
+    // compile.py walks field boxes by Box identity. The positional
+    // `InputArg(prefix+i)` remap above is the densified fallback.
+    // A mint-identity bind (renamed[p] == mint[j]) must win: GET_ITER
+    // of that slot reloads field j, not the valuestack slot at p.
+    // Portal TOS is an index into *this* vable's array. leftover_peel_tos
+    // reads the live heap (alen=38 on `_compile`) so a heap vsd past the
+    // mint walk (31/29 leftover-empty: path=[28] on a 25-slot mint) must
+    // still emit the peel. GETARRAYITEM below stays on `walk_lengths`.
+    // A previous clamp dropped that peel and remapped FOR_ITER onto
+    // locals[22] (ZipInfo / `_compile.p`).
+
+    // ListIter leftovers use LISTITER_TOS_RELOAD: the live TOS slot
+    // `valuestackdepth - 1`, not a baked local. Also pick up leftover
+    // Getfield(seq) receivers densify missed (descr name after opt).
+    let mut tos_sources: Vec<OpRef> = live_from_entry
+        .iter()
+        .filter(|(_, j)| *j == LISTITER_TOS_RELOAD)
+        .map(|(s, _)| *s)
+        .collect();
+    for op in ops.iter() {
+        if op.opcode != OpCode::GetfieldGcR {
+            continue;
+        }
+        if !op.getdescr().is_some_and(|d| {
+            d.as_field_descr()
+                .is_some_and(crate::history::is_list_iter_seq_field)
+        }) {
+            continue;
+        }
+        if let Some(src) = op.getarglist().first().map(|a| a.to_opref()) {
+            if src.is_input_arg() && src.ty() == Some(Type::Ref) && !tos_sources.contains(&src) {
+                tos_sources.push(src);
+            }
+        }
+    }
+    // ForIterNext residual leftover (no Getfield seq). Bind it to the
+    // peeled TOS only when leftover-empty would otherwise GETFIELD a
+    // portal slot that is not the iterator. Leftover numbering is the
+    // portal field space (`InputArg(28)` = field 26). After a peel the
+    // portal TOS *is* the callee frame — leftover at that field must
+    // follow the inner TOS, not stay on GETARRAYITEM(portal). A leftover
+    // already at the unpeeled TOS field (range for-loops) stays
+    // positional; remapping every ForIterNext leftover GC-panicked.
+    if let Some(path) = live_tos.as_ref() {
+        if let Some(&portal_tos) = path.first() {
+            let n_static = vinfo.static_fields.len();
+            let portal_tos_inputarg = (entry_prefix_len + n_static + portal_tos) as u32;
+            let peeled = path.len() > 1;
+            for op in ops.iter() {
+                if !op.opcode.is_call() {
+                    continue;
+                }
+                let is_foriter = op.getdescr().is_some_and(|d| {
+                    d.as_call_descr().is_some_and(|cd| {
+                        cd.get_extra_info().runtime_helper
+                            == majit_ir::RuntimeHelperKind::ForIterNext
+                    })
+                });
+                if !is_foriter {
+                    continue;
+                }
+                for arg in op.getarglist() {
+                    let src = arg.to_opref();
+                    // Densified leftover below the portal TOS, or *at*
+                    // the portal TOS after a peel (that slot is a frame).
+                    // High-id split leftovers stay off this bind.
+                    // Call args include ConstInt helper targets; do not
+                    // call `raw()` until `is_input_arg` is true.
+                    if !src.is_input_arg() || src.ty() != Some(Type::Ref) {
+                        continue;
+                    }
+                    let below_portal = src.raw() < portal_tos_inputarg;
+                    let at_peeled_frame = peeled && src.raw() == portal_tos_inputarg;
+                    if src.raw() >= entry_prefix_len as u32
+                        && (below_portal || at_peeled_frame)
+                        && !tos_sources.contains(&src)
+                    {
+                        tos_sources.push(src);
+                    }
+                }
+            }
+            if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+                let leftover_raws: Vec<u32> = leftover.iter().map(|r| r.raw()).collect();
+                eprintln!(
+                    "leftover-empty expanded={} baked={} entry={} prefix={} n_static={} \
+                     path={path:?} portal_tos_ia={portal_tos_inputarg} peeled={peeled} \
+                     leftover={leftover_raws:?} tos_src={:?} inline_vable={inline_vable:?}",
+                    expanded_inputargs.len(),
+                    baked_field_len,
+                    entry_field_oprefs.len(),
+                    entry_prefix_len,
+                    n_static,
+                    tos_sources.iter().map(|r| r.raw()).collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+    let peel_vable_prologue = match inline_vable {
+        Some(r) if r.is_input_arg() && (r.raw() as usize) < entry_prefix_len => Some(
+            Operand::from_bound_inputarg(&expanded_inputargs[r.raw() as usize]),
+        ),
+        Some(r) if r.is_input_arg() => Some(Operand::from_opref(r)),
+        Some(_) => None,
+        None => Some(vable_box.clone()),
+    };
+    let emit_peel = |extra_ops: &mut Vec<majit_ir::OpRc>,
+                     next_opref: &mut u32,
+                     peel_vable: Operand|
+     -> Option<Operand> {
+        let vsd_f = vinfo
+            .static_fields
+            .iter()
+            .find(|f| f.name == "valuestackdepth")?;
+        let arr = vinfo.array_fields.first()?;
+        let (ptr_off, kind) = match arr.storage {
+            crate::virtualizable::VableArrayStorage::EmbeddedArray { ptr_offset } => {
+                (ptr_offset as i64, 1_i64)
+            }
+            _ => (0, 0_i64),
+        };
+        let effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        let descr = majit_ir::descr::make_call_descr(
+            vec![
+                Type::Ref,
+                Type::Int,
+                Type::Int,
+                Type::Int,
+                Type::Int,
+                Type::Int,
+                Type::Int,
+            ],
+            Type::Ref,
+            effect,
+        );
+        let peel_fn = if cfg!(target_arch = "wasm32") {
+            leftover_peel_tos_i64 as usize as i64
+        } else {
+            leftover_peel_tos as usize as i64
+        };
+        let fn_op = Operand::from_opref(OpRef::const_int(peel_fn));
+        let call_opref = OpRef::ref_op(*next_opref);
+        *next_opref += 1;
+        let mut call = Op::new(
+            OpCode::CallR,
+            &[
+                fn_op,
+                peel_vable,
+                Operand::from_opref(OpRef::const_int(vsd_f.offset as i64)),
+                Operand::from_opref(OpRef::const_int(arr.field_offset as i64)),
+                Operand::from_opref(OpRef::const_int(ptr_off)),
+                Operand::from_opref(OpRef::const_int(arr.length_offset as i64)),
+                Operand::from_opref(OpRef::const_int(arr.items_offset as i64)),
+                Operand::from_opref(OpRef::const_int(kind)),
+            ],
+        );
+        call.pos().set(call_opref);
+        call.setdescr(descr);
+        let call = OpRc::new(call);
+        extra_ops.push(call.clone());
+        Some(Operand::from_bound_op(&call))
+    };
+    let mut peel_emitted = false;
+    if !tos_sources.is_empty() && leftover_has_listiter_id() && !orig_vable.is_null() {
+        let vsd_f = vinfo
+            .static_fields
+            .iter()
+            .find(|f| f.name == "valuestackdepth");
+        let arr = vinfo.array_fields.first();
+        if let (Some(vsd_f), Some(arr)) = (vsd_f, arr) {
+            let (ptr_off, kind) = match arr.storage {
+                crate::virtualizable::VableArrayStorage::EmbeddedArray { ptr_offset } => {
+                    (ptr_offset as i64, 1_i64)
+                }
+                _ => (0, 0_i64),
+            };
+            let preview = unsafe {
+                leftover_peel_tos(
+                    orig_vable,
+                    vsd_f.offset as i64,
+                    arr.field_offset as i64,
+                    ptr_off,
+                    arr.length_offset as i64,
+                    arr.items_offset as i64,
+                    kind,
+                )
+            };
+            if !leftover_ptr_is_listiter(preview) {
+                if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+                    eprintln!(
+                        "leftover-empty reject non-iterator TOS={preview:p} orig={orig_vable:p}"
+                    );
+                }
+                tos_sources.clear();
+                note_leftover_empty_reject();
+            }
+        }
+    }
+    if !tos_sources.is_empty() {
+        if let Some(peel_vable) = peel_vable_prologue {
+            if let Some(bound) = emit_peel(&mut extra_ops, &mut next_opref, peel_vable) {
+                for &source in &tos_sources {
+                    set_local_forwarded(&mut forwarding, source, bound.clone());
+                }
+                peel_emitted = true;
+                if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+                    eprintln!(
+                        "leftover-empty peel_emitted tos_src={:?}",
+                        tos_sources.iter().map(|r| r.raw()).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+    for &(source, mint_index) in live_from_entry {
+        if mint_index == LISTITER_TOS_RELOAD {
+            continue;
+        }
+        if tos_sources.contains(&source) {
+            continue;
+        }
+        if let Some(bound) = field_bounds.get(mint_index as usize) {
+            set_local_forwarded(&mut forwarding, source, bound.clone());
+        }
+    }
+
     // compile.py — emit_op walks the existing ops re-emitting
     // each one with `get_box_replacement` applied to args + fail_args.
     let original_ops = std::mem::take(ops);
     for op in original_ops.iter() {
         emit_forwarded_patch_op(&mut extra_ops, op, &mut forwarding, &mut next_opref);
+        if !peel_emitted && !tos_sources.is_empty() && inline_vable == Some(op.pos().get()) {
+            if let Some(emitted) = extra_ops.last().cloned() {
+                let peel_vable = Operand::from_bound_op(&emitted);
+                if let Some(bound) = emit_peel(&mut extra_ops, &mut next_opref, peel_vable) {
+                    for &source in &tos_sources {
+                        set_local_forwarded(&mut forwarding, source, bound.clone());
+                    }
+                    peel_emitted = true;
+                }
+            }
+        }
     }
     *ops = extra_ops;
 }
@@ -2673,7 +3614,7 @@ pub fn compile_tmp_callback(
 mod tests {
     use super::*;
     use crate::compile::make_fail_descr_with_index;
-    use crate::history::test_support::rooted_inputarg_operand;
+    use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
 
@@ -2932,6 +3873,9 @@ mod tests {
             1,
             0,
             &mut constants,
+            &[],
+            &[],
+            None,
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
@@ -2973,6 +3917,1835 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_new_loop_reloads_leftover_inputargs_after_virtualstate_reduce() {
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        // Densify already dropped the expanded field, but skip-unmodified
+        // store-back left the snapshot InputArgRef on LABEL/JUMP/failargs.
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+            ],
+        );
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 0)]);
+        guard.setfailargs(smallvec::smallvec![
+            rooted_inputarg_operand(Type::Ref, 0),
+            rooted_inputarg_operand(Type::Ref, 1),
+        ]);
+        let jump = Op::new(
+            OpCode::Jump,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, guard, jump]
+            .into_iter()
+            .map(OpRc::new)
+            .collect();
+        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &[],
+            &[],
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        let reloaded = ops[0].pos().get();
+        assert_eq!(
+            ops[1]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), reloaded]
+        );
+        assert_eq!(
+            ops[2]
+                .guard_fail_args()
+                .unwrap()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), reloaded]
+        );
+        assert_eq!(
+            ops[3]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), reloaded]
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_leaves_non_identity_leftover_ref() {
+        // InputArg 98 is a virtualstate body Ref, not virtualizable_boxes[-1]
+        // (the prefix red at index_of_virtualizable). compile.py does not
+        // forward it onto the frame.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 98),
+            ],
+        );
+        let jump = Op::new(
+            OpCode::Jump,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 98),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, jump].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &[],
+            &[],
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            ops[0]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(98)]
+        );
+        assert_eq!(
+            ops[1]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0), OpRef::input_arg_ref(98)]
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_does_not_rewrite_multiple_leftover_refs_as_identity() {
+        // Two leftover Refs after densify are virtualstate body args, not
+        // two copies of the vable red. compile.py forwards only
+        // `virtualizable_boxes[-1]`.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 98),
+                rooted_inputarg_operand(Type::Ref, 99),
+            ],
+        );
+        let jump = Op::new(
+            OpCode::Jump,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 98),
+                rooted_inputarg_operand(Type::Ref, 99),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, jump].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &[],
+            &[],
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            ops[0]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_ref(98),
+                OpRef::input_arg_ref(99),
+            ]
+        );
+        assert_eq!(
+            ops[1]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_ref(98),
+                OpRef::input_arg_ref(99),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_forwards_densified_field_slots_not_only_entry_mints() {
+        // Densify left last_instr as InputArg(2) on LABEL. The mint
+        // `vable_entry_oprefs` still names InputArg(50). Rebuild must
+        // forward 2 — the id the ops still use — or the backend treats
+        // InputArg(2) as a missing entry register (last_instr-as-pointer).
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("obj", Type::Ref, 16);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            24,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(32));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Int, 2),
+                rooted_inputarg_operand(Type::Ref, 3),
+                rooted_inputarg_operand(Type::Int, 50),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_int(50), OpRef::input_arg_ref(51)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[2],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        let label_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("label")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert!(
+            !label_args.iter().any(|r| r.is_input_arg() && r.raw() == 2),
+            "densified last_instr InputArg(2) must be forwarded to GETFIELD, got {label_args:?}"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
+            "must emit GETFIELD_GC_I for last_instr"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_inputarg_forward_does_not_alias_op_raw() {
+        // InputArg(50) and RefOp(50) share OpRef::raw(). Forwarding the
+        // leftover last_instr mint must not rewrite a live pointer op.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Int, 50),
+            ],
+        );
+        let get = Op::new(OpCode::GetfieldGcR, &[rooted_resop_operand(Type::Ref, 50)]);
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, get].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_int(50)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            None,
+        );
+
+        let get_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::GetfieldGcR)
+            .expect("getfield")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(
+            get_args,
+            vec![OpRef::ref_op(50)],
+            "RefOp(50) must stay a pointer; InputArg(50) last_instr must not steal its raw"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_rebuilds_partially_reduced_array_tail() {
+        // Virtualstate kept a prefix of the array InputArgs (6 of 8) and
+        // dropped the rest. The live vable still reports length 8, so a
+        // walk that trusts `vable_array_lengths` against the partial list
+        // overruns (`i + 8 > 8` after the red + 4 statics, or here
+        // red + 2 kept items). Rebuild to the baked shape first.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            16,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(24));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 2),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_ref(2),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[4],
+            1,
+            0,
+            &mut constants,
+            &[],
+            &[],
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert!(
+            ops.iter()
+                .filter(|op| op.opcode == OpCode::GetarrayitemRawR)
+                .count()
+                == 1,
+            "a short leftover-empty tail must GETARRAYITEM only the present slots"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_drops_leftover_empty_extras_from_entry() {
+        // leftover-empty, inputargs = prefix + minted fields + 2 extras.
+        // compile.py `loop.inputargs = inputargs[:num_red_args]`; extras
+        // stay on LABEL as leftover InputArgs and must not join the
+        // assembler entry (`execute_assembler` passes only the reds).
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 2),
+                rooted_inputarg_operand(Type::Int, 3),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_ref(2),
+            InputArg::new_int(3),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_ref(1)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcR),
+            "must GETFIELD the minted obj slot"
+        );
+        let label_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("label")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(label_args.len(), 4);
+        assert_eq!(label_args[0], OpRef::input_arg_ref(0));
+        assert!(
+            !label_args[1].is_input_arg(),
+            "minted obj must be a GETFIELD result, got {label_args:?}"
+        );
+        assert_eq!(label_args[2], OpRef::input_arg_ref(2));
+        assert_eq!(label_args[3], OpRef::input_arg_int(3));
+    }
+
+    #[test]
+    fn test_patch_new_loop_does_not_getfield_past_the_mint() {
+        // leftover-empty. Entry minted last_instr + 1 item; the live tail
+        // and baked length are last_instr + 3 items. Growing the walk to
+        // the bake treats the extra live boxes as array items (frame-as
+        // iterator). GETARRAYITEM only the mint; extras stay on LABEL.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            16,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(24));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Int, 1),
+                rooted_inputarg_operand(Type::Ref, 2),
+                rooted_inputarg_operand(Type::Ref, 3),
+                rooted_inputarg_operand(Type::Ref, 4),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_int(1),
+            InputArg::new_ref(2),
+            InputArg::new_ref(3),
+            InputArg::new_ref(4),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_int(1), OpRef::input_arg_ref(2)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[3],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.opcode == OpCode::GetarrayitemRawR)
+                .count(),
+            1,
+            "must GETARRAYITEM only the minted array item, not the baked tail"
+        );
+        let label_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("label")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(label_args[3], OpRef::input_arg_ref(3));
+        assert_eq!(label_args[4], OpRef::input_arg_ref(4));
+    }
+
+    #[test]
+    fn test_patch_new_loop_binds_live_leftover_to_entry_slot_getfield() {
+        // Densify split a body-LABEL list/pattern onto InputArg(99) from
+        // entry slot 1. leftover-empty GETFIELDs that slot and forwards
+        // the live leftover the same result so first entry is a real
+        // pointer, not an uninitialized InputArg.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 99),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_ref(1)];
+        let live_from_entry = vec![(OpRef::input_arg_ref(99), 0)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+            &live_from_entry,
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcR),
+            "must GETFIELD the entry slot the live leftover came from"
+        );
+        let label_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("label")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(label_args[0], OpRef::input_arg_ref(0));
+        assert!(
+            !label_args[1].is_input_arg(),
+            "entry obj must be a GETFIELD result, got {label_args:?}"
+        );
+        assert_eq!(
+            label_args[2], label_args[1],
+            "live leftover must share the GETFIELD pointer, got {label_args:?}"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_mint_identity_wins_over_positional_getfield() {
+        // leftover-empty. Two Ref fields. InputArg(2) is mint field 0
+        // (the list), not field 1. Positional remap would GETFIELD field 1
+        // (a frame). Mint identity must win.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("pattern", Type::Ref, 8);
+        vinfo.add_field("scratch", Type::Ref, 16);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(24));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 2),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_ref(2),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_ref(50), OpRef::input_arg_ref(51)];
+        let live_from_entry = vec![(OpRef::input_arg_ref(2), 0)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+            &live_from_entry,
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        let getfields: Vec<OpRef> = ops
+            .iter()
+            .filter(|op| op.opcode == OpCode::GetfieldGcR)
+            .map(|op| op.pos().get())
+            .collect();
+        assert_eq!(
+            getfields.len(),
+            2,
+            "two static Ref fields, got {getfields:?}"
+        );
+        let label_args: Vec<OpRef> = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::Label)
+            .expect("label")
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(
+            label_args[2], getfields[0],
+            "InputArg(2) is mint field 0, not positional field 1, got {label_args:?} getfields={getfields:?}"
+        );
+        assert_ne!(
+            label_args[2], getfields[1],
+            "must not leave InputArg(2) on the positional scratch field"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_reloads_listiter_from_live_tos() {
+        // leftover ListIter must GETARRAYITEM(valuestackdepth - 1), not a
+        // baked locals slot (field 26 = `_compile.p` under expanded-tail).
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 99),
+            ],
+        );
+        let mut seq = Op::new(
+            OpCode::GetfieldGcR,
+            &[rooted_inputarg_operand(Type::Ref, 99)],
+        );
+        seq.setdescr(std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_ListIterObject.seq".into(),
+                "seq".into(),
+            ),
+        ));
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, seq].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+            InputArg::new_ref(6),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+            OpRef::input_arg_ref(6),
+        ];
+        let live_from_entry = vec![(OpRef::input_arg_ref(99), LISTITER_TOS_RELOAD)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            2,
+            0,
+            &mut constants,
+            &entry_mints,
+            &live_from_entry,
+            Some(vec![0]),
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0), InputArg::new_ref(1)]);
+        let peel = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
+            .expect("leftover_peel_tos");
+        let expected_peel = if cfg!(target_arch = "wasm32") {
+            leftover_peel_tos_i64 as usize as i64
+        } else {
+            leftover_peel_tos as usize as i64
+        };
+        assert_eq!(
+            peel.arg(0).to_opref(),
+            OpRef::const_int(expected_peel),
+            "CallR target must be leftover_peel_tos on native, leftover_peel_tos_i64 on wasm"
+        );
+        let seq_recv = ops
+            .iter()
+            .find(|op| {
+                op.opcode == OpCode::GetfieldGcR
+                    && op.getdescr().is_some_and(|d| {
+                        d.as_field_descr()
+                            .is_some_and(crate::history::is_list_iter_seq_field)
+                    })
+            })
+            .expect("ListIter.seq getfield")
+            .arg(0)
+            .to_opref();
+        assert_eq!(
+            seq_recv,
+            peel.pos().get(),
+            "ListIter leftover must be leftover_peel_tos, got {seq_recv:?}"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_reloads_listiter_from_inlined_callee_tos() {
+        // Portal TOS is the inlined `_compile` frame. leftover-empty
+        // must GETARRAYITEM that frame's TOS, not use the frame as
+        // the iterator (`'frame' object is not an iterator`).
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 99),
+            ],
+        );
+        let mut seq = Op::new(
+            OpCode::GetfieldGcR,
+            &[rooted_inputarg_operand(Type::Ref, 99)],
+        );
+        seq.setdescr(std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_ListIterObject.seq".into(),
+                "seq".into(),
+            ),
+        ));
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, seq].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+            InputArg::new_ref(6),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+            OpRef::input_arg_ref(6),
+        ];
+        let live_from_entry = vec![(OpRef::input_arg_ref(99), LISTITER_TOS_RELOAD)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            2,
+            0,
+            &mut constants,
+            &entry_mints,
+            &live_from_entry,
+            Some(vec![0, 1]),
+        );
+
+        let seq_recv = ops
+            .iter()
+            .find(|op| {
+                op.opcode == OpCode::GetfieldGcR
+                    && op.getdescr().is_some_and(|d| {
+                        d.as_field_descr()
+                            .is_some_and(crate::history::is_list_iter_seq_field)
+                    })
+            })
+            .expect("ListIter.seq getfield")
+            .arg(0)
+            .to_opref();
+        let peel = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
+            .expect("leftover_peel_tos");
+        assert_eq!(
+            peel.arg(1).to_opref(),
+            OpRef::input_arg_ref(0),
+            "without inline_vable, leftover_peel_tos walks the portal red"
+        );
+        assert_eq!(
+            seq_recv,
+            peel.pos().get(),
+            "ListIter leftover must be leftover_peel_tos, got {seq_recv:?}"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_peels_inlined_compile_box_not_portal() {
+        // leftover-empty must leftover_peel_tos the inlined `_compile`
+        // box (a body New/Getfield), not the portal red.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+
+        let compile_frame = OpRef::ref_op(100);
+        let mut new_frame = Op::new(
+            OpCode::GetfieldGcR,
+            &[rooted_inputarg_operand(Type::Ref, 0)],
+        );
+        new_frame.pos().set(compile_frame);
+        new_frame.setdescr(majit_ir::descr::make_field_descr(
+            0,
+            8,
+            Type::Ref,
+            majit_ir::ArrayFlag::Pointer,
+        ));
+        let mut seq = Op::new(
+            OpCode::GetfieldGcR,
+            &[rooted_inputarg_operand(Type::Ref, 5)],
+        );
+        seq.setdescr(std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_ListIterObject.seq".into(),
+                "seq".into(),
+            ),
+        ));
+        let mut ops: Vec<majit_ir::OpRc> = vec![
+            OpRc::new(Op::new(
+                OpCode::Label,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 0),
+                    rooted_inputarg_operand(Type::Ref, 1),
+                    rooted_inputarg_operand(Type::Ref, 5),
+                ],
+            )),
+            OpRc::new(new_frame),
+            OpRc::new(seq),
+        ];
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+        ];
+        patch_new_loop_to_load_virtualizable_fields_with_vable(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            2,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[(OpRef::input_arg_ref(5), LISTITER_TOS_RELOAD)],
+            Some(vec![0]),
+            std::ptr::null(),
+            Some(compile_frame),
+        );
+        let peel = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
+            .expect("leftover_peel_tos");
+        let peel_vable = peel.arg(1).to_opref();
+        assert_ne!(
+            peel_vable,
+            OpRef::input_arg_ref(0),
+            "must not peel the portal red"
+        );
+        let frame_load = ops
+            .iter()
+            .find(|op| op.pos().get() == peel_vable)
+            .expect("peel vable must be a produced op");
+        assert_eq!(frame_load.opcode, OpCode::GetfieldGcR);
+        assert!(
+            !frame_load.getdescr().is_some_and(|d| {
+                d.as_field_descr()
+                    .is_some_and(crate::history::is_list_iter_seq_field)
+            }),
+            "peel vable must be the inlined _compile box, not ListIter.seq"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_reloads_foriter_residual_from_live_tos() {
+        // Specialize declined: leftover is the ForIterNext residual arg,
+        // not a Getfield(seq). Still reload live TOS.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+
+        let mut effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        effect.runtime_helper = majit_ir::RuntimeHelperKind::ForIterNext;
+        let descr = majit_ir::descr::make_call_descr(vec![Type::Ref], Type::Ref, effect);
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 5),
+            ],
+        );
+        let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 5)]);
+        call.setdescr(descr);
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+            InputArg::new_ref(6),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+            OpRef::input_arg_ref(6),
+        ];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            2,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            Some(vec![0]),
+        );
+
+        let peel = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
+            .expect("leftover_peel_tos");
+        let call_arg = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 1)
+            .expect("ForIterNext residual")
+            .arg(0)
+            .to_opref();
+        assert_eq!(
+            call_arg,
+            peel.pos().get(),
+            "ForIterNext leftover off the TOS field must bind to leftover_peel_tos, got {call_arg:?}"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_reloads_foriter_at_peeled_portal_tos() {
+        // Portal TOS index equals the leftover field (`InputArg(6)` =
+        // prefix+n_static+0). After a peel that slot is the callee
+        // frame; leftover must follow the inner TOS, not stay on
+        // GETARRAYITEM(0).
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+
+        let mut effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        effect.runtime_helper = majit_ir::RuntimeHelperKind::ForIterNext;
+        let descr = majit_ir::descr::make_call_descr(vec![Type::Ref], Type::Ref, effect);
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 6),
+            ],
+        );
+        let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 6)]);
+        call.setdescr(descr);
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+            InputArg::new_ref(6),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+            OpRef::input_arg_ref(6),
+        ];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            2,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            Some(vec![0, 0]),
+        );
+
+        let peel = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 8)
+            .expect("leftover_peel_tos");
+        let call_arg = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::CallR && op.num_args() == 1)
+            .expect("ForIterNext residual")
+            .arg(0)
+            .to_opref();
+        assert_eq!(
+            call_arg,
+            peel.pos().get(),
+            "ForIterNext leftover at the peeled portal TOS must be leftover_peel_tos, got {call_arg:?}"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_drops_tos_past_the_mint_array() {
+        // Heap vsd can sit past the minted array (pip: vsd=30, mint=28).
+        // Do not GETARRAYITEM that slot.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+
+        let mut seq = Op::new(
+            OpCode::GetfieldGcR,
+            &[rooted_inputarg_operand(Type::Ref, 35)],
+        );
+        seq.setdescr(std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_ListIterObject.seq".into(),
+                "seq".into(),
+            ),
+        ));
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 35),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, seq].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+            InputArg::new_ref(6),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+            OpRef::input_arg_ref(6),
+        ];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            2,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            Some(vec![29]),
+        );
+
+        let oob = ops.iter().any(|op| {
+            matches!(
+                op.opcode,
+                OpCode::GetarrayitemGcR | OpCode::GetarrayitemRawR
+            ) && op.arg(1).to_opref() == OpRef::const_int(29)
+        });
+        assert!(!oob, "must not GETARRAYITEM past the mint array");
+    }
+
+    static PEEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_leftover_peel_tos_walks_inlined_callee_frame() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        register_leftover_scan_frame(std::ptr::null());
+        // Portal TOS is an inlined `_compile` frame; that frame's TOS
+        // is the iterator. leftover_peel_tos must return the iterator,
+        // not the callee frame.
+        #[repr(C)]
+        struct Container {
+            items: *mut usize,
+            len: usize,
+        }
+        #[repr(C)]
+        struct Frame {
+            ty: usize,
+            class: usize,
+            _pad: [usize; 1],
+            vsd: usize,
+            _pad2: [usize; 1],
+            locals: *mut Container,
+        }
+        const FRAME_TY: usize = 0xF1;
+        const FRAME_CLASS: usize = 0xF2;
+        const ITER_TY: usize = 0xA1;
+        let prev = LISTITER_TYPE_WORD.swap(ITER_TY, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _restore = Restore(prev);
+        let mut iterator = [ITER_TY, 0];
+        let mut callee_slots = [iterator.as_mut_ptr() as usize];
+        let mut callee_arr = Container {
+            items: callee_slots.as_mut_ptr(),
+            len: 1,
+        };
+        let mut callee = Frame {
+            ty: FRAME_TY,
+            class: FRAME_CLASS,
+            _pad: [0],
+            vsd: 1,
+            _pad2: [0],
+            locals: &mut callee_arr,
+        };
+        let mut portal_slots = [&mut callee as *mut Frame as usize];
+        let mut portal_arr = Container {
+            items: portal_slots.as_mut_ptr(),
+            len: 1,
+        };
+        let mut portal = Frame {
+            ty: FRAME_TY,
+            class: FRAME_CLASS,
+            _pad: [0],
+            vsd: 1,
+            _pad2: [0],
+            locals: &mut portal_arr,
+        };
+        let got = unsafe {
+            leftover_peel_tos(&mut portal as *mut Frame as *const u8, 24, 40, 0, 8, 0, 1)
+        };
+        assert_eq!(
+            got as usize,
+            iterator.as_mut_ptr() as usize,
+            "must peel the callee frame and return the iterator"
+        );
+    }
+
+    #[test]
+    fn test_leftover_peel_tos_direct_pointer_array() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        register_leftover_scan_frame(std::ptr::null());
+        #[repr(C)]
+        struct Block {
+            len: usize,
+            items: [usize; 1],
+        }
+        #[repr(C)]
+        struct Frame {
+            ty: usize,
+            class: usize,
+            _pad: [usize; 1],
+            vsd: usize,
+            _pad2: [usize; 1],
+            locals: *mut Block,
+        }
+        const FRAME_TY: usize = 0xF1;
+        const FRAME_CLASS: usize = 0xF2;
+        const ITER_TY: usize = 0xA1;
+        let prev = LISTITER_TYPE_WORD.swap(ITER_TY, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _restore = Restore(prev);
+        let mut iterator = [ITER_TY, 0];
+        let mut callee_block = Block {
+            len: 1,
+            items: [iterator.as_mut_ptr() as usize],
+        };
+        let mut callee = Frame {
+            ty: FRAME_TY,
+            class: FRAME_CLASS,
+            _pad: [0],
+            vsd: 1,
+            _pad2: [0],
+            locals: &mut callee_block,
+        };
+        let mut portal_block = Block {
+            len: 1,
+            items: [&mut callee as *mut Frame as usize],
+        };
+        let mut portal = Frame {
+            ty: FRAME_TY,
+            class: FRAME_CLASS,
+            _pad: [0],
+            vsd: 1,
+            _pad2: [0],
+            locals: &mut portal_block,
+        };
+        let items_off = std::mem::offset_of!(Block, items) as i64;
+        let got = unsafe {
+            leftover_peel_tos(
+                &mut portal as *mut Frame as *const u8,
+                24,
+                40,
+                0,
+                0,
+                items_off,
+                0,
+            )
+        };
+        assert_eq!(
+            got as usize,
+            iterator.as_mut_ptr() as usize,
+            "DirectPointer peel must return the iterator, not the callee frame"
+        );
+    }
+
+    #[test]
+    fn test_leftover_peel_tos_stops_at_non_frame_tos() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        register_leftover_scan_frame(std::ptr::null());
+        #[repr(C)]
+        struct Block {
+            len: usize,
+            items: [usize; 1],
+        }
+        #[repr(C)]
+        struct Frame {
+            ty: usize,
+            class: usize,
+            _pad: [usize; 1],
+            vsd: usize,
+            _pad2: [usize; 1],
+            locals: *mut Block,
+        }
+        const FRAME_TY: usize = 0xF1;
+        const FRAME_CLASS: usize = 0xF2;
+        const STR_TY: usize = 0x53;
+        let mut string = [STR_TY, 0];
+        let mut portal_block = Block {
+            len: 1,
+            items: [string.as_mut_ptr() as usize],
+        };
+        let mut portal = Frame {
+            ty: FRAME_TY,
+            class: FRAME_CLASS,
+            _pad: [0],
+            vsd: 1,
+            _pad2: [0],
+            locals: &mut portal_block,
+        };
+        let items_off = std::mem::offset_of!(Block, items) as i64;
+        let got = unsafe {
+            leftover_peel_tos(
+                &mut portal as *mut Frame as *const u8,
+                24,
+                40,
+                0,
+                0,
+                items_off,
+                0,
+            )
+        };
+        assert!(
+            got.is_null(),
+            "non-listiter TOS must not be handed to FOR_ITER"
+        );
+    }
+
+    #[test]
+    fn test_leftover_peel_tos_does_not_scan_locals_for_listiter() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        register_leftover_scan_frame(std::ptr::null());
+        // 31/29 leftover-empty: portal `_compile` TOS is ZipInfo
+        // (`for op, av in pattern` after unpack) while the live
+        // listiter sits at a lower locals_cells_stack_w slot.
+        #[repr(C)]
+        struct Block {
+            len: usize,
+            items: [usize; 3],
+        }
+        #[repr(C)]
+        struct Frame {
+            ty: usize,
+            class: usize,
+            _pad: [usize; 1],
+            vsd: usize,
+            _pad2: [usize; 1],
+            locals: *mut Block,
+        }
+        const FRAME_TY: usize = 0xF1;
+        const FRAME_CLASS: usize = 0xF2;
+        const ZIPINFO_TY: usize = 0x5A;
+        const LISTITER_TY: usize = 0x1A11;
+        let prev = LISTITER_TYPE_WORD.swap(LISTITER_TY, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _restore = Restore(prev);
+        let mut zipinfo = [ZIPINFO_TY, 0];
+        let mut listiter = [LISTITER_TY, 0];
+        let mut other = [0x11usize, 0];
+        let mut portal_block = Block {
+            len: 3,
+            items: [
+                other.as_mut_ptr() as usize,
+                listiter.as_mut_ptr() as usize,
+                zipinfo.as_mut_ptr() as usize,
+            ],
+        };
+        let mut portal = Frame {
+            ty: FRAME_TY,
+            class: FRAME_CLASS,
+            _pad: [0],
+            vsd: 3,
+            _pad2: [0],
+            locals: &mut portal_block,
+        };
+        let items_off = std::mem::offset_of!(Block, items) as i64;
+        let got = unsafe {
+            leftover_peel_tos(
+                &mut portal as *mut Frame as *const u8,
+                24,
+                40,
+                0,
+                0,
+                items_off,
+                0,
+            )
+        };
+        assert!(
+            got.is_null(),
+            "non-iterator TOS must not invent a listiter from another slot"
+        );
+    }
+
+    #[test]
+    fn test_leftover_peel_tos_uses_scan_frame_when_portal_tos_is_not_listiter() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        // 31/29 leftover-empty: portal red TOS is ZipInfo; the live
+        // listiter sits on the inlined `_compile` published as the
+        // leftover scan frame (EC top).
+        #[repr(C)]
+        struct Block {
+            len: usize,
+            items: [usize; 2],
+        }
+        #[repr(C)]
+        struct Frame {
+            ty: usize,
+            class: usize,
+            _pad: [usize; 1],
+            vsd: usize,
+            _pad2: [usize; 1],
+            locals: *mut Block,
+        }
+        const FRAME_TY: usize = 0xF1;
+        const FRAME_CLASS: usize = 0xF2;
+        const ZIPINFO_TY: usize = 0x5A;
+        const LISTITER_TY: usize = 0x1A12;
+        let prev_ty = LISTITER_TYPE_WORD.swap(LISTITER_TY, std::sync::atomic::Ordering::Relaxed);
+        let prev_scan = leftover_scan_frame();
+        register_leftover_scan_frame(std::ptr::null());
+        struct Restore {
+            ty: usize,
+            scan: *mut u8,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.ty, std::sync::atomic::Ordering::Relaxed);
+                register_leftover_scan_frame(self.scan);
+            }
+        }
+        let _restore = Restore {
+            ty: prev_ty,
+            scan: prev_scan,
+        };
+        let mut zipinfo = [ZIPINFO_TY, 0];
+        let mut listiter = [LISTITER_TY, 0];
+        let mut portal_block = Block {
+            len: 1,
+            items: [zipinfo.as_mut_ptr() as usize, 0],
+        };
+        let mut portal = Frame {
+            ty: FRAME_TY,
+            class: FRAME_CLASS,
+            _pad: [0],
+            vsd: 1,
+            _pad2: [0],
+            locals: &mut portal_block,
+        };
+        let mut compile_block = Block {
+            len: 2,
+            items: [0, listiter.as_mut_ptr() as usize],
+        };
+        let mut compile = Frame {
+            ty: FRAME_TY,
+            class: FRAME_CLASS,
+            _pad: [0],
+            vsd: 2,
+            _pad2: [0],
+            locals: &mut compile_block,
+        };
+        register_leftover_scan_frame(&mut compile as *mut Frame as *const u8);
+        let items_off = std::mem::offset_of!(Block, items) as i64;
+        let got = unsafe {
+            leftover_peel_tos(
+                &mut portal as *mut Frame as *const u8,
+                24,
+                40,
+                0,
+                0,
+                items_off,
+                0,
+            )
+        };
+        assert_eq!(
+            got as usize,
+            listiter.as_mut_ptr() as usize,
+            "portal ZipInfo TOS must yield the scan-frame listiter"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_rejects_non_iterator_portal_tos() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        register_leftover_scan_frame(std::ptr::null());
+        #[repr(C)]
+        struct Block {
+            len: usize,
+            items: [usize; 1],
+        }
+        #[repr(C)]
+        struct Frame {
+            ty: usize,
+            class: usize,
+            _pad: [usize; 1],
+            vsd: usize,
+            _pad2: [usize; 1],
+            locals: *mut Block,
+        }
+        const FRAME_TY: usize = 0xF1;
+        const ZIPINFO_TY: usize = 0x5A;
+        const LISTITER_TY: usize = 0x1A13;
+        let prev = LISTITER_TYPE_WORD.swap(LISTITER_TY, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+                let _ = take_leftover_empty_reject();
+            }
+        }
+        let _restore = Restore(prev);
+        let _ = take_leftover_empty_reject();
+        let mut zipinfo = [ZIPINFO_TY, 0];
+        let mut portal_block = Block {
+            len: 1,
+            items: [zipinfo.as_mut_ptr() as usize],
+        };
+        let mut portal = Frame {
+            ty: FRAME_TY,
+            class: FRAME_TY,
+            _pad: [0],
+            vsd: 1,
+            _pad2: [0],
+            locals: &mut portal_block,
+        };
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            std::mem::offset_of!(Block, items),
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 99),
+            ],
+        );
+        let mut seq = Op::new(
+            OpCode::GetfieldGcR,
+            &[rooted_inputarg_operand(Type::Ref, 99)],
+        );
+        seq.setdescr(std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                16,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "W_ListIterObject.seq".into(),
+                "seq".into(),
+            ),
+        ));
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, seq].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+            InputArg::new_ref(6),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+            OpRef::input_arg_ref(6),
+        ];
+        let live_from_entry = vec![(OpRef::input_arg_ref(99), LISTITER_TOS_RELOAD)];
+        patch_new_loop_to_load_virtualizable_fields_with_vable(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            2,
+            0,
+            &mut constants,
+            &entry_mints,
+            &live_from_entry,
+            Some(vec![0]),
+            &mut portal as *mut Frame as *const u8,
+            None,
+        );
+        assert!(
+            take_leftover_empty_reject(),
+            "ZipInfo portal TOS must reject leftover-empty peel"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == OpCode::CallR && op.num_args() == 8),
+            "rejected leftover-empty must not emit leftover_peel_tos"
+        );
+    }
+
+    fn test_patch_new_loop_rejects_leftover_empty_type_mismatch() {
+        // leftover-empty, length matches the mint (one Ref field) but the
+        // present slot is an Int. That is a live virtualstate box, not
+        // `obj`. Do not GETFIELD it as a Ref.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Int, 1),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![OpRef::input_arg_ref(1)];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert!(
+            ops.iter().all(|op| op.opcode != OpCode::GetfieldGcR),
+            "a type-mismatched leftover-empty tail must not GETFIELD"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_uses_entry_mints_not_stale_baked_length() {
+        // leftover-empty. Baked array length is 1 (expanded = prefix +
+        // last_instr + 1 item = 3) but `entry_field_oprefs` minted
+        // last_instr + 3 items and inputargs still holds that tail.
+        // Trusting the bake would long-tail from slot 3 and GETARRAYITEM
+        // once (binary_slice frame-as-iter). Walk the mint list.
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            16,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(24));
+
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Int, 1),
+                rooted_inputarg_operand(Type::Ref, 2),
+                rooted_inputarg_operand(Type::Ref, 3),
+                rooted_inputarg_operand(Type::Ref, 4),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_int(1),
+            InputArg::new_ref(2),
+            InputArg::new_ref(3),
+            InputArg::new_ref(4),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_ref(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_ref(4),
+        ];
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[1],
+            1,
+            0,
+            &mut constants,
+            &entry_mints,
+            &[],
+            None,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.opcode == OpCode::GetarrayitemRawR)
+                .count(),
+            3,
+            "entry minted 3 array items; baked length 1 must not win"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
+            "must GETFIELD last_instr"
+        );
+    }
+
+    #[test]
     fn test_patch_new_loop_reads_embedded_array_items_from_backing_storage() {
         let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
         vinfo.add_embedded_array_field(
@@ -3010,6 +5783,9 @@ mod tests {
             1,
             0,
             &mut constants,
+            &[],
+            &[],
+            None,
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
@@ -3092,6 +5868,9 @@ mod tests {
             2,
             1,
             &mut constants,
+            &[],
+            &[],
+            None,
         );
 
         // The scalar at slot 0 survives the truncation alongside the
@@ -4599,16 +7378,10 @@ impl FailDescr for ResumeGuardCopiedDescr {
     }
     /// Per-emission, and deliberately NOT
     /// chased through `prev`: the classification describes this guard's own
-    /// condition chain, which a sharer does not inherit from its donor.  A
-    /// copied descr always answers `false`, and that is correct twice over.
-    /// A poll guard can never be the *sharer*: sharing requires
-    /// `!op.has_descr() && op.rd_resume_position < 0` (optimizer.rs
-    /// `emit_guard_operation`, mirrored in optimizeopt/mod.rs), whereas the
-    /// poll is emitted by `close_loop_args_at` through `generate_guard`,
-    /// which captures resume data and so always carries a resume position.
-    /// And when a poll guard is the *donor*, the sharer is some descrless
-    /// optimizer-created follow-up guard that is not itself a poll, so
-    /// reading through `prev` would misreport it as one.
+    /// condition chain, which a sharer does not inherit from its donor.
+    /// Sharing redirects resume storage, not the classification of this
+    /// guard's own condition. A poll donor must not classify every sharing
+    /// guard as a poll; a copied poll is stamped independently at emission.
     fn is_back_edge_poll(&self) -> bool {
         self.back_edge_poll
             .load(std::sync::atomic::Ordering::Relaxed)

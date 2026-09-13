@@ -1,4 +1,10 @@
 # pyre-check: max-pypy-ratio=10.4
+# pyre-check: max-wasm-ratio=6.5
+# leftover-empty vable tails now GETFIELD the live/baked field list
+# (`compile.py patch_new_loop_to_load_virtualizable_fields`). dynasm
+# turns those into native loads; wasm emits them as guest ops. darwin-arm64
+# measured 5.6x against dynasm after rebase onto origin/main; 6.5x is
+# that reading plus WASM_RATIO_FIT_HEADROOM (15%).
 # Ubuntu run 33279264115: 2-5.2x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython

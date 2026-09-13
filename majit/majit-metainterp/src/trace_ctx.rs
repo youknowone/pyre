@@ -291,6 +291,21 @@ pub struct TraceCtx {
     /// (RPython parity: `virtualizable_boxes[-1]`). Used by gen_store_back_in_vable
     /// to distinguish standard vs nonstandard virtualizable.
     pub(crate) virtualizable_boxes: Option<Vec<OpRef>>,
+    /// Snapshot of `virtualizable_boxes` at `init_virtualizable_boxes` /
+    /// `set_virtualizable_boxes_with_info`. `gen_store_back_in_vable` skips
+    /// a static field or array slot whose live box is still this opref —
+    /// the `xxx only write back the fields really modified` note on
+    /// `pyjitpl.py gen_store_back_in_vable`. `replace_box` updates the live
+    /// list only, so a renamed box is still written back.
+    virtualizable_boxes_at_entry: Option<Vec<OpRef>>,
+    /// Mint field indices of GET_ITER iterables recorded while tracing.
+    /// leftover-empty binds those leftovers to this field even when
+    /// virtualstate replaced the mint box with a new InputArg.
+    pub(crate) getiter_vable_fields: Vec<u32>,
+    /// Inlined callee's own red frame (`emit_new_pyframe_inline`). leftover-empty
+    /// GETFIELDs this instead of the portal red when the leftover iterator
+    /// belongs to the callee (`_compile` inlined into its caller).
+    pub(crate) inline_vable_box: Option<OpRef>,
     /// Concrete shadow of `virtualizable_boxes`. Same layout, each slot carries
     /// the current runtime `Value` (RPython Box ≡ OpRef + concrete value).
     /// Seeded from `original_boxes` in `initialize_virtualizable` and kept in
@@ -1822,6 +1837,9 @@ impl TraceCtx {
             green_key_values: None,
             driver_descriptor: None,
             virtualizable_boxes: None,
+            virtualizable_boxes_at_entry: None,
+            getiter_vable_fields: Vec::new(),
+            inline_vable_box: None,
             virtualizable_values: None,
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
@@ -1923,6 +1941,9 @@ impl TraceCtx {
             green_key_values: Some(green_key_values),
             driver_descriptor: None,
             virtualizable_boxes: None,
+            virtualizable_boxes_at_entry: None,
+            getiter_vable_fields: Vec::new(),
+            inline_vable_box: None,
             virtualizable_values: None,
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
@@ -2628,6 +2649,46 @@ impl TraceCtx {
     /// are the OpRef and concrete of the virtualizable object (frame pointer).
     /// Boxes layout: `[field0, ..., fieldN, arr[0], ..., arr[M], vable_ref]`
     /// where `boxes[-1]` is the standard virtualizable identity (RPython parity).
+    /// If `args` of a GET_ITER residual include a virtualizable field box,
+    /// remember that mint index for leftover-empty.
+    pub fn note_getiter_iterable(&mut self, args: &[OpRef]) {
+        let field_len = self
+            .virtualizable_boxes_at_entry
+            .as_ref()
+            .or(self.virtualizable_boxes.as_ref())
+            .map(|boxes| boxes.len().saturating_sub(1))
+            .unwrap_or(0);
+        if field_len == 0 {
+            return;
+        }
+        let match_in = |boxes: &[OpRef], arg: OpRef| -> Option<u32> {
+            boxes[..field_len.min(boxes.len())]
+                .iter()
+                .position(|&m| m == arg)
+                .map(|j| j as u32)
+        };
+        for &arg in args {
+            if arg.is_none() || arg.is_constant() {
+                continue;
+            }
+            let found = self
+                .virtualizable_boxes_at_entry
+                .as_ref()
+                .and_then(|boxes| match_in(boxes, arg))
+                .or_else(|| {
+                    self.virtualizable_boxes
+                        .as_ref()
+                        .and_then(|boxes| match_in(boxes, arg))
+                });
+            if let Some(j) = found {
+                if !self.getiter_vable_fields.contains(&j) {
+                    self.getiter_vable_fields.push(j);
+                }
+                return;
+            }
+        }
+    }
+
     pub fn init_virtualizable_boxes(
         &mut self,
         info: &VirtualizableInfo,
@@ -2639,6 +2700,7 @@ impl TraceCtx {
     ) {
         let mut boxes = input_oprefs.to_vec();
         boxes.push(vable_ref); // RPython: virtualizable_boxes[-1] = vable identity
+        self.virtualizable_boxes_at_entry = Some(boxes.clone());
         self.virtualizable_boxes = Some(boxes);
         if input_values.is_empty() {
             // Caller has no live concrete values (e.g. bridge-entry rebuild
@@ -3573,6 +3635,49 @@ impl TraceCtx {
             .is_some_and(|slots| slots.get(index).copied().unwrap_or(false))
     }
 
+    pub fn set_inline_vable_box(&mut self, frame: OpRef) {
+        if !frame.is_none() {
+            self.inline_vable_box = Some(frame);
+        }
+    }
+
+    pub fn inline_vable_box(&self) -> Option<OpRef> {
+        self.inline_vable_box
+    }
+
+    /// The IR box whose concrete is `addr`, if it is not the portal red.
+    /// leftover-empty GETFIELDs this inlined `_compile` frame instead of
+    /// `inputargs[index_of_virtualizable]`.
+    pub fn opref_with_concrete_ref(&self, addr: usize, skip: OpRef) -> Option<OpRef> {
+        if addr == 0 {
+            return None;
+        }
+        let is_addr = |opref: OpRef| -> bool {
+            matches!(
+                self.concrete_of_opref(opref),
+                Some(Value::Ref(r)) if r.as_usize() == addr
+            )
+        };
+        if let Some(b) = self.standard_virtualizable_box() {
+            if b != skip && is_addr(b) {
+                return Some(b);
+            }
+        }
+        for op in self.recorder.ops() {
+            let pos = op.pos().get();
+            if !pos.is_none() && pos != skip && is_addr(pos) {
+                return Some(pos);
+            }
+            for a in op.getarglist() {
+                let r = a.to_opref();
+                if r != skip && !r.is_none() && is_addr(r) {
+                    return Some(r);
+                }
+            }
+        }
+        None
+    }
+
     /// Return the standard virtualizable identity (`virtualizable_boxes[-1]`).
     pub fn standard_virtualizable_box(&self) -> Option<OpRef> {
         self.virtualizable_boxes
@@ -3802,6 +3907,7 @@ impl TraceCtx {
     /// resume data before the bridge replays any vable op.
     pub fn clear_virtualizable_boxes(&mut self) {
         self.virtualizable_boxes = None;
+        self.virtualizable_boxes_at_entry = None;
     }
 
     /// Set virtualizable_boxes with VirtualizableInfo and array lengths.
@@ -3832,6 +3938,7 @@ impl TraceCtx {
             self.virtualizable_values = None;
             self.virtualizable_live_null_slots = None;
         }
+        self.virtualizable_boxes_at_entry = Some(boxes.clone());
         self.virtualizable_boxes = Some(boxes);
         self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
@@ -4062,9 +4169,34 @@ impl TraceCtx {
         // pyjitpl.py:3478 self.forced_virtualizable = vbox
         self.forced_virtualizable = Some(vable_opref);
 
+        // pyjitpl.py `xxx only write back the fields really modified`.
+        // A slot whose live box is still the entry snapshot is the heap
+        // value `initialize_virtualizable` read; writing it is a no-op
+        // and, unlike upstream, OptHeap cannot cancel it: the portal
+        // fields ride as inputargs, not GETFIELD, so the lazy-set cache
+        // is empty. `replace_box` leaves the snapshot alone, so a
+        // renamed box is still stored.
+        let entry = self.virtualizable_boxes_at_entry.clone();
+        let box_unchanged = |i: usize, value: OpRef| -> bool {
+            entry.as_deref().and_then(|e| e.get(i).copied()) == Some(value)
+        };
+
         for field_index in 0..info.static_fields.len() {
             if let Some(&value) = boxes.get(field_index) {
-                let descr = info.static_field_descr(field_index);
+                if box_unchanged(field_index, value) {
+                    continue;
+                }
+                // pyjitpl.py `gen_store_back_in_vable` records SETFIELD_GC
+                // with `vinfo.static_field_descrs[i]`. Upstream that list
+                // is `cpu.fielddescrof(VTYPE, name)` — the same FieldDescr
+                // the interpreter's SETFIELD_GC uses (`descr.py`). Pyre
+                // splits the vable schedule (`index_in_parent` =
+                // `[token, statics, arrays]`) from the parent SizeDescr
+                // walker; OptHeap keys the lazy-set cache by descr
+                // identity, so the store-back must reuse the parent
+                // field (`static_field_struct_descr`) or last_instr is
+                // written twice and unchanged slots cannot cancel.
+                let descr = info.static_field_struct_descr(field_index);
                 // pyjitpl.py `gen_store_back_in_vable`. A store has no
                 // `resvalue` and `SETFIELD_GC` is never pure, so no cpu.
                 self.execute_and_record(
@@ -4081,22 +4213,34 @@ impl TraceCtx {
         let mut flat_box_index = info.static_fields.len();
         for array_index in 0..info.array_fields.len() {
             let len = lengths.get(array_index).copied().unwrap_or(0);
-            let field_descr = info.array_pointer_field_descr(array_index);
-            let array_descr = info.array_item_descr(array_index);
-            let array_ref = self.vable_getfield_ref_descr(vable_opref, field_descr);
-            for item_index in 0..len {
-                if let Some(&value) = boxes.get(flat_box_index) {
-                    let index = self.const_int(item_index as i64);
-                    self.execute_and_record(
-                        None,
-                        OpCode::SetarrayitemGc,
-                        Some(array_descr.clone()),
-                        &[array_ref, index, value],
-                        None,
-                        0,
-                    );
+            let array_start = flat_box_index;
+            let any_item_changed = (0..len).any(|item_index| {
+                boxes
+                    .get(array_start + item_index)
+                    .is_some_and(|&value| !box_unchanged(array_start + item_index, value))
+            });
+            if any_item_changed {
+                let field_descr = info.array_pointer_struct_descr(array_index);
+                let array_descr = info.array_item_descr(array_index);
+                let array_ref = self.vable_getfield_ref_descr(vable_opref, field_descr);
+                for item_index in 0..len {
+                    if let Some(&value) = boxes.get(flat_box_index)
+                        && !box_unchanged(flat_box_index, value)
+                    {
+                        let index = self.const_int(item_index as i64);
+                        self.execute_and_record(
+                            None,
+                            OpCode::SetarrayitemGc,
+                            Some(array_descr.clone()),
+                            &[array_ref, index, value],
+                            None,
+                            0,
+                        );
+                    }
+                    flat_box_index += 1;
                 }
-                flat_box_index += 1;
+            } else {
+                flat_box_index += len;
             }
         }
 
@@ -6350,6 +6494,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inline_vable_box_is_the_seeded_callee_frame() {
+        let mut ctx = TraceCtx::for_test(1);
+        let callee = OpRef::ref_op(7);
+        ctx.set_inline_vable_box(callee);
+        assert_eq!(ctx.inline_vable_box(), Some(callee));
+        ctx.set_inline_vable_box(OpRef::NONE);
+        assert_eq!(
+            ctx.inline_vable_box(),
+            Some(callee),
+            "NONE must not clear the seeded callee red"
+        );
+    }
+
     /// `heapcache.py is_nullity_known` answers truthy for a non-`Const` box
     /// whatever its nullity — `nullity_now_known` sets one flag for both — and
     /// falsy for a null `Const`, whose answer is `bool(box.getref_base())`.
@@ -6896,6 +7054,108 @@ mod tests {
     }
 
     #[test]
+    fn test_record_getiter_remembers_vable_field_index() {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("last_instr", Type::Int, 8);
+        info.add_field("pycode", Type::Ref, 16);
+        info.add_field("valuestackdepth", Type::Int, 24);
+        info.add_field("debugdata", Type::Ref, 32);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(40));
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let last_instr = recorder.record_input_arg(Type::Int);
+        let pycode = recorder.record_input_arg(Type::Ref);
+        let depth = recorder.record_input_arg(Type::Int);
+        let debugdata = recorder.record_input_arg(Type::Ref);
+        let pattern = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[last_instr, pycode, depth, debugdata, pattern],
+            &[
+                ph(Type::Int),
+                ph(Type::Ref),
+                ph(Type::Int),
+                ph(Type::Ref),
+                ph(Type::Ref),
+            ],
+            &[],
+        );
+        let mut effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        effect.runtime_helper = majit_ir::RuntimeHelperKind::GetIter;
+        let descr = majit_ir::descr::make_call_descr(vec![Type::Ref], Type::Ref, effect);
+        ctx.record_op_with_descr(OpCode::CallR, &[pattern], descr);
+        assert_eq!(
+            ctx.getiter_vable_fields,
+            vec![4],
+            "GET_ITER of the pattern mint box must record field 4"
+        );
+    }
+
+    #[test]
+    fn test_record_listiter_seq_getfield_remembers_vable_field_index() {
+        // pip `_compile` traces FOR_ITER as Getfield of W_ListIterObject.seq,
+        // not RuntimeHelperKind::GetIter. The receiver is the iterator mint.
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("last_instr", Type::Int, 8);
+        info.add_field("pycode", Type::Ref, 16);
+        info.add_field("valuestackdepth", Type::Int, 24);
+        info.add_field("debugdata", Type::Ref, 32);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(40));
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let last_instr = recorder.record_input_arg(Type::Int);
+        let pycode = recorder.record_input_arg(Type::Ref);
+        let depth = recorder.record_input_arg(Type::Int);
+        let debugdata = recorder.record_input_arg(Type::Ref);
+        let listiter = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[last_instr, pycode, depth, debugdata, listiter],
+            &[
+                ph(Type::Int),
+                ph(Type::Ref),
+                ph(Type::Int),
+                ph(Type::Ref),
+                ph(Type::Ref),
+            ],
+            &[],
+        );
+        let descr = std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+            0,
+            16,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "W_ListIterObject.seq".into(),
+            "seq".into(),
+        )) as majit_ir::DescrRef;
+        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[listiter], descr);
+        assert_eq!(
+            ctx.getiter_vable_fields,
+            vec![4],
+            "Getfield of ListIter.seq must record the iterator mint field"
+        );
+    }
+
+    #[test]
     fn standard_vable_setfield_writes_to_boxes() {
         let info = make_test_vable_info();
         let fd8 = info.static_field_descr(0);
@@ -7306,33 +7566,77 @@ mod tests {
             &[2],
         );
 
+        let new_pc = ctx.const_int(7);
+        let new_arr1 = ctx.const_ref(99);
+        if let Some(boxes) = ctx.virtualizable_boxes.as_mut() {
+            boxes[0] = new_pc;
+            boxes[2] = new_arr1;
+        }
         ctx.gen_store_back_in_vable(vable);
 
         let ops = take_all_ops(ctx);
-        assert_eq!(ops.len(), 5);
+        assert_eq!(ops.len(), 4);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(
             ops[0].getdescr().map(|d| d.index()),
-            Some(info.static_field_descr(0).index())
+            Some(info.static_field_struct_descr(0).index())
         );
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
         assert_eq!(
             ops[1].getdescr().map(|d| d.index()),
-            Some(info.array_pointer_field_descr(0).index())
+            Some(info.array_pointer_struct_descr(0).index())
         );
         assert_eq!(ops[2].opcode, OpCode::SetarrayitemGc);
         assert_eq!(
             ops[2].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
-        assert_eq!(ops[3].opcode, OpCode::SetarrayitemGc);
+        assert_eq!(ops[3].opcode, OpCode::SetfieldGc);
         assert_eq!(
             ops[3].getdescr().map(|d| d.index()),
-            Some(info.array_item_descr(0).index())
+            Some(info.token_field_descr().index())
         );
-        assert_eq!(ops[4].opcode, OpCode::SetfieldGc);
+    }
+
+    #[test]
+    fn gen_store_back_in_vable_skips_unmodified_fields() {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field(
+            "locals",
+            Type::Ref,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Ref),
+        );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0],
+            &[ph(Type::Int), ph(Type::Ref)],
+            &[1],
+        );
+
+        ctx.gen_store_back_in_vable(vable);
+
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(
-            ops[4].getdescr().map(|d| d.index()),
+            ops[0].getdescr().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
     }

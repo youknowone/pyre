@@ -3630,8 +3630,8 @@ fn walker_ec_enter(
 /// from `pyframe.py execute_frame` rather than from `enter` / `leave`.
 /// Whatever inlines the callee inlines those `ec.gettrace()` reads with it, so
 /// upstream's trace carries a guard on them and a tracer installed later cannot
-/// be missed.  This walker inlines neither, so an inlined callee reports
-/// nothing for as long as the loop stays compiled.
+/// be missed.  The walker records the same reads via `record_gettrace_promote`
+/// at the enter / leave sites.
 ///
 /// What keeps the omission sound is that there is no inlined callee to lose
 /// events for while a hook is installed:
@@ -5204,6 +5204,24 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
     let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
     let recursive_portal_present = fbw_recursive_portal_present(ctx, callee_code_key);
+    // The first recording has no procedure token, so it still inlines the
+    // `fib(2)` shape. A later *bridge* of that same compiled portal must
+    // not unroll the left spine (`bridge_subwalk.rs`: that continuation
+    // is CALL_ASSEMBLER, not a fresh peel). A different hot loop that
+    // calls an already-compiled recursive helper is not a bridge of that
+    // helper and still inlines (`recursion_past_unroll_bound_from_loop`).
+    if recursive_portal_present
+        && ctx.trace_ctx.is_bridge_trace
+        && crate::driver::try_driver_pair().is_some_and(|(driver, _)| {
+            driver
+                .meta_interp()
+                .warm_state_ref()
+                .get_cell_for_key(&callee_green_key)
+                .is_some_and(|cell| cell.is_compiled())
+        })
+    {
+        return resolved_inline_decline(op.pc, line!());
+    }
     if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
@@ -5253,8 +5271,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
     // `executioncontext.py leave` adds `_trace(frame, 'leaveframe', ...)` when
     // a profiler is installed.  `walker_ec_enter` / `walker_ec_leave` port the
-    // frame-chain half of that bracket and nothing else, and the walker has no
-    // route to record `_trace` — it calls back into app-level Python with the
+    // frame-chain half; `record_gettrace_promote` records the `gettrace()`
+    // reads those two hooks start with.  The walker still has no route to
+    // record `_trace` itself — it calls back into app-level Python with the
     // callee frame as an argument.  So while a hook is installed there is no
     // shape of this inline that can report what the callee owes, and the
     // answer is the one `codewriter/policy.py look_inside_graph` gives for a
@@ -5434,8 +5453,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // this frame reg (see the `*_vable_via_metainterp` short-circuits).
     // `u16::MAX` for a non-portal callee keeps the strict predicate
     // byte-identical (`inline_resolvable_seeded_frame_op` declines).
+    // Own-frame red, not the caller's `metadata.portal_frame_reg`.
+    // `built_as_portal` records the Portal *input shape* on every drained
+    // per-code jitcode; do not require it here. A missing filter left
+    // non-portal-shaped callees on `u16::MAX` so leftover-empty GETFIELD
+    // the portal and never saw the New `_compile` box.
     let callee_portal_frame_reg = crate::state::ensure_jitcode_index(callee_code_key as *const ())
-        .filter(|&jc| crate::state::built_as_portal_at(jc))
         .map(|jc| crate::state::portal_red_regs_at(jc).0)
         .unwrap_or(u16::MAX);
     let strict_inlinable =
@@ -6729,6 +6752,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
 
         callee_regs_r.set(frame_reg as usize, callee_frame);
+        ctx.trace_ctx.set_inline_vable_box(callee_frame);
         // `perform_call` creates one concrete frame per MIFrame before
         // `setup_call` installs the argument boxes (pyjitpl.py,
         // 1862-1874).  Mirror that recording-time object.  `setup_call`
@@ -7003,6 +7027,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ca_concrete_frame,
                 concrete_ec,
             );
+            // `execute_frame.call_trace` — `gettrace()` — sits between
+            // `enter` and `dispatch`.  Snapshot failure still has to reach
+            // the matching `leave` below, so a recording miss here drops
+            // the pin rather than unwinding past the vref.
+            let _ = super::record_gettrace_promote(ctx, op.pc);
             // This inlined level is an activation `execute_frame` would have
             // charged the recursion counter for.  Counting it at RUN time is
             // what a recorded call would do, and that is exactly wrong here: a
@@ -7159,6 +7188,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     .registers_r
                     .get(callee_portal_frame_reg as usize)
                     .expect("ref register in range");
+                if shadow.frame_box != OpRef::NONE {
+                    sub_wc.trace_ctx.set_inline_vable_box(shadow.frame_box);
+                }
             }
             if !try_multiframe {
                 let mut state = sub_wc.frame_state.borrow_mut();
@@ -7562,6 +7594,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // permanently `mark_as_escaped` the caller and force a vref that never
         // needed forcing.
         let got_exception = matches!(callee_outcome, Ok((DispatchOutcome::SubRaise { .. }, _)));
+        // `execute_frame.return_trace` — a second `gettrace()` — sits
+        // between `dispatch` and `leave`.  Same finally pairing as enter.
+        let _ = super::record_gettrace_promote(ctx, op.pc);
         walker_ec_leave(
             ctx.trace_ctx,
             ca_callee_frame,

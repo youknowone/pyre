@@ -107,6 +107,7 @@ pub fn __majit_struct_type_id_path(module_path: &str, type_path: &str, is_gc_man
     hasher.finish()
 }
 
+pub mod allvirtuals;
 pub mod blackhole;
 pub mod box_trace;
 pub(crate) mod call_descr;
@@ -185,9 +186,10 @@ pub use call_descr::{
     nursery_alloc_effect_info,
 };
 pub use compile::{
-    make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,
+    leftover_peel_tos_i64, make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,
     make_resume_guard_descr_instance_next_foriter, make_resume_guard_descr_range_foriter,
-    raw_exit_values,
+    raw_exit_values, register_leftover_scan_frame, register_listiter_pred,
+    register_listiter_type_word, take_leftover_empty_reject,
 };
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,

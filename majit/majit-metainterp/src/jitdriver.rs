@@ -6572,12 +6572,21 @@ impl<S: JitState> JitDriver<S> {
             // exception guard unwinds into its handler instead of resuming
             // the no-exception continuation.
             let guard_exc = result.exception.exc_value;
+            // compile.py ResumeGuardForcedDescr.handle_fail reads
+            // `cpu.get_savedata_ref(deadframe)` before the blackhole.
+            // Root the copied AllVirtuals object across the bridge
+            // attempt and resume construction.
+            let savedata = result.savedata;
             drop(result);
             // The deadframe root died with the grab and the reconstruction
             // below allocates through the blackhole allocator, so hold the
             // exception where the frontend's root walker can reach it until
             // `prepare_resume_from_failure` hands it to the blackhole.
             let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
+            let savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let _savedata_root = unsafe {
+                crate::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata.is_some())
+            };
 
             // must_compile tick for bridge threshold counting.
             if crate::majit_log_enabled() {
@@ -6794,7 +6803,11 @@ impl<S: JitState> JitDriver<S> {
                         .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                     None, // ginfo
                     vable_identity_override,
-                    None, // all_virtuals
+                    descr_arc
+                        .is_guard_forced()
+                        .then(|| savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)))
+                        .flatten()
+                        .and_then(crate::allvirtuals::reveal),
                     allocator,
                 );
                 let (mut bh, vable_ptr) = bh;
@@ -7971,14 +7984,14 @@ impl<S: JitState> JitDriver<S> {
     /// virtuals through the same resume allocator used by ordinary guard
     /// failure.  In particular, a `jit.virtual_ref` frame must not be decoded
     /// through `NullAllocator`, or its `forced` writeback remains null.
-    pub fn force_virtualizable_token(&mut self, token: u64) {
+    pub fn force_virtualizable_token(&mut self, token: u64, identity_override: Option<i64>) {
         let fallback_alloc = crate::resume::NullAllocator;
         let allocator: &dyn crate::resume::BlackholeAllocator = self
             .blackhole_allocator
             .as_deref()
             .unwrap_or(&fallback_alloc);
         self.meta
-            .force_virtualizable_token_with_allocator(token, allocator);
+            .force_virtualizable_token_with_allocator(token, identity_override, allocator);
     }
 
     /// framework.py `root_walker.walk_roots` parity: visit every Ref-typed
@@ -8008,18 +8021,6 @@ impl<S: JitState> JitDriver<S> {
     /// live during compilation. See `MetaInterp::walk_compile_snapshot_refs`.
     pub fn walk_compile_snapshot_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
         self.meta.walk_compile_snapshot_refs(visitor);
-    }
-
-    /// GC walker for the forced-virtual caches awaiting a `GUARD_NOT_FORCED`.
-    /// See `MetaInterp::walk_forced_virtuals_refs`.
-    pub fn walk_forced_virtuals_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
-        self.meta.walk_forced_virtuals_refs(visitor);
-    }
-
-    /// Drop forced-virtual caches whose owner frame died.
-    /// See `MetaInterp::prune_forced_virtuals`.
-    pub fn prune_forced_virtuals(&mut self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
-        self.meta.prune_forced_virtuals(classify);
     }
 
     pub fn run_compiled_detailed_keyed(
@@ -8292,6 +8293,7 @@ impl<S: JitState> JitDriver<S> {
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).
         let guard_exc = result.exception.exc_value;
+        let savedata = result.savedata;
         drop(result);
 
         // memmgr.py: keep_loop_alive(loop_token)
@@ -8372,6 +8374,7 @@ impl<S: JitState> JitDriver<S> {
             raw_values,
             exit_layout,
             guard_exc,
+            savedata,
         }
     }
 
