@@ -1281,9 +1281,10 @@ pub struct SnapshotIterator<'a> {
     /// opencoder.py:211,214-217 self.framestack — snapshot byte
     /// offsets in bottom-up order (outermost frame first, innermost
     /// frame last), built by reversing the top-down iterator.
-    /// Eight inline slots cover the inlined-callee chain so
-    /// `SnapshotIterator.__init__` does not spill a 64 B heap per snapshot.
-    pub framestack: SmallVec<[usize; 8]>,
+    /// Sixteen inline slots cover the inlined-callee chain so
+    /// `SnapshotIterator.__init__` does not spill a 128 B heap per snapshot.
+    /// Regex `and`/`or` inlines past eight (`number_from_parts`).
+    pub framestack: SmallVec<[usize; 16]>,
     /// Back-reference to `_snapshot_array_data` so callers can
     /// construct fresh `BoxArrayIter` values without rethreading the
     /// buffer. Matches RPython's implicit `main_iter.trace._snapshot_array_data`

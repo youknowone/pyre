@@ -893,14 +893,17 @@ fn snapshot_map_from_trace_snapshots(
     // sparse Rust adapter here only adds allocator traffic while preserving no
     // extra semantics.
     let snapshot_count = trace_snapshots.len();
+    let total_frames: usize = trace_snapshots.iter().map(|s| s.frames.len()).sum();
     let mut box_map = Vec::with_capacity(snapshot_count);
-    let mut size_map = Vec::with_capacity(snapshot_count);
+    let mut size_map = SnapshotFrameSizes::with_capacity(snapshot_count, 0);
+    size_map.reserve_frames(total_frames);
     let mut vable_map = Vec::with_capacity(snapshot_count);
     let mut vref_map = Vec::with_capacity(snapshot_count);
     // Not `pc_map`: that name belongs to the `-live-` marker table keyed by
     // Python pc (`pc_map[py_pc]`, `pyre-jit/src/jit/codewriter.rs`). This is
     // keyed by snapshot id and holds one `(jitcode_index, pc, py_pc)` per frame.
-    let mut frame_pcs_map = Vec::with_capacity(snapshot_count);
+    let mut frame_pcs_map = SnapshotFramePcs::with_capacity(snapshot_count, 0);
+    frame_pcs_map.reserve_frames(total_frames);
     // opencoder.py _encode: trace snapshot recorder only emits Box
     // (live deadframe slot) and Const (compile-time pool) payloads.
     // TAGVIRTUAL belongs to resume numbering (resume.py:_number_boxes)
@@ -916,7 +919,6 @@ fn snapshot_map_from_trace_snapshots(
             .flat_map(|f| f.boxes.iter())
             .map(&tagged_to_box)
             .collect();
-        let frame_sizes: Vec<usize> = snap.frames.iter().map(|f| f.boxes.len()).collect();
         let vable_boxes: crate::optimizeopt::SnapshotBoxList =
             snap.vable_boxes.iter().map(&tagged_to_box).collect();
         // opencoder.py create_top_snapshot writes BOTH vable_array
@@ -924,16 +926,15 @@ fn snapshot_map_from_trace_snapshots(
         // vref_array as a separate section after vable_array.
         let vref_boxes: crate::optimizeopt::SnapshotBoxList =
             snap.vref_boxes.iter().map(&tagged_to_box).collect();
-        let frame_pcs: Vec<(i32, i32, i32)> = snap
-            .frames
-            .iter()
-            .map(|f| (f.jitcode_index as i32, f.pc as i32, f.py_pc as i32))
-            .collect();
         box_map.push(Some(boxes));
-        size_map.push(Some(frame_sizes));
+        size_map.push_run(snap.frames.iter().map(|f| f.boxes.len()));
         vable_map.push(Some(vable_boxes));
         vref_map.push(Some(vref_boxes));
-        frame_pcs_map.push(Some(frame_pcs));
+        frame_pcs_map.push_run(
+            snap.frames
+                .iter()
+                .map(|f| (f.jitcode_index as i32, f.pc as i32, f.py_pc as i32)),
+        );
     }
     (box_map, size_map, vable_map, vref_map, frame_pcs_map)
 }
@@ -969,10 +970,12 @@ fn snapshot_map_from_byte_recorder(
     let box_to_unique = recorder.box_to_unique_map();
     let n = recorder.snapshot_offset_count();
     let mut box_map = Vec::with_capacity(n);
-    let mut size_map = Vec::with_capacity(n);
+    let mut size_map = SnapshotFrameSizes::with_capacity(n, 0);
+    size_map.reserve_frames(recorder.captured_frame_count());
     let mut vable_map = Vec::with_capacity(n);
     let mut vref_map = Vec::with_capacity(n);
-    let mut frame_pcs_map = Vec::with_capacity(n);
+    let mut frame_pcs_map = SnapshotFramePcs::with_capacity(n, 0);
+    frame_pcs_map.reserve_frames(recorder.captured_frame_count());
     let inputargs = recorder.inputargs();
     let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
         snapshot_tagged_to_box(&t, inputargs)
@@ -984,17 +987,23 @@ fn snapshot_map_from_byte_recorder(
             .map(|&snap_idx| it.iter_array(snap_idx).len())
             .sum();
         let mut boxes = crate::optimizeopt::SnapshotBoxList::with_capacity(n_boxes);
-        let mut frame_sizes = Vec::with_capacity(it.framestack.len());
-        let mut frame_pcs = Vec::with_capacity(it.framestack.len());
-        for (fi, &snap_idx) in it.framestack.iter().enumerate() {
+        // opencoder.py SnapshotIterator keeps box arrays as iterators.
+        // Flatten sizes/pcs into the run table without copying tagged arrays.
+        size_map.push_run(
+            it.framestack
+                .iter()
+                .map(|&snap_idx| it.iter_array(snap_idx).len()),
+        );
+        frame_pcs_map.push_run(it.framestack.iter().enumerate().map(|(fi, &snap_idx)| {
             let (jc, pc) = it.unpack_jitcode_pc(snap_idx);
-            let tagged = it.iter_array(snap_idx);
-            frame_sizes.push(tagged.len());
-            frame_pcs.push((
+            (
                 crate::recorder::Trace::decode_jitcode_index(jc) as i32,
                 pc as i32,
                 py_pcs.get(fi).copied().unwrap_or(pc as u32) as i32,
-            ));
+            )
+        }));
+        for &snap_idx in it.framestack.iter() {
+            let tagged = it.iter_array(snap_idx);
             boxes.extend(
                 tagged
                     .into_iter()
@@ -1010,10 +1019,8 @@ fn snapshot_map_from_byte_recorder(
             .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
             .collect();
         box_map.push(Some(boxes));
-        size_map.push(Some(frame_sizes));
         vable_map.push(Some(vable_boxes));
         vref_map.push(Some(vref_boxes));
-        frame_pcs_map.push(Some(frame_pcs));
     });
     (box_map, size_map, vable_map, vref_map, frame_pcs_map)
 }
@@ -25512,10 +25519,10 @@ mod tests {
             &bridge_ops,
             &bridge_inputargs,
             snapshot_boxes,
-            Vec::new(),
+            SnapshotFrameSizes::new(),
             snapshot_vable_boxes,
             Vec::new(),
-            Vec::new(),
+            SnapshotFramePcs::new(),
             Some(pending_bridge_rd),
             bridge_runtime_boxes,
             10,
@@ -25677,10 +25684,10 @@ mod tests {
             &[] as &[majit_ir::Op],
             &bridge_inputargs,
             Vec::new(),
+            SnapshotFrameSizes::new(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            SnapshotFramePcs::new(),
             None,
             Vec::new(),
             10,
@@ -28241,10 +28248,10 @@ mod tests {
             &bridge_inputargs,
             majit_ir::ConstMap::default(),
             Vec::new(),
+            SnapshotFrameSizes::new(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            SnapshotFramePcs::new(),
         ));
 
         let fresh = meta
