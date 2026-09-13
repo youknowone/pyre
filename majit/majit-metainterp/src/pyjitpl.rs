@@ -2127,6 +2127,9 @@ pub struct MetaInterp<M: Clone> {
     /// preamble.
     pub(crate) single_pass_label_entry_key: Option<u64>,
     pub(crate) next_trace_id: u64,
+    /// rjitlog.py `JitLogger.trace_id`. `start_new_trace` increments this
+    /// even when the binary log is off.
+    pub(crate) jitlog_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
     /// Pre-allocated token object for the trace currently being recorded.
@@ -3390,6 +3393,17 @@ impl<M: Clone> MetaInterp<M> {
         trace_id
     }
 
+    /// rjitlog.py `JitLogger.start_new_trace`: increment even when the
+    /// binary log is off. Called at the start of `compile_trace`.
+    fn jitlog_start_new_trace(&mut self) {
+        self.jitlog_trace_id += 1;
+    }
+
+    /// rjitlog.py `JitLogger.trace_aborted`.
+    fn jitlog_trace_aborted(&mut self) {
+        self.warm_state.log_trace_aborted();
+    }
+
     /// Test-only accessor for the root trace_id of a compiled entry.
     /// Production code reaches the same value via the resume guard descr's
     /// `descr.trace_id()` (set at backend compile time) or via
@@ -3884,6 +3898,7 @@ impl<M: Clone> MetaInterp<M> {
             single_pass_compiled_key: None,
             single_pass_label_entry_key: None,
             next_trace_id: 1,
+            jitlog_trace_id: 0,
             hooks: JitHooks::default(),
             pending_token: None,
             stats: JitStatsCounters::default(),
@@ -9012,6 +9027,24 @@ impl<M: Clone> MetaInterp<M> {
         )
     }
 
+    /// compile.py `compile_trace` + `ResumeFromInterpDescr.compile_and_attach`
+    /// for a FINISH-only interp-origin trace. `compile_entry_bridge` is the
+    /// JUMP-into-existing-loop sibling; a return has no target loop.
+    pub fn compile_trace_finish_from_interp(
+        &mut self,
+        finish_args: &[OpRef],
+        finish_arg_types: Vec<Type>,
+        entry_meta: M,
+        exit_with_exception: bool,
+    ) -> Result<(), SwitchToBlackhole> {
+        self.finish_and_compile(
+            finish_args,
+            finish_arg_types,
+            entry_meta,
+            exit_with_exception,
+        )
+    }
+
     fn compile_trace_inner(
         &mut self,
         green_key: u64,
@@ -9027,13 +9060,14 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_resume_memos,
         );
         let ends_with_jump = finish_descr.is_none();
-        let ctx = match self.tracing.as_mut() {
-            Some(ctx) => ctx,
-            None => {
-                crate::mc_diag_bump(33); // compile_trace: no tracing session
-                return CompileOutcome::Cancelled;
-            }
-        };
+        if self.tracing.is_none() {
+            crate::mc_diag_bump(33); // compile_trace: no tracing session
+            return CompileOutcome::Cancelled;
+        }
+        // compile.py compile_trace: jitlog.start_new_trace. After the
+        // session check, before the long tracing borrow.
+        self.jitlog_start_new_trace();
+        let ctx = self.tracing.as_mut().unwrap();
 
         // pyjitpl.py:3187: save position before recording JUMP/FINISH
         let cut_at = ctx.get_trace_position();
@@ -10571,6 +10605,19 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap()
             .recorder
             .finish(finish_args, finish_descr);
+        // compile.py compile_trace: `trace.tracing_done()` then
+        // `jitlog.start_new_trace` before optimize.
+        if let Err(reason) = self
+            .compile_tracing
+            .as_mut()
+            .unwrap()
+            .recorder
+            .tracing_done()
+        {
+            self.pending_abort_reason = Some(reason.as_int());
+            return Err(SwitchToBlackhole::giveup());
+        }
+        self.jitlog_start_new_trace();
         // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
         // downstream consumers (`trace.snapshots`) still observe the
         // captured resumedata. `recorder.get_trace()` on its own returns
@@ -10688,6 +10735,8 @@ impl<M: Clone> MetaInterp<M> {
             // ceiling (`MAX_TRACE_ABORT_COUNT`) is what retires a location
             // that keeps failing.
             Err(_invalid_loop) => {
+                // compile.py compile_trace: jitlog.trace_aborted on InvalidLoop.
+                self.jitlog_trace_aborted();
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-abort",
@@ -14254,6 +14303,7 @@ impl<M: Clone> MetaInterp<M> {
         // decode (resume.py:1245-1282).
         let retrace_limit = self.warm_state.retrace_limit();
         let optimize_start = Instant::now();
+        let mut retraced_count = retraced_count;
         let bridge_optimize_result = {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             optimizer.optimize_bridge(
@@ -14263,7 +14313,7 @@ impl<M: Clone> MetaInterp<M> {
                 &mut compiled.front_target_tokens,
                 bridge_runtime_boxes,
                 true,
-                retraced_count,
+                &mut retraced_count,
                 retrace_limit,
                 None,
                 Some(loop_num_inputs),
@@ -14283,6 +14333,7 @@ impl<M: Clone> MetaInterp<M> {
             // than a panic), abandons the function-entry bridge.
             Err(invalid_loop) => {
                 crate::mc_diag_bump(36); // compile_entry_bridge: optimize_bridge InvalidLoop
+                self.jitlog_trace_aborted();
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_entry_bridge: InvalidLoop({}) target={} original={}",
@@ -14303,7 +14354,8 @@ impl<M: Clone> MetaInterp<M> {
                 .get(&green_key)
                 .and_then(|compiled| compiled.live_token())
             {
-                tok.set_retraced_count(tok.get_retraced_count() + 1);
+                // unroll.py already incremented the count inside optimize_bridge.
+                tok.set_retraced_count(retraced_count);
             }
             crate::mc_diag_bump(37); // compile_entry_bridge: optimizer asked for a retrace
             if let Some(es) = optimizer.exported_loop_state.take() {
@@ -14826,7 +14878,7 @@ impl<M: Clone> MetaInterp<M> {
         // cell_token.retraced_count += 1` — the retrace budget is charged to
         // the jitcell being entered, so a cross-loop close reads (and below,
         // bumps) the target's counter rather than the origin's.
-        let retraced_count = self
+        let mut retraced_count = self
             .compiled_loops
             .get(&cell_token_key)
             .and_then(|compiled| compiled.live_token())
@@ -15125,7 +15177,7 @@ impl<M: Clone> MetaInterp<M> {
                     front_target_tokens,
                     bridge_runtime_boxes,
                     bridge_inline_short_preamble,
-                    retraced_count,
+                    &mut retraced_count,
                     retrace_limit,
                     pending_bridge_rd,
                     Some(loop_num_inputs),
@@ -15175,6 +15227,7 @@ impl<M: Clone> MetaInterp<M> {
             // `InvalidLoop` signal, not a panic), discards the bridge.
             Err(inv) => {
                 crate::mc_diag_bump(9); // compile_bridge InvalidLoop discard
+                self.jitlog_trace_aborted();
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_bridge: InvalidLoop(\"{}\") at key={} fail_index={}",
@@ -15196,14 +15249,13 @@ impl<M: Clone> MetaInterp<M> {
             // compile.py:1079: metainterp.retrace_needed(new_trace, info)
             // Save partial trace + exported state so the next loop-header's
             // compile_loop → compile_retrace can produce a new specialization.
-            // unroll.py `cell_token.retraced_count += 1` — charged to the
-            // jitcell the JUMP enters, which is where the count was read from.
+            // unroll.py increment already ran inside optimize_bridge.
             if let Some(tok) = self
                 .compiled_loops
                 .get(&cell_token_key)
                 .and_then(|compiled| compiled.live_token())
             {
-                tok.set_retraced_count(tok.get_retraced_count() + 1);
+                tok.set_retraced_count(retraced_count);
             }
             let exported = optimizer.exported_loop_state.take();
             if crate::majit_log_enabled() {
@@ -17861,14 +17913,18 @@ impl<M: Clone> MetaInterp<M> {
                 }
             };
         }
-        // Root branch: drain `trace_meta`, drive `finish_and_compile`.
-        // `finish_and_compile` takes the tracer (`self.tracing`) so no
-        // separate `abort_trace` is needed.
+        // Root branch: compile.py compile_trace with ResumeFromInterpDescr.
+        // `finish_and_compile` is that resumekey's compile_and_attach for a
+        // FINISH-only entry procedure (no target loop to JUMP into).
         let meta = self
             .take_trace_meta()
             .expect("compile_finish_from_active_session: session must be present");
-        let result =
-            self.finish_and_compile(finish_args, finish_arg_types, meta, exit_with_exception);
+        let result = self.compile_trace_finish_from_interp(
+            finish_args,
+            finish_arg_types,
+            meta,
+            exit_with_exception,
+        );
         // pyjitpl.py:2897 `finally: profiler.end_tracing()` — close the
         // tracing event scope opened by `prepare_trace_start_runtime`
         // / `start_retrace_from_guard` for the root-finish path.  The

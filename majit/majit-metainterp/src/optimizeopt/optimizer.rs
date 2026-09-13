@@ -4281,9 +4281,10 @@ impl Optimizer {
     /// no existing trace matches, export_state creates a new specialization.
     /// Default retrace_limit = 0 (disabled, warmstate.py PARAMETERS).
     ///
-    /// Returns `(optimized_ops, retrace_requested)`. When retrace_requested
-    /// is true, the caller should increment retraced_count and may use the
-    /// optimizer's exported_loop_state for the new target token.
+    /// Returns `(optimized_ops, retrace_requested)`. When retrace is
+    /// requested, this method increments `retraced_count` itself
+    /// (`unroll.py` `cell_token.retraced_count += 1`). The caller writes
+    /// the updated count back onto the entered JitCellToken.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -4296,7 +4297,7 @@ impl Optimizer {
         front_target_tokens: &mut [crate::history::TargetToken],
         runtime_boxes: &[OpRef],
         inline_short_preamble: bool,
-        retraced_count: u32,
+        retraced_count: &mut u32,
         retrace_limit: u32,
         pending_bridge_rd: Option<PendingBridgeRd>,
         _loop_num_inputs: Option<usize>,
@@ -4629,11 +4630,13 @@ impl Optimizer {
                 ),
             );
         }
-        if retraced_count < retrace_limit {
+        if *retraced_count < retrace_limit {
+            // unroll.py `cell_token.retraced_count += 1` before export.
+            *retraced_count += 1;
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
                     "jit-tracing",
-                    &format!("Retracing ({}/{retrace_limit})", retraced_count + 1),
+                    &format!("Retracing ({}/{retrace_limit})", retraced_count),
                 );
             }
             // unroll.py `exported_state = self.optunroll.export_state(

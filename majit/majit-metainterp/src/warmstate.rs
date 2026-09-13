@@ -2046,6 +2046,13 @@ impl WarmEnterState {
         }
     }
 
+    /// rjitlog.py `JitLogger.trace_aborted`. No-op if Logger is disabled.
+    pub fn log_trace_aborted(&mut self) {
+        if let Some(log) = &mut self.jitlog {
+            log.log_abort();
+        }
+    }
+
     /// Get a reference to the Logger, if enabled.
     pub fn jitlog(&self) -> Option<&Logger> {
         self.jitlog.as_ref()
