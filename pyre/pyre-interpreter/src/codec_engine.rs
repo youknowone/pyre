@@ -5,7 +5,9 @@
 //! routes named / registered handlers through the same UnicodeError
 //! objects the rest of pyre already builds.
 
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use rustpython_common::encodings::{
     self, ByteOrder, CodecContext, DecodeContext, DecodeErrorHandler, EncodeContext,
@@ -72,44 +74,51 @@ pub fn decode_escape(
 }
 
 pub fn encode_utf8(
-    s: &Wtf8,
+    _s: &Wtf8,
     w_object: pyre_object::PyObjectRef,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
-    let ctx = PyreEncodeContext::new(encodings::utf8::ENCODING_NAME, s, w_object);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ctx = PyreEncodeContext::pinned(encodings::utf8::ENCODING_NAME, w_object);
     encodings::utf8::encode(ctx, &PyreErrors { errors })
 }
 
 pub fn encode_ascii(
-    s: &Wtf8,
+    _s: &Wtf8,
     w_object: pyre_object::PyObjectRef,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
-    let ctx = PyreEncodeContext::new(encodings::ascii::ENCODING_NAME, s, w_object);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ctx = PyreEncodeContext::pinned(encodings::ascii::ENCODING_NAME, w_object);
     encodings::ascii::encode(ctx, &PyreErrors { errors })
 }
 
 pub fn encode_latin1(
-    s: &Wtf8,
+    _s: &Wtf8,
     w_object: pyre_object::PyObjectRef,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
-    let ctx = PyreEncodeContext::new(encodings::latin_1::ENCODING_NAME, s, w_object);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ctx = PyreEncodeContext::pinned(encodings::latin_1::ENCODING_NAME, w_object);
     encodings::latin_1::encode(ctx, &PyreErrors { errors })
 }
 
 pub fn decode_ascii(data: Vec<u8>, errors: &str) -> Result<Wtf8Buf, crate::PyError> {
-    let ctx = PyreDecodeContext::new(encodings::ascii::ENCODING_NAME, data);
+    let ctx = PyreDecodeContext::new(encodings::ascii::ENCODING_NAME, data, Rc::new(Cell::new(0)));
     encodings::ascii::decode(ctx, &PyreErrors { errors }).map(|(text, _)| text)
 }
 
 pub fn decode_latin1(data: Vec<u8>, errors: &str) -> Result<Wtf8Buf, crate::PyError> {
-    let ctx = PyreDecodeContext::new(encodings::latin_1::ENCODING_NAME, data);
+    let ctx = PyreDecodeContext::new(
+        encodings::latin_1::ENCODING_NAME,
+        data,
+        Rc::new(Cell::new(0)),
+    );
     encodings::latin_1::decode(ctx, &PyreErrors { errors }).map(|(text, _)| text)
 }
 
 pub fn encode_utf16(
-    s: &Wtf8,
+    _s: &Wtf8,
     w_object: pyre_object::PyObjectRef,
     errors: &str,
     order: ByteOrder,
@@ -120,12 +129,13 @@ pub fn encode_utf16(
         ByteOrder::Little => encodings::utf16::ENCODING_NAME_LE,
         ByteOrder::Big => encodings::utf16::ENCODING_NAME_BE,
     };
-    let ctx = PyreEncodeContext::new(name, s, w_object);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ctx = PyreEncodeContext::pinned(name, w_object);
     encodings::utf16::encode(ctx, &PyreErrors { errors }, order, bom)
 }
 
 pub fn encode_utf32(
-    s: &Wtf8,
+    _s: &Wtf8,
     w_object: pyre_object::PyObjectRef,
     errors: &str,
     order: ByteOrder,
@@ -136,7 +146,8 @@ pub fn encode_utf32(
         ByteOrder::Little => encodings::utf32::ENCODING_NAME_LE,
         ByteOrder::Big => encodings::utf32::ENCODING_NAME_BE,
     };
-    let ctx = PyreEncodeContext::new(name, s, w_object);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ctx = PyreEncodeContext::pinned(name, w_object);
     encodings::utf32::encode(ctx, &PyreErrors { errors }, order, bom)
 }
 
@@ -153,13 +164,15 @@ pub fn decode_utf16_32(
     final_: bool,
     error_encoding: &str,
 ) -> Result<(Wtf8Buf, usize, i32), crate::PyError> {
-    let ctx = PyreDecodeContext::new(error_encoding, data.to_vec());
+    let pos_delta = Rc::new(Cell::new(0isize));
+    let ctx = PyreDecodeContext::new(error_encoding, data.to_vec(), pos_delta.clone());
     let handler = PyreErrors { errors };
-    if is32 {
-        encodings::utf32::decode(ctx, &handler, order, final_)
+    let (text, consumed, byteorder) = if is32 {
+        encodings::utf32::decode(ctx, &handler, order, final_)?
     } else {
-        encodings::utf16::decode(ctx, &handler, order, final_)
-    }
+        encodings::utf16::decode(ctx, &handler, order, final_)?
+    };
+    Ok((text, adjust_consumed(consumed, &pos_delta), byteorder))
 }
 
 pub fn decode_unicode_escape(
@@ -167,8 +180,15 @@ pub fn decode_unicode_escape(
     errors: &str,
     final_: bool,
 ) -> Result<(Wtf8Buf, usize, Option<EscapeNote>), crate::PyError> {
-    let ctx = PyreDecodeContext::new(encodings::unicode_escape::ENCODING_NAME, data);
-    encodings::unicode_escape::decode(ctx, &PyreErrors { errors }, final_)
+    let pos_delta = Rc::new(Cell::new(0isize));
+    let ctx = PyreDecodeContext::new(
+        encodings::unicode_escape::ENCODING_NAME,
+        data,
+        pos_delta.clone(),
+    );
+    let (text, consumed, note) =
+        encodings::unicode_escape::decode(ctx, &PyreErrors { errors }, final_)?;
+    Ok((text, adjust_consumed(consumed, &pos_delta), note))
 }
 
 pub fn decode_raw_unicode_escape(
@@ -176,8 +196,15 @@ pub fn decode_raw_unicode_escape(
     errors: &str,
     final_: bool,
 ) -> Result<(Wtf8Buf, usize), crate::PyError> {
-    let ctx = PyreDecodeContext::new(encodings::raw_unicode_escape::ENCODING_NAME, data);
-    encodings::raw_unicode_escape::decode(ctx, &PyreErrors { errors }, final_)
+    let pos_delta = Rc::new(Cell::new(0isize));
+    let ctx = PyreDecodeContext::new(
+        encodings::raw_unicode_escape::ENCODING_NAME,
+        data,
+        pos_delta.clone(),
+    );
+    let (text, consumed) =
+        encodings::raw_unicode_escape::decode(ctx, &PyreErrors { errors }, final_)?;
+    Ok((text, adjust_consumed(consumed, &pos_delta)))
 }
 
 pub fn decode_utf7(
@@ -185,29 +212,43 @@ pub fn decode_utf7(
     errors: &str,
     final_: bool,
 ) -> Result<(Wtf8Buf, usize), crate::PyError> {
-    let ctx = PyreDecodeContext::new(encodings::utf7::ENCODING_NAME, data);
-    encodings::utf7::decode(ctx, &PyreErrors { errors }, final_)
+    let pos_delta = Rc::new(Cell::new(0isize));
+    let ctx = PyreDecodeContext::new(encodings::utf7::ENCODING_NAME, data, pos_delta.clone());
+    let (text, consumed) = encodings::utf7::decode(ctx, &PyreErrors { errors }, final_)?;
+    Ok((text, adjust_consumed(consumed, &pos_delta)))
+}
+
+fn adjust_consumed(engine_pos: usize, pos_delta: &Cell<isize>) -> usize {
+    (engine_pos as isize + pos_delta.get()) as usize
 }
 
 struct PyreEncodeContext<'a> {
     encoding: &'a str,
-    data: &'a Wtf8,
     pos: StrSize,
-    w_object: pyre_object::PyObjectRef,
+    source_slot: usize,
 }
 
 impl<'a> PyreEncodeContext<'a> {
-    fn new(encoding: &'a str, data: &'a Wtf8, w_object: pyre_object::PyObjectRef) -> Self {
+    fn pinned(encoding: &'a str, w_object: pyre_object::PyObjectRef) -> Self {
+        let source_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_object);
         Self {
             encoding,
-            data,
             pos: StrSize::default(),
-            w_object,
+            source_slot,
         }
     }
 
+    fn w_object(&self) -> pyre_object::PyObjectRef {
+        pyre_object::gc_roots::shadow_stack_get(self.source_slot)
+    }
+
+    fn data(&self) -> &Wtf8 {
+        unsafe { pyre_object::w_str_get_wtf8(self.w_object()) }
+    }
+
     fn char_len(&self) -> usize {
-        self.data.code_points().count()
+        self.data().code_points().count()
     }
 }
 
@@ -227,18 +268,18 @@ impl CodecContext for PyreEncodeContext<'_> {
 
 impl EncodeContext for PyreEncodeContext<'_> {
     fn full_data(&self) -> &Wtf8 {
-        self.data
+        self.data()
     }
 
     fn data_len(&self) -> StrSize {
         StrSize {
-            bytes: self.data.len(),
+            bytes: self.data().len(),
             chars: self.char_len(),
         }
     }
 
     fn remaining_data(&self) -> &Wtf8 {
-        &self.data[self.pos.bytes..]
+        &self.data()[self.pos.bytes..]
     }
 
     fn position(&self) -> StrSize {
@@ -259,7 +300,7 @@ impl EncodeContext for PyreEncodeContext<'_> {
     fn error_encoding(&self, range: Range<StrSize>, reason: Option<&str>) -> Self::Error {
         crate::typedef::unicode_encode_error(
             self.encoding,
-            self.w_object,
+            self.w_object(),
             range.start.chars as i64,
             range.end.chars as i64,
             reason.unwrap_or("unknown encoding error"),
@@ -271,14 +312,16 @@ struct PyreDecodeContext {
     encoding: String,
     data: Vec<u8>,
     pos: usize,
+    pos_delta: Rc<Cell<isize>>,
 }
 
 impl PyreDecodeContext {
-    fn new(encoding: &str, data: Vec<u8>) -> Self {
+    fn new(encoding: &str, data: Vec<u8>, pos_delta: Rc<Cell<isize>>) -> Self {
         Self {
             encoding: encoding.to_owned(),
             data,
             pos: 0,
+            pos_delta,
         }
     }
 }
@@ -366,16 +409,24 @@ impl<'a> EncodeErrorHandler<PyreEncodeContext<'a>> for PyreErrors<'_> {
                 let (rep, newpos) = call_registered_encode_error_handler(
                     self.errors,
                     ctx.encoding,
-                    ctx.w_object,
+                    ctx.w_object(),
                     ctx.char_len(),
                     range.start.chars,
                     range.end.chars,
                     reason.unwrap_or("unknown encoding error"),
                     EncodeErrorOwner::UnicodeObject,
                 )?;
-                let restart = str_size_at_char(ctx.data, newpos);
+                let restart = str_size_at_char(ctx.data(), newpos);
                 let replace = match rep {
                     EncodeReplacement::Str(cps) => {
+                        // utf-8/16/32 copy a str replacement as ASCII units
+                        // and re-raise the original error for any other
+                        // code point (`test_encode_nonascii_replacement`).
+                        if StandardEncoding::parse(ctx.encoding).is_some()
+                            && cps.iter().any(|&cp| cp >= 0x80)
+                        {
+                            return Err(ctx.error_encoding(range, reason));
+                        }
                         let mut buf = Wtf8Buf::new();
                         for cp in cps {
                             buf.push(
@@ -426,6 +477,12 @@ impl DecodeErrorHandler<PyreDecodeContext> for PyreErrors<'_> {
                     &mut replace,
                 )?;
                 if let Some(bytes) = new_bytes {
+                    // `unicodehelper.str_decode_unicode_escape` `pos_delta`:
+                    // the handler's resume index is in the replacement
+                    // object, but the consumed count stays relative to the
+                    // original input (`pos + (prelen - len(s))`).
+                    ctx.pos_delta
+                        .set(ctx.pos_delta.get() + ctx.data.len() as isize - bytes.len() as isize);
                     ctx.data = bytes;
                 }
                 Ok((EngineStr(replace), newpos))
