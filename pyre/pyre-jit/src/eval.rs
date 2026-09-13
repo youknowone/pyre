@@ -7658,6 +7658,13 @@ fn unpack_merge_point_jit(
     if !jd1_experiment_enabled() {
         return;
     }
+    // blackhole.py `bhimpl_jit_merge_point`: a merge point reached from
+    // blackhole does not start a new trace.  The hook is the interpreter
+    // portal, so a STORE_ATTR deopt that unpacks a list would otherwise
+    // nest `force_start_tracing` under `BlackholeInterpreter::run`.
+    if majit_metainterp::blackhole::blackhole_is_running() {
+        return;
+    }
     if greenkey.is_null() || w_iterator.is_null() || items.is_null() {
         return;
     }
@@ -7784,12 +7791,9 @@ fn drive_unpack_iterable_trace(
         return;
     }
 
-    // baseobjspace.py:31 reds='auto' → `w_iterator`, `items` as the two Ref
-    // input args, in the order `create_sym`/`collect_jump_args` use.
-    let live_values = [
-        majit_ir::Value::Ref(majit_ir::GcRef(w_iterator as usize)),
-        majit_ir::Value::Ref(majit_ir::GcRef(items as usize)),
-    ];
+    // Extracted merge-point reds: root_base, greenkey, w_iterator, items.
+    let live_values =
+        pyre_jit_trace::unpack_state::jd1_live_values(greenkey_raw, w_iterator, items);
 
     // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
     // the novable jd1 is elected over jd0 (whose `virtualizable_info` would
@@ -7988,29 +7992,42 @@ fn drive_unpack_iterable_trace(
         return;
     }
 
-    // reds='auto' as the merge-point InputArgs: (w_iterator, items) in the
-    // order `collect_jump_args` returns, seeded onto the registers the
-    // `jit_merge_point` op names (decoded inside
-    // `trace_jitcode_from_merge_point`) so each residual runs on the shared
-    // heap objects the caller loop holds.
-    let red_refs = [
+    // Seed every bank the extracted `jit_merge_point` names.  Green is
+    // the type object; reds are root_base / greenkey / iterator / items
+    // in i-then-r order.
+    let green_args = [(
+        majit_metainterp::JitArgKind::Ref,
+        greenkey_raw as usize as i64,
+    )];
+    let red_args = [
         (
-            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+            pyre_jit_trace::unpack_state::jd1_root_base(),
+        ),
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+            greenkey_raw as usize as i64,
+        ),
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
             w_iterator as usize as i64,
         ),
         (
-            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(3, majit_ir::Type::Ref),
             items as usize as i64,
         ),
     ];
-    // baseobjspace.py green `greenkey` = `iterator_greenkey(w_iterator)`,
-    // a per-type singleton pointer — seeded as the merge-point green Const.
-    let green_ref = greenkey_raw as usize as i64;
 
     let mut sym = pyre_jit_trace::unpack_state::UnpackSym {
         greenkey: pyre_object::PY_NULL,
-        w_iterator: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
-        items: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+        root_base: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+        greenkey_red: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+        w_iterator: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+        items: majit_ir::OpRef::input_arg_typed(3, majit_ir::Type::Ref),
     };
 
     // The `jit_merge_point` opcode byte offset in the extracted body — the
@@ -8050,7 +8067,13 @@ fn drive_unpack_iterable_trace(
                 recursive_exec_void,
             );
             majit_metainterp::trace_jitcode_from_merge_point(
-                ctx, &mut sym, &jitcode, header_pc, &runtime, green_ref, &red_refs,
+                ctx,
+                &mut sym,
+                &jitcode,
+                header_pc,
+                &runtime,
+                &green_args,
+                &red_args,
             )
         },
     );

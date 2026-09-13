@@ -12024,18 +12024,19 @@ where
 /// (`blackhole.py` `@arguments("i","I","R","F","I","R","F")`) lists the
 /// green {I,R,F} register slots then the red {I,R,F} slots, each as
 /// `[len:u8][reg:u8 * len]`. The green ref is seeded as a `Const`
-/// (verify_green_args); each red ref as its InputArg, paired positionally with
-/// the op's red-ref list (the `collect_jump_args` order). Reds are Ref-typed
-/// to match the `reds='auto'` pointer set; int/float reds are unimplemented
-/// (no such driver exists yet).
+/// (verify_green_args); each red as its InputArg, paired positionally with
+/// the op's red lists in i/r/f bank order (`collect_jump_args`).  The
+/// extracted `unpackiterable_portal` merge point carries a red Int
+/// (`root_base`) plus three red Refs, so the caller must pass that shape
+/// rather than assuming every red is a Ref.
 pub fn trace_jitcode_from_merge_point<S, R>(
     ctx: &mut TraceCtx,
     sym: &mut S,
     jitcode: &JitCode,
     header_pc: usize,
     runtime: &R,
-    green_ref: i64,
-    red_refs: &[(OpRef, i64)],
+    green_args: &[(JitArgKind, i64)],
+    red_args: &[(JitArgKind, OpRef, i64)],
 ) -> TraceAction
 where
     S: JitCodeSym,
@@ -12044,19 +12045,14 @@ where
     if refuse_reachable_symbolic_residuals(jitcode) {
         return TraceAction::Abort;
     }
-    let green_args = [(JitArgKind::Ref, green_ref)];
-    let red_args: Vec<_> = red_refs
-        .iter()
-        .map(|&(opref, value)| (JitArgKind::Ref, opref, value))
-        .collect();
     let mut standalone = StandaloneFrameStack::new();
     let frame = setup_frame_from_merge_point(
         ctx,
         &mut standalone.frames,
         Arc::new(jitcode.clone()),
         header_pc,
-        &green_args,
-        &red_args,
+        green_args,
+        red_args,
     );
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
@@ -12085,6 +12081,42 @@ fn seed_register(frame: &mut MIFrame, kind: JitArgKind, reg: usize, opref: OpRef
     }
 }
 
+/// The six register lists a `jit_merge_point` names, in
+/// (green I, green R, green F, red I, red R, red F) order.
+/// `bhimpl_jit_merge_point` decodes the same layout.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MergePointBanks {
+    pub green_i: Vec<usize>,
+    pub green_r: Vec<usize>,
+    pub green_f: Vec<usize>,
+    pub red_i: Vec<usize>,
+    pub red_r: Vec<usize>,
+    pub red_f: Vec<usize>,
+}
+
+/// Decode the six `[len:u8][reg:u8 * len]` lists after the merge-point
+/// opcode and jdindex bytes.
+pub fn decode_jit_merge_point_banks(code: &[u8], header_pc: usize) -> MergePointBanks {
+    let mut slot_regs: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+    let mut cur = header_pc + 2;
+    for regs in slot_regs.iter_mut() {
+        let len = code[cur] as usize;
+        cur += 1;
+        for _ in 0..len {
+            regs.push(code[cur] as usize);
+            cur += 1;
+        }
+    }
+    MergePointBanks {
+        green_i: std::mem::take(&mut slot_regs[0]),
+        green_r: std::mem::take(&mut slot_regs[1]),
+        green_f: std::mem::take(&mut slot_regs[2]),
+        red_i: std::mem::take(&mut slot_regs[3]),
+        red_r: std::mem::take(&mut slot_regs[4]),
+        red_f: std::mem::take(&mut slot_regs[5]),
+    }
+}
+
 /// Build an [`MIFrame`] whose first instruction is a JitDriver merge point.
 ///
 /// `MIFrame::setup_call` is the ordinary callee-entry path and resets the
@@ -12101,22 +12133,15 @@ pub fn setup_frame_from_merge_point(
     green_args: &[(JitArgKind, i64)],
     red_args: &[(JitArgKind, OpRef, i64)],
 ) -> MIFrame {
-    // Decode the six register lists of the `jit_merge_point` op at
-    // `header_pc`: opcode(1) + jdindex(1), then `[len:u8][reg:u8 * len]` per
-    // slot in (green I, green R, green F, red I, red R, red F) order.
-    let mut slot_regs: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
-    {
-        let code = &jitcode_arc.code;
-        let mut cur = header_pc + 2;
-        for regs in slot_regs.iter_mut() {
-            let len = code[cur] as usize;
-            cur += 1;
-            for _ in 0..len {
-                regs.push(code[cur] as usize);
-                cur += 1;
-            }
-        }
-    }
+    let banks = decode_jit_merge_point_banks(&jitcode_arc.code, header_pc);
+    let slot_regs = [
+        banks.green_i,
+        banks.green_r,
+        banks.green_f,
+        banks.red_i,
+        banks.red_r,
+        banks.red_f,
+    ];
     let mut frame = frames.take_frame(jitcode_arc, header_pc, None, Some(ctx));
     for (bank, kind) in [JitArgKind::Int, JitArgKind::Ref, JitArgKind::Float]
         .into_iter()

@@ -22,7 +22,7 @@
 //! portal — see `eval.rs jd1_experiment_enabled` for why that is not yet
 //! RPython's independent second driver.
 
-use majit_ir::{OpRef, Type};
+use majit_ir::{GcRef, OpRef, Type, Value};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
 
 use crate::state::{PyreEnv, PyreMeta};
@@ -30,16 +30,23 @@ use pyre_object::{PY_NULL, PyObjectRef};
 
 /// jd1 symbolic state carried across the `unpackiterable_driver` back-edge.
 ///
-/// The two `reds='auto'` values are [`Self::w_iterator`] and [`Self::items`];
-/// `greenkey` is the merge-point green (const across the loop, never a jump
-/// arg).
+/// PyPy's Python portal has two `reds='auto'` values, `w_iterator` and
+/// `items`.  The extracted Rust portal also pins those objects on the
+/// shadow stack, so `reds='auto'` collects `root_base` (Int) and a live
+/// `greenkey` Ref as well.  The extracted `jit_merge_point` names that
+/// four-red shape; JUMP / enter must match it.
 #[allow(dead_code)]
 pub struct UnpackSym {
     /// baseobjspace.py:1012 jit_merge_point(greenkey=greenkey) green.
     pub greenkey: PyObjectRef,
-    /// reds='auto' #1 — the iterator drained by `self.next(w_iterator)`.
+    /// Shadow-stack slot of the pinned iterator.  The extracted body
+    /// reloads `w_iterator` / `items` through this base.
+    pub root_base: OpRef,
+    /// The greenkey object, still live as a red across the merge.
+    pub greenkey_red: OpRef,
+    /// The iterator drained by `self.next(w_iterator)`.
     pub w_iterator: OpRef,
-    /// reds='auto' #2 — the `items` list grown by `items.append(w_item)`.
+    /// The `items` list grown by `items.append(w_item)`.
     pub items: OpRef,
 }
 
@@ -71,18 +78,42 @@ pub struct UnpackJitState {
     pub greenkey: PyObjectRef,
 }
 
+/// Shadow-stack slot of the iterator pinned by `unpackiterable_portal`.
+/// The hook runs inside that portal, so the two pins are the top of the
+/// stack and this is `len - 2`.
+pub fn jd1_root_base() -> i64 {
+    pyre_object::gc_roots::shadow_stack_len().saturating_sub(2) as i64
+}
+
+/// Loop-carried reds in merge-point bank order (red I, then red R).
+pub fn jd1_live_values(
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    items: PyObjectRef,
+) -> Vec<Value> {
+    vec![
+        Value::Int(jd1_root_base()),
+        Value::Ref(GcRef(greenkey as usize)),
+        Value::Ref(GcRef(w_iterator as usize)),
+        Value::Ref(GcRef(items as usize)),
+    ]
+}
+
 impl UnpackJitState {
     /// jd1 (`unpackiterable_driver`) portal descriptor.
-    /// `baseobjspace.py:29` `greens=['greenkey'], reds='auto'` — the two
-    /// `reds='auto'` values are `w_iterator` and `items` (see [`UnpackSym`]),
-    /// in the argument order `create_sym` seeds and `collect_jump_args`
-    /// returns. Novable: no virtualizable name, so
-    /// `elect_active_jitdriver_sd`'s vinfo-scan keeps electing jd0. The driver
-    /// yields the grown `items` list → `Type::Ref` (the `new` default).
+    /// `baseobjspace.py` `greens=['greenkey'], reds='auto'`.  The extracted
+    /// Rust portal's merge point also names `root_base` and a live
+    /// `greenkey` Ref; [`create_sym`] / [`JitState::collect_jump_args`]
+    /// follow that four-red shape. Novable: no virtualizable name.
     pub fn unpackiterable_driver_descriptor() -> JitDriverStaticData {
         let mut sd = JitDriverStaticData::new(
             vec![("greenkey", Type::Ref)],
-            vec![("w_iterator", Type::Ref), ("items", Type::Ref)],
+            vec![
+                ("root_base", Type::Int),
+                ("greenkey_red", Type::Ref),
+                ("w_iterator", Type::Ref),
+                ("items", Type::Ref),
+            ],
         );
         // baseobjspace.py unpackiterable_driver = jit.JitDriver(name='unpackiterable', ...)
         sd.name = "unpackiterable".into();
@@ -122,9 +153,9 @@ impl JitState for UnpackJitState {
     }
 
     fn extract_live(&self, meta: &Self::Meta) -> Vec<i64> {
-        // The live reds (`w_iterator`, `items`) are the tracer's InputArgs, not
-        // interpreter-frame values; the dormant driver holds no concrete frame
-        // to project them from.
+        // The live reds are the tracer's InputArgs, not interpreter-frame
+        // values; the dormant driver holds no concrete frame to project them
+        // from.
         let _ = meta;
         Vec::new()
     }
@@ -133,9 +164,12 @@ impl JitState for UnpackJitState {
         let _ = (meta, header_pc);
         UnpackSym {
             greenkey: PY_NULL,
-            // reds='auto' seeded as the merge-point InputArgs in argument order.
-            w_iterator: OpRef::input_arg_typed(0, Type::Ref),
-            items: OpRef::input_arg_typed(1, Type::Ref),
+            // InputArg order is red I then red R, matching the merge-point
+            // banks and [`jd1_live_values`].
+            root_base: OpRef::input_arg_typed(0, Type::Int),
+            greenkey_red: OpRef::input_arg_typed(1, Type::Ref),
+            w_iterator: OpRef::input_arg_typed(2, Type::Ref),
+            items: OpRef::input_arg_typed(3, Type::Ref),
         }
     }
 
@@ -152,7 +186,7 @@ impl JitState for UnpackJitState {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        vec![sym.w_iterator, sym.items]
+        vec![sym.root_base, sym.greenkey_red, sym.w_iterator, sym.items]
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {
@@ -187,6 +221,22 @@ mod tests {
             .filter(|op| op.opname == "jit_merge_point")
             .collect();
         assert_eq!(merge_points.len(), 1);
+        let banks =
+            majit_metainterp::decode_jit_merge_point_banks(&canonical.code, merge_points[0].pc);
+        assert_eq!(banks.green_i.len(), 0);
+        assert_eq!(banks.green_r.len(), 1);
+        assert_eq!(banks.green_f.len(), 0);
+        assert_eq!(
+            banks.red_i.len(),
+            1,
+            "extracted portal carries root_base as a red Int"
+        );
+        assert_eq!(
+            banks.red_r.len(),
+            3,
+            "extracted portal carries greenkey + iterator + items as red Refs"
+        );
+        assert_eq!(banks.red_f.len(), 0);
 
         crate::jitcode_runtime::install_global_build_descr_pool();
         let jitcode = JitCode::from_canonical((*canonical).clone());
