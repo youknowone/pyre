@@ -16250,7 +16250,18 @@ fn walker_emit_jit_int_str<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(length, majit_ir::Value::Int(concrete_len));
 
-    let wrapped = crate::helpers::emit_box_unicode_inline(ctx.trace_ctx, payload, length, length);
+    // Residual wrap, not NewWithVtable: `_utf8` is `_immutable_fields_`,
+    // so an inlined wrapper lets getfield fold to the preamble payload
+    // across a jump.  `newutf8` stays an opaque CallR.
+    let wrap = pyre_object::unicodeobject::jit_w_str_from_storage_and_length as *const ();
+    let wrapped = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
+        wrap,
+        &[payload, length],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
     ctx.trace_ctx.set_opref_concrete(
         wrapped,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
@@ -22250,9 +22261,8 @@ pub(crate) fn try_walker_specialize_compare_op_str<Sym: WalkSym>(
 /// `descr_add` (unicodeobject.py) is `W_UnicodeObject(self._utf8 +
 /// w_other._utf8, self._len() + w_other._len())`.  Record that split:
 /// `getfield _utf8` + `ll_strconcat` (`OS_STR_CONCAT`,
-/// `EF_ELIDABLE_OR_MEMORYERROR`) + `new_with_vtable` wrap
-/// (`W_UnicodeObject.__init__`).  Two `a + b` sites allocate two
-/// wrappers (`is_w` of `_len() > 1`).
+/// `EF_ELIDABLE_OR_MEMORYERROR`) + residual `newutf8` wrap.  Two
+/// `a + b` sites allocate two wrappers (`is_w` of `_len() > 1`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -22269,14 +22279,21 @@ pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
     }
     // `s + t` and `s += t` reach the same `descr_add`: `str` has no
     // `__iadd__`, so the in-place tag resolves to concatenation too.
-    if !matches!(
-        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+    // `s * n` / `n * s` is `descr_mul` (`unicodeobject.py`).
+    match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
         Some(
             pyre_interpreter::bytecode::BinaryOperator::Add
-                | pyre_interpreter::bytecode::BinaryOperator::InplaceAdd
-        )
-    ) {
-        return Ok(None);
+            | pyre_interpreter::bytecode::BinaryOperator::InplaceAdd,
+        ) => {}
+        Some(
+            pyre_interpreter::bytecode::BinaryOperator::Multiply
+            | pyre_interpreter::bytecode::BinaryOperator::InplaceMultiply,
+        ) => {
+            return try_walker_specialize_str_mul(
+                ctx, op_pc, r_args, allboxes, call_descr, dst, dst_bank,
+            );
+        }
+        _ => return Ok(None),
     }
     let Some((lhs, rhs, _lhs_obj, _rhs_obj)) = walker_str_pair_operands(ctx, r_args) else {
         return Ok(None);
@@ -22301,12 +22318,10 @@ pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `descr_add` body: getfield `_utf8` + `ll_strconcat` + `W_UnicodeObject`
-/// (`unicodeobject.py` `W_UnicodeObject(self._utf8 + w_other._utf8,
-/// self._len() + w_other._len())` / `newutf8`).  `StrPtrInfo` inherits
-/// `AbstractVirtualPtrInfo._force_at_the_end_of_preamble` → `force_box`,
-/// so a loop-carried `_utf8` VStrConcat is materialized before export
-/// (`VirtualStateConstructor` has no `visit_vstr*`).
+/// `descr_add` body: getfield `_utf8` + `ll_strconcat` + residual
+/// `newutf8`.  NewWithVtable is not used: `_utf8` is
+/// `_immutable_fields_`, so an inlined wrapper folds getfield to the
+/// preamble payload across a jump.
 fn emit_walker_descr_add<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -22346,24 +22361,129 @@ fn emit_walker_descr_add<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(total_len, majit_ir::Value::Int(concrete_len));
 
-    let lhs_blen = ctx.trace_ctx.record_op(OpCode::Strlen, &[lhs_utf8]);
-    let rhs_blen = ctx.trace_ctx.record_op(OpCode::Strlen, &[rhs_utf8]);
-    let total_blen = ctx
-        .trace_ctx
-        .record_op(OpCode::IntAdd, &[lhs_blen, rhs_blen]);
-    let concrete_blen = unsafe {
-        (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).byte_len as i64
-    };
-    ctx.trace_ctx
-        .set_opref_concrete(total_blen, majit_ir::Value::Int(concrete_blen));
-
-    let wrapped =
-        crate::helpers::emit_box_unicode_inline(ctx.trace_ctx, concat, total_len, total_blen);
+    let wrap = pyre_object::unicodeobject::jit_w_str_from_storage_and_length as *const ();
+    let wrapped = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
+        wrap,
+        &[concat, total_len],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
     ctx.trace_ctx.set_opref_concrete(
         wrapped,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
     );
     Ok(wrapped)
+}
+
+/// `descr_mul` (`unicodeobject.py`): `times <= 0` is empty, `times == 1`
+/// is the receiver, otherwise `W_UnicodeObject(self._utf8 * times, …)`.
+/// The fused `jit_str_repeat` is recorded `CanRaise`, not elidable:
+/// sharing one box between two `s * n` sites is visible to `is_w`.
+fn try_walker_specialize_str_mul<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 2 {
+        return Ok(None);
+    }
+    let (lhs, rhs) = (r_args[0], r_args[1]);
+    let lhs_obj = walker_concrete_ref_object(ctx, lhs);
+    let rhs_obj = walker_concrete_ref_object(ctx, rhs);
+    let (Some(lhs_obj), Some(rhs_obj)) = (lhs_obj, rhs_obj) else {
+        return Ok(None);
+    };
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
+            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
+    {
+        return Ok(None);
+    }
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let exact_str = |obj: pyre_object::PyObjectRef| unsafe {
+        pyre_object::is_exact_type(obj, &pyre_object::STR_TYPE)
+    };
+    let exact_int = |obj: pyre_object::PyObjectRef| unsafe {
+        std::ptr::eq((*obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+            && std::ptr::eq((*obj).w_class, int_typeobj)
+    };
+    let (str_op, _str_obj, int_op, int_obj) = if exact_str(lhs_obj) && exact_int(rhs_obj) {
+        (lhs, lhs_obj, rhs, rhs_obj)
+    } else if exact_int(lhs_obj) && exact_str(rhs_obj) {
+        (rhs, rhs_obj, lhs, lhs_obj)
+    } else {
+        return Ok(None);
+    };
+    let times = unsafe { pyre_object::w_int_get_value(int_obj) };
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let boxed_result = boxed_result_i64 as pyre_object::PyObjectRef;
+    if boxed_result.is_null()
+        || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
+    {
+        return Ok(None);
+    }
+
+    walker_guard_exact_str(ctx, op_pc, str_op)?;
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, int_op, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, int_op, int_typeobj)?;
+    let times_raw = walker_unbox_int_typed(
+        ctx,
+        op_pc,
+        int_op,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+
+    if times == 1 {
+        let eq1 = walker_int_eq_const(ctx, times_raw, 1, 1);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[eq1])?;
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, str_op)?;
+        return Ok(Some(()));
+    }
+    if times <= 0 {
+        let zero = ctx.trace_ctx.const_int(0);
+        let le0 = ctx.trace_ctx.record_op(OpCode::IntLe, &[times_raw, zero]);
+        ctx.trace_ctx
+            .set_opref_concrete(le0, majit_ir::Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[le0])?;
+        let empty = ctx.trace_ctx.const_ref(boxed_result as i64);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, empty)?;
+        return Ok(Some(()));
+    }
+    let one = ctx.trace_ctx.const_int(1);
+    let gt1 = ctx.trace_ctx.record_op(OpCode::IntGt, &[times_raw, one]);
+    ctx.trace_ctx
+        .set_opref_concrete(gt1, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[gt1])?;
+
+    let helper = pyre_object::unicodeobject::jit_str_repeat as *const ();
+    let raw = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
+        helper,
+        &[str_op, times_raw],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        raw,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, raw)?;
+    Ok(Some(()))
 }
 
 /// #62 LoadGlobal cell-cache fold — walker mirror of the retired trait
