@@ -239,7 +239,7 @@ impl MIFrame {
 
     /// A later PUT/copy into this register is no longer the portal red
     /// that was seeded there. Snapshot the live SSA, not the entry InputArg.
-    fn retire_portal_red_ref(&mut self, idx: usize) {
+    pub(crate) fn retire_portal_red_ref(&mut self, idx: usize) {
         if let Ok(reg) = u16::try_from(idx) {
             self.portal_red_refs.retain(|(r, _)| *r != reg);
         }
