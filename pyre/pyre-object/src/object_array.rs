@@ -318,10 +318,12 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 // `Ptr(GcArray(OBJECTPTR))`. It carries the same inline-traced shape as
 // list/tuple item blocks (`PY_OBJECT_ARRAY_GC_TYPE_ID`) — every slot is a
 // reference — under its own tid (`W_MAPDICT_STORAGE_GC_TYPE_ID`) and differs
-// only in being allocated `stable` (non-moving old-gen). Stable allocation
-// mirrors the instance's own `try_gc_alloc_stable` (objectobject.rs) and the
-// `TypedItemsBlock` int/float backing blocks: a non-moving block means the
-// instance's `storage` pointer never needs rewriting on a minor GC, and the
+// only in being allocated on the nursery bump (`malloc_varsize`). The
+// instance is already a nursery object; `instance_walk_boxed_storage`
+// rewrites its `storage` slot. A non-moving block was a shortcut so the
+// instance's `storage` pointer never needed rewriting. That is not
+// `mapdict.py`. The
+
 // A stable allocation does not itself start a collection, but it is still a GC
 // operation and can wait behind a collection started by another mutator.
 // Therefore its inputs and fresh result need the same shadow-stack publication
@@ -396,14 +398,15 @@ pub unsafe fn dealloc_instance_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
 }
 
-/// Stable leaf-block allocator for mapdict storage. Routes through
-/// `try_gc_alloc_stable(W_MAPDICT_STORAGE_GC_TYPE_ID, payload)`; the capacity
-/// header is set, items are left uninitialised (the caller writes every slot
-/// before exposing the block). Falls back to `std::alloc` [`alloc_items_block`]
-/// when no GC hook is installed. `cap` may be zero (header-only block).
+/// Nursery leaf-block allocator for mapdict storage (`malloc_varsize`).
+/// `instance_walk_boxed_storage` forwards the instance's `storage` slot
+/// and walks the items. Capacity is set; items are left uninitialised
+/// (the caller writes every slot before exposing the block). Falls back
+/// to `std::alloc` [`alloc_items_block`] when no GC hook is installed.
+/// `cap` may be zero (header-only block).
 unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
     let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_MAPDICT_STORAGE_GC_TYPE_ID, payload);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_MAPDICT_STORAGE_GC_TYPE_ID, payload);
     if !raw.is_null() {
         let block = raw as *mut ItemsBlock;
         unsafe { (*block).capacity = cap };

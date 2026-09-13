@@ -809,12 +809,13 @@ fn make_heap_structseq_type(
         .rsplit_once('.')
         .map_or((None, full_name), |(module, name)| (Some(module), name));
     if let Some(module) = module {
-        let w_module = pyre_object::w_str_new(module);
+        let module_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::intern_str_value(module));
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 pyre_object::gc_roots::shadow_stack_get(ns_slot),
                 "__module__",
-                w_module,
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
             )
         };
     }
