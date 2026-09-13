@@ -3365,9 +3365,19 @@ impl InstanceRepr {
             } else {
                 (fullname.as_str(), IR_IMMUTABLE, false)
             };
-            let Some((mangled_name, _r)) = self._get_field(name) else {
+            let Some((mangled_name, r)) = self._get_field(name) else {
                 continue;
             };
+            if matches!(rank, IR_IMMUTABLE_ARRAY | IR_QUASIIMMUTABLE_ARRAY)
+                && r.repr_class_id() != ReprClassId::ListRepr
+            {
+                return Err(TyperError::message(format!(
+                    "_immutable_fields_ = [{fullname:?}] in {:?}, but {name:?} is not a list \
+                     (got {})",
+                    self.classdef.as_ref().map(|cd| cd.borrow().name.clone()),
+                    r.class_name(),
+                )));
+            }
             if quasi && hints.get("immutable") == Some(&ConstValue::Bool(true)) {
                 return Err(TyperError::message(format!(
                     "can't have _immutable_ = True and a quasi-immutable field {name} \

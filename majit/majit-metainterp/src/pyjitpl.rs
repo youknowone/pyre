@@ -2256,6 +2256,9 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) pending_token: Option<(u64, Arc<JitCellToken>)>,
     /// Cumulative statistics counters.
     pub(crate) stats: JitStatsCounters,
+    /// Host-supplied virtualizable until `TraceCtx` exists.
+    /// `sync_before` / tests call `set_vable_ptr` before tracing starts.
+    pending_vable_ptr: *const u8,
     /// `compile.py` — the virtual cache `handle_async_forcing`
     /// produced, kept for the `GUARD_NOT_FORCED` failure that must follow.
     ///
@@ -4059,6 +4062,7 @@ impl<M: Clone> MetaInterp<M> {
             hooks: JitHooks::default(),
             pending_token: None,
             stats: JitStatsCounters::default(),
+            pending_vable_ptr: std::ptr::null(),
             forced_virtuals: Vec::new(),
             vable_array_lengths: Vec::new(),
             result_type: Type::Ref,
@@ -4634,20 +4638,29 @@ impl<M: Clone> MetaInterp<M> {
     /// `vinfo.unwrap_virtualizable_box` is the reader; this only publishes
     /// the host's current object so initialize / residual can unwrap it.
     pub(crate) fn set_vable_ptr(&mut self, ptr: *const u8) {
+        self.pending_vable_ptr = ptr;
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.set_virtualizable_heap_ptr(ptr);
         }
     }
 
     /// `vinfo.unwrap_virtualizable_box(virtualizable_boxes[-1])`.
+    ///
+    /// Prefer the host pointer `set_vable_ptr` / `initialize_virtualizable`
+    /// published into `TraceCtx`: tests and residual reload that object after
+    /// a later `set_vable_ptr`, and a force that forwards the object updates
+    /// the same slot. Fall back to the box unwrap, then to the pre-TraceCtx
+    /// pending pointer.
     pub fn unwrap_standard_virtualizable(&self) -> *const u8 {
-        let Some(ctx) = self.tracing.as_ref() else {
-            return std::ptr::null();
-        };
-        if let Some(ptr) = ctx.standard_virtualizable_ptr() {
-            return ptr as *const u8;
+        if let Some(ctx) = self.tracing.as_ref() {
+            if let Some(ptr) = ctx.virtualizable_heap_ptr() {
+                return ptr;
+            }
+            if let Some(ptr) = ctx.standard_virtualizable_ptr() {
+                return ptr as *const u8;
+            }
         }
-        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null())
+        self.pending_vable_ptr
     }
 
     /// `pyjitpl.py` unwrap of the standard virtualizable identity.
@@ -4810,15 +4823,15 @@ impl<M: Clone> MetaInterp<M> {
         // two force_now arms and reaches the host's ResumeGuardForcedDescr
         // force hook for an Active token.
         // `virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)`.
-        let mut virtualizable_ptr = {
-            let unwrapped = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(
+        // The pending host pointer is kept until TraceCtx exists so a
+        // state-field identity that is not `original_boxes[index]` still
+        // reaches `read_boxes`.
+        let mut virtualizable_ptr = if !self.pending_vable_ptr.is_null() {
+            self.pending_vable_ptr as *mut u8
+        } else {
+            crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(
                 original_boxes.get(index).copied(),
-            );
-            if !unwrapped.is_null() {
-                unwrapped as *mut u8
-            } else {
-                self.unwrap_standard_virtualizable() as *mut u8
-            }
+            ) as *mut u8
         };
         if !virtualizable_ptr.is_null() {
             // RPython's `virtualizable` local is a GC pointer: `clear_vable_token`
@@ -5758,6 +5771,7 @@ impl<M: Clone> MetaInterp<M> {
                 // is the parallel trace-start entry point and must keep the
                 // same invariant.
                 self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
+                ctx.set_virtualizable_heap_ptr(self.pending_vable_ptr);
                 // pyjitpl.py initialize_virtualizable parity.
                 self.initialize_virtualizable(&mut ctx, live_values);
                 // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
@@ -6073,6 +6087,7 @@ impl<M: Clone> MetaInterp<M> {
         // driver matching the descriptor; with the single-portal pyre
         // shell driver this collapses to slot 0.
         self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
+        ctx.set_virtualizable_heap_ptr(self.pending_vable_ptr);
         // pyjitpl.py initialize_virtualizable parity.
         self.initialize_virtualizable(&mut ctx, live_values);
         // pyjitpl.py `_compile_and_run_once`: `create_empty_history`

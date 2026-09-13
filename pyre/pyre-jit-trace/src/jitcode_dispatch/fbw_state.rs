@@ -2691,7 +2691,7 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
 pub(crate) fn fbw_innermost_inline_callee_key<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<usize> {
-    ctx.session.borrow().framestack.last().map(|f| f.w_code)
+    ctx.session.borrow().last_inline().map(|f| f.w_code)
 }
 
 /// Take the outer-caller CALL JitCode coordinate stashed by

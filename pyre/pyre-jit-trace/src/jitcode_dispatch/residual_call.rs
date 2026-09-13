@@ -396,7 +396,7 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     }
     let session = ctx.session.borrow();
     let parent = need!(
-        need!(session.framestack.first(), "empty framestack")
+        need!(session.first_inline(), "empty framestack")
             .parents
             .first(),
         "innermost frame has no parent"

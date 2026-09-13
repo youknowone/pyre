@@ -54,10 +54,11 @@ impl VirtualizableInstanceRepr {
             let basedesc = classdesc.basedesc.clone();
             if let Some(base) = basedesc {
                 let base_param = base.borrow().get_param("_virtualizable_", None, true);
-                assert!(
-                    !const_truthy(&base_param),
-                    "basedesc must not declare _virtualizable_"
-                );
+                if !matches!(base_param, ConstValue::None) {
+                    return Err(crate::translator::rtyper::error::TyperError::message(
+                        "basedesc must not declare _virtualizable_".to_string(),
+                    ));
+                }
             }
             Ok(Self::new(true))
         } else {
@@ -256,6 +257,44 @@ mod tests {
             VirtualizableInstanceRepr::new(false)
                 .setup_repr_llfields()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn from_classdesc_rejects_a_base_declaration_that_is_not_none() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::flowspace::model::HostObject;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut base_members = indexmap::IndexMap::new();
+        base_members.insert("_virtualizable_".into(), ConstValue::List(vec![]));
+        let base = crate::annotator::classdesc::ClassDesc::new(
+            &bk,
+            HostObject::new_class_with_members("Base", vec![], base_members),
+            Some("Base".into()),
+            None,
+            None,
+        )
+        .expect("base ClassDesc");
+        let mut child_members = indexmap::IndexMap::new();
+        child_members.insert(
+            "_virtualizable_".into(),
+            ConstValue::List(vec![ConstValue::byte_str("x")]),
+        );
+        let child = crate::annotator::classdesc::ClassDesc::new(
+            &bk,
+            HostObject::new_class_with_members("Child", vec![], child_members),
+            Some("Child".into()),
+            Some(base),
+            None,
+        )
+        .expect("child ClassDesc");
+        let err = VirtualizableInstanceRepr::from_classdesc(&child.borrow())
+            .expect_err("empty-list base declaration is not None");
+        assert!(
+            err.to_string()
+                .contains("basedesc must not declare _virtualizable_")
         );
     }
 }

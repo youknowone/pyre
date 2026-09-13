@@ -776,7 +776,7 @@ impl Default for WalkSession {
             is_being_profiled: false,
 
             helper_live: Vec::new(),
-            framestack: vec![InlineFrame::portal()],
+            framestack: Vec::new(),
             next_call_id: 1,
             open_inline_activations: 0,
             root_debug_merge_point_py_pc: None,
@@ -810,6 +810,14 @@ impl WalkSession {
             .iter()
             .filter(|frame| !frame.is_portal)
             .count()
+    }
+
+    pub(crate) fn last_inline(&self) -> Option<&InlineFrame> {
+        self.framestack.iter().rev().find(|frame| !frame.is_portal)
+    }
+
+    pub(crate) fn first_inline(&self) -> Option<&InlineFrame> {
+        self.framestack.iter().find(|frame| !frame.is_portal)
     }
 
     /// Claim an abort coordinate for the frame whose `walk()` observed it.
@@ -8081,7 +8089,7 @@ impl ActiveResumeFrame {
         session: &std::cell::RefCell<WalkSession>,
         snapshot_sym: *const Sym,
     ) -> Option<Self> {
-        let current_code = session.borrow().framestack.last().map(|frame| frame.w_code);
+        let current_code = session.borrow().last_inline().map(|frame| frame.w_code);
         match current_code {
             Some(callee_w_code) => {
                 let idx = crate::state::ensure_jitcode_index(callee_w_code as *const ())?;

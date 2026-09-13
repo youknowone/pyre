@@ -86,10 +86,7 @@ pub fn stamp_host_virtualizable(host: &HostObject, class_key: &str) {
 }
 
 fn field_names_for(class_key: &str) -> Option<Vec<String>> {
-    if !is_registered(class_key) {
-        return None;
-    }
-    if is_pyframe(class_key) {
+    if is_pyframe(class_key) && is_registered(class_key) {
         return Some(
             PYFRAME_VIRTUALIZABLE
                 .iter()
@@ -97,7 +94,11 @@ fn field_names_for(class_key: &str) -> Option<Vec<String>> {
                 .collect(),
         );
     }
-    REGISTERED.with(|registered| lookup(&registered.borrow(), class_key).cloned())
+    let fields = REGISTERED.with(|registered| lookup(&registered.borrow(), class_key).cloned())?;
+    if fields.is_empty() {
+        return None;
+    }
+    Some(fields)
 }
 
 fn is_registered(class_key: &str) -> bool {
@@ -105,7 +106,7 @@ fn is_registered(class_key: &str) -> bool {
 }
 
 fn is_pyframe(class_key: &str) -> bool {
-    class_key.rsplit("::").next() == Some("PyFrame")
+    class_key == "PyFrame" || class_key.ends_with("::PyFrame")
 }
 
 fn lookup<'a>(
@@ -115,11 +116,9 @@ fn lookup<'a>(
     if let Some(fields) = registered.get(class_key) {
         return Some(fields);
     }
-    let leaf = class_key.rsplit("::").next().unwrap_or(class_key);
     registered
         .iter()
-        .find(|(key, _)| key.rsplit("::").next() == Some(leaf))
-        .map(|(_, fields)| fields)
+        .find_map(|(key, fields)| class_key.ends_with(&format!("::{key}")).then_some(fields))
 }
 
 #[cfg(test)]
@@ -160,5 +159,35 @@ mod tests {
         let host = HostObject::new_class("Plain", vec![]);
         stamp_host_virtualizable(&host, "Plain");
         assert!(host.class_get("_virtualizable_").is_none());
+    }
+
+    #[test]
+    fn stamp_host_virtualizable_skips_empty_non_pyframe_lists() {
+        register_virtualizable_roots(["OtherFrame".to_string()]);
+        let host = HostObject::new_class("OtherFrame", vec![]);
+        stamp_host_virtualizable(&host, "OtherFrame");
+        assert!(host.class_get("_virtualizable_").is_none());
+        register_virtualizable_roots(std::iter::empty::<String>());
+    }
+
+    #[test]
+    fn lookup_does_not_share_a_qualified_declaration_across_leaf_names() {
+        REGISTERED.with(|registered| {
+            *registered.borrow_mut() = [("a::Frame".to_string(), vec!["x".to_string()])]
+                .into_iter()
+                .collect();
+        });
+        let host = HostObject::new_class("Frame", vec![]);
+        stamp_host_virtualizable(&host, "b::Frame");
+        assert!(host.class_get("_virtualizable_").is_none());
+        stamp_host_virtualizable(&host, "mod::a::Frame");
+        let ConstValue::List(items) = host
+            .class_get("_virtualizable_")
+            .expect("qualified suffix of the registered key stamps")
+        else {
+            panic!("_virtualizable_ must be a list");
+        };
+        assert_eq!(items, vec![ConstValue::byte_str("x")]);
+        register_virtualizable_roots(std::iter::empty::<String>());
     }
 }

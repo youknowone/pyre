@@ -14499,7 +14499,10 @@ mod tests {
         recorder.record_input_arg(majit_ir::Type::Int); // index
         recorder.record_input_arg(majit_ir::Type::Int); // value
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
-        let info = make_test_vable_info();
+        // `virtualizable.py finish()` / `finalize_arc` stamps every field
+        // descr with the vinfo backref. `_nonstandard_virtualizable` only
+        // emits the isstandard PTR_EQ when `vinfo is fielddescr.get_vinfo()`.
+        let info = make_test_vable_info().finalize_arc(majit_ir::descr::make_size_descr(64));
         let field_box = ctx.const_int(111);
         let array_box = ctx.const_int(222);
         let standard_box = ctx.const_ref(999);
