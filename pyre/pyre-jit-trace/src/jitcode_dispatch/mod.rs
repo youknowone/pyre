@@ -244,7 +244,7 @@ pub use branch::*;
 mod vstack_mirror;
 pub use vstack_mirror::*;
 mod vable_ops;
-use vable_ops::FrameBoxReplacements;
+
 mod frame_state;
 mod register_bank;
 mod register_list;
@@ -557,6 +557,49 @@ pub struct InlineFrame {
     /// level and its descendants did, so it is only sound while the odometer
     /// has not moved since.
     pub entry_executed_effects: usize,
+    /// This level's own `MIFrame.registers_*` while a descendant (a helper
+    /// sub-walk) is running. `None` until a child pauses this frame.
+    live: Option<LiveFrameRegs>,
+}
+
+/// The live register banks of one paused `MIFrame`.
+///
+/// `MetaInterp.replace_box` writes `framestack` frames in place. The portal
+/// is not an `InlineFrame` (depth scans treat `framestack.len()` as the
+/// inlined-callee count), so it lives on [`WalkSession::portal_live`].
+#[derive(Clone)]
+pub(crate) struct LiveFrameRegs {
+    pub(crate) registers_r: RegisterBank,
+    pub(crate) registers_i: RegisterBank,
+    pub(crate) registers_f: RegisterBank,
+    frame_state: WalkFrameState,
+}
+
+impl LiveFrameRegs {
+    fn new(
+        registers_r: &RegisterBank,
+        registers_i: &RegisterBank,
+        registers_f: &RegisterBank,
+        frame_state: &WalkFrameState,
+    ) -> Self {
+        Self {
+            registers_r: registers_r.clone(),
+            registers_i: registers_i.clone(),
+            registers_f: registers_f.clone(),
+            frame_state: frame_state.clone(),
+        }
+    }
+
+    fn replace_active_box(&self, oldbox: OpRef, newbox: OpRef) {
+        let bank = match oldbox.ty() {
+            Some(majit_ir::Type::Int) => &self.registers_i,
+            Some(majit_ir::Type::Ref) => &self.registers_r,
+            Some(majit_ir::Type::Float) => &self.registers_f,
+            _ => return,
+        };
+        bank.replace_active_box(oldbox, newbox);
+        self.frame_state.replace_active_box(oldbox, newbox);
+    }
 }
 
 /// Per-trace-attempt walk session, owned by the walk driver and threaded
@@ -565,7 +608,13 @@ pub struct InlineFrame {
 pub struct WalkSession {
     /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
     /// borrowed register banks. Resume snapshots are updated synchronously.
-    pub(crate) box_replacement_frames: Vec<std::rc::Weak<vable_ops::FrameBoxReplacementInbox>>,
+
+    /// Portal `MIFrame` registers while a child runs. Not on `framestack`
+    /// because `framestack.len()` is the inlined-callee depth.
+    pub(crate) portal_live: Option<LiveFrameRegs>,
+    /// Paused transparent-helper `SubWalkFrame` banks. Helpers are not
+    /// Python `MIFrame`s and must not overwrite `portal_live`.
+    pub(crate) helper_live: Vec<LiveFrameRegs>,
     /// The root frame's `is_being_profiled` portal green for this walk.
     pub is_being_profiled: bool,
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
@@ -699,7 +748,9 @@ impl Default for WalkSession {
     fn default() -> Self {
         Self {
             is_being_profiled: false,
-            box_replacement_frames: Vec::new(),
+
+            portal_live: None,
+            helper_live: Vec::new(),
             framestack: Vec::new(),
             next_call_id: 1,
             open_inline_activations: 0,
@@ -1599,7 +1650,13 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// Python pc of the caller CALL instruction an inline sub-walk is
     /// executing under.  Used only for the temporary live-frame coordinate a
     /// residual frame reader observes; it is not a walk-end resume claim.
+    /// Nested inlines inherit the outermost portal CALL so a residual can
+    /// still publish `last_instr` onto the portal frame.
     pub inline_caller_py_pc: Option<u32>,
+    /// Python pc of the CALL that entered THIS level, in the immediate
+    /// caller's own code.  Nested inlines do not inherit: `leaf` reading
+    /// `_getframe(1).f_lasti` on `mid` owes `mid`'s CALL, not the portal's.
+    pub immediate_inline_caller_py_pc: Option<u32>,
     /// The current sub-walk is a translated builtin gateway helper.  The
     /// helper is not a Python frame, but it is an RPython `MIFrame` and must be
     /// retained as the innermost blackhole frame so a post-residual guard can
@@ -1716,6 +1773,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             snapshot_sym: std::ptr::null(),
             inline_subwalk: false,
             inline_caller_py_pc: None,
+            immediate_inline_caller_py_pc: None,
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
             carrier_resume: false,
@@ -6560,6 +6618,51 @@ struct InlineParentFrame {
     /// at the return point with the not-yet-produced call-result slot nulled
     /// (`get_list_of_active_boxes(in_a_call=true)` parity, trace_opcode.rs).
     boxes: Vec<OpRef>,
+    /// Live `MIFrame.registers_{r,i,f}` of the paused caller, plus the
+    /// walker extras on `WalkFrameState`. `MetaInterp.replace_box` writes
+    /// these in place (`pyjitpl.py replace_box` → `replace_active_box_in_frame`).
+    /// `None` on a reconstructed resume image that has no live walk
+    /// (bridge reconstruct, ctor continuation).
+    registers_r: Option<RegisterBank>,
+    registers_i: Option<RegisterBank>,
+    registers_f: Option<RegisterBank>,
+    frame_state: Option<WalkFrameState>,
+    /// CALL in this paused caller that entered the child. `f_lasti` /
+    /// `f_lineno` for a getframe landing on this caller. `None` when the
+    /// parent is a reconstructed image with no live CALL.
+    caller_py_pc: Option<u32>,
+}
+
+impl InlineParentFrame {
+    fn attach_live_caller(
+        mut self,
+        registers_r: &RegisterBank,
+        registers_i: &RegisterBank,
+        registers_f: &RegisterBank,
+        frame_state: &WalkFrameState,
+    ) -> Self {
+        self.registers_r = Some(registers_r.clone());
+        self.registers_i = Some(registers_i.clone());
+        self.registers_f = Some(registers_f.clone());
+        self.frame_state = Some(frame_state.clone());
+        self
+    }
+
+    fn with_caller_py_pc(mut self, jitcode_index: u32, call_jit_pc: usize) -> Self {
+        self.caller_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc_public(
+            jitcode_index as i32,
+            call_jit_pc as i32,
+        )
+        .map(|py| py as u32);
+        self
+    }
+
+    fn paused_concrete_frame(&self) -> Option<usize> {
+        let state = self.frame_state.as_ref()?;
+        let borrowed = state.borrow();
+        let ptr = borrowed.callee_shadow.as_ref()?.concrete_frame;
+        (ptr != 0).then_some(ptr)
+    }
 }
 
 #[derive(Clone)]
@@ -6615,6 +6718,11 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
         resume_coord: ParentResumeCoord::Backxlat(resume_pc),
         resume_marker_jit_pc: Some(resume_pc),
         boxes: vec![instance],
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
     })
 }
 
@@ -6736,6 +6844,7 @@ impl<'a> InlineFrameGuard<'a> {
             debug_merge_point_py_pc: None,
             parents,
             entry_executed_effects: fbw_executed_effect_count(),
+            live: None,
         });
         drop(walk);
         if fbw_depth_census_enabled() {

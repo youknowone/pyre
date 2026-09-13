@@ -454,6 +454,7 @@ spec_folds! {
     FrameLasti           => ("frame_lasti",              "specialize",    "load_attr"),
     LoadDeref            => ("load_deref",               "residual_call", "-"),
     FrameLineno          => ("frame_lineno",             "specialize",    "load_attr"),
+    FrameFback           => ("frame_f_back",             "specialize",    "load_attr"),
     ObjectClassAttr      => ("object_class_attr",        "specialize",    "load_attr"),
     BareSuperCall        => ("bare_super_call",          "residual_call", "-"),
     BareSuperVirtual     => ("bare_super_virtual",       "residual_call", "-"),

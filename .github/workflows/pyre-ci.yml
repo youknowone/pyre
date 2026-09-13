@@ -1180,6 +1180,11 @@ jobs:
       # the wall time of whichever module is running when the extra job lands.
       # `--timeout` is per module: `test.test_asyncio` alone takes ~117s of CPU
       # and ~2m47s of wall time, which does not fit the former 120s limit.
+      # After the synthetic suite the same runner has timed out
+      # `test.test_statistics` at 300s and 480s (it was still printing
+      # progress dots, so this is wall time, not a hang) and
+      # `test.test_unparse` at 300s. main's last pyre CI timed out
+      # `test.test_statistics` the same way.
       #
       # Last, as the longest step here, so every other verdict in this job lands
       # before it. It reports whatever check.py and the pip run above did; the
@@ -1202,7 +1207,7 @@ jobs:
       shell: bash
       run: |
         sudo sysctl -w vm.overcommit_memory=1 || echo "note: could not relax overcommit; fork-heavy modules may report ENOMEM"
-        ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
+        ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 600
 
   pyre-check-macos:
     name: pyre/check.py ${{ matrix.label }} (macos-latest)

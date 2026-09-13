@@ -888,6 +888,11 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         // a branch guard's own top-frame word.
         resume_marker_jit_pc: root_word,
         boxes,
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
     })
 }
 
@@ -1084,6 +1089,11 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         resume_coord: ParentResumeCoord::Backxlat(recipe.jitcode_pc as usize),
         resume_marker_jit_pc,
         boxes,
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
     })
 }
 

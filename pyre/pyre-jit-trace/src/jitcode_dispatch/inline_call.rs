@@ -4677,6 +4677,43 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     }
 }
 
+fn immediate_inline_caller_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_jitcode_pc: usize,
+) -> Option<u32> {
+    // A canonical helper has no Python pc. Remapping its CALL through the
+    // portal snapshot would stamp the surrounding user frame with an
+    // unrelated offset. Inherit the Python caller's coordinate instead.
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        // Nested helper entry stores the Python CALL that invoked the
+        // helper on `InlineParentFrame.caller_py_pc`. That is the site
+        // `_getframe(1)` should report, not the CALL that entered the
+        // surrounding Python frame.
+        if let Some(pc) = ctx
+            .session
+            .borrow()
+            .framestack
+            .last()
+            .and_then(|frame| frame.parents.last().and_then(|parent| parent.caller_py_pc))
+        {
+            return Some(pc);
+        }
+        return ctx
+            .fbw_mode
+            .immediate_inline_caller_py_pc
+            .or(ctx.fbw_mode.inline_caller_py_pc);
+    }
+    if let Some(consts) = ctx.inline_callee_consts {
+        crate::py_coord::containing_py_pc_for_jitcode_pc_public(
+            consts.jitcode_index,
+            call_jitcode_pc as i32,
+        )
+        .map(|py| py as u32)
+    } else {
+        inline_caller_py_pc_from_snapshot(ctx, call_jitcode_pc)
+    }
+}
+
 fn inline_caller_py_pc_from_snapshot<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     call_jitcode_pc: usize,
@@ -7022,9 +7059,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     } else {
         None
     };
-    let caller_replacements = FrameBoxReplacements::new(ctx.session);
-    caller_replacements.bind_banks(ctx.registers_r, ctx.registers_i, ctx.registers_f);
-    caller_replacements.bind_frame_state(&ctx.frame_state);
+    // The paused caller's banks live on `InlineParentFrame` (`attach_live_caller`
+    // in `compute_*_caller_frame`). `replace_box` walks `framestack` the way
+    // `MetaInterp.replace_box` walks `MIFrame`s; no Weak inbox is needed here.
     let (callee_outcome, callee_class_of_last_exc_is_const) = {
         {
             let parent_state = ctx.frame_state.borrow();
@@ -7055,6 +7092,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             fbw_mode: FbwWalkMode {
                 inline_subwalk: true,
                 inline_caller_py_pc,
+                immediate_inline_caller_py_pc: immediate_inline_caller_py_pc(ctx, op.pc),
                 instance_next_foriter_green_key,
                 instance_next_foriter_census_active: instance_next_seeded_route,
                 ..ctx.fbw_mode
@@ -7533,7 +7571,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
         (result, class_of_last_exc_is_const)
     };
-    drop(caller_replacements);
     // `executioncontext.py leave`, in the original's `finally`
     // position: the sub-walk block above is an expression that always
     // completes, so every callee exit — return, exception, or decline —
@@ -12075,8 +12112,18 @@ impl Drop for SubWalkDriverGuard {
     }
 }
 
+struct HelperLiveGuard<'a> {
+    session: &'a std::cell::RefCell<WalkSession>,
+}
+
+impl Drop for HelperLiveGuard<'_> {
+    fn drop(&mut self) {
+        super::vable_ops::pop_helper_live(self.session);
+    }
+}
+
 struct SubWalkFrame<'a, Sym: WalkSym> {
-    box_replacements: FrameBoxReplacements,
+    _helper_live: HelperLiveGuard<'a>,
     id: usize,
     caller_pc: usize,
     pc: usize,
@@ -12163,9 +12210,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         }
         // The bank is rooted by `SubWalkDriver::push_frame` for this frame's
         // whole residency, which outlasts this call.
-        self.box_replacements.set_listening(false);
         let result = walk(self.body.code, self.pc, &mut walk_ctx);
-        self.box_replacements.set_listening(true);
 
         self.inline_callee_consts = walk_ctx.inline_callee_consts;
         self.inline_poison_pcs = walk_ctx.inline_poison_pcs.take();
@@ -12570,30 +12615,39 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         exchange.next_frame_id += 1;
         id
     };
+    let registers_i = RegisterBank::with_constants(callee_regs_i, sub_body.num_regs_i);
+    let registers_f = RegisterBank::with_constants(callee_regs_f, sub_body.num_regs_f);
+    let frame_state = WalkFrameState::new(WalkFrameStateData {
+        callee_shadow: None,
+        concrete_registers_r: callee_concrete_r,
+        current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
+        current_exception_seed_concrete: ctx.frame_state.borrow().current_exception_seed_concrete,
+        outer_active_boxes: ctx.frame_state.borrow().outer_active_boxes.clone(),
+        vstack_boxes: Vec::new(),
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_saved: None,
+        ..Default::default()
+    });
+    super::vable_ops::push_helper_live(
+        ctx.session,
+        &callee_regs_r,
+        &registers_i,
+        &registers_f,
+        &frame_state,
+    );
     let mut frame = SubWalkFrame {
-        box_replacements: FrameBoxReplacements::new(ctx.session),
+        _helper_live: HelperLiveGuard {
+            session: ctx.session,
+        },
         id: frame_id,
         caller_pc: pc,
         pc: start_pc,
         body: sub_body.clone(),
         seed_from_active_resume: start_pc == 0,
         registers_r: callee_regs_r,
-        registers_i: RegisterBank::with_constants(callee_regs_i, sub_body.num_regs_i),
-        registers_f: RegisterBank::with_constants(callee_regs_f, sub_body.num_regs_f),
-        frame_state: WalkFrameState::new(WalkFrameStateData {
-            callee_shadow: None,
-            concrete_registers_r: callee_concrete_r,
-            current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
-            current_exception_seed_concrete: ctx
-                .frame_state
-                .borrow()
-                .current_exception_seed_concrete,
-            outer_active_boxes: ctx.frame_state.borrow().outer_active_boxes.clone(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
-            ..Default::default()
-        }),
+        registers_i,
+        registers_f,
+        frame_state,
         concrete_registers_i: callee_concrete_i,
 
         inline_callee_consts: None,
@@ -12627,10 +12681,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    frame
-        .box_replacements
-        .bind_banks(&frame.registers_r, &frame.registers_i, &frame.registers_f);
-    frame.box_replacements.bind_frame_state(&frame.frame_state);
 
     if !driver_pointer.is_null() {
         // Nested descent: publish the heap frame and yield the parent at its
@@ -12645,11 +12695,14 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     let descent_unjournaled_before = fbw_has_unjournaled_effect();
     let mut driver = SubWalkDriver::new(frame);
     let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
-    let caller_replacements = FrameBoxReplacements::new(ctx.session);
-    caller_replacements.bind_banks(ctx.registers_r, ctx.registers_i, ctx.registers_f);
-    caller_replacements.bind_frame_state(&ctx.frame_state);
+    super::vable_ops::bind_paused_caller_regs(
+        ctx.session,
+        ctx.registers_r,
+        ctx.registers_i,
+        ctx.registers_f,
+        &ctx.frame_state,
+    );
     let result = driver.drive(ctx.trace_ctx);
-    drop(caller_replacements);
     match result {
         Ok((outcome, class_state)) => {
             // `MetaInterp.class_of_last_exc_is_const` is shared across the

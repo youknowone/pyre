@@ -104,15 +104,8 @@ const _: () = {
 /// today, so the arm is reachable and the frame it hands back has to carry the
 /// compiled values.  `executioncontext.rs force_frame` dispatches to whichever
 /// arm the token names — the same split `force_virtualizable_if_necessary`
-/// runs.
-///
-/// The trailing write is pyre's and has no upstream counterpart: `force_frame`
-/// goes through a `OnceLock` hook a JIT-less embedding never fills, and
-/// `force_pyframe` declines a token the metainterp does not recognise as
-/// armed, so a token left behind would fault later in `JitFrame::resolve`
-/// rather than here.  Upstream asserts at that point; the debug assertion
-/// below is that assert, and since a panic reached from compiled code is the
-/// worse failure in a release build, the write stays as its backstop.
+/// runs.  The force is what clears the slot; this helper does not overwrite
+/// a live token after a force that failed to write back.
 unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
     unsafe {
         let ptr = obj_ptr as *mut u8;
@@ -126,17 +119,13 @@ unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
             return;
         }
         pyre_interpreter::executioncontext::force_frame(ptr as *mut pyre_interpreter::PyFrame);
+        // virtualizable.py `clear_vable_token` — `assert not virtualizable.vable_token`.
+        // The force is what clears the slot; do not overwrite a live token
+        // after a force that failed to write back.
         debug_assert_eq!(
             *token_ptr, 0,
-            "clear_vable_token: force_now must leave TOKEN_NONE behind"
+            "virtualizable.py clear_vable_token must leave TOKEN_NONE behind"
         );
-        if *token_ptr != 0 {
-            if majit_metainterp::majit_log_enabled() {
-                let token = *token_ptr;
-                eprintln!("[jit][clear-vable] force left token=0x{token:x} frame={ptr:p}");
-            }
-            *token_ptr = 0;
-        }
     }
 }
 

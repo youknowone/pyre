@@ -27,6 +27,11 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
         resume_coord: ParentResumeCoord::Backxlat(0),
         resume_marker_jit_pc: None,
         boxes: vec![OpRef::const_ptr(majit_ir::GcRef(word + 0x20))],
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
     };
     let frames = vec![
         InlineFrameGuard::enter(&outer, 0, false, vec![parent(0x1000)]),
@@ -730,6 +735,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
         debug_merge_point_py_pc: None,
         parents: Vec::new(),
         entry_executed_effects: 0,
+        live: None,
     });
     let mut regs_r = Vec::new();
     let mut regs_i = Vec::new();

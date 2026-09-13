@@ -580,7 +580,7 @@ pub struct Transformer<'a> {
     /// RPython: `Transformer.vable_flags`. Keyed by Variable identity
     /// matching upstream `self.vable_flags[op.args[0]] = ...`
     /// (`jtransform.py` populates with `Variable` objects).
-    vable_flags: std::collections::HashMap<crate::flowspace::model::Variable, VableFlag>,
+    vable_flags: std::collections::HashMap<crate::flowspace::model::Variable, VableFlags>,
     /// Value aliases from identity rewrites (same_as / hint rewriting).
     aliases: std::collections::HashMap<
         crate::flowspace::model::Variable,
@@ -605,10 +605,57 @@ pub struct Transformer<'a> {
     excmatch: Option<&'a crate::translator::rtyper::rtyper::LowLevelFunction>,
 }
 
-/// RPython: jtransform.py vable_flags values
+/// RPython: `jtransform.py` `vable_flags` values — the `flags` dict
+/// `rewrite_op_jit_force_virtualizable` files from `op.args[2].value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VableFlags {
+    pub access_directly: bool,
+    pub fresh_virtualizable: bool,
+}
+
+impl VableFlags {
+    fn from_annotation(var: &crate::flowspace::model::Variable) -> Self {
+        let Some(ann) = var.annotation.borrow().clone() else {
+            return Self::default();
+        };
+        match ann.as_ref() {
+            crate::annotator::model::SomeValue::Instance(instance) => Self {
+                access_directly: instance.flags.get("access_directly") == Some(&true),
+                fresh_virtualizable: instance.flags.get("fresh_virtualizable") == Some(&true),
+            },
+            _ => Self::default(),
+        }
+    }
+
+    fn from_const(value: &crate::flowspace::model::ConstValue) -> Self {
+        let crate::flowspace::model::ConstValue::Dict(items) = value else {
+            return Self::default();
+        };
+        let has = |key: &str| {
+            items.get(&crate::flowspace::model::ConstValue::byte_str(key))
+                == Some(&crate::flowspace::model::ConstValue::Bool(true))
+        };
+        Self {
+            access_directly: has("access_directly"),
+            fresh_virtualizable: has("fresh_virtualizable"),
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            access_directly: self.access_directly || other.access_directly,
+            fresh_virtualizable: self.fresh_virtualizable || other.fresh_virtualizable,
+        }
+    }
+}
+
+/// `jtransform.py is_virtualizable_getset` result: `False`, `True`, or
+/// the `VirtualizableArrayField` exception raised for an array field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VableFlag {
-    FreshVirtualizable,
+enum VirtualizableGetset {
+    No,
+    Static,
+    Array,
 }
 
 /// `support.py result.append(Constant(obj, lltype.typeOf(obj)))`
@@ -1687,13 +1734,68 @@ impl<'a> Transformer<'a> {
     /// field instead of one at the end.  The GC and the JIT want the same
     /// shape here; they simply want it for different reasons.
     fn is_fresh_virtualizable(&self, base: &crate::flowspace::model::Variable) -> bool {
-        self.vable_flags.get(base) == Some(&VableFlag::FreshVirtualizable)
+        self.vable_flags
+            .get(base)
+            .is_some_and(|flags| flags.fresh_virtualizable)
+    }
+
+    /// `jtransform.py is_virtualizable_getset`.
+    ///
+    /// ```text
+    /// vinfo = self.get_vinfo(op.args[0])
+    /// if vinfo is None:
+    ///     return False
+    /// res = False
+    /// if op.args[1].value in vinfo.static_field_to_extra_box:
+    ///     res = True
+    /// if op.args[1].value in vinfo.array_fields:
+    ///     res = VirtualizableArrayField(self.graph, vinfo)
+    /// if res:
+    ///     flags = self.vable_flags[op.args[0]]
+    ///     if 'fresh_virtualizable' in flags:
+    ///         return False
+    /// if isinstance(res, Exception):
+    ///     raise res
+    /// return res
+    /// ```
+    fn is_virtualizable_getset(
+        &self,
+        base: &crate::flowspace::model::Variable,
+        field: &FieldDescriptor,
+    ) -> VirtualizableGetset {
+        if !self.config.lower_virtualizable {
+            return VirtualizableGetset::No;
+        }
+        let is_static = self.config.virtualizable_field(field).is_some();
+        let is_array = self.config.virtualizable_array(field).is_some();
+        if !is_static && !is_array {
+            return VirtualizableGetset::No;
+        }
+        // Frame-constructor by-value: the container was never dereferenced,
+        // so this is not a live virtualizable access. Same fact
+        // `hint(access_directly=True, fresh_virtualizable=True)` marks
+        // upstream; the structural arm covers the constructor that holds
+        // the frame by value.
+        if field.suppresses_virtualizable() || field.base_is_local_aggregate() {
+            return VirtualizableGetset::No;
+        }
+        // `if res: flags = self.vable_flags[op.args[0]]`. rematerialize
+        // files the key for every redirected access; missing key after that
+        // is empty flags (still lower), not a translator crash.
+        if self.is_fresh_virtualizable(base) {
+            return VirtualizableGetset::No;
+        }
+        if is_array {
+            VirtualizableGetset::Array
+        } else {
+            VirtualizableGetset::Static
+        }
     }
 
     /// The codewriter half of
     /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`.
-    /// Consult the pre-renaming SSA value for its annotator flag, then file
-    /// the flag under the renamed operand exactly as
+    /// Consult the pre-renaming SSA value for its annotator flags, then file
+    /// them under the renamed operand exactly as
     /// `rewrite_op_jit_force_virtualizable` does upstream.
     fn rematerialize_vable_flags_for_access(
         &mut self,
@@ -1706,16 +1808,8 @@ impl<'a> Transformer<'a> {
             }
             _ => return,
         };
-        let is_fresh = original_base.annotation.borrow().as_ref().is_some_and(|s| {
-            matches!(
-                s.as_ref(),
-                crate::annotator::model::SomeValue::Instance(instance)
-                    if instance.flags.get("fresh_virtualizable") == Some(&true)
-            )
-        });
-        if !is_fresh
-            || (self.config.virtualizable_field(field).is_none()
-                && self.config.virtualizable_array(field).is_none())
+        if self.config.virtualizable_field(field).is_none()
+            && self.config.virtualizable_array(field).is_none()
         {
             return;
         }
@@ -1723,8 +1817,17 @@ impl<'a> Transformer<'a> {
             OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. } => base,
             _ => unreachable!("renaming preserves field-access kind"),
         };
-        self.vable_flags
-            .insert(renamed_base.clone(), VableFlag::FreshVirtualizable);
+        // Merge with flags already filed by `rewrite_op_hint` /
+        // `rewrite_op_jit_force_virtualizable` in this block. After
+        // `join_blocks` the access may name the hinted SSA value, whose
+        // annotation is empty; overwriting would drop `fresh_virtualizable`.
+        let flags = self
+            .vable_flags
+            .get(renamed_base)
+            .copied()
+            .unwrap_or_default()
+            .merge(VableFlags::from_annotation(original_base));
+        self.vable_flags.insert(renamed_base.clone(), flags);
     }
 
     /// `jtransform.py _check_no_vable_array`.
@@ -2126,8 +2229,7 @@ impl<'a> Transformer<'a> {
             // The front lowers the stand-in helper as a Call; dispatch it
             // here so it never reaches residual `CallMayForce`.
             OpKind::Call { target, args, .. } if is_jit_force_virtualizable_target(target) => {
-                let args = crate::model::call_arg_vars(args);
-                self.rewrite_op_jit_force_virtualizable(&args, graph_name)
+                self.rewrite_op_jit_force_virtualizable(args, graph_name)
             }
             // RPython `Transformer.rewrite_op_cast_opaque_ptr` aliases
             // only the explicit low-level operation. A ptr/int roundtrip
@@ -3563,16 +3665,31 @@ impl<'a> Transformer<'a> {
 
     /// `jtransform.py rewrite_op_jit_force_virtualizable`.
     ///
-    /// Upstream files `vable_flags[v_inst]` from the injected op's third
-    /// argument and returns `[]`. The source-level residual marker carries
-    /// only the instance; `rematerialize_vable_flags_for_access` reads the
-    /// same flags from `Variable.annotation` at each access. This rewrite
-    /// therefore only deletes the marker from looked-inside code.
+    /// ```text
+    /// vinfo = self.get_vinfo(op.args[0])
+    /// assert vinfo is not None, (...)
+    /// self.vable_flags[op.args[0]] = op.args[2].value
+    /// return []
+    /// ```
+    ///
+    /// Production residual is the 1-arg `jit_force_virtualizable(frame)`
+    /// marker. The 3-arg hook form carries `[vinst, cname, cflags]`. File
+    /// flags from `args[2]` when present, otherwise from the instance
+    /// annotation — the same source `rematerialize_vable_flags_for_access`
+    /// reads at each redirected access.
     fn rewrite_op_jit_force_virtualizable(
         &mut self,
-        _args: &[crate::flowspace::model::Variable],
+        args: &[crate::model::LinkArg],
         graph_name: &str,
     ) -> RewriteResult {
+        if let Some(base) = args.first().and_then(crate::model::LinkArg::as_variable) {
+            let mut flags = VableFlags::from_annotation(base);
+            if let Some(crate::model::LinkArg::Const(c)) = args.get(2) {
+                flags = flags.merge(VableFlags::from_const(&c.value));
+            }
+            self.vable_flags
+                .insert(resolve_alias(base, &self.aliases), flags);
+        }
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: "rewrite: jit_force_virtualizable(...) → []".to_string(),
@@ -3608,16 +3725,22 @@ impl<'a> Transformer<'a> {
                     detail: format!("rewrite: {label}(...) → identity"),
                 });
                 if let Some(arg) = args.first() {
-                    if hint_kind == crate::hints::HintKind::FreshVirtualizable {
-                        // Key on the resolved operand: `optimize_block`
-                        // remaps every op through `aliases` before rewriting,
-                        // so this is the same handle the later field reads
-                        // present as their base.
-                        self.vable_flags.insert(
-                            resolve_alias(arg, &self.aliases),
-                            VableFlag::FreshVirtualizable,
-                        );
+                    // Key on the resolved operand: `optimize_block`
+                    // remaps every op through `aliases` before rewriting,
+                    // so this is the same handle the later field reads
+                    // present as their base.
+                    let key = resolve_alias(arg, &self.aliases);
+                    let mut flags = self.vable_flags.get(&key).copied().unwrap_or_default();
+                    match hint_kind {
+                        crate::hints::HintKind::FreshVirtualizable => {
+                            flags.fresh_virtualizable = true;
+                        }
+                        crate::hints::HintKind::AccessDirectly => {
+                            flags.access_directly = true;
+                        }
+                        _ => {}
                     }
+                    self.vable_flags.insert(key, flags);
                     RewriteResult::Identity(arg.clone())
                 } else {
                     RewriteResult::Keep
@@ -3871,36 +3994,15 @@ impl<'a> Transformer<'a> {
             .as_ref()
             .and_then(|result| self.get_value_type(result))
             .unwrap_or_else(|| ty.clone());
-        // `jtransform.py:990-993` — a just-allocated virtualizable is not
-        // under the virtualizable protocol yet, so neither the array
-        // tracking nor the scalar lowering below may fire for it.
-        let fresh_virtualizable = match &op.kind {
-            OpKind::FieldRead { base, .. } => self.is_fresh_virtualizable(base),
+        // `jtransform.py is_virtualizable_getset` — one predicate for the
+        // array-tracking arm and the scalar `getfield_vable_*` arm.
+        let getset = match &op.kind {
+            OpKind::FieldRead { base, .. } => self.is_virtualizable_getset(base, field),
             _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
         };
-        // Two more suppressions, both reached structurally.  A container
-        // that was not dereferenced is a value in this frame, so the
-        // access cannot be to a live virtualizable — that is what covers
-        // the frame constructor, where the hint upstream relies on cannot
-        // land.  And a projection whose *address* was taken is not a read
-        // of the field at all; tracking it would drop the op and leave the
-        // address's consumer with an undefined operand.
-        let fresh_virtualizable = fresh_virtualizable || field.suppresses_virtualizable();
-        // `lower_virtualizable` guards the four sibling dispatch arms —
-        // `rewrite_op_setfield`, `rewrite_op_getarrayitem`,
-        // `rewrite_op_setarrayitem`, `rewrite_op_getarraysize`.  This function
-        // runs whether or not the flag is set, because the quasi-immutable
-        // tail below is independent of virtualizable lowering; the two
-        // virtualizable arms here are not.  With the flag off, the array arm
-        // would register a base no consumer will ever read and drop a read
-        // those consumers still reference, leaving regalloc an undefined
-        // variable.  The field's own doc covers "field/array accesses" — both.
-        let lower_vable = self.config.lower_virtualizable && !fresh_virtualizable;
         // Track virtualizable array field reads
-        if let Some(array_field) = self
-            .config
-            .virtualizable_array(field)
-            .filter(|_| lower_vable)
+        if getset == VirtualizableGetset::Array
+            && let Some(array_field) = self.config.virtualizable_array(field)
             && let Some(result) = op.result.clone()
         {
             // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
@@ -3929,10 +4031,8 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(Vec::new());
         }
         // Virtualizable scalar field → VableFieldRead
-        if let Some(vable_field) = self
-            .config
-            .virtualizable_field(field)
-            .filter(|_| lower_vable)
+        if getset == VirtualizableGetset::Static
+            && let Some(vable_field) = self.config.virtualizable_field(field)
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -4092,21 +4192,15 @@ impl<'a> Transformer<'a> {
             .as_variable()
             .and_then(|v| self.get_value_type(v))
             .unwrap_or_else(|| ty.clone());
-        // `jtransform.py if self.is_virtualizable_getset(op)` — the
-        // write side consults the same predicate, so the
-        // `jtransform.py:990-993` fresh-virtualizable arm suppresses it too.
-        let fresh_virtualizable = match &op.kind {
-            OpKind::FieldWrite { base, .. } => self.is_fresh_virtualizable(base),
+        // `jtransform.py if self.is_virtualizable_getset(op)` — same
+        // predicate as the read side, including the fresh-virtualizable arm.
+        let getset = match &op.kind {
+            OpKind::FieldWrite { base, .. } => self.is_virtualizable_getset(base, field),
             _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
         };
-        // The structural arm, as on the read side: a write into a
-        // non-dereferenced local aggregate is not a virtualizable write.
-        let fresh_virtualizable = fresh_virtualizable || field.base_is_local_aggregate();
-        // `is_virtualizable_getset`: writing the array field itself
-        // (not an element) raises `VirtualizableArrayField`. `rewrite_op_setfield`
-        // does not catch it, so translation fails. A fresh virtualizable
-        // is still being initialised and may take a plain `setfield`.
-        if !fresh_virtualizable && self.config.virtualizable_array(field).is_some() {
+        // `is_virtualizable_getset` raising `VirtualizableArrayField` is
+        // not caught by `rewrite_op_setfield`, so translation fails.
+        if getset == VirtualizableGetset::Array {
             panic!(
                 "A virtualizable array is passed around; it should\n\
                  only be used immediately after being read.  Note\n\
@@ -4116,10 +4210,8 @@ impl<'a> Transformer<'a> {
                  Occurred in: {graph_name}"
             );
         }
-        if let Some(vable_field) = self
-            .config
-            .virtualizable_field(field)
-            .filter(|_| !fresh_virtualizable)
+        if getset == VirtualizableGetset::Static
+            && let Some(vable_field) = self.config.virtualizable_field(field)
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -13293,6 +13385,126 @@ mod tests {
             ops[1].kind,
             OpKind::VableFieldRead { field_index: 0, .. }
         ));
+    }
+
+    fn mark_instance_flags(
+        variable: &crate::flowspace::model::Variable,
+        access_directly: bool,
+        fresh_virtualizable: bool,
+    ) {
+        let mut flags = std::collections::BTreeMap::new();
+        if access_directly {
+            flags.insert("access_directly".to_string(), true);
+        }
+        if fresh_virtualizable {
+            flags.insert("fresh_virtualizable".to_string(), true);
+        }
+        *variable.annotation.borrow_mut() = Some(std::rc::Rc::new(
+            crate::annotator::model::SomeValue::Instance(
+                crate::annotator::model::SomeInstance::new(None, false, flags),
+            ),
+        ));
+    }
+
+    /// `jtransform.py is_virtualizable_getset`: `access_directly` in
+    /// `vable_flags` does not suppress lowering — only `fresh_virtualizable`.
+    #[test]
+    fn access_directly_does_not_suppress_vable_field_read() {
+        let mut graph = FunctionGraph::new("access_directly_vable");
+        let frame_var = graph.alloc_value_var();
+        mark_instance_flags(&frame_var, true, false);
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: frame_var,
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            },
+        );
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::VableFieldRead { field_index: 0, .. })),
+            "access_directly must still lower to getfield_vable, got {ops:?}"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_jit_force_virtualizable` files
+    /// `vable_flags[args[0]]` from the third-arg flags dict.
+    #[test]
+    fn rewrite_op_jit_force_virtualizable_files_three_arg_flags() {
+        use crate::flowspace::model::{ConstValue, Constant};
+
+        let mut graph = FunctionGraph::new("force_three_arg");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        let mut flags = std::collections::HashMap::new();
+        flags.insert(
+            ConstValue::byte_str("access_directly"),
+            ConstValue::Bool(true),
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_force_virtualizable"]),
+                args: vec![
+                    LinkArg::from(frame_var.clone()),
+                    LinkArg::Const(Constant::new(ConstValue::byte_str("next_instr"))),
+                    LinkArg::Const(Constant::new(ConstValue::Dict(flags))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: frame_var,
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            },
+        );
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().all(|op| !matches!(op.kind, OpKind::Call { .. })),
+            "three-arg jit_force_virtualizable must be deleted, got {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::VableFieldRead { field_index: 0, .. })),
+            "access_directly flags must still lower to getfield_vable, got {ops:?}"
+        );
     }
 
     /// `jtransform.py` — `rewrite_op_int_add_ovf` (aliased to

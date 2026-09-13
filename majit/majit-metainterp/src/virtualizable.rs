@@ -790,13 +790,25 @@ impl VirtualizableInfo {
 
     /// Force the virtualizable now.
     ///
-    /// If TOKEN_TRACING_RESCALL, just clear (tracing can reconstruct state).
-    /// If active JIT frame pointer, call `force_fn` to flush JIT state to heap.
-    /// If TOKEN_NONE, no-op.
+    /// virtualizable.py `force_now`:
+    /// ```python
+    /// token = virtualizable.vable_token
+    /// if token == TOKEN_TRACING_RESCALL:
+    ///     virtualizable.vable_token = TOKEN_NONE
+    /// else:
+    ///     ResumeGuardForcedDescr.force_now(cpu, token)
+    ///     assert virtualizable.vable_token == TOKEN_NONE
+    /// ```
+    ///
+    /// Callers (`clear_vable_token`, `force_virtualizable_if_necessary`)
+    /// enter only on a truthy token. TOKEN_NONE in the else arm is the
+    /// same as handing `cpu.force` a NULL GCREF.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn force_now(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
+        // Layout guard for `without_vable_token` test machines. Upstream
+        // `virtualizable.py force_now` always has the field.
         if !self.has_vable_token() {
             return;
         }
@@ -804,12 +816,15 @@ impl VirtualizableInfo {
             let token_ptr = obj_ptr.add(self.token_offset) as *mut usize;
             let token = *token_ptr;
             if token == token_tracing_rescall() as usize {
-                // During tracing — just clear the marker
+                // virtualizable.py `force_now` — values are correct during tracing.
                 *token_ptr = 0;
-            } else if token != 0 {
-                // Active JIT frame — force it, then verify it cleared the token
+            } else {
+                // virtualizable.py `force_now` — ResumeGuardForcedDescr.force_now.
                 force_fn(token as u64);
-                assert_eq!(*token_ptr, 0, "force_fn should have cleared the token");
+                assert_eq!(
+                    *token_ptr, 0,
+                    "virtualizable.py force_now must leave TOKEN_NONE"
+                );
             }
         }
     }
@@ -919,12 +934,18 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn clear_vable_token(&self, obj_ptr: *mut u8, force_fn: impl FnOnce(u64)) {
+        // virtualizable.py `clear_vable_token`:
+        //     if virtualizable.vable_token:
+        //         force_now(virtualizable)
+        //         assert not virtualizable.vable_token
         unsafe {
-            self.force_virtualizable_if_necessary(obj_ptr, force_fn);
-            assert!(
-                matches!(self.read_token(obj_ptr), VableToken::None),
-                "clear_vable_token must leave TOKEN_NONE"
-            );
+            if !matches!(self.read_token(obj_ptr), VableToken::None) {
+                self.force_now(obj_ptr, force_fn);
+                assert!(
+                    matches!(self.read_token(obj_ptr), VableToken::None),
+                    "virtualizable.py clear_vable_token must leave TOKEN_NONE"
+                );
+            }
         }
     }
 
@@ -1624,11 +1645,7 @@ unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool
 
 /// Force a virtualizable: flush JIT-held values back to the heap.
 ///
-/// Token semantics:
-/// - TOKEN_NONE (0): not in JIT, nothing to do.
-/// - TOKEN_TRACING_RESCALL (prebuilt GCREF): tracing + residual call, just clear.
-/// - Any other non-zero value: active JIT frame pointer. Call `force_fn`
-///   with the frame pointer, which must clear the token itself.
+/// Delegates to `VirtualizableInfo::force_now` (`virtualizable.py force_now`).
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
@@ -2011,17 +2028,19 @@ mod tests {
 
     #[test]
     fn test_force_virtualizable_not_active() {
+        // virtualizable.py `force_now` — TOKEN_NONE is not TOKEN_TRACING_RESCALL,
+        // so the else arm runs and the helper is invoked with the NULL token.
         let info = VirtualizableInfo::new(0);
         let mut obj = vec![0u8; 8];
         let obj_ptr = obj.as_mut_ptr();
 
-        let mut forced = false;
+        let mut received = None;
         unsafe {
-            force_virtualizable(&info, obj_ptr, |_| {
-                forced = true;
+            force_virtualizable(&info, obj_ptr, |token| {
+                received = Some(token);
             });
         }
-        assert!(!forced, "should not force when token is zero");
+        assert_eq!(received, Some(0));
     }
 
     #[test]
@@ -2819,18 +2838,20 @@ mod tests {
 
     #[test]
     fn test_force_now_none() {
-        // force_now when token is NONE — no-op
+        // virtualizable.py `force_now` — TOKEN_NONE is not TOKEN_TRACING_RESCALL,
+        // so the else arm runs. Callers never enter with TOKEN_NONE; this
+        // documents the unguarded structure, not a production no-op.
         let info = VirtualizableInfo::new(0);
         let mut obj = vec![0u8; 8];
         let obj_ptr = obj.as_mut_ptr();
 
         unsafe {
-            let mut called = false;
-            info.force_now(obj_ptr, |_| {
-                called = true;
+            let mut received = None;
+            info.force_now(obj_ptr, |token| {
+                received = Some(token);
             });
 
-            assert!(!called, "force_fn should NOT be called for TOKEN_NONE");
+            assert_eq!(received, Some(0));
             assert_eq!(info.read_token(obj_ptr), VableToken::None);
         }
     }
@@ -3416,44 +3437,51 @@ pub(crate) unsafe fn vable_write_array_item_at(
 ///
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
-pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) {
-    // A machine with no real `vable_token` field (`has_vable_token`) keeps an
-    // inert token protocol: writing to offset 0 would clobber the struct's
-    // first live field (e.g. a `Vec`'s data pointer).
-    if !vinfo.has_vable_token() {
-        return;
+/// Follow a nursery forwarding address left by a moving collection.
+///
+/// `force_now` can allocate while reconstructing a compiled frame. The
+/// blackhole keeps `virtualizable` as a GCREF that the GC updates; a
+/// raw `*mut u8` does not move with it.
+unsafe fn follow_forwarded_vable(obj_ptr: *mut u8) -> *mut u8 {
+    if obj_ptr.is_null() {
+        return obj_ptr;
     }
     unsafe {
-        let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
-        let token = *token_ptr;
-        if token == 0 {
-            return;
+        let hdr = majit_gc::header::header_of(obj_ptr as usize);
+        if (*hdr).is_forwarded() {
+            majit_gc::header::GcHeader::forwarding_address(hdr) as *mut u8
+        } else {
+            obj_ptr
         }
-        if token == token_tracing_rescall() as usize {
-            // virtualizable.py:250-255: the values are already correct during
-            // tracing; the marker only tells the tracer this one escaped.
-            *token_ptr = 0;
-            return;
-        }
-        let Some(clear_vable_ptr) = vinfo.clear_vable_ptr else {
-            // A machine that registered no force helper has no compiled
-            // activation to write back either: `emit_force_virtualizable`
-            // `expect`s this same field, so a trace that could have parked an
-            // Active token here could not have been built.  Clear it, matching
-            // the post-state `force_now` guarantees.
-            *token_ptr = 0;
-            return;
-        };
-        // `make_clear_vable_descr` declares `[Ref] -> Void` and
-        // `frame_layout.rs` registers a function taking that word as `i64`;
-        // spelling the pointee any other way mismatches the wasm32 signature
-        // and traps on call.
-        let force: unsafe extern "C" fn(i64) = std::mem::transmute(clear_vable_ptr);
-        force(obj_ptr as i64);
-        assert_eq!(
-            *token_ptr, 0,
-            "virtualizable.py:222 — force_now must leave TOKEN_NONE behind"
-        );
+    }
+}
+
+pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *mut u8) -> *mut u8 {
+    // virtualizable.py `clear_vable_token`: if token: force_now(); assert not token.
+    unsafe {
+        vinfo.clear_vable_token(obj_ptr, |_token| {
+            let Some(clear_vable_ptr) = vinfo.clear_vable_ptr else {
+                // A machine that registered no force helper has no compiled
+                // activation to write back. `force_now`'s else arm must still
+                // leave TOKEN_NONE.
+                unsafe {
+                    let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
+                    *token_ptr = 0;
+                }
+                return;
+            };
+            // `make_clear_vable_descr` declares `[Ref] -> Void` and
+            // `frame_layout.rs` registers a function taking that word as `i64`;
+            // spelling the pointee any other way mismatches the wasm32 signature
+            // and traps on call.
+            let force: unsafe extern "C" fn(i64) = unsafe { std::mem::transmute(clear_vable_ptr) };
+            force(obj_ptr as i64);
+        });
+    }
+    if vinfo.clear_vable_ptr.is_some() {
+        unsafe { follow_forwarded_vable(obj_ptr) }
+    } else {
+        obj_ptr
     }
 }
 

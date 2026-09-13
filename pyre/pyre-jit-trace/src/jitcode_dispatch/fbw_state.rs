@@ -145,6 +145,7 @@ mod recursion_depth_policy_tests {
             debug_merge_point_py_pc: None,
             parents: Vec::new(),
             entry_executed_effects: 0,
+            live: None,
         }
     }
 
