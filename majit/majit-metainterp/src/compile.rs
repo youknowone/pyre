@@ -2544,7 +2544,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     /// RPython rewrites a LABEL arg that *is* the forwarded inputarg.
     fn forward_residual_args_sharing_inputarg(
         ops: &[majit_ir::OpRc],
-        forwarding: &mut Vec<Option<Operand>>,
+        forwarding: &mut LocalForwarding,
         old_opref: OpRef,
         target: &Operand,
     ) {
@@ -3319,7 +3319,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         let fail_types: Vec<Type> = (0..entry_prefix_len)
             .map(|i| expanded_inputargs[i].tp)
             .collect();
-        let failargs: smallvec::SmallVec<[Operand; 4]> = (0..entry_prefix_len)
+        let failargs: smallvec::SmallVec<[Operand; 8]> = (0..entry_prefix_len)
             .map(|i| Operand::from_bound_inputarg(&expanded_inputargs[i]))
             .collect();
         let mut guard = Op::new(OpCode::GuardNonnull, std::slice::from_ref(&bound));
@@ -6274,6 +6274,9 @@ mod tests {
             1,
             0,
             &mut constants,
+            &[],
+            &[],
+            None,
         );
 
         assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
