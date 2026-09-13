@@ -12965,9 +12965,34 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     // go through residual_call's BINARY_OP arm, so the write-back
     // that keeps `p["x"]` live must run here too.
     super::residual_call::write_back_locals_for_proxy_reader(ctx, &allboxes);
+    let profiled_call = matches!(
+        call_opcode,
+        OpCode::CallI
+            | OpCode::CallR
+            | OpCode::CallF
+            | OpCode::CallN
+            | OpCode::CallPureI
+            | OpCode::CallPureR
+            | OpCode::CallPureF
+            | OpCode::CallPureN
+            | OpCode::CallLoopinvariantI
+            | OpCode::CallLoopinvariantR
+            | OpCode::CallLoopinvariantF
+            | OpCode::CallLoopinvariantN
+    );
+    if profiled_call {
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(call_opcode, majit_metainterp::counters::OPS);
+    }
     let recorded = ctx
         .trace_ctx
         .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+    if profiled_call {
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+    }
     let resid = super::residual_call::try_execute_residual_call_via_executor(
         ctx,
         call_opcode,

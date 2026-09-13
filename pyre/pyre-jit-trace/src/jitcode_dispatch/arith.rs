@@ -214,6 +214,7 @@ pub(crate) fn record_int_ovf<Sym: WalkSym>(
         // the op and take that arm instead of aborting the except
         // bridge (`total += 2` after a caught raise).
         let _ = pc;
+        count_ops_executed(ctx, opcode);
         count_ops_recorded(ctx, opcode);
         let resbox = ctx.trace_ctx.record_op(opcode, &[b1, b2]);
         return Ok((resbox, false));
