@@ -1552,9 +1552,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             // snapshot slot (`opref.is_constant()` above); an InputArg
             // whose replacement is this-eval's stack address is not.
             return match value {
-                majit_ir::Value::Ref(gcref) => {
-                    !(opref.is_input_arg() && OptContext::ref_addr_is_stack_resident(gcref.0))
-                }
+                majit_ir::Value::Ref(gcref) => !OptContext::ref_addr_is_stack_resident(gcref.0),
                 _ => true,
             };
         }
@@ -1565,7 +1563,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 // ConstPtr is remapped to its InputArg; numbering that
                 // InputArg as TAGCONST would drop it from the failargs
                 // again. Heap ConstPtrInfo stays Const (PyPy identity).
-                !(opref.is_input_arg() && OptContext::ref_addr_is_stack_resident(gcref.0))
+                !OptContext::ref_addr_is_stack_resident(gcref.0)
             }
             _ => false,
         }
