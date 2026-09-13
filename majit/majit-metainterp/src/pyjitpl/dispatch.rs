@@ -1653,6 +1653,20 @@ where
         })
     }
 
+    /// `pyjitpl.py` `get_list_of_active_boxes`: when
+    /// `after_residual_call`, `pc` is the trailing `-live-` (`:194-198`).
+    /// A residual whose calldescr was stamped `RandomEffects` but whose
+    /// transform treated it as cannot-raise has no `-live-` (the next
+    /// instruction is often an `int_copy` of the following funcptr).
+    /// Snapshotting that pc decodes operand bytes as an `all_liveness`
+    /// offset and indexes `constants_r` out of range.
+    fn after_residual_live_pc(&self, ctx: &TraceCtx) -> Option<usize> {
+        let frame = self.frames.frames.last()?;
+        let pc = frame.code_cursor;
+        let op_live = ctx.metainterp_sd().op_live as u8;
+        (frame.jitcode.code.get(pc) == Some(&op_live)).then_some(pc)
+    }
+
     fn finalize_standard_virtualizable_may_force(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1707,7 +1721,12 @@ where
             // sub-frame.  Same source as
             // `finish_residual_call_exception_path`, which records the
             // GUARD_NO_EXCEPTION that follows this guard.
-            let resume_pc = self.frames.current_mut().code_cursor;
+            let Some(resume_pc) = self.after_residual_live_pc(ctx) else {
+                if materialized {
+                    ctx.reload_tokenless_virtualizable_after_residual_call();
+                }
+                return TraceAction::Continue;
+            };
             self.record_state_guard(
                 ctx,
                 sym,
@@ -3003,7 +3022,13 @@ where
         // `MIFrame::pc` is only the saved resume position.  Capture the
         // post-call bytecode cursor so the snapshot reads the trailing
         // `-live-` marker for this residual call.
-        let resume_pc = self.frames.current_mut().code_cursor;
+        let Some(resume_pc) = self.after_residual_live_pc(ctx) else {
+            if exc != 0 {
+                self.last_exception_value = exc;
+                return self.unwind_to_exception_handler(ctx);
+            }
+            return TraceAction::Continue;
+        };
 
         if exc == 0 {
             self.record_state_guard(
