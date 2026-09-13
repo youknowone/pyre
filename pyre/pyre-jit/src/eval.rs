@@ -5669,8 +5669,17 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // recorded `arg_types`/`result_type` were written against that signature,
     // and naming it here is the vouching the backend cannot do for itself --
     // a raw callee taking `&T` is `(i32)` on wasm32 whatever its descr says.
+    //
+    // Word mode treats every Int/Ref residual as `(i64×n) -> i64`. That
+    // `call_indirect` type-checks the callee, so an unvouched pointer-ABI
+    // helper traps (`indirect call type mismatch`) instead of reaching
+    // `jit_call`. Vouched mode is the list below plus every target the
+    // assembler marked word-spelled; everything else stays on the trampoline.
     #[cfg(target_arch = "wasm32")]
     {
+        majit_backend_wasm::codegen::set_residual_call_abi(
+            majit_backend_wasm::codegen::ResidualCallAbi::Vouched,
+        );
         let mut faithful = vec![
             // (f64) -> i64
             pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const ()
