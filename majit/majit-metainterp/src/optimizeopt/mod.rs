@@ -6987,7 +6987,6 @@ impl OptContext {
         resolved
     }
 
-<<<<<<< HEAD
     /// Recover a declared Ref inputarg that the IR fail_args still
     /// name but snapshot numbering dropped as TAGCONST.
     ///
@@ -7072,8 +7071,6 @@ impl OptContext {
         }
     }
 
-||||||| parent of c9e3352b95c (Hole later fail_args that resolve to one InputArg)
-=======
     /// finish() liveboxes are unique. Two numbering positions can still
     /// resolve to one InputArg after identity unification. Keep the failarg
     /// arity and punch a hole in the later slot (`rd_locs = 0xFFFF`); resume
@@ -7100,7 +7097,6 @@ impl OptContext {
         (out, locs.into())
     }
 
->>>>>>> c9e3352b95c (Hole later fail_args that resolve to one InputArg)
     /// RPython optimizer.py store_final_boxes_in_guard inline.
     /// Called from emit() for every guard during optimization. Produces
     /// rd_numb via memo.number() using the CURRENT optimizer state
