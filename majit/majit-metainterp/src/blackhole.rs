@@ -230,6 +230,34 @@ pub enum DispatchError {
     ContinueRunningNormally(Box<MergePointArgs>),
 }
 
+thread_local! {
+    static BLACKHOLE_RUNNING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// True while [`BlackholeInterpreter::run`] is on the stack.
+///
+/// `bhimpl_jit_merge_point` does not start a new trace.  The unpack
+/// portal hook is the interpreter function, so a deopt that unpacks
+/// from blackhole would otherwise nest `force_start_tracing`.
+pub fn blackhole_is_running() -> bool {
+    BLACKHOLE_RUNNING.with(|c| c.get() > 0)
+}
+
+struct BlackholeRunningGuard;
+
+impl BlackholeRunningGuard {
+    fn enter() -> Self {
+        BLACKHOLE_RUNNING.with(|c| c.set(c.get().saturating_add(1)));
+        Self
+    }
+}
+
+impl Drop for BlackholeRunningGuard {
+    fn drop(&mut self) {
+        BLACKHOLE_RUNNING.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 /// Jitcode-based blackhole interpreter.
 ///
 /// Executes jitcode bytecodes with concrete values. Each instance
@@ -1729,6 +1757,7 @@ impl BlackholeInterpreter {
     /// Returns `Some(args)` for `ContinueRunningNormally` (RPython: raise
     /// jitexc.ContinueRunningNormally propagates through run→_run_forever).
     pub fn run(&mut self) -> BhRunOutcome {
+        let _running = BlackholeRunningGuard::enter();
         let _bh_phase = majit_gc::BhProbePhase::enter("blackhole");
         // Pooled interpreters are registered for life (`acquire_interp`).
         // `seed_deopt_vinfo_ptr` still stamps a no-token state-field
