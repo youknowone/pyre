@@ -5592,6 +5592,14 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 .filter_map(|(name, addr)| name.contains("w_code_const").then_some(addr))
                 .collect(),
         });
+        majit_metainterp::register_frame_anchor_live_residual(
+            majit_metainterp::FrameAnchorLiveResidual {
+                fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .filter_map(|(name, addr)| name.contains("frame_anchor_live").then_some(addr))
+                    .collect(),
+            },
+        );
         majit_metainterp::register_exact_int_false_residual(
             majit_metainterp::ExactIntFalseResidual {
                 fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
