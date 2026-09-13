@@ -480,6 +480,17 @@ fn publish_leaf_exception(err: &mut pyre_interpreter::PyError) -> i64 {
     0
 }
 
+/// `format_w(value, spec)` as a CanRaise residual.  Exact `int`/`str`
+/// FORMAT_WITH_SPEC records this instead of the MayForce
+/// `bh_format_with_spec_fn` residual, so a compiled `f"{i:05d}"` does not
+/// force virtualizables.
+pub extern "C" fn jit_format_w(value: i64, spec: i64) -> i64 {
+    match pyre_interpreter::type_methods::format_w(value as PyObjectRef, spec as PyObjectRef) {
+        Ok(s) => s as i64,
+        Err(mut err) => publish_leaf_exception(&mut err),
+    }
+}
+
 /// `normalize_hash_digest` as a JIT residual: normalize a boxed `__hash__`
 /// digest to the machine hash, raising for a non-integer.  On error the
 /// exception enters both channels for the trailing `GuardNoException`.
