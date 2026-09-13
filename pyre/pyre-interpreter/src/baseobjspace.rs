@@ -9095,7 +9095,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                     return Ok(code);
                 }
                 "__name__" => {
-                    return Ok(w_str_new(crate::function_get_name(obj)));
+                    return Ok(w_str_new_managed(crate::function_get_name(obj)));
                 }
                 "__closure__" => {
                     let closure = crate::function_get_closure(obj);
@@ -20748,8 +20748,12 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
     };
     let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(qualname);
-    let method_repr = unsafe { crate::display::py_repr_wtf8(w_str_new(method)) }
-        .unwrap_or_else(|_| Wtf8Buf::from_string(format!("'{method}'")));
+    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(method));
+    let method_repr = unsafe {
+        crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(method_slot))
+    }
+    .unwrap_or_else(|_| Wtf8Buf::from_string(format!("'{method}'")));
     let qualname_repr = unsafe {
         crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(qualname_slot))
     }

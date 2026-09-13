@@ -777,7 +777,7 @@ fn ffi_getctype(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             .to_string()
     };
     if replacement.is_empty() {
-        return Ok(pyre_object::w_str_new(ct.name()));
+        return Ok(pyre_object::w_str_new_managed(ct.name()));
     }
     let add_paren = replacement.starts_with('*') && ct.kind == ctypeobj::KIND_ARRAY;
     let add_space = !add_paren && !replacement.starts_with('[') && !replacement.starts_with('(');

@@ -62,7 +62,7 @@ pub unsafe fn string(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyEr
     let roots = pyre_object::gc_roots::push_roots();
     let value_slot = roots.base();
     let _ = roots.pin_root(unsafe { get_value(ct, cdata)? });
-    Ok(pyre_object::w_str_new(
+    Ok(pyre_object::w_str_new_managed(
         &match enumerator_of(ct, roots.get(value_slot))? {
             Some(name) => name,
             None => value_str(roots.get(value_slot))?,

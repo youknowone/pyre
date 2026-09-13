@@ -146,7 +146,7 @@ pub(super) fn stginfo_new(data: StgInfoData) -> PyObjectRef {
         pyre_object::w_dict_setitem_str(
             d,
             K_PARAMFUNC,
-            pyre_object::w_str_new(data.paramfunc.name()),
+            pyre_object::w_str_new_managed(data.paramfunc.name()),
         );
         pyre_object::w_dict_setitem_str(d, K_PROTO, data.proto.unwrap_or_else(pyre_object::w_none));
         pyre_object::w_dict_setitem_str(

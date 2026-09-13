@@ -405,10 +405,12 @@ fn tuple_index(t: PyObjectRef, item: PyObjectRef) -> Result<Option<usize>, crate
     let item = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let n = unsafe { w_tuple_len(t()) };
     for i in 0..n {
-        if let Some(x) = unsafe { w_tuple_getitem(t(), i as i64) }
-            && crate::baseobjspace::eq_w(x, item())?
-        {
-            return Ok(Some(i));
+        if let Some(x) = unsafe { w_tuple_getitem(t(), i as i64) } {
+            let x_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(x);
+            if crate::baseobjspace::eq_w(pyre_object::gc_roots::shadow_stack_get(x_slot), item())? {
+                return Ok(Some(i));
+            }
         }
     }
     Ok(None)

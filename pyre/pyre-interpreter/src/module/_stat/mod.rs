@@ -331,7 +331,7 @@ fn filemode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     buf[0] = filetype(mode);
     let (_, perm) = buf.split_at_mut(1);
     fileperm(mode, perm.try_into().expect("nine permission columns"));
-    Ok(w_str_new(
+    Ok(w_str_new_managed(
         std::str::from_utf8(&buf).expect("filemode writes ASCII only"),
     ))
 }
