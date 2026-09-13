@@ -6931,6 +6931,32 @@ impl OptContext {
         resolved
     }
 
+    /// finish() liveboxes are unique. Two numbering positions can still
+    /// resolve to one InputArg after identity unification. Keep the failarg
+    /// arity and punch a hole in the later slot (`rd_locs = 0xFFFF`); resume
+    /// reads the first slot via rd_numb, and
+    /// `initialize_state_from_guard_failure` drops None holes.
+    fn uniquify_resolved_fail_args(operands: Vec<Operand>) -> (Vec<Operand>, majit_ir::RdLocs) {
+        let mut out: Vec<Operand> = Vec::with_capacity(operands.len());
+        let mut locs = Vec::with_capacity(operands.len());
+        for operand in operands {
+            if operand.is_none()
+                || out
+                    .iter()
+                    .any(|seen| !seen.is_none() && seen.same_box(&operand))
+            {
+                out.push(Operand::none());
+                locs.push(0xFFFF);
+            } else {
+                locs.push(
+                    u16::try_from(out.len()).expect("resume failarg position must fit in rd_locs"),
+                );
+                out.push(operand);
+            }
+        }
+        (out, locs.into())
+    }
+
     /// RPython optimizer.py store_final_boxes_in_guard inline.
     /// Called from emit() for every guard during optimization. Produces
     /// rd_numb via memo.number() using the CURRENT optimizer state
@@ -7309,7 +7335,7 @@ impl OptContext {
         // non-Const position has no operand to bind and panics at
         // `Operand::from_opref` — the same contract the operand-union
         // `_args` model enforces (#9).
-        let final_operands: Vec<Operand> = liveboxes
+        let resolved: Vec<Operand> = liveboxes
             .iter()
             .copied()
             .map(|a| {
@@ -7318,17 +7344,15 @@ impl OptContext {
             })
             .collect();
         memo.recycle_ordered_liveboxes(liveboxes);
-        let logical_rd_locs: majit_ir::RdLocs = final_operands
-            .iter()
-            .enumerate()
-            .map(|(index, operand)| {
-                if operand.is_none() {
-                    0xFFFF
-                } else {
-                    u16::try_from(index).expect("resume failarg position must fit in rd_locs")
-                }
-            })
-            .collect();
+        // optimizer.py:768-774 `assert box not in seen`. Two numbering
+        // positions can resolve to one InputArg after identity unification;
+        // finish() would not emit that box twice. Keep the failarg arity
+        // and punch a hole in the later slot (`rd_locs = 0xFFFF`). Resume
+        // reads the first slot via rd_numb; `initialize_state_from_guard_failure`
+        // drops None holes. Mapping the later slot onto the first index
+        // instead left `store_final_boxes` with a duplicate and panicked
+        // under nursery poison.
+        let (final_operands, logical_rd_locs) = Self::uniquify_resolved_fail_args(resolved);
         if crate::callee_rca_enabled() {
             let final_oprefs: Vec<_> = final_operands
                 .iter()
@@ -11910,5 +11934,21 @@ mod opt_box_env_tests {
             .bound_op()
             .expect("empty ResOp slot lazy-materialised the wrong host kind");
         assert_eq!(op.pos().get(), result);
+    }
+
+    #[test]
+    fn uniquify_resolved_fail_args_holes_a_later_duplicate() {
+        let first = Operand::bound_from_opref(OpRef::input_arg_typed(9, majit_ir::Type::Int));
+        let dup = first.clone();
+        assert!(
+            first.same_box(&dup),
+            "clone must keep the InputArg host so same_box sees a duplicate"
+        );
+        let (out, locs) =
+            OptContext::uniquify_resolved_fail_args(vec![first.clone(), Operand::none(), dup]);
+        assert!(out[0].same_box(&first));
+        assert!(out[1].is_none());
+        assert!(out[2].is_none());
+        assert_eq!(&*locs, &[0, 0xFFFF, 0xFFFF]);
     }
 }
