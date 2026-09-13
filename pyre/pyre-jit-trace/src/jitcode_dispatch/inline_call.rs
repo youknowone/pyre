@@ -6151,14 +6151,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // drain builds once a guard inside the compiled chain fails.  The drain
     // walks the paused middle frames between the raising leaf and the root, so
     // one intermediate frame may sit between the loop and the raise; a middle
-    // that CATCHES is still declined.  Raising depth stays at two for every
-    // shape: a third distinct `shape → mid → leaf` frame abort_trace's
-    // `exception_try_call_inlined_callee_raise` (3/1/0 → 2/0/3, `b3efabbc8ed`),
-    // and a third copy of the same `w_code` storms
-    // `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408).
-    // `perform_call` has no such cap; see `fbw_effective_multiframe_depth`
-    // for the convergence condition.  A value-returning chain (no raise)
-    // inlines to the full depth either way.
+    // that CATCHES is still declined.  Two live copies of the same `w_code`
+    // stay at depth two because a third copy storms
+    // `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408).  A
+    // distinct `shape → mid → leaf` chain is admitted at three so it follows
+    // `perform_call`.  A value-returning chain (no raise) inlines to the full
+    // depth either way.
     // Value-returning recursion still keys only on this callee's own
     // greenkey (`_opimpl_recursive_call`).  The duplicate-w_code bit is
     // only a raising-chain safety valve: it must not promote an unrelated
@@ -6508,17 +6506,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // an MIFrame for every admitted callee.  The replay screen below is only
     // for an unseeded sub-walk, whose guards resume at the caller's CALL
     // boundary and would double a live-heap write.  A seeded frame
-    // (`try_multiframe` / `strict_seed`) carries the callee's own resume
-    // coordinate, which is enough for `DeferredCall` (`mutate_then_raise_caught`
-    // `step`).  A `Dirty` handler-bearing body still abort_trace's under that
-    // seed (`blackhole_inlined_callee_local_after_escape_declined` 0 → 5).
+    // (`try_multiframe` / `strict_seed`, the `perform_call` shape) carries the
+    // callee's own resume coordinate, so the screen does not apply.  The
+    // foriter Dirty flag is the same exemption, but only `fbw_foriter_inflight`
+    // ever sets it; a regular CALL that already owns a seeded frame was still
+    // residualized here (`mutate_then_raise_caught`'s `step`).
     let seeded_inline = try_multiframe || strict_seed;
-    let seeded_deferred =
-        seeded_inline && branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall);
     if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean)
         && !foriter_dirty_seeded_resume_admit
         && !branchy_poison_admit
-        && !seeded_deferred
+        && !seeded_inline
     {
         crate::jitcode_dispatch::census_record(
             if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {
