@@ -10608,6 +10608,113 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
 /// out-of-range index with `PY_NULL`, so `IndexError` and `__index__`
 /// coercion stay in the interpreter; the trailing non-null guard carries that
 /// decline back. Any other shape falls through to the generic residual (SAFE).
+/// `s[start:stop]` via BINARY_SUBSCR of a constant `slice` — the
+/// `descr_getitem` slice arm (`_unicode_sliced`) with step 1.
+fn try_walker_specialize_subscr_str_slice<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq_op: OpRef,
+    slice_op: OpRef,
+    seq_obj: pyre_object::PyObjectRef,
+    slice_obj: pyre_object::PyObjectRef,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !slice_op.is_constant() {
+        return Ok(None);
+    }
+    let start_obj = unsafe { pyre_object::w_slice_get_start(slice_obj) };
+    let stop_obj = unsafe { pyre_object::w_slice_get_stop(slice_obj) };
+    let step_obj = unsafe { pyre_object::w_slice_get_step(slice_obj) };
+    if !unsafe { pyre_object::is_none(step_obj) } {
+        return Ok(None);
+    }
+    let exact_int = |obj: pyre_object::PyObjectRef| -> Option<i64> {
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+            return None;
+        }
+        if obj.is_null()
+            || unsafe {
+                !std::ptr::eq((*obj).ob_type, &pyre_object::INT_TYPE)
+                    || !std::ptr::eq(
+                        (*obj).w_class,
+                        pyre_object::get_instantiate(&pyre_object::INT_TYPE),
+                    )
+            }
+        {
+            None
+        } else {
+            Some(unsafe { pyre_object::w_int_get_value(obj) })
+        }
+    };
+    let start_raw = if unsafe { pyre_object::is_none(start_obj) } {
+        0
+    } else if let Some(v) = exact_int(start_obj) {
+        v
+    } else {
+        return Ok(None);
+    };
+    let stop_raw = if unsafe { pyre_object::is_none(stop_obj) } {
+        i64::MAX
+    } else if let Some(v) = exact_int(stop_obj) {
+        v
+    } else {
+        return Ok(None);
+    };
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let boxed_result = boxed_result_i64 as pyre_object::PyObjectRef;
+    if boxed_result.is_null()
+        || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
+    {
+        return Ok(None);
+    }
+    let helper_result =
+        pyre_object::unicodeobject::jit_str_slice(seq_obj as i64, start_raw, stop_raw);
+    let same = unsafe {
+        pyre_object::is_exact_type(
+            helper_result as pyre_object::PyObjectRef,
+            &pyre_object::STR_TYPE,
+        ) && pyre_object::w_str_get_value_opt(helper_result as pyre_object::PyObjectRef)
+            == pyre_object::w_str_get_value_opt(boxed_result)
+    };
+    if !same {
+        return Ok(None);
+    }
+    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+    walker_guard_class(ctx, op_pc, seq_op, str_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, seq_op, str_typeobj)?;
+    let start_op = ctx.trace_ctx.const_int(start_raw);
+    let stop_op = ctx.trace_ctx.const_int(stop_raw);
+    let helper = pyre_object::unicodeobject::jit_str_slice as *const ();
+    let sliced = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
+        helper,
+        &[seq_op, start_op, stop_op],
+        &[
+            majit_ir::Type::Ref,
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+        ],
+        majit_ir::Type::Ref,
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::ElidableOrMemoryError,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        sliced,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, sliced)?;
+    Ok(Some(()))
+}
+
 fn try_walker_specialize_subscr_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10622,6 +10729,11 @@ fn try_walker_specialize_subscr_str<Sym: WalkSym>(
 ) -> Result<Option<()>, DispatchError> {
     if dst_bank != 'r' {
         return Ok(None);
+    }
+    if unsafe { pyre_object::is_slice(key_obj) } {
+        return try_walker_specialize_subscr_str_slice(
+            ctx, op_pc, seq_op, key_op, seq_obj, key_obj, allboxes, call_descr, dst, dst_bank,
+        );
     }
     // A tagged immediate has no header for the `w_class` and unbox guards to
     // read, and this emit is not tag-aware.
@@ -16507,7 +16619,7 @@ pub(crate) fn try_walker_specialize_convert_value<Sym: WalkSym>(
 /// `_fill_number`.  A sign-interior pad (`format(-42, "05d") == "-0042"`),
 /// a bool, a subclass, or a spec that is not a constant exact `str`
 /// declines (SAFE).
-pub(crate) fn try_walker_specialize_format_with_spec<Sym: WalkSym>(
+pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     r_args: &[OpRef],
@@ -16672,6 +16784,132 @@ pub(crate) fn try_walker_specialize_format_with_spec<Sym: WalkSym>(
     );
     walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
+    Ok(Some(()))
+}
+
+/// BINARY_SLICE of an exact `str` plus exact-int / `None` bounds:
+/// `_unicode_sliced` (`unicodeobject.py descr_getitem` slice arm)
+/// as one elidable cut + residual wrap.  A custom `__index__`,
+/// subclass, or non-str declines (SAFE).
+pub(crate) fn try_walker_specialize_binary_slice_str<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let Some(concrete) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_exact_type(concrete, &pyre_object::STR_TYPE) } {
+        return Ok(None);
+    }
+    let bound_raw = |obj: pyre_object::PyObjectRef, none_default: i64| -> Option<i64> {
+        if obj.is_null() || unsafe { pyre_object::is_none(obj) } {
+            return Some(none_default);
+        }
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+            return None;
+        }
+        let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+        unsafe {
+            if !std::ptr::eq((*obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+                || !std::ptr::eq((*obj).w_class, int_typeobj)
+            {
+                return None;
+            }
+            Some(pyre_object::w_int_get_value(obj))
+        }
+    };
+    let Some(start_obj) = walker_concrete_ref_object(ctx, r_args[1]) else {
+        return Ok(None);
+    };
+    let Some(stop_obj) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        return Ok(None);
+    };
+    let Some(start_raw) = bound_raw(start_obj, 0) else {
+        return Ok(None);
+    };
+    let Some(stop_raw) = bound_raw(stop_obj, i64::MAX) else {
+        return Ok(None);
+    };
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::runtime_ops::binary_slice_values(concrete, start_obj, stop_obj)
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    if boxed_result.is_null()
+        || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
+    {
+        return Ok(None);
+    }
+    let helper_result =
+        pyre_object::unicodeobject::jit_str_slice(concrete as i64, start_raw, stop_raw);
+    let helper_obj = helper_result as pyre_object::PyObjectRef;
+    let same = unsafe {
+        pyre_object::is_exact_type(helper_obj, &pyre_object::STR_TYPE)
+            && pyre_object::w_str_get_value_opt(helper_obj)
+                == pyre_object::w_str_get_value_opt(boxed_result)
+    };
+    if !same {
+        return Ok(None);
+    }
+
+    let seq = r_args[0];
+    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+    walker_guard_class(ctx, op.pc, seq, str_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, seq, str_typeobj)?;
+
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let emit_bound = |ctx: &mut WalkContext<'_, '_, Sym>,
+                      bound_op: OpRef,
+                      bound_obj: pyre_object::PyObjectRef,
+                      raw: i64|
+     -> Result<OpRef, DispatchError> {
+        if unsafe { pyre_object::is_none(bound_obj) } {
+            return Ok(ctx.trace_ctx.const_int(raw));
+        }
+        walker_guard_class(ctx, op.pc, bound_op, int_type_addr)?;
+        walker_guard_exact_w_class(ctx, op.pc, bound_op, int_typeobj)?;
+        walker_unbox_int_typed(
+            ctx,
+            op.pc,
+            bound_op,
+            int_type_addr,
+            crate::descr::int_intval_descr(),
+        )
+    };
+    let start_op = emit_bound(ctx, r_args[1], start_obj, start_raw)?;
+    let stop_op = emit_bound(ctx, r_args[2], stop_obj, stop_raw)?;
+
+    let helper = pyre_object::unicodeobject::jit_str_slice as *const ();
+    let sliced = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
+        helper,
+        &[seq, start_op, stop_op],
+        &[
+            majit_ir::Type::Ref,
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+        ],
+        majit_ir::Type::Ref,
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::ElidableOrMemoryError,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        sliced,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', sliced)?;
     Ok(Some(()))
 }
 

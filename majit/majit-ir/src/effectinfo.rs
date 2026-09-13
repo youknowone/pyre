@@ -1274,6 +1274,11 @@ pub enum RuntimeHelperKind {
     /// an exact `str` `!s` to identity (`unicodeobject.py` `descr_str`).
     /// A bool, subclass, or Python `__str__` / `__repr__` stays residual.
     ConvertValue,
+    /// `bh_binary_slice_fn(obj, start, stop)` — BINARY_SLICE.  The walker
+    /// folds an exact `str` plus exact-int / `None` bounds to
+    /// `_unicode_sliced` (`ll_int2dec` sibling: elidable cut + residual
+    /// wrap).  A custom `__index__`, subclass, or non-str stays residual.
+    BinarySlice,
 }
 
 impl EffectInfo {

@@ -693,8 +693,8 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         // fell back to `malloc_raw`, and `try_gc_owns_object` is false.
         let value_ptr = unicode.base.value;
         if crate::gc_hook::try_gc_owns_object(value_ptr as *mut u8) {
-            let recovered = unsafe { (*value_ptr).clone() };
-            unicode.base.value = crate::lltype::malloc_raw(recovered);
+            let bytes = unsafe { utf8_payload_wtf8(value_ptr).as_bytes() };
+            unicode.base.value = alloc_utf8_payload(bytes, false);
         }
         crate::lltype::malloc_typed(unicode) as PyObjectRef
     } else {
@@ -1440,6 +1440,23 @@ pub extern "C" fn jit_str_rfind_bounds(s: i64, sub: i64, start: i64, end: i64) -
     jit_str_search_bounds(s, sub, start, end, false)
 }
 
+/// `_unicode_sliced` (`unicodeobject.py`) with already-unboxed
+/// code-point bounds and step 1.  The payload cut is `_utf8[start_byte:
+/// end_byte]` after `_index_to_byte`; the wrap is `newutf8`.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_slice(s: i64, start: i64, end: i64) -> i64 {
+    let s = s as PyObjectRef;
+    unsafe {
+        let Some((lo, hi)) = str_byte_window(s, start, end) else {
+            return w_str_new("") as i64;
+        };
+        let hay = w_str_get_wtf8(s).as_bytes();
+        let part = rustpython_wtf8::Wtf8::from_bytes(&hay[lo..hi])
+            .expect("code-point-aligned slice is WTF-8");
+        w_str_from_wtf8_managed(part.to_wtf8_buf()) as i64
+    }
+}
+
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_str_count_bounds(s: i64, sub: i64, start: i64, end: i64) -> i64 {
     let s = s as PyObjectRef;
@@ -1721,6 +1738,10 @@ mod tests {
         );
         assert_eq!(jit_str_count_bounds(hay as i64, needle as i64, 2, 6), 1);
         assert_eq!(jit_str_find_bounds(hay as i64, needle as i64, 2, 6), 5);
+        let sliced = jit_str_slice(hay as i64, 1, 4) as PyObjectRef;
+        unsafe {
+            assert_eq!(w_str_get_value(sliced), "二三四");
+        }
     }
 
     #[test]
