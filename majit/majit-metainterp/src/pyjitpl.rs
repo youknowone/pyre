@@ -7728,7 +7728,9 @@ impl<M: Clone> MetaInterp<M> {
         // Only the materialized cut/legacy path needs TreeLoop snapshots.
         // Uncut byte snapshots already live in the final maps above.
         let mut trace = recorder.get_trace();
-        trace.snapshots = snapshots;
+        if !snapshots.is_empty() {
+            trace.snapshots = snapshots;
+        }
 
         // compile.py:269-270: cut trace at cross-loop merge point.
         // When the trace was retargeted to a different loop header, record
@@ -7925,10 +7927,10 @@ impl<M: Clone> MetaInterp<M> {
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
         let (
             mut snapshot_map,
-            snapshot_frame_size_map,
+            mut snapshot_frame_size_map,
             mut snapshot_vable_map,
             mut snapshot_vref_map,
-            snapshot_frame_pcs,
+            mut snapshot_frame_pcs,
         ) = byte_snapshot_maps.unwrap_or_else(|| {
             snapshot_map_from_trace_snapshots(
                 &trace_snapshots,
@@ -7940,37 +7942,18 @@ impl<M: Clone> MetaInterp<M> {
         // intrinsic attribute on the Box itself, so no raw-u32 type
         // side-table propagation is needed; callers recover the type
         // through `OpRef::ty()` / `Const::get_type()`.
-        // Phase 1's copy of the snapshot banks. The originals stay owned here
-        // because the `InvalidLoop` arm below moves them into the unroll-free
-        // optimizer, so this is a second set, one snapshot-box list per
-        // recorded guard. A trace that records guards in the thousands makes
-        // that the largest single allocation of the compile, and the arm that
-        // never peels never reads it.
+        // compile.py keeps one opencoder buffer; the InvalidLoop retry
+        // takes these maps back rather than cloning a second adapter.
         if !no_unroll {
-            unroll_opt.snapshot_boxes = snapshot_map.clone();
-            unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
-            unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
-            unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
-            unroll_opt.snapshot_frame_pcs = snapshot_frame_pcs.clone();
+            unroll_opt.snapshot_boxes = std::mem::take(&mut snapshot_map);
+            unroll_opt.snapshot_frame_sizes = std::mem::take(&mut snapshot_frame_size_map);
+            unroll_opt.snapshot_vable_boxes = std::mem::take(&mut snapshot_vable_map);
+            unroll_opt.snapshot_vref_boxes = std::mem::take(&mut snapshot_vref_map);
+            unroll_opt.snapshot_frame_pcs = std::mem::take(&mut snapshot_frame_pcs);
         }
-        // The original snapshot maps are re-cloned into `simple_opt` on the
-        // InvalidLoop retry below, so they must stay rooted across the WHOLE
-        // unroll. Each phase's `replace_compile_snapshot_roots` overwrites the
-        // root list, so register the originals as the persistent base (prepended
-        // to every phase's slots) rather than only up front — otherwise a moving
-        // GC after the first phase replace leaves them with stale pre-move
-        // gcrefs. `snapshot_frame_sizes` / `snapshot_frame_pcs` hold no gcrefs.
-        unroll_opt.persistent_snapshot_root_slots = collect_snapshot_const_ptr_slots(&mut [
-            &mut snapshot_map,
-            &mut snapshot_vable_map,
-            &mut snapshot_vref_map,
-        ]);
-        // Until the first phase replace, also root unroll_opt's own clones (the
-        // phase-1 source) alongside the persistent originals. Where there is no
-        // phase 1 those clones were never taken, and naming empty banks here
-        // would root nothing; the originals still are, which is what the arm
-        // that moves them into the unroll-free optimizer needs.
-        self.compile_snapshot_refs = if no_unroll {
+        // One live copy of the snapshot banks (on `unroll_opt` when peeling,
+        // otherwise the locals). RPython has only the opencoder buffer.
+        unroll_opt.persistent_snapshot_root_slots = if no_unroll {
             collect_snapshot_const_ptr_slots(&mut [
                 &mut snapshot_map,
                 &mut snapshot_vable_map,
@@ -7981,11 +7964,9 @@ impl<M: Clone> MetaInterp<M> {
                 &mut unroll_opt.snapshot_boxes,
                 &mut unroll_opt.snapshot_vable_boxes,
                 &mut unroll_opt.snapshot_vref_boxes,
-                &mut snapshot_map,
-                &mut snapshot_vable_map,
-                &mut snapshot_vref_map,
             ])
         };
+        self.compile_snapshot_refs = unroll_opt.persistent_snapshot_root_slots.clone();
 
         // RPython compile.py:278-294 parity: Phase 1 results must survive
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
@@ -8076,6 +8057,15 @@ impl<M: Clone> MetaInterp<M> {
                         // across `run_optimize_from_inputs` (which can move the GC
                         // via constant_fold_alloc). The originals are not read
                         // past this point.
+                        if !no_unroll {
+                            snapshot_map = std::mem::take(&mut unroll_opt.snapshot_boxes);
+                            snapshot_frame_size_map =
+                                std::mem::take(&mut unroll_opt.snapshot_frame_sizes);
+                            snapshot_vable_map =
+                                std::mem::take(&mut unroll_opt.snapshot_vable_boxes);
+                            snapshot_vref_map = std::mem::take(&mut unroll_opt.snapshot_vref_boxes);
+                            snapshot_frame_pcs = std::mem::take(&mut unroll_opt.snapshot_frame_pcs);
+                        }
                         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
                             &mut snapshot_map,
                             &mut snapshot_vable_map,
