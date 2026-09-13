@@ -793,7 +793,7 @@ pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
 /// else forwards a value the trace holds.
 #[inline]
 #[must_use = "a top root may have moved; use the reloaded live word"]
-#[majit_macros::dont_look_inside]
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn reload_top_root(root: PyObjectRef) -> PyObjectRef {
     let _ = root;
     majit_gc::shadow_stack::top_ref().0 as PyObjectRef
@@ -803,7 +803,9 @@ pub fn reload_top_root(root: PyObjectRef) -> PyObjectRef {
 ///
 /// A residual with a `Ref` result lowers to a direct `call_indirect` typed
 /// `(i64) -> i64`; `PyObjectRef` is `i32` on wasm32, where the call
-/// type-checks its callee.
+/// type-checks its callee. Same exception effect as [`reload_top_root`]:
+/// the body only reads the shadow-stack top.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn reload_top_root_jit_abi(root: i64) -> i64 {
     reload_top_root(root as PyObjectRef) as i64
 }
