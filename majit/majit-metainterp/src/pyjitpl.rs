@@ -15048,6 +15048,22 @@ impl<M: Clone> MetaInterp<M> {
         // RPython unroll.py: Optimizer.optimize_bridge()
         // compile.py: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
+        // A Grain inner-`for` exhaust JUMP onto the outer loop is the
+        // orthodox close (`compile.py` compile_trace JUMP). The dest
+        // LABEL's virtual state is the outer range; the recorded JUMP
+        // still carries the inner leftovers, so both the specialized
+        // short-preamble match and `jump_to_preamble` publish a close
+        // that marks the next primes composite. Decline until the
+        // JUMP args are the dest inputargs (`unroll.py:196-200`).
+        if cell_token_key != green_key && self.second_portal_red_is_grain_vm() {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] compile_bridge: decline Grain cross-loop close \
+                     origin={green_key} dest={cell_token_key}"
+                );
+            }
+            return false;
+        }
         // RPython warmspot.py:93 retrace_limit=5: allow bridge to create
         // new target_token specializations when existing body token doesn't
         // match. Without this, bridges fall back to preamble (causing
@@ -15321,6 +15337,14 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             None
         };
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] compile_bridge origin={green_key} dest={jump_target_key} \
+                 cell={cell_token_key} crossed={} dest_n={}",
+                crossed_target_tokens.is_some(),
+                crossed_target_tokens.as_ref().map(|t| t.len()).unwrap_or(0),
+            );
+        }
         // compile.py compile_trace: ends_with_jump selects BridgeCompileData
         // (UnrollOptimizer.optimize_bridge) vs SimpleCompileData
         // (Optimizer.optimize_loop). A DoneWithThisFrame FINISH has no JUMP
