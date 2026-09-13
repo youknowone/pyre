@@ -598,6 +598,11 @@ mod gateway_cache_tests {
             found |= *slot == function;
         });
         assert!(found, "non-global space caches are GC roots too");
+        drop(cache);
+        assert!(
+            weak.upgrade().is_none(),
+            "stored fromcache must not cycle the isolated space"
+        );
     }
 }
 

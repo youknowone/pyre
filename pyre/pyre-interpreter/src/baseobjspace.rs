@@ -472,12 +472,71 @@ pub enum SpaceCacheClass {
     SysState,
 }
 
+/// A `fromcache` value plus the IsolatedStrong that keeps an isolated
+/// space alive. InternalSpaceCache stores Isolated(Weak); `fromcache`
+/// upgrades only this wrapper so `ObjSpace → cache → ObjSpace` cannot cycle.
+pub struct RetainedSpaceCache<T> {
+    #[allow(dead_code)]
+    keep_alive: SpaceHandle,
+    inner: std::sync::Arc<T>,
+}
+
+impl<T> Clone for RetainedSpaceCache<T> {
+    fn clone(&self) -> Self {
+        Self {
+            keep_alive: self.keep_alive.clone(),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> RetainedSpaceCache<T> {
+    fn stored(space: SpaceHandle, inner: std::sync::Arc<T>) -> Self {
+        Self {
+            keep_alive: space,
+            inner,
+        }
+    }
+
+    fn retain_owner(self) -> Self {
+        Self {
+            keep_alive: self.keep_alive.retain(),
+            inner: self.inner,
+        }
+    }
+
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&this.inner, &other.inner)
+    }
+}
+
+impl<T> std::ops::Deref for RetainedSpaceCache<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
 #[derive(Clone)]
 pub enum SpaceCacheInstance {
-    GatewayCache(std::sync::Arc<crate::gateway::GatewayCache>),
-    TypeCache(std::sync::Arc<crate::objspace::std::typeobject::TypeCache>),
-    ClassDictStrategy(std::sync::Arc<crate::objspace::std::classdict::ClassDictStrategy>),
-    SysState(std::sync::Arc<crate::module::sys::state::SysState>),
+    GatewayCache(RetainedSpaceCache<crate::gateway::GatewayCache>),
+    TypeCache(RetainedSpaceCache<crate::objspace::std::typeobject::TypeCache>),
+    ClassDictStrategy(RetainedSpaceCache<crate::objspace::std::classdict::ClassDictStrategy>),
+    SysState(RetainedSpaceCache<crate::module::sys::state::SysState>),
+}
+
+impl SpaceCacheInstance {
+    /// Attach IsolatedStrong to a cloned cache so an escaped result keeps
+    /// its isolated space alive. The stored clone is left untouched.
+    fn retain_owner(self) -> Self {
+        match self {
+            Self::GatewayCache(cache) => Self::GatewayCache(cache.retain_owner()),
+            Self::TypeCache(cache) => Self::TypeCache(cache.retain_owner()),
+            Self::ClassDictStrategy(cache) => Self::ClassDictStrategy(cache.retain_owner()),
+            Self::SysState(cache) => Self::SysState(cache.retain_owner()),
+        }
+    }
 }
 
 /// Process-wide prebuilt space, or an isolated test space.
@@ -544,19 +603,30 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
         &self,
         space: &SpaceHandle,
     ) -> Result<Self::Value, majit_rlib::cache::CacheError<Self::Error>> {
-        let space = space.retain();
+        // Store Isolated(Weak). IsolatedStrong is attached only to the
+        // clone `fromcache` returns (`SpaceCacheInstance::retain_owner`).
         Ok(match self {
-            Self::TypeCache => SpaceCacheInstance::TypeCache(std::sync::Arc::new(
-                crate::objspace::std::typeobject::TypeCache::new(space.clone()),
+            Self::TypeCache => SpaceCacheInstance::TypeCache(RetainedSpaceCache::stored(
+                space.clone(),
+                std::sync::Arc::new(crate::objspace::std::typeobject::TypeCache::new(
+                    space.clone(),
+                )),
             )),
-            Self::GatewayCache => SpaceCacheInstance::GatewayCache(std::sync::Arc::new(
-                crate::gateway::GatewayCache::new(space.clone()),
+            Self::GatewayCache => SpaceCacheInstance::GatewayCache(RetainedSpaceCache::stored(
+                space.clone(),
+                std::sync::Arc::new(crate::gateway::GatewayCache::new(space.clone())),
             )),
-            Self::ClassDictStrategy => SpaceCacheInstance::ClassDictStrategy(std::sync::Arc::new(
-                crate::objspace::std::classdict::ClassDictStrategy::new(space.clone()),
-            )),
-            Self::SysState => SpaceCacheInstance::SysState(std::sync::Arc::new(
-                crate::module::sys::state::SysState::new(),
+            Self::ClassDictStrategy => {
+                SpaceCacheInstance::ClassDictStrategy(RetainedSpaceCache::stored(
+                    space.clone(),
+                    std::sync::Arc::new(crate::objspace::std::classdict::ClassDictStrategy::new(
+                        space.clone(),
+                    )),
+                ))
+            }
+            Self::SysState => SpaceCacheInstance::SysState(RetainedSpaceCache::stored(
+                space.clone(),
+                std::sync::Arc::new(crate::module::sys::state::SysState::new()),
             )),
         })
     }
@@ -609,6 +679,7 @@ impl ObjSpace {
         self.fromcache
             .getorbuild(cls)
             .unwrap_or_else(|_| panic!("recursive object-space cache construction"))
+            .retain_owner()
     }
 
     pub fn walk_cache_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {

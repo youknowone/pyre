@@ -322,13 +322,17 @@ mod tests {
         else {
             panic!("expected ClassDictStrategy");
         };
-        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        assert!(crate::baseobjspace::RetainedSpaceCache::ptr_eq(
+            &first, &again
+        ));
         let SpaceCacheInstance::ClassDictStrategy(other) =
             b.fromcache(SpaceCacheClass::ClassDictStrategy)
         else {
             panic!("expected ClassDictStrategy");
         };
-        assert!(!std::sync::Arc::ptr_eq(&first, &other));
+        assert!(!crate::baseobjspace::RetainedSpaceCache::ptr_eq(
+            &first, &other
+        ));
     }
 
     #[test]
