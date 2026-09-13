@@ -17242,8 +17242,12 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
 
 /// Runtime residual for [`try_walker_specialize_import_cached`].
 ///
-/// Re-runs `dunder_import` at level 0 with an empty fromlist so a replaced
-/// `sys.modules` entry is visible; the caller `GuardValue`s the result.
+/// Reads the current `sys.modules` entry and nothing else.  A miss or a
+/// replaced module returns a different pointer than the record-time
+/// `GuardValue`, so the original `IMPORT_NAME` runs the importer once.
+/// Running `dunder_import` here would execute a finder on a miss, then
+/// swallow the error as null and let the result guard retry the same
+/// import.
 extern "C" fn jit_import_cached(name: i64) -> i64 {
     let w_name = name as pyre_object::PyObjectRef;
     if w_name.is_null() {
@@ -17252,17 +17256,9 @@ extern "C" fn jit_import_cached(name: i64) -> i64 {
     let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return 0;
     };
-    let exec = pyre_interpreter::call::getexecutioncontext();
-    match pyre_interpreter::importing::dunder_import(
-        s,
-        pyre_object::w_none(),
-        pyre_object::w_none(),
-        pyre_object::w_none(),
-        0,
-        exec,
-    ) {
-        Ok(module) => module as i64,
-        Err(_) => 0,
+    match pyre_interpreter::importing::get_sys_module(s) {
+        Some(module) => module as i64,
+        None => 0,
     }
 }
 
@@ -17273,8 +17269,9 @@ extern "C" fn jit_import_cached(name: i64) -> i64 {
 /// PyPy's `test_import.test_import_in_function` wants the IMPORT_NAME region
 /// to be `guard_not_invalidated` only.  Look-inside of the generated
 /// `__import__` wrapper is still refused (un-lowered helpers in the body), so
-/// the walker records `jit_import_cached` and `GuardValue`s the module
-/// observed at record time.  A replaced `sys.modules` entry side-exits.
+/// the walker records an impure `jit_import_cached` `sys.modules` read
+/// and `GuardValue`s the module observed at record time.  A replaced or
+/// deleted entry side-exits to the original `IMPORT_NAME`.
 ///
 /// A non-empty fromlist is accepted only when the cached module is not a
 /// package (`__path__` missing), matching `interp___import__`.  Relative
@@ -17409,18 +17406,16 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[level_raw, zero])?;
 
     let helper = jit_import_cached as *const ();
-    let result = ctx.trace_ctx.call_typed_with_effect_pure(
+    // Impure `CallR`: `sys.modules` is mutable, so an elidable / `CallPureR`
+    // rewrite would fold the entry observed while tracing.  The helper
+    // only reads the dict and cannot raise.
+    let result = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
         helper,
         &[name_op],
         &[majit_ir::Type::Ref],
         majit_ir::Type::Ref,
         majit_metainterp::cannot_raise_effect_info(),
-        &[
-            majit_ir::Value::Int(helper as usize as i64),
-            majit_ir::Value::Ref(majit_ir::GcRef(w_name as usize)),
-        ],
-        majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
     );
     ctx.trace_ctx.set_opref_concrete(
         result,
