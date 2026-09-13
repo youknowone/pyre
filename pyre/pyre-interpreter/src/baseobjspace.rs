@@ -567,6 +567,8 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
 /// static (`OBJECT_SPACE`); isolated test spaces keep an `Arc`.
 pub struct ObjSpace {
     fromcache: InternalSpaceCache<SpaceCacheClass, SpaceHandle>,
+    sys_state: crate::module::sys::state::SysState,
+    class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy,
 }
 
 impl ObjSpace {
@@ -575,11 +577,27 @@ impl ObjSpace {
             space: SpaceHandle::ProcessWide,
             base: majit_rlib::cache::Cache::EMPTY,
         },
+        sys_state: crate::module::sys::state::SysState::new(),
+        class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(
+            SpaceHandle::ProcessWide,
+        ),
     };
+
+    pub fn sys_state(&self) -> &crate::module::sys::state::SysState {
+        &self.sys_state
+    }
+
+    pub fn class_dict_strategy(&self) -> &crate::objspace::std::classdict::ClassDictStrategy {
+        &self.class_dict_strategy
+    }
 
     pub fn new() -> std::sync::Arc<Self> {
         let space = std::sync::Arc::new_cyclic(|space| Self {
             fromcache: InternalSpaceCache::new(SpaceHandle::Isolated(space.clone())),
+            sys_state: crate::module::sys::state::SysState::new(),
+            class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(
+                SpaceHandle::Isolated(space.clone()),
+            ),
         });
         OBJECT_SPACE_ROOTS
             .lock()
@@ -19646,7 +19664,11 @@ pub(crate) unsafe fn generator_frame_is_finished(
         // replace a delegate's true one before `descr_close` reads it, and the
         // object whose last reference was a delegate local would not run
         // `__del__` before `close()` returned.
-        PENDING_CLOSE_FINALIZER.with(|slot| slot.set(slot.get() || released_graph_has_finalizer));
+        let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+        if !ec.is_null() {
+            let slot = unsafe { &(*ec).pending_close_finalizer };
+            slot.set(slot.get() || released_graph_has_finalizer);
+        }
     }
 }
 
@@ -19659,12 +19681,12 @@ pub(crate) unsafe fn generator_frame_is_finished(
 /// teardown: `_invoke_execute_frame`'s `finally` has not restored the
 /// execution context yet and the frame it is unwinding is still reachable from
 /// native locals the collector does not root.
-thread_local! {
-    static PENDING_CLOSE_FINALIZER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 pub(crate) fn take_pending_close_finalizer() -> bool {
-    PENDING_CLOSE_FINALIZER.with(|slot| slot.replace(false))
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        return false;
+    }
+    unsafe { (*ec).pending_close_finalizer.replace(false) }
 }
 
 /// CPython 3.14 `gen_close` / `_PyFrame_ClearExceptCode`: releasing the

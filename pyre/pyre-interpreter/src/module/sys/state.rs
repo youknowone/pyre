@@ -50,7 +50,7 @@ pub struct SysState {
 }
 
 impl SysState {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             int_max_str_digits: AtomicI32::new(DEFAULT_MAX_STR_DIGITS),
         }
@@ -59,14 +59,9 @@ impl SysState {
     pub fn walk_roots(&self, _forward: &mut dyn FnMut(&mut pyre_object::PyObjectRef)) {}
 }
 
-/// `state.py get(space)` → `space.fromcache(State)`.
-fn sys_state() -> std::sync::Arc<SysState> {
-    match crate::baseobjspace::object_space()
-        .fromcache(crate::baseobjspace::SpaceCacheClass::SysState)
-    {
-        crate::baseobjspace::SpaceCacheInstance::SysState(state) => state,
-        _ => unreachable!("SpaceCacheClass::SysState builds SysState"),
-    }
+/// `state.py get(space)` → the prebuilt space's State field.
+fn sys_state() -> &'static SysState {
+    crate::baseobjspace::object_space().sys_state()
 }
 
 /// `space.sys.recursionlimit` getter. Matches

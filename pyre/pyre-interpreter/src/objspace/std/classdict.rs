@@ -14,11 +14,21 @@ use rustpython_wtf8::Wtf8;
 pub struct ClassDictStrategy {
     #[allow(dead_code)]
     space: crate::baseobjspace::SpaceHandle,
+    /// The holder `W_DictObject.dstrategy` points at. A field of the
+    /// fromcache / prebuilt-space instance, not a naked module-static read.
+    strategy_ref: &'static DictStrategyRef,
 }
 
 impl ClassDictStrategy {
-    pub fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
-        Self { space }
+    pub const fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
+        Self {
+            space,
+            strategy_ref: &CLASS_DICT_STRATEGY_REF,
+        }
+    }
+
+    pub fn strategy_ref(&self) -> &'static DictStrategyRef {
+        self.strategy_ref
     }
 
     pub fn walk_roots(&self, _forward: &mut dyn FnMut(&mut PyObjectRef)) {}
@@ -284,12 +294,10 @@ unsafe fn type_deldictvalue_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Result<boo
 /// `W_DictObject(space, strategy, strategy.erase(self))`.
 pub fn class_dict_for_type(w_type: PyObjectRef) -> PyObjectRef {
     let space = crate::baseobjspace::object_space();
-    let SpaceCacheInstance::ClassDictStrategy(_) =
-        space.fromcache(SpaceCacheClass::ClassDictStrategy)
-    else {
-        unreachable!()
-    };
-    pyre_object::w_dict_new_with(&CLASS_DICT_STRATEGY_REF, w_type as *mut u8)
+    pyre_object::w_dict_new_with(
+        space.class_dict_strategy().strategy_ref(),
+        w_type as *mut u8,
+    )
 }
 
 #[cfg(test)]

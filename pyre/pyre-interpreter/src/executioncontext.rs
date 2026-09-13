@@ -1,5 +1,6 @@
 use pyre_object::PyObjectRef;
 use pyre_object::quasiimmut::QuasiImmutField;
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31,6 +32,10 @@ pub fn register_force_frame_hook(f: ForceFrameFn) {
 /// JIT keeps virtual, and forcing there escapes the traced virtualizable for
 /// every frame-walking helper — `pyjitpl.vable_after_residual_call` then
 /// aborts the whole trace with `ABORT_ESCAPE`.
+///
+/// Residual by policy: upstream `hook_access_field` rewrites the field
+/// access at translation time. The 17 `force_frame` subjects stay residual
+/// until the front emits `jit_force_virtualizable` at those sites.
 #[inline]
 pub fn force_frame(frame: *mut PyFrame) {
     let p = FORCE_FRAME_HOOK.load(Ordering::Acquire);
@@ -618,6 +623,13 @@ pub struct ExecutionContext {
     /// Recursive `__repr__` (e.g. `OrderedDict`) consults it to emit `...`
     /// instead of recursing.  Execution-context-owned like `contextvar_context`.
     pub py_repr: PyObjectRef,
+    /// Mid-repr object set for `Py_ReprEnter` / the display cycle guard.
+    /// Upstream keeps this on the execution context (`objspace.py
+    /// get_objects_in_repr` / `cpyext Py_ReprEnter`), not a thread-local.
+    pub repr_active: RefCell<Vec<PyObjectRef>>,
+    /// Frame-close census for `__del__` before the next opcode. Owned by
+    /// the execution context that is finishing the generator, not TLS.
+    pub pending_close_finalizer: Cell<bool>,
     /// Number of user Python frames currently executing bytecode on this
     /// context.  Bumped once at every `eval_loop` / `eval_loop_jit` entry and
     /// dropped when that activation returns, so the module-level frame, an
@@ -766,6 +778,8 @@ impl ExecutionContext {
             w_asyncgen_finalizer_fn: pyre_object::PY_NULL,
             contextvar_context: pyre_object::PY_NULL,
             py_repr: pyre_object::PY_NULL,
+            repr_active: RefCell::new(Vec::new()),
+            pending_close_finalizer: Cell::new(false),
             py_recursion_depth: 0,
             accounted_activation: 0,
         }
@@ -813,6 +827,8 @@ impl ExecutionContext {
         ec.w_asyncgen_finalizer_fn = pyre_object::PY_NULL;
         ec.contextvar_context = pyre_object::PY_NULL;
         ec.py_repr = pyre_object::PY_NULL;
+        ec.repr_active = RefCell::new(Vec::new());
+        ec.pending_close_finalizer = Cell::new(false);
         ec
     }
 
@@ -833,6 +849,9 @@ impl ExecutionContext {
             &mut *(&mut self.contextvar_context as *mut PyObjectRef as *mut majit_ir::GcRef)
         });
         visitor(unsafe { &mut *(&mut self.py_repr as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        for entry in self.repr_active.get_mut().iter_mut() {
+            visitor(unsafe { &mut *(entry as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        }
         if let Some(pending) = self.pending_loop_exit.as_mut() {
             match pending {
                 PendingLoopExit::Done(Ok(value)) => {

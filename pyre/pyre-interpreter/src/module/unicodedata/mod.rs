@@ -32,11 +32,13 @@ pub(crate) fn character_name(ch: char) -> Option<String> {
 type PyResult = Result<PyObjectRef, PyError>;
 
 /// `interp_ucd.py UCD._unicodedb` — the view is a field of the UCD
-/// instance, not a module-level const the translator would load as a
-/// residual global.  `legacy` is `W_UCD.legacy`; module callables pass
-/// `false` (latest tables).
+/// instance, not a constructor the translator would residualize.
+/// `legacy` is `W_UCD.legacy`; module callables pass `false` (latest tables).
+const UCD_MODERN: ucd_core::Ucd = ucd_core::Ucd::new(true);
+const UCD_LEGACY: ucd_core::Ucd = ucd_core::Ucd::new(false);
+
 fn ucd(legacy: bool) -> ucd_core::Ucd {
-    ucd_core::Ucd::new(!legacy)
+    if legacy { UCD_LEGACY } else { UCD_MODERN }
 }
 
 /// Extract the single-code-point argument of a character function.

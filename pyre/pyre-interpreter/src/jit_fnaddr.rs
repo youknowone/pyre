@@ -2294,7 +2294,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `OnceLock` the `_io` module init stamps with its module-local
     // `UnsupportedOperation` class, `eval::current_frame` the `CURRENT_FRAME`
     // thread-local `install_current_frame` moves, the two `display::repr_*`
-    // twins the `REPR_ACTIVE` mid-repr set (the
+    // twins the execution-context mid-repr set (the
     // `note_eval_activation_{enter,exit}` twin shape), and `autoflusher_add`
     // the process-global `AUTOFLUSHER` handle table owned by the object space.
     let unsupported_operation_type: fn() -> pyre_object::PyObjectRef =

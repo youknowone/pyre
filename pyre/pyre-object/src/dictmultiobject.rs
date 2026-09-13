@@ -6558,6 +6558,7 @@ pub struct DictStrategyRef {
 /// dict never uses a holder anyway: its strategy lives behind
 /// `W_ModuleDictObject.mstrategy`.
 unsafe impl Sync for DictStrategyRef {}
+unsafe impl Send for DictStrategyRef {}
 
 impl std::ops::Deref for DictStrategyRef {
     type Target = dyn crate::dictmultiobject::DictStrategy;

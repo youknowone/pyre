@@ -303,72 +303,41 @@ pub(crate) fn bytes_repr_string(data: &[u8]) -> String {
     out
 }
 
-thread_local! {
-    /// Object pointers currently mid-`py_repr` on this thread.  Guards the
-    /// recursive container branches against unbounded recursion on a
-    /// reference cycle (a list holding itself, a dict valued by itself).
-    /// Mirrors the per-thread reprlist behind `Py_ReprEnter`/`Py_ReprLeave`.
-    /// Entries are the objects themselves, not their addresses: the guarded
-    /// container is a list or a dict on every interesting path, and both move.
-    /// `walk_repr_active_area` is registered per mutator so the collector
-    /// forwards these slots — a raw address recorded here would stop matching
-    /// its own object after the first collection, and the cycle would recurse
-    /// unbounded instead of emitting the `...` placeholder.
-    static REPR_ACTIVE: std::cell::RefCell<Vec<PyObjectRef>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// This thread's mid-repr set, for `register_mutator_extra_area`.
-pub fn capture_repr_active_area() -> *const () {
-    REPR_ACTIVE.with(|active| active as *const _ as *const ())
-}
-
-/// Forward the mid-repr set of the mutator that owns `data`.
-///
-/// # Safety
-/// `data` must be a pointer returned by [`capture_repr_active_area`] on a
-/// thread that is still registered.
-pub unsafe fn walk_repr_active_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut pyre_object::PyObjectRef),
-) {
-    let active = unsafe { &*(data as *const std::cell::RefCell<Vec<PyObjectRef>>) };
-    // A collection can be entered from inside `repr_enter`/`repr_leave`, which
-    // hold the borrow.  Skipping the walk then would drop the forwarding, so
-    // take the pointer to the buffer instead of a second borrow.
-    let entries = unsafe { &mut *active.as_ptr() };
-    for entry in entries.iter_mut() {
-        visitor(entry);
+fn repr_active() -> Option<&'static std::cell::RefCell<Vec<PyObjectRef>>> {
+    let ec = crate::call::getexecutioncontext();
+    if ec.is_null() {
+        return None;
     }
+    Some(unsafe { &(*ec).repr_active })
 }
 
-/// Record `obj` as mid-repr on this thread, or report `false` when it already
-/// is (`Py_ReprEnter`).  Writes the runtime-mutable `REPR_ACTIVE` thread-local,
-/// not a build-time constant, so the JIT residualises the call instead of
-/// tracing into it (`@dont_look_inside`, the `eval::set_in_flight_exception`
-/// shape), the [`repr_leave`] twin.
+/// Record `obj` as mid-repr on this execution context, or report `false`
+/// when it already is (`Py_ReprEnter`).  The set lives on the EC
+/// (`objspace.py get_objects_in_repr` / `cpyext Py_ReprEnter`).
 #[majit_macros::dont_look_inside]
 pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
-    REPR_ACTIVE.with(|active| {
-        let mut active = active.borrow_mut();
-        if active.contains(&obj) {
-            false
-        } else {
-            active.push(obj);
-            true
-        }
-    })
+    let Some(active) = repr_active() else {
+        return true;
+    };
+    let mut active = active.borrow_mut();
+    if active.contains(&obj) {
+        false
+    } else {
+        active.push(obj);
+        true
+    }
 }
 
 /// Drop `obj` from the mid-repr set (`Py_ReprLeave`) — see [`repr_enter`].
 #[majit_macros::dont_look_inside]
 pub(crate) fn repr_leave(obj: PyObjectRef) {
-    REPR_ACTIVE.with(|active| {
-        let mut active = active.borrow_mut();
-        if let Some(pos) = active.iter().rposition(|&entry| entry == obj) {
-            active.remove(pos);
-        }
-    });
+    let Some(active) = repr_active() else {
+        return;
+    };
+    let mut active = active.borrow_mut();
+    if let Some(pos) = active.iter().rposition(|&entry| entry == obj) {
+        active.remove(pos);
+    }
 }
 
 /// Drop the entry `repr_enter` pushed at `index` — see [`repr_leave`].
@@ -377,12 +346,13 @@ pub(crate) fn repr_leave(obj: PyObjectRef) {
 /// the object is a Rust local the collector does not update, so matching on it
 /// would miss a forwarded entry and leave the set holding a finished repr.
 fn repr_leave_at(index: usize) {
-    REPR_ACTIVE.with(|active| {
-        let mut active = active.borrow_mut();
-        if index < active.len() {
-            active.remove(index);
-        }
-    });
+    let Some(active) = repr_active() else {
+        return;
+    };
+    let mut active = active.borrow_mut();
+    if index < active.len() {
+        active.remove(index);
+    }
 }
 
 /// RAII cycle guard.  `enter` returns `None` when `obj` is already being
@@ -392,7 +362,13 @@ pub(crate) struct ReprGuard(usize);
 
 impl ReprGuard {
     pub(crate) fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
-        repr_enter(obj).then(|| ReprGuard(REPR_ACTIVE.with(|active| active.borrow().len() - 1)))
+        repr_enter(obj).then(|| {
+            ReprGuard(
+                repr_active()
+                    .map(|active| active.borrow().len() - 1)
+                    .unwrap_or(0),
+            )
+        })
     }
 }
 
