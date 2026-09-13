@@ -4808,13 +4808,17 @@ impl<M: Clone> MetaInterp<M> {
         // token-none precondition.  The blackhole helper implements the same
         // two force_now arms and reaches the host's ResumeGuardForcedDescr
         // force hook for an Active token.
-        let mut virtualizable_ptr = if !self.vable_ptr.is_null() {
-            self.vable_ptr as *mut u8
-        } else {
-            match original_boxes.get(index) {
-                Some(Value::Ref(r)) => r.as_usize() as *mut u8,
-                Some(Value::Int(v)) => *v as *mut u8,
-                _ => std::ptr::null_mut(),
+        // `virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)`.
+        // `vable_ptr` is only the state-field identity when the red at
+        // `index` is not the frame pointer.
+        let mut virtualizable_ptr = {
+            let unwrapped = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(
+                original_boxes.get(index).copied(),
+            );
+            if !unwrapped.is_null() {
+                unwrapped as *mut u8
+            } else {
+                self.vable_ptr as *mut u8
             }
         };
         if !virtualizable_ptr.is_null() {

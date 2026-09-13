@@ -24,9 +24,10 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 /// residual force marker from looked-inside graphs. The compiled interpreter
 /// retains that marker at the gateway, so residual execution forces while the
 /// generated JIT path does not.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct VirtualizableInstanceRepr {
     pub top_of_virtualizable_hierarchy: bool,
+    pub accessor: crate::translator::rtyper::rclass::FieldListAccessor,
     pub my_redirected_fields: HashMap<String, bool>,
 }
 
@@ -34,7 +35,33 @@ impl VirtualizableInstanceRepr {
     pub fn new(top_of_virtualizable_hierarchy: bool) -> Self {
         VirtualizableInstanceRepr {
             top_of_virtualizable_hierarchy,
+            accessor: crate::translator::rtyper::rclass::FieldListAccessor::default(),
             my_redirected_fields: HashMap::new(),
+        }
+    }
+
+    /// `VirtualizableInstanceRepr.__init__` after `InstanceRepr.__init__`.
+    pub fn from_classdesc(
+        classdesc: &crate::annotator::classdesc::ClassDesc,
+    ) -> Result<Self, crate::translator::rtyper::error::TyperError> {
+        if const_truthy(&classdesc.get_param("_virtualizable2_", None, true)) {
+            return Err(crate::translator::rtyper::error::TyperError::message(
+                "_virtualizable2_ is now called _virtualizable_, please rename".to_string(),
+            ));
+        }
+        let own = classdesc.get_param("_virtualizable_", None, false);
+        if const_truthy(&own) {
+            let basedesc = classdesc.basedesc.clone();
+            if let Some(base) = basedesc {
+                let base_param = base.borrow().get_param("_virtualizable_", None, true);
+                assert!(
+                    !const_truthy(&base_param),
+                    "basedesc must not declare _virtualizable_"
+                );
+            }
+            Ok(Self::new(true))
+        } else {
+            Ok(Self::new(false))
         }
     }
 
@@ -54,6 +81,14 @@ impl VirtualizableInstanceRepr {
             .copied()
             .unwrap_or(false)
     }
+}
+
+fn const_truthy(value: &ConstValue) -> bool {
+    !matches!(value, ConstValue::None | ConstValue::Bool(false))
+        && !matches!(value, ConstValue::List(items) if items.is_empty())
+        && !matches!(value, ConstValue::Tuple(items) if items.is_empty())
+        && !matches!(value, ConstValue::ByteStr(text) if text.is_empty())
+        && !matches!(value, ConstValue::UniStr(text) if text.is_empty())
 }
 
 /// RPython `replace_force_virtualizable_with_call(graphs, VTYPEPTR,

@@ -408,6 +408,33 @@ impl Flavor {
     }
 }
 
+fn hlvalue_byte_str(value: &Hlvalue) -> Option<String> {
+    let Hlvalue::Constant(c) = value else {
+        return None;
+    };
+    match &c.value {
+        ConstValue::ByteStr(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        ConstValue::UniStr(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn const_value_field_names(value: &ConstValue) -> Vec<String> {
+    match value {
+        ConstValue::List(items) | ConstValue::Tuple(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                ConstValue::ByteStr(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+                ConstValue::UniStr(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect(),
+        ConstValue::ByteStr(bytes) => vec![String::from_utf8_lossy(bytes).into_owned()],
+        ConstValue::UniStr(text) => vec![text.clone()],
+        _ => Vec::new(),
+    }
+}
+
 fn const_truthy(value: &ConstValue) -> bool {
     match value {
         ConstValue::None => false,
@@ -2326,6 +2353,9 @@ pub struct InstanceRepr {
     iprebuiltinstances: RefCell<HashMap<HostObject, _ptr>>,
     /// RPython `Repr._initialized` state machine.
     state: ReprState,
+    /// Extra state of `rvirtualizable.py VirtualizableInstanceRepr`.
+    /// `None` on a plain `InstanceRepr`.
+    virtualizable: RefCell<Option<super::rvirtualizable::VirtualizableInstanceRepr>>,
 }
 
 impl InstanceRepr {
@@ -2357,6 +2387,7 @@ impl InstanceRepr {
             reusable_prebuilt_instance: RefCell::new(None),
             iprebuiltinstances: RefCell::new(HashMap::new()),
             state: ReprState::new(),
+            virtualizable: RefCell::new(None),
         }
     }
 
@@ -2490,12 +2521,35 @@ impl InstanceRepr {
     /// override to emit `promote_virtualizable` op before the getfield.
     pub fn hook_access_field(
         &self,
-        _vinst: &Hlvalue,
-        _cname: &Hlvalue,
-        _llops: &mut LowLevelOpList,
-        _flags: &Flags,
+        vinst: &Hlvalue,
+        cname: &Hlvalue,
+        llops: &mut LowLevelOpList,
+        flags: &Flags,
     ) {
-        // upstream: `pass`.
+        let Some(vable) = self.virtualizable.borrow().clone() else {
+            return;
+        };
+        let Some(name) = hlvalue_byte_str(cname) else {
+            return;
+        };
+        if !vable.should_force_field(&name) {
+            return;
+        }
+        // `cflags = inputconst(lltype.Void, flags)`
+        // `llops.genop('jit_force_virtualizable', [vinst, cname, cflags])`
+        let mut items = HashMap::new();
+        for (key, value) in flags {
+            items.insert(ConstValue::byte_str(key), value.clone());
+        }
+        let cflags = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Dict(items),
+            LowLevelType::Void,
+        ));
+        llops.genop(
+            "jit_force_virtualizable",
+            vec![vinst.clone(), cname.clone(), cflags],
+            GenopResult::Void,
+        );
     }
 
     /// RPython `InstanceRepr.hook_setfield(self, vinst, fieldname,
@@ -3286,6 +3340,74 @@ impl InstanceRepr {
         let mut local = result;
         self.initialize_prebuilt_data(None, self.classdef.as_ref(), &mut local, &[])?;
         Ok(local)
+    }
+
+    /// RPython `InstanceRepr._get_field(self, attr)` — `self.fields[attr]`.
+    fn _get_field(&self, attr: &str) -> Option<(String, Arc<dyn Repr>)> {
+        self.fields.borrow().get(attr).cloned()
+    }
+
+    /// RPython `InstanceRepr._parse_field_list`.
+    fn _parse_field_list(
+        &self,
+        fields: &[String],
+        accessor: &mut FieldListAccessor,
+        hints: &HashMap<String, ConstValue>,
+    ) -> Result<HashMap<String, ImmutableRanking>, TyperError> {
+        let mut ranking = HashMap::new();
+        for fullname in fields {
+            let (name, rank, quasi) = if let Some(name) = fullname.strip_suffix("?[*]") {
+                (name, IR_QUASIIMMUTABLE_ARRAY, true)
+            } else if let Some(name) = fullname.strip_suffix("[*]") {
+                (name, IR_IMMUTABLE_ARRAY, false)
+            } else if let Some(name) = fullname.strip_suffix('?') {
+                (name, IR_QUASIIMMUTABLE, true)
+            } else {
+                (fullname.as_str(), IR_IMMUTABLE, false)
+            };
+            let Some((mangled_name, _r)) = self._get_field(name) else {
+                continue;
+            };
+            if quasi && hints.get("immutable") == Some(&ConstValue::Bool(true)) {
+                return Err(TyperError::message(format!(
+                    "can't have _immutable_ = True and a quasi-immutable field {name} \
+                     in class {:?}",
+                    self.classdef.as_ref().map(|cd| cd.borrow().name.clone())
+                )));
+            }
+            ranking.insert(mangled_name, rank);
+        }
+        accessor.initialize(self.object_type.clone(), ranking.clone());
+        Ok(ranking)
+    }
+
+    fn finish_virtualizable_setup(&self) -> Result<(), TyperError> {
+        let Some(mut vable) = self.virtualizable.borrow().clone() else {
+            return Ok(());
+        };
+        if vable.top_of_virtualizable_hierarchy {
+            let classdesc = self
+                .classdef
+                .as_ref()
+                .map(|cd| cd.borrow().classdesc.clone())
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "VirtualizableInstanceRepr._setup_repr needs a classdesc".to_string(),
+                    )
+                })?;
+            let vfields = classdesc.borrow().get_param("_virtualizable_", None, false);
+            let names = const_value_field_names(&vfields);
+            let mut hints = HashMap::new();
+            hints.insert("virtualizable_accessor".to_string(), ConstValue::Bool(true));
+            let ranking = self._parse_field_list(&names, &mut vable.accessor, &hints)?;
+            vable.my_redirected_fields = ranking.into_keys().map(|name| (name, true)).collect();
+        } else if let Some(base) = self.rbase.borrow().as_ref()
+            && let Some(base_vable) = base.virtualizable.borrow().clone()
+        {
+            vable.my_redirected_fields = base_vable.my_redirected_fields;
+        }
+        *self.virtualizable.borrow_mut() = Some(vable);
+        Ok(())
     }
 }
 
@@ -4171,6 +4293,16 @@ impl Repr for InstanceRepr {
         // struct carries an `_runtime_type_info` opaque consumable by
         // `fill_vtable_root` via `getRuntimeTypeInfo`. Immutable /
         // special_memory_pressure hints stay unported (R2-D).
+        // `VirtualizableInstanceRepr._setup_repr_llfields`: `vable_token`
+        // precedes the instance attrs (`llfields + myllfields`).
+        if self
+            .virtualizable
+            .borrow()
+            .as_ref()
+            .is_some_and(|vable| vable.top_of_virtualizable_hierarchy)
+        {
+            myllfields.insert(0, ("vable_token".into(), lltype::GCREF.clone()));
+        }
         let name = classdef_rc.borrow().name.clone();
         let mut struct_fields = Vec::with_capacity(1 + myllfields.len());
         struct_fields.push(("super".into(), rbase.object_type().clone()));
@@ -4200,6 +4332,7 @@ impl Repr for InstanceRepr {
         }
         *self.fields.borrow_mut() = fields;
         *self.allinstancefields.borrow_mut() = allinstancefields;
+        self.finish_virtualizable_setup()?;
         Ok(())
     }
 }
@@ -4649,17 +4782,13 @@ pub fn buildinstancerepr(
             "_virtualizable_ class must not have UnboxedValue subclasses"
         );
         assert_eq!(gcflavor, Flavor::Gc, "_virtualizable_ requires gc flavor");
-        // Unreachable as things stand: `_virtualizable_` is never written into
-        // a `ClassDesc` member map, because pyre's virtualizable is the
-        // hand-written Rust `PyFrame` rather than an RPython class, and its
-        // field set is declared out of band in
-        // `pyre-jit-trace/src/virtualizable_spec.rs`. Kept fail-closed so a
-        // future producer of that parameter cannot silently get a plain
-        // `InstanceRepr` with no `vable_token`.
-        return Err(TyperError::message(
-            "buildinstancerepr: no VirtualizableInstanceRepr — pyre declares its \
-             virtualizable field set out of band, not through _virtualizable_",
-        ));
+        let classdef = classdef.expect("virtualizable InstanceRepr needs a classdef");
+        let classdesc = classdef.borrow().classdesc.clone();
+        let extra =
+            super::rvirtualizable::VirtualizableInstanceRepr::from_classdesc(&classdesc.borrow())?;
+        let repr = InstanceRepr::new(rtyper, Some(classdef), gcflavor);
+        *repr.virtualizable.borrow_mut() = Some(extra);
+        return Ok(repr);
     }
     // rclass.py:109-117 — tagged-pointer path.
     if usetagging {
@@ -6418,6 +6547,45 @@ mod tests {
             panic!("lowleveltype must be Ptr");
         };
         assert!(matches!(ptr.TO, PtrTarget::ForwardReference(_)));
+    }
+
+    #[test]
+    fn buildinstancerepr_returns_virtualizable_instance_repr_when_class_declares_it() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{ConstValue, HostObject};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let mut members = indexmap::IndexMap::new();
+        members.insert(
+            "_virtualizable_".into(),
+            ConstValue::List(vec![
+                ConstValue::byte_str("x"),
+                ConstValue::byte_str("items[*]"),
+            ]),
+        );
+        let pyobj = HostObject::new_class_with_members("Frame", vec![], members);
+        let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        let classdesc = crate::annotator::classdesc::ClassDesc::new(
+            &bk,
+            pyobj,
+            Some("Frame".into()),
+            None,
+            None,
+        )
+        .expect("ClassDesc");
+        let classdef = crate::annotator::classdesc::ClassDef::new(&bk, &classdesc);
+        let repr = buildinstancerepr(&rtyper, Some(&classdef), Flavor::Gc)
+            .expect("VirtualizableInstanceRepr");
+        assert!(
+            repr.virtualizable
+                .borrow()
+                .as_ref()
+                .is_some_and(|vable| vable.top_of_virtualizable_hierarchy)
+        );
     }
 
     #[test]

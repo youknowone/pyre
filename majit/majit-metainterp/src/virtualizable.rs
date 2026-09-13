@@ -17,7 +17,7 @@
 use indexmap::IndexMap;
 use std::sync::{Arc, Weak};
 
-use majit_ir::{DescrRef, Type, descr::descr_identity};
+use majit_ir::{DescrRef, Type, Value, descr::descr_identity};
 
 /// `virtualizable.py TOKEN_TRACING_RESCALL`: the GCREF address of the
 /// prebuilt `JITFRAME_DUMMY` object shared with virtual references.
@@ -305,6 +305,16 @@ impl majit_ir::descr::VinfoMarker for VirtualizableInfo {
 }
 
 impl VirtualizableInfo {
+    /// `virtualizable.py VirtualizableInfo.unwrap_virtualizable_box`.
+    ///
+    /// `return virtualizable_box.getref(llmemory.GCREF)`.
+    pub fn unwrap_virtualizable_box(virtualizable_box: Option<Value>) -> *const u8 {
+        match virtualizable_box {
+            Some(Value::Ref(gcref)) => gcref.as_usize() as *const u8,
+            _ => std::ptr::null(),
+        }
+    }
+
     /// Create a new VirtualizableInfo.
     pub fn new(token_offset: usize) -> Self {
         Self::with_token(token_offset, true)
