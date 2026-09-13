@@ -28,7 +28,8 @@ fn pyre_probe_bh_startup_enabled() -> bool {
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
     PyResult, function_get_closure, function_get_defaults, function_get_globals_obj,
-    function_get_name, is_function, register_jit_exc_raiser, register_jit_function_caller,
+    function_get_name, is_function, register_jit_exc_clearer, register_jit_exc_raiser,
+    register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
@@ -554,6 +555,10 @@ pub(crate) fn store_jit_exception(value: i64) {
 /// the GuardNoException after the call detects it.
 extern "C" fn jit_exc_raise_shim(value: i64) {
     store_jit_exception(value);
+}
+
+extern "C" fn jit_exc_clear_shim() {
+    drain_backend_jit_exc();
 }
 
 /// Publish a raise from a may-force residual helper to BOTH executors.
@@ -1898,6 +1903,7 @@ pub fn install_jit_call_bridge() {
         majit_ir::descr::set_w_class_obj_resolver(pyre_jit_trace::descr::w_class_obj_for_vtable);
         register_jit_function_caller(jit_call_user_function_from_frame);
         register_jit_exc_raiser(jit_exc_raise_shim);
+        register_jit_exc_clearer(jit_exc_clear_shim);
         // compile.py `memory_error = MemoryError()` parity — give
         // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
         // pyre's lazy `W_BaseException(MemoryError, "")` singleton
@@ -7158,13 +7164,17 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         return pyre_object::w_bool_from(matched) as i64;
     }
 
-    // op_code 6 = CONTAINS_OP `in`, 7 = `not in` (from compare_op_tag).
+    // CONTAINS_OP `in` / `not in` (from compare_op_tag).
     // lhs = needle/item, rhs = container/haystack (flatten lowers the args
     // as `[item, container]`).
-    if op_code == 6 || op_code == 7 {
+    if pyre_interpreter::runtime_ops::compare_op_tag_is_contains(op_code) {
         match pyre_interpreter::baseobjspace::contains(rhs, lhs) {
             Ok(found) => {
-                let result = if op_code == 7 { !found } else { found };
+                let result = if op_code == pyre_interpreter::runtime_ops::COMPARE_OP_NOT_CONTAINS {
+                    !found
+                } else {
+                    found
+                };
                 return pyre_object::w_bool_from(result) as i64;
             }
             Err(mut err) => {
@@ -7175,14 +7185,18 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
         }
     }
 
-    // op_code 8 = IS_OP `is`, 9 = `is not` (from compare_op_tag).
+    // IS_OP `is` / `is not` (from compare_op_tag).
     // `space.is_w`, not raw pointer identity: `W_AbstractIntObject.is_w`
     // (`intobject.py`) and `W_FloatObject.is_w` (`floatobject.py`)
     // compare two plain `int`s / `float`s by value, so a freshly boxed equal
     // value is identical.  Infallible — never publishes BH_LAST_EXC_VALUE.
-    if op_code == 8 || op_code == 9 {
+    if pyre_interpreter::runtime_ops::compare_op_tag_is_identity(op_code) {
         let same = pyre_interpreter::baseobjspace::is_w(lhs, rhs);
-        let result = if op_code == 9 { !same } else { same };
+        let result = if op_code == pyre_interpreter::runtime_ops::COMPARE_OP_IS_NOT {
+            !same
+        } else {
+            same
+        };
         return pyre_object::w_bool_from(result) as i64;
     }
 

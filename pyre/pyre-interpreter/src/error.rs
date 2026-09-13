@@ -539,6 +539,24 @@ pub unsafe fn pyerror_type_error_to_exc_object(
     PyError::type_error(msg).to_exc_object()
 }
 
+/// The zero-division twin of [`pyerror_type_error_to_exc_object`].
+///
+/// `int_floordiv` and `int_mod` both raise `PyError::zero_division` with the
+/// literal `ZERO_DIVISION_MSG`.  Fusing that constructor with exception
+/// materialisation keeps the non-RPython Rust `PyError` aggregate out of the
+/// generated operator JitCode, so the orthodox descent carries the same
+/// `W_BaseException` value that PyPy's `OperationError` path exposes.
+///
+/// # Safety
+/// `w_msg` must be a live `W_UnicodeObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn pyerror_zero_division_to_exc_object(
+    w_msg: *mut pyre_object::PyObject,
+) -> *mut pyre_object::PyObject {
+    let msg = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_msg) }.to_owned();
+    PyError::zero_division(msg).to_exc_object()
+}
+
 impl PyError {
     /// Forward the up-to-three GC-managed references a `PyError` holds — the
     /// cached exception object and the lazy NameError/AttributeError name/obj
