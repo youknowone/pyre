@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
+use crate::codewriter::assembler::rewrite_call_kinds;
 use crate::flatten::{FlatOp, Label, RegKind, RegOrConst, SSARepr};
 
 /// `flatten.py Register.kind[0]` — single-char prefix used in
@@ -501,7 +502,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         } => {
             format!(
                 "call_elidable_{}_{result_kind}",
-                kind_signature(args_i, args_r, args_f, *result_kind)
+                rewrite_call_kinds(args_i, args_r, args_f, *result_kind)
             )
         }
         OpKind::CallResidual {
@@ -513,7 +514,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         } => {
             format!(
                 "residual_call_{}_{result_kind}",
-                kind_signature(args_i, args_r, args_f, *result_kind)
+                rewrite_call_kinds(args_i, args_r, args_f, *result_kind)
             )
         }
         OpKind::CallMayForce {
@@ -525,7 +526,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         } => {
             format!(
                 "call_may_force_{}_{result_kind}",
-                kind_signature(args_i, args_r, args_f, *result_kind)
+                rewrite_call_kinds(args_i, args_r, args_f, *result_kind)
             )
         }
         OpKind::InlineCall {
@@ -537,7 +538,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         } => {
             format!(
                 "inline_call_{}_{result_kind}",
-                kind_signature(args_i, args_r, args_f, *result_kind)
+                rewrite_call_kinds(args_i, args_r, args_f, *result_kind)
             )
         }
         OpKind::RecursiveCall { result_kind, .. } => {
@@ -556,28 +557,6 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
             .unwrap_or("?")
             .trim()
             .to_lowercase(),
-    }
-}
-
-/// `jtransform.py rewrite_call` — call-family opcode kind suffix.
-///
-/// One of exactly three signatures, chosen by the widest bin in play rather
-/// than by which bins are occupied: `"irf"` when a float appears among the
-/// arguments or as the result, else `"ir"` when an int does, else `"r"`.  So
-/// `(args_i=[a], args_r=[], args_f=[])` is `"ir"` and an all-empty call is
-/// `"r"` — the `r` bin is named even when it is empty, because the sublists
-/// the signature announces are positional and the reader counts them.
-///
-/// The result kind is a signature input, not just the suffix after it: a
-/// float-returning call with no float argument is still `"irf"`.
-fn kind_signature<T>(args_i: &[T], args_r: &[T], args_f: &[T], result_kind: char) -> &'static str {
-    if !args_f.is_empty() || result_kind == 'f' {
-        "irf"
-    } else if !args_i.is_empty() {
-        "ir"
-    } else {
-        let _ = args_r;
-        "r"
     }
 }
 
@@ -659,7 +638,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
             // the matching kind char is in the signature, which is not the
             // same test as "the bin is non-empty": `ir` over no int arguments
             // still announces an empty `I[]`.
-            let kinds = kind_signature(args_i, args_r, args_f, *result_kind);
+            let kinds = rewrite_call_kinds(args_i, args_r, args_f, *result_kind);
             if kinds.contains('i') {
                 parts.push(list_of_kind_repr_vars('i', args_i));
             }
@@ -691,7 +670,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
                 None => format!("<JitCode {:?}>", jitcode.name),
             };
             let mut parts = vec![head];
-            let kinds = kind_signature(args_i, args_r, args_f, *result_kind);
+            let kinds = rewrite_call_kinds(args_i, args_r, args_f, *result_kind);
             if kinds.contains('i') {
                 parts.push(list_of_kind_repr_vars('i', args_i));
             }

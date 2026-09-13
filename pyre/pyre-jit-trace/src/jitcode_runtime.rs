@@ -474,7 +474,6 @@ static PATHED_JITCODE_INDEX: LazyLock<indexmap::IndexMap<&'static str, usize>> =
 
 /// The JitCode allocated under `canonical_path`, or `None` when the build-time
 /// pipeline does not contain that graph. See [`compute_pathed_jitcode_index`].
-#[allow(dead_code)]
 pub(crate) fn pathed_jitcode(canonical_path: &str) -> Option<Arc<JitCode>> {
     get_jitcode_by_index(compute_pathed_jitcode_index(canonical_path)?)
 }

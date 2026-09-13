@@ -1299,7 +1299,7 @@ impl Assembler {
                 argcodes.push('d');
                 // RPython jtransform.py: rewrite_call
                 // Only emit the kind sublists that are in 'kinds'.
-                let kinds = self.kinds_suffix(args_i, args_r, args_f, *result_kind);
+                let kinds = rewrite_call_kinds(args_i, args_r, args_f, *result_kind);
                 if kinds.contains('i') {
                     self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
                     argcodes.push('I');
@@ -1450,7 +1450,7 @@ impl Assembler {
                 let calldescr = descriptor.to_bh_calldescr();
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
                 // RPython jtransform.py:422-431: kind-separated sublists
-                let kinds = self.kinds_suffix(args_i, args_r, args_f, *result_kind);
+                let kinds = rewrite_call_kinds(args_i, args_r, args_f, *result_kind);
                 if kinds.contains('i') {
                     self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
                     argcodes.push('I');
@@ -2906,34 +2906,6 @@ impl Assembler {
         }
     }
 
-    /// RPython `jtransform.py rewrite_call`:
-    /// ```text
-    /// if lst_f or reskind == 'f': kinds = 'irf'
-    /// elif lst_i or force_ir: kinds = 'ir'
-    /// else: kinds = 'r'
-    /// ```
-    /// Result float forces `irf` even if no float args (`test_jtransform.py:356`
-    /// `if RESTYPE == lltype.Float: with_f = True`). Without this rule a
-    /// `&self -> f64` shape (empty `args_i`/`args_f`, single `args_r`,
-    /// `result_kind='f'`) would map to a pyre-only `_r_f` handler that
-    /// has no RPython `bhimpl_*_r_f` counterpart (`blackhole.py:1224,1278`
-    /// only has `_r_{i,r,v}` / `_ir_*` / `_irf_*`).
-    fn kinds_suffix<T, U, V>(
-        &self,
-        args_i: &[T],
-        _args_r: &[U],
-        args_f: &[V],
-        result_kind: char,
-    ) -> &'static str {
-        if !args_f.is_empty() || result_kind == 'f' {
-            "irf"
-        } else if !args_i.is_empty() {
-            "ir"
-        } else {
-            "r"
-        }
-    }
-
     /// RPython `flatten.py` emits the trailing `-> result` only for
     /// non-Void result variables. `jtransform.py:433` still computes
     /// `reskind = getkind(op.result.concretetype)[0]`, so a call op may
@@ -3630,6 +3602,45 @@ impl Assembler {
         }
         state.constants_f.push(bits);
         const_pool_slot(state.num_regs_f, state.constants_f.len() - 1)
+    }
+}
+
+/// RPython `jtransform.py rewrite_call` — the call-family opcode kind suffix:
+/// ```text
+/// if lst_f or reskind == 'f': kinds = 'irf'
+/// elif lst_i or force_ir: kinds = 'ir'
+/// else: kinds = 'r'
+/// ```
+/// One of exactly three signatures, chosen by the widest bin in play rather
+/// than by which bins are occupied: `"irf"` when a float appears among the
+/// arguments or as the result, else `"ir"` when an int does, else `"r"`.  So
+/// `(args_i=[a], args_r=[], args_f=[])` is `"ir"` and an all-empty call is
+/// `"r"` — the `r` bin is named even when it is empty, because the sublists
+/// the signature announces are positional and the reader counts them.
+///
+/// The result kind is a signature input, not just the suffix after it: a
+/// float result forces `irf` even with no float argument
+/// (`test_jtransform.py:356` `if RESTYPE == lltype.Float: with_f = True`).
+/// Without that a `&self -> f64` shape (empty `args_i`/`args_f`, single
+/// `args_r`, `result_kind='f'`) would map to a pyre-only `_r_f` handler with
+/// no RPython `bhimpl_*_r_f` counterpart (`blackhole.py:1224,1278` only has
+/// `_r_{i,r,v}` / `_ir_*` / `_irf_*`).
+///
+/// The emitter and the text formatter (`codewriter::format`) both spell the
+/// opname from this one rule, so a printed trace names the opcode the
+/// bytecode carries.
+pub(crate) fn rewrite_call_kinds<T, U, V>(
+    args_i: &[T],
+    _args_r: &[U],
+    args_f: &[V],
+    result_kind: char,
+) -> &'static str {
+    if !args_f.is_empty() || result_kind == 'f' {
+        "irf"
+    } else if !args_i.is_empty() {
+        "ir"
+    } else {
+        "r"
     }
 }
 

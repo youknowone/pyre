@@ -2626,10 +2626,6 @@ pub enum DispatchError {
     /// or decide whether to jump to the label target, so surface the
     /// missing concrete explicitly instead of guessing.
     GotoIfNotValueNotConcrete { pc: usize, value: OpRef },
-    /// An overflow-checking integer jump needs both operands' runtime values
-    /// to choose the overflow arm. Decline when either value is unavailable
-    /// instead of crashing the tracer.
-    IntOvfOperandNotConcrete { pc: usize, value: OpRef },
     /// `OS_NOT_IN_TRACE` must run the callee concretely and record no
     /// IR on the normal path (`pyjitpl.py`). The standalone
     /// symbolic walker has no concrete executor, so it must stop here
@@ -2954,7 +2950,6 @@ impl DispatchError {
             Self::ExpectedSwitchDescr { .. } => "ExpectedSwitchDescr",
             Self::SwitchValueNotConcrete { .. } => "SwitchValueNotConcrete",
             Self::GotoIfNotValueNotConcrete { .. } => "GotoIfNotValueNotConcrete",
-            Self::IntOvfOperandNotConcrete { .. } => "IntOvfOperandNotConcrete",
             Self::NotInTraceRequiresConcreteExecution { .. } => {
                 "NotInTraceRequiresConcreteExecution"
             }
@@ -3043,7 +3038,6 @@ impl DispatchError {
             | Self::ExpectedSwitchDescr { pc, .. }
             | Self::SwitchValueNotConcrete { pc, .. }
             | Self::GotoIfNotValueNotConcrete { pc, .. }
-            | Self::IntOvfOperandNotConcrete { pc, .. }
             | Self::NotInTraceRequiresConcreteExecution { pc, .. }
             | Self::JitForceVirtualRequiresConcreteResolver { pc, .. }
             | Self::VableBoxNotSeeded { pc, .. }
@@ -3489,11 +3483,7 @@ pub fn step<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
-    inline_call::note_subwalk_driver_step::<Sym>(
-        op.opname,
-        ctx.trace_ctx.get_trace_position(),
-        ctx.trace_ctx.heap_cache(),
-    );
+    inline_call::note_subwalk_driver_step::<Sym>(op.opname, ctx.trace_ctx.get_trace_position());
     // The walker mixes translated vable operations (which update the shadow)
     // with concrete interpreter steps (which update the heap PyFrame).  Pull
     // those concrete writes into `virtualizable_boxes` before any handler can
@@ -3534,9 +3524,6 @@ pub fn step<Sym: WalkSym>(
     // unless the full-body walk owns the virtualizable shadow and the
     // mirror is still valid.
     step_vstack_mirror(ctx, pc);
-    if let Some(finished) = inline_call::try_finish_replayed_call_subreturn(ctx, code, &op) {
-        return finished;
-    }
     let effects_before = fbw_executed_effect_count();
     let result = handle(&op, code, ctx);
     if matches!(

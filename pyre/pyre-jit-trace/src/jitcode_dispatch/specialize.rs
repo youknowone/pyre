@@ -342,25 +342,6 @@ fn walker_read_long_payload<Sym: WalkSym>(
     payload
 }
 
-/// #57: walker-native speculative int specialization for the `BINARY_OP`
-/// helper residual_call (oopspec `BinaryOp`).  Re-derives
-/// the former int fast path's structure (`guard_class` + `getfield_gc_i` per
-/// operand, `int_OP_ovf` + `guard_no_overflow`, `wrapint`) walker-native rather
-/// than calling back into the retired trait path (which would alias the
-/// reborrowed sym slices and emit `MIFrame`-style snapshots inconsistent with
-/// the walker model).
-///
-/// The concrete boxed result is obtained from the same
-/// `execute_residual_call` path the generic leg uses, so
-/// `concrete_registers_r[dst]` holds the authentic runtime `W_IntObject`.
-///
-/// Returns `Ok(Some(outcome))` when the specialization was emitted; the
-/// outcome is `Continue` for a value arm or `SubRaise` for a zero divisor.
-/// `Ok(None)` means the operator is deferred
-/// (FloorDiv / Mod / Shift / TrueDiv / Power / Subscr), the operands are
-/// not both concrete `W_IntObject`, or an unsupported helper arm is reached — the caller
-/// then falls through to the generic `CallMayForce` record so the
-/// Python-level `__op__` semantics are preserved.
 /// rint.py `_ovf_zer` guards for a machine-int division: `int_eq(rhs,0)` →
 /// `guard_false` plus `(lhs==INT_MIN)&(rhs==-1)` → `guard_false`.  Both must
 /// precede the elidable `ll_int_py_div` / `ll_int_py_mod` call so a re-used
@@ -389,8 +370,8 @@ fn walker_emit_int_div_domain_guards<Sym: WalkSym>(
 }
 
 /// After a successful `//` / `%` dest-write, pin the same `_ovf_zer`
-/// pair the int fold records so a later zero divisor deopts before
-/// the compiled dest is stored into a Python local (`checksum +=`).
+/// pair `try_emit_exact_int_binop` records so a later zero divisor deopts
+/// before the compiled dest is stored into a Python local (`checksum +=`).
 pub(crate) fn walker_guard_int_div_domain_if_exact<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -729,11 +710,14 @@ pub(crate) fn try_walker_specialize_binary_op_int_zero_div<Sym: WalkSym>(
     // still the raising arm.
     let exc_i64 = match walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr) {
         Some(Err(exc)) => exc,
-        Some(Ok(0)) | None => {
+        Some(Ok(0)) => {
             let mut err = pyre_interpreter::PyError::zero_division("division by zero");
             err.to_exc_object() as i64
         }
-        Some(Ok(_)) => return Ok(None),
+        // `None` means the call was never executed (non-constant callee,
+        // symbolic fnaddr, or an argument without a concrete), not that it
+        // divided by zero.
+        Some(Ok(_)) | None => return Ok(None),
     };
     // The helper publishes through both the blackhole cell (drained by
     // `execute_residual_call`) and the backend exception cells.  The latter
@@ -836,11 +820,17 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
     if int_value == 0 {
         let exc_i64 = match walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr) {
             Some(Err(exc)) => exc,
-            Some(Ok(0)) | None => {
+            // Native `sdiv` by zero returns 0 on some backends and the helper
+            // then dest-writes NULL instead of `Err`.  A live zero divisor is
+            // still the raising arm.
+            Some(Ok(0)) => {
                 let mut err = pyre_interpreter::PyError::zero_division("division by zero");
                 err.to_exc_object() as i64
             }
-            Some(Ok(_)) => return Ok(None),
+            // `None` means the call was never executed (non-constant callee,
+            // symbolic fnaddr, or an argument without a concrete), not that it
+            // divided by zero.
+            Some(Ok(_)) | None => return Ok(None),
         };
         if let Some(cb) = crate::callbacks::try_get() {
             (cb.drain_backend_jit_exc)();
@@ -4988,13 +4978,16 @@ fn try_walker_orthodox_load_super_attr<Sym: WalkSym>(
     let is_two_arg = ctx.trace_ctx.const_int(0);
     let self_is_cell_arg = ctx.trace_ctx.const_int(i64::from(self_is_cell));
     let class_slot_arg = ctx.trace_ctx.const_int(class_slot as i64);
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let walk = run_orthodox_helper_subwalk(
         ctx,
         op_pc,
         sym,
         &sub_body,
-        None,
+        nested_entry,
         "load_super_attr_value_commit",
         "load_super_attr_value_call_site",
         &[is_two_arg, self_is_cell_arg, class_slot_arg],
@@ -7491,6 +7484,9 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
 /// into the operand-stack slot the guard's own resume image describes, and
 /// swapping the prebuilt singleton in for a recorded call result leaves it
 /// storing the same value.
+///
+/// A constant truth takes the singleton with no guard and no resume image, the
+/// way `generate_guard` (`pyjitpl.py:2583`) returns early for a `Const` box.
 pub(crate) fn walker_newbool_guarded<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -7498,6 +7494,9 @@ pub(crate) fn walker_newbool_guarded<Sym: WalkSym>(
     observed: bool,
     dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
+    if truth.is_constant() {
+        return Ok(Some(walker_const_bool(ctx, observed)));
+    }
     // No resume image, no guard: emitting one without a snapshot to resume
     // into would leave the bail with nowhere to land.  That is the only thing
     // that keeps a caller on the residual box.
@@ -7511,13 +7510,19 @@ pub(crate) fn walker_newbool_guarded<Sym: WalkSym>(
     };
     ctx.trace_ctx.record_guard(guard, &[truth], 0);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    Ok(Some(walker_const_bool(ctx, observed)))
+}
+
+/// The prebuilt `w_True` / `w_False` singleton (`boolobject.py:79-80`) as a
+/// trace constant carrying its own concrete shadow.
+fn walker_const_bool<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, observed: bool) -> OpRef {
     let result_obj = pyre_object::w_bool_from(observed);
     let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
     ctx.trace_ctx.set_opref_concrete(
         const_bool,
         majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
     );
-    Ok(Some(const_bool))
+    const_bool
 }
 
 /// A `w_bool_from(truth)` residual met inside a descended body, folded the
@@ -7558,19 +7563,8 @@ pub(crate) fn try_walker_fold_newbool_call<Sym: WalkSym>(
         return Ok(None);
     };
     let observed = value != 0;
-    let result = if truth.is_constant() {
-        let result_obj = pyre_object::w_bool_from(observed);
-        let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
-        ctx.trace_ctx.set_opref_concrete(
-            const_bool,
-            majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
-        );
-        const_bool
-    } else {
-        let Some(guarded) = walker_newbool_guarded(ctx, op_pc, truth, observed, dst_bank)? else {
-            return Ok(None);
-        };
-        guarded
+    let Some(result) = walker_newbool_guarded(ctx, op_pc, truth, observed, dst_bank)? else {
+        return Ok(None);
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
     Ok(Some(()))
@@ -7738,12 +7732,7 @@ fn walker_write_const_bool_result<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<(), DispatchError> {
-    let result_obj = pyre_object::w_bool_from(value);
-    let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
-    ctx.trace_ctx.set_opref_concrete(
-        const_bool,
-        majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
-    );
+    let const_bool = walker_const_bool(ctx, value);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, const_bool)
 }
 
@@ -9524,14 +9513,6 @@ pub(crate) fn binary_op_tag_for_helper_index(
     binary_op_tag_for_helper_name(name)
 }
 
-/// The machine-int body of `int_add` / `int_sub` / `int_mul` / bitwise
-/// and of `int_floordiv` / `int_mod` (`descroperation.rs`): unbox,
-/// `int_*_ovf` or `int_and`/`or`/`xor` or the `OS_INT_PY_DIV` /
-/// `OS_INT_PY_MOD` elidable, rebox.  Used when a helper walk cannot
-/// stamp its resume word (`GuardResumeCoordinateUnavailable`) so the
-/// call would otherwise become `CallMayForce`.  Does not walk
-/// `binary_value_from_tag` — that re-enters the same `add` inline and
-/// recurses.
 /// `int_add` / `int_sub` / `int_mul` overflow arm: after `INT_*_OVF`
 /// records overflow, emit `GUARD_OVERFLOW` and the same
 /// `w_long_new(bigint_*_int_int(va, vb))` the interpreter takes
@@ -9606,6 +9587,14 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
     }))
 }
 
+/// The machine-int body of `int_add` / `int_sub` / `int_mul` / bitwise
+/// and of `int_floordiv` / `int_mod` (`descroperation.rs`): unbox,
+/// `int_*_ovf` or `int_and`/`or`/`xor` or the `OS_INT_PY_DIV` /
+/// `OS_INT_PY_MOD` elidable, rebox.  Used when a helper walk cannot
+/// stamp its resume word (`GuardResumeCoordinateUnavailable`) so the
+/// call would otherwise become `CallMayForce`.  Does not walk
+/// `binary_value_from_tag` — that re-enters the same `add` inline and
+/// recurses.
 pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9719,19 +9708,8 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     let both_bools = unsafe { pyre_object::is_bool(lhs_obj) && pyre_object::is_bool(rhs_obj) };
     if both_bools && matches!(opcode, OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor) {
         let observed = concrete != 0;
-        let boxed = if raw.is_constant() {
-            let result_obj = pyre_object::w_bool_from(observed);
-            let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
-            ctx.trace_ctx.set_opref_concrete(
-                const_bool,
-                majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
-            );
-            const_bool
-        } else {
-            let Some(boxed) = walker_newbool_guarded(ctx, op_pc, raw, observed, dst_bank)? else {
-                return Ok(None);
-            };
-            boxed
+        let Some(boxed) = walker_newbool_guarded(ctx, op_pc, raw, observed, dst_bank)? else {
+            return Ok(None);
         };
         let _ = (dst, dst_bank);
         return Ok(Some(DispatchOutcome::SubReturn {
@@ -10007,7 +9985,7 @@ fn binary_op_tag_for_helper_name(name: &str) -> Option<i64> {
     let leaf = leaf.strip_prefix("long_").unwrap_or(leaf);
     let op = match leaf {
         "add" => B::Add,
-        "getitem" | "descr_getitem" => B::Subscr,
+        "getitem" => B::Subscr,
         "sub" => B::Subtract,
         "mul" => B::Multiply,
         "floordiv" => B::FloorDivide,

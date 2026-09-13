@@ -3239,21 +3239,52 @@ impl<'a> Transformer<'a> {
             // the canonical `float_ne` opname here rather than
             // leaving an intermediate op for the float-comparison
             // arm in `rewrite_operation`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if (unop_name == "bool" && self.get_value_kind_var(operand) == 'f')
+                || unop_name == "float_is_true" =>
+            {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::Signed,
+                );
+                let zero_var = self.fresh_synthetic_variable_typed(
+                    graph,
+                    crate::codewriter::type_state::ConcreteType::Float,
+                );
+                let zero_op = SpaceOperation {
+                    result: Some(zero_var.clone()),
+                    kind: OpKind::ConstFloat(0.0_f64.to_bits()),
+                };
+                let ne_op = SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::BinOp {
+                        op: "float_ne".into(),
+                        lhs: operand.clone(),
+                        rhs: zero_var,
+                        result_ty: ValueType::Int,
+                    },
+                };
+                RewriteResult::Replace(vec![zero_op, ne_op])
+            }
             // `rtype_bool` per repr for the un-rtyped `bool` hop that
             // `FunctionGraph::set_branch` puts before every exitswitch:
             // `BoolRepr` is the identity, `IntegerRepr.rtype_bool` is
             // `int_is_true` (`rint.py`), a nullable `PtrRepr` is
             // `ptr_nonzero` (`rmodel.py`).  Naming the op here, ahead
-            // of `optimize_goto_if_not`, is half of what lets the fusion see
-            // it: that gate matches opnames, and `bool` is not one of them --
-            // but it reads the exitswitch variable's `concretetype` FIRST, so
-            // the result also has to carry the `lltype.Bool` those two
-            // opnames return, which is why the rewrite stamps it exactly as
-            // `null_test_rewrite` does for the same pair.  The identity arm
-            // is what fuses an `is_null` test -- its `ptr_iszero` result is
-            // already Bool -- into `goto_if_not_ptr_iszero`, which the walker
-            // answers from the heap cache without recording once the nullity
-            // is known.  Left as `bool`, every null test of a traced operand
+            // of `optimize_goto_if_not`, is what lets the fusion see it: that
+            // gate matches opnames, and `bool` is not one of them.  The result
+            // is stamped with the `lltype.Bool` those two opnames return,
+            // exactly as `null_test_rewrite` stamps the same pair, so the
+            // identity arm below and that gate's `concretetype` test each read
+            // a witness rather than falling back on the exits.  That identity
+            // arm is what fuses an `is_null` test -- its `ptr_iszero` result
+            // is already Bool -- into `goto_if_not_ptr_iszero`, which the
+            // walker answers from the heap cache without recording once the
+            // nullity is known.  Left as `bool`, every null test of a traced operand
             // cost `ptr_eq` + `int_is_true` + `guard_false`: six of them per
             // `int + int` descent.
             OpKind::UnaryOp {
@@ -3286,37 +3317,6 @@ impl<'a> Transformer<'a> {
                         },
                     }])
                 }
-            }
-            OpKind::UnaryOp {
-                op: unop_name,
-                operand,
-                ..
-            } if (unop_name == "bool" && self.get_value_kind_var(operand) == 'f')
-                || unop_name == "float_is_true" =>
-            {
-                self.stamp_value_kind(
-                    graph,
-                    op.result.clone(),
-                    crate::codewriter::type_state::ConcreteType::Signed,
-                );
-                let zero_var = self.fresh_synthetic_variable_typed(
-                    graph,
-                    crate::codewriter::type_state::ConcreteType::Float,
-                );
-                let zero_op = SpaceOperation {
-                    result: Some(zero_var.clone()),
-                    kind: OpKind::ConstFloat(0.0_f64.to_bits()),
-                };
-                let ne_op = SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::BinOp {
-                        op: "float_ne".into(),
-                        lhs: operand.clone(),
-                        rhs: zero_var,
-                        result_ty: ValueType::Int,
-                    },
-                };
-                RewriteResult::Replace(vec![zero_op, ne_op])
             }
             // RPython `jtransform.py:587-588`:
             //   rewrite_op_cast_float_to_uint  = _do_builtin_call
@@ -4361,6 +4361,18 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        // `jtransform.py rewrite_op_setfield`: `if self.is_typeptr_getset(op):
+        // # ignore the operation completely -- instead, it's done by 'new';
+        // return` — checked before anything else, as on the read side.  The
+        // class word is stamped by the allocation, so a write to it emits no
+        // op at all.
+        if matches!(&op.kind, OpKind::FieldWrite { .. }) && is_typeptr_field(field) {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("rewrite: setfield({}) → dropped", field.name),
+            });
+            return RewriteResult::Replace(Vec::new());
+        }
         // `jtransform.py self._check_no_vable_array(op.args)` —
         // upstream's `op.args` is `[v_inst, c_fieldname, v_value]`; the
         // field name rides in a descriptor here, leaving the base and the
@@ -10942,11 +10954,13 @@ mod tests {
     }
 
     /// The `bool` hop `set_branch` puts before every exitswitch has to come out
-    /// of the rewrite fusable.  `optimize_goto_if_not` reads the exitswitch
-    /// variable's `concretetype` before it reads any opname, so naming the op
-    /// `int_is_true` is not on its own enough — nothing in the value-kind
-    /// channel can produce `Bool` (`concrete_to_canonical_lltype` has no such
-    /// case), so the rewrite is the only place that stamp can come from.
+    /// of the rewrite fusable.  Naming the op `int_is_true` is what
+    /// `optimize_goto_if_not` matches on.  Its `concretetype` test is not the
+    /// reason the stamp exists: that gate also takes a non-`Bool` exitswitch
+    /// whose two exits carry the false/true `llexitcase` pair
+    /// (`exits_are_bool_pair`).  The `Bool` stamp is read elsewhere — by this
+    /// rewrite's own identity arm, which drops a hop over an operand already
+    /// stamped `Bool`, and on `null_test_rewrite`'s `ptr_iszero` result.
     #[test]
     fn transform_graph_leaves_the_bool_hop_fusable() {
         use crate::model::ExitSwitch;
@@ -10984,9 +10998,8 @@ mod tests {
 
     /// The Ref-kind sibling of [`transform_graph_leaves_the_bool_hop_fusable`].
     /// A `bool` hop over a Ref operand rewrites to `ptr_nonzero`, which
-    /// `optimize_goto_if_not` also fuses, and it reaches that gate through the
-    /// same `Bool` stamp — the value-kind channel banks the result as an int
-    /// either way.
+    /// `optimize_goto_if_not` also fuses, and it carries the same `Bool` stamp
+    /// — the value-kind channel banks the result as an int either way.
     #[test]
     fn transform_graph_leaves_the_ref_bool_hop_fusable() {
         use crate::model::ExitSwitch;

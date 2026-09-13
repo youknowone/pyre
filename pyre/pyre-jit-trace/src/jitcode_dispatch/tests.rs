@@ -4781,6 +4781,132 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
 }
 
 #[test]
+fn compare_tag_inline_call_records_no_binary_exception_guard() {
+    // Flatten lowers `x is y` to `inline_call_ir_r` of
+    // `compare_value_from_tag` with COMPARE tag 8, which sits in the same
+    // I-list slot a `binary_value_from_tag` call uses for its BINARY tag.
+    // Read as a BINARY tag, 8 decodes as `<<` — a raising operator — so the
+    // call used to record a `GUARD_NO_EXCEPTION` plus its snapshot for an
+    // operation it never performs.  The callee here is neither helper, so
+    // no operator guard may appear.
+    let ret_byte = *insns_opname_to_byte()
+        .get("ref_return/r")
+        .expect("`ref_return/r` must be in insns table");
+    let inline_ir_r_byte = *insns_opname_to_byte()
+        .get("inline_call_ir_r/dIR>r")
+        .expect("`inline_call_ir_r/dIR>r` must be in insns table");
+    // Callee body: `ref_return r0` (size 2), two ref params.
+    let callee_code: &'static [u8] = Box::leak(Box::new([ret_byte, 0]));
+    let sub_body = SubJitCodeBody {
+        code: callee_code,
+        num_regs_r: 2,
+        num_regs_i: 1,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+    };
+    let lookup = {
+        let sub_body = sub_body.clone();
+        move |idx: usize| {
+            if idx == 7 {
+                Some(sub_body.clone())
+            } else {
+                None
+            }
+        }
+    };
+    // Caller body: `inline_call_ir_r descr=7, I=[i1], R=[r2, r3], >r=r5`
+    let caller_code = [
+        inline_ir_r_byte,
+        0x07,
+        0x00, // descr index 7 (LE)
+        0x01,
+        0x01, // I-list: len=1, args=[i1]
+        0x02,
+        0x02,
+        0x03, // R-list: len=2, args=[r2, r3]
+        0x05, // dst = r5
+    ];
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let arg_ref = regs_r[2];
+    // The I-list names `i1`, so THAT slot must carry COMPARE tag 8 (`is`),
+    // which decodes as the raising `<<` when read as a BINARY tag.  The tag
+    // is read out of the color-indexed concrete shadow, not the OpRef bank,
+    // so both have to hold it.
+    let mut regs_i: Vec<OpRef> = (0..4).map(|_| tc.const_int(0)).collect();
+    regs_i[1] = tc.const_int(8);
+    let mut concrete_i = vec![ConcreteValue::Int(0); 4];
+    concrete_i[1] = ConcreteValue::Int(8);
+    let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    descr_pool[7] = make_jitcode_descr(7);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    // Give the fixture a resume coordinate so a guard this dispatcher records
+    // can capture its snapshot.  Without one the bogus guard surfaces as a
+    // dispatch error instead of as a recorded op, which is a weaker witness.
+    wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+    wc.outer_resume_marker_jit_pc = Some(0);
+    let (outcome, next_pc) =
+        step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, caller_code.len());
+    let regs_r_after = wc.registers_r.to_vec();
+    drop(wc);
+    assert_eq!(
+        regs_r_after[5], arg_ref,
+        "dst writeback must still propagate the callee's SubReturn",
+    );
+    assert!(
+        !tc.ops()
+            .iter()
+            .any(|o| o.opcode == majit_ir::OpCode::GuardNoException),
+        "a COMPARE tag must not be read as a raising BINARY operator",
+    );
+}
+
+#[test]
 fn inline_call_irf_r_populates_all_three_kind_banks() {
     // Acceptance: caller's `inline_call_irf_r/dIRF>r`
     // carries an I-list, R-list, AND F-list. Smoke test: callee

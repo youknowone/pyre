@@ -19,6 +19,33 @@ use super::symbolic_fold::try_fold_registered_symbolic_residual;
 use super::*;
 use pyre_interpreter::{locals_w, locals_w_mut};
 
+/// The published fnaddrs whose registered path matches `pred`, collected once.
+///
+/// `jit_trace_fnaddrs()` builds a fresh `Vec` of every published residual on
+/// each call, so asking it a name question per residual call rebuilds and
+/// rescans the whole table.  The addresses are fixed for the process, so the
+/// answer is a set taken once.
+fn fnaddr_set(pred: impl Fn(&str) -> bool) -> std::collections::HashSet<i64> {
+    pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .filter_map(|(name, addr)| pred(name).then_some(addr))
+        .collect()
+}
+
+/// Residuals whose registered path names a `bigint` helper: their Ref slots
+/// carry `*mut BigInt` payloads, not `PyObject`s.
+static BIGINT_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| name.contains("bigint")));
+
+/// The eval-loop `BINARY_OP` helper, which can arrive with
+/// `RuntimeHelperKind::None` and so is identified by address.
+static BINARY_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("binary_value_from_tag")));
+
+/// The eval-loop `COMPARE_OP` helper, identified the same way.
+static COMPARE_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("compare_value_from_tag")));
+
 /// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
 /// pc.  They differ in exactly the way the walk-end commit contract cares
 /// about, so the epilogue cannot classify the leg without being told.
@@ -1935,9 +1962,7 @@ fn residual_operands_are_not_all_objects<Sym: WalkSym>(
     };
     majit_translate::codewriter::call::is_symbolic_fnaddr(addr)
         || pyre_interpreter::is_abi_unsound_argument_residual(addr as usize)
-        || pyre_interpreter::jit_trace_fnaddrs()
-            .iter()
-            .any(|(n, a)| *a == addr && n.contains("bigint"))
+        || BIGINT_FNADDRS.contains(&addr)
 }
 
 /// Write the traced frame's locals region out before a residual that reads it
@@ -3920,11 +3945,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // Name the helper first.  A descended `jit_bigint_*` residual also
     // has two Ref slots, but those are `*mut BigInt` payloads, not
     // `PyObject`s; `is_int` must not see them.
-    let opcode_binop_or_compare_fnaddr =
-        pyre_interpreter::jit_trace_fnaddrs().iter().any(|(n, a)| {
-            *a == func_ptr as i64
-                && (n.ends_with("binary_value_from_tag") || n.ends_with("compare_value_from_tag"))
-        });
+    let opcode_binop_or_compare_fnaddr = BINARY_VALUE_FROM_TAG_FNADDRS.contains(&(func_ptr as i64))
+        || COMPARE_VALUE_FROM_TAG_FNADDRS.contains(&(func_ptr as i64));
     let binop_or_compare_helper = matches!(
         helper,
         majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
@@ -9409,7 +9431,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
 
     // `w_bool_from(truth)` inside a descended body: guard the truth and take
     // the singleton, as `space.newbool` traces.
-    if try_walker_fold_newbool_call(ctx, op.pc, &allboxes, &i_args, dst, dst_bank)?.is_some() {
+    if spec_gate(SpecFold::NewboolCall, || {
+        try_walker_fold_newbool_call(ctx, op.pc, &allboxes, &i_args, dst, dst_bank)
+    })?
+    .is_some()
+    {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
@@ -9451,14 +9477,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         Some(majit_ir::Value::Int(n)) => n,
         _ => 0,
     };
-    let opcode_binary_fnaddr = func_addr != 0
-        && pyre_interpreter::jit_trace_fnaddrs()
-            .iter()
-            .any(|(n, a)| *a == func_addr && n.ends_with("binary_value_from_tag"));
-    let opcode_compare_fnaddr = func_addr != 0
-        && pyre_interpreter::jit_trace_fnaddrs()
-            .iter()
-            .any(|(n, a)| *a == func_addr && n.ends_with("compare_value_from_tag"));
+    let opcode_binary_fnaddr = func_addr != 0 && BINARY_VALUE_FROM_TAG_FNADDRS.contains(&func_addr);
+    let opcode_compare_fnaddr =
+        func_addr != 0 && COMPARE_VALUE_FROM_TAG_FNADDRS.contains(&func_addr);
     let is_binary_op =
         foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp || opcode_binary_fnaddr;
     let is_compare_op =

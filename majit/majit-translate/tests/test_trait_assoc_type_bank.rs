@@ -100,7 +100,55 @@ fn opcode_unary_not_calls_space_not() {
             }
         }
     }
-    assert_eq!(seen, 1, "opcode_unary_not calls unary_not_value / not_ once");
+    assert_eq!(
+        seen, 1,
+        "opcode_unary_not calls unary_not_value / not_ once"
+    );
+}
+
+#[test]
+fn the_same_projection_resolves_in_a_provided_default_body() {
+    // `record_branch_guard` is the provided body that reaches the projection
+    // from the trait side rather than from the impl: it forwards its
+    // `truth: Self::Truth` to `guard_truth_value`.  The forwarded operand has
+    // to be the parameter itself, banked as the unique impl's `bool` — a
+    // projection left unresolved here re-banks the value between the two
+    // trait-side spellings and no kind for the caller's variable satisfies
+    // both callees.
+    let graph = lower("pyre_interpreter::pyopcode::BranchOpcodeHandler::record_branch_guard");
+    let truth = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::Input { name, ty, .. } if name == "truth" => Some((
+                op.result.clone().expect("`truth` input names a variable"),
+                ty.clone(),
+            )),
+            _ => None,
+        })
+        .expect("record_branch_guard declares `truth`");
+    assert_eq!(truth.1, ValueType::Bool, "`truth: Self::Truth` is `bool`");
+    let mut seen = 0usize;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            let CallTarget::FunctionPath { segments } = target else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("guard_truth_value") {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                args.iter().any(|arg| arg.as_variable() == Some(&truth.0)),
+                "the forwarding call passes the `truth` parameter itself, got {args:?}"
+            );
+        }
+    }
+    assert_eq!(seen, 1, "record_branch_guard calls guard_truth_value once");
 }
 
 #[test]

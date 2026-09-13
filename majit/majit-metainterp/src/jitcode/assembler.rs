@@ -3555,6 +3555,26 @@ impl JitCodeBuilder {
         args_f: Option<&[u16]>,
         result: Option<(JitArgKind, u16)>,
     ) {
+        // The callee places each varlist at the start of its matching register
+        // bank (`MIFrame.setup_call`), so an argument's index within its kind
+        // is the callee register it lands in.  The triples are grouped in the
+        // same int/ref/float order `inline_call_grouped` uses, so a caller
+        // whose kinds disagree with the callee's declared signature is
+        // reported identically on both emit paths.
+        let typed_args: Vec<(JitArgKind, u16, u16)> = [
+            (JitArgKind::Int, args_i),
+            (JitArgKind::Ref, args_r),
+            (JitArgKind::Float, args_f),
+        ]
+        .into_iter()
+        .flat_map(|(kind, args)| {
+            args.unwrap_or(&[])
+                .iter()
+                .enumerate()
+                .map(move |(callee_dst, &caller_src)| (kind, caller_src, callee_dst as u16))
+        })
+        .collect();
+        self.check_inline_call_arg_classes(sub_jitcode_idx, &typed_args);
         self.write_insn(key);
         self.push_u16(sub_jitcode_idx);
         if let Some(args) = args_i {
@@ -7512,6 +7532,44 @@ mod tests {
         let idx = builder.add_sub_jitcode(callee_declaring("r"));
         let start = builder.current_pos();
         builder.inline_call_ir_v(idx, &[], &[(0, 0)], None);
+        assert!(builder.current_pos() > start);
+    }
+
+    #[test]
+    #[should_panic(expected = "passes 1 int / 0 ref / 0 float argument(s)")]
+    fn a_canonical_inline_call_passing_the_wrong_argument_kind_is_rejected() {
+        // The canonical varlist shape reaches the callee's register banks the
+        // same way the grouped shape does, so it is held to the same
+        // declaration: a callee taking one reference, handed one integer.
+        let mut builder = JitCodeBuilder::new();
+        let idx = builder.add_sub_jitcode(callee_declaring("r"));
+        builder.canonical_inline_call(
+            "inline_call_ir_v/dIR",
+            idx,
+            Some(&[0]),
+            Some(&[]),
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn a_canonical_inline_call_may_reorder_kinds_against_the_signature() {
+        // `inline_call_ir_r` passes the integers first and the references
+        // second, while the callee declares them in source order `(r, r, i)`.
+        // The counts per kind agree, which is all the callee's register banks
+        // require, so this emits.
+        let mut builder = JitCodeBuilder::new();
+        let idx = builder.add_sub_jitcode(callee_declaring("rri"));
+        let start = builder.current_pos();
+        builder.canonical_inline_call(
+            "inline_call_ir_r/dIR>r",
+            idx,
+            Some(&[0]),
+            Some(&[0, 1]),
+            None,
+            Some((JitArgKind::Ref, 0)),
+        );
         assert!(builder.current_pos() > start);
     }
 

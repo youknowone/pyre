@@ -1371,20 +1371,24 @@ impl HeapCache {
         //         OpHelpers.is_call_loopinvariant(opnum) or
         //         OpHelpers.is_cond_call_value(opnum) or
         //         opnum == rop.COND_CALL):
-        // `is_plain_call` matches `CALL_{I,R,F,N}` only — `CALL_PURE_*`,
-        // `CALL_MAY_FORCE_*`, `CALL_ASSEMBLER_*`, `CALL_RELEASE_GIL_*`
-        // all fall through to `reset_keep_likely_virtuals` (the
-        // aggressive arm).  Pyre's `is_call()` is the broader
-        // `_CALL_FIRST..=_CALL_LAST` range, so use the narrow
-        // `is_plain_call()` predicate to mirror upstream's enumeration.
-        // `CALL_PURE_*` reaches here spelled as itself, where upstream would
-        // still be holding the plain `CALL_*` it recorded:
-        // `MIFrame.execute_varargs` (pyjitpl.py) records the residual through
-        // `execute_and_record_varargs(rop.CALL_*)` -- which is what runs
-        // `invalidate_caches` -- and only then does
-        // `record_result_of_call_pure` rewrite the opcode to `CALL_PURE_*`.
-        // So the elidable early-return below is on upstream's path for exactly
-        // these calls, and gating it on `is_plain_call` alone drops an
+        // The narrow arm below takes exactly that enumeration: `CALL_{I,R,F,N}`
+        // (`is_plain_call`), `CALL_LOOPINVARIANT_*`, `COND_CALL_VALUE_*` and
+        // `COND_CALL`.  `CALL_MAY_FORCE_*`, `CALL_ASSEMBLER_*` and
+        // `CALL_RELEASE_GIL_*` are outside it and fall through to
+        // `reset_keep_likely_virtuals` (the aggressive arm).  Pyre's
+        // `is_call()` is the broader `_CALL_FIRST..=_CALL_LAST` range, so the
+        // narrow `is_plain_call()` predicate mirrors upstream's enumeration.
+        //
+        // `CALL_PURE_*` is in the narrow arm here because pyre records the
+        // pure opcode up front: `select_residual_call_opcode`
+        // (pyre-jit-trace) picks `CallPure*` before
+        // `heapcache_invalidate_caches_varargs` runs.  Upstream's
+        // `MIFrame.execute_varargs` (pyjitpl.py) instead records the plain
+        // `CALL_*` through `execute_and_record_varargs(rop.CALL_*)` -- which
+        // is what runs `invalidate_caches` -- and patches the opcode to
+        // `CALL_PURE_*` afterwards in `record_result_of_call_pure`.  The same
+        // residual therefore reaches this gate spelled differently on the two
+        // sides, and gating on `is_plain_call` alone would drop an
         // `EF_ELIDABLE_CANNOT_RAISE` residual onto the blanket
         // `reset_keep_likely_virtuals`, which bumps `head_version` and voids
         // every box's class and nullity knowledge mid-trace.

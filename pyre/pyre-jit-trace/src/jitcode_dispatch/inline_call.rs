@@ -978,10 +978,10 @@ fn collect_descent_effect_aware_blockers(
     for (blocker, effect) in here {
         record_reachable_blocker(out, blocker, entry_effect || effect);
     }
-    let memo = descent_blocker_summary(jitcode_index);
     // Per-jitcode summaries (and the decode feeding them) are debug-abort
     // output; inline-diag alone keeps the recursive walk quiet.
     if fbw_debug_abort_enabled() {
+        let memo = descent_blocker_summary(jitcode_index);
         eprintln!(
             "[builtin-inline-summary] jitcode={jitcode_index} may_effect={} free={:?} after={:?} not_walked={}",
             memo.may_execute_effect,
@@ -1758,24 +1758,21 @@ pub(crate) fn summarize_body_blockers_with(
                 *slot = carried;
             }
         }
-        // A Ref-bank write is fresh only when a `new*` op produced it; any
-        // other producer -- a field read, a call result, a copy -- may name
-        // live heap.
-        if d.argcodes
-            .split_once('>')
-            .is_some_and(|(_, dst)| dst == "r")
-            && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
-            && let Some(slot) = fresh_r.get_mut(dst as usize)
-        {
-            *slot = d.opname.starts_with("new");
-        }
-        // The wrapper-argument array can move between Ref colors before its
-        // length check.  Only a plain ref copy preserves that entry fact.
+        // The Ref-bank destination color, if this op writes one: the dst byte
+        // is the last operand.  Both facts below are keyed on it.
         if d.argcodes
             .split_once('>')
             .is_some_and(|(_, dst)| dst == "r")
             && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
         {
+            // A Ref-bank write is fresh only when a `new*` op produced it; any
+            // other producer -- a field read, a call result, a copy -- may name
+            // live heap.
+            if let Some(slot) = fresh_r.get_mut(dst as usize) {
+                *slot = d.opname.starts_with("new");
+            }
+            // The wrapper-argument array can move between Ref colors before its
+            // length check.  Only a plain ref copy preserves that entry fact.
             let carried = (d.key == "ref_copy/r>r")
                 .then(|| code.get(d.pc + 1))
                 .flatten()
@@ -2569,7 +2566,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // path (jitcode_dispatch.rs) and
     // `do_residual_call_walker_emit`.  `CALL_ASSEMBLER_R` yields the boxed
     // PyObject return value, taken as-is by the Ref dst (the consuming
-    // BINARY_OP unboxes); eligibility pinned `dst_bank == 'r'`.
+    // BINARY_OP unboxes); a void callsite (`dst_bank == 'v'`) is eligible too
+    // and its write lands nowhere.
     // Written REGARDLESS of `exec_raised`: on a raise `ca_result` is still
     // the recorded CALL_ASSEMBLER OpRef (carrying a Null concrete shadow,
     // never read on the exception path), and the after-call resume snapshots
@@ -4897,6 +4895,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // carries it — not just the ones entered from another sub-walk.
     let _helper_frame = nested_helper_entry
         .map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
+    // Bracket the session-wide exception slot around the callee so a NULL
+    // return only reads as a raise when the callee installed the exception.
+    let exc_before_subwalk = ctx.last_exc_value();
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -4994,7 +4995,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             return Err(error);
         }
     };
-    match promote_published_null_return(ctx, walk_result, op.pc) {
+    match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk) {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete = concrete_from_recorded_opref(ctx, value);
@@ -7591,6 +7592,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // The paused caller's banks live on `InlineParentFrame` (`attach_live_caller`
     // in `compute_*_caller_frame`). `replace_box` walks `framestack` the way
     // `MetaInterp.replace_box` walks `MIFrame`s; no Weak inbox is needed here.
+    // Bracket the session-wide exception slot around the callee so a NULL
+    // return only reads as a raise when the callee installed the exception.
+    // Nothing between here and the sub-walk writes the slot.
+    let exc_before_subwalk = ctx.last_exc_value();
     let (callee_outcome, callee_class_of_last_exc_is_const) = {
         {
             let parent_state = ctx.frame_state.borrow();
@@ -8194,7 +8199,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
     };
 
-    match promote_published_null_return(ctx, outcome, op.pc) {
+    match promote_published_null_return_since(ctx, outcome, op.pc, exc_before_subwalk) {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
@@ -12628,14 +12633,34 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
     result
 }
 
-/// `jit_*_from_tag` publishes and returns NULL on raise.  A subwalk that
-/// recorded that arm looks like `SubReturn` with `last_exc_value` set.
-/// `finishframe` would dest-write the NULL and clear the exception;
-/// promote to `finishframe_exception` instead.
+/// [`promote_published_null_return_since`] without a bracket around the
+/// sub-walk: any standing exception promotes.  Correct only where nothing
+/// could already be standing when the callee was entered.
 pub(crate) fn promote_published_null_return<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     outcome: DispatchOutcome,
     pc: usize,
+) -> DispatchOutcome {
+    promote_published_null_return_since(ctx, outcome, pc, None)
+}
+
+/// The `*_from_tag` helpers follow a publish-and-return-NULL convention: on a
+/// raise they set the exception and hand back NULL, so a sub-walk that
+/// recorded that arm looks like `SubReturn` with `last_exc_value` set.
+/// `finishframe` would dest-write the NULL and clear the exception; promote to
+/// `finishframe_exception` instead.
+///
+/// `exc_before` is the slot as it stood before the sub-walk.  The slot is
+/// session-wide and survives a `SubRaise` that routed into a Python handler
+/// (`try_catch_exception_at` re-installs it and continues), so inside an
+/// `except` body a helper that legitimately returns NULL would otherwise
+/// re-raise the exception that body already caught.  Only a value the callee
+/// itself installed is the published-NULL convention.
+pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    outcome: DispatchOutcome,
+    pc: usize,
+    exc_before: Option<OpRef>,
 ) -> DispatchOutcome {
     let _ = pc;
     let DispatchOutcome::SubReturn { result: Some(op) } = outcome else {
@@ -12651,7 +12676,7 @@ pub(crate) fn promote_published_null_return<Sym: WalkSym>(
     if !published_null {
         return DispatchOutcome::SubReturn { result: Some(op) };
     }
-    match ctx.last_exc_value() {
+    match ctx.last_exc_value().filter(|&exc| Some(exc) != exc_before) {
         Some(_) => {
             // Recording-time cells must not leak into a later loop.
             // The compiled path consumes them via `GUARD_EXCEPTION`
@@ -12723,7 +12748,7 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
     ref_args: &[OpRef],
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
-) -> Result<DispatchOutcome, DispatchError> {
+) -> Result<InlineCallOutcome, DispatchError> {
     // `pyjitpl.py MIFrame.setup` walks the *callee* jitcode with that
     // jitcode's own descrs.  Build-time helpers (`from_canonical`)
     // resolve `d`/`j` through the process-wide table.  The caller's
@@ -12798,14 +12823,14 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                         ctx, pc, op_tag, ref_args, dst, dst_bank,
                     )
                 })? {
-                    return Ok(outcome);
+                    return Ok(outcome.into());
                 }
                 if let Some(outcome) = spec_gate(SpecFold::BinaryOpFloat, || {
                     super::specialize::try_emit_exact_float_binop(
                         ctx, pc, op_tag, ref_args, dst, dst_bank,
                     )
                 })? {
-                    return Ok(outcome);
+                    return Ok(outcome.into());
                 }
                 if matches!(
                     pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
@@ -12813,7 +12838,7 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 ) && let Some(outcome) = spec_gate(SpecFold::Subscr, || {
                     super::specialize::try_emit_list_int_getitem(ctx, pc, ref_args, dst, dst_bank)
                 })? {
-                    return Ok(outcome);
+                    return Ok(outcome.into());
                 }
             } else if fbw_debug_abort_enabled() {
                 let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
@@ -12835,7 +12860,7 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 float_args,
             )
         }
-        other => other,
+        other => other.map(InlineCallOutcome::from),
     }
 }
 
@@ -12945,6 +12970,25 @@ fn inline_fnaddr_call_setup_from_jc<Sym: WalkSym>(
     })
 }
 
+/// A helper CALL's outcome plus whether the CALL was turned into a residual
+/// that already recorded its own post-call exception guard.
+///
+/// A caller that adds a second guard of its own from the operator tag would
+/// record `GUARD_NO_EXCEPTION` twice for one call.
+struct InlineCallOutcome {
+    outcome: DispatchOutcome,
+    guard_no_exception_recorded: bool,
+}
+
+impl From<DispatchOutcome> for InlineCallOutcome {
+    fn from(outcome: DispatchOutcome) -> Self {
+        Self {
+            outcome,
+            guard_no_exception_recorded: false,
+        }
+    }
+}
+
 /// `cpu.bh_call_*(jitcode.fnaddr, ...)` for a helper body the walker
 /// could not record.  The codewriter already required a callable
 /// `fnaddr` (`fully_bound_callee_body`); blackhole uses the same
@@ -12957,7 +13001,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     int_args: &[OpRef],
     ref_args: &[OpRef],
     float_args: &[OpRef],
-) -> Result<DispatchOutcome, DispatchError> {
+) -> Result<InlineCallOutcome, DispatchError> {
     let InlineFnaddrCall {
         fnaddr,
         allboxes,
@@ -13021,10 +13065,25 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
             .profiler()
             .count_ops(call_opcode, majit_metainterp::counters::OPS);
     }
+    // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
+    // `record_result_of_call_pure` can cut it back out.
+    let patch_pos = ctx.trace_ctx.get_trace_position();
     let recorded = ctx
         .trace_ctx
         .record_op_with_descr(call_opcode, &allboxes, descr.clone());
-    if profiled_call {
+    // `MIFrame.execute_varargs(pure=True)` parity — see
+    // `dispatch_residual_call_iRd_kind` for the upstream walk.
+    let recorded = super::residual_call::try_fold_pure_call_via_executor(
+        ctx,
+        call_opcode,
+        &allboxes,
+        call_descr,
+        descr.clone(),
+        patch_pos,
+        recorded,
+    );
+    // See `dispatch_residual_call_iRd_kind`: count only a standing call.
+    if profiled_call && recorded.inline_const_to_value().is_none() {
         ctx.trace_ctx
             .profiler()
             .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
@@ -13087,15 +13146,19 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
         return Ok(DispatchOutcome::SubRaise {
             exc,
             exc_concrete: ctx.last_exc_value_concrete(),
-        });
+        }
+        .into());
     }
     if can_raise {
         ctx.trace_ctx
             .record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
-    Ok(DispatchOutcome::SubReturn {
-        result: (dst_bank != 'v').then_some(recorded),
+    Ok(InlineCallOutcome {
+        outcome: DispatchOutcome::SubReturn {
+            result: (dst_bank != 'v').then_some(recorded),
+        },
+        guard_no_exception_recorded: can_raise,
     })
 }
 
@@ -13124,71 +13187,6 @@ pub fn subwalk_resume_counts() -> (u64, u64) {
 
 pub fn subwalk_heap_clone_count() -> u64 {
     SUBWALK_HEAP_CLONES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// If the driver just finished a nested callee at this CALL pc with
-/// `SubReturn`, consume it and write dest.  `step` has already run the
-/// live/vstack/merge-point bookkeeping; this skips only the handler
-/// prefix (`specialize`, arg decode, a second `run_sub_jitcode_walk`).
-///
-/// `SubRaise` and errors stay in `completed` so the existing CALL
-/// handler still owns `catch_exception` and abort latching.
-pub(crate) fn try_finish_replayed_call_subreturn<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &crate::jitcode_runtime::DecodedOp,
-) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
-    // `pyjitpl.py finishframe` writes dest for `inline_call_*` only.
-    // A `residual_call_*` that suspended for a nested helper still has
-    // its Rust continuation to run (`try_walker_orthodox_descent`,
-    // `orthodox_list_append_commit` journal/apply).  Consuming that
-    // `SubReturn` here skips those epilogues.
-    if !op.opname.starts_with("inline_call_") {
-        return None;
-    }
-    let Some((dst_bank, dst, next_pc)) = call_opcode_result_dst(code, op.pc) else {
-        return None;
-    };
-    let pointer = SUBWALK_DRIVER.with(|slot| slot.get());
-    if pointer.is_null() {
-        return None;
-    }
-    // SAFETY: `SubWalkDriverGuard` installs this pointer for the enclosing
-    // `drive` call.  `step` runs only while that guard is live.
-    let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
-    let matches_subreturn = exchange.completed.as_ref().is_some_and(|completed| {
-        completed.parent_id == exchange.active_frame_id
-            && completed.caller_pc == op.pc
-            && matches!(completed.result, Ok(DispatchOutcome::SubReturn { .. }))
-    });
-    if !matches_subreturn {
-        return None;
-    }
-    let completed = exchange.completed.take().unwrap();
-    let Ok(DispatchOutcome::SubReturn { result }) = completed.result else {
-        unreachable!("matches_subreturn required SubReturn");
-    };
-    ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
-    if let DispatchOutcome::SubRaise { exc, exc_concrete } =
-        promote_published_null_return(ctx, DispatchOutcome::SubReturn { result }, op.pc)
-    {
-        return Some(Ok((
-            DispatchOutcome::SubRaise { exc, exc_concrete },
-            next_pc,
-        )));
-    }
-    let applied = match finish_inline_callee_return(ctx, result) {
-        Some(value) => super::residual_call::write_residual_call_result_to_dst(
-            ctx, op.pc, dst, dst_bank, value,
-        )
-        .is_ok(),
-        None => dst_bank == 'v',
-    };
-    if !applied {
-        return Some(Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }));
-    }
-    SUBWALK_DIRECT_RESUME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Some(Ok((DispatchOutcome::Continue, next_pc)))
 }
 
 struct SubWalkDriverGuard {
@@ -13224,6 +13222,10 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     _helper_live: HelperLiveGuard<'a>,
     id: usize,
     caller_pc: usize,
+    /// The caller's `last_exc_value` when this frame was pushed.  The slot is
+    /// session-wide, so only a value this frame installed marks its NULL
+    /// return as the publish-and-return-NULL convention.
+    caller_exc_before: Option<OpRef>,
     pc: usize,
     body: SubJitCodeBody,
     seed_from_active_resume: bool,
@@ -13269,6 +13271,8 @@ struct PendingSubReturn {
     dst: usize,
     caller_pc: usize,
     result: Option<OpRef>,
+    /// `SubWalkFrame::caller_exc_before` of the callee that produced `result`.
+    exc_before: Option<OpRef>,
 }
 
 impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
@@ -13323,13 +13327,16 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         // vstack/live bookkeeping before it suspended.
         let mut published_raise = None;
         let dest_err = if let Some(pending) = self.pending_subreturn.take() {
-            if let DispatchOutcome::SubRaise { exc, exc_concrete } = promote_published_null_return(
-                &mut walk_ctx,
-                DispatchOutcome::SubReturn {
-                    result: pending.result,
-                },
-                pending.caller_pc,
-            ) {
+            if let DispatchOutcome::SubRaise { exc, exc_concrete } =
+                promote_published_null_return_since(
+                    &mut walk_ctx,
+                    DispatchOutcome::SubReturn {
+                        result: pending.result,
+                    },
+                    pending.caller_pc,
+                    pending.exc_before,
+                )
+            {
                 published_raise = Some(DispatchOutcome::SubRaise { exc, exc_concrete });
                 None
             } else {
@@ -13568,6 +13575,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     let frame = self.pop_frame();
                     let class_state = frame.fbw_mode.class_of_last_exc_is_const;
                     let caller_pc = frame.caller_pc;
+                    let caller_exc_before = frame.caller_exc_before;
                     let result = result.map(|(outcome, _)| outcome);
                     let Some(parent) = self.frames.last_mut() else {
                         return result.map(|outcome| (outcome, class_state));
@@ -13582,6 +13590,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                             dst,
                             caller_pc,
                             result: *ret,
+                            exc_before: caller_exc_before,
                         });
                         parent.pc = next_pc;
                         continue;
@@ -13609,12 +13618,16 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
 /// local replay continuation needs a heap-cache checkpoint for that CALL's
 /// preamble, not for scalar operations, field reads or control flow. Both
 /// direct inline calls and descents entered through residual-call handlers
-/// can suspend. A non-call clears the checkpoint, so an unexpected suspension
-/// fails at the driver's existing assertion rather than reusing stale state.
+/// can suspend. A non-call clears the checkpoint, so a suspension from an
+/// opcode that took none finds the slot empty and the driver cuts nothing,
+/// rather than replaying against another opcode's heap state.
+///
+/// The checkpoint itself is cloned later, by
+/// [`snapshot_residual_heap_before_suspend`] at the suspend, so this mark
+/// needs only the opname and the trace position.
 pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
     opname: &str,
     trace_position: majit_metainterp::recorder::TracePosition,
-    _heap_cache: &majit_metainterp::heapcache::HeapCache,
 ) {
     SUBWALK_DRIVER.with(|slot| {
         let pointer = slot.get();
@@ -13694,7 +13707,7 @@ mod subwalk_checkpoint_tests {
             ("inline_call_irf_v", false),
             ("int_return", false),
         ] {
-            note_subwalk_driver_step::<crate::state::PyreSym>(opname, position, &heap_cache);
+            note_subwalk_driver_step::<crate::state::PyreSym>(opname, position);
             assert_eq!(
                 exchange.step_heap_cache.is_some(),
                 keeps_checkpoint,
@@ -13702,11 +13715,7 @@ mod subwalk_checkpoint_tests {
             );
             assert_eq!(exchange.step_trace_position, Some(position));
         }
-        note_subwalk_driver_step::<crate::state::PyreSym>(
-            "residual_call_ir_r",
-            position,
-            &heap_cache,
-        );
+        note_subwalk_driver_step::<crate::state::PyreSym>("residual_call_ir_r", position);
         assert!(exchange.step_heap_cache.is_none());
         snapshot_residual_heap_before_suspend::<crate::state::PyreSym>(&heap_cache);
         assert!(exchange.step_heap_cache.is_some());
@@ -13932,6 +13941,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         },
         id: frame_id,
         caller_pc: pc,
+        caller_exc_before: ctx.last_exc_value(),
         pc: start_pc,
         body: sub_body.clone(),
         seed_from_active_resume: start_pc == 0,
@@ -14138,6 +14148,9 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         }
     }
 
+    // Bracket the session-wide exception slot around the callee so a NULL
+    // return only reads as a raise when the callee installed the exception.
+    let exc_before_subwalk = ctx.last_exc_value();
     let callee_result = run_inline_call_subwalk(
         ctx,
         code,
@@ -14151,7 +14164,8 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         &arg_concretes,
         &[],
     );
-    let callee_outcome = promote_published_null_return(ctx, callee_result?, op.pc);
+    let callee_outcome =
+        promote_published_null_return_since(ctx, callee_result?.outcome, op.pc, exc_before_subwalk);
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -14299,9 +14313,14 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 /// `registers_r[dst]` (paired with callee `ref_return/r`), `'i'`
 /// writes to `registers_i[dst]` (paired with callee `int_return/i`).
 ///
-/// Inplace add/sub/mul/and/or/xor.  Inplace `//` / `%` stay off this
-/// emit: `acc //= 0` in a compiled-then-raise loop must remain a
-/// residual so the except bridge can blackhole (`exception_loop_warmup`).
+/// Inplace add/sub/mul/and/or/xor, excluding inplace `//` and `%`: `acc //= 0`
+/// in a compiled-then-raise loop must remain a residual so the except bridge
+/// can blackhole (`exception_loop_warmup`).
+///
+/// This is the admission test for the NAMED-helper arms only — a body such as
+/// `inplace_add` whose tag has to be recovered from the helper index.  A call
+/// the walk has identified as `binary_value_from_tag` carries its tag in the
+/// I-list and is admitted whatever that tag is.
 fn inplace_int_arith_tag(tag: i64) -> bool {
     use pyre_interpreter::bytecode::BinaryOperator as B;
     matches!(
@@ -14441,8 +14460,14 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // walk dest-writes a wrap.  Skipping `GUARD_FALSE` of a proven
     // `int_eq(0, 0)` avoided InvalidLoop but left that wrap as the
     // compiled result (`exception_loop_warmup`).
+    //
+    // The raw I-list concrete is a BINARY tag only for `binary_value_from_tag`.
+    // `compare_value_from_tag` puts a COMPARE tag in the same slot, so reading
+    // it as a BINARY tag makes every `a < b` look like a divisor operand.  The
+    // helper-index fallback keys on the callee's name instead, so it needs no
+    // such gate.
     let zero_div_tag = match int_arg_concretes.first() {
-        Some(ConcreteValue::Int(tag)) => Some(*tag),
+        Some(ConcreteValue::Int(tag)) if is_binary_from_tag => Some(*tag),
         _ => super::specialize::binary_op_tag_for_helper_index(sub_index, &int_arg_concretes),
     };
     if dst_bank == 'r'
@@ -14475,12 +14500,13 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             .unwrap_or_else(|| ctx.trace_ctx.const_int(op_tag));
         let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
         // Emit the machine-int body before descending `binary_value_from_tag`.
-        // The descent walks `int_add_ovf`; a bridge InputArg for `total`
-        // has no sidecar stamp, so that walk used to abort the except
-        // path (`IntOvfOperandNotConcrete`) before this emit ran.
-        // Boxed concretes are available here (`try_emit_exact_int_binop`
-        // reads the heap objects), so `total += 2` after a caught raise
-        // records `int_add_ovf` instead of aborting the bridge.
+        // The descent walks `int_add_ovf`; a bridge InputArg for `total` has
+        // no sidecar stamp, so that walk used to abort the except path before
+        // this emit ran.  Boxed concretes are available here
+        // (`try_emit_exact_int_binop` reads the heap objects), so `total += 2`
+        // after a caught raise records `int_add_ovf` instead of aborting the
+        // bridge.  `record_int_ovf` now takes its guarded arm for an unknown
+        // operand rather than declining.
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::BinaryOpDescent, || {
@@ -14649,7 +14675,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 .is_some_and(|obj| unsafe { pyre_object::is_complex(obj) })
         })
     {
-        let outcome = residualize_inline_call_via_fnaddr(
+        let residualized = residualize_inline_call_via_fnaddr(
             ctx,
             code,
             op.pc,
@@ -14658,9 +14684,12 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             &ref_args,
             &[],
         )?;
-        return Ok((outcome, op.next_pc));
+        return Ok((residualized.outcome, op.next_pc));
     }
 
+    // Bracket the session-wide exception slot around the callee so a NULL
+    // return only reads as a raise when the callee installed the exception.
+    let exc_before_subwalk = ctx.last_exc_value();
     let walked = run_inline_call_subwalk(
         ctx,
         code,
@@ -14674,7 +14703,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         &ref_arg_concretes,
         &[],
     )?;
-    let callee_outcome = promote_published_null_return(ctx, walked, op.pc);
+    let guard_no_exception_recorded = walked.guard_no_exception_recorded;
+    let callee_outcome =
+        promote_published_null_return_since(ctx, walked.outcome, op.pc, exc_before_subwalk);
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -14700,21 +14731,37 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                         "dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"
                     ),
                 }
-                maybe_guard_no_exception_after_raising_binop(ctx, op.pc, &int_arg_concretes)?;
-                if let Some(ConcreteValue::Int(tag)) = int_arg_concretes.first().copied() {
-                    use pyre_interpreter::bytecode::BinaryOperator as B;
-                    if matches!(
-                        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
-                        Some(
-                            B::FloorDivide
-                                | B::InplaceFloorDivide
-                                | B::Remainder
-                                | B::InplaceRemainder
-                        )
-                    ) {
-                        super::specialize::walker_guard_int_div_domain_if_exact(
-                            ctx, op.pc, &ref_args,
+                // The first I-list concrete reads as a BINARY tag only when
+                // the callee is `binary_value_from_tag`.  The same slot holds
+                // a COMPARE tag for `compare_value_from_tag` — `is` and
+                // `is_not` are 8 and 9, which decode as `<<` and `>>` — so
+                // every `x is y` recorded a guard for an operator the call
+                // never performs.
+                if is_binary_from_tag {
+                    // A CALL residualized through `jitcode.fnaddr` already
+                    // recorded its own `GUARD_NO_EXCEPTION`.
+                    if !guard_no_exception_recorded {
+                        maybe_guard_no_exception_after_raising_binop(
+                            ctx,
+                            op.pc,
+                            &int_arg_concretes,
                         )?;
+                    }
+                    if let Some(ConcreteValue::Int(tag)) = int_arg_concretes.first().copied() {
+                        use pyre_interpreter::bytecode::BinaryOperator as B;
+                        if matches!(
+                            pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
+                            Some(
+                                B::FloorDivide
+                                    | B::InplaceFloorDivide
+                                    | B::Remainder
+                                    | B::InplaceRemainder
+                            )
+                        ) {
+                            super::specialize::walker_guard_int_div_domain_if_exact(
+                                ctx, op.pc, &ref_args,
+                            )?;
+                        }
                     }
                 }
                 Ok((DispatchOutcome::Continue, op.next_pc))
@@ -14884,6 +14931,9 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // Bracket the session-wide exception slot around the callee so a NULL
+    // return only reads as a raise when the callee installed the exception.
+    let exc_before_subwalk = ctx.last_exc_value();
     let callee_result = run_inline_call_subwalk(
         ctx,
         code,
@@ -14897,7 +14947,8 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         &ref_arg_concretes,
         &float_args,
     );
-    let callee_outcome = promote_published_null_return(ctx, callee_result?, op.pc);
+    let callee_outcome =
+        promote_published_null_return_since(ctx, callee_result?.outcome, op.pc, exc_before_subwalk);
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {

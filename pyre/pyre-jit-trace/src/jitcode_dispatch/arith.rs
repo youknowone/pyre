@@ -209,10 +209,18 @@ pub(crate) fn record_int_ovf<Sym: WalkSym>(
     }) else {
         // `pyjitpl.py opimpl_int_add_jump_if_ovf` records `INT_*_OVF`
         // via `execute` and then `handle_possible_overflow_error`.
-        // A bridge InputArg may have no sidecar stamp even though the
-        // helper walk is on the sequential (no-overflow) arm.  Record
-        // the op and take that arm instead of aborting the except
-        // bridge (`total += 2` after a caught raise).
+        // A bridge InputArg may have no sidecar stamp, so neither operand's
+        // value is known here and overflow cannot be decided.
+        //
+        // The `false` returned with the recorded op is the GUARDED arm, not a
+        // claim that the operation did not overflow: the wrapper reads it as
+        // "no overflow was proven at trace time" and emits `GUARD_NO_OVERFLOW`
+        // for the non-constant result, so a run that does overflow deopts.
+        // This arm also stamps no concrete on `resbox`, which is why callers
+        // that need the value — `try_emit_exact_int_binop` — recompute
+        // overflow from the heap objects instead of trusting this flag.
+        //
+        // `pc` belongs to the signature the `specialize.rs` callers use.
         let _ = pc;
         count_ops_executed(ctx, opcode);
         count_ops_recorded(ctx, opcode);
