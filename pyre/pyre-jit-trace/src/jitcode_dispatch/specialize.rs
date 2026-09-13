@@ -17956,10 +17956,10 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
 /// `setarrayitem_gc` + `bh_build_string_from_array`.  Recover the
 /// fragment boxes from the backing-array heap-cache (the same
 /// [`try_walker_specialize_newtuple`] read) and left-fold
-/// `descr_add` (`getfield _utf8` + `OS_STR_CONCAT` + `new_with_vtable`),
+/// `descr_add` (`getfield _utf8` + `OS_STR_CONCAT` + residual `newutf8`),
 /// the channel [`try_walker_specialize_binary_op_str`] already records
 /// for `BINARY_OP ADD` of two exact `str`s.  A one-fragment BUILD_STRING
-/// is the operand itself.
+/// declines: `BUILD_STRING` always allocates (`newutf8(builder.build())`).
 ///
 /// `Utf8StringBuilder` look-inside (`rutf8.py`) remains the next port
 /// for a single virtualized build.  The left-fold uses the same
@@ -18010,9 +18010,12 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         walker_guard_exact_str(ctx, op_pc, frag)?;
     }
 
+    // `pyopcode.py BUILD_STRING` always does `Utf8StringBuilder` +
+    // `space.newutf8(builder.build(), …)`, including `itemcount == 1`.
+    // Returning the fragment itself makes `f"{s}" is s` True for a
+    // one-piece BUILD_STRING; decline so the residual allocates.
     if fragments.len() == 1 {
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, fragments[0])?;
-        return Ok(Some(()));
+        return Ok(None);
     }
 
     let mut acc = fragments[0];
