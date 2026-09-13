@@ -6481,7 +6481,7 @@ mod tests {
     }
 
     #[test]
-    fn ref_inputarg_longevity_spans_the_trace() {
+    fn ref_inputarg_longevity_follows_failargs() {
         let i0 = OpRef::input_arg_typed(0, Type::Int);
         let vm = OpRef::input_arg_typed(1, Type::Ref);
         let add = OpRef::int_op(0);
@@ -6497,8 +6497,8 @@ mod tests {
         let longevity = compute_vars_longevity(&inputargs, &ops);
         assert_eq!(
             longevity.get(vm).unwrap().last_usage,
-            2,
-            "a Ref red stays allocated through the last op so a guard dump reads it"
+            1,
+            "compute_vars_longevity: last_usage is the last failarg/arg use"
         );
     }
 
