@@ -5722,11 +5722,33 @@ fn build_jit_driver_pair() -> JitDriverPair {
         for addr in pyre_jit_trace::helpers::walker_void_word_helper_addrs() {
             majit_backend_wasm::vouch_residual_call_addr(addr);
         }
+        use pyre_interpreter::module::math::interp_math as math;
         use pyre_interpreter::objspace::descroperation as desc;
+        use pyre_object::longobject as long;
+        use pyre_object::unicodeobject as uni;
         for addr in [
             desc::jit_bigint_add_int_int as *const () as usize as i64,
             desc::jit_bigint_sub_int_int as *const () as usize as i64,
             desc::jit_bigint_mul_int_int as *const () as usize as i64,
+            desc::jit_bigint_int_div_floor as *const () as usize as i64,
+            desc::jit_bigint_int_mod_int_result as *const () as usize as i64,
+            desc::jit_bigint_int_divmod as *const () as usize as i64,
+            desc::jit_bigint_int_pow_nomod as *const () as usize as i64,
+            desc::jit_bigint_lshift_count as *const () as usize as i64,
+            desc::jit_bigint_shr as *const () as usize as i64,
+            desc::jit_w_long_floordiv_raw as *const () as usize as i64,
+            desc::jit_w_long_mod_raw as *const () as usize as i64,
+            math::jit_math_isqrt_i64 as *const () as usize as i64,
+            long::jit_bigint_fits_int as *const () as usize as i64,
+            long::jit_bigint_cmp as *const () as usize as i64,
+            uni::jit_str_concat as *const () as usize as i64,
+            uni::jit_str_compare as *const () as usize as i64,
+            uni::jit_str_startswith as *const () as usize as i64,
+            uni::jit_str_endswith as *const () as usize as i64,
+            uni::jit_int_str as *const () as usize as i64,
+            uni::jit_str_getitem as *const () as usize as i64,
+            majit_metainterp::blackhole::ll_int_py_div as *const () as usize as i64,
+            majit_metainterp::blackhole::ll_int_py_mod as *const () as usize as i64,
         ] {
             majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
         }
