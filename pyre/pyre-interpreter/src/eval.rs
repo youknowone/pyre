@@ -3697,6 +3697,10 @@ impl TruthOpcodeHandler for PyFrame {
     ) -> Result<Self::Value, PyError> {
         Ok(bool_value_from_truth(if negate { !truth } else { truth }))
     }
+
+    fn unary_not_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError> {
+        crate::opcode_ops::unary_not_value(value)
+    }
 }
 
 impl ControlFlowOpcodeHandler for PyFrame {

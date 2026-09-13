@@ -514,6 +514,7 @@ pub trait TruthOpcodeHandler: SharedOpcodeHandler {
         truth: Self::Truth,
         negate: bool,
     ) -> Result<Self::Value, PyError>;
+    fn unary_not_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError>;
 }
 
 pub trait ControlFlowOpcodeHandler: SharedOpcodeHandler {
@@ -874,11 +875,9 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
 
 pub fn opcode_unary_not<H: TruthOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
     let value = handler.pop_value()?;
-    // `space.is_true()` may call application code.  This is the explicit
-    // counterpart of the translated live `self` around PyPy's unary opcode.
+    // `unaryoperation("not_")` keeps `self` live across `space.not_`.
     let anchor = handler.anchor();
-    let truth = handler.truth_value(value)?;
-    let result = handler.bool_value_from_truth(truth, true)?;
+    let result = handler.unary_not_value(value)?;
     H::push_anchored(&anchor, result)
 }
 

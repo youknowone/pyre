@@ -80,31 +80,27 @@ fn a_generic_caller_types_an_assoc_type_result_through_the_unique_impl() {
 }
 
 #[test]
-fn the_same_projection_resolves_in_a_provided_default_body() {
-    // `opcode_unary_not` is the second caller of the same projection, and
-    // `record_branch_guard` is the provided body that reaches it from the
-    // trait side rather than from the impl.
+fn opcode_unary_not_calls_space_not() {
+    // `unaryoperation("not_")` is `space.not_`, not a hand-composed
+    // `truth_value` + invert.  The generic caller must name that body so
+    // flatten can emit `inline_call_r_r` of `baseobjspace::not_`.
     let graph = lower("pyre_interpreter::pyopcode::opcode_unary_not");
     let mut seen = 0usize;
     for block in &graph.blocks {
         for op in &block.operations {
-            let OpKind::Call {
-                target, result_ty, ..
-            } = &op.kind
-            else {
+            let OpKind::Call { target, .. } = &op.kind else {
                 continue;
             };
             let CallTarget::FunctionPath { segments } = target else {
                 continue;
             };
-            if segments.last().map(String::as_str) != Some("truth_value") {
-                continue;
+            let last = segments.last().map(String::as_str);
+            if last == Some("unary_not_value") || last == Some("not_") {
+                seen += 1;
             }
-            seen += 1;
-            assert_eq!(*result_ty, ValueType::Bool);
         }
     }
-    assert_eq!(seen, 1, "opcode_unary_not calls truth_value once");
+    assert_eq!(seen, 1, "opcode_unary_not calls unary_not_value / not_ once");
 }
 
 #[test]

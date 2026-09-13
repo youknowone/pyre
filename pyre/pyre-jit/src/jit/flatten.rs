@@ -3759,11 +3759,10 @@ pub struct LoweringContext {
     /// unpacks `*`/`**` and dispatches (user code → `MayForce`).
     pub call_function_ex_fn_idx: u16,
     /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
-    /// `not_(value)` op (pyopcode.py:651) lowered to
-    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
-    /// [`lower_unary_not_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE shape);
-    /// `bh_unary_not_fn` returns `not value` as a bool (a user `__bool__` /
-    /// `__len__` may force virtualizables → `MayForce`).
+    /// `not_(value)` op lowered to `residual_call_r_r` via
+    /// [`lower_unary_not_hlop_to_insn`]; walking `baseobjspace::not_` is
+    /// declined until `w_bool_from` is a select rather than a branch.
+    /// `bh_unary_not_fn` returns `not value` as a bool (`MayForce`).
     pub unary_not_fn_idx: u16,
     /// `load_fast_check_fn` descrs-pool index.  LOAD_FAST_CHECK records the
     /// `load_fast_check(value, code, name_idx)` HLOp lowered to
@@ -6931,9 +6930,11 @@ where
 /// Lower the UNARY_NOT object-space op `not_(value)` → `result: Ref`
 /// (pyopcode.py `unaryoperation("not_")`) to
 /// `residual_call_r_r(ConstInt(unary_not_fn_idx), ListR([value]), Descr) →
-/// reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
-/// `bh_unary_not_fn` returns `not value` as a bool; a user `__bool__` /
-/// `__len__` may force virtualizables → `MayForce`.
+/// reg`.  `baseobjspace::not_` is now a real jitcode (`space.not_`), but
+/// walking it records `w_bool_from`'s branch onto one bool singleton and
+/// guards the other — a toggling `not` then deopts every iteration.  The
+/// residual fold emits `int_is_true` / bool invert instead.  Inline once
+/// that boxing is a select, the same way `pos`/`neg`/`invert` already are.
 ///
 /// Returns `None` for non-`not_` opnames so the caller can fall through
 /// to other lowering arms.
@@ -13713,7 +13714,8 @@ mod tests {
 
     #[test]
     fn lower_unary_not_hlop_emits_unary_not_fn_residual() {
-        // MayForce — a user `__bool__` / `__len__` may run Python.
+        // Residual on purpose: walking `not_` currently guards one bool
+        // singleton.  See `lower_unary_not_hlop_to_insn`.
         assert_unary_lowering_emits_residual("not_", 110, |op, ctx, gr, lc| {
             super::lower_unary_not_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
         });

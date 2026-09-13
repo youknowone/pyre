@@ -5106,9 +5106,14 @@ pub fn flag_sequence_bug_compat(w_type: PyObjectRef) -> bool {
         && unsafe { pyre_object::typeobject::w_type_get_flag_sequence_bug_compat(w_type) }
 }
 
-/// Python-level `not` operation. descroperation.py:289-290
-/// `not_ = space.newbool(not space.is_true(w_obj))`; the `is_true` call
-/// may raise, so the result is fallible.
+/// Python-level `not` operation. `baseobjspace.py not_` is
+/// `space.newbool(not space.is_true(w_obj))`; the `is_true` call may raise,
+/// so the result is fallible.
+///
+/// `inline(never)` is load-bearing: rustc otherwise folds this body into
+/// `unary_not_value` and the codewriter never mints the graph named by
+/// `flatten.rs build_orthodox_inline_call_r_r`.
+#[inline(never)]
 pub fn not_(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     Ok(w_bool_from(!is_true(obj)?))
 }

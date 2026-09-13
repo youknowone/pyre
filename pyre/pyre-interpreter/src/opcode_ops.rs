@@ -292,6 +292,10 @@ pub fn unary_positive_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> 
     crate::baseobjspace::pos(value)
 }
 
+pub fn unary_not_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    crate::baseobjspace::not_(value)
+}
+
 /// CALL_INTRINSIC_1 ListToTuple — convert a list to a tuple (star
 /// unpacking).  Shared by the interpreter's `list_to_tuple` and the JIT
 /// residual `bh_list_to_tuple_fn`.  Allocates a fresh tuple.
@@ -1104,6 +1108,14 @@ pub extern "C" fn jit_descroperation_invert(value: i64) -> i64 {
 #[inline(never)]
 pub extern "C" fn jit_descroperation_pos(value: i64) -> i64 {
     jit_unary_positive_value(value)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_not_(value: i64) -> i64 {
+    match unary_not_value(value as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
 }
 
 #[majit_macros::jit_may_force]
