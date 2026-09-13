@@ -111,10 +111,10 @@ pub mod blackhole;
 pub mod box_trace;
 pub use box_trace::{
     CompareOpResidual, ElidableIntResidual, ElidableRefResidual, ExactIntFalseResidual,
-    IdentityRefResidual, VoidSkipResidual, WrapintResidual, register_compare_op_residual,
-    register_elidable_int_residual, register_elidable_ref_residual,
-    register_exact_int_false_residual, register_identity_ref_residual, register_void_skip_residual,
-    register_wrapint_residual,
+    FrameAnchorLiveResidual, IdentityRefResidual, VoidSkipResidual, WrapintResidual,
+    register_compare_op_residual, register_elidable_int_residual, register_elidable_ref_residual,
+    register_exact_int_false_residual, register_frame_anchor_live_residual,
+    register_identity_ref_residual, register_void_skip_residual, register_wrapint_residual,
 };
 pub(crate) mod call_descr;
 pub(crate) mod compile;
