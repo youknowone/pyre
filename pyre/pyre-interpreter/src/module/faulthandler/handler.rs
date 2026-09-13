@@ -120,7 +120,9 @@ pub fn walk_faulthandler_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let mut forward = |addr: usize| -> usize {
         let mut slot: pyre_object::PyObjectRef = addr as pyre_object::PyObjectRef;
         // SAFETY: `PyObjectRef` and `GcRef` are layout-compatible.
-        visitor(unsafe { &mut *(&mut slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) });
+        visitor(unsafe {
+            &mut *(&mut slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef)
+        });
         slot as usize
     };
     let fatal = FAULTHANDLER_FILE.load(std::sync::atomic::Ordering::Relaxed);
@@ -173,10 +175,8 @@ fn faulthandler_write_decimal(fd: i32, mut value: usize) {
 /// callback must remain allocation-free.
 #[cfg(all(windows, feature = "host_env"))]
 unsafe fn faulthandler_dump_current_traceback(fd: i32) {
-    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-
     rustpython_host_env::faulthandler::write_fd(fd, b"Current thread 0x");
-    let thread_id = unsafe { GetCurrentThreadId() } as usize;
+    let thread_id = rustpython_host_env::faulthandler::current_thread_id() as usize;
     let mut hex = [0u8; 2 * std::mem::size_of::<usize>()];
     let mut start = hex.len();
     let mut value = thread_id;
@@ -292,7 +292,10 @@ unsafe extern "system" fn faulthandler_exc_handler(
 #[cfg(windows)]
 const WINDOWS_EXCEPTIONS: [(&str, i32); 5] = [
     ("_EXCEPTION_ACCESS_VIOLATION", EXCEPTION_ACCESS_VIOLATION),
-    ("_EXCEPTION_INT_DIVIDE_BY_ZERO", EXCEPTION_INT_DIVIDE_BY_ZERO),
+    (
+        "_EXCEPTION_INT_DIVIDE_BY_ZERO",
+        EXCEPTION_INT_DIVIDE_BY_ZERO,
+    ),
     ("_EXCEPTION_NONCONTINUABLE", 0x1),
     ("_EXCEPTION_NONCONTINUABLE_EXCEPTION", 0xc000_0025u32 as i32),
     ("_EXCEPTION_STACK_OVERFLOW", 0xc000_00fdu32 as i32),
@@ -556,7 +559,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // instead of silent success.  Through the stderr seam, so it
             // reaches an embedder that has no fd 2 and every host gets it, not
             // just the ones with a `libc::write`.
-            crate::host_seam::emit_stderr(b"<faulthandler: pyre has no Python-level traceback yet>\n");
+            crate::host_seam::emit_stderr(
+                b"<faulthandler: pyre has no Python-level traceback yet>\n",
+            );
             Ok(pyre_object::w_none())
         }),
     );
@@ -693,8 +698,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     let _state = lock_faulthandler_state();
-                    let changed =
-                        rustpython_host_env::faulthandler::unregister_user_signal(signum);
+                    let changed = rustpython_host_env::faulthandler::unregister_user_signal(signum);
                     // `handler.py` `self.user_w_files.pop(signum, None)`,
                     // run whether or not the signal was registered.
                     clear_user_signal_file(signum);
@@ -833,12 +837,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // `panic_cannot_unwind`, so finish with the same silent
                     // process status the unhandled SEH would have produced.
                     if code == 0xE06D_7363 || code == 0xE043_4352 {
-                        unsafe {
-                            windows_sys::Win32::System::Threading::TerminateProcess(
-                                windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                                code,
-                            );
-                        }
+                        rustpython_host_env::winapi::terminate_process(
+                            rustpython_host_env::winapi::get_current_process(),
+                            code,
+                        );
                     }
                     rustpython_host_env::faulthandler::raise_exception(code, flags);
                 }

@@ -808,7 +808,7 @@ pub fn install_builtin_modules() {
         // no host layer publishes it and the numbers, and leaves out the
         // entry points that would need a descriptor.
         pyre_install_module!(_socket);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
         pyre_install_module!(_ssl);
         #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!(mmap);

@@ -3295,7 +3295,7 @@ dependencies = [
 [[package]]
 name = "rustpython-codegen"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=53f518eed34df2c5a161d535d8a987f546a1fd3f#53f518eed34df2c5a161d535d8a987f546a1fd3f"
+source = "git+https://github.com/RustPython/RustPython.git?rev=6e3129a85290367595ce1bbf6e452ef8db7d973f#6e3129a85290367595ce1bbf6e452ef8db7d973f"
 dependencies = [
  "bitflags 2.13.0",
  "indexmap",
@@ -3318,7 +3318,7 @@ dependencies = [
 [[package]]
 name = "rustpython-common"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=53f518eed34df2c5a161d535d8a987f546a1fd3f#53f518eed34df2c5a161d535d8a987f546a1fd3f"
+source = "git+https://github.com/RustPython/RustPython.git?rev=6e3129a85290367595ce1bbf6e452ef8db7d973f#6e3129a85290367595ce1bbf6e452ef8db7d973f"
 dependencies = [
  "ascii",
  "base64 0.23.1",
@@ -3358,7 +3358,7 @@ dependencies = [
 [[package]]
 name = "rustpython-compiler"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=53f518eed34df2c5a161d535d8a987f546a1fd3f#53f518eed34df2c5a161d535d8a987f546a1fd3f"
+source = "git+https://github.com/RustPython/RustPython.git?rev=6e3129a85290367595ce1bbf6e452ef8db7d973f#6e3129a85290367595ce1bbf6e452ef8db7d973f"
 dependencies = [
  "rustpython-codegen",
  "rustpython-compiler-core",
@@ -3372,7 +3372,7 @@ dependencies = [
 [[package]]
 name = "rustpython-compiler-core"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=53f518eed34df2c5a161d535d8a987f546a1fd3f#53f518eed34df2c5a161d535d8a987f546a1fd3f"
+source = "git+https://github.com/RustPython/RustPython.git?rev=6e3129a85290367595ce1bbf6e452ef8db7d973f#6e3129a85290367595ce1bbf6e452ef8db7d973f"
 dependencies = [
  "bitflags 2.13.0",
  "bitflagset",
@@ -3388,7 +3388,7 @@ dependencies = [
 [[package]]
 name = "rustpython-host_env"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=53f518eed34df2c5a161d535d8a987f546a1fd3f#53f518eed34df2c5a161d535d8a987f546a1fd3f"
+source = "git+https://github.com/RustPython/RustPython.git?rev=6e3129a85290367595ce1bbf6e452ef8db7d973f#6e3129a85290367595ce1bbf6e452ef8db7d973f"
 dependencies = [
  "bitflags 2.13.0",
  "cc",
@@ -3430,7 +3430,7 @@ dependencies = [
 [[package]]
 name = "rustpython-literal"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=53f518eed34df2c5a161d535d8a987f546a1fd3f#53f518eed34df2c5a161d535d8a987f546a1fd3f"
+source = "git+https://github.com/RustPython/RustPython.git?rev=6e3129a85290367595ce1bbf6e452ef8db7d973f#6e3129a85290367595ce1bbf6e452ef8db7d973f"
 dependencies = [
  "hexf-parse",
  "is-macro",
@@ -3515,7 +3515,7 @@ dependencies = [
 [[package]]
 name = "rustpython-sre_engine"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=53f518eed34df2c5a161d535d8a987f546a1fd3f#53f518eed34df2c5a161d535d8a987f546a1fd3f"
+source = "git+https://github.com/RustPython/RustPython.git?rev=6e3129a85290367595ce1bbf6e452ef8db7d973f#6e3129a85290367595ce1bbf6e452ef8db7d973f"
 dependencies = [
  "bitflags 2.13.0",
  "num_enum",
@@ -3527,7 +3527,7 @@ dependencies = [
 [[package]]
 name = "rustpython-unicode"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=53f518eed34df2c5a161d535d8a987f546a1fd3f#53f518eed34df2c5a161d535d8a987f546a1fd3f"
+source = "git+https://github.com/RustPython/RustPython.git?rev=6e3129a85290367595ce1bbf6e452ef8db7d973f#6e3129a85290367595ce1bbf6e452ef8db7d973f"
 dependencies = [
  "icu_casemap",
  "icu_locale",
@@ -3541,7 +3541,7 @@ dependencies = [
 [[package]]
 name = "rustpython-wtf8"
 version = "0.5.0"
-source = "git+https://github.com/RustPython/RustPython.git?rev=53f518eed34df2c5a161d535d8a987f546a1fd3f#53f518eed34df2c5a161d535d8a987f546a1fd3f"
+source = "git+https://github.com/RustPython/RustPython.git?rev=6e3129a85290367595ce1bbf6e452ef8db7d973f#6e3129a85290367595ce1bbf6e452ef8db7d973f"
 dependencies = [
  "ascii",
  "bstr",

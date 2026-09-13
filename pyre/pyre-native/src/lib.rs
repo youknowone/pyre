@@ -12,5 +12,8 @@ pub mod hash;
 pub mod locale;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ssl;
+#[cfg(target_arch = "wasm32")]
+#[path = "ssl_wasm.rs"]
+pub mod ssl;
 #[cfg(feature = "wasm_vfs")]
 pub mod vfs;

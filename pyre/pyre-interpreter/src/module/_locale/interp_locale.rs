@@ -43,7 +43,8 @@ fn active_acp() -> u32 {
 
 #[cfg(all(windows, not(feature = "host_env"), not(feature = "sandbox")))]
 fn active_acp() -> u32 {
-    unsafe { windows_sys::Win32::Globalization::GetACP() }
+    // host_env owns GetACP; without it there is no ANSI code page to ask.
+    65001
 }
 
 #[cfg(all(
@@ -61,12 +62,15 @@ pub(crate) fn locale_encoding() -> String {
     }
 }
 
-#[cfg(not(any(all(windows, not(feature = "sandbox")), all(
-    unix,
-    feature = "host_env",
-    not(feature = "sandbox"),
-    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
-))))]
+#[cfg(not(any(
+    all(windows, not(feature = "sandbox")),
+    all(
+        unix,
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+    )
+)))]
 pub(crate) fn locale_encoding() -> String {
     // No host locale to ask, which is the answer `_Py_FORCE_UTF8_LOCALE`
     // builds give without asking one.
@@ -128,7 +132,7 @@ fn locale_error(message: &str) -> crate::PyError {
     err
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 fn windows_default_locale_component(lctype: u32) -> Option<String> {
     use windows_sys::Win32::Globalization::{GetLocaleInfoW, GetUserDefaultLCID};
 
@@ -398,7 +402,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // is Windows-only.  The locale name is built from the user's ISO
     // language and territory and reports the active ANSI code page separately.
     // PyPy publishes the same two-item shape from `getdefaultlocale`.
-    #[cfg(all(windows, not(feature = "sandbox")))]
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     crate::module_ns_store(
         ns,
         "_getdefaultlocale",
@@ -406,7 +410,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "_getdefaultlocale",
             |_| {
                 use windows_sys::Win32::Globalization::{
-                    LOCALE_SISO3166CTRYNAME, LOCALE_SISO639LANGNAME,
+                    LOCALE_SISO639LANGNAME, LOCALE_SISO3166CTRYNAME,
                 };
                 let language = windows_default_locale_component(LOCALE_SISO639LANGNAME);
                 let territory = windows_default_locale_component(LOCALE_SISO3166CTRYNAME);
@@ -549,7 +553,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 let out = rustpython_host_env::locale::setlocale(cat, c_locale.as_deref());
                 match out {
-                    Some(bytes) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(&bytes))),
+                    Some(bytes) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+                        &bytes,
+                    ))),
                     None => Err(locale_error("unsupported locale setting")),
                 }
             }
@@ -594,9 +600,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::nl_item
                     };
                     if item == libc::CODESET
-                        && let Some(bytes) = rustpython_host_env::locale::nl_langinfo_codeset() {
-                            return Ok(crate::typedef::charp2uni(&bytes));
-                        }
+                        && let Some(bytes) = rustpython_host_env::locale::nl_langinfo_codeset()
+                    {
+                        return Ok(crate::typedef::charp2uni(&bytes));
+                    }
                     // `interp_locale.py:151-154` — unknown items raise
                     // ValueError("unsupported langinfo constant").  POSIX
                     // nl_langinfo never returns NULL for valid items, so a
@@ -647,7 +654,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let ord = rustpython_host_env::locale::strcoll(&c1, &c2) as i64;
                     Ok(pyre_object::w_int_new(ord))
                 }
-                #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+                #[cfg(not(all(
+                    any(unix, windows),
+                    feature = "host_env",
+                    not(feature = "sandbox")
+                )))]
                 {
                     // No libc collation available (or sandbox build) — fall back
                     // to lexical comparison.  Pure computation, no I/O; under
@@ -672,9 +683,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             |args| {
                 let s = args[0];
                 if !unsafe { pyre_object::is_str(s) } {
-                    return Err(crate::PyError::type_error(
-                        "strxfrm() argument must be str",
-                    ));
+                    return Err(crate::PyError::type_error("strxfrm() argument must be str"));
                 }
                 let c = collation_arg(s)?;
                 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -702,9 +711,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // a plain utf-8 decode (lossy), matching `setlocale`;
                     // unlike `localeconv`/`nl_langinfo` it does not apply
                     // surrogateescape.
-                    Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(&out)))
+                    Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+                        &out,
+                    )))
                 }
-                #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+                #[cfg(not(all(
+                    any(unix, windows),
+                    feature = "host_env",
+                    not(feature = "sandbox")
+                )))]
                 {
                     // No libc collation available (or sandbox build) — the
                     // transform is identity, keeping the fixed "C" locale and
@@ -761,11 +776,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::module_ns_store(
             ns,
             "_getdefaultlocale",
-            crate::make_builtin_function_with_arity(
-                "_getdefaultlocale",
-                locale_unavailable,
-                0,
-            ),
+            crate::make_builtin_function_with_arity("_getdefaultlocale", locale_unavailable, 0),
         );
     }
     Ok(())

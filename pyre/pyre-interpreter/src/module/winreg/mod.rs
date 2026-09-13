@@ -1075,23 +1075,11 @@ mod imp {
     /// second one writes into.  `None` is the call having failed, which the
     /// caller spells with the code the system left behind.
     ///
-    /// `host_reg::expand_environment_strings` answers a `String`, so an
-    /// expansion holding an unpaired surrogate has no spelling it can give
-    /// back; the units are read here instead and carried across as themselves
-    /// (`PyUnicode_FromWideChar`).
+    /// The wide reader keeps unpaired surrogates (`PyUnicode_FromWideChar`).
     fn expand_environment_strings_wide(input: &WideCStr) -> Option<Wtf8Buf> {
-        use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
-        let size = unsafe { ExpandEnvironmentStringsW(input.as_ptr(), core::ptr::null_mut(), 0) };
-        if size == 0 {
-            return None;
-        }
-        let mut out = vec![0u16; size as usize];
-        let written = unsafe { ExpandEnvironmentStringsW(input.as_ptr(), out.as_mut_ptr(), size) };
-        if written == 0 {
-            return None;
-        }
-        let end = out.iter().position(|&unit| unit == 0).unwrap_or(out.len());
-        Some(Wtf8Buf::from_wide(&out[..end]))
+        host_reg::expand_environment_strings_wide(input)
+            .ok()
+            .map(|units| Wtf8Buf::from_wide(&units))
     }
 
     fn expand_environment_strings(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

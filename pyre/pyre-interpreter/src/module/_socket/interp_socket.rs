@@ -5815,29 +5815,34 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let returned = match cmd {
                 ws::SIO_RCVALL | ws::SIO_LOOPBACK_FAST_PATH => {
                     let value = masked_ulong_w(args[2])?;
-                    unsafe {
-                        rffi::wsa_ioctl(
-                            fd,
-                            cmd,
-                            (&raw const value).cast(),
-                            core::mem::size_of::<u32>() as u32,
-                        )
+                    #[cfg(feature = "host_env")]
+                    {
+                        rustpython_host_env::socket::ioctl_u32(fd as _, cmd, value).ok()
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = value;
+                        None
                     }
                 }
                 ws::SIO_KEEPALIVE_VALS => {
                     let [onoff, keepalivetime, keepaliveinterval] = ioctl_keepalive_w(args[2])?;
-                    let keepalive = ws::tcp_keepalive {
-                        onoff,
-                        keepalivetime,
-                        keepaliveinterval,
-                    };
-                    unsafe {
-                        rffi::wsa_ioctl(
-                            fd,
-                            cmd,
-                            (&raw const keepalive).cast(),
-                            core::mem::size_of::<ws::tcp_keepalive>() as u32,
+                    #[cfg(feature = "host_env")]
+                    {
+                        rustpython_host_env::socket::ioctl_keepalive(
+                            fd as _,
+                            rustpython_host_env::socket::TcpKeepalive {
+                                onoff,
+                                keepalivetime,
+                                keepaliveinterval,
+                            },
                         )
+                        .ok()
+                    }
+                    #[cfg(not(feature = "host_env"))]
+                    {
+                        let _ = (onoff, keepalivetime, keepaliveinterval);
+                        None
                     }
                 }
                 _ => {
