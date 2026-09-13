@@ -171,18 +171,38 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
         let idx = (value - PREBUILTINTFROM) as usize;
         return (&SMALL_INTS.0[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
     }
-    if crate::gc_interp::enabled() {
+    // Interpreter-only collector arm. `wrapint` is `return W_IntObject(x)`
+    // (`intobject.py`) with no residual: `instantiate` + `intval = x`,
+    // which `fuse_boxing_alloc` rewrites to `new_with_vtable` +
+    // `setfield_gc` so `OptVirtualize.optimize_NEW_WITH_VTABLE` can keep
+    // the box virtual. `w_int_gc_alloc` is `dont_look_inside` and
+    // `gc_interp::enabled()` residualizes true, so taking that arm in
+    // the trace leaves a `CallR` whose recording-time `intval` a
+    // handler bridge constant-folds. `we_are_jitted` folds to true
+    // (`rlib/jit.py we_are_jitted`); the residual arm is then JIT-dead
+    // and [`wrapint`] is the only remaining body.
+    if !majit_rlib::jit::we_are_jitted() && crate::gc_interp::enabled() {
         let boxed = w_int_gc_alloc(value);
         if !boxed.is_null() {
             return boxed;
         }
     }
+    wrapint(value)
+}
+
+/// `intobject.py wrapint` with `withprebuiltint=False`: `return W_IntObject(x)`.
+///
+/// Kept as its own body so `fuse_boxing_alloc` sees a single
+/// `malloc_typed` cluster, not a diamond with the interpreter collector
+/// arm. `w_int_new` inlines this after that arm is folded away.
+#[inline]
+pub fn wrapint(x: i64) -> PyObjectRef {
     crate::lltype::malloc_typed(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
             w_class: get_instantiate(&INT_TYPE),
         },
-        intval: value,
+        intval: x,
     }) as PyObjectRef
 }
 
