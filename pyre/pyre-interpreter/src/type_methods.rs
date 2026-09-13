@@ -1426,22 +1426,107 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `unicodeobject.py descr_startswith` — accepts either a single str
 /// prefix or a tuple of str prefixes (CPython parity).
 /// unicodeobject.py descr_startswith(self, prefix, start=0, end=sys.maxsize)
+///
+/// Bounds, a tuple needle, and the TypeError arm stay behind
+/// [`str_prefix_match_slow`] so the generated wrapper graph is the
+/// default-bounds exact-str path: `rstring.py startswith` plus
+/// `space.newbool`.
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "startswith", 1)?;
     arity_at_most(args, "startswith", 3)?;
-    let Some(slice) = str_slice_args(args[0], args)? else {
-        return validate_prefix_arg(args[1], "startswith").map(|()| w_bool_from(false));
-    };
-    str_prefix_match(slice, args[1], "startswith", true).map(w_bool_from)
+    if args.len() == 2 {
+        if let Some(result) = descr_prefix_match_default(args[0], args[1], true) {
+            return result;
+        }
+    }
+    str_prefix_match_slow(args, "startswith", true)
 }
 
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "endswith", 1)?;
     arity_at_most(args, "endswith", 3)?;
-    let Some(slice) = str_slice_args(args[0], args)? else {
-        return validate_prefix_arg(args[1], "endswith").map(|()| w_bool_from(false));
+    if args.len() == 2 {
+        if let Some(result) = descr_prefix_match_default(args[0], args[1], false) {
+            return result;
+        }
+    }
+    str_prefix_match_slow(args, "endswith", false)
+}
+
+/// Default-bounds exact-str arm of `descr_startswith` / `descr_endswith`.
+/// `None` means the shape is not this arm (tuple needle, non-str).
+fn descr_prefix_match_default(
+    w_self: PyObjectRef,
+    w_needle: PyObjectRef,
+    start: bool,
+) -> Option<Result<PyObjectRef, crate::PyError>> {
+    unsafe {
+        if !pyre_object::is_str(w_self)
+            || pyre_object::is_tuple(w_needle)
+            || !pyre_object::is_str(w_needle)
+        {
+            return None;
+        }
+    }
+    let matched = unsafe {
+        if start {
+            pyre_object::unicodeobject::startswith(w_self, w_needle, 0, i64::MAX)
+        } else {
+            pyre_object::unicodeobject::endswith(w_self, w_needle, 0, i64::MAX)
+        }
     };
-    str_prefix_match(slice, args[1], "endswith", false).map(w_bool_from)
+    Some(Ok(w_bool_from(matched)))
+}
+
+/// Bounds / tuple / TypeError residual of `descr_startswith`.
+/// `dont_look_inside` so those arms do not drag the slice-index helpers
+/// into the generated wrapper (`__import__` look-inside split).
+#[majit_macros::dont_look_inside]
+fn str_prefix_match_slow(
+    args: &[PyObjectRef],
+    method: &str,
+    start: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(slice) = str_slice_args(args[0], args)? else {
+        return validate_prefix_arg(args[1], method).map(|()| w_bool_from(false));
+    };
+    str_prefix_match(slice, args[1], method, start).map(w_bool_from)
+}
+
+/// `BuiltinCode.func` PBC member for `str.startswith`.
+///
+/// `interp2app` would generate this wrapper; the descent walker keys the
+/// args-array heap-cache off the element reads, the same shape
+/// `__majit_wrap_builtin_len` uses.  The non-default-bounds / tuple /
+/// TypeError arms go through [`str_prefix_match_slow`] so they stay
+/// `dont_look_inside` and do not pull `__getslice_minusone` into this graph.
+pub fn __majit_wrap_str_descr_startswith(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return str_prefix_match_slow(args, "startswith", true);
+    }
+    let w_self = args[0];
+    let w_prefix = args[1];
+    if let Some(result) = descr_prefix_match_default(w_self, w_prefix, true) {
+        return result;
+    }
+    str_prefix_match_slow(args, "startswith", true)
+}
+
+/// `BuiltinCode.func` PBC member for `str.endswith`.
+pub fn __majit_wrap_str_descr_endswith(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return str_prefix_match_slow(args, "endswith", false);
+    }
+    let w_self = args[0];
+    let w_suffix = args[1];
+    if let Some(result) = descr_prefix_match_default(w_self, w_suffix, false) {
+        return result;
+    }
+    str_prefix_match_slow(args, "endswith", false)
 }
 
 /// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,
@@ -6409,6 +6494,32 @@ pub fn __majit_wrap_dict_descr_items(args: &[PyObjectRef]) -> Result<PyObjectRef
         pyre_object::dictmultiobject::DictViewKind::Items,
     ))
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_str_descr_startswith:
+    crate::gateway::BuiltinWrapperDescriptor = crate::gateway::BuiltinWrapperDescriptor {
+    path: concat!(
+        module_path!(),
+        "::",
+        stringify!(__majit_wrap_str_descr_startswith)
+    ),
+    func: __majit_wrap_str_descr_startswith,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_str_descr_endswith: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_str_descr_endswith)
+        ),
+        func: __majit_wrap_str_descr_endswith,
+    };
 
 #[cfg(not(target_arch = "wasm32"))]
 #[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
