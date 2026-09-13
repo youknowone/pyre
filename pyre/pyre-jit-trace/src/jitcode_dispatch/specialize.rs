@@ -9665,16 +9665,15 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         opcode,
         OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
     ) {
-        let (raw, ovf_flag) = record_int_ovf(ctx, op_pc, opcode, lhs_raw, rhs_raw)?;
+        let (raw, ovf_flag) = record_int_ovf(ctx, op_pc, opcode, lhs_raw, rhs_raw, Some((la, rb)))?;
         let heap_ovf = match opcode {
             OpCode::IntAddOvf => la.checked_add(rb).is_none(),
             OpCode::IntSubOvf => la.checked_sub(rb).is_none(),
             OpCode::IntMulOvf => la.checked_mul(rb).is_none(),
             _ => false,
         };
-        // A bridge InputArg for the unbox may have no sidecar stamp, so
-        // `record_int_ovf` reports overflow=false and takes the sequential
-        // arm. The heap objects still overflow (`a * a` with a≈5e9).
+        // Heap values are passed as `known` so an unstamped unbox InputArg
+        // still decides overflow from the live objects (`a * a` with a≈5e9).
         if ovf_flag || heap_ovf {
             return emit_int_ovf_to_long(
                 ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj,
@@ -11402,7 +11401,7 @@ fn record_int_ovf_guarded<Sym: WalkSym>(
     b1: OpRef,
     b2: OpRef,
 ) -> Result<Option<OpRef>, DispatchError> {
-    let (result, overflow) = record_int_ovf(ctx, op_pc, opcode, b1, b2)?;
+    let (result, overflow) = record_int_ovf(ctx, op_pc, opcode, b1, b2, None)?;
     if overflow {
         return Ok(None);
     }

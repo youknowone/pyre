@@ -10329,11 +10329,16 @@ pub(crate) unsafe fn lookup_where_class_uncached(
 /// Rebuild the `(w_class, w_value)` pair of [`lookup_where`] from its two
 /// single-register `dont_look_inside` projections
 /// ([`lookup_where_class_uncached`] and [`lookup_in_type_where_uncached`]),
-/// for the callers that need both halves.  The projections run over the same
-/// deterministic MRO walk, so the reconstructed pair is identical to the raw
-/// `lookup_where` result; the value half decides presence (`None` when the
-/// name is absent), so the class half is only fetched on a hit.  Keeping the
-/// raw walk behind the two residuals contains its `<other> ∪ _ptr` phi-merge.
+/// for the callers that need both halves.
+///
+/// Residual ABI cannot return the pair in one register, so the halves are
+/// two residuals. A free-threaded mutator can change `w_type`'s MRO between
+/// them — including on uncacheable types, whose version tag is 0 and never
+/// bumps. The pair is published only when the class's own dict still maps
+/// `name` to that exact `value`; otherwise both walks retry. The retry is
+/// bounded so a type that keeps mutating cannot livelock the lookup.
+/// Keeping the raw walk behind the two residuals contains its
+/// `<other> ∪ _ptr` phi-merge.
 pub(crate) unsafe fn lookup_where_pair(
     w_type: PyObjectRef,
     name: &str,
@@ -10348,12 +10353,25 @@ pub(crate) unsafe fn lookup_where_pair(
     // `&str` projections above cannot be published as residual targets, and
     // an unpublished callee blocks every descent whose body reaches this arm.
     let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
-    let value = _lookup_in_type_uncached(w_type, w_name);
-    if value.is_null() {
-        return None;
+    let name_wtf8 = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
+    for _ in 0..8 {
+        let tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
+        let value = _lookup_in_type_uncached(w_type, w_name);
+        if value.is_null() {
+            if pyre_object::typeobject::w_type_get_version_tag(w_type) == tag {
+                return None;
+            }
+            continue;
+        }
+        let class = _lookup_where_class_uncached(w_type, w_name);
+        if class.is_null() {
+            continue;
+        }
+        if crate::type_dict_lookup_wtf8(class, name_wtf8) == Some(value) {
+            return Some((class, value));
+        }
     }
-    let class = _lookup_where_class_uncached(w_type, w_name);
-    Some((class, value))
+    None
 }
 
 /// WTF-8 keyed `_lookup_where_all_typeobjects` MRO walk, returning the
@@ -21960,6 +21978,34 @@ mod tests {
             .expect("ValueError has a type")
             .as_ptr();
         assert!(std::ptr::eq(fp_type, w_type));
+    }
+
+    /// The jitted arm of [`lookup_where_pair`] reconstructs the pair from
+    /// two single-register residuals. The published `(class, value)` must
+    /// still be a pair that exists on `class`'s own dict, matching the
+    /// one-walk interpreter result.
+    #[test]
+    fn lookup_where_pair_jitted_matches_one_walk() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let w_list = pyre_object::listobject::w_list_new(vec![]);
+        let w_type = crate::typedef::r#type(w_list)
+            .expect("list has a type")
+            .as_ptr();
+        let one_walk = unsafe { lookup_where(w_type, "append") }.expect("list.append exists");
+        let interpreted =
+            unsafe { lookup_where_pair(w_type, "append") }.expect("interpreter pair exists");
+        assert!(std::ptr::eq(interpreted.0, one_walk.0));
+        assert!(std::ptr::eq(interpreted.1, one_walk.1));
+        let _guard = majit_metainterp::JittedGuard::enter();
+        let jitted = unsafe { lookup_where_pair(w_type, "append") }.expect("jitted pair exists");
+        assert!(std::ptr::eq(jitted.0, one_walk.0));
+        assert!(std::ptr::eq(jitted.1, one_walk.1));
+        assert!(
+            crate::type_dict_lookup(jitted.0, "append")
+                .is_some_and(|value| std::ptr::eq(value, jitted.1)),
+            "jitted pair must still be the class's own dict mapping",
+        );
     }
 
     /// typeobject.py:293-301 — under the interpreter (`we_are_jitted()`

@@ -11579,7 +11579,14 @@ fn int_ovf_jump<Sym: WalkSym>(
     let b1 = read_int_reg(code, op, 2, ctx)?;
     let b2 = read_int_reg(code, op, 3, ctx)?;
     let dst = code[op.pc + 5] as usize;
-    let (resbox, overflow) = record_int_ovf(ctx, op.pc, opcode, b1, b2)?;
+    let known = match (
+        read_int_reg_concrete(code, op, 2, ctx),
+        read_int_reg_concrete(code, op, 3, ctx),
+    ) {
+        (ConcreteValue::Int(lhs), ConcreteValue::Int(rhs)) => Some((lhs, rhs)),
+        _ => None,
+    };
+    let (resbox, overflow) = record_int_ovf(ctx, op.pc, opcode, b1, b2, known)?;
 
     // `pyjitpl.py opimpl_int_add_jump_if_ovf` and
     // `pyjitpl.py handle_possible_overflow_error`: Const operands branch

@@ -186,21 +186,17 @@ pub(crate) fn record_int_ovf<Sym: WalkSym>(
     opcode: OpCode,
     b1: OpRef,
     b2: OpRef,
+    known: Option<(i64, i64)>,
 ) -> Result<(OpRef, bool), DispatchError> {
-    let v1 = match ctx.trace_ctx.concrete_of_opref(b1) {
+    let from_opref = |box_ref: OpRef| match ctx.trace_ctx.concrete_of_opref(box_ref) {
         Some(Value::Int(value)) => Some(value),
-        _ => match ctx.trace_ctx.box_value(b1) {
+        _ => match ctx.trace_ctx.box_value(box_ref) {
             Some(Value::Int(value)) => Some(value),
             _ => None,
         },
     };
-    let v2 = match ctx.trace_ctx.concrete_of_opref(b2) {
-        Some(Value::Int(value)) => Some(value),
-        _ => match ctx.trace_ctx.box_value(b2) {
-            Some(Value::Int(value)) => Some(value),
-            _ => None,
-        },
-    };
+    let v1 = known.map(|pair| pair.0).or_else(|| from_opref(b1));
+    let v2 = known.map(|pair| pair.1).or_else(|| from_opref(b2));
     let Some((wrapping_result, overflow)) = v1.zip(v2).map(|(v1, v2)| match opcode {
         OpCode::IntAddOvf => (v1.wrapping_add(v2), v1.checked_add(v2).is_none()),
         OpCode::IntSubOvf => (v1.wrapping_sub(v2), v1.checked_sub(v2).is_none()),
@@ -209,23 +205,14 @@ pub(crate) fn record_int_ovf<Sym: WalkSym>(
     }) else {
         // `pyjitpl.py opimpl_int_add_jump_if_ovf` records `INT_*_OVF`
         // via `execute` and then `handle_possible_overflow_error`.
-        // A bridge InputArg may have no sidecar stamp, so neither operand's
-        // value is known here and overflow cannot be decided.
-        //
-        // The `false` returned with the recorded op is the GUARDED arm, not a
-        // claim that the operation did not overflow: the wrapper reads it as
-        // "no overflow was proven at trace time" and emits `GUARD_NO_OVERFLOW`
-        // for the non-constant result, so a run that does overflow deopts.
-        // This arm also stamps no concrete on `resbox`, which is why callers
-        // that need the value — `try_emit_exact_int_binop` — recompute
-        // overflow from the heap objects instead of trusting this flag.
-        //
-        // `pc` belongs to the signature the `specialize.rs` callers use.
-        let _ = pc;
-        count_ops_executed(ctx, opcode);
-        count_ops_recorded(ctx, opcode);
-        let resbox = ctx.trace_ctx.record_op(opcode, &[b1, b2]);
-        return Ok((resbox, false));
+        // Without operand values the overflow flag cannot be decided, so
+        // guessing the no-overflow arm would walk the fallthrough even when
+        // the live inputs overflowed. Recover via `known` (heap objects or
+        // the int-bank shadow) or decline.
+        return Err(DispatchError::UnsupportedOpname {
+            pc,
+            key: "int_*_ovf (operands not concrete)",
+        });
     };
     count_ops_executed(ctx, opcode);
     if b1.is_constant() && b2.is_constant() {

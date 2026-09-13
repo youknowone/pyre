@@ -739,8 +739,17 @@ pub(crate) fn guard_class_record<Sym: WalkSym>(
             key: "guard_class (receiver not concrete)",
         });
     };
-    // SAFETY: `obj_ptr` is a live object the walk is executing over; the
-    // class word is the first word of every `PyObject` header.
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && pyre_object::tagged_int::is_tagged_int(obj_ptr as pyre_object::PyObjectRef)
+    {
+        return Err(DispatchError::UnsupportedOpname {
+            pc: op.pc,
+            key: "guard_class (tagged receiver)",
+        });
+    }
+    // SAFETY: `obj_ptr` is a live heap object the walk is executing over;
+    // tagged immediates are declined above. The class word is the first
+    // word of every `PyObject` header.
     let cls = unsafe { (*(obj_ptr as *const pyre_object::PyObject)).ob_type } as i64;
     ctx.trace_ctx
         .profiler()

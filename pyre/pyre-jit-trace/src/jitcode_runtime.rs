@@ -220,16 +220,13 @@ fn build_indirectcalltargets() -> Box<[Arc<majit_metainterp::jitcode::JitCode>]>
     let vec: Vec<Arc<majit_metainterp::jitcode::JitCode>> = entries
         .into_iter()
         .map(|(index, _)| {
-            let canonical = get_jitcode_by_index(index).unwrap_or_else(|| {
+            get_runtime_jitcode_by_index(index).unwrap_or_else(|| {
                 panic!(
                     "pyre-jit-trace: indirect-call target index {index} is \
                      outside all_jitcodes (len={})",
                     jitcode_count()
                 )
-            });
-            Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
-                (*canonical).clone(),
-            ))
+            })
         })
         .collect();
     vec.into_boxed_slice()
@@ -289,10 +286,7 @@ pub(crate) fn indirectcalltarget_index_for_address(fnaddress: usize) -> Option<u
 pub(crate) fn indirectcalltarget_by_index(
     index: usize,
 ) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
-    let canonical = get_jitcode_by_index(index)?;
-    Some(Arc::new(
-        majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone()),
-    ))
+    get_runtime_jitcode_by_index(index)
 }
 
 // Cached index of the build-time portal jitcode within `ALL_JITCODES`.
@@ -1971,10 +1965,9 @@ fn load_runtime_descr(index: usize) -> majit_metainterp::RuntimeBhDescr {
     use majit_metainterp::RuntimeBhDescr;
     let bh = load_descr_uncached(index);
     match bh {
-        BhDescr::JitCode { jitcode_index, .. } => match get_jitcode_by_index(jitcode_index) {
-            Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
-                majit_metainterp::JitCode::from_canonical((*canonical).clone()),
-            )),
+        BhDescr::JitCode { jitcode_index, .. } => match get_runtime_jitcode_by_index(jitcode_index)
+        {
+            Some(runtime) => RuntimeBhDescr::JitCode(runtime),
             None => RuntimeBhDescr::Descr(Box::new(bh)),
         },
         other => RuntimeBhDescr::Descr(Box::new(other)),

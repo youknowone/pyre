@@ -2570,7 +2570,7 @@ fn int_ovf_jump_constant_operands_fold_without_recording_an_ovf_op() {
 }
 
 #[test]
-fn int_ovf_jump_records_when_an_operand_is_not_concrete() {
+fn int_ovf_jump_declines_when_an_operand_is_not_concrete() {
     let byte = *insns_opname_to_byte()
         .get("int_add_jump_if_ovf/Lii>i")
         .expect("int_add_jump_if_ovf must be in the runtime instruction table");
@@ -2579,14 +2579,49 @@ fn int_ovf_jump_records_when_an_operand_is_not_concrete() {
     let lhs = OpRef::input_arg_int(0);
     let rhs = OpRef::input_arg_int(1);
     let mut regs_i = [lhs, rhs, OpRef::NONE];
-    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
-        .expect("unstamped overflow operands still record the sequential arm");
+    let err = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect_err("unstamped overflow operands cannot guess the no-overflow arm");
+    match err {
+        DispatchError::UnsupportedOpname { key, .. } => {
+            assert_eq!(key, "int_*_ovf (operands not concrete)");
+        }
+        other => panic!("expected unsupported overflow operands, got {other:?}"),
+    }
+}
+
+#[test]
+fn int_ovf_jump_recovers_overflow_from_int_bank_shadow() {
+    let byte = *insns_opname_to_byte()
+        .get("int_add_jump_if_ovf/Lii>i")
+        .expect("int_add_jump_if_ovf must be in the runtime instruction table");
+    let live_byte = *insns_opname_to_byte()
+        .get("live/")
+        .expect("live must be in the runtime instruction table");
+    let code = [byte, 9, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0];
+    let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
+    let lhs = OpRef::input_arg_int(0);
+    let rhs = OpRef::input_arg_int(1);
+    let mut regs_i = [lhs, rhs, OpRef::NONE];
+    let mut concrete_i = [
+        ConcreteValue::Int(i64::MAX),
+        ConcreteValue::Int(1),
+        ConcreteValue::Null,
+    ];
+    let (outcome, next_pc) = run_hint_step_full(
+        &code,
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &[],
+    )
+    .expect("int-bank shadow recovers the overflow decision");
     assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 6);
-    assert!(
-        tc.num_ops() >= 1,
-        "bridge InputArgs must still record INT_ADD_OVF"
-    );
+    assert_eq!(next_pc, 9, "overflow jumps to the handler target");
+    let opcodes: Vec<_> = tc.ops().iter().map(|op| op.opcode).collect();
+    assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardOverflow]);
 }
 
 /// Drive one of the `d>r` struct-allocation handlers (`new`,

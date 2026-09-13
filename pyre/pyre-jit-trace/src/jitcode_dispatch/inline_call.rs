@@ -14492,10 +14492,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         // The descent walks `int_add_ovf`; a bridge InputArg for `total` has
         // no sidecar stamp, so that walk used to abort the except path before
         // this emit ran.  Boxed concretes are available here
-        // (`try_emit_exact_int_binop` reads the heap objects), so `total += 2`
-        // after a caught raise records `int_add_ovf` instead of aborting the
-        // bridge.  `record_int_ovf` now takes its guarded arm for an unknown
-        // operand rather than declining.
+        // (`try_emit_exact_int_binop` reads the heap objects and passes them
+        // as `known`), so `total += 2` after a caught raise records
+        // `int_add_ovf` instead of aborting the bridge.
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::BinaryOpDescent, || {
