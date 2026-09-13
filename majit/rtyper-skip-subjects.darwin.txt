@@ -2,22 +2,10 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=4b6f8f17b85630bb platform=darwin
-direct-skip (never reaches unported_category)	pyre_interpreter::gateway::builtin_code_get
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_hashlib::hash_state_class::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_hashlib::hmac_class::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_ssl::certificate_methods::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_ssl::ssl_session_methods::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::_ssl::ssl_socket_methods::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::gc::gcref::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::gc::stats::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_interpreter::module::select::interp_select::__majit_wrap___new__
-direct-skip (never reaches unported_category)	pyre_object::dictmultiobject::strategy_is
-direct-skip (never reaches unported_category)	pyre_object::dictmultiobject::w_module_dict_is_object_strategy
+# corpus=a64a26a63d9726e4 platform=darwin
 two-phase-never-a-subject	eval_loop_jit_portal
 two-phase-never-a-subject	ll_listslice_startonly__ref
 two-phase-never-a-subject	ll_listslice_startonly__ref____mut_PyObject_
-two-phase-never-a-subject	majit_rlib::cache::<Impl>::getorbuild
 two-phase-never-a-subject	majit_rlib::lltypesystem::rlist::try_typed_items_block_layout
 two-phase-never-a-subject	majit_rlib::lltypesystem::rlist::typed_items_block_layout
 two-phase-never-a-subject	majit_rlib::rbigint::gc::<Impl>::new
@@ -32,8 +20,6 @@ two-phase-never-a-subject	pyre_interpreter::argument::<Impl>::positional_only
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starargs_wrapped
 two-phase-never-a-subject	pyre_interpreter::argument::combine_starstarargs_wrapped
 two-phase-never-a-subject	pyre_interpreter::argument::raise_type_error
-two-phase-never-a-subject	pyre_interpreter::baseobjspace::<Impl>::fromcache
-two-phase-never-a-subject	pyre_interpreter::baseobjspace::<Impl>::getorbuild
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::<Impl>::release
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::_check_len_result
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::_get_bases
@@ -112,7 +98,6 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::native_slot_set
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::object_functionstr
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::object_getattribute_surrogate
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::object_setattr
-two-phase-never-a-subject	pyre_interpreter::baseobjspace::object_space
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::p_abstract_issubclass_w
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::p_recursive_isinstance_type_w
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::p_recursive_isinstance_w
@@ -297,7 +282,6 @@ two-phase-never-a-subject	pyre_interpreter::executioncontext::<Impl>::run_trace_
 two-phase-never-a-subject	pyre_interpreter::executioncontext::<Impl>::setllprofile
 two-phase-never-a-subject	pyre_interpreter::executioncontext::<Impl>::sync_async_ticker
 two-phase-never-a-subject	pyre_interpreter::executioncontext::<Impl>::take_pending_loop_exit
-two-phase-never-a-subject	pyre_interpreter::executioncontext::force_frame
 two-phase-never-a-subject	pyre_interpreter::executioncontext::force_frame_before_locals_read
 two-phase-never-a-subject	pyre_interpreter::executioncontext::register_finalizer
 two-phase-never-a-subject	pyre_interpreter::executioncontext::space_user_del_action
@@ -335,6 +319,7 @@ two-phase-never-a-subject	pyre_interpreter::function::is_function_with_fixed_cod
 two-phase-never-a-subject	pyre_interpreter::function::method_class_bound_qualname
 two-phase-never-a-subject	pyre_interpreter::function::method_wrapper_new
 two-phase-never-a-subject	pyre_interpreter::function::restamped_bound_method_new
+two-phase-never-a-subject	pyre_interpreter::gateway::builtin_code_get_docstring
 two-phase-never-a-subject	pyre_interpreter::gateway::builtin_fixed_arity_fn
 two-phase-never-a-subject	pyre_interpreter::gateway::fsdecode_filename_bytes
 two-phase-never-a-subject	pyre_interpreter::gateway::fsdecode_filename_wtf8
@@ -1189,6 +1174,7 @@ two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::unpack
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::unpack_from
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___init__
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___new__
+two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___repr__
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___sizeof__
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_iter_unpack
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_pack
@@ -1305,6 +1291,7 @@ two-phase-never-a-subject	pyre_interpreter::module::unicodedata::name_impl
 two-phase-never-a-subject	pyre_interpreter::module::unicodedata::normalize
 two-phase-never-a-subject	pyre_interpreter::module::unicodedata::numeric_impl
 two-phase-never-a-subject	pyre_interpreter::module::unicodedata::one_char
+two-phase-never-a-subject	pyre_interpreter::module::unicodedata::ucd
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::add_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::and_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::bytes_concat
@@ -1357,6 +1344,7 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_reflec
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_subclass_binop_override
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::tuple_concat_type_error
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor_impl
+two-phase-never-a-subject	pyre_interpreter::objspace::std::classdict::<Impl>::strategy_ref
 two-phase-never-a-subject	pyre_interpreter::objspace::std::classdict::class_dict_for_type
 two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::has_mapdict_layout
 two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::has_mapdict_storage
@@ -1678,21 +1666,15 @@ two-phase-never-a-subject	pyre_object::dictmultiobject::_orig_w_dict_store_int_s
 two-phase-never-a-subject	pyre_object::dictmultiobject::_orig_w_module_dict_lookup_object_entries
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_get_str
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_index_of_object
-two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_index_of_object_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_index_of_str
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_index_of_str_hashed
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_insert_hashed
-two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_insert_hashed_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_insert_object
-two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_insert_object_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_pop_last
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_probe_hashed
-two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_probe_hashed_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_probe_object
-two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_probe_object_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_probe_str
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_remove_object
-two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_remove_object_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::dict_entries_value_set_at
 two-phase-never-a-subject	pyre_object::dictmultiobject::install_empty_strategy
 two-phase-never-a-subject	pyre_object::dictmultiobject::object_dict_storage_new
@@ -1712,20 +1694,16 @@ two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_getitem_str_objec
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_getitem_wtf8
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_lookup
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy
-two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_lookup_checked
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_lookup_int_strategy
-two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_lookup_int_strategy_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_lookup_object_strategy
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_lookup_object_strategy_checked
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_setitem
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store_bytes_strategy
-two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store_bytes_strategy_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store_checked
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store_checked_inner
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store_int_strategy
-two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store_int_strategy_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store_object_strategy
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store_object_strategy_checked
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_dict_store_object_strategy_checked_inner
@@ -1737,7 +1715,6 @@ two-phase-never-a-subject	pyre_object::dictmultiobject::w_module_dict_getitem_st
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_module_dict_lookup_inner
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_module_dict_lookup_inner_checked
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_module_dict_lookup_object_entries
-two-phase-never-a-subject	pyre_object::dictmultiobject::w_module_dict_lookup_object_entries_iff
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_module_dict_setitem_str
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_module_dict_setitem_str_internal
 two-phase-never-a-subject	pyre_object::dictmultiobject::w_module_dict_store_inner
@@ -1776,11 +1753,8 @@ two-phase-never-a-subject	pyre_object::identitydict::_orig_w_dict_delete_identit
 two-phase-never-a-subject	pyre_object::identitydict::_orig_w_dict_lookup_identity_strategy
 two-phase-never-a-subject	pyre_object::identitydict::_orig_w_dict_store_identity_strategy
 two-phase-never-a-subject	pyre_object::identitydict::w_dict_delete_identity_strategy
-two-phase-never-a-subject	pyre_object::identitydict::w_dict_delete_identity_strategy_iff
 two-phase-never-a-subject	pyre_object::identitydict::w_dict_lookup_identity_strategy
-two-phase-never-a-subject	pyre_object::identitydict::w_dict_lookup_identity_strategy_iff
 two-phase-never-a-subject	pyre_object::identitydict::w_dict_store_identity_strategy
-two-phase-never-a-subject	pyre_object::identitydict::w_dict_store_identity_strategy_iff
 two-phase-never-a-subject	pyre_object::int_array::<Impl>::empty
 two-phase-never-a-subject	pyre_object::int_array::<Impl>::grow
 two-phase-never-a-subject	pyre_object::int_array::<Impl>::install
@@ -1845,7 +1819,9 @@ two-phase-never-a-subject	pyre_object::object_array::items_block_layout
 two-phase-never-a-subject	pyre_object::object_array::try_alloc_typed_items_block
 two-phase-never-a-subject	pyre_object::object_array::try_grow_typed_items_block
 two-phase-never-a-subject	pyre_object::object_array::try_items_block_layout
+two-phase-never-a-subject	pyre_object::pyobject::notify_w_class_mutated_then
 two-phase-never-a-subject	pyre_object::quasiimmut::<Impl>::invalidate
+two-phase-never-a-subject	pyre_object::quasiimmut::<Impl>::invalidate_then_store
 two-phase-never-a-subject	pyre_object::quasiimmut::<Impl>::take
 two-phase-never-a-subject	pyre_object::rordereddict::<Impl>::clone
 two-phase-never-a-subject	pyre_object::rordereddict::<Impl>::get
