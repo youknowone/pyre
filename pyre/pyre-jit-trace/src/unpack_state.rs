@@ -8,9 +8,8 @@
 //! [`UnpackJitState`]'s [`JitState`] implementation, without touching jd0's
 //! `state.rs`:
 //!
-//! * [`UnpackSym`] — the `reds='auto'` symbolic state: `w_iterator` (the
-//!   iterator drained by `self.next(w_iterator)`) and `items` (the list grown
-//!   by `items.append(w_item)`).
+//! * [`UnpackSym`] — the extracted `reds='auto'` state of the Rust portal:
+//!   `root_base`, `items_slot`, and the live `RootScope` cell.
 //! * [`UnpackJitState`] — `Meta = PyreMeta`, `Sym = UnpackSym`, `Env = PyreEnv`.
 //!
 //! Dormant means gated, not unbuilt: the descriptor builder, its second
@@ -30,24 +29,19 @@ use pyre_object::{PY_NULL, PyObjectRef};
 
 /// jd1 symbolic state carried across the `unpackiterable_driver` back-edge.
 ///
-/// PyPy's Python portal has two `reds='auto'` values, `w_iterator` and
-/// `items`.  The extracted Rust portal also pins those objects on the
-/// shadow stack, so `reds='auto'` collects `root_base` (Int) and a live
-/// `greenkey` Ref as well.  The extracted `jit_merge_point` names that
-/// four-red shape; JUMP / enter must match it.
+/// `baseobjspace.py` `reds='auto'` names whatever is live at the marker.
+/// The extracted Rust portal keeps `root_base`, `items_slot`, and the
+/// `RootScope` cell; JUMP / enter must match that bank.
 #[allow(dead_code)]
 pub struct UnpackSym {
-    /// baseobjspace.py:1012 jit_merge_point(greenkey=greenkey) green.
+    /// baseobjspace.py jit_merge_point(greenkey=greenkey) green.
     pub greenkey: PyObjectRef,
-    /// Shadow-stack slot of the pinned iterator.  The extracted body
-    /// reloads `w_iterator` / `items` through this base.
+    /// Shadow-stack slot of the pinned iterator.
     pub root_base: OpRef,
-    /// The greenkey object, still live as a red across the merge.
-    pub greenkey_red: OpRef,
-    /// The iterator drained by `self.next(w_iterator)`.
-    pub w_iterator: OpRef,
-    /// The `items` list grown by `items.append(w_item)`.
-    pub items: OpRef,
+    /// Shadow-stack slot of the pinned `items` list (`root_base + 1`).
+    pub items_slot: OpRef,
+    /// `RootScope.stack_slot`, the one object red the extracted body keeps.
+    pub roots_cell: OpRef,
 }
 
 impl JitCodeSym for UnpackSym {
@@ -86,33 +80,26 @@ pub fn jd1_root_base() -> i64 {
 }
 
 /// Loop-carried reds in merge-point bank order (red I, then red R).
-pub fn jd1_live_values(
-    greenkey: PyObjectRef,
-    w_iterator: PyObjectRef,
-    items: PyObjectRef,
-) -> Vec<Value> {
+pub fn jd1_live_values() -> Vec<Value> {
+    let root_base = jd1_root_base();
     vec![
-        Value::Int(jd1_root_base()),
-        Value::Ref(GcRef(greenkey as usize)),
-        Value::Ref(GcRef(w_iterator as usize)),
-        Value::Ref(GcRef(items as usize)),
+        Value::Int(root_base),
+        Value::Int(root_base + 1),
+        Value::Ref(GcRef(pyre_object::gc_roots::shadow_stack_cell() as usize)),
     ]
 }
 
 impl UnpackJitState {
     /// jd1 (`unpackiterable_driver`) portal descriptor.
-    /// `baseobjspace.py` `greens=['greenkey'], reds='auto'`.  The extracted
-    /// Rust portal's merge point also names `root_base` and a live
-    /// `greenkey` Ref; [`create_sym`] / [`JitState::collect_jump_args`]
-    /// follow that four-red shape. Novable: no virtualizable name.
+    /// `baseobjspace.py` `greens=['greenkey'], reds='auto'`. The extracted
+    /// body names `root_base`, `items_slot`, and the `RootScope` cell.
     pub fn unpackiterable_driver_descriptor() -> JitDriverStaticData {
         let mut sd = JitDriverStaticData::new(
             vec![("greenkey", Type::Ref)],
             vec![
                 ("root_base", Type::Int),
-                ("greenkey_red", Type::Ref),
-                ("w_iterator", Type::Ref),
-                ("items", Type::Ref),
+                ("items_slot", Type::Int),
+                ("roots_cell", Type::Ref),
             ],
         );
         // baseobjspace.py unpackiterable_driver = jit.JitDriver(name='unpackiterable', ...)
@@ -164,12 +151,9 @@ impl JitState for UnpackJitState {
         let _ = (meta, header_pc);
         UnpackSym {
             greenkey: PY_NULL,
-            // InputArg order is red I then red R, matching the merge-point
-            // banks and [`jd1_live_values`].
             root_base: OpRef::input_arg_typed(0, Type::Int),
-            greenkey_red: OpRef::input_arg_typed(1, Type::Ref),
-            w_iterator: OpRef::input_arg_typed(2, Type::Ref),
-            items: OpRef::input_arg_typed(3, Type::Ref),
+            items_slot: OpRef::input_arg_typed(1, Type::Int),
+            roots_cell: OpRef::input_arg_typed(2, Type::Ref),
         }
     }
 
@@ -186,7 +170,7 @@ impl JitState for UnpackJitState {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        vec![sym.root_base, sym.greenkey_red, sym.w_iterator, sym.items]
+        vec![sym.root_base, sym.items_slot, sym.roots_cell]
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {
@@ -228,13 +212,13 @@ mod tests {
         assert_eq!(banks.green_f.len(), 0);
         assert_eq!(
             banks.red_i.len(),
-            1,
-            "extracted portal carries root_base as a red Int"
+            2,
+            "extracted portal carries root_base and items_slot as red Ints"
         );
         assert_eq!(
             banks.red_r.len(),
-            3,
-            "extracted portal carries greenkey + iterator + items as red Refs"
+            1,
+            "extracted portal carries the RootScope cell as the one object red"
         );
         assert_eq!(banks.red_f.len(), 0);
 
