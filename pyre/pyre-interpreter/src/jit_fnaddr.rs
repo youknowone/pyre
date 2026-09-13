@@ -1393,6 +1393,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::pos",
         crate::opcode_ops::jit_descroperation_pos,
     );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::not_",
+        crate::opcode_ops::jit_baseobjspace_not_,
+    );
     // Same binding for the BINARY/COMPARE codewriter `inline_call_ir_r`
     // graphs: the walker descends `binary_value_from_tag` /
     // `compare_value_from_tag`, and guard-failure blackholing calls the
@@ -5185,6 +5190,10 @@ mod tests {
             (
                 "pyre_interpreter::objspace::descroperation::pos",
                 crate::opcode_ops::jit_descroperation_pos as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::baseobjspace::not_",
+                crate::opcode_ops::jit_baseobjspace_not_ as *const () as usize as i64,
             ),
             (
                 "pyre_interpreter::opcode_ops::binary_value_from_tag",

@@ -13325,14 +13325,10 @@ impl CodeWriter {
 
                         // UNARY_NOT: pops `value`, pushes `not value` as a bool
                         // (net 0).  The graph records the object-space
-                        // `not_(value)` op (pyopcode.py:651
-                        // `unaryoperation("not_")` → `space.not_` =
-                        // `newbool(not is_true(value))`); the SSARepr lowering
-                        // `lower_unary_not_hlop_to_insn` turns it into
-                        // `residual_call_r_r(unary_not_fn, ListR[value])`
-                        // returning `not truth(value)` through
-                        // `opcode_ops::truth_value`; a user `__bool__` /
-                        // `__len__` may run Python → MayForce.
+                        // `not_(value)` op (`unaryoperation("not_")` →
+                        // `space.not_`); the SSARepr lowering keeps the
+                        // MayForce residual because walking `not_` currently
+                        // guards one bool singleton.
                         Instruction::UnaryNot => {
                             let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
