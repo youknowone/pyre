@@ -9820,7 +9820,14 @@ fn walker_guard_class<Sym: WalkSym>(
     obj: OpRef,
     type_addr: i64,
 ) -> Result<(), DispatchError> {
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+    // `heapcache.py is_class_known` is only `HF_KNOWN_CLASS`, not
+    // `isinstance`.  `W_IntObject.intval` and `W_LongObject.value` sit at
+    // the same offset, so skipping `GuardClass(LONG)` because some other
+    // class is already known lets a box recorded as `INT` take the long
+    // payload path: `jit_bigint_int_eq` then treats the intval as a
+    // `*const BigInt`.  Skip only when the known class is this one, the
+    // same compare `walker_guard_mapdict_instance_shape` already does.
+    if ctx.trace_ctx.heap_cache().get_known_class(obj) != Some(type_addr) {
         // `GuardClass` reads `ob_type` off `obj` (rpython/jit/backend/x86/
         // assembler.py `_cmp_guard_class` derefs the pointer with no tag
         // test), so the frontend must not hand it a tagged immediate. `obj`
@@ -11728,7 +11735,7 @@ fn read_portal_debugdata<Sym: WalkSym>(
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
 /// was recorded — is `record_portal_tracefunc_guard` for a trace function and
-/// the `is_being_profiled` green (`interp_jit.py greens`) for a profiler.
+/// `record_portal_profilefunc_guard` (`profilefunc?`) for a profiler.
 pub(crate) fn ec_hook_installed() -> bool {
     let ec = pyre_interpreter::call::getexecutioncontext();
     !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() || (*ec).profilefunc.is_some() }
@@ -11761,10 +11768,9 @@ pub(crate) fn ec_hook_installed() -> bool {
 /// A trace recorded while the slot is ALREADY non-NULL records nothing: there
 /// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
 /// declines every Python-callee inline in that state, so the events come from
-/// the interpreter's own `execute_frame`.  `sys.setprofile` needs no guard
-/// here at all — `is_being_profiled` is a portal-driver green
-/// (`interp_jit.py greens`), so arming a profiler mints a different cell whose
-/// own recording sees the hook and declines the same inlines.
+/// the interpreter's own `execute_frame`.  `sys.setprofile` is the
+/// sibling `profilefunc?` pin (`record_portal_profilefunc_guard`), not
+/// this slot.
 fn record_portal_tracefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -11807,6 +11813,37 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .nullity_now_known(read, false);
+    Ok(())
+}
+
+/// `executioncontext.py` `profilefunc?`.  We do not trace through
+/// `execute_frame`, so PyPy's `getfield + int_is_zero + guard_true` is
+/// not a compiled-loop read we have to replay.  The `?` watcher is what
+/// `setllprofile` needs: a compiled loop jumps to itself and never
+/// re-reads the `is_being_profiled` green, and GNI fails when the slot
+/// is written.  Recording the promote half here ate five ops of a
+/// `trace_limit=8` walk and fragmented `trace_too_long_effect_replay`
+/// (aborts 17→46, guard_failures 1247→7746).  Marker only; the pending
+/// GNI flushes on the next real guard, coalesced with `w_tracefunc?`.
+fn record_portal_profilefunc_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    _op_pc: usize,
+) -> Result<(), DispatchError> {
+    if ctx.fbw_mode.inline_subwalk {
+        return Ok(());
+    }
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() || unsafe { (*ec).profilefunc.is_some() } {
+        return Ok(());
+    }
+    let Some(ec_box) = walker_ensure_execution_context(ctx) else {
+        return Ok(());
+    };
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        ec_box,
+        crate::descr::ec_profilefunc_descr(),
+    );
     Ok(())
 }
 
@@ -13612,6 +13649,7 @@ fn handle<Sym: WalkSym>(
             // loop makes.  The walker records neither for an inlined callee,
             // so the loop pins the slot instead.
             record_portal_tracefunc_guard(ctx, op.pc)?;
+            record_portal_profilefunc_guard(ctx, op.pc)?;
 
             // pyjitpl.py, the tail of `MIFrame.debug_merge_point`,
             // which `opimpl_jit_merge_point` calls at :1542 — ahead of every
