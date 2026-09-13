@@ -8480,11 +8480,8 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             unroll_opt.final_exported_label_source_positions.clone()
         };
-        // `compile.py:237` / `compile.py:289`
-        // `target_token.original_jitcell_token = jitcell_token`. Backfill the
-        // owning JitCellToken.number on every TargetToken now that the token
-        // exists, so `record_loop_or_bridge`'s JUMP branch
-        // (`compile.py:197-199`) can read it.
+        // `compile.py compile_simple_loop` / `compile_loop`
+        // `target_token.original_jitcell_token = jitcell_token`.
         //
         // `compile.py` `jitcell_token.target_tokens = [start_descr]` —
         // populate the JCT-side descr list for `has_compiled_targets` parity
@@ -8492,7 +8489,7 @@ impl<M: Clone> MetaInterp<M> {
         // an append; this loop reaches the same state because the seed on
         // this path holds only the tokens this compile produced.
         for target_token in &front_target_tokens {
-            target_token.set_original_jitcell_token_number(token_num);
+            target_token.set_original_jitcell_token(token.clone());
             token.record_target_token(target_token.as_jump_target_descr());
         }
         // RPython backend contract: `consider_label` records the compact
@@ -9654,7 +9651,7 @@ impl<M: Clone> MetaInterp<M> {
         // this arm is none, so every seeded candidate is inadmissible
         // however it got here. A seed can thus never buy an admitted
         // close. Its only live consumers are the loop that rebinds each
-        // token through `set_original_jitcell_token_number` and the
+        // token through `set_original_jitcell_token` and the
         // republication that hands them on as the next entry's
         // `front_target_tokens` — the route by which a retired loop lends
         // its labels to the loop that replaced it.
@@ -10030,7 +10027,7 @@ impl<M: Clone> MetaInterp<M> {
                 // note there about upstream leaving the minted token's list
                 // empty on this arm.
                 for target_token in &unroll_opt.target_tokens {
-                    target_token.set_original_jitcell_token_number(token_num);
+                    target_token.set_original_jitcell_token(token.clone());
                     token.record_target_token(target_token.as_jump_target_descr());
                 }
                 self.warm_state.memory_manager.keep_loop_alive(&token);
@@ -10242,7 +10239,7 @@ impl<M: Clone> MetaInterp<M> {
         // token (`metainterp.resumekey_original_loop_token`), which it uses for
         // `new_loop.original_jitcell_token`, for `send_bridge_to_backend` and
         // for `record_loop_or_bridge` alike. This function binds the artifact
-        // to `source_jct` the same way (`set_original_jitcell_token_number`,
+        // to `source_jct` the same way (`set_original_jitcell_token`,
         // `record_loop_or_bridge`) but files everything else under the
         // caller-supplied `green_key`: `set_next_header_pc`, the
         // `previous_tokens` read, `caller_recovery_layout`,
@@ -10367,7 +10364,7 @@ impl<M: Clone> MetaInterp<M> {
                 // (`compile.py`'s `get_procedure_token(greenkey)`), which
                 // is what `pyjitpl.py has_compiled_targets` reads.
                 for target_token in &unroll_opt.target_tokens {
-                    target_token.set_original_jitcell_token_number(source_jct.number);
+                    target_token.set_original_jitcell_token(source_jct.clone());
                     loop_jitcell_token.record_target_token(target_token.as_jump_target_descr());
                 }
                 // `unroll.py:213-215 if cell_token.retraced_count < limit:
@@ -11424,7 +11421,7 @@ impl<M: Clone> MetaInterp<M> {
         // closing JUMP to the same token.
         let target_token = crate::history::TargetToken::new_loop(token_num);
         // `compile.py target_token.original_jitcell_token = jitcell_token`.
-        target_token.set_original_jitcell_token_number(token_num);
+        target_token.set_original_jitcell_token(token.clone());
         // `compile.py jitcell_token.target_tokens = [target_token]` —
         // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py`).
         token.record_target_token(target_token.as_jump_target_descr());
@@ -12996,12 +12993,13 @@ impl<M: Clone> MetaInterp<M> {
     /// one line — `next_generation()` alone — because long-lived
     /// references outside `alive_loops` are weakrefs, so pruning
     /// `alive_loops` can trigger `LoopToken.__del__` (`memmgr.py`).
-    /// Pyre's `compiled_loops` token handles are now weak, but the map
-    /// still holds per-trace metadata and warmstate still keeps
-    /// `BaseJitCell.loop_token` as an `Arc<JitCellToken>` until the
-    /// weakref convergence work there lands.  Keep this explicit cleanup
-    /// until warmstate reaches the PyPy weakref shape and compiled-loop
-    /// metadata no longer needs object-identity pruning.
+    /// `BaseJitCell.loop_token` and `compiled_loops` token handles are
+    /// already `Weak`. The remaining extra drop is the `CompiledEntry`
+    /// metadata (`traces`, layouts) that lives in the green-key map
+    /// rather than on the token / `CompiledLoopToken`. Shrink to
+    /// `next_generation()` only once that metadata is owned the way
+    /// `model.py LoopToken.__del__` → `cpu.free_loop_and_bridges`
+    /// owns it.
     ///
     /// The eviction dispatch matches by **token-object identity**
     /// (`Arc::ptr_eq`) — mirroring `memmgr.py:73`'s `del
@@ -13267,16 +13265,15 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        // TODO: pyre-only fallback to cover targets
-        // whose `JitCellToken` lives only on `BaseJitCell.loop_token`
-        // (tmp-callback installs via `attach_tmp_callback_to_interp` —
-        // `warmstate.py:716-723`). Without this, `compile.py:187`
-        // `original.record_jump_to(descr)` keepalive narrows to
-        // already-compiled targets and silently drops tmp-callback ones,
-        // regressing main behavior. Removable once
-        // `CallAssemblerDescr` carries the owning `Arc<JitCellToken>`
-        // directly (Codex parity recommendation #4).
-        self.warm_state.find_token_by_number(token_number)
+        // Production CALL_ASSEMBLER descrs carry the Arc
+        // (`MetaCallAssemblerDescr::token_handle_any`) and production
+        // JUMP TargetTokens carry `original_jitcell_token_handle`.
+        // tmp-callback tokens are the same Arc installed on the cell
+        // and on the descr (`warmstate.py get_assembler_token`), so a warmstate
+        // number walk is not a second owner. Leftover
+        // `BC_CALL_ASSEMBLER_*` dispatch has its own resolver in
+        // `with_trace_ctx_and_token_resolver`.
+        None
     }
 
     /// Port of `rpython/jit/metainterp/compile.py:171-211
@@ -13438,45 +13435,41 @@ impl<M: Clone> MetaInterp<M> {
             // (JUMP target).
             //
             // `compile.py:197 if descr.original_jitcell_token is not
-            //                  original_jitcell_token`. pyre stores the
-            // owner's `number` in `LoopTargetDescr.original_jitcell_token_number`
-            // (set by this file's `compile.py:237` / `compile.py:289`
-            // counterparts, which call `set_original_jitcell_token_number`).
-            // Empirically (probe
-            // `MAJIT_PROBE_TARGETTOKEN_NONE` against the full pyre/check.py
-            // suite, dynasm 14/14) every JUMP TargetToken reaching the
-            // walker has the owner number backfilled, so the
-            // `assert descr.original_jitcell_token is not None`
-            // (`compile.py:198`) form below is a structural invariant
-            // rather than a sentinel skip.
+            //                  original_jitcell_token`. Production
+            // TargetTokens carry the token object via
+            // `original_jitcell_token_handle` (`compile.py compile_simple_loop` /
+            // `compile_loop` / `propagate_original_jitcell_token`). Number-only
+            // descrs (`BasicLoopTargetDescr` in tests) still resolve
+            // through `jitcell_token_by_number`.
             if op.opcode == majit_ir::OpCode::Jump
                 && let Some(target_descr) = descr.as_loop_target_descr()
             {
-                let target_owner_num = target_descr.original_jitcell_token_number();
+                let direct_arc = target_descr
+                    .original_jitcell_token_handle()
+                    .and_then(|any| any.downcast::<JitCellToken>().ok());
                 // `compile.py:197` `if descr.original_jitcell_token
                 // is not original_jitcell_token`.
-                if target_owner_num != Some(original.number) {
-                    // `compile.py:198` `assert descr.original_jitcell_token
-                    // is not None`.
-                    let target_owner_num = target_owner_num.expect(
-                        "compile.py:198 — JUMP TargetToken must carry an owning \
-                             JitCellToken.number by record_loop_or_bridge time",
-                    );
-                    // `compile.py:199` `original_jitcell_token
-                    // .record_jump_to(descr.original_jitcell_token)` — the
-                    // upstream call is unconditional (the descr already
-                    // carries the owning JitCellToken object).  Empirically
-                    // (probe `MAJIT_PROBE_JUMP_TARGET_MISS` against full
-                    // pyre/check.py + cargo test, dynasm 14/14 +
-                    // metainterp 1321/0/2) the number→Arc resolve through
-                    // `jitcell_token_by_number` always succeeds, so the
-                    // unwrap mirrors RPython's no-fallback shape.
-                    let target = self.jitcell_token_by_number(target_owner_num).expect(
-                        "compile.py:199 — JUMP TargetToken's owning \
-                             JitCellToken must be reachable through compiled_loops \
-                             or warmstate cells",
-                    );
-                    original.record_jump_to(target);
+                if let Some(target) = direct_arc {
+                    if !std::sync::Arc::ptr_eq(&target, original) {
+                        // `compile.py record_loop_or_bridge` `original_jitcell_token
+                        // .record_jump_to(descr.original_jitcell_token)`.
+                        original.record_jump_to(target);
+                    }
+                } else {
+                    let target_owner_num = target_descr.original_jitcell_token_number();
+                    if target_owner_num != Some(original.number) {
+                        // `compile.py record_loop_or_bridge` `assert descr.original_jitcell_token
+                        // is not None`.
+                        let target_owner_num = target_owner_num.expect(
+                            "compile.py record_loop_or_bridge — JUMP TargetToken must carry an owning \
+                                 JitCellToken by record_loop_or_bridge time",
+                        );
+                        let target = self.jitcell_token_by_number(target_owner_num).expect(
+                            "compile.py record_loop_or_bridge — JUMP TargetToken's owning \
+                                 JitCellToken must be reachable through compiled_loops",
+                        );
+                        original.record_jump_to(target);
+                    }
                 }
                 // `compile.py:202` `op.cleardescr()`.  Clears the
                 // TargetToken descr reference unconditionally —
@@ -15671,7 +15664,7 @@ impl<M: Clone> MetaInterp<M> {
                         .as_ref()
                         .and_then(|d| d.as_loop_target_descr())
                     {
-                        ltd.set_original_jitcell_token_number(source_jct.number);
+                        ltd.set_original_jitcell_token_handle(source_jct.clone());
                     }
                 }
                 // `compile.py record_loop_or_bridge(metainterp_sd,

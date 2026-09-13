@@ -1901,13 +1901,11 @@ impl WarmEnterState {
     ///
     /// RPython equivalent does not exist because upstream descrs hold
     /// the `JitCellToken` object directly (`compile.py:187 isinstance(descr,
-    /// JitCellToken)`) — no number→token resolution is needed.  This
-    /// helper is removed once `CallAssemblerDescr` /
-    /// `LoopTargetDescr` carry the owning `Arc<JitCellToken>`.
+    /// JitCellToken)`). Production CALL_ASSEMBLER / JUMP descrs now
+    /// carry the token object, so `record_loop_or_bridge` no longer
+    /// calls this. Leftover `BC_CALL_ASSEMBLER_*` dispatch still
+    /// resolves by number through `with_trace_ctx_and_token_resolver`.
     /// Walks each chain, not just its head — see `clear_all_loop_tokens`.
-    /// A token living on a chained cell was previously unfindable here, and
-    /// this is the fallback `with_trace_ctx_and_token_resolver` reaches when
-    /// no `compiled_loops` entry matches (`pyjitpl.rs:4663`).
     ///
     /// Owned, for the reason [`Self::get_compiled`] gives: the cell's handle is
     /// weak, so a token that no longer upgrades is simply not a match — it has

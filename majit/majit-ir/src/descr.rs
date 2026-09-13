@@ -3325,10 +3325,48 @@ pub trait LoopTargetDescr: Descr {
     /// before the owner exists (the preamble sentinel at
     /// `unroll.rs`'s `TargetToken::new_preamble(0)`); `record_loop_or_bridge`
     /// (`compile.py:197-199`) must then leave this JUMP branch unhandled.
+    ///
+    /// Production `history.rs` `LoopTargetDescr` also stores the token
+    /// object (as a Weak; see `original_jitcell_token_handle`). The number
+    /// remains the dense identity `unroll.rs` compares without upgrading.
     fn original_jitcell_token_number(&self) -> Option<u64> {
         None
     }
     fn set_original_jitcell_token_number(&self, _num: u64) {}
+
+    /// `history.py TargetToken.original_jitcell_token`.
+    ///
+    /// Upstream stores the `JitCellToken` object itself. `majit-ir` cannot
+    /// name that type (`majit-backend`), so production `history.rs`
+    /// `LoopTargetDescr` exposes an upgraded `Arc<JitCellToken>` as
+    /// `Arc<dyn Any + Send + Sync>` for `record_loop_or_bridge` to
+    /// downcast — the same identity contract as
+    /// `LoopTokenDescr::token_handle_any`.
+    ///
+    /// The production slot is a `Weak`: `JitCellToken.target_tokens`
+    /// holds this descr, so a strong back-ref would cycle
+    /// (`JitCellToken` → `target_tokens` → descr → token). RPython
+    /// collects that cycle; Rust `Arc` does not. `record_jump_to` is
+    /// the keepalive (`compile.py record_loop_or_bridge`), taken from
+    /// the upgraded Weak while the token is still strongly held by the
+    /// compile in flight.
+    ///
+    /// Default `None` — number-only descrs (`BasicLoopTargetDescr`)
+    /// and a preamble sentinel that never received an owner.
+    fn original_jitcell_token_handle(
+        &self,
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+
+    /// `compile.py compile_simple_loop` / `compile_loop` /
+    /// `propagate_original_jitcell_token`. Production downcasts to
+    /// `Arc<JitCellToken>` and stores a Weak plus the cached number.
+    fn set_original_jitcell_token_handle(
+        &self,
+        _handle: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+    }
 }
 
 #[derive(Debug, Default)]

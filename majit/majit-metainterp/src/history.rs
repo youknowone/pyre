@@ -5,9 +5,10 @@
 /// that forms a loop (ending with JUMP) or an exit (ending with FINISH).
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
+use majit_backend::JitCellToken;
 use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// history.py get_const_ptr_for_string(s)
 ///
@@ -125,10 +126,18 @@ impl TargetToken {
         self.minor_scan_pending = true;
     }
 
-    /// `compile.py:237` / `compile.py:289` — bind the freshly-made
-    /// JitCellToken's `number` to this TargetToken's `original_jitcell_token`.
-    /// Walker (`record_loop_or_bridge`, `compile.py`) reads this to
-    /// determine whether a JUMP crosses to a different loop.
+    /// `compile.py compile_simple_loop` / `compile_loop` —
+    /// `target_token.original_jitcell_token = jitcell_token`.
+    /// Stores the token object (Weak on the descr; see
+    /// `LoopTargetDescr::original_jitcell_token_handle`) and caches
+    /// `token.number` for the dense `unroll.rs` compare.
+    pub fn set_original_jitcell_token(&self, token: Arc<JitCellToken>) {
+        self.jump_target_descr.set_original_jitcell_token(token);
+    }
+
+    /// Number-only backfill for descrs that do not carry a token object
+    /// (`BasicLoopTargetDescr`). Production compile sites use
+    /// [`Self::set_original_jitcell_token`].
     pub fn set_original_jitcell_token_number(&self, num: u64) {
         majit_ir::LoopTargetDescr::set_original_jitcell_token_number(
             self.jump_target_descr.as_ref(),
@@ -140,10 +149,13 @@ impl TargetToken {
 #[derive(Debug, Default)]
 struct LoopTargetDescrState {
     target_arglocs: Vec<majit_ir::TargetArgLoc>,
-    /// `history.py:493 self.original_jitcell_token`. Backfilled once the
-    /// owning JitCellToken is created (`pyjitpl.rs`'s `compile_loop_body`
-    /// calling `set_original_jitcell_token_number`, the
-    /// counterpart to `compile.py:237` / `compile.py:289`).
+    /// `history.py TargetToken.original_jitcell_token`. Weak because
+    /// `JitCellToken.target_tokens` holds this descr; a strong back-ref
+    /// would cycle. `record_loop_or_bridge` upgrades at compile time
+    /// (`compile.py record_loop_or_bridge` `record_jump_to` is the keepalive).
+    original_jitcell_token: Option<Weak<JitCellToken>>,
+    /// Cached `JitCellToken.number` so `unroll.rs` can compare owners
+    /// without upgrading the Weak.
     original_jitcell_token_number: Option<u64>,
 }
 
@@ -179,6 +191,15 @@ impl LoopTargetDescr {
             target_frame_depth: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(LoopTargetDescrState::default()),
         }
+    }
+
+    /// `compile.py compile_simple_loop` / `compile_loop` /
+    /// `propagate_original_jitcell_token`.
+    fn set_original_jitcell_token(&self, token: Arc<JitCellToken>) {
+        let number = token.number;
+        let mut st = self.state.lock();
+        st.original_jitcell_token_number = Some(number);
+        st.original_jitcell_token = Some(Arc::downgrade(&token));
     }
 }
 
@@ -264,6 +285,21 @@ impl majit_ir::LoopTargetDescr for LoopTargetDescr {
 
     fn set_original_jitcell_token_number(&self, num: u64) {
         self.state.lock().original_jitcell_token_number = Some(num);
+    }
+
+    fn original_jitcell_token_handle(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.state
+            .lock()
+            .original_jitcell_token
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn std::any::Any + Send + Sync>)
+    }
+
+    fn set_original_jitcell_token_handle(&self, handle: Arc<dyn std::any::Any + Send + Sync>) {
+        if let Ok(token) = handle.downcast::<JitCellToken>() {
+            self.set_original_jitcell_token(token);
+        }
     }
 }
 
@@ -2595,8 +2631,6 @@ use crate::call_descr::{
 use crate::jitdriver::JitDriverStaticData;
 use crate::recorder::{Trace, TracePosition};
 use crate::trace_ctx::TraceCtx;
-
-use majit_backend::JitCellToken;
 
 impl TraceCtx {
     /// history.py: get_trace_position — current recorder position.
