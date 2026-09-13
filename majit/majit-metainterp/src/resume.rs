@@ -5724,10 +5724,10 @@ mod tests {
     }
 
     #[test]
-    fn finish_emits_the_numbered_inputarg_when_the_operand_collapses() {
+    fn finish_emits_the_collapsed_inputarg_when_the_operand_collapses() {
         // Phase-2 remap names InputArgRef(231). Numbering TAGBOXes that
         // opref, but LiveboxMap keys by Operand and `to_opref` can still
-        // be Phase-1 InputArgRef(1). finish() must emit 231.
+        // be Phase-1 InputArgRef(1). finish() must emit that collapsed input.
         use majit_ir::OpRef;
 
         struct KeepNumberedInputArgEnv {

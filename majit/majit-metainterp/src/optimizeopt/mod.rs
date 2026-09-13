@@ -1475,7 +1475,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // to ConstPtr would TAGCONST and drop out of the dump. Stay
         // on the InputArg so the next `Vm::new` still has a livebox.
         if opref.is_input_arg()
-            && walked.is_constant()
+            && matches!(walked, OpRef::ConstPtr(_))
             && walked
                 .inline_const_bits()
                 .is_some_and(|bits| OptContext::ref_addr_is_stack_resident(bits as usize))

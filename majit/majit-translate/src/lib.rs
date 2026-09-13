@@ -2146,7 +2146,10 @@ fn analyze_pipeline_from_module_paths(
     // `program.functions`. Its harvested `cannot_raise` mark must still
     // reach `getcalldescr`, or the residual records GUARD_NO_EXCEPTION.
     for (path_str, hints) in &program.harvested_hints {
-        if !hints.iter().any(|h| h == "cannot_raise") {
+        if !hints
+            .iter()
+            .any(|h| h == "cannot_raise" || h == "elidable_cannot_raise")
+        {
             continue;
         }
         let segs: Vec<&str> = path_str.split("::").collect();
