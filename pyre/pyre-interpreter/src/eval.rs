@@ -1990,28 +1990,6 @@ pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) ->
     // where `raise oefmt(...)` becomes a guard outside the bool-returning
     // residual call.  The 1-register `bool` ABI is preserved for
     // cranelift / dynasm residual-call codegen.
-    // `exception_match` opens with `is_w(type(exc), T)` (baseobjspace.py).
-    // A specialised `w_class` is already that type, so the identity hit
-    // can return before `typedef::r#type`'s exception-stub / kind-tag
-    // dance.  The generic `EXCEPTION_TYPE` stub is *not* the real class
-    // (`r#type` falls back to the kind registry for it).
-    if !exc_value.is_null() && !exc_type.is_null() {
-        unsafe {
-            if !(pyre_object::tagged_int::CAN_BE_TAGGED
-                && pyre_object::tagged_int::is_tagged_int(exc_value))
-            {
-                let w_class = (*exc_value).w_class;
-                if !w_class.is_null() {
-                    let stub = pyre_object::get_instantiate(
-                        &pyre_object::interp_exceptions::EXCEPTION_TYPE,
-                    );
-                    if !std::ptr::eq(w_class, stub) && std::ptr::eq(w_class, exc_type) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
     let Some(w_exc_class) = crate::typedef::r#type(exc_value) else {
         return false;
     };

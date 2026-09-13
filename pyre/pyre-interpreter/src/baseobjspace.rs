@@ -1096,14 +1096,6 @@ unsafe fn p_recursive_isinstance_w(
 /// Do not replace it with `pyre_object::is_type_or_subtype()`: that helper
 /// inspects the static Rust `PyType` tag and is not the RPython data path.
 unsafe fn is_type_like_w(obj: PyObjectRef) -> bool {
-    // W_TypeObject (builtin and heap types, including metaclass
-    // instances) is `ob_type == TYPE_TYPE`.  That is the
-    // `exception_is_valid_class_w` / `issubtype_w` caller.  The
-    // `isinstance_w(..., w_type)` walk is only for a type-like object
-    // that is not that layout.
-    if pyre_object::is_type(obj) {
-        return true;
-    }
     let w_type = crate::typedef::w_type();
     !w_type.is_null() && isinstance_w(obj, w_type)
 }
