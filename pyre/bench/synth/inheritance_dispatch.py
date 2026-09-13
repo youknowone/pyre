@@ -1,7 +1,4 @@
 # pyre-check: max-pypy-ratio=7
-# pyre-check: max-wasm-ratio=5.9
-# ubuntu-24.04 run 34737668364 measured 5.1x wasm/dynasm (1.09s / 0.22s).
-# 5.9x is that reading plus WASM_RATIO_FIT_HEADROOM (15%).
 # Ubuntu run 33279264115: 1.5-3.5x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython

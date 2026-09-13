@@ -1,7 +1,4 @@
 # pyre-check: max-pypy-ratio=6.5
-# pyre-check: max-wasm-ratio=6.7
-# ubuntu-24.04 run 34737668364 measured 5.8x wasm/dynasm (3.69s / 0.63s).
-# 6.7x is that reading plus WASM_RATIO_FIT_HEADROOM (15%).
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,
