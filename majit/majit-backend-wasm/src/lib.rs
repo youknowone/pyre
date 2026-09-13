@@ -105,9 +105,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// block is opened in; 53 = eligible but no trip callback is published to
 /// defer to; 54 = eligible, merge deferred until the bridge standing in for it
 /// has been entered `INLINE_TRIP_THRESHOLD` times; 55 = that trip fired and the
-/// merge was attempted; 56 = eligible but not deferrable, because the region
-/// carries a `GUARD_NOT_INVALIDATED` whose dependencies would outlive the flag
-/// it reads.
+/// merge was attempted; 56 = unused (outside-loop `GUARD_NOT_INVALIDATED`
+/// regions take the eager merge arm, the same flag-attachment window as a
+/// header region; the name stays so later indices do not move).
 ///
 /// 57-63 split slot 1, which says only that some CALL_ASSEMBLER target did not
 /// resolve and leaves the trace unsupported. Each answers one of the questions
@@ -2403,7 +2403,16 @@ const DEFAULT_INLINE_TRIP_BYTES_FACTOR: u64 = 40;
 /// not yet started losing the merges that earn theirs. Below it the fixtures
 /// whose merge removes millions of crossings begin to lose it, and each one
 /// costs several times what the re-emissions saved.
-const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 4096;
+///
+/// 4096 was fitted when an outside-loop `GUARD_NOT_INVALIDATED` region
+/// could not take this arm. Those regions now do, and they are the hot
+/// mid-body joins of `p2_local_result_bridge` and
+/// `short_circuit_value_kept_stack`: at 4096 the first merge grows the
+/// owner past the cap and the rest stay out of line, which is slower
+/// than merging none. 16384 is the smallest ceiling that lands those
+/// remaining regions (four on p2, five on the short-circuit loop)
+/// without moving pickle / float_subclass compile tax.
+const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 16384;
 
 /// A merge that passed every inline check and is waiting on
 /// [`INLINE_TRIP_THRESHOLD`] entries into the bridge compiled in its place.
@@ -5251,21 +5260,6 @@ impl majit_backend::Backend for WasmBackend {
                     if !outside_labels_initialized {
                         diag_bump(48);
                         decline("uninitialized_label");
-                    } else if has_invalidation_guard && outside_loop {
-                        // A quasi-immutable fold's dependencies are registered
-                        // once, against whatever flag the token names when this
-                        // compile returns — the bridge's own, because deferring
-                        // takes the out-of-line path below. The merge cannot
-                        // move a registration that has already happened, so
-                        // merged, the region would read the owner's root flag
-                        // while its dependencies still hold the bridge's: a
-                        // field mutated before the trip would be forgotten, and
-                        // one mutated after would leave the fold in place. The
-                        // eager invalidation arm below has no such window — it
-                        // merges before this compile returns, so the flag it
-                        // records is the one the dependencies then attach to.
-                        diag_bump(56);
-                        decline("defer_invalidation_guard");
                     } else if !has_invalidation_guard {
                         // Eligible, but not yet worth its owner re-emission:
                         // arm the bridge's entry counter and merge when it
@@ -5303,10 +5297,14 @@ impl majit_backend::Backend for WasmBackend {
                         decline("eager_too_large");
                     } else {
                         // Deferral would register this region's dependencies
-                        // against its temporary bridge flag. A header region
-                        // can instead merge before this compile returns, so
-                        // its dependencies attach to the owner's flag from the
-                        // outset. The outside-loop case was declined above.
+                        // against its temporary bridge flag. Merge before this
+                        // compile returns instead, so the dependencies attach
+                        // to the owner's flag from the outset. That window is
+                        // the same for a header region and for an outside-loop
+                        // one: both read whichever flag the emitted module
+                        // names, and only an in-compile merge makes that the
+                        // owner's. `INLINE_EAGER_MAX_BYTES` still bounds the
+                        // unmeasured re-emission.
                         let region = codegen::InlinedBridge {
                             source_fail_index: merged_fail_index,
                             external_jump: region_external.clone(),
