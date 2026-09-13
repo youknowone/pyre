@@ -8489,7 +8489,7 @@ impl<M: Clone> MetaInterp<M> {
         // an append; this loop reaches the same state because the seed on
         // this path holds only the tokens this compile produced.
         for target_token in &front_target_tokens {
-            target_token.set_original_jitcell_token(token.clone());
+            target_token.set_original_jitcell_token(&token);
             token.record_target_token(target_token.as_jump_target_descr());
         }
         // RPython backend contract: `consider_label` records the compact
@@ -10027,7 +10027,7 @@ impl<M: Clone> MetaInterp<M> {
                 // note there about upstream leaving the minted token's list
                 // empty on this arm.
                 for target_token in &unroll_opt.target_tokens {
-                    target_token.set_original_jitcell_token(token.clone());
+                    target_token.set_original_jitcell_token(&token);
                     token.record_target_token(target_token.as_jump_target_descr());
                 }
                 self.warm_state.memory_manager.keep_loop_alive(&token);
@@ -10364,7 +10364,7 @@ impl<M: Clone> MetaInterp<M> {
                 // (`compile.py`'s `get_procedure_token(greenkey)`), which
                 // is what `pyjitpl.py has_compiled_targets` reads.
                 for target_token in &unroll_opt.target_tokens {
-                    target_token.set_original_jitcell_token(source_jct.clone());
+                    target_token.set_original_jitcell_token(&source_jct);
                     loop_jitcell_token.record_target_token(target_token.as_jump_target_descr());
                 }
                 // `unroll.py:213-215 if cell_token.retraced_count < limit:
@@ -11421,7 +11421,7 @@ impl<M: Clone> MetaInterp<M> {
         // closing JUMP to the same token.
         let target_token = crate::history::TargetToken::new_loop(token_num);
         // `compile.py target_token.original_jitcell_token = jitcell_token`.
-        target_token.set_original_jitcell_token(token.clone());
+        target_token.set_original_jitcell_token(&token);
         // `compile.py jitcell_token.target_tokens = [target_token]` —
         // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py`).
         token.record_target_token(target_token.as_jump_target_descr());
@@ -11483,12 +11483,11 @@ impl<M: Clone> MetaInterp<M> {
         );
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
-            self.backend.compile_loop(
-                &inputargs,
-                &compiled_ops,
-                Arc::get_mut(&mut token)
-                    .expect("JitCellToken must stay uniquely owned until backend compile"),
-            )
+            // `Backend::compile_loop` takes `&JitCellToken`: JUMP
+            // TargetTokens now carry a Weak to this token
+            // (`history.py TargetToken.original_jitcell_token`), and a
+            // self-recursive CALL_ASSEMBLER descr may hold a strong clone.
+            self.backend.compile_loop(&inputargs, &compiled_ops, &token)
         };
         let compile_time = Instant::now().saturating_duration_since(compile_start);
         match compile_loop_result {

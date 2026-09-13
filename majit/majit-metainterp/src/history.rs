@@ -131,7 +131,7 @@ impl TargetToken {
     /// Stores the token object (Weak on the descr; see
     /// `LoopTargetDescr::original_jitcell_token_handle`) and caches
     /// `token.number` for the dense `unroll.rs` compare.
-    pub fn set_original_jitcell_token(&self, token: Arc<JitCellToken>) {
+    pub fn set_original_jitcell_token(&self, token: &Arc<JitCellToken>) {
         self.jump_target_descr.set_original_jitcell_token(token);
     }
 
@@ -195,11 +195,11 @@ impl LoopTargetDescr {
 
     /// `compile.py compile_simple_loop` / `compile_loop` /
     /// `propagate_original_jitcell_token`.
-    fn set_original_jitcell_token(&self, token: Arc<JitCellToken>) {
+    fn set_original_jitcell_token(&self, token: &Arc<JitCellToken>) {
         let number = token.number;
         let mut st = self.state.lock();
         st.original_jitcell_token_number = Some(number);
-        st.original_jitcell_token = Some(Arc::downgrade(&token));
+        st.original_jitcell_token = Some(Arc::downgrade(token));
     }
 }
 
@@ -298,7 +298,7 @@ impl majit_ir::LoopTargetDescr for LoopTargetDescr {
 
     fn set_original_jitcell_token_handle(&self, handle: Arc<dyn std::any::Any + Send + Sync>) {
         if let Ok(token) = handle.downcast::<JitCellToken>() {
-            self.set_original_jitcell_token(token);
+            self.set_original_jitcell_token(&token);
         }
     }
 }
