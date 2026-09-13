@@ -1975,12 +1975,6 @@ static LISTITER_TYPE_WORD: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 static LISTITER_PRED: std::sync::atomic::AtomicPtr<()> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-/// EC top frame published at `execute_assembler` entry. The leftover-empty
-/// red can be the portal caller (`portal_frame_reg`) whose TOS is ZipInfo
-/// while the live FOR_ITER iterator sits on the inlined `_compile`.
-static LEFTOVER_SCAN_FRAME: std::sync::atomic::AtomicPtr<u8> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
 /// JIT boot: `&LIST_ITER_TYPE as *const _ as usize`.
 pub fn register_listiter_type_word(word: usize) {
     LISTITER_TYPE_WORD.store(word, std::sync::atomic::Ordering::Relaxed);
@@ -1993,20 +1987,27 @@ pub fn register_listiter_pred(f: unsafe extern "C" fn(*const u8) -> i32) {
 
 /// `execute_assembler`: the live EC top frame (`vref_referent`, never a vref).
 pub fn register_leftover_scan_frame(frame: *const u8) {
-    LEFTOVER_SCAN_FRAME.store(frame as *mut u8, std::sync::atomic::Ordering::Relaxed);
+    LEFTOVER_SCAN_FRAME.with(|c| c.set(frame as *mut u8));
 }
 
-static LEFTOVER_EMPTY_REJECT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+fn leftover_scan_frame() -> *mut u8 {
+    LEFTOVER_SCAN_FRAME.with(|c| c.get())
+}
+
+thread_local! {
+    static LEFTOVER_SCAN_FRAME: std::cell::Cell<*mut u8> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static LEFTOVER_EMPTY_REJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// leftover-empty would leftover_peel_tos a non-iterator portal TOS
 /// (ZipInfo). compile_loop must abort rather than install that loop.
 pub fn take_leftover_empty_reject() -> bool {
-    LEFTOVER_EMPTY_REJECT.swap(false, std::sync::atomic::Ordering::Relaxed)
+    LEFTOVER_EMPTY_REJECT.with(|c| c.replace(false))
 }
 
 fn note_leftover_empty_reject() {
-    LEFTOVER_EMPTY_REJECT.store(true, std::sync::atomic::Ordering::Relaxed);
+    LEFTOVER_EMPTY_REJECT.with(|c| c.set(true));
 }
 
 fn leftover_has_listiter_id() -> bool {
@@ -2057,7 +2058,7 @@ pub(crate) unsafe fn live_tos_for_vable(
     let vable_tid = gc_type_id(vable as usize);
     let mut ptr = vable;
     let mut path = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..10 {
         let vsd = unsafe { vinfo.read_field(ptr, vsd_i) as usize };
         let alen = if vinfo.array_fields.is_empty() {
             usize::MAX
@@ -2118,11 +2119,11 @@ fn gc_type_id(addr: usize) -> Option<u32> {
 /// this is a plain C call.
 ///
 /// If TOS is not a list iterator (a leftover-empty portal TOS can be
-/// ZipInfo / Tokenizer / str after densify remaps by position), scan
-/// the frame's locals array for a `list_iterator`. When the red is the
-/// portal caller, also scan the EC top frame published by
-/// `register_leftover_scan_frame`. The type word / `is_list_iter`
-/// predicate is registered at JIT boot so this helper stays a 7-arg CallR.
+/// ZipInfo / Tokenizer / str after densify remaps by position), peel the
+/// EC top frame published by `register_leftover_scan_frame`. Do not scan
+/// other locals: that can return a live `frame`. The type word /
+/// `is_list_iter` predicate is registered at JIT boot so this helper
+/// stays a 7-arg CallR.
 ///
 /// CallR arg0 is the function pointer (not in `CallDescr.arg_types`).
 ///
@@ -2172,7 +2173,7 @@ pub unsafe extern "C" fn leftover_peel_tos(
     if std::env::var_os("MAJIT_LEFTOVER").is_some() {
         eprintln!(
             "leftover-peel enter vable={vable:p} extra={:p}",
-            LEFTOVER_SCAN_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+            leftover_scan_frame()
         );
     }
     let vable_ty = unsafe { *(vable as *const usize) };
@@ -2228,23 +2229,11 @@ pub unsafe extern "C" fn leftover_peel_tos(
         }
         Some((items, alen))
     };
-    let scan_listiter = |frame: *const u8| -> *const u8 {
-        let Some((items, alen)) = items_of(frame) else {
-            return std::ptr::null();
-        };
-        // Highest index first: a live FOR_ITER iterator sits at TOS.
-        for i in (0..alen).rev() {
-            let p = unsafe { *items.add(i) };
-            if is_listiter(p) {
-                return p as *const u8;
-            }
-        }
-        std::ptr::null()
-    };
-    let peel_one = |start: *const u8| -> (*const u8, *const u8) {
+    // Walk TOS only. Scanning other locals can return a live `frame`
+    // (or ZipInfo) and compile FOR_ITER against it.
+    let peel_one = |start: *const u8| -> *const u8 {
         let mut ptr = start;
-        let mut last = start;
-        for _ in 0..8 {
+        for _ in 0..10 {
             let vsd = unsafe { *(ptr.add(vsd_off as usize) as *const usize) };
             let Some((items, alen)) = items_of(ptr) else {
                 break;
@@ -2260,35 +2249,26 @@ pub unsafe extern "C" fn leftover_peel_tos(
             if next == 0 {
                 break;
             }
-            last = next as *const u8;
             if !is_frame(next) {
                 if is_listiter(next) {
-                    return (last, std::ptr::null());
+                    return next as *const u8;
                 }
-                let found = scan_listiter(ptr);
-                if !found.is_null() {
-                    return (found, std::ptr::null());
-                }
-                return (last, last);
+                return std::ptr::null();
             }
-            ptr = last;
+            ptr = next as *const u8;
         }
-        let found = scan_listiter(ptr);
-        if !found.is_null() {
-            return (found, std::ptr::null());
-        }
-        (last, last)
+        std::ptr::null()
     };
-    let (found, non_iter) = peel_one(vable);
-    if non_iter.is_null() && !found.is_null() {
+    let found = peel_one(vable);
+    if !found.is_null() {
         return found;
     }
     // Portal TOS is ZipInfo / Tokenizer / str: the live FOR_ITER
     // iterator is on the inlined `_compile` (EC top), not this red.
-    let extra = LEFTOVER_SCAN_FRAME.load(std::sync::atomic::Ordering::Relaxed) as *const u8;
+    let extra = leftover_scan_frame() as *const u8;
     if !extra.is_null() && extra != vable {
-        let (extra_found, extra_non_iter) = peel_one(extra);
-        if extra_non_iter.is_null() && !extra_found.is_null() {
+        let extra_found = peel_one(extra);
+        if !extra_found.is_null() {
             if std::env::var_os("MAJIT_LEFTOVER").is_some() {
                 eprintln!(
                     "leftover-peel extra={extra:p} found={extra_found:p} portal_tos={found:p}"
@@ -2303,7 +2283,7 @@ pub unsafe extern "C" fn leftover_peel_tos(
             LISTITER_TYPE_WORD.load(std::sync::atomic::Ordering::Relaxed)
         );
     }
-    found
+    std::ptr::null()
 }
 
 /// The assertion at the baking site below is what that invariant buys in
@@ -5178,7 +5158,7 @@ mod tests {
     #[test]
     fn test_leftover_peel_tos_walks_inlined_callee_frame() {
         let _guard = PEEL_TEST_LOCK.lock().unwrap();
-        LEFTOVER_SCAN_FRAME.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        register_leftover_scan_frame(std::ptr::null());
         // Portal TOS is an inlined `_compile` frame; that frame's TOS
         // is the iterator. leftover_peel_tos must return the iterator,
         // not the callee frame.
@@ -5199,6 +5179,14 @@ mod tests {
         const FRAME_TY: usize = 0xF1;
         const FRAME_CLASS: usize = 0xF2;
         const ITER_TY: usize = 0xA1;
+        let prev = LISTITER_TYPE_WORD.swap(ITER_TY, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _restore = Restore(prev);
         let mut iterator = [ITER_TY, 0];
         let mut callee_slots = [iterator.as_mut_ptr() as usize];
         let mut callee_arr = Container {
@@ -5239,7 +5227,7 @@ mod tests {
     #[test]
     fn test_leftover_peel_tos_direct_pointer_array() {
         let _guard = PEEL_TEST_LOCK.lock().unwrap();
-        LEFTOVER_SCAN_FRAME.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        register_leftover_scan_frame(std::ptr::null());
         #[repr(C)]
         struct Block {
             len: usize,
@@ -5257,6 +5245,14 @@ mod tests {
         const FRAME_TY: usize = 0xF1;
         const FRAME_CLASS: usize = 0xF2;
         const ITER_TY: usize = 0xA1;
+        let prev = LISTITER_TYPE_WORD.swap(ITER_TY, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _restore = Restore(prev);
         let mut iterator = [ITER_TY, 0];
         let mut callee_block = Block {
             len: 1,
@@ -5304,7 +5300,7 @@ mod tests {
     #[test]
     fn test_leftover_peel_tos_stops_at_non_frame_tos() {
         let _guard = PEEL_TEST_LOCK.lock().unwrap();
-        LEFTOVER_SCAN_FRAME.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        register_leftover_scan_frame(std::ptr::null());
         #[repr(C)]
         struct Block {
             len: usize,
@@ -5347,17 +5343,16 @@ mod tests {
                 0,
             )
         };
-        assert_eq!(
-            got as usize,
-            string.as_mut_ptr() as usize,
-            "non-frame TOS is the result"
+        assert!(
+            got.is_null(),
+            "non-listiter TOS must not be handed to FOR_ITER"
         );
     }
 
     #[test]
-    fn test_leftover_peel_tos_scans_for_listiter_when_tos_is_not_one() {
+    fn test_leftover_peel_tos_does_not_scan_locals_for_listiter() {
         let _guard = PEEL_TEST_LOCK.lock().unwrap();
-        LEFTOVER_SCAN_FRAME.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        register_leftover_scan_frame(std::ptr::null());
         // 31/29 leftover-empty: portal `_compile` TOS is ZipInfo
         // (`for op, av in pattern` after unpack) while the live
         // listiter sits at a lower locals_cells_stack_w slot.
@@ -5418,10 +5413,9 @@ mod tests {
                 0,
             )
         };
-        assert_eq!(
-            got as usize,
-            listiter.as_mut_ptr() as usize,
-            "non-iterator TOS must yield the frame's listiter, not ZipInfo"
+        assert!(
+            got.is_null(),
+            "non-iterator TOS must not invent a listiter from another slot"
         );
     }
 
@@ -5450,8 +5444,8 @@ mod tests {
         const ZIPINFO_TY: usize = 0x5A;
         const LISTITER_TY: usize = 0x1A12;
         let prev_ty = LISTITER_TYPE_WORD.swap(LISTITER_TY, std::sync::atomic::Ordering::Relaxed);
-        let prev_scan =
-            LEFTOVER_SCAN_FRAME.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        let prev_scan = leftover_scan_frame();
+        register_leftover_scan_frame(std::ptr::null());
         struct Restore {
             ty: usize,
             scan: *mut u8,
@@ -5459,7 +5453,7 @@ mod tests {
         impl Drop for Restore {
             fn drop(&mut self) {
                 LISTITER_TYPE_WORD.store(self.ty, std::sync::atomic::Ordering::Relaxed);
-                LEFTOVER_SCAN_FRAME.store(self.scan, std::sync::atomic::Ordering::Relaxed);
+                register_leftover_scan_frame(self.scan);
             }
         }
         let _restore = Restore {
@@ -5515,7 +5509,7 @@ mod tests {
     #[test]
     fn test_patch_new_loop_rejects_non_iterator_portal_tos() {
         let _guard = PEEL_TEST_LOCK.lock().unwrap();
-        LEFTOVER_SCAN_FRAME.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+        register_leftover_scan_frame(std::ptr::null());
         #[repr(C)]
         struct Block {
             len: usize,
