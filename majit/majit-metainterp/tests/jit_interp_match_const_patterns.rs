@@ -150,7 +150,6 @@ fn expected() -> i64 {
 }
 
 #[test]
-#[ignore = "pre-existing on 2f9c2bee327: store_final_boxes_in_guard GuardValue has no snapshot (resume.py assert resume_position). Reproduced identically before fill_registers / ShortBoxes move."]
 fn the_traced_match_sends_each_tag_to_its_own_arm() {
     let cold = dispatch_tags(&PROGRAM, u32::MAX, TICKS);
     assert_eq!(cold, expected(), "the cold arm states the answer");
@@ -170,7 +169,6 @@ fn the_traced_match_sends_each_tag_to_its_own_arm() {
 
 /// The denominator: the arms are in the trace as guarded comparisons.
 #[test]
-#[ignore = "pre-existing on 2f9c2bee327: store_final_boxes_in_guard GuardValue has no snapshot (resume.py assert resume_position). Reproduced identically before fill_registers / ShortBoxes move."]
 fn the_constant_arms_are_guarded_in_the_trace() {
     let _ = dispatch_tags(&PROGRAM, 8, TICKS);
     let body = COMPILED.lock().clone();
