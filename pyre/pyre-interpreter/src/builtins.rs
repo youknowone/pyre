@@ -12166,9 +12166,10 @@ pub(crate) fn collect_iterator(it: PyObjectRef) -> Result<Vec<PyObjectRef>, crat
     }
     // Read the forwarded element slots back out. `item_base` follows the
     // iterator and any carrier-specific backing roots above.
-    let items = (0..count)
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(item_base + i))
-        .collect();
+    let mut items = Vec::with_capacity(count);
+    for i in 0..count {
+        items.push(pyre_object::gc_roots::shadow_stack_get(item_base + i));
+    }
     Ok(items)
 }
 

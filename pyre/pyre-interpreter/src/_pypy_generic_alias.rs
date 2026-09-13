@@ -120,10 +120,10 @@ pub(crate) fn collect_parameters(args: PyObjectRef) -> crate::PyResult {
             collect_parameters_one(t, &mut param_slots)?;
         }
     }
-    let params: Vec<PyObjectRef> = param_slots
-        .iter()
-        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
-        .collect();
+    let mut params = Vec::with_capacity(param_slots.len());
+    for &slot in &param_slots {
+        params.push(pyre_object::gc_roots::shadow_stack_get(slot));
+    }
     Ok(w_tuple_new(params))
 }
 
@@ -469,10 +469,10 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             push_newarg(arg, &mut newarg_slots);
         }
     }
-    let newargs: Vec<PyObjectRef> = newarg_slots
-        .iter()
-        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
-        .collect();
+    let mut newargs = Vec::with_capacity(newarg_slots.len());
+    for &slot in &newarg_slots {
+        newargs.push(pyre_object::gc_roots::shadow_stack_get(slot));
+    }
     Ok(w_tuple_new(newargs))
 }
 
@@ -771,10 +771,11 @@ pub(crate) fn subs_parameters(
             push_newarg(arg, &mut newarg_slots);
         }
     }
-    Ok(newarg_slots
-        .into_iter()
-        .map(pyre_object::gc_roots::shadow_stack_get)
-        .collect())
+    let mut newargs = Vec::with_capacity(newarg_slots.len());
+    for slot in newarg_slots {
+        newargs.push(pyre_object::gc_roots::shadow_stack_get(slot));
+    }
+    Ok(newargs)
 }
 
 /// `subs_tvars(obj, params, argitems)` (`_pypy_generic_alias.py:183`) —
@@ -838,10 +839,10 @@ fn subs_tvars(
             subarg_slots.push(arg_slot);
         }
     }
-    let subargs: Vec<PyObjectRef> = subarg_slots
-        .iter()
-        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
-        .collect();
+    let mut subargs = Vec::with_capacity(subarg_slots.len());
+    for &slot in &subarg_slots {
+        subargs.push(pyre_object::gc_roots::shadow_stack_get(slot));
+    }
     // Build the substitution tuple before reading `obj` back: `w_tuple_new`
     // allocates, so a receiver read ahead of it would be the pre-move one.
     let subs = w_tuple_new(subargs);

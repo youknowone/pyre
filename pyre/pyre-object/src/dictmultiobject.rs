@@ -7229,17 +7229,21 @@ impl DictStrategy for ObjectDictStrategy {
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_items(w_dict)
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect()
+        let items = crate::dictmultiobject::w_dict_items(w_dict);
+        let mut keys = Vec::with_capacity(items.len());
+        for (k, _) in items {
+            keys.push(k);
+        }
+        keys
     }
 
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_items(w_dict)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect()
+        let items = crate::dictmultiobject::w_dict_items(w_dict);
+        let mut values = Vec::with_capacity(items.len());
+        for (_, v) in items {
+            values.push(v);
+        }
+        values
     }
 
     /// `dictmultiobject.py items` — `self.unerase
@@ -7408,17 +7412,21 @@ impl DictStrategy for BytesDictStrategy {
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_items_bytes_strategy(w_dict)
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect()
+        let items = crate::dictmultiobject::w_dict_items_bytes_strategy(w_dict);
+        let mut keys = Vec::with_capacity(items.len());
+        for (k, _) in items {
+            keys.push(k);
+        }
+        keys
     }
 
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_items_bytes_strategy(w_dict)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect()
+        let items = crate::dictmultiobject::w_dict_items_bytes_strategy(w_dict);
+        let mut values = Vec::with_capacity(items.len());
+        for (_, v) in items {
+            values.push(v);
+        }
+        values
     }
 
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
@@ -7660,17 +7668,21 @@ impl DictStrategy for UnicodeDictStrategy {
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_items_object_strategy(w_dict)
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect()
+        let items = crate::dictmultiobject::w_dict_items_object_strategy(w_dict);
+        let mut keys = Vec::with_capacity(items.len());
+        for (k, _) in items {
+            keys.push(k);
+        }
+        keys
     }
 
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_items_object_strategy(w_dict)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect()
+        let items = crate::dictmultiobject::w_dict_items_object_strategy(w_dict);
+        let mut values = Vec::with_capacity(items.len());
+        for (_, v) in items {
+            values.push(v);
+        }
+        values
     }
 
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
@@ -7875,17 +7887,21 @@ impl DictStrategy for IntDictStrategy {
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_items_int_strategy(w_dict)
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect()
+        let items = crate::dictmultiobject::w_dict_items_int_strategy(w_dict);
+        let mut keys = Vec::with_capacity(items.len());
+        for (k, _) in items {
+            keys.push(k);
+        }
+        keys
     }
 
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_items_int_strategy(w_dict)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect()
+        let items = crate::dictmultiobject::w_dict_items_int_strategy(w_dict);
+        let mut values = Vec::with_capacity(items.len());
+        for (_, v) in items {
+            values.push(v);
+        }
+        values
     }
 
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
