@@ -1,10 +1,4 @@
 # pyre-check: max-pypy-ratio=6.5
-# pyre-check: max-wasm-ratio=6.3
-# The post-warm-up raise is not in the recorded trace, so the hop
-# floordiv → inner finally → reraise → outer except runs entirely in
-# the blackhole. wasm pays that path through the guest; ubuntu-24.04
-# read 5.5x (3.14s / dynasm 0.57s). 6.3x is 5.5x plus
-# WASM_RATIO_FIT_HEADROOM. The 4x default ceiling is not raised.
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,

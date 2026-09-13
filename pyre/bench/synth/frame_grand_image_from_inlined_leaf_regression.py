@@ -1,8 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=hot
-# pyre-check: skip-backends=wasm
-# Same wasm compile-shape skip as the mid-caller sibling: five aborts then
-# a root, so it cannot declare the native `hot` loop.
 # `sys._getframe(2)` from `leaf` lands on `grand`, not `mid` and not the
 # portal. lasti/lineno fold at the CALL `grand` is suspended at
 # (`InlineParentFrame.caller_py_pc`).

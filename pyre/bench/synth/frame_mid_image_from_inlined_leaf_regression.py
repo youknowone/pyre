@@ -1,8 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=hot
-# pyre-check: skip-backends=wasm
-# wasm still prints PASS but compiles a root trace after five loop aborts,
-# so it cannot declare the native `hot` loop.
 # Self-checking regression guard for a mid inlined caller's frame read from
 # inside its inlined leaf while the portal loop is still running.
 #

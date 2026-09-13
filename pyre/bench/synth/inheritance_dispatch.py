@@ -1,7 +1,4 @@
 # pyre-check: max-pypy-ratio=7
-# pyre-check: max-wasm-ratio=5.9
-# Method dispatch is a residual CALL on wasm. ubuntu-24.04 read 5.1x
-# (1.12s / dynasm 0.22s). 5.9x is 5.1x plus WASM_RATIO_FIT_HEADROOM.
 # Ubuntu run 33279264115: 1.5-3.5x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython

@@ -1,8 +1,4 @@
 # pyre-check: max-pypy-ratio=10.6
-# pyre-check: max-wasm-ratio=5.1
-# The not-taken arm is a kept-stack snapshot; wasm pays the decline
-# through the guest. ubuntu-24.04 read 4.4x (1.07s / dynasm 0.24s).
-# 5.1x is 4.4x plus WASM_RATIO_FIT_HEADROOM.
 # Ubuntu run 33279264115: 2.2-5.3x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython

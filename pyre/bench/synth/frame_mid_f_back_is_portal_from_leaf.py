@@ -1,7 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=hot
-# pyre-check: skip-backends=wasm
-# Same wasm compile-shape skip as the mid lasti sibling.
 # `sys._getframe(1).f_back` from an inlined leaf is the portal. The fold
 # is `pyframe.py fget_f_back` → `getnextframe_nohidden` when the hop
 # names the standard virtualizable.

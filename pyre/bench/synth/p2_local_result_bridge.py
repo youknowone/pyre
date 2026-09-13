@@ -1,8 +1,4 @@
 # pyre-check: max-pypy-ratio=11.8
-# pyre-check: max-wasm-ratio=5.3
-# The late type flip compiles a bridge; wasm pays that owner through
-# the guest. ubuntu-24.04 read 4.6x (1.24s / dynasm 0.27s). 5.3x is
-# 4.6x plus WASM_RATIO_FIT_HEADROOM.
 # Ubuntu run 33279264115: 2.2-5.9x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython

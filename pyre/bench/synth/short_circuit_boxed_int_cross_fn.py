@@ -1,7 +1,4 @@
 # pyre-check: max-pypy-ratio=10.4
-# pyre-check: max-wasm-ratio=5.1
-# The kept-stack decline resumes in the interpreter. ubuntu-24.04 read
-# 4.4x (1.29s / dynasm 0.29s). 5.1x is 4.4x plus WASM_RATIO_FIT_HEADROOM.
 # Ubuntu run 33279264115: 2-5.2x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython
