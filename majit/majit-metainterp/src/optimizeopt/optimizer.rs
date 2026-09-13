@@ -2156,17 +2156,19 @@ impl Optimizer {
             return resolved;
         }
 
-        // RawBuffer / RawSlice: `AbstractRawPtrInfo` (info.py)
-        // inherits `AbstractVirtualPtrInfo._force_at_the_end_of_preamble`
-        // (info.py:159-160) without override, so both take the base
-        // `force_box()` materialization path.  pyre mirrors this by
-        // matching both `VirtualRawBuffer` and `VirtualRawSlice`
-        // (info.py `RawBufferPtrInfo` / info.py `RawSlicePtrInfo`).
+        // `AbstractVirtualPtrInfo._force_at_the_end_of_preamble`
+        // without override is `force_box()`.
+        // `StrPtrInfo` (`vstring.py`) and `AbstractRawPtrInfo`
+        // (`RawBufferPtrInfo` / `RawSlicePtrInfo`) all inherit that
+        // base.  `VirtualStateConstructor` has no `visit_vstr*`
+        // (`walkvirtual.py` raises `NotImplementedError`), so a
+        // virtual string that reaches export is a missed force.
         // optimizer.py:311-312 routes through `optforce = self.optearlyforce`.
         if matches!(
             info,
             crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
                 | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_)
+                | crate::optimizeopt::info::PtrInfo::Str(_)
         ) {
             let saved = ctx.current_pass_idx;
             ctx.current_pass_idx = ctx.optearlyforce_idx;

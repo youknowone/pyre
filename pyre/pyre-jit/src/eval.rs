@@ -5624,6 +5624,26 @@ fn build_jit_driver_pair() -> JitDriverPair {
         pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
         pyre_jit_trace::jitcode_runtime::all_liveness(),
     );
+    // `jtransform.py` `_handle_stroruni_call` / `_handle_oopspec_call`
+    // adds `OS_STR_CONCAT` to `callinfocollection`.  The walker records
+    // `jit_ll_strconcat` itself, so seed the same row for
+    // `resume.py concat_strings`.
+    {
+        let descr = majit_metainterp::make_call_descr_with_effect(
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::Type::Ref,
+            majit_ir::EffectInfo::const_new(
+                majit_ir::ExtraEffect::ElidableOrMemoryError,
+                majit_ir::OopSpecIndex::StrConcat,
+            ),
+        );
+        d.meta_interp_mut().ensure_oopspec_callinfo(
+            majit_ir::OopSpecIndex::StrConcat,
+            descr,
+            pyre_object::lowlevel_string::jit_ll_strconcat as *const () as u64,
+            "jit_ll_strconcat",
+        );
+    }
     // rlib/jit.py set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its

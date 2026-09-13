@@ -2746,7 +2746,7 @@ impl Bookkeeper {
             // `bytes_block_chars` folds the Rust raw-slice view back to this
             // owner, so the owner must carry the same `SomeString` annotation
             // as the slice it represents, not a nominal Rust-struct class.
-            "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" => {
+            "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" | "Utf8Str" => {
                 return super::model::s_str0();
             }
             // `malachite_bigint::BigInt` is deliberately foreign and opaque

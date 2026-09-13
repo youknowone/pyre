@@ -692,6 +692,52 @@ pub fn emit_box_int_inline(
     new_op
 }
 
+/// `W_UnicodeObject.__init__(utf8str, length)` (`unicodeobject.py`):
+/// `new_with_vtable` + `setfield _utf8` + `setfield _length` +
+/// `setfield _index_storage = rutf8.null_storage()`.
+///
+/// `byte_len` is the cached `len(_utf8)` this layout stores beside
+/// `_length`.  Like [`emit_box_int_inline`], `w_class` is left to the
+/// GC rewriter; `type(s)` / `isinstance` resolve through `ob_type`.
+pub fn emit_box_unicode_inline(
+    ctx: &mut TraceCtx,
+    utf8: OpRef,
+    length: OpRef,
+    byte_len: OpRef,
+) -> OpRef {
+    let new_op = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_unicode_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(new_op);
+
+    let utf8_descr = crate::descr::unicode_utf8_descr();
+    let utf8_idx = utf8_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, utf8], utf8_descr);
+    ctx.heapcache_setfield_cached(new_op, utf8_idx, utf8);
+
+    let len_descr = crate::descr::str_len_descr();
+    let len_idx = len_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, length], len_descr);
+    ctx.heapcache_setfield_cached(new_op, len_idx, length);
+
+    let blen_descr = crate::descr::unicode_byte_len_descr();
+    let blen_idx = blen_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, byte_len], blen_descr);
+    ctx.heapcache_setfield_cached(new_op, blen_idx, byte_len);
+
+    let index_descr = crate::descr::unicode_index_storage_descr();
+    let null = OpRef::const_ptr(GcRef(0));
+    let index_idx = index_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, null], index_descr);
+    ctx.heapcache_setfield_cached(new_op, index_idx, null);
+
+    let str_type = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+    ctx.heap_cache_mut().class_now_known(new_op, str_type);
+    new_op
+}
+
 /// Emit inline W_LongObject creation (NewWithVtable + SetfieldGc) for the
 /// boxing of a bigint result — the PyPy `W_LongObject(rbigint)` shape
 /// (`new_with_vtable` + `setfield_gc('num', z)`). `bigint_ref` is the

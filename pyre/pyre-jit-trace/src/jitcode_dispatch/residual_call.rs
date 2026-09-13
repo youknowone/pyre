@@ -3819,6 +3819,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         helper,
         majit_ir::RuntimeHelperKind::NewtupleFromArray
             | majit_ir::RuntimeHelperKind::NewlistFromArray
+            | majit_ir::RuntimeHelperKind::BuildStringFromArray
     );
     let provably_side_effect_free = reentrant_residual
         || is_rerunnable_bookkeeping
@@ -6767,6 +6768,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             try_walker_specialize_format_simple(ctx, op, &r_args, dst)
         })?
         .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // BUILD_STRING of already-str fragments: left-fold `descr_add`
+    // (`jit_str_concat`) off the backing-array heap-cache, the same
+    // channel as `BINARY_OP ADD` of two exact `str`s.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BuildStringFromArray
+        && try_walker_specialize_build_string(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }

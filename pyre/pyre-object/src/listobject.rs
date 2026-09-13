@@ -4122,10 +4122,10 @@ pub unsafe fn w_list_sort_strings(obj: PyObjectRef, reverse: bool) -> bool {
         ListStrategy::Bytes => list.bytes_items.as_mut_slice().sort_by(|a, b| {
             crate::bytesobject::bytes_block_chars(*a).cmp(crate::bytesobject::bytes_block_chars(*b))
         }),
-        ListStrategy::Ascii => list
-            .ascii_items
-            .as_mut_slice()
-            .sort_by(|a, b| (&**a).as_bytes().cmp((&**b).as_bytes())),
+        ListStrategy::Ascii => list.ascii_items.as_mut_slice().sort_by(|a, b| unsafe {
+            crate::unicodeobject::utf8_payload_bytes(*a)
+                .cmp(crate::unicodeobject::utf8_payload_bytes(*b))
+        }),
         _ => return false,
     }
     if reverse {

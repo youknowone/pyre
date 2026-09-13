@@ -965,10 +965,10 @@ pub enum RuntimeHelperKind {
     /// `__format__` runs Python here, so the generic residual is opaque for
     /// the whole method body.
     ///
-    /// The walker folds an exact `int` to `jit_int_str` and an exact `str`
-    /// to identity — the empty-spec arms of `format_w`.  A bool, subclass,
-    /// or Python `__format__` stays residual.  [`FormatWithSpec`] inlines a
-    /// Python `__format__` when a spec operand is present.
+    /// The walker folds an exact `int` to `ll_int2dec` + `newutf8` and an
+    /// exact `str` to identity — the empty-spec arms of `format_w`.  A bool,
+    /// subclass, or Python `__format__` stays residual.  [`FormatWithSpec`]
+    /// inlines a Python `__format__` when a spec operand is present.
     FormatSimple,
     /// `bh_format_with_spec_fn(value, spec)` — the FORMAT_WITH_SPEC helper,
     /// the two-operand sibling of [`RuntimeHelperKind::FormatSimple`] carrying
@@ -1010,6 +1010,14 @@ pub enum RuntimeHelperKind {
     /// recovered from the backing array (const length + per-index element
     /// shadows) rather than from residual args.
     NewlistFromArray,
+    /// `bh_build_string_from_array(array)` — the BUILD_STRING array consumer
+    /// (`pyopcode.py BUILD_STRING`).  Fragments are already strings
+    /// (FORMAT_* / CONVERT_VALUE ran first).  The walker recovers them
+    /// from the backing-array heap-cache and left-folds `descr_add`
+    /// (`jit_str_concat`), the same channel as `BINARY_OP ADD` of two
+    /// exact `str`s.  `Utf8StringBuilder` look-inside remains the next
+    /// port for a single virtualized build.
+    BuildStringFromArray,
     /// `n_varargs_fn(frame, exc, cause)` — the RAISE-family residual the
     /// codewriter emits for `n argc>=1` (`build_n_varargs_fn_residual_call_r_r_insn`).
     /// `cause` (the trailing Ref arg) is a `PY_NULL` sentinel for `raise X`

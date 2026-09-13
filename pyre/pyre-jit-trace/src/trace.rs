@@ -1271,8 +1271,8 @@ pub fn trace_bytecode<Sym: WalkSym>(
 ) -> (TraceAction, pyre_interpreter::pyframe::FrameBox) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
-    // `bh_strgetitem` family routes through `W_UnicodeObject`-shaped
-    // `str_descr` / `unicode_descr` (`pyre_cpu` module).
+    // `bh_strgetitem` family routes through rstr `STR` `str_descr`
+    // (`pyre_cpu` module).
     meta.set_cpu(crate::pyre_cpu::shared());
 
     // A stale flag from a prior trace on this thread must not leak into

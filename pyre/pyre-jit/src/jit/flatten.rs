@@ -4990,7 +4990,7 @@ where
                 ctx.build_string_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::Plain,
-                majit_ir::RuntimeHelperKind::None,
+                majit_ir::RuntimeHelperKind::BuildStringFromArray,
                 dst_reg,
             ))
         }

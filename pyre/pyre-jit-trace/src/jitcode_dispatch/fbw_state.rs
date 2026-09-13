@@ -2426,6 +2426,14 @@ thread_local! {
     /// trace executes that residual once on later iterations, so the generic
     /// nested-replay decline does not apply to this resolved descriptor path.
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `try_walker_inline_format` for a `__format__` that builds a string
+    /// (`"<" + spec + ">"`).  The entry is not a CALL, so
+    /// `entry_is_call_boundary` stays false (a non-str result must decline
+    /// to `descroperation.py format`'s TypeError residual).  The body is
+    /// still `get_and_call_function`, and this flag lets the DeferredCall
+    /// gate admit it.
+    pub(crate) static FORMAT_INLINE_CONSTRUCTS_STR: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// Code keys of the callees [`fbw_inline_callee_hazardous`] named when the
     /// hazard arm of [`fbw_abort_nested_unjournaled_residual`] fired.  The
     /// inline callsite declines them from then on, so the call residualizes
@@ -3826,6 +3834,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     | majit_ir::RuntimeHelperKind::BoxInt
                     | majit_ir::RuntimeHelperKind::NewtupleFromArray
                     | majit_ir::RuntimeHelperKind::NewlistFromArray
+                    | majit_ir::RuntimeHelperKind::BuildStringFromArray
                     | majit_ir::RuntimeHelperKind::GetCurrentException
                     | majit_ir::RuntimeHelperKind::LoadDeref
                     // `super_attr_unwrap` is a total function of its argument —

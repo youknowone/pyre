@@ -4950,6 +4950,41 @@ impl<M: Clone> MetaInterp<M> {
         self.callinfocollection.as_ref()
     }
 
+    /// `jtransform.py` `_handle_oopspec_call`:
+    /// `callinfocollection.add(oopspecindex, calldescr, func)`.
+    ///
+    /// Walker-emitted oopspecs (`OS_STR_CONCAT` on `jit_ll_strconcat`)
+    /// never pass the codewriter, so seed the table the resume decoder
+    /// (`resume.py concat_strings`) reads.
+    pub fn ensure_oopspec_callinfo(
+        &mut self,
+        oopspec: majit_ir::OopSpecIndex,
+        calldescr: majit_ir::DescrRef,
+        func_addr: u64,
+        name: &str,
+    ) {
+        if self
+            .callinfocollection
+            .as_ref()
+            .is_some_and(|cic| cic.has_oopspec(oopspec))
+        {
+            return;
+        }
+        let mut cic = self
+            .callinfocollection
+            .as_ref()
+            .map(|a| (**a).clone())
+            .unwrap_or_default();
+        cic.add(oopspec, calldescr.clone(), func_addr);
+        cic.register_func_name(func_addr, name.to_string());
+        if let Some(sd) = std::sync::Arc::get_mut(&mut self.staticdata) {
+            sd.callinfocollection.add(oopspec, calldescr, func_addr);
+            sd.callinfocollection
+                .register_func_name(func_addr, name.to_string());
+        }
+        self.callinfocollection = Some(std::sync::Arc::new(cic));
+    }
+
     /// Decay all counters to avoid stale hotness data.
     pub fn decay_counters(&mut self) {
         self.warm_state.decay_counters();
@@ -5226,6 +5261,8 @@ impl<M: Clone> MetaInterp<M> {
             Optimizer::default_pipeline()
         };
         opt.supports_efficient_uint_mul_high = self.backend.supports_efficient_uint_mul_high();
+        // optimizer.py Optimizer.__init__: `self.cpu = metainterp_sd.cpu`.
+        opt.cpu = self.cpu.clone();
         opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
         // `virtualize.py:140` `vrefinfo =
         // self.optimizer.metainterp_sd.virtualref_info` — install the
@@ -7895,6 +7932,7 @@ impl<M: Clone> MetaInterp<M> {
                         };
                         simple_opt.supports_efficient_uint_mul_high =
                             self.backend.supports_efficient_uint_mul_high();
+                        simple_opt.cpu = self.cpu.clone();
                         // Clone rather than move: only the success arm below hands
                         // the list back, so a retry that aborts would otherwise
                         // leave `unroll_opt.all_descrs` empty, and the
@@ -10654,6 +10692,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
+        optimizer.cpu = self.cpu.clone();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
@@ -11151,6 +11190,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
+        optimizer.cpu = self.cpu.clone();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py/261/307 — `Const.type` / `InputArg.type` are
