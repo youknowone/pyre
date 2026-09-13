@@ -64,8 +64,9 @@ pub struct TargetToken {
     /// closing onto this LABEL lands one arg short. A virtualizable static
     /// field is reconstructible from the frame at any point, so record the
     /// `(opcode, field descr)` pair and let the close emit the load.
-    /// Non-reconstructible appends record nothing and still reach
-    /// `compile_bridge`'s arity giveup.
+    /// Non-reconstructible appends record nothing; the LABEL/JUMP
+    /// contract is `vable_label_arg_recipes` in
+    /// `OptUnroll::jump_to_existing_trace`.
     pub vable_label_arg_recipes: Vec<(majit_ir::OpCode, majit_ir::DescrRef)>,
     jump_target_descr: Arc<LoopTargetDescr>,
     /// `IncrementalMiniMarkGC.old_objects_pointing_to_young` state for the

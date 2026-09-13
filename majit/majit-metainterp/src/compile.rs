@@ -24,6 +24,7 @@ use majit_backend::{
     Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, ExitFrameLayout,
     ExitRecoveryLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
+use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{
     AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op, OpCode,
@@ -385,14 +386,12 @@ pub struct DeadFrameArtifacts {
 
 /// `compile.py` `class CompileData(object)`.
 ///
-/// PYRE-ADAPTATION: RPython's `CompileData.optimize_trace()` builds the
-/// optimizer chain, logs, dispatches to the subclass `optimize()`, and clears
-/// forwarded boxes in one Python method. Pyre's optimizer entry points borrow
-/// `MetaInterp`, backend state, constant pools, and snapshot side tables
-/// directly in `pyjitpl.rs`, so that dispatch remains flattened there.
-/// These structs intentionally model the RPython constructor payloads only;
-/// call sites must still pass the same trace/runtime/resume/call-pure/opts
-/// state that RPython would store on the corresponding object.
+/// `optimize_trace` is the compile.py method: run subclass `optimize()`,
+/// then `forget_optimization_info`. Logging / `build_opt_chain` stay at the
+/// flattened call site in `pyjitpl.rs` because the optimizer borrows
+/// `MetaInterp`, backend state, constant pools, and snapshot side tables.
+/// Call sites still pass the same trace/runtime/resume/call-pure/opts state
+/// that RPython would store on the corresponding object.
 pub struct CompileData<'a> {
     pub trace: &'a TreeLoop,
 }
@@ -400,6 +399,22 @@ pub struct CompileData<'a> {
 impl<'a> CompileData<'a> {
     pub fn new(trace: &'a TreeLoop) -> Self {
         Self { trace }
+    }
+
+    /// compile.py `CompileData.forget_optimization_info`:
+    /// `for arg in self.trace.inputargs: arg.set_forwarded(None)`.
+    pub fn forget_optimization_info(&self) {
+        for arg in self.inputargs() {
+            arg.clear_forwarded();
+        }
+    }
+
+    /// compile.py `CompileData.optimize_trace`: run the subclass
+    /// `optimize()` body, then `forget_optimization_info`.
+    pub fn optimize_trace<T, E>(&self, optimize: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let result = optimize();
+        self.forget_optimization_info();
+        result
     }
 
     pub fn inputargs(&self) -> &'a [majit_ir::InputArgRc] {
@@ -465,6 +480,14 @@ impl<'a> SimpleCompileData<'a> {
             enable_opts,
         }
     }
+
+    /// compile.py `CompileData.optimize_trace` + `SimpleCompileData.optimize`.
+    pub fn optimize_trace<T, E>(
+        &self,
+        optimize: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.base.optimize_trace(|| optimize(self))
+    }
 }
 
 /// `compile.py` `class BridgeCompileData(CompileData)`.
@@ -474,7 +497,9 @@ pub struct BridgeCompileData<'a> {
     pub runtime_boxes: &'a [OpRef],
     #[allow(dead_code)]
     pub resumestorage: Option<&'a ResumeStorage>,
+    #[allow(dead_code)]
     pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
+    #[allow(dead_code)]
     pub inline_short_preamble: bool,
     #[allow(dead_code)]
     pub enable_opts: &'a [String],
@@ -497,6 +522,14 @@ impl<'a> BridgeCompileData<'a> {
             inline_short_preamble,
             enable_opts,
         }
+    }
+
+    /// compile.py `CompileData.optimize_trace` + `BridgeCompileData.optimize`.
+    pub fn optimize_trace<T, E>(
+        &self,
+        optimize: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.base.optimize_trace(|| optimize(self))
     }
 }
 

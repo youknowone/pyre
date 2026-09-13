@@ -1562,8 +1562,8 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// returned true, 6 = start_retrace_from_guard entered, 7 = start_retrace bailed
 /// (source loop evicted: compiled_loops miss), 8 = compile_bridge entered (trace
 /// closed → backend request path), 9 = compile_bridge InvalidLoop discard, 10 =
-/// compile_bridge retrace_requested return, 11 = compile_bridge arity giveup
-/// return (JUMP args != target LABEL args), 12 = start_bridge_tracing entered,
+/// compile_bridge retrace_requested return, 11 = retired (compile.py
+/// compile_trace has no JUMP/LABEL arity giveup), 12 = start_bridge_tracing entered,
 /// 13 = sbt early: descr not FailDescr, 14 = sbt early: no owning jct, 15 = sbt
 /// early: no compiled_meta, 16 = sbt early: !can_trace, 17 = sbt early:
 /// fail_values too short, 18 = compile_and_run_once entered from a back edge,
@@ -1892,8 +1892,7 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     //
     // A crate that never passes `"max_unroll_loops"` to `jit::set_param` takes
     // L from `warmstate::DEFAULT_MAX_UNROLL_LOOPS`, so read that constant before
-    // reading 72. `TraceCtx::declined_cross_loop_closes` draws its own
-    // consequence from the same one.
+    // reading 72.
     "unroll_cancelled_invalid_loop",
     "unroll_free_retry_rescued",
     "unroll_free_retry_failed",

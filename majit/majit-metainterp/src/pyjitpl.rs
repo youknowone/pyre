@@ -14906,27 +14906,14 @@ impl<M: Clone> MetaInterp<M> {
             prepared_ops,
             Vec::new(),
         );
-        let bridge_resumestorage = pending_bridge_rd
-            .as_ref()
-            .map(|pending| pending.storage.as_ref());
-        let (bridge_inline_short_preamble, bridge_call_pure_results) = {
-            let bridge_data = compile::BridgeCompileData::new(
-                &bridge_trace_data,
-                &prepared_runtime_boxes,
-                bridge_resumestorage,
-                &call_pure_results,
-                inline_short_preamble,
-                self.warm_state.get_enable_opts(),
-            );
-            // The flattened dispatch consumes this slice below rather than
-            // through BridgeCompileData::optimize, but constructing the
-            // payload still validates that both views name the same boxes.
-            debug_assert_eq!(bridge_data.runtime_boxes, prepared_runtime_boxes);
-            (
-                bridge_data.inline_short_preamble,
-                bridge_data.call_pure_results.clone(),
-            )
-        };
+        // `enable_opts` must be owned before `take_optimizer` / compiled_loops
+        // borrows. CompileData.resumestorage is the same payload as
+        // `pending_bridge_rd` (compile.py BridgeCompileData.resumestorage);
+        // the flattened optimize_* call consumes that value, so the
+        // CompileData constructor below cannot also borrow it.
+        let enable_opts = self.warm_state.get_enable_opts().to_vec();
+        let bridge_inline_short_preamble = inline_short_preamble;
+        let bridge_call_pure_results = call_pure_results.clone();
         let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared_inputargs
             .iter()
             .enumerate()
@@ -15013,28 +15000,49 @@ impl<M: Clone> MetaInterp<M> {
                         .front_target_tokens
                 }
             };
-            optimizer.optimize_bridge(
-                bridge_ops,
-                &mut constants,
-                bridge_inputargs.len(),
-                front_target_tokens,
-                bridge_runtime_boxes,
-                bridge_inline_short_preamble,
-                retraced_count,
-                retrace_limit,
-                pending_bridge_rd,
-                Some(loop_num_inputs),
-                bridge_inputarg_base,
-            )
-        } else {
-            optimizer
-                .optimize_loop(
+            // compile.py BridgeCompileData.optimize → UnrollOptimizer.optimize_bridge
+            let bridge_data = compile::BridgeCompileData::new(
+                &bridge_trace_data,
+                &prepared_runtime_boxes,
+                None,
+                &call_pure_results,
+                inline_short_preamble,
+                &enable_opts,
+            );
+            debug_assert_eq!(bridge_data.runtime_boxes, prepared_runtime_boxes.as_slice());
+            bridge_data.optimize_trace(|_| {
+                optimizer.optimize_bridge(
                     bridge_ops,
                     &mut constants,
                     bridge_inputargs.len(),
+                    front_target_tokens,
+                    bridge_runtime_boxes,
+                    bridge_inline_short_preamble,
+                    retraced_count,
+                    retrace_limit,
                     pending_bridge_rd,
+                    Some(loop_num_inputs),
                     bridge_inputarg_base,
                 )
+            })
+        } else {
+            let simple_data = compile::SimpleCompileData::new(
+                &bridge_trace_data,
+                None,
+                &call_pure_results,
+                &enable_opts,
+            );
+            // compile.py SimpleCompileData.optimize → Optimizer.optimize_loop
+            simple_data
+                .optimize_trace(|_| {
+                    optimizer.optimize_loop(
+                        bridge_ops,
+                        &mut constants,
+                        bridge_inputargs.len(),
+                        pending_bridge_rd,
+                        bridge_inputarg_base,
+                    )
+                })
                 .map(|ops| (ops, false))
         };
         if let Some(tokens) = crossed_target_tokens
@@ -15144,47 +15152,9 @@ impl<M: Clone> MetaInterp<M> {
             &constants,
         );
 
-        // compile.py giveup() parity: a bridge whose terminal JUMP
-        // targets an already-compiled loop must supply exactly as many args
-        // as that loop's LABEL — the backend regalloc asserts
-        // `arglocs.len() == target_arglocs.len()`. The full-body walk can
-        // close a bridge against an outer-loop LABEL that an unroll short
-        // preamble grew beyond the virtualizable layout the bridge close
-        // reconstructs (its loop-invariant `extra` inputargs), so the counts
-        // disagree. Give up on this bridge gracefully (blackhole resume still
-        // produces the correct result) instead of letting the backend panic.
-        // target_arglocs is empty for a not-yet-compiled target (fresh
-        // retrace token); skip the check there, matching the backend's own
-        // `target_arglocs.is_empty()` no-assert branch.
-        if let Some(jump) = optimized_ops
-            .last()
-            .filter(|op| op.opcode == majit_ir::OpCode::Jump)
-        {
-            let target_len = jump.getdescr().and_then(|d| {
-                d.as_loop_target_descr()
-                    .map(|ltd| ltd.target_arglocs().len())
-            });
-            if let Some(target_len) = target_len {
-                let jump_len = jump.getarglist().len();
-                if target_len != 0 && jump_len != target_len {
-                    crate::mc_diag_bump(11); // compile_bridge arity giveup return
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] compile_bridge giveup: JUMP args {jump_len} != \
-                             target LABEL args {target_len} (key={green_key} guard={fail_index})"
-                        );
-                    }
-                    crate::debug::log_one(
-                        "jit-summary",
-                        &format!(
-                            "bridge giveup: JUMP args {jump_len} != target LABEL args {target_len}"
-                        ),
-                    );
-                    self.return_optimizer(optimizer);
-                    return false;
-                }
-            }
-        }
+        // compile.py compile_trace has no JUMP/LABEL arity giveup. Extra
+        // LABEL slots are rebuilt from `vable_label_arg_recipes` in
+        // `OptUnroll::jump_to_existing_trace` (`unroll.py` send_extra JUMP).
 
         self.backend
             .set_constants_pool(compiled_constants_typed.clone());

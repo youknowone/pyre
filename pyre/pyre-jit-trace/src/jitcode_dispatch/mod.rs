@@ -14030,168 +14030,137 @@ fn handle<Sym: WalkSym>(
                     .bridge_info()
                     .map(|b| (b.trace_id, b.fail_index));
                 let has_targets = driver.meta_interp().has_compiled_targets(key);
-                // A close an attempt *rejected* is not retried on a later
-                // crossing of the same header: the attempt runs the optimizer
-                // over the whole trace-so-far, and the decline is deterministic,
-                // so an inner loop crossed N times would pay N optimizer passes
-                // over a growing trace (see
-                // `TraceCtx::declined_cross_loop_closes`).  Which outcomes count
-                // as rejected is the `classify_compile_outcome` match below.
-                let already_declined = ctx.trace_ctx.cross_loop_close_declined(key);
+                // pyjitpl.py `if not self.partial_trace:` is the only
+                // compile_trace gate. Upstream retries on every header visit.
                 if !has_partial && has_targets {
-                    if !already_declined {
-                        // pyjitpl.py reached_loop_header:
-                        //
-                        //     # generate a dummy guard just before the JUMP so
-                        //     # that unroll can use it when it's creating
-                        //     # artificial guards.
-                        //     self.generate_guard(rop.GUARD_FUTURE_CONDITION)
-                        //
-                        // Upstream emits it once at :2993, ahead of BOTH the
-                        // `get_procedure_token` / `compile_trace` pair at
-                        // :3001-3007 that closes into an ALREADY compiled loop
-                        // and the merge-point scan at :3018-3060 that closes a
-                        // loop of the trace's own. pyre splits those two
-                        // outcomes across different returns and had the guard on
-                        // only one of them: the own-loop leg gets it from
-                        // `close_loop_args_at`, which runs off
-                        // `DispatchOutcome::CloseLoop`, while this leg returns
-                        // `CompileTracePending` and never reached it. So every
-                        // bridge arrived at the optimizer carrying no
-                        // GUARD_FUTURE_CONDITION — measured across
-                        // `pyre/bench/synth`: 672 bridge compilations, 0 with
-                        // one. `Optimizer.patchguardop` was left to a stand-in
-                        // synthesized from one of the bridge's own body guards,
-                        // whose resume coordinate is mid-trace where upstream's
-                        // is the merge point's, and a bridge with no such guard
-                        // got none at all.
-                        //
-                        // `_jump_to_existing_trace` dereferences that
-                        // patchguardop for the extra virtual-state guards
-                        // (unroll.py:333-337) and hands it to
-                        // `inline_short_preamble`, which stamps it onto every
-                        // replayed short-preamble guard (unroll.py:409).
-                        //
-                        // Emitted on this leg only, so the own-loop leg is not
-                        // double-guarded. The capture coordinate is the
-                        // `jit_merge_point` op's OWN JitCode pc — the walk is
-                        // standing on the loop header, so "where we are" and
-                        // "where the synthesized JUMP goes" are the same
-                        // program point. `next_instr` is the green Python pc
-                        // (`make_green_key` above); feeding it to a parameter
-                        // read as a JitCode offset resolves an unrelated
-                        // `-live-` marker, and the snapshot then describes a
-                        // program point the walk registers hold nothing for.
-                        ctx.trace_ctx
-                            .record_guard(OpCode::GuardFutureCondition, &[], 0);
-                        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-                        // `JitDriver::merge_point` states the rule the latch runs
-                        // under: only latch what an attempt actually rejected.
-                        // The give-up below returns without calling into
-                        // `compile_trace` at all, so it costs no optimizer pass
-                        // and has nothing to report about this header.
-                        let mut attempted = true;
-                        let outcome = match bridge_origin {
-                            // Guard-origin: existing bridge path.
-                            Some(_) => driver.meta_interp_mut().compile_trace(
-                                key,
-                                &live_args,
-                                bridge_origin,
-                            ),
-                            // pyjitpl.py interp-origin: a
-                            // function-entry trace (ResumeFromInterpDescr)
-                            // closes as an entry bridge jumping into the
-                            // already-compiled hot loop (compile.py);
-                            // a trace rooted at a *loop header* falls back to
-                            // the plain bridge shape.
-                            None => match driver.compile_trace_entry_data() {
-                                Some((original_green_key, mut entry_meta)) => {
-                                    // `compile_trace_entry_data` clones the active
-                                    // trace metadata, whose `namespace_dependent` is
-                                    // only finalized by `finish_trace_namespace_dependency`
-                                    // after the walk returns. An entry bridge is
-                                    // compiled mid-walk, before that finalize, so a
-                                    // trace that has already read a module global
-                                    // would otherwise install the bridge with a stale
-                                    // `namespace_dependent = false` and let it be
-                                    // re-entered after later namespace growth. Fold in
-                                    // the live per-trace flag so the bridge keeps the
-                                    // conservative namespace gate.
-                                    entry_meta.namespace_dependent |=
-                                        ctx.trace_ctx.reads_module_global;
-                                    driver.meta_interp_mut().compile_trace_from_interp(
-                                        key,
-                                        &live_args,
-                                        original_green_key,
-                                        entry_meta,
-                                    )
-                                }
-                                // compile.py:1002-1021 — an interp-origin close is a
-                                // `ResumeFromInterpDescr` entry bridge, and with no
-                                // entry data there is no original green key to attach
-                                // it to. `compile_trace(key, args, None)` cannot serve
-                                // that state: its `None`-origin arm demands the
-                                // entry-bridge payload and answers `Cancelled` for
-                                // every input, after deep-cloning the whole
-                                // trace-so-far and lowering its snapshot pool. Decline
-                                // here instead, so the give-up reads as one.
-                                // `compile_trace_entry_data` reads
-                                // `trace_ctx().root_green_key()` and `trace_meta()`,
-                                // and every `JitDriver` trace start installs both
-                                // halves, so this is unreachable from a jd0 walk; only
-                                // `MetaInterp::force_start_tracing` opens a tracer with
-                                // no session envelope.
-                                None => {
-                                    attempted = false;
-                                    majit_metainterp::CompileOutcome::Cancelled
-                                }
-                            },
-                        };
-                        // pyjitpl.py:2982-2983 `classify_compile_outcome` is
-                        // the shared reading of a close's outcome; the sibling
-                        // close in `JitDriver::merge_point` already goes through it.
-                        // Reading `Compiled` here and treating every other
-                        // outcome as one declined close collapses three states
-                        // the classifier keeps apart, and latches the one that
-                        // is explicitly retryable.
-                        match driver.meta_interp().classify_compile_outcome(outcome) {
-                            majit_metainterp::BridgeCompileResult::Compiled => {
-                                if majit_metainterp::majit_log_enabled() {
-                                    eprintln!(
-                                        "[jit][walker-reached-loop-header] compile_trace success: \
-                                 key={} pc={} bridge={:?}",
-                                        key, next_instr, bridge_origin
-                                    );
-                                }
-                                // pyjitpl.py raise_if_successful() — the
-                                // successful compile_trace ends tracing; surface
-                                // the dedicated outcome so the driver maps it to
-                                // `TraceAction::CompileTrace` (no further compile
-                                // or abort on this session).
-                                driver.note_compile_trace_success();
-                                return Ok((
-                                    DispatchOutcome::CompileTracePending {
-                                        loop_header_pc: next_instr,
-                                    },
-                                    op.next_pc,
-                                ));
-                            }
-                            // pyjitpl.py:3000, `JitDriver::merge_point`: the
-                            // attempt armed `partial_trace`, so the next visit
-                            // of this header takes the `has_partial` arm of the
-                            // gate above and runs no optimizer pass either way.
-                            // Once the retrace lands, the state this close was
-                            // refused against is gone -- latching it would
-                            // refuse the close forever for a reason that has
-                            // already stopped holding.
-                            majit_metainterp::BridgeCompileResult::RetraceNeeded => {}
-                            majit_metainterp::BridgeCompileResult::Declined
-                            | majit_metainterp::BridgeCompileResult::Failed => {
-                                if attempted {
-                                    ctx.trace_ctx.note_cross_loop_close_declined(key);
-                                }
-                            }
+                    // pyjitpl.py reached_loop_header:
+                    //
+                    //     # generate a dummy guard just before the JUMP so
+                    //     # that unroll can use it when it's creating
+                    //     # artificial guards.
+                    //     self.generate_guard(rop.GUARD_FUTURE_CONDITION)
+                    //
+                    // Upstream emits it once in `reached_loop_header`, ahead
+                    // of BOTH the `get_procedure_token` / `compile_trace`
+                    // pair that closes into an ALREADY compiled loop
+                    // and the merge-point scan that closes a
+                    // loop of the trace's own. pyre splits those two
+                    // outcomes across different returns and had the guard on
+                    // only one of them: the own-loop leg gets it from
+                    // `close_loop_args_at`, which runs off
+                    // `DispatchOutcome::CloseLoop`, while this leg returns
+                    // `CompileTracePending` and never reached it. So every
+                    // bridge arrived at the optimizer carrying no
+                    // GUARD_FUTURE_CONDITION — measured across
+                    // `pyre/bench/synth`: 672 bridge compilations, 0 with
+                    // one. `Optimizer.patchguardop` was left to a stand-in
+                    // synthesized from one of the bridge's own body guards,
+                    // whose resume coordinate is mid-trace where upstream's
+                    // is the merge point's, and a bridge with no such guard
+                    // got none at all.
+                    //
+                    // `_jump_to_existing_trace` dereferences that
+                    // patchguardop for the extra virtual-state guards
+                    // (`unroll.py` `_jump_to_existing_trace`) and hands it to
+                    // `inline_short_preamble`, which stamps it onto every
+                    // replayed short-preamble guard.
+                    //
+                    // Emitted on this leg only, so the own-loop leg is not
+                    // double-guarded. The capture coordinate is the
+                    // `jit_merge_point` op's OWN JitCode pc — the walk is
+                    // standing on the loop header, so "where we are" and
+                    // "where the synthesized JUMP goes" are the same
+                    // program point. `next_instr` is the green Python pc
+                    // (`make_green_key` above); feeding it to a parameter
+                    // read as a JitCode offset resolves an unrelated
+                    // `-live-` marker, and the snapshot then describes a
+                    // program point the walk registers hold nothing for.
+                    ctx.trace_ctx
+                        .record_guard(OpCode::GuardFutureCondition, &[], 0);
+                    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+                    let outcome = match bridge_origin {
+                        // Guard-origin: existing bridge path.
+                        Some(_) => {
+                            driver
+                                .meta_interp_mut()
+                                .compile_trace(key, &live_args, bridge_origin)
                         }
+                        // pyjitpl.py interp-origin: a
+                        // function-entry trace (ResumeFromInterpDescr)
+                        // closes as an entry bridge jumping into the
+                        // already-compiled hot loop (compile.py);
+                        // a trace rooted at a *loop header* falls back to
+                        // the plain bridge shape.
+                        None => match driver.compile_trace_entry_data() {
+                            Some((original_green_key, mut entry_meta)) => {
+                                // `compile_trace_entry_data` clones the active
+                                // trace metadata, whose `namespace_dependent` is
+                                // only finalized by `finish_trace_namespace_dependency`
+                                // after the walk returns. An entry bridge is
+                                // compiled mid-walk, before that finalize, so a
+                                // trace that has already read a module global
+                                // would otherwise install the bridge with a stale
+                                // `namespace_dependent = false` and let it be
+                                // re-entered after later namespace growth. Fold in
+                                // the live per-trace flag so the bridge keeps the
+                                // conservative namespace gate.
+                                entry_meta.namespace_dependent |= ctx.trace_ctx.reads_module_global;
+                                driver.meta_interp_mut().compile_trace_from_interp(
+                                    key,
+                                    &live_args,
+                                    original_green_key,
+                                    entry_meta,
+                                )
+                            }
+                            // compile.py compile_trace — an interp-origin close is a
+                            // `ResumeFromInterpDescr` entry bridge, and with no
+                            // entry data there is no original green key to attach
+                            // it to. `compile_trace(key, args, None)` cannot serve
+                            // that state: its `None`-origin arm demands the
+                            // entry-bridge payload and answers `Cancelled` for
+                            // every input, after deep-cloning the whole
+                            // trace-so-far and lowering its snapshot pool. Decline
+                            // here instead, so the give-up reads as one.
+                            // `compile_trace_entry_data` reads
+                            // `trace_ctx().root_green_key()` and `trace_meta()`,
+                            // and every `JitDriver` trace start installs both
+                            // halves, so this is unreachable from a jd0 walk; only
+                            // `MetaInterp::force_start_tracing` opens a tracer with
+                            // no session envelope.
+                            None => majit_metainterp::CompileOutcome::Cancelled,
+                        },
+                    };
+                    // pyjitpl.py `classify_compile_outcome` is the shared
+                    // reading of a close's outcome; the sibling close in
+                    // `JitDriver::merge_point` already goes through it.
+                    match driver.meta_interp().classify_compile_outcome(outcome) {
+                        majit_metainterp::BridgeCompileResult::Compiled => {
+                            if majit_metainterp::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit][walker-reached-loop-header] compile_trace success: \
+                                 key={} pc={} bridge={:?}",
+                                    key, next_instr, bridge_origin
+                                );
+                            }
+                            // pyjitpl.py raise_if_successful() — the
+                            // successful compile_trace ends tracing; surface
+                            // the dedicated outcome so the driver maps it to
+                            // `TraceAction::CompileTrace` (no further compile
+                            // or abort on this session).
+                            driver.note_compile_trace_success();
+                            return Ok((
+                                DispatchOutcome::CompileTracePending {
+                                    loop_header_pc: next_instr,
+                                },
+                                op.next_pc,
+                            ));
+                        }
+                        // pyjitpl.py raise_if_successful does not raise
+                        // on None. Fall through to the merge-point scan;
+                        // the next header visit retries compile_trace.
+                        majit_metainterp::BridgeCompileResult::RetraceNeeded
+                        | majit_metainterp::BridgeCompileResult::Declined
+                        | majit_metainterp::BridgeCompileResult::Failed => {}
                     }
                     // The jump did not take (`compile.compile_trace` returns
                     // None when none of the existing loop tokens match). Fall

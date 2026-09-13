@@ -2293,8 +2293,8 @@ impl UnrollOptimizer {
         // vable input layout is `[frame, static scalars.., array items..]`, so
         // an appended static-scalar slot is exactly `GetfieldGc*(frame, descr)`
         // — the load the preamble itself performed before the optimizer folded
-        // it onto the seeded slot. Appends outside that window record nothing
-        // and keep reaching `compile_bridge`'s arity giveup.
+        // it onto the seeded slot. Appends outside that window record nothing;
+        // the LABEL/JUMP contract is `vable_label_arg_recipes`.
         //
         // The list is all-or-nothing: the recipes rebuild a contiguous LABEL
         // tail, so one append with no recipe leaves the close short anyway and

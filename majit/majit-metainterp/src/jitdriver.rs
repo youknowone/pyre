@@ -4046,55 +4046,25 @@ impl<S: JitState> JitDriver<S> {
                                 self.bridge_attempt_declined = true;
                             }
                             crate::pyjitpl::BridgeCompileResult::Declined => {
-                                // pyjitpl.py: `compile_trace` returned without raising, so the
-                                // trace is NOT given up — tracing continues.  Latch the decline so the walk
-                                // does not re-run the optimizer over the same key, and re-enter the walk at
-                                // the merge point's own pc (pyjitpl.py `self.pc = saved_pc`).
-                                //
-                                // Only latch what an attempt actually rejected.  A close the gate
-                                // above never evaluated cost no optimizer pass, which is the whole
-                                // reason the latch exists, and the gate's own conditions can be
-                                // false now and true at the next visit of this header.
+                                // pyjitpl.py raise_if_successful does not raise
+                                // on None. The reached greens are the target
+                                // we failed to JUMP into, so the merge-point
+                                // scan below (same-greenkey of this trace)
+                                // must not compile_loop them. Re-enter the
+                                // walk as `reached_loop_header` does after
+                                // appending a merge point. Do not latch: the
+                                // next header visit retries compile_trace
+                                // (`if not self.partial_trace`).
+                                if attempted {
+                                    crate::mc_diag_bump(50); // bridge_declined_close
+                                } else {
+                                    crate::mc_diag_bump(67); // bridge_unattempted_close
+                                }
                                 if let Some(ctx) = self.meta.trace_ctx() {
-                                    if attempted {
-                                        // The two sibling close sites report a declined
-                                        // attempt under the same tally; this one is the
-                                        // third.  Bump it on the same condition the latch
-                                        // uses, so the census counts closes an optimizer
-                                        // pass actually rejected and not headers the gate
-                                        // above skipped.
-                                        crate::mc_diag_bump(50); // bridge_declined_close
-                                        ctx.note_cross_loop_close_declined(target_key);
-                                    } else {
-                                        // The gate above declined to attempt this close, so no
-                                        // optimizer pass ran and slot 50 must not move.  That
-                                        // is a different event from "an attempt was declined",
-                                        // and without its own slot the two are indistinguishable
-                                        // downstream: both render as slot 50 reading zero.
-                                        // `result` is initialized to `Declined` at the top of
-                                        // this block and is only written inside the gate, so
-                                        // this arm is reachable with nothing having been tried
-                                        // — the sibling close sites bind `result` from
-                                        // `close_bridge` directly and have no such path.
-                                        crate::mc_diag_bump(67); // bridge_unattempted_close
-                                    }
-                                    // pyjitpl.py `self.pc = saved_pc` resumes at the
-                                    // merge point that was CONSULTED — the one whose greens
-                                    // `get_procedure_token` read (pyjitpl.py), which is
-                                    // this one. The `continue` below re-runs the walk with
-                                    // the native interpreter's `pc` untouched, i.e. at the
-                                    // position the walk STARTED from, while the symbolic
-                                    // state stands here. Publish the position half before
-                                    // dropping the only record of it, or the re-entered walk
-                                    // replays the instructions between the two against state
-                                    // that belongs to neither.
                                     ctx.resume_walk_after_close();
                                     ctx.close_greens = None;
                                     ctx.close_green_pc = None;
                                 }
-                                // The walk-final handoff staged at the top of this arm describes a trace
-                                // that ENDED; discard it, same as the `take_keep_tracing_after_close` path
-                                // at the bottom of this arm.
                                 self.meta.single_pass_outcome = None;
                                 self.meta.single_pass_scalar_values = None;
                                 self.meta.single_pass_ref_scalar_values = None;
@@ -4121,17 +4091,11 @@ impl<S: JitState> JitDriver<S> {
                     // retrace a second time. Fall straight through to the
                     // merge-point scan, which is the only consumer upstream leaves
                     // for a partial trace.
-                    // pyjitpl.py:3003-3005 has no resumekey test in this gate:
-                    // upstream re-attempts `compile_trace` on every header visit.
-                    // majit keeps its declined-attempt latch here for now, so this
-                    // commit changes no behavior at this site.
+                    // pyjitpl.py `if not self.partial_trace:` is the only
+                    // compile_trace gate. Upstream retries on every header
+                    // visit; do not skip a later visit after a decline.
                     let has_partial_trace = self.meta.partial_trace().is_some();
-                    let attempt_declined = self.bridge_attempt_declined;
-                    if let Some(bridge) = self
-                        .meta
-                        .bridge_info()
-                        .filter(|_| !has_partial_trace && !attempt_declined)
-                    {
+                    if let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace) {
                         let bridge_key = bridge.green_key;
                         let bridge_trace_id = bridge.trace_id;
                         let bridge_fail_index = bridge.fail_index;
@@ -4482,17 +4446,11 @@ impl<S: JitState> JitDriver<S> {
                     // loop being closed is a RETRACE, and re-entering
                     // `compile_trace` would both bridge into the loop the retrace
                     // exists to respecialize and arm the retrace a second time.
-                    // pyjitpl.py:3003-3005 has no resumekey test in this gate:
-                    // upstream re-attempts `compile_trace` on every header visit.
-                    // majit keeps its declined-attempt latch here for now, so this
-                    // commit changes no behavior at this site.
+                    // pyjitpl.py `if not self.partial_trace:` is the only
+                    // compile_trace gate. Upstream retries on every header
+                    // visit; do not skip a later visit after a decline.
                     let has_partial_trace = self.meta.partial_trace().is_some();
-                    let attempt_declined = self.bridge_attempt_declined;
-                    if let Some(bridge) = self
-                        .meta
-                        .bridge_info()
-                        .filter(|_| !has_partial_trace && !attempt_declined)
-                    {
+                    if let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace) {
                         let bridge_key = bridge.green_key;
                         let bridge_trace_id = bridge.trace_id;
                         let bridge_fail_index = bridge.fail_index;
@@ -11953,16 +11911,11 @@ mod cross_loop_cut_close_tests {
 
         // pyjitpl.py: `compile_trace` returned without raising, so
         // the trace is NOT given up — the walk keeps recording.
+        // Upstream retries compile_trace on the next header visit
+        // (`if not self.partial_trace`); do not latch the decline.
         assert!(
             driver.is_tracing(),
             "a cut target must not be entered by an entry bridge",
-        );
-        assert!(
-            driver
-                .meta
-                .trace_ctx()
-                .is_some_and(|ctx| ctx.cross_loop_close_declined(inner_key)),
-            "the decline must be latched so the walk does not re-attempt it",
         );
     }
 
@@ -11993,9 +11946,8 @@ mod cross_loop_cut_close_tests {
     /// this lands in the same `Declined` arm a rejected attempt lands in — and
     /// the two must not report as one event.
     ///
-    /// Both assertions are trace-local on purpose: `MC_DIAG` is process-global
-    /// and this suite runs in parallel, so slot 50 is checked through the latch
-    /// it always writes rather than by reading its counter.
+    /// Slot 67 is process-global and this suite runs in parallel, so the
+    /// assertion is a before/after bump rather than an absolute count.
     #[test]
     fn interp_origin_close_into_an_uncompiled_target_is_not_a_declined_attempt() {
         let mut driver = JitDriver::<CutCloseState>::new(2);
@@ -12014,14 +11966,6 @@ mod cross_loop_cut_close_tests {
         assert!(
             crate::mc_diag(67) > before,
             "a close that was never attempted must be counted under its own slot",
-        );
-        assert!(
-            driver
-                .meta
-                .trace_ctx()
-                .is_some_and(|ctx| !ctx.cross_loop_close_declined(never_compiled)),
-            "nothing rejected this close, so there is no decline to latch — \
-             latching it would suppress a retry the gate's own conditions allow",
         );
         assert!(
             driver.is_tracing(),
