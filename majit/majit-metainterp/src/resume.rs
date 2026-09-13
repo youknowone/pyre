@@ -6867,6 +6867,9 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
         if struct_ptr == 0 {
             return;
         }
+        // Barrier first: `gc_write_barrier` must run before the store so
+        // a concurrent minor cannot miss the young referent.
+        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
         unsafe {
             majit_backend::llmodel::write_ref_at_mem(
                 struct_ptr as usize,
@@ -6874,11 +6877,6 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
                 value as usize,
             );
         }
-        // `write_ref_at_mem` documents that the caller owes the barrier
-        // the GC transformer would wrap around `llop.raw_store`.
-        // `Backend::bh_setfield_gc_r` and `PyreBlackholeAllocator` both
-        // call it; this path materializes via `alloc_oldgen_typed`.
-        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
     }
 
     fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
@@ -6925,11 +6923,10 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
         let ofs = ad
             .base_size()
             .wrapping_add(index.wrapping_mul(ad.item_size()));
+        majit_gc::gc_write_barrier(majit_ir::GcRef(array as usize));
         unsafe {
             majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize);
         }
-        // Same old→young obligation as `bh_setfield_gc_r` above.
-        majit_gc::gc_write_barrier(majit_ir::GcRef(array as usize));
     }
 
     fn bh_setarrayitem_gc_f(

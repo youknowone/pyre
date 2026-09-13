@@ -3116,8 +3116,12 @@ impl CallControl {
             return Some(effects);
         }
         if path.segments.len() > 1 {
-            let stripped = CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
-            return self.func_effects(&stripped);
+            let root = path.segments[0].as_str();
+            if root == "crate" || crate::local_crates::is_local_crate_root(root) {
+                let stripped =
+                    CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
+                return self.func_effects(&stripped);
+            }
         }
         None
     }

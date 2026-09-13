@@ -5025,9 +5025,12 @@ impl<'a> Transformer<'a> {
                     // `#[dont_look_inside_cannot_raise]` residual emits
                     // GUARD_NO_EXCEPTION.
                     let extraeffect = match classified.as_ref() {
-                        Some((descriptor, CallEffectKind::Declared(_))) => {
-                            Some(descriptor.extra_info.extraeffect)
-                        }
+                        Some((
+                            descriptor,
+                            CallEffectKind::Declared(_)
+                            | CallEffectKind::MayForce
+                            | CallEffectKind::Elidable,
+                        )) => Some(descriptor.extra_info.extraeffect),
                         _ => None,
                     };
                     let mut descriptor = cc_ref.getcalldescr(
@@ -5039,7 +5042,13 @@ impl<'a> Transformer<'a> {
                         &mut self.analysis_cache,
                         None,
                     );
-                    if let Some((declared, CallEffectKind::Declared(_))) = classified {
+                    if let Some((
+                        declared,
+                        CallEffectKind::Declared(_)
+                        | CallEffectKind::MayForce
+                        | CallEffectKind::Elidable,
+                    )) = classified
+                    {
                         descriptor.extra_info = declared.extra_info;
                     }
                     self.handle_residual_call(

@@ -14766,10 +14766,9 @@ impl<M: Clone> MetaInterp<M> {
         fail_descr: &dyn majit_ir::FailDescr,
     ) -> Option<usize> {
         let compiled = self.compiled_loops.get(&origin_key)?;
-        let trace = compiled
-            .traces
-            .get(&fail_descr.trace_id())
-            .or_else(|| compiled.traces.get(&compiled.root_trace_id))?;
+        // The owning compiled trace, not the root loop. A missing
+        // bridge id must not reuse root ops at a bridge-relative index.
+        let trace = compiled.traces.get(&fail_descr.trace_id())?;
         let op_idx = fail_descr.source_op_index().or_else(|| {
             trace
                 .exit_layouts
