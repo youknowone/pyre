@@ -278,6 +278,33 @@ def run_stamp_skip(engine) -> int:
     return failures
 
 
+def run_child_dirs_whose_rs_mention(engine) -> int:
+    """Immediate subdirs that contain the needle, not siblings that do not."""
+    failures = 0
+
+    def expect(name, condition):
+        nonlocal failures
+        if condition:
+            print(f"ok   {name}")
+        else:
+            failures += 1
+            print(f"FAIL {name}")
+
+    root = pathlib.Path(tempfile.mkdtemp()).resolve()
+    try:
+        (root / "keep" / "nested").mkdir(parents=True)
+        (root / "skip").mkdir()
+        (root / "keep" / "nested" / "lib.rs").write_text("#[majit_macros::elidable]\nfn f() {}\n")
+        (root / "skip" / "lib.rs").write_text("fn g() {}\n")
+        (root / "file.rs").write_text("#[majit_macros::elidable]\nfn h() {}\n")
+        names = engine.child_dirs_whose_rs_mention(root, "majit_macros::")
+        expect("hinted subdirectory is named", names == ["keep"])
+        expect("missing root is empty", engine.child_dirs_whose_rs_mention(root / "nope", "x") == [])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return failures
+
+
 def run_charon_target_dir(engine) -> int:
     """Charon's cargo target is not the workspace `target/`."""
     failures = 0
@@ -330,6 +357,7 @@ def main() -> None:
         + run_fingerprint(engine)
         + run_layout_sidecar(engine)
         + run_stamp_skip(engine)
+        + run_child_dirs_whose_rs_mention(engine)
         + run_charon_target_dir(engine)
     )
     if failures:

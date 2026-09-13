@@ -77,6 +77,30 @@ class CrateSpec:
         return f"{Path(self.output_name).stem}.{target}.layouts.ullbc"
 
 
+def child_dirs_whose_rs_mention(root: Path, needle: str) -> list[str]:
+    """Immediate subdirectories of `root` that have a `.rs` file containing `needle`.
+
+    Used to find interpreter `src/module/<name>/` trees that carry a JIT
+    hint macro, so Charon can `--start-from` those modules (and their
+    marker consts) without a hand-maintained name list.
+    """
+    if not root.is_dir():
+        return []
+    names: list[str] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        for rs in child.rglob("*.rs"):
+            try:
+                text = rs.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if needle in text:
+                names.append(child.name)
+                break
+    return names
+
+
 @dataclass
 class Engine:
     """Resolved driver configuration threaded through the extraction helpers."""

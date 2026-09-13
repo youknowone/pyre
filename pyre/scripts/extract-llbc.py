@@ -14,7 +14,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from llbc_extract import CrateSpec, llbc_dest_path, run_cli  # noqa: E402
+from llbc_extract import (  # noqa: E402
+    CrateSpec,
+    child_dirs_whose_rs_mention,
+    llbc_dest_path,
+    run_cli,
+)
 
 
 # Each successful extraction persists the repo-relative Local entries from the
@@ -42,6 +47,30 @@ CHARON_ARGS = ["--hide-marker-traits"]
 # in rustpython-common instead; the output audit below guards their foreign
 # boundary as well.
 PYRE_RUNTIME_CHARON_ARGS = [*CHARON_ARGS, "--opaque", "pyre_native"]
+
+
+def interpreter_charon_args(crate_dir: Path) -> list[str]:
+    """Do not walk `crate::module` as a crate root; translate a module item
+    only if something outside it reaches it.
+
+    Charon's own example: `--opaque crate::module --include crate::module::_`.
+    rustc still compiles the files. Modules that carry a JIT-hint macro are
+    `--start-from` so their marker consts stay in the artefact
+    (`harvest_hints_from_llbcs`); a hand list of residual modules is not
+    kept. `posix` / `gc` / `time` need no special case: core calls reach
+    them and `--include crate::module::_` then translates those items.
+    """
+    args = [
+        *PYRE_RUNTIME_CHARON_ARGS,
+        "--opaque",
+        "crate::module",
+        "--include",
+        "crate::module::_",
+    ]
+    for name in child_dirs_whose_rs_mention(crate_dir / "src" / "module", "majit_macros::"):
+        args += ["--start-from", f"crate::module::{name}"]
+    return args
+
 
 SPECS: dict[str, CrateSpec] = {
     # `corpus` lives outside the crate graph the metadata walk sees, so its
@@ -90,7 +119,7 @@ SPECS: dict[str, CrateSpec] = {
         name="pyre-interpreter",
         crate_dir=ROOT / "pyre" / "pyre-interpreter",
         output_name="pyre-interpreter.ullbc",
-        charon_args=PYRE_RUNTIME_CHARON_ARGS,
+        charon_args=interpreter_charon_args(ROOT / "pyre" / "pyre-interpreter"),
         cargo_args=["--features", "{features}"],
     ),
     "pyre-jit": CrateSpec(
