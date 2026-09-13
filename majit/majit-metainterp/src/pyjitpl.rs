@@ -1470,22 +1470,18 @@ fn prepare_bridge_from_byte_recorder(
     runtime_boxes: Vec<OpRef>,
     bridge_inputarg_base: u32,
 ) -> Option<PreparedBridgeTrace> {
-    // unroll.py `optimize_bridge` `trace = trace.get_iter()` — one cls() walk of the
-    // live opencoder buffer. compile.py compile_trace leaves the JUMP
-    // on the buffer until this walk finishes.
-    // compile.py compile_trace / history.py InputArgInt: reuse the
-    // iterator's reminted Rc rather than minting a second object.
-    let (ops, iter_inputargs, cache) = recorder.get_iter_fresh(bridge_inputarg_base)?;
-    for (arg, ia) in bridge_inputargs.iter().zip(iter_inputargs.iter()) {
-        if let Some(value) = arg.get_value() {
-            ia.set_value(value);
-        }
-    }
-    Some(finish_prepared_bridge(
+    // unroll.py `optimize_bridge` `trace = trace.get_iter()`.
+    // compile.py compile_trace leaves the JUMP on the live buffer until
+    // this walk. `materialize_ops` is that cls() walk (unique positions,
+    // slot fail_args, recorder inputarg identity). The fresh-iterator
+    // rename is `prepare_bridge_trace_from_owned`, the same remint the
+    // Vec-recorder path uses — a unique-keyed cache built from
+    // ByteTraceIter's fresh positions alone types a hole-filtered Int as
+    // a reserved Ref (`make_equal_to` Box.type on compile_bridge).
+    let ops = recorder.materialize_ops();
+    Some(prepare_bridge_trace_from_owned(
         ops,
         bridge_inputargs,
-        iter_inputargs,
-        cache,
         snapshot_boxes,
         snapshot_frame_sizes,
         snapshot_vable_boxes,
@@ -1493,6 +1489,7 @@ fn prepare_bridge_from_byte_recorder(
         snapshot_frame_pcs,
         pending_bridge_rd,
         runtime_boxes,
+        bridge_inputarg_base,
     ))
 }
 
@@ -25709,6 +25706,52 @@ mod tests {
             prepared.bridge_vm_red,
             Some(OpRef::input_arg_ref(11)),
             "assembled InputArg(1) remints to the fresh Ref inputarg"
+        );
+    }
+
+    #[test]
+    fn byte_get_iter_pairs_live_inputargs_by_original_position() {
+        // History.set_inputargs keeps sparse get_position() (0 and 2).
+        // ByteTraceIter remints the reserved prefix, including the dead Ref.
+        // Zipping live[i] with iter.inputargs[i] would type the second live
+        // Int as that reminted Ref (`make_equal_to` Box.type on compile_bridge).
+        let mut rec = crate::recorder::Trace::with_input_layout(
+            &[Type::Int, Type::Ref, Type::Int],
+            &[true, false, true],
+        );
+        rec.attach_byte_buffer(Arc::new(MetaInterpStaticData::new()));
+        let add = rec.record_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(2)],
+        );
+        rec.close_loop(&[add]);
+        let live = rec.live_inputargs_cloned();
+        assert_eq!(
+            live.iter().map(InputArg::opref).collect::<Vec<_>>(),
+            vec![OpRef::input_arg_int(0), OpRef::input_arg_int(2)]
+        );
+        let prepared = prepare_bridge_from_byte_recorder(
+            &rec,
+            &live,
+            Vec::new(),
+            SnapshotFrameSizes::new(),
+            Vec::new(),
+            Vec::new(),
+            SnapshotFramePcs::new(),
+            None,
+            vec![add],
+            1000,
+        )
+        .expect("byte buffer");
+        assert_eq!(
+            prepared
+                .inputargs
+                .iter()
+                .map(|arg| (arg.index, arg.tp))
+                .collect::<Vec<_>>(),
+            vec![(1000, Type::Int), (1001, Type::Int)],
+            "hole-filtered live Ints remint densely with their own types; \
+             a zip against the reserved prefix would type the second as the Ref hole"
         );
     }
 
