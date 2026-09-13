@@ -5828,6 +5828,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
             pyre_interpreter::jit_getitem as *const () as usize as i64,
             pyre_interpreter::jit_sequence_getitem as *const () as usize as i64,
             pyre_interpreter::jit_range_iter_next_or_null as *const () as usize as i64,
+            pyre_interpreter::jit_exception_match as *const () as usize as i64,
+            pyre_interpreter::bh_w_exception_get_kind as *const () as usize as i64,
+            pyre_interpreter::bh_exception_object_matches_stop_iteration as *const () as usize
+                as i64,
             pyre_interpreter::jit_call_callable_0 as *const () as usize as i64,
             pyre_interpreter::jit_call_callable_1 as *const () as usize as i64,
             pyre_interpreter::jit_call_callable_2 as *const () as usize as i64,
