@@ -130,6 +130,13 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// 65 = the same eager arm declined an owner already too large to re-emit. The
 /// arm cannot wait for the entry evidence the deferred arm waits for, so the
 /// only thing it can read is what the re-emission will cost.
+///
+/// 66 = `compile_loop` entered (`cl_entered`) but `build_wasm_module` returned
+/// `Unsupported`. Slots 25/26 only name the pre-codegen CALL_ASSEMBLER filter
+/// and a host module reject; every other `Result` return on that stretch was
+/// silent, so a `cl_entered` without `cl_ok` could not say which opcode or
+/// frame-layout check declined. The last reason string is also kept for the
+/// host (`compile_loop_last_error`).
 pub static BRIDGE_DIAG: [AtomicU64; BRIDGE_DIAG_LABELS.len()] =
     [const { AtomicU64::new(0) }; BRIDGE_DIAG_LABELS.len()];
 
@@ -212,6 +219,7 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "ca_decl_terminal",
     "inline_decl_foreign_eager",
     "inline_decl_eager_too_large",
+    "cl_decl_codegen",
 ];
 
 #[repr(u8)]
@@ -257,6 +265,23 @@ static INLINE_TRIAL_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// census, whose `entries` count is how often that crossing actually ran.
 static INLINE_DECLINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 const INLINE_DECLINE_LOG_CAP: usize = 64;
+/// Last `compile_loop` decline reason. Guest `eprintln` never reaches the
+/// host; this string is packed out through `pyre_jit_compile_loop_last_error`.
+static COMPILE_LOOP_LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+
+fn record_compile_loop_error(error: &BackendError) {
+    *COMPILE_LOOP_LAST_ERROR.lock() = error.to_string();
+}
+
+fn decline_compile_loop<T>(error: BackendError) -> Result<T, BackendError> {
+    record_compile_loop_error(&error);
+    Err(error)
+}
+
+/// Last `compile_loop` `Unsupported` reason, or empty if none declined.
+pub fn compile_loop_last_error() -> String {
+    COMPILE_LOOP_LAST_ERROR.lock().clone()
+}
 
 pub(crate) fn record_inline_geometry(kind: FrameShortageKind, needed: usize, available: usize) {
     const FIELD_MASK: u64 = (1 << 24) - 1;
@@ -2924,7 +2949,9 @@ impl WasmBackend {
         ops: Vec<Op>,
     ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
         let next_pos = codegen::next_value_pos(inputargs, &ops);
-        let (ops, gcrefs) = majit_gc::rewrite::remove_ref_constants(&ops, next_pos);
+        let input_indices: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
+        let (ops, gcrefs) =
+            majit_gc::rewrite::remove_ref_constants_for_inputs(&ops, next_pos, &input_indices);
         let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
         let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
         codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
@@ -4016,14 +4043,26 @@ fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame 
     let raw_values: Vec<i64> = (0..num_outputs)
         .map(|i| {
             let word = force_arg_word(frame_ptr, &fail_descr, i);
-            // `emit_force_arm` publishes a Ref argument as `home_offset * 2 + 1`
-            // so the value is read out of the traced home slot a collection
-            // inside the bracketed call forwards, rather than out of an
-            // untraced copy in the exit slot. A literal is even (Ref pointers
-            // are 8-aligned; a null and a non-Ref argument are published as
-            // themselves).
+            // `emit_force_arm` publishes a Ref as `home_offset * 2 + 1`
+            // (bit 0) so the value is read out of the traced home a
+            // collection inside the bracketed call forwards. A non-null
+            // ConstPtr has no home; it is published as `table_addr | 3`
+            // (bits 0 and 1) so this path reloads the forwarded GC-table
+            // slot. A literal is even (Ref pointers are 8-aligned; a
+            // null and a non-Ref argument are published as themselves).
             let value = if types.get(i) == Some(&majit_ir::Type::Ref) && word & 1 == 1 {
-                unsafe { *((frame_ptr + (word >> 1) as usize) as *const i64) }
+                let addr = if word & 2 == 2 {
+                    (word & !3) as usize
+                } else {
+                    frame_ptr + (word >> 1) as usize
+                };
+                // The GC table stores `GcRef` (= `usize`) slots; wasm32
+                // entries are 32-bit (`emit_gc_table_load` uses `i64.load32_u`).
+                if word & 2 == 2 && std::mem::size_of::<majit_ir::GcRef>() == 4 {
+                    unsafe { i64::from(*(addr as *const u32)) }
+                } else {
+                    unsafe { *(addr as *const i64) }
+                }
             } else {
                 word
             };
@@ -4290,7 +4329,7 @@ impl majit_backend::Backend for WasmBackend {
         let entry_bridge_target = if has_cross_loop_terminal_jump(ops) {
             let Some(target) = resolve_cross_loop_jump_target(ops, None) else {
                 diag_bump(2); // declined: JUMP target not chainable
-                return Err(BackendError::Unsupported(
+                return decline_compile_loop(BackendError::Unsupported(
                     "wasm backend: cross-loop terminal JUMP target is not a \
                      chainable published label"
                         .into(),
@@ -4302,7 +4341,7 @@ impl majit_backend::Backend for WasmBackend {
                 || raw_num_ref_homes > target.frame.ordinary_home_slots()
             {
                 diag_bump(4);
-                return Err(BackendError::Unsupported(format!(
+                return decline_compile_loop(BackendError::Unsupported(format!(
                     "wasm backend: entry bridge needs values={raw_frame_value_slots}, \
                      homes={raw_num_ref_homes}; target frozen layout has values={}, homes={}",
                     target.frame.value_slots,
@@ -4347,7 +4386,7 @@ impl majit_backend::Backend for WasmBackend {
         // `allow_ca` above; see `wasm_unsupported_trace_reason`.
         if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
             diag_bump(25);
-            return Err(BackendError::Unsupported(reason));
+            return decline_compile_loop(BackendError::Unsupported(reason));
         }
         if allow_ca {
             diag_bump(14); // accepted general CALL_ASSEMBLER loop
@@ -4433,6 +4472,8 @@ impl majit_backend::Backend for WasmBackend {
                 Err(err) => {
                     diag_bump(25);
                     record_last_compile_err(&err);
+                    record_compile_loop_error(&err);
+                    diag_bump(66);
                     return Err(err);
                 }
             };
@@ -4515,7 +4556,7 @@ impl majit_backend::Backend for WasmBackend {
         #[cfg(target_arch = "wasm32")]
         if !defer_host_compile && func_handle == 0 {
             diag_bump(26);
-            return Err(BackendError::Unsupported(
+            return decline_compile_loop(BackendError::Unsupported(
                 "wasm host rejected the compiled trace module (oversized function body \
                  or invalid module)"
                     .to_string(),

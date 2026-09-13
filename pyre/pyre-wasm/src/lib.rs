@@ -1578,6 +1578,13 @@ mod host_abi {
         pack_into_guest(majit_backend_wasm::inline_declines().into_bytes())
     }
 
+    /// Last `compile_loop` decline reason. Guest `eprintln` never reaches the
+    /// host, and slots 25/26 do not cover `build_wasm_module` `Unsupported`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_compile_loop_last_error() -> u64 {
+        pack_into_guest(majit_backend_wasm::compile_loop_last_error().into_bytes())
+    }
+
     /// Status the last `pyre_run_python` ended with: `SystemExit`'s code, 1 for
     /// an uncaught exception or a `SyntaxError`, else 0. The host exits with
     /// it, as `pyrex` does with `targetpypystandalone.py entry_point`'s

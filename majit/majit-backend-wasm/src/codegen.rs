@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+use majit_ir::forwarding::Forwarded;
+use majit_ir::operand::Operand;
+use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
     FunctionSection, GlobalSection, GlobalType, ImportSection, InstructionSink, MemArg, MemoryType,
@@ -10821,13 +10823,18 @@ fn emit_gc_table_load(sink: &mut PeepSink<'_, '_>, base: u32, index: i64) {
 
 /// Failarg counterpart of cranelift `resolve_failarg_opref`: rematerialize a
 /// preamble `LoadFromGcTable` (or SameAs of one) instead of spilling the
-/// local the back edge does not refresh.
+/// local the back edge does not refresh. A Ref with a home is loaded from
+/// that slot — the same contract `emit_force_arm` uses — because the local
+/// can be a stale from-space pointer after a collecting call, and
+/// `build_home_gcmap` only traces homes.
 fn emit_resolve_failarg(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     opref: OpRef,
     gc_table_slots: &HashMap<u32, (u32, i64)>,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
 ) {
     // rewrite.py leaves a ConstPtr failarg as a constant. Load it from
     // the table on this path only — the collector forwards the slot —
@@ -10845,6 +10852,14 @@ fn emit_resolve_failarg(
         && let Some(&(base, index)) = gc_table_slots.get(&opref.raw())
     {
         emit_gc_table_load(sink, base, index);
+        return;
+    }
+    if !opref.is_none()
+        && !opref.is_constant()
+        && let Some(home) = ref_homes.home(opref)
+    {
+        sink.local_get(0);
+        sink.i64_load(mem64(frame.home_slot_base + home as u64 * SLOT_SIZE));
         return;
     }
     emit_resolve(sink, constants, value_types, opref);
@@ -10941,6 +10956,40 @@ fn emit_resolve_f64(
 ///
 /// Only positions actually read as a plain OpRef are returned, so a trace
 /// whose pool holds no such value emits no extra prologue instruction.
+/// Scalar bits a folded producer still carries after it left the compiled
+/// stream. `RegisterManager::loc` (dynasm `regalloc.rs`) recovers the same
+/// payload from the box; flattening to `IntOp(pos)` and looking only at the
+/// backend pool drops `_resint` / `_forwarded` (`history.py *FrontendOp`).
+fn folded_scalar_bits(arg: &Operand) -> Option<i64> {
+    // InputArg.get_value() is the value observed while tracing, not a
+    // folded proof. Seeding that sample makes later iterations reuse the
+    // first loop counter (or similar) instead of the runtime argument.
+    let value = if arg.is_inputarg() {
+        match arg.get_forwarded() {
+            Forwarded::Const(c) => c.get(),
+            _ => return None,
+        }
+    } else {
+        match arg.get_value() {
+            Some(value) => value,
+            None => match arg.get_forwarded() {
+                Forwarded::Const(c) => c.get(),
+                _ => {
+                    let replaced = arg.get_box_replacement(false);
+                    if !replaced.is_constant() {
+                        return None;
+                    }
+                    replaced.const_value()?
+                }
+            },
+        }
+    };
+    match value {
+        Value::Ref(_) => None,
+        value => Some(value.as_raw_i64()),
+    }
+}
+
 fn unbound_pool_const_seeds(
     inputargs: &[InputArg],
     ops: &[Op],
@@ -10986,28 +11035,95 @@ fn unbound_pool_const_seeds(
         }
     }
     let mut seeds: Vec<(u32, i64)> = Vec::new();
-    let mut unresolved: Vec<(OpRef, OpCode, bool)> = Vec::new();
+    let mut unresolved: Vec<u32> = Vec::new();
+    let mut readers: Vec<String> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
-    let mut consider = |a: OpRef, opcode: OpCode, failarg: bool, seeds: &mut Vec<(u32, i64)>| {
-        if a == OpRef::NONE || a.is_constant() {
-            return;
+    // A 0-seeded Ref in a guard snapshot is a null identity / pycode at
+    // deopt (`consume_vable_info` / `BytecodeCorruption`). LABEL/JUMP can
+    // still carry a dummy leftover; failargs cannot.
+    let mut failarg_stray_refs: HashSet<u32> = HashSet::new();
+    for op in ops {
+        if let Some(fa) = op.getfailargs() {
+            // Same live extent `emit_guard_fail_args_spill` writes. A
+            // hole (`rd_locs == 0xFFFF`) or a past-extent slot is not a
+            // read of the named box; recording it here would make a
+            // later JUMP leftover of the same id look unresolved.
+            let live = live_fail_arg_mask(op.getdescr().as_ref(), fa.len());
+            let extent = live_fail_arg_extent(op.getdescr().as_ref(), fa.len());
+            for (i, a) in fa.iter().take(extent).enumerate() {
+                if !live.get(i).copied().unwrap_or(true) {
+                    continue;
+                }
+                if a.is_constant() {
+                    continue;
+                }
+                let opref = a.to_opref();
+                if opref == OpRef::NONE || opref.is_constant() {
+                    continue;
+                }
+                if !matches!(opref, OpRef::InputArgRef(_)) && opref.ty() != Some(Type::Ref) {
+                    continue;
+                }
+                let raw = opref.raw();
+                if defined.contains(&raw) || inputargs.iter().any(|ia| ia.index == raw) {
+                    continue;
+                }
+                failarg_stray_refs.insert(raw);
+            }
         }
-        let raw = a.raw();
-        if raw >= num_vars || defined.contains(&raw) || !seen.insert(raw) {
-            return;
-        }
-        match constants.get(&raw) {
-            Some(&bits) => seeds.push((raw, bits)),
-            // No producer and no pool entry: the local would read as the
-            // zero wasm initializes it to, which is a wrong value, not a
-            // missing one. Decline the trace (the interpreter runs it
-            // correctly, unaccelerated) exactly as the unhandled-opcode
-            // arm does. Live failargs are spilled from that same local
-            // (`emit_guard_fail_args_spill`); accepting a hole here
-            // would resume with a zero instead of declining.
-            None => unresolved.push((a, opcode, failarg)),
-        }
-    };
+    }
+    let mut consider =
+        |op: &Op, slot: &str, a: &Operand, seeds: &mut Vec<(u32, i64)>, seen: &mut HashSet<u32>| {
+            if a.is_constant() {
+                return;
+            }
+            let opref = a.to_opref();
+            if opref == OpRef::NONE || opref.is_constant() {
+                return;
+            }
+            let raw = opref.raw();
+            if raw >= num_vars || defined.contains(&raw) {
+                return;
+            }
+            if !seen.insert(raw) {
+                if unresolved.contains(&raw) {
+                    readers.push(format!("{:?}.{slot} {opref:?}", op.opcode));
+                }
+                return;
+            }
+            if let Some(&bits) = constants.get(&raw) {
+                seeds.push((raw, bits));
+                return;
+            }
+            if let Some(bits) = folded_scalar_bits(a) {
+                seeds.push((raw, bits));
+                return;
+            }
+            // A peeled-loop fallthrough scan can append a resume live-in
+            // (`assemble_peeled_trace_with_jump_args`) that is an InputArg
+            // not in the token's input list and has no producer — leftover
+            // of a residualized interior slot (`FrameLocalsRoot` keeps that
+            // address out of compiled Ref homes). Dynasm `RegisterManager.loc`
+            // allocates a dummy frame slot; seed a LABEL/JUMP-only leftover
+            // with 0 so the module is well-formed. A Ref that also sits in
+            // failargs is the virtualizable identity / pycode: compiling
+            // null there panics at deopt, so decline and let the interpreter
+            // run the loop.
+            if a.is_inputarg() && !inputargs.iter().any(|ia| ia.index == raw) {
+                if failarg_stray_refs.contains(&raw) {
+                    unresolved.push(raw);
+                    readers.push(format!("{:?}.{slot} {opref:?}", op.opcode));
+                    return;
+                }
+                seeds.push((raw, 0));
+                return;
+            }
+            // No producer, no pool entry, no leftover box value: the local
+            // would read as the zero wasm initializes it to. Decline the
+            // trace (the interpreter runs it correctly, unaccelerated).
+            unresolved.push(raw);
+            readers.push(format!("{:?}.{slot} {opref:?}", op.opcode));
+        };
     for op in ops {
         // rewrite.py `keep` — JIT_DEBUG / DebugMergePoint keep their
         // constants inline and never execute as values. LABEL args are
@@ -11018,8 +11134,8 @@ fn unbound_pool_const_seeds(
         if op.opcode.is_label() || op.opcode.is_jit_debug() {
             continue;
         }
-        for a in op.getarglist().iter() {
-            consider(a.to_opref(), op.opcode, false, &mut seeds);
+        for (i, a) in op.getarglist().iter().enumerate() {
+            consider(op, &format!("arg{i}"), a, &mut seeds, &mut seen);
         }
         // Same live extent `emit_guard_fail_args_spill` writes. A hole
         // (`rd_locs == 0xFFFF`) is spilled as zero and is not a read of
@@ -11027,9 +11143,11 @@ fn unbound_pool_const_seeds(
         let fail_args = exit_fail_args(op);
         let live = live_fail_arg_mask(op.getdescr().as_ref(), fail_args.len());
         let extent = live_fail_arg_extent(op.getdescr().as_ref(), fail_args.len());
-        for (i, &a) in fail_args.iter().take(extent).enumerate() {
-            if live.get(i).copied().unwrap_or(true) {
-                consider(a, op.opcode, true, &mut seeds);
+        if let Some(fa) = op.getfailargs() {
+            for (i, a) in fa.iter().take(extent).enumerate() {
+                if live.get(i).copied().unwrap_or(true) {
+                    consider(op, &format!("fail{i}"), a, &mut seeds, &mut seen);
+                }
             }
         }
     }
@@ -11052,7 +11170,9 @@ fn unbound_pool_const_seeds(
         let in_idx: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
         return Err(BackendError::Unsupported(format!(
             "wasm codegen: value{unresolved:?} read with no producing op and no \
-             constant-pool entry; inputargs={in_idx:?} labels={labels:?} sameas={sameas:?}"
+             constant-pool entry; readers=[{}]; inputargs={in_idx:?} \
+             labels={labels:?} sameas={sameas:?}",
+            readers.join(" | "),
         )));
     }
     Ok(seeds)
@@ -11561,6 +11681,8 @@ fn emit_guard_exit(
             dispatch.counter_slot,
             dispatch.spill_helpers,
             dispatch.gc_table_slots,
+            dispatch.ref_homes,
+            dispatch.frame,
         );
         if dispatch.enabled {
             emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
@@ -11578,6 +11700,8 @@ fn emit_guard_exit(
             dispatch.counter_slot,
             dispatch.spill_helpers,
             dispatch.gc_table_slots,
+            dispatch.ref_homes,
+            dispatch.frame,
         );
     }
     sink.br(block_exit_depth);
@@ -11630,7 +11754,15 @@ fn emit_guard_param_tail_call(
             emit_resolve_f64(sink, constants, value_types, arg);
             sink.i64_reinterpret_f64();
         } else {
-            emit_resolve_failarg(sink, constants, value_types, arg, dispatch.gc_table_slots);
+            emit_resolve_failarg(
+                sink,
+                constants,
+                value_types,
+                arg,
+                dispatch.gc_table_slots,
+                dispatch.ref_homes,
+                dispatch.frame,
+            );
         }
     }
     sink.local_get(dispatch.bridge_slot_local);
@@ -11661,7 +11793,15 @@ fn emit_guard_inline_bridge_move(
         if value_types.ty(input.index) == ValType::F64 {
             emit_resolve_f64(sink, constants, value_types, *arg);
         } else {
-            emit_resolve_failarg(sink, constants, value_types, *arg, gc_table_slots);
+            emit_resolve_failarg(
+                sink,
+                constants,
+                value_types,
+                *arg,
+                gc_table_slots,
+                ref_homes,
+                frame,
+            );
         }
     }
     for input in inputargs.iter().rev() {
@@ -11742,8 +11882,15 @@ fn emit_force_bracket_before_call(
 /// `dead_frame_from_forced_frame` would read a from-space address. The home
 /// slot IS traced and holds the same value, so naming it survives the
 /// collection. Ref pointers are 8-aligned, which is what makes the low tag bit
-/// free to tell an offset from a value; `undefined` and any Ref without a home
-/// (a constant) still publish a literal, which is even.
+/// free to tell an offset from a value.
+///
+/// A non-null `ConstPtr` has no home. Publishing its compile-time address
+/// (or even the current `FAILARG_CONST_TABLE` load) into the untraced force
+/// slot goes stale if the bracketed call collects. Homes use
+/// `offset * 2 + 1` (bit 0 set; bit 1 is clear because `offset` is
+/// 8-aligned). A table slot is published as `abs_addr | 3` so consume
+/// reloads the forwarded table entry after the collection. `undefined`
+/// and a null constant still publish a literal 0.
 #[allow(clippy::too_many_arguments)]
 fn emit_force_arm(
     sink: &mut PeepSink<'_, '_>,
@@ -11767,11 +11914,26 @@ fn emit_force_arm(
     ));
     for (i, &arg_ref) in force_args.iter().enumerate() {
         sink.local_get(0);
+        // Inline-Const failargs have no `raw()` index (`ConstPtr` panics).
         if !arg_ref.is_constant() && undefined == Some(arg_ref.raw()) {
             sink.i64_const(0);
         } else if let Some(home) = ref_homes.home(arg_ref) {
             let ofs = frame.home_slot_base + home as u64 * SLOT_SIZE;
             sink.i64_const((ofs as i64) * 2 + 1);
+        } else if let Some(g) = arg_ref.as_const_ptr() {
+            if g.is_null() {
+                sink.i64_const(0);
+            } else if let Some((base, index)) =
+                FAILARG_CONST_TABLE.with(|cell| cell.borrow().get(&g.0).copied())
+            {
+                // Tag the GC-table slot so `dead_frame_from_forced_frame`
+                // reloads after a collection inside the bracketed call.
+                let addr = i64::from(base)
+                    + i64::from(index) * std::mem::size_of::<majit_ir::GcRef>() as i64;
+                sink.i64_const(addr | 3);
+            } else {
+                emit_resolve(sink, constants, value_types, arg_ref);
+            }
         } else {
             emit_resolve(sink, constants, value_types, arg_ref);
         }
@@ -11806,6 +11968,8 @@ fn emit_guard_spill(
     counter_slot: Option<u64>,
     spill_helpers: &indexmap::IndexMap<usize, u32>,
     gc_table_slots: &HashMap<u32, (u32, i64)>,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
 ) {
     emit_guard_fail_args_spill(
         sink,
@@ -11815,6 +11979,8 @@ fn emit_guard_spill(
         counter_slot,
         spill_helpers,
         gc_table_slots,
+        ref_homes,
+        frame,
     );
     emit_guard_fail_index_store(sink, exit_index(op, guard_idx));
 }
@@ -11842,6 +12008,8 @@ fn emit_guard_fail_args_spill(
     counter_slot: Option<u64>,
     spill_helpers: &indexmap::IndexMap<usize, u32>,
     gc_table_slots: &HashMap<u32, (u32, i64)>,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
 ) {
     // Only through the last live position: `normal_frame_value_slots` sizes the
     // value area the same way, so writing past it would write past the frame.
@@ -11857,21 +12025,45 @@ fn emit_guard_fail_args_spill(
     if let Some(&helper) = spill_helpers.get(&fail_args.len()) {
         sink.local_get(0);
         for &arg_ref in &fail_args {
-            emit_resolve_failarg(sink, constants, value_types, arg_ref, gc_table_slots);
+            emit_resolve_failarg(
+                sink,
+                constants,
+                value_types,
+                arg_ref,
+                gc_table_slots,
+                ref_homes,
+                frame,
+            );
         }
         sink.call(helper);
     } else {
         for (i, &arg_ref) in fail_args.iter().enumerate() {
             let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
             sink.local_get(0);
-            emit_resolve_failarg(sink, constants, value_types, arg_ref, gc_table_slots);
+            emit_resolve_failarg(
+                sink,
+                constants,
+                value_types,
+                arg_ref,
+                gc_table_slots,
+                ref_homes,
+                frame,
+            );
             sink.i64_store(mem64(offset));
         }
     }
     if let Some((operand, slot)) = counter_value_spill(op, &fail_args).zip(counter_slot) {
         let offset = FRAME_SLOT_BASE + slot * SLOT_SIZE;
         sink.local_get(0);
-        emit_resolve_failarg(sink, constants, value_types, operand, gc_table_slots);
+        emit_resolve_failarg(
+            sink,
+            constants,
+            value_types,
+            operand,
+            gc_table_slots,
+            ref_homes,
+            frame,
+        );
         sink.i64_store(mem64(offset));
     }
 }

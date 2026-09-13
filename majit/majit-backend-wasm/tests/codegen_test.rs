@@ -3139,6 +3139,294 @@ fn unbound_non_label_read_of_import_hole_is_declined() {
 }
 
 #[test]
+fn test_folded_producer_value_seeds_unbound_local() {
+    // The producer at pos 99 is not in the compiled stream. Its `_resint`
+    // still holds the folded constant (`history.py IntFrontendOp`). Flattening
+    // to `IntOp(99)` without a pool entry used to decline the module.
+    let producer = OpRc::new(Op::new(OpCode::IntAdd, &[]));
+    producer.pos().set(OpRef::int_op(99));
+    producer.set_value(majit_ir::Value::Int(7));
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let add = Op::new(
+        OpCode::IntAdd,
+        &[
+            Operand::from_bound_op(&producer),
+            rb(OpRef::input_arg_int(0)),
+        ],
+    );
+    add.pos().set(OpRef::int_op(1));
+    let ops = vec![add, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+    assert_eq!(
+        execute_simple_trace(&bytes, &[5]),
+        12,
+        "folded 7 + input 5 must execute as 12"
+    );
+}
+
+#[test]
+fn test_folded_producer_ref_is_interned() {
+    // Same hole as the scalar case, but a leftover `_resref` must become
+    // `LoadFromGcTable` (`rewrite.py remove_constptr`), not a baked pointer.
+    let producer = OpRc::new(Op::new(OpCode::SameAsR, &[]));
+    producer.pos().set(OpRef::ref_op(99));
+    producer.set_value(majit_ir::Value::Ref(majit_ir::GcRef(0x1000)));
+
+    let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+    let same = Op::new(OpCode::SameAsR, &[Operand::from_bound_op(&producer)]);
+    same.pos().set(OpRef::ref_op(1));
+    let ops = vec![same, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(1))])];
+    // `compile_loop` intern_ref_constants runs this pass first; a leftover
+    // `_resref` must become LoadFromGcTable before unbound-seed.
+    let (ops, gcrefs) = majit_gc::rewrite::remove_ref_constants(&ops, 2);
+    assert_eq!(gcrefs, vec![majit_ir::GcRef(0x1000)]);
+    let load = ops
+        .iter()
+        .find(|op| op.opcode == OpCode::LoadFromGcTable)
+        .expect("remove_constptr must emit LoadFromGcTable");
+    assert_eq!(
+        load.arg(0).const_value(),
+        Some(majit_ir::Value::Int(0)),
+        "LoadFromGcTable must use table index 0, ops={ops:?}"
+    );
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+}
+
+#[test]
+fn test_stray_label_inputarg_is_seeded() {
+    // Loop LABEL / JUMP carry an InputArg that is not in the token input
+    // list (peeled fallthrough leftover). Must compile, not decline.
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[
+                rb(OpRef::input_arg_ref(0)),
+                rb(OpRef::input_arg_ref(1)),
+                rb(OpRef::input_arg_ref(99)),
+            ],
+        ),
+        make_op(
+            OpCode::SameAsR,
+            &[OpRef::input_arg_ref(0)],
+            OpRef::ref_op(2),
+        ),
+        Op::new(
+            OpCode::Jump,
+            &[
+                rb(OpRef::input_arg_ref(0)),
+                rb(OpRef::input_arg_ref(1)),
+                rb(OpRef::input_arg_ref(99)),
+            ],
+        ),
+    ];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+}
+
+#[test]
+fn test_stray_failarg_ref_declines() {
+    // A failarg InputArg that is not a token input and not a LABEL
+    // live-in has no producer. #1780 treats LABEL args as defined;
+    // a snapshot-only leftover is still a null identity at deopt.
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_ref(0)],
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_ref(99),
+        ],
+    );
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))],
+        ),
+        guard,
+        Op::new(
+            OpCode::Jump,
+            &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))],
+        ),
+    ];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants,
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let error = match codegen::build_wasm_module(&inputs) {
+        Ok(_) => panic!("a stray Ref failarg must decline, not compile as null"),
+        Err(error) => error,
+    };
+    let msg = error.to_string();
+    assert!(
+        (msg.contains("value[99]") || msg.contains("InputArgRef(99)"))
+            && msg.contains("no producing op"),
+        "decline must name the stray failarg, got {msg}"
+    );
+}
+
+#[test]
+fn test_force_arm_accepts_constptr_failarg() {
+    // `emit_force_arm` used to call `OpRef::raw()` on every failarg.
+    // An inline `ConstPtr` (null or interned) has no raw index and panicked
+    // while compiling a `CallMayForce` + `GuardNotForced` bridge.
+    let call = make_op(
+        OpCode::CallMayForceI,
+        &[OpRef::const_int(42)],
+        OpRef::int_op(1),
+    );
+    call.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        vec![],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    ));
+    let guard = Op::new(OpCode::GuardNotForced, &[]);
+    guard.setfailargs(smallvec![
+        rb(OpRef::input_arg_ref(0)),
+        rb(OpRef::const_ptr(majit_ir::GcRef(0))),
+    ]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    let bytes = build_module_with_write_barrier_target(
+        &[InputArg::from_type(Type::Ref, 0)],
+        &[call, guard, finish],
+        127,
+    );
+    validate_wasm(&bytes);
+}
+
+fn wasm_contains_i64_const(bytes: &[u8], value: i64) -> bool {
+    let mut encoded = vec![0x42];
+    let mut n = value;
+    loop {
+        let mut byte = (n as u8) & 0x7f;
+        n >>= 7;
+        let done = (n == 0 && byte & 0x40 == 0) || (n == -1 && byte & 0x40 != 0);
+        if !done {
+            byte |= 0x80;
+        }
+        encoded.push(byte);
+        if done {
+            break;
+        }
+    }
+    bytes.windows(encoded.len()).any(|window| window == encoded)
+}
+
+#[test]
+fn test_force_arm_rematerializes_constptr_from_gc_table() {
+    // A movable non-null ConstPtr must not be stored as its compile-time
+    // address in the untraced force slot. Tag the GC-table slot so
+    // `dead_frame_from_forced_frame` reloads after a collection.
+    let table_base = 0x2000u32;
+    codegen::bind_failarg_const_table(&[majit_ir::GcRef(0x1000)], table_base);
+    let call = make_op(
+        OpCode::CallMayForceI,
+        &[OpRef::const_int(42)],
+        OpRef::int_op(1),
+    );
+    call.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        vec![],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    ));
+    let guard = Op::new(OpCode::GuardNotForced, &[]);
+    guard.setfailargs(smallvec![
+        rb(OpRef::input_arg_ref(0)),
+        rb(OpRef::const_ptr(majit_ir::GcRef(0x1000))),
+    ]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    let bytes = build_module_with_write_barrier_target(
+        &[InputArg::from_type(Type::Ref, 0)],
+        &[call, guard, finish],
+        127,
+    );
+    codegen::bind_failarg_const_table(&[], 0);
+    validate_wasm(&bytes);
+    let tagged = i64::from(table_base) | 3;
+    assert!(
+        wasm_contains_i64_const(&bytes, tagged),
+        "force slot must publish the tagged GC-table address {tagged:#x}"
+    );
+    assert!(
+        !wasm_contains_i64_const(&bytes, 0x1000),
+        "force slot must not bake the compile-time ConstPtr address"
+    );
+}
+
+#[test]
+fn test_inputarg_observation_is_not_a_folded_scalar() {
+    // An InputArg's get_value() is the sample seen while tracing. Seeding
+    // that sample would freeze the first loop counter into later iterations.
+    let ia = InputArg::new_int_rc(99);
+    ia.set_value(majit_ir::Value::Int(7));
+    let add = Op::new(
+        OpCode::IntAdd,
+        &[
+            Operand::from_bound_inputarg(&ia),
+            rb(OpRef::input_arg_int(0)),
+        ],
+    );
+    add.pos().set(OpRef::int_op(1));
+    let ops = vec![
+        Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
+        add,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
+    ];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+    assert_eq!(
+        execute_simple_trace(&bytes, &[5]),
+        5,
+        "InputArg observation 7 must not seed the leftover; 0-seed + input 5 = 5"
+    );
+}
+
+#[test]
 fn test_float_ops() {
     let inputargs = vec![
         InputArg::from_type(Type::Float, 0),

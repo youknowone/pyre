@@ -914,6 +914,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "ca_decl_terminal",
                 "inline_decl_foreign_eager",
                 "inline_decl_eager_too_large",
+                "cl_decl_codegen",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -1519,6 +1520,25 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             dealloc.call(&mut store, (ptr, len))?;
             eprintln!(
                 "[jit-stats] inline_declines {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
+    // `compile_loop` `Unsupported` reason. Guest eprintln is silent; slots
+    // 25/26 do not cover `build_wasm_module`, so a `cl_entered` without
+    // `cl_ok` otherwise names no opcode or layout check.
+    if std::env::var_os("PYRE_WASM_JIT_STATS").is_some()
+        && let Ok(last_err) =
+            instance.get_typed_func::<(), u64>(&mut store, "pyre_jit_compile_loop_last_error")
+        && let Ok(packed) = last_err.call(&mut store, ())
+    {
+        let (ptr, len) = ((packed >> 32) as u32, packed as u32);
+        if len != 0 {
+            let mut bytes = vec![0u8; len as usize];
+            memory.read(&store, ptr as usize, &mut bytes)?;
+            dealloc.call(&mut store, (ptr, len))?;
+            eprintln!(
+                "[jit-stats] compile_loop_last_error {}",
                 String::from_utf8_lossy(&bytes)
             );
         }
