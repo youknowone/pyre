@@ -1,7 +1,7 @@
 # pyre-check: spec-folds=str_call
-# Hot-loop `str(int)`. The Python-level call has to reach the same decimal
-# render the rtyper gives an unboxed `str(int)` -- one elidable
-# `jit_int_str` over the unboxed operand -- instead of the opaque
+# Hot-loop `str(int)`. The Python-level call has to reach the same
+# `descr_repr` split the rtyper gives an unboxed `str(int)` -- elidable
+# `ll_int2dec` plus a `newutf8` wrap -- instead of the opaque
 # `bh_call_fn(str_type, NULL, i)` residual. That residual is a `CallMayForce`,
 # so it clears the heap cache and forces virtualizables across itself; a loop
 # built around it pays far more than the one string it allocates.
