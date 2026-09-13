@@ -388,6 +388,16 @@ impl Trace {
         self.trb.is_some()
     }
 
+    /// opencoder.py `Trace.tracing_done` — `compile.py compile_trace`
+    /// calls this before `optimize_trace`. A tag overflow becomes
+    /// `SwitchToBlackhole(ABORT_TOO_LONG)`.
+    pub fn tracing_done(&mut self) -> Result<(), crate::pyjitpl::AbortReason> {
+        if let Some(trb) = self.trb.as_mut() {
+            return trb.tracing_done();
+        }
+        Ok(())
+    }
+
     pub fn snapshot_offset_count(&self) -> usize {
         self.snapshot_offsets.len()
     }

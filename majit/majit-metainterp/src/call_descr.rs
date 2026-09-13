@@ -928,6 +928,39 @@ pub fn make_call_may_force_descr(arg_types: &[Type], result_type: Type) -> Descr
     })
 }
 
+/// `pyjitpl.py compile_trace` records `descr=ptoken` on the tentative JUMP.
+/// `unroll.py optimize_bridge` then does `cell_token = jump_op.getdescr()`
+/// and `assert isinstance(cell_token, JitCellToken)`.
+#[derive(Debug)]
+struct JitCellTokenDescr {
+    token: Arc<JitCellToken>,
+}
+
+impl majit_ir::Descr for JitCellTokenDescr {
+    fn as_loop_token_descr(&self) -> Option<&dyn majit_ir::descr::LoopTokenDescr> {
+        Some(self)
+    }
+}
+
+impl majit_ir::descr::LoopTokenDescr for JitCellTokenDescr {
+    fn loop_token_number(&self) -> u64 {
+        self.token.number
+    }
+
+    fn call_virtualizable_index(&self) -> Option<usize> {
+        self.token.virtualizable_arg_index()
+    }
+
+    fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
+        Some(&self.token)
+    }
+}
+
+/// Wrap a live `JitCellToken` as the JUMP descr `compile_trace` records.
+pub fn jit_cell_token_as_descr(token: Arc<JitCellToken>) -> DescrRef {
+    Arc::new(JitCellTokenDescr { token })
+}
+
 /// `compile.py isinstance(descr, JitCellToken)` parity factory.
 ///
 /// Create a `CALL_ASSEMBLER_*` descr that owns the same `Arc<JitCellToken>`
@@ -1009,6 +1042,27 @@ mod set_effect_bitstrings_tests {
             Some(&[0x88u8][..])
         );
         assert_eq!(ei_after.write_descrs_fields.as_deref(), Some(&[0x00u8][..]));
+    }
+
+    #[test]
+    fn jit_cell_token_as_descr_exposes_the_same_arc() {
+        let token = Arc::new(JitCellToken::new(42));
+        let descr = jit_cell_token_as_descr(Arc::clone(&token));
+        let recovered = descr
+            .as_loop_token_descr()
+            .and_then(|ltd| ltd.token_handle_any())
+            .and_then(|any| any.downcast_ref::<Arc<JitCellToken>>())
+            .expect("JUMP descr must be the JitCellToken");
+        assert!(
+            Arc::ptr_eq(recovered, &token),
+            "compile_trace records descr=ptoken, the same Arc the cell holds"
+        );
+        assert_eq!(
+            descr
+                .as_loop_token_descr()
+                .map(|ltd| ltd.loop_token_number()),
+            Some(42)
+        );
     }
 
     /// Default `Descr::set_effect_bitstrings` is a no-op for descrs

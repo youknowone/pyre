@@ -9002,101 +9002,34 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(descr) = finish_descr {
             ctx.finish(finish_args, descr);
         } else {
-            // pyjitpl.py:3005-3007 reads the procedure token once, through
-            // the `warmstate.py:191-196` invalidation filter, and hands that
-            // same object to `compile_trace` — the loop a bridge closes onto
-            // is the loop `has_compiled_targets` admitted. `has_compiled_targets`
-            // here already answers from the token, so taking the
-            // descr from the `compiled_loops` side table made one decision read
-            // two sources: the side table applies no invalidation filter, and
-            // `jitdriver.rs`'s `invalidate_loop` keeps an invalidated loop's
-            // target tokens on
-            // purpose. Reading both halves off the token is what makes the
-            // filter cover the target as well as the gate.
-            //
-            // Resolving to a TargetToken descr here, where `pyjitpl.py:3213-3214`
-            // records the JitCellToken itself, is early binding rather than a
-            // different answer. Upstream's cell-token descr is a placeholder the
-            // optimizer always consumes, in one of two ways: `unroll.py:196-199`
-            // takes `jump_to_preamble` when the target list holds one entry, and
-            // `:238-241` rewrites the descr to `cell_token.target_tokens[0]` —
-            // element zero, unconditionally, exactly what `first_target_token`
-            // answers; otherwise `:320-359` virtual-state matches and rewrites to
-            // the token it picked. Both consumers exist here:
-            // `jump_to_existing_trace_impl` (`unroll.rs`) iterates every
-            // candidate, and its `unroll.py:357-359` arm re-points this JUMP's
-            // descr at whichever token matched. So the ladder is not bypassed by
-            // binding early; only the preamble arm keeps what is recorded here.
-            //
-            // The equivalence needs the list to be unchanged between the two
-            // points, and it is: recording and optimizing are one synchronous
-            // sequence in this function (cut → record → snapshot → optimize) on
-            // the single JIT thread, and `optimize_bridge` mints no target
-            // tokens.
-            let jump_descr = self
-                .warm_state
-                .get_procedure_token(green_key)
-                .and_then(|token| token.first_target_token());
-            let Some(jump_descr) = jump_descr else {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] compile_trace: no front_target_token for key={}, bridge_origin={:?}",
-                        green_key, bridge_origin
-                    );
-                }
+            // pyjitpl.py compile_trace: `history.record(JUMP, ..., descr=ptoken)`
+            // — the JitCellToken itself, not `target_tokens[0]`.
+            // `unroll.py optimize_bridge` reads `cell_token = jump_op.getdescr()`
+            // and either `jump_to_preamble` (rewrites to `target_tokens[0]`)
+            // or `_jump_to_existing_trace` (scans every token).
+            let Some(ptoken) = self.warm_state.get_procedure_token(green_key) else {
                 if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
-                crate::mc_diag_bump(29); // compile_trace: no front target token
+                crate::mc_diag_bump(29); // compile_trace: no procedure token
                 return CompileOutcome::Cancelled;
             };
-            // `unroll.py jump_to_preamble` reaches this same unconditional
-            // take of the head, and it opens with
-            // `assert cell_token.target_tokens[0].virtual_state is None`.
-            // That assertion is what makes the take sound: a head carrying a
-            // virtual state is a specialized label, and entering one needs the
-            // guards `_jump_to_existing_trace` derives from that state — which
-            // the take, by construction, does not emit. The crate layering
-            // keeps `virtual_state` off the backend's descr list (see the note
-            // below), so read it from the `compiled_loops` projection the head
-            // is mirrored into. Upstream states this as unreachable; declining
-            // costs a bridge where crashing would cost the process.
-            if self
-                .compiled_loops
-                .get(&green_key)
-                .and_then(|compiled| compiled.front_target_tokens.first())
-                .is_some_and(|front| front.virtual_state.is_some())
-            {
+            if !ptoken.has_target_tokens() {
                 if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
-                crate::mc_diag_bump(crate::mc_diag_slot(
-                    "bridge_close_head_target_has_virtual_state",
-                ));
+                crate::mc_diag_bump(29);
                 return CompileOutcome::Cancelled;
             }
-            // The descr list on the token and the value list in
-            // `compiled_loops` are two projections of one thing, written by
-            // separate statements, and nothing else checks that they agree.
-            // Upstream cannot drift because `token.target_tokens` holds the
-            // TargetTokens themselves; the split here is forced by the crate
-            // layering (`JitCellToken` lives in majit-backend, which cannot
-            // name a `VirtualState`). This asserts what that layering costs us
-            // the ability to guarantee: the head the optimizer will see is the
-            // head whose value the ladder reads.
-            debug_assert!(
-                self.compiled_loops
-                    .get(&green_key)
-                    .and_then(|compiled| compiled.front_target_tokens.first())
-                    .is_none_or(
-                        |front| majit_ir::descr_identity(&front.as_jump_target_descr())
-                            == majit_ir::descr_identity(&jump_descr)
-                    ),
-                "compile_trace: token target-descr head disagrees with \
-                 front_target_tokens head for key={green_key}"
+            ctx.recorder.close_loop_with_descr(
+                finish_args,
+                Some(crate::call_descr::jit_cell_token_as_descr(ptoken)),
             );
-            ctx.recorder
-                .close_loop_with_descr(finish_args, Some(jump_descr));
+        }
+        // compile.py compile_trace: `trace.tracing_done()` before optimize.
+        if let Err(reason) = ctx.recorder.tracing_done() {
+            self.pending_abort_reason = Some(reason.as_int());
+            return CompileOutcome::Aborted;
         }
 
         // Keep the recorded operations (including JUMP) alive while the
@@ -9211,24 +9144,6 @@ impl<M: Clone> MetaInterp<M> {
                 // `resumekey.rd_loop_token`; pyre stores it in
                 // `active_trace_session.bridge.green_key`.
                 let origin_key = self.bridge_info().map(|b| b.green_key).unwrap_or(green_key);
-                // Prevent double-compilation: if a bridge was already compiled
-                // and attached to this guard, skip. RPython's
-                // raise_continue_running_normally stops the trace entirely,
-                // so this path is never re-entered; pyre's trace may continue
-                // and re-enter, so guard explicitly.
-                let already = self.bridge_was_compiled(origin_key, trace_id, fail_index);
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] bridge_was_compiled({}, {}, {}) = {}",
-                        origin_key, trace_id, fail_index, already
-                    );
-                }
-                if already {
-                    return CompileOutcome::Compiled {
-                        green_key: 0,
-                        from_retry: false,
-                    };
-                }
                 // `pyjitpl.py` `handle_guard_failure(self,
                 // resumedescr, deadframe)` parity: the source descr Arc
                 // is `self.resumekey` (== the descr
@@ -9275,6 +9190,7 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_vref_boxes,
                     snapshot_frame_pcs,
                     call_pure_results,
+                    ends_with_jump,
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -10675,6 +10591,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut snapshot_vref_map,
         ]);
         // compile.py SimpleCompileData.optimize → optimize_loop parity.
+        optimizer.simple_compile = true;
         // Wire snapshot data through to the optimizer so guard
         // store_final_boxes_in_guard (optimizeopt/mod.rs) can properly populate
         // rd_numb / rd_consts via _number_boxes (resume.py).
@@ -14736,6 +14653,9 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
         call_pure_results: crate::optimizeopt::util::ArgsDict,
+        // compile.py compile_trace: BridgeCompileData when ends_with_jump,
+        // SimpleCompileData (optimize_loop) otherwise.
+        ends_with_jump: bool,
     ) -> bool {
         self.remember_compiled_graph_write();
         self.last_compiled_artifact_token = None;
@@ -15073,12 +14993,16 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             None
         };
-        // compile.py:1077-1078 parity: optimize_bridge may raise InvalidLoop
-        // (e.g. rewrite.py:404-407 GUARD_CLASS proven to always fail).
-        // RPython catches it via the abstract jitexc handler and discards
-        // the bridge. Mirror that here so the trace abort doesn't unwind
+        // compile.py compile_trace: ends_with_jump selects BridgeCompileData
+        // (UnrollOptimizer.optimize_bridge) vs SimpleCompileData
+        // (Optimizer.optimize_loop). A DoneWithThisFrame FINISH has no JUMP
+        // for jump_to_existing_trace; BasicLoopInfo.final() is always True.
+        // compile.py compile_trace: either optimize may raise InvalidLoop
+        // (e.g. rewrite.py GUARD_CLASS proven to always fail). RPython
+        // catches it via the abstract jitexc handler and discards the
+        // bridge. Mirror that here so the trace abort doesn't unwind
         // past compile_bridge.
-        let bridge_optimize_result = {
+        let bridge_optimize_result = if ends_with_jump {
             let front_target_tokens = match crossed_target_tokens.as_mut() {
                 Some(tokens) => tokens,
                 None => {
@@ -15102,6 +15026,16 @@ impl<M: Clone> MetaInterp<M> {
                 Some(loop_num_inputs),
                 bridge_inputarg_base,
             )
+        } else {
+            optimizer
+                .optimize_loop(
+                    bridge_ops,
+                    &mut constants,
+                    bridge_inputargs.len(),
+                    pending_bridge_rd,
+                    bridge_inputarg_base,
+                )
+                .map(|ops| (ops, false))
         };
         if let Some(tokens) = crossed_target_tokens
             && let Some(compiled) = self.compiled_loops.get_mut(&cell_token_key)
@@ -17828,12 +17762,15 @@ impl<M: Clone> MetaInterp<M> {
                     Ok(())
                 }
                 CompileOutcome::Cancelled => {
-                    // Preserve the existing cancelled-compile teardown: it
-                    // does not propagate a SwitchToBlackhole reason, but it is
-                    // not a successful compile either.
+                    // pyjitpl.py compile_done_with_this_frame /
+                    // compile_exit_frame_with_exception:
+                    //   target_token = compile.compile_trace(...)
+                    //   if target_token is not token: compile.giveup()
+                    // compile_trace returns None on InvalidLoop or a
+                    // non-final optimize; None is not the FINISH descr.
                     self.abort_trace_live(false);
-                    self.clear_pending_abort();
-                    Ok(())
+                    crate::mc_diag_bump(49);
+                    Err(SwitchToBlackhole::giveup())
                 }
                 // pyjitpl.py:3220/:3245 `compile.giveup()` per
                 // `rpython/jit/metainterp/compile.py:27` →

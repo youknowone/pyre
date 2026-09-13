@@ -3806,12 +3806,12 @@ pub fn trace_and_compile_from_bridge(
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
 
-    // NOTE: guard resume_pc pointing to LOAD_CONST + RETURN_VALUE does NOT
-    // mean the guard is a loop-exit guard. It means the blackhole resume
-    // path leads to function return. RPython handles this correctly via
-    // blackhole resume → interpreter runs remaining code → natural return.
-    // Direct FINISH bridges are WRONG here — they skip the remaining loop
-    // body that the blackhole should execute.
+    // A resume_pc on LOAD_CONST + RETURN_VALUE (or `n<=0` RETURN) is still
+    // a live `handle_guard_failure` walk. RPython's `interpret()` records
+    // through that return and `compile_done_with_this_frame` attaches a
+    // DoneWithThisFrame FINISH bridge (`compile.compile_trace` with
+    // `ends_with_jump=False`). Blackhole-only is the SwitchToBlackhole
+    // fallback, not the success path.
     // RPython rebuild_from_resumedata (pyjitpl.py:2901,3400)
     // restores the complete frame stack before bridge tracing.
     // Bridge tracing sees the full frame layout — no truncation.
@@ -4455,14 +4455,13 @@ fn jit_ca_handle_guard_failure(
     }
     let mut frame_root = FrameRoot::new(unsafe { &mut *(fail0 as *mut PyFrame) });
 
-    // This callback has no channel for the exception value carried by a
-    // failing CALL_ASSEMBLER exception guard.  Compiling from its post-call
-    // resume state would treat the null call result as a normal operand.
-    // Leave exception-guard recovery to the blackhole path, which owns the
-    // callee exception and propagates it through the caller frames.
-    if descr_arc.is_guard_exc() {
-        return false;
-    }
+    // compile.py handle_fail traces exception guards the same as any other
+    // (`must_compile` then `_trace_and_compile_from_bridge`). The exception
+    // lives on the deadframe (`cpu.grab_exc_value`); read it here so
+    // `_prepare_exception_resumption` / `prepare_resume_from_failure` see
+    // the same value the general `handle_fail` path threads as `guard_exc`.
+    let guard_exc = unsafe { (*deadframe).jf_guard_exc as i64 };
+    let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
 
     // compile.py must_compile: jitcounter.tick(guard_hash, increment)
     let (must_compile, owning_key) = {
@@ -4513,9 +4512,6 @@ fn jit_ca_handle_guard_failure(
     // with the matching `start_compiling` even on panic.
     let compiled = {
         let _guard = crate::eval::GuardCompilingScope::new(&descr_arc);
-        // CALL_ASSEMBLER guard failures grab their callee exception on the
-        // blackhole leg, not here; pass 0 so the non-exception-guard
-        // deferral keys only off the general guard path's `guard_exc`.
         // `allow_finish_direct_return = false`: this callback returns a bare
         // bool to native code and has no channel for a concrete result; a
         // walk that terminates with a kept finish-concrete stash hands it to
@@ -4541,7 +4537,7 @@ fn jit_ca_handle_guard_failure(
             frame_root.frame(),
             &raw_values,
             &exit_layout,
-            0,
+            guard_exc,
             false,
         ) {
             BridgeResolution::CompiledContinue => true,
