@@ -81,8 +81,8 @@ def child_dirs_whose_rs_mention(root: Path, needle: str) -> list[str]:
     """Immediate subdirectories of `root` that have a `.rs` file containing `needle`.
 
     Used to find interpreter `src/module/<name>/` trees that carry a JIT
-    hint macro, so Charon can `--start-from` those modules (and their
-    marker consts) without a hand-maintained name list.
+    hint macro, so Charon can `--start-from-if-exists` those modules (and
+    their marker consts) without a hand-maintained name list.
     """
     if not root.is_dir():
         return []

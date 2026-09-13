@@ -54,9 +54,12 @@ def interpreter_charon_args(crate_dir: Path) -> list[str]:
     only if something outside it reaches it.
 
     Charon's own example: `--opaque crate::module --include crate::module::_`.
-    rustc still compiles the files. Modules that carry a JIT-hint macro are
-    `--start-from` so their marker consts stay in the artefact
-    (`harvest_hints_from_llbcs`); a hand list of residual modules is not
+    rustc still compiles the files. `--start-from crate` keeps the crate
+    walk: a non-empty `--start-from` list replaces that default. Modules
+    that carry a JIT-hint macro are `--start-from-if-exists` so their
+    marker consts stay in the artefact (`harvest_hints_from_llbcs`) even
+    when the module is cfg'd out on a layout target (`mmap` /
+    `_cffi_backend` on wasm). A hand list of residual modules is not
     kept. `posix` / `gc` / `time` need no special case: core calls reach
     them and `--include crate::module::_` then translates those items.
     """
@@ -66,9 +69,11 @@ def interpreter_charon_args(crate_dir: Path) -> list[str]:
         "crate::module",
         "--include",
         "crate::module::_",
+        "--start-from",
+        "crate",
     ]
     for name in child_dirs_whose_rs_mention(crate_dir / "src" / "module", "majit_macros::"):
-        args += ["--start-from", f"crate::module::{name}"]
+        args += ["--start-from-if-exists", f"crate::module::{name}"]
     return args
 
 
