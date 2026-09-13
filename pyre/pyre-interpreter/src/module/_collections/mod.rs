@@ -1509,7 +1509,7 @@ impl W_Deque {
         // `dequerepr` — a deque reachable from its own items renders
         // the inner reference as `[...]` instead of recursing.
         let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
-            return Ok(pyre_object::w_str_new("[...]"));
+            return Ok(pyre_object::w_str_new_managed("[...]"));
         };
         // The repr uses the short class name, so strip any dotted
         // module prefix from the builtin tp_name (`collections.deque`

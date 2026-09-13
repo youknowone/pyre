@@ -4819,7 +4819,7 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     if !displayhook_write(repr)? {
         return Ok(w_none());
     }
-    if !displayhook_write(w_str_new("\n"))? {
+    if !displayhook_write(w_str_new_managed("\n"))? {
         return Ok(w_none());
     }
     set_builtins_underscore(value)?;
@@ -8179,10 +8179,12 @@ fn base_exception_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let base = pyre_object::gc_roots::pin_roots(&[w_self, w_state]);
     let entries =
         unsafe { pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(base + 1)) };
-    let entry_base = pyre_object::gc_roots::shadow_stack_len();
-    for &(key, value) in &entries {
-        pyre_object::gc_roots::pin_roots(&[key, value]);
+    let mut flat = Vec::with_capacity(entries.len() * 2);
+    for (key, value) in &entries {
+        flat.push(*key);
+        flat.push(*value);
     }
+    let entry_base = pyre_object::gc_roots::pin_roots(&flat);
     for index in 0..entries.len() {
         let key = pyre_object::gc_roots::shadow_stack_get(entry_base + index * 2);
         let value = pyre_object::gc_roots::shadow_stack_get(entry_base + index * 2 + 1);

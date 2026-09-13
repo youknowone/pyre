@@ -3432,12 +3432,22 @@ pub unsafe fn descr_method_eq(
     if !unsafe { pyre_object::is_method(other) } {
         return Ok(pyre_object::special::w_not_implemented());
     }
-    let funcs_equal =
-        crate::baseobjspace::eq_w(unsafe { pyre_object::w_method_get_func(this) }, unsafe {
-            pyre_object::w_method_get_func(other)
-        })?;
-    let selves_identical =
-        unsafe { pyre_object::w_method_get_self(this) == pyre_object::w_method_get_self(other) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pair = pyre_object::gc_roots::pin_roots(&[this, other]);
+    let fa =
+        unsafe { pyre_object::w_method_get_func(pyre_object::gc_roots::shadow_stack_get(pair)) };
+    let fb = unsafe {
+        pyre_object::w_method_get_func(pyre_object::gc_roots::shadow_stack_get(pair + 1))
+    };
+    let funcs = pyre_object::gc_roots::pin_roots(&[fa, fb]);
+    let funcs_equal = crate::baseobjspace::eq_w(
+        pyre_object::gc_roots::shadow_stack_get(funcs),
+        pyre_object::gc_roots::shadow_stack_get(funcs + 1),
+    )?;
+    let selves_identical = unsafe {
+        pyre_object::w_method_get_self(pyre_object::gc_roots::shadow_stack_get(pair))
+            == pyre_object::w_method_get_self(pyre_object::gc_roots::shadow_stack_get(pair + 1))
+    };
     Ok(pyre_object::w_bool_from(funcs_equal && selves_identical))
 }
 

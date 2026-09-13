@@ -53,10 +53,9 @@ pub fn w_list_find_or_count(
     // `eq_w` re-enters Python and may collect; the list and needle are raw
     // locals re-read each iteration, so pin them on the shadow stack.
     let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    let item_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_item);
+    let pair = pyre_object::gc_roots::pin_roots(&[obj, w_item]);
+    let obj_slot = pair;
+    let item_slot = pair + 1;
     while i < stop
         && i < unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(obj_slot)) }
             as i64
@@ -67,6 +66,8 @@ pub fn w_list_find_or_count(
             Some(v) => v,
             None => break,
         };
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let w_curr = pyre_object::gc_roots::pin_root(w_curr);
         if crate::baseobjspace::eq_w(w_curr, pyre_object::gc_roots::shadow_stack_get(item_slot))? {
             if count {
                 result += 1;

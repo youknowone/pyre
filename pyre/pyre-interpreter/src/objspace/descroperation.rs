@@ -5976,9 +5976,7 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             // the value stack before this dispatch, so publish the whole set
             // and read each entry back after the comparisons that precede it.
             let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(a);
-            let _ = pyre_object::gc_roots::pin_root(b);
+            let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
             let la = pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(root_base));
             let lb =
                 pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(root_base + 1));
@@ -5986,11 +5984,12 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             if equal {
                 let items =
                     pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(root_base));
-                let items_base = pyre_object::gc_roots::shadow_stack_len();
-                for &(k, v) in &items {
-                    let _ = pyre_object::gc_roots::pin_root(k);
-                    let _ = pyre_object::gc_roots::pin_root(v);
+                let mut flat = Vec::with_capacity(items.len() * 2);
+                for (k, v) in &items {
+                    flat.push(*k);
+                    flat.push(*v);
                 }
+                let items_base = pyre_object::gc_roots::pin_roots(&flat);
                 for index in 0..items.len() {
                     let k = pyre_object::gc_roots::shadow_stack_get(items_base + index * 2);
                     let other = pyre_object::dictmultiobject::w_dict_lookup_checked(
@@ -6006,9 +6005,15 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
                         Some(other_v) => {
                             // dictmultiobject.py:664 `if not space.eq_w(w_val,
                             // w_rightval): return space.w_False`
-                            let v =
-                                pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1);
-                            if !crate::baseobjspace::eq_w(v, other_v)? {
+                            let _val_roots = pyre_object::gc_roots::push_roots();
+                            let pair = pyre_object::gc_roots::pin_roots(&[
+                                pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1),
+                                other_v,
+                            ]);
+                            if !crate::baseobjspace::eq_w(
+                                pyre_object::gc_roots::shadow_stack_get(pair),
+                                pyre_object::gc_roots::shadow_stack_get(pair + 1),
+                            )? {
                                 equal = false;
                                 break;
                             }
@@ -6110,9 +6115,7 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             // them back at every loop boundary and length read, which is also
             // what makes the "read the live lists" contract above hold.
             let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(a);
-            let _ = pyre_object::gc_roots::pin_root(b);
+            let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
             let a = || pyre_object::gc_roots::shadow_stack_get(root_base);
             let b = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             if matches!(op, CompareOp::Eq | CompareOp::Ne)
@@ -6125,7 +6128,12 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             while i < pyre_object::w_list_len(a()) && i < pyre_object::w_list_len(b()) {
                 let ea = pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL);
                 let eb = pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL);
-                if !crate::baseobjspace::eq_w(ea, eb)? {
+                let _elem_roots = pyre_object::gc_roots::push_roots();
+                let pair = pyre_object::gc_roots::pin_roots(&[ea, eb]);
+                if !crate::baseobjspace::eq_w(
+                    pyre_object::gc_roots::shadow_stack_get(pair),
+                    pyre_object::gc_roots::shadow_stack_get(pair + 1),
+                )? {
                     break;
                 }
                 i += 1;

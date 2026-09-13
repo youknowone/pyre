@@ -1325,7 +1325,7 @@ fn write_typeids_sidecar(
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
     let mode_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_str_new(match payload {
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(match payload {
         TypeidsPayload::Binary(_) => "wb",
         TypeidsPayload::Text(_) => "w",
     }));
@@ -1372,7 +1372,7 @@ fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError
         // dump, closes it, then materializes typeids.txt/.lst if absent.
         let path = crate::gateway::fspath_buf(file())?;
         let mode_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_str_new("wb"));
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("wb"));
         let opened = crate::builtins::builtin_open(&[
             file(),
             pyre_object::gc_roots::shadow_stack_get(mode_slot),

@@ -364,8 +364,9 @@ pub fn combine_starargs_wrapped(
     // walker updates, so they are published before the unpack and read back
     // after it.
     let _roots = pyre_object::gc_roots::push_roots();
-    let args_base = pyre_object::gc_roots::pin_roots(&arguments_w[..]);
-    let star_slot = pyre_object::gc_roots::pin_roots(&[w_stararg, w_function]);
+    let args_base = pyre_object::gc_roots::publish_roots(&arguments_w[..]);
+    let star_slot = pyre_object::gc_roots::publish_roots(&[w_stararg, w_function]);
+    pyre_object::gc_roots::normalize_roots(args_base, arguments_w.len() + 2);
     let w_stararg = || pyre_object::gc_roots::shadow_stack_get(star_slot);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(star_slot + 1);
     match crate::baseobjspace::fixedview(w_stararg(), -1) {
@@ -449,15 +450,15 @@ pub fn combine_starstarargs_wrapped(
     // afterwards to fetch each value.  Publish the mapping and the callable so
     // that later read is of the live object, not the address they had on entry.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::pin_roots(&[w_starstararg, w_function]);
+    let root_base = pyre_object::gc_roots::publish_roots(&[w_starstararg, w_function]);
+    let names_base = pyre_object::gc_roots::publish_roots(&keyword_names_out[..]);
+    let values_base = pyre_object::gc_roots::publish_roots(&keywords_out[..]);
+    pyre_object::gc_roots::normalize_roots(
+        root_base,
+        2 + keyword_names_out.len() + keywords_out.len(),
+    );
     let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-    // The pairs the caller already accepted are in the same position: native
-    // vectors that this merge both reads (the duplicate check) and outlives.
-    // They are published here and read back before each of those uses; the
-    // merge only appends, so the published prefix keeps its indices.
-    let names_base = pyre_object::gc_roots::pin_roots(&keyword_names_out[..]);
-    let values_base = pyre_object::gc_roots::pin_roots(&keywords_out[..]);
     let refresh_out = |names: &mut Vec<PyObjectRef>, values: &mut Vec<PyObjectRef>| {
         pyre_object::gc_roots::shadow_stack_copy_range(names_base, &mut names[..]);
         pyre_object::gc_roots::shadow_stack_copy_range(values_base, &mut values[..]);

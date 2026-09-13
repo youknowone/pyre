@@ -327,16 +327,26 @@ fn signal_signal(
     // `if / elif` short-circuits: when the SIG_DFL compare is true the
     // SIG_IGN compare never runs, so a handler equal to SIG_DFL whose
     // `__eq__` raises against SIG_IGN is still accepted.
-    if crate::baseobjspace::eq_w(w_handler, pyre_object::w_int_new(0))? {
+    let _handler_roots = pyre_object::gc_roots::push_roots();
+    let handler_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_handler);
+    let w_handler = || pyre_object::gc_roots::shadow_stack_get(handler_slot);
+    // Mint the sentinel after the handler is published: `w_int_new` can
+    // collect, and LTR `eq_w(handler, alloc())` would pass a pre-move word.
+    let sig_dfl = pyre_object::w_int_new(0);
+    if crate::baseobjspace::eq_w(w_handler(), sig_dfl)? {
         signalstate::pypysig_default(signum);
-    } else if crate::baseobjspace::eq_w(w_handler, pyre_object::w_int_new(1))? {
-        signalstate::pypysig_ignore(signum);
-    } else if !crate::baseobjspace::callable_w(w_handler) {
-        return Err(crate::PyError::type_error(
-            "'handler' must be a callable or SIG_DFL or SIG_IGN",
-        ));
     } else {
-        signalstate::pypysig_setflag(signum);
+        let sig_ign = pyre_object::w_int_new(1);
+        if crate::baseobjspace::eq_w(w_handler(), sig_ign)? {
+            signalstate::pypysig_ignore(signum);
+        } else if !crate::baseobjspace::callable_w(w_handler()) {
+            return Err(crate::PyError::type_error(
+                "'handler' must be a callable or SIG_DFL or SIG_IGN",
+            ));
+        } else {
+            signalstate::pypysig_setflag(signum);
+        }
     }
 
     // interp_signal.py:323-326 — swap in the new handler, return the old
@@ -347,7 +357,7 @@ fn signal_signal(
     } else {
         old
     };
-    set_handler(signum, w_handler);
+    set_handler(signum, w_handler());
     Ok(old)
 }
 
@@ -587,10 +597,9 @@ impl AsyncActionOps for CheckSignalAction {
             // the message allocation.
             let _roots = pyre_object::gc_roots::push_roots();
             let cls_slot = pyre_object::gc_roots::pin_roots(&[w_exc]);
-            let w_msg =
-                pyre_object::w_str_new_managed(
-                    "asynchronous exception triggered from another thread",
-                );
+            let w_msg = pyre_object::w_str_new_managed(
+                "asynchronous exception triggered from another thread",
+            );
             let msg_slot = pyre_object::gc_roots::pin_roots(&[w_msg]);
             let w_obj = crate::builtins::exc_exception_new(&[
                 pyre_object::gc_roots::shadow_stack_get(cls_slot),

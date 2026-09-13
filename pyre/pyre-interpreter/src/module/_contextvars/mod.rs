@@ -391,7 +391,7 @@ fn token_missing_type() -> PyObjectRef {
                 "__repr__",
                 crate::make_builtin_function_with_arity(
                     "__repr__",
-                    |_| Ok(w_str_new("<Token.MISSING>")),
+                    |_| Ok(w_str_new_managed("<Token.MISSING>")),
                     1,
                 ),
             );

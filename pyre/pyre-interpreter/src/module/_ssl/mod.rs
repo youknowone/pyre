@@ -281,15 +281,20 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
                     "verify_message",
                     pyre_object::gc_roots::shadow_stack_get(verify_slot),
                 );
+                let library_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("SSL"));
                 let _ = crate::baseobjspace::setattr_str(
                     pyre_object::gc_roots::shadow_stack_get(exc_slot),
                     "library",
-                    w_str_new("SSL"),
+                    pyre_object::gc_roots::shadow_stack_get(library_slot),
                 );
+                let reason_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ =
+                    pyre_object::gc_roots::pin_root(w_str_new_managed("CERTIFICATE_VERIFY_FAILED"));
                 let _ = crate::baseobjspace::setattr_str(
                     pyre_object::gc_roots::shadow_stack_get(exc_slot),
                     "reason",
-                    w_str_new("CERTIFICATE_VERIFY_FAILED"),
+                    pyre_object::gc_roots::shadow_stack_get(reason_slot),
                 );
             }
             error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
@@ -2769,7 +2774,7 @@ mod ssl_session_methods {
         }
 
         fn __repr__(&self) -> PyObjectRef {
-            w_str_new("<_ssl.SSLSession>")
+            w_str_new_managed("<_ssl.SSLSession>")
         }
     }
 } // ssl_session_methods
@@ -2964,9 +2969,9 @@ fn nid2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn get_default_verify_paths(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (cert_file, cert_dir) = pyre_native::ssl::default_verify_paths();
     let mut fields = pyre_object::gc_roots::RootedItems::new();
-    fields.push(w_str_new("SSL_CERT_FILE"));
+    fields.push(w_str_new_managed("SSL_CERT_FILE"));
     fields.push(w_str_new_managed(&cert_file));
-    fields.push(w_str_new("SSL_CERT_DIR"));
+    fields.push(w_str_new_managed("SSL_CERT_DIR"));
     fields.push(w_str_new_managed(&cert_dir));
     Ok(w_tuple_new(fields.take()))
 }
@@ -2992,8 +2997,8 @@ mod cert_store {
 
     fn encoding_type(encoding: EncodingType) -> PyObjectRef {
         match encoding {
-            EncodingType::X509Asn => pyre_object::w_str_new("x509_asn"),
-            EncodingType::Pkcs7Asn => pyre_object::w_str_new("pkcs_7_asn"),
+            EncodingType::X509Asn => pyre_object::w_str_new_managed("x509_asn"),
+            EncodingType::Pkcs7Asn => pyre_object::w_str_new_managed("pkcs_7_asn"),
             EncodingType::Other(value) => pyre_object::w_int_new(value as i64),
         }
     }

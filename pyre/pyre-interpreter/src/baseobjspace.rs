@@ -3007,14 +3007,15 @@ pub(crate) fn sequence_index(w_container: PyObjectRef, w_item: PyObjectRef) -> P
     // not scanned by the collector, so both live on the shadow stack.  (RPython
     // stack slots are GC roots; Rust's are not.)
     let _roots = pyre_object::gc_roots::push_roots();
-    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_iter);
-    let item_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_item);
+    let pair = pyre_object::gc_roots::pin_roots(&[w_iter, w_item]);
+    let iter_slot = pair;
+    let item_slot = pair + 1;
     let mut index: i64 = 0;
     loop {
         match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
             Ok(w_next) => {
+                let _item_roots = pyre_object::gc_roots::push_roots();
+                let w_next = pyre_object::gc_roots::pin_root(w_next);
                 if eq_w(w_next, pyre_object::gc_roots::shadow_stack_get(item_slot))? {
                     return Ok(w_int_new(index));
                 }
@@ -3037,14 +3038,15 @@ pub(crate) fn sequence_count(w_container: PyObjectRef, w_item: PyObjectRef) -> P
     // `next`/`eq_w` re-enter Python and may collect; a raw local is not a root,
     // so the iterator and needle live on the shadow stack.
     let _roots = pyre_object::gc_roots::push_roots();
-    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_iter);
-    let item_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_item);
+    let pair = pyre_object::gc_roots::pin_roots(&[w_iter, w_item]);
+    let iter_slot = pair;
+    let item_slot = pair + 1;
     let mut count: i64 = 0;
     loop {
         match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
             Ok(w_next) => {
+                let _item_roots = pyre_object::gc_roots::push_roots();
+                let w_next = pyre_object::gc_roots::pin_root(w_next);
                 if eq_w(w_next, pyre_object::gc_roots::shadow_stack_get(item_slot))? {
                     count += 1;
                 }
@@ -3067,13 +3069,14 @@ pub(crate) fn sequence_contains(
     // `next`/`eq_w` re-enter Python and may collect; a raw local is not a root,
     // so the iterator and needle live on the shadow stack.
     let _roots = pyre_object::gc_roots::push_roots();
-    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_iter);
-    let item_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_item);
+    let pair = pyre_object::gc_roots::pin_roots(&[w_iter, w_item]);
+    let iter_slot = pair;
+    let item_slot = pair + 1;
     loop {
         match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
             Ok(w_next) => {
+                let _item_roots = pyre_object::gc_roots::push_roots();
+                let w_next = pyre_object::gc_roots::pin_root(w_next);
                 if eq_w(w_next, pyre_object::gc_roots::shadow_stack_get(item_slot))? {
                     return Ok(true);
                 }
@@ -21312,10 +21315,9 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                     // collect; `k` (error path) and `want` (success path) are
                     // raw locals read after the probe, so pin them across it.
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let k_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(k);
-                    let want_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(want);
+                    let pair = pyre_object::gc_roots::pin_roots(&[k, want]);
+                    let k_slot = pair;
+                    let want_slot = pair + 1;
                     return match unsafe {
                         pyre_object::dictmultiobject::w_dict_lookup_checked(
                             dict,
@@ -21323,6 +21325,8 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                         )
                     } {
                         Ok(Some(have)) => {
+                            let _have_roots = pyre_object::gc_roots::push_roots();
+                            let have = pyre_object::gc_roots::pin_root(have);
                             eq_w(have, pyre_object::gc_roots::shadow_stack_get(want_slot))
                         }
                         Ok(None) => Ok(false),
@@ -21337,12 +21341,13 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                     // needle are raw locals, so pin them on the shadow stack.
                     let items = pyre_object::w_dict_items(dict);
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let needle_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(needle);
-                    let base = pyre_object::gc_roots::shadow_stack_len();
+                    let mut live = Vec::with_capacity(items.len() + 1);
+                    live.push(needle);
                     for (_, v) in &items {
-                        let _ = pyre_object::gc_roots::pin_root(*v);
+                        live.push(*v);
                     }
+                    let needle_slot = pyre_object::gc_roots::pin_roots(&live);
+                    let base = needle_slot + 1;
                     for j in 0..items.len() {
                         if eq_w(
                             pyre_object::gc_roots::shadow_stack_get(base + j),
@@ -21383,17 +21388,19 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             // `eq_w` re-enters Python and may collect; the tuple and needle are
             // raw locals, so pin them on the shadow stack across the scan.
             let _roots = pyre_object::gc_roots::push_roots();
-            let hay_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(haystack);
-            let needle_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(needle);
+            let pair = pyre_object::gc_roots::pin_roots(&[haystack, needle]);
+            let hay_slot = pair;
+            let needle_slot = pair + 1;
             let len = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(hay_slot));
             for i in 0..len {
                 if let Some(item) =
                     w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(hay_slot), i as i64)
-                    && eq_w(item, pyre_object::gc_roots::shadow_stack_get(needle_slot))?
                 {
-                    return Ok(true);
+                    let _item_roots = pyre_object::gc_roots::push_roots();
+                    let item = pyre_object::gc_roots::pin_root(item);
+                    if eq_w(item, pyre_object::gc_roots::shadow_stack_get(needle_slot))? {
+                        return Ok(true);
+                    }
                 }
             }
             return Ok(false);
@@ -21532,13 +21539,14 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
     // `next`/`eq_w` re-enter Python and may collect; the iterator and needle
     // are raw locals, so pin them on the shadow stack across the scan.
     let _roots = pyre_object::gc_roots::push_roots();
-    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(iterator);
-    let needle_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(needle);
+    let pair = pyre_object::gc_roots::pin_roots(&[iterator, needle]);
+    let iter_slot = pair;
+    let needle_slot = pair + 1;
     loop {
         match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
             Ok(item) => {
+                let _item_roots = pyre_object::gc_roots::push_roots();
+                let item = pyre_object::gc_roots::pin_root(item);
                 if eq_w(item, pyre_object::gc_roots::shadow_stack_get(needle_slot))? {
                     return Ok(true);
                 }

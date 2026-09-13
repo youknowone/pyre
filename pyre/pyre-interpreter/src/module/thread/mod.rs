@@ -2444,13 +2444,14 @@ fn thread_excepthook_file(
     thread: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let file_slot = pin_root_slot(file);
-    let exc_value_slot = pin_root_slot(exc_value);
-    let exc_traceback_slot = pin_root_slot(exc_traceback);
-    let thread_slot = pin_root_slot(thread);
+    let base = pyre_object::gc_roots::pin_roots(&[file, exc_value, exc_traceback, thread]);
+    let file_slot = base;
+    let exc_value_slot = base + 1;
+    let exc_traceback_slot = base + 2;
+    let thread_slot = base + 3;
 
     // `PyFile_WriteString("Exception in thread ", file)`.
-    thread_excepthook_write(file_slot, w_str_new("Exception in thread "))?;
+    thread_excepthook_write(file_slot, w_str_new_managed("Exception in thread "))?;
 
     // `PyObject_GetOptionalAttr(thread, "name")`; a missing name falls back
     // to the native thread identifier, while a raising descriptor propagates.
@@ -2469,7 +2470,7 @@ fn thread_excepthook_file(
     } else {
         thread_excepthook_write(file_slot, w_str_new_managed(&current_ident().to_string()))?;
     }
-    thread_excepthook_write(file_slot, w_str_new(":\n"))?;
+    thread_excepthook_write(file_slot, w_str_new_managed(":\n"))?;
 
     // `_PyErr_Display(file, exc_type, exc_value, exc_traceback)`.  The
     // renderer consumes the explicit traceback field and never rewrites the
@@ -2538,9 +2539,10 @@ fn thread_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(hook_args_slot), 3)
             .expect("ExceptHookArgs has four sequence fields")
     };
-    let exc_value_slot = pin_root_slot(exc_value);
-    let exc_traceback_slot = pin_root_slot(exc_traceback);
-    let thread_slot = pin_root_slot(thread);
+    let trio = pyre_object::gc_roots::pin_roots(&[exc_value, exc_traceback, thread]);
+    let exc_value_slot = trio;
+    let exc_traceback_slot = trio + 1;
+    let thread_slot = trio + 2;
 
     // `_PySys_GetOptionalAttr("stderr")` reads the interpreter-owned sys dict,
     // not the replaceable `sys.modules["sys"]` entry.  When stderr is

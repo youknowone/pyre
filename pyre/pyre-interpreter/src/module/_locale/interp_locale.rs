@@ -564,7 +564,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // No libc available — every valid call resolves to the
                 // POSIX "C" locale.  `locale_str` is dropped on purpose.
                 let _ = locale_str;
-                Ok(pyre_object::w_str_new("C"))
+                Ok(pyre_object::w_str_new_managed("C"))
             }
         }),
     );

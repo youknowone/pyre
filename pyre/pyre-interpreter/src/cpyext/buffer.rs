@@ -1528,7 +1528,7 @@ fn unowned_view(
     use pyre_object::bufferview::BufferView;
     let roots = pyre_object::gc_roots::push_roots();
     let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_str_new(format));
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(format));
     let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
     let w_obj = pyre_object::w_none();
     let built = BufferView::Raw {
@@ -1556,7 +1556,7 @@ fn unowned_view(
 fn unowned_view_nd(geometry: Geometry, format: &str) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_str_new(format));
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(format));
     let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
     let w_obj = pyre_object::w_none();
     let built = carrier_for(

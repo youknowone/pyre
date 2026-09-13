@@ -3783,7 +3783,7 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
     {
         let mut name = crate::baseobjspace::getattr_str(roots.get(spec_slot), "name")?;
         if unsafe { pyre_object::is_none(name) } {
-            name = pyre_object::w_str_new("?");
+            name = pyre_object::w_str_new_managed("?");
         }
         let name_slot = spec_slot + 1;
         let _ = roots.pin_root(name);
@@ -3821,7 +3821,7 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
         return Ok(wtf8_format!("<module ", name_repr, " (", origin_str, ")>"));
     }
     let name = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__name__")?
-        .unwrap_or_else(|| pyre_object::w_str_new("?"));
+        .unwrap_or_else(|| pyre_object::w_str_new_managed("?"));
     let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
     if let Some(filename) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__file__")? {
         let file_repr = unsafe { crate::display::py_repr_wtf8(filename)? };
@@ -7987,7 +7987,7 @@ fn init_dict_type(ns: PyObjectRef) {
                     // method (not only the `py_repr` fast path) so dict-subclass
                     // instances and `super().__repr__()` format their backing.
                     if args.is_empty() {
-                        return Ok(pyre_object::w_str_new("{}"));
+                        return Ok(pyre_object::w_str_new_managed("{}"));
                     }
                     let recv = args[0];
                     let dict = crate::type_methods::resolve_dict_backing(recv);
@@ -9295,7 +9295,7 @@ fn init_frame_type(ns: PyObjectRef) {
                 |args| {
                     let f = frame_ptr(args[0]);
                     if f.is_null() {
-                        return Ok(pyre_object::w_str_new("<frame (null)>"));
+                        return Ok(pyre_object::w_str_new_managed("<frame (null)>"));
                     }
                     Ok(pyre_object::w_str_from_wtf8_managed(
                         unsafe { &*f }.descr_repr(),
@@ -20838,7 +20838,9 @@ fn init_float_type(ns: PyObjectRef) {
                                 )
                             })?;
                         match kind.as_str() {
-                            "double" | "float" => Ok(pyre_object::w_str_new("IEEE, little-endian")),
+                            "double" | "float" => {
+                                Ok(pyre_object::w_str_new_managed("IEEE, little-endian"))
+                            }
                             _ => Err(crate::PyError::value_error(
                                 "__getformat__() argument must be 'double' or 'float'",
                             )),
@@ -29386,11 +29388,11 @@ fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
     // cleared on exhaustion).  `_qualname is None` delegates to `get_name`.
     let pycode = unsafe { pyre_object::generator::w_generator_get_pycode(obj) };
     if pycode.is_null() || unsafe { pyre_object::is_none(pycode) } {
-        return Ok(w_str_new("<finished>"));
+        return Ok(w_str_new_managed("<finished>"));
     }
     let code_ptr = unsafe { crate::pycode::w_code_get_ptr(pycode) } as *const crate::CodeObject;
     if code_ptr.is_null() {
-        return Ok(w_str_new("<finished>"));
+        return Ok(w_str_new_managed("<finished>"));
     }
     Ok(w_str_new_managed(unsafe { &(*code_ptr).obj_name }))
 }
@@ -31098,9 +31100,14 @@ fn count_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn count_single_argument(w_step: PyObjectRef) -> Result<bool, crate::PyError> {
     // W_Count.single_argument: isinstance(step, int) and step == 1.
     let int_type = gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    Ok(!int_type.is_null()
-        && unsafe { crate::baseobjspace::isinstance_w(w_step, int_type) }
-        && crate::baseobjspace::eq_w(w_step, w_int_new(1))?)
+    if int_type.is_null() || !unsafe { crate::baseobjspace::isinstance_w(w_step, int_type) } {
+        return Ok(false);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let step_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_step);
+    let one = w_int_new(1);
+    crate::baseobjspace::eq_w(pyre_object::gc_roots::shadow_stack_get(step_slot), one)
 }
 
 fn count_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
