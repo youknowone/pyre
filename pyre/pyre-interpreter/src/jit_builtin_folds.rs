@@ -84,6 +84,21 @@ pub fn float_fold_helper_addrs() -> Vec<i64> {
         .collect()
 }
 
+/// Addresses of the uniformly word-spelled fold helpers (`Int1` / `Ref2`).
+/// Word mode lowered these through the arity-keyed family automatically;
+/// Vouched mode needs them named the same way the assembler names its
+/// word-ABI targets.
+pub fn word_fold_helper_addrs() -> Vec<i64> {
+    BUILTIN_FOLDS
+        .iter()
+        .filter_map(|fold| match fold.raw {
+            BuiltinFoldRaw::Int1(f) => Some(f as *const () as usize as i64),
+            BuiltinFoldRaw::Ref2(f) => Some(f as *const () as usize as i64),
+            BuiltinFoldRaw::Float1(_) => None,
+        })
+        .collect()
+}
+
 impl BuiltinFoldRaw {
     /// Positional argument count this helper answers for.  A call with any
     /// other count is not this row's shape and keeps the residual.

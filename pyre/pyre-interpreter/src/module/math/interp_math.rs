@@ -617,6 +617,22 @@ pub fn math_float2_fold_helper(callable: PyObjectRef) -> Option<extern "C" fn(f6
         .map(|fold| fold.raw)
 }
 
+/// Addresses of the `math` float-fold helpers for
+/// `set_faithful_residual_call_addrs`. Each is `(f64) -> f64` or
+/// `(f64, f64) -> f64`, which the wasm backend will not lower from a
+/// descr's word types alone.
+pub fn math_float_fold_helper_addrs() -> Vec<i64> {
+    MATH_FLOAT1_FOLDS
+        .iter()
+        .map(|fold| fold.raw as *const () as usize as i64)
+        .chain(
+            MATH_FLOAT2_FOLDS
+                .iter()
+                .map(|fold| fold.raw as *const () as usize as i64),
+        )
+        .collect()
+}
+
 pm1!(cbrt);
 pm1!(exp);
 pm1!(exp2);

@@ -5709,7 +5709,13 @@ fn build_jit_driver_pair() -> JitDriverPair {
         ];
         // (i64) -> f64, one per float-result builtin fold.
         faithful.extend(pyre_interpreter::jit_builtin_folds::float_fold_helper_addrs());
+        faithful
+            .extend(pyre_interpreter::module::math::interp_math::math_float_fold_helper_addrs());
+        faithful.extend(pyre_jit_trace::walker_float_helper_addrs());
         majit_backend_wasm::set_faithful_residual_call_addrs(&faithful);
+        for addr in pyre_interpreter::jit_builtin_folds::word_fold_helper_addrs() {
+            majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
+        }
     }
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);

@@ -144,6 +144,26 @@ pub mod runtime_fnaddr_patch;
 pub mod state;
 pub mod super_inst_expand;
 mod trace_opcode;
+
+/// Addresses of walker-emitted `CALL_F` helpers (`sqrt_nonneg_jit`, libm
+/// pins, `float_pow_jit`) for `set_faithful_residual_call_addrs`. Each is
+/// `(f64…) -> f64`, which the wasm backend will not lower from a descr's
+/// word types alone.
+pub fn walker_float_helper_addrs() -> Vec<i64> {
+    use trace_opcode::{
+        ccall_pow, float_pow_jit, math_cos_finite_jit, math_log_positive_jit, math_sin_finite_jit,
+        sqrt_nonneg_jit,
+    };
+    [
+        sqrt_nonneg_jit as *const () as usize as i64,
+        math_log_positive_jit as *const () as usize as i64,
+        math_cos_finite_jit as *const () as usize as i64,
+        math_sin_finite_jit as *const () as usize as i64,
+        float_pow_jit as *const () as usize as i64,
+        ccall_pow as *const () as usize as i64,
+    ]
+    .into()
+}
 #[cfg(test)]
 mod ullbc_semantic;
 pub mod unpack_state;
