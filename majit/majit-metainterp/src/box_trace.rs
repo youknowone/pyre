@@ -195,6 +195,49 @@ pub fn wrapint_residual() -> Option<&'static WrapintResidual> {
     WRAPINT_RESIDUAL.get()
 }
 
+/// Host-registered rewrite of residual `jit_binary_value_from_tag`.
+///
+/// Portal interpret residualizes that `jit_may_force` helper as
+/// `CallMayForceR`, which stamps `ForceToken` and escapes virtual int
+/// boxes. FBW already specialises the same helper (`RuntimeHelperKind::BinaryOp`)
+/// to unbox + int_OP + wrapint when both operands are ints. This spec
+/// is that fold on the JitCodeMachine residual path.
+#[derive(Clone)]
+pub struct BinaryOpResidual {
+    pub fnaddrs: Vec<i64>,
+    pub size_descr: majit_ir::DescrRef,
+    pub intval_descr: majit_ir::DescrRef,
+    pub int_type_addr: i64,
+}
+
+impl BinaryOpResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static BINARY_OP_RESIDUAL: std::sync::OnceLock<BinaryOpResidual> = std::sync::OnceLock::new();
+
+pub fn register_binary_op_residual(spec: BinaryOpResidual) {
+    let _ = BINARY_OP_RESIDUAL.set(spec);
+}
+
+pub fn binary_op_residual() -> Option<&'static BinaryOpResidual> {
+    BINARY_OP_RESIDUAL.get()
+}
+
+/// `binary_op_from_tag` 0/1/2/4 → add/sub/mul/rem. `ovf` is the
+/// overflow-checked form `trace_int_binop_ovf` records.
+pub fn int_binary_op_kind(tag: i64) -> Option<(majit_ir::OpCode, bool)> {
+    match tag {
+        0 => Some((majit_ir::OpCode::IntAddOvf, true)),
+        1 => Some((majit_ir::OpCode::IntSubOvf, true)),
+        2 => Some((majit_ir::OpCode::IntMulOvf, true)),
+        4 => Some((majit_ir::OpCode::IntMod, false)),
+        _ => None,
+    }
+}
+
 /// Emit an overflow-checked binary int operation.
 ///
 /// Auto-generated: unbox a, unbox b, emit ovf op, guard no overflow, box result.
