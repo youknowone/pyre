@@ -5725,6 +5725,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
         for addr in [
             list::jit_drain_list_append as *const () as usize as i64,
             pyre_object::object_array::jit_ll_arraymove as *const () as usize as i64,
+            crate::call_jit::bh_set_current_exception as *const () as usize as i64,
+            crate::call_jit::bh_clear_in_flight_exception as *const () as usize as i64,
+            pyre_interpreter::jit_setitem as *const () as usize as i64,
         ] {
             majit_backend_wasm::vouch_residual_call_addr(addr);
         }
@@ -5770,6 +5773,8 @@ fn build_jit_driver_pair() -> JitDriverPair {
             desc::jit_bigint_rshift as *const () as usize as i64,
             desc::jit_w_long_floordiv_raw as *const () as usize as i64,
             desc::jit_w_long_mod_raw as *const () as usize as i64,
+            desc::jit_w_long_lshift_raw as *const () as usize as i64,
+            desc::jit_w_long_rshift_raw as *const () as usize as i64,
             math::jit_math_isqrt_i64 as *const () as usize as i64,
             long::jit_bigint_fits_int as *const () as usize as i64,
             long::jit_bigint_cmp as *const () as usize as i64,
@@ -5808,6 +5813,30 @@ fn build_jit_driver_pair() -> JitDriverPair {
             uni::jit_str_getitem as *const () as usize as i64,
             majit_metainterp::blackhole::ll_int_py_div as *const () as usize as i64,
             majit_metainterp::blackhole::ll_int_py_mod as *const () as usize as i64,
+            crate::call_jit::bh_load_global_fn as *const () as usize as i64,
+            crate::call_jit::bh_reraise_varargs_zero as *const () as usize as i64,
+            crate::call_jit::bh_get_current_exception as *const () as usize as i64,
+            pyre_interpreter::jit_load_name_from_namespace as *const () as usize as i64,
+            pyre_interpreter::jit_store_name_to_namespace as *const () as usize as i64,
+            pyre_interpreter::jit_binary_value_from_tag as *const () as usize as i64,
+            pyre_interpreter::jit_compare_value_from_tag as *const () as usize as i64,
+            pyre_interpreter::jit_unary_negative_value as *const () as usize as i64,
+            pyre_interpreter::jit_unary_invert_value as *const () as usize as i64,
+            pyre_interpreter::jit_unary_positive_value as *const () as usize as i64,
+            pyre_interpreter::jit_truth_value as *const () as usize as i64,
+            pyre_interpreter::jit_bool_value_from_truth as *const () as usize as i64,
+            pyre_interpreter::jit_getitem as *const () as usize as i64,
+            pyre_interpreter::jit_sequence_getitem as *const () as usize as i64,
+            pyre_interpreter::jit_range_iter_next_or_null as *const () as usize as i64,
+            pyre_interpreter::jit_call_callable_0 as *const () as usize as i64,
+            pyre_interpreter::jit_call_callable_1 as *const () as usize as i64,
+            pyre_interpreter::jit_call_callable_2 as *const () as usize as i64,
+            pyre_interpreter::jit_call_callable_3 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_0 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_1 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_2 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_3 as *const () as usize as i64,
+            pyre_interpreter::jit_build_list_4 as *const () as usize as i64,
         ] {
             majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
         }
