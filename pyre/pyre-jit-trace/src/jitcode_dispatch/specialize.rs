@@ -9346,7 +9346,12 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
         OpCode::IntMulOvf => (desc::jit_bigint_mul_int_int as *const (), B::Multiply),
         _ => return Ok(None),
     };
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardOverflow, &[])?;
+    // `record_int_ovf` on two ConstInts returns a ConstInt and records no
+    // `INT_*_OVF`. An operand-less `GUARD_OVERFLOW` after that is
+    // `InvalidLoop`. The overflow arm is already selected at record time.
+    if !lhs_raw.is_constant() || !rhs_raw.is_constant() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardOverflow, &[])?;
+    }
     let Ok(boxed_obj) = pyre_interpreter::opcode_ops::binary_value(lhs_obj, rhs_obj, binop) else {
         return Ok(None);
     };
@@ -9426,7 +9431,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     );
     // A live zero divisor is `try_walker_specialize_binary_op_int_zero_div`.
     // Emitting `ll_int_py_div` here would dest-write a wrap value.
-    if is_py_div && rb == 0 {
+    if is_py_div && (rb == 0 || (la == i64::MIN && rb == -1)) {
         return Ok(None);
     }
     let opcode = match op {
@@ -9502,6 +9507,28 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
             .set_opref_concrete(raw, majit_ir::Value::Int(concrete));
         (raw, concrete)
     };
+    let both_bools = unsafe { pyre_object::is_bool(lhs_obj) && pyre_object::is_bool(rhs_obj) };
+    if both_bools && matches!(opcode, OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor) {
+        let observed = concrete != 0;
+        let boxed = if raw.is_constant() {
+            let result_obj = pyre_object::w_bool_from(observed);
+            let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
+            ctx.trace_ctx.set_opref_concrete(
+                const_bool,
+                majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
+            );
+            const_bool
+        } else {
+            let Some(boxed) = walker_newbool_guarded(ctx, op_pc, raw, observed, dst_bank)? else {
+                return Ok(None);
+            };
+            boxed
+        };
+        let _ = (dst, dst_bank);
+        return Ok(Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }));
+    }
     let boxed_ptr = pyre_object::w_int_new(concrete) as i64;
     let boxed = walker_box_int(ctx, op_pc, raw, concrete)?;
     ctx.trace_ctx
