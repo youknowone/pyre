@@ -2633,11 +2633,16 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
 /// Publish `build_home_gcmap` on the live frame (`local 0` is the items
 /// base). `ptr == 0` is the test path that never installs a map.
 ///
-/// Ordinary homes and LABEL captures grow independently, so the live map
-/// and this module's map can be incomparable. With a residual type family
-/// the store is their bitwise union (`wasm_jit_union_gcmap`). Without one
-/// (host tests) the store is still monotonic: publish this map only when
-/// it covers every live bit.
+/// assembler.py `push_gcmap` stores this site's map. Ordinary homes and
+/// LABEL captures grow independently, so two live maps can be incomparable
+/// and a later keyed resume must not drop the other region. The host
+/// `wasm_jit_union_gcmap` exists only for that case. A live map that
+/// already covers these bits — the same pointer, or a prior union — is
+/// left in place: a host call here sat on every keyed LABEL resume and
+/// every key-0 re-entry after the first, including the hot out-of-line
+/// loop-closing bridges that #1766 put over the wasm/dynasm ceiling.
+/// Without a residual type family (host tests) the store is still
+/// monotonic: publish this map only when it covers every live bit.
 fn emit_publish_home_gcmap(
     sink: &mut PeepSink<'_, '_>,
     ptr: i64,
@@ -2692,6 +2697,46 @@ fn emit_publish_home_gcmap(
     if let Some(base) = residual_type_base {
         // `(i64, i64) -> i64` at `residual_type_base + 2`.
         let union_fn = crate::wasm_jit_union_gcmap as *const () as usize as i64;
+        let ne_words = |sink: &mut PeepSink<'_, '_>| {
+            if word == 4 {
+                sink.i32_ne();
+            } else {
+                sink.i64_ne();
+            }
+        };
+        sink.block(BlockType::Empty); // $after
+        sink.local_get(old_local);
+        sink.i64_extend_i32_u();
+        sink.i64_const(ptr);
+        sink.i64_eq();
+        sink.br_if(0);
+        sink.block(BlockType::Empty); // $union
+        sink.local_get(old_local);
+        load_usize(sink, 0);
+        if word == 8 {
+            sink.i32_wrap_i64();
+        }
+        sink.i32_const(n_new as i32);
+        sink.i32_lt_u();
+        sink.br_if(0);
+        for (i, &new_word) in new_words.iter().enumerate() {
+            if new_word == 0 {
+                continue;
+            }
+            sink.local_get(old_local);
+            load_usize(sink, (1 + i as u32) as u64 * word as u64);
+            const_usize(sink, new_word);
+            if word == 4 {
+                sink.i32_and();
+            } else {
+                sink.i64_and();
+            }
+            const_usize(sink, new_word);
+            ne_words(sink);
+            sink.br_if(0);
+        }
+        sink.br(1);
+        sink.end(); // $union
         emit_hdr(sink);
         sink.local_get(old_local);
         sink.i64_extend_i32_u();
@@ -2699,6 +2744,7 @@ fn emit_publish_home_gcmap(
         sink.i32_const(union_fn as i32);
         sink.call_indirect(0, base + 2);
         emit_word_store(sink, JF_GCMAP_OFS as u64);
+        sink.end(); // $after
         sink.end();
         return;
     }
@@ -3005,12 +3051,12 @@ fn emit_ca_malloc_cond_varsize_frame(
     sink.i32_shr_u();
     sink.i64_extend_i32_u();
     emit_word_store(sink, JF_FRAME_OFS as u64);
-    // Leave `jf_gcmap` null. The callee key-0 prologue nulls the whole
-    // frozen home region (live homes plus chain padding) and then
-    // publishes the map — the same moment PyPy's assembler writes
-    // `_finish_gcmap` / the live gcmap, once those slots are valid or
-    // null. Filling `ca_frame_bytes` here on every recursive bump is
-    // what made `recursion_past_unroll_bound_from_loop` 4.9x dynasm.
+    // Leave `jf_gcmap` null. The callee key-0 prologue nulls the homes
+    // `build_home_gcmap` marks and then publishes — the same moment
+    // PyPy's assembler writes `_finish_gcmap` / the live gcmap, once
+    // those slots are valid or null. Filling `ca_frame_bytes` here on
+    // every recursive bump is what made
+    // `recursion_past_unroll_bound_from_loop` 4.9x dynasm.
     sink.local_get(alloc_scratch_local);
     sink.i64_const(0);
     emit_word_store(sink, JF_GCMAP_OFS as u64);
@@ -3921,10 +3967,11 @@ pub struct CaParams {
     pub inline: Option<CaInlineParams>,
     /// `build_home_gcmap` pointer published after the fresh-entry home/input
     /// stores, and again on each keyed LABEL resume after those slots are
-    /// already valid or newly marked ones have been nulled. Used only when
-    /// [`Self::compute_home_gcmap`] is false. Zero leaves `jf_gcmap` unset
-    /// in the generated module (tests). assembler.py writes `jf_gcmap` at
-    /// safepoints once those slots are live.
+    /// already valid or newly marked ones have been nulled. A resume whose
+    /// live map already covers this pointer leaves `jf_gcmap` unchanged.
+    /// Used only when [`Self::compute_home_gcmap`] is false. Zero leaves
+    /// `jf_gcmap` unset in the generated module (tests). assembler.py
+    /// writes `jf_gcmap` at safepoints once those slots are live.
     pub home_gcmap_ptr: i64,
     /// When set, leak a map from this module's `RefHomes` and LABEL captures
     /// (raised to the `home_gcmap_min_*` floors) instead of
@@ -6025,27 +6072,26 @@ fn build_function(
     // prefix and the LABEL-capture tail, not reserved chain-padding.
     // The nursery bump leaves `jf_gcmap` null and does not fill items, so
     // unused marked homes still hold recycled nursery bytes; those must
-    // be null before the map is published. A resume dispatch branches
-    // past this code, preserving captures written when the source loop
-    // first crossed the LABEL, and publishes in the resume loader.
-    // A home the input loop fills below needs no null first: its store follows
-    // immediately and nothing between the two allocates, so no collection can
-    // read the slot while it is stale. Homes no input fills keep their clear
-    // because store-on-def writes them only later.
-    // The loop below fills `entry_inputargs`, not every arg of the merged
-    // stream: an appended region's live-ins are stored by the guard-fail branch
-    // that reaches the region, which is nowhere near this entry. Marking those
-    // homes filled here would skip their clear and leave the collector reading
-    // an uninitialised slot.
-    let mut input_filled_home = vec![false; ref_homes.len()];
-    for ia in entry_inputargs {
-        if let Some(h) = ref_homes.home_id(ia.index) {
-            input_filled_home[h as usize] = true;
-        }
-    }
-    emit_null_home_slots(&mut sink, frame, 0..frame.home_slots as u64, |h| {
-        (h as usize) >= input_filled_home.len() || !input_filled_home[h as usize]
-    });
+    // be null before the map is published. Unmarked reserved padding is
+    // invisible to `jitframe_trace` and must not be cleared on every
+    // CALL_ASSEMBLER — that 128-slot fill is what still bound
+    // `fib_recursive`. A resume dispatch branches past this code,
+    // preserving captures written when the source loop first crossed
+    // the LABEL, and publishes in the resume loader.
+    // Null every slot the map about to be published marks. Skipping
+    // input-filled homes left recycled nursery words in a marked slot
+    // when the later store used a different home than `home_id` named
+    // (`recursive_call_frame_relocation` then copied an invalid
+    // type_id). The extra store per input Ref is lost in the noise
+    // next to the CALL_ASSEMBLER itself.
+    emit_null_home_slots(&mut sink, frame, 0..used_ordinary as u64, |_| true);
+    let label_base = frame.ordinary_home_slots() as u64;
+    emit_null_home_slots(
+        &mut sink,
+        frame,
+        label_base..label_base + used_labels as u64,
+        |_| true,
+    );
 
     // Load inputs from frame into locals, and store Ref inputs to their homes.
     // The input value lives at the frame slot its producer wrote it to: the
@@ -6177,7 +6223,11 @@ fn build_function(
             // Keyed resume skipped the key-0 stores. Grown slots were
             // nulled before `br_table`; remaining marked homes already
             // hold the previous module's values. Publish before the
-            // loader stores, matching `push_gcmap` at a live safepoint.
+            // loader stores so a foreign JUMP or a grown re-emission
+            // cannot leave this module's homes unmarked. assembler.py
+            // `push_gcmap` is a safepoint store, not a LABEL op: when
+            // the live map already covers these bits the publish is a
+            // guest compare, not a host union.
             emit_publish_home_gcmap(
                 &mut sink,
                 publish_ptr,
@@ -9009,13 +9059,13 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     sink.i64_store(mem64(FRAME_SLOT_BASE + arg_index as u64 * SLOT_SIZE));
                 }
-                // Homes are still recycled nursery bytes. Null the *callee*
-                // home range from the dispatch snapshot before installing
-                // that snapshot's gcmap. The caller module's FrameGeometry
-                // can disagree after `redirect_call_assembler`.
-                // No call sits between the input stores and this map, so a
-                // Ref argument cannot be collected while the map is still
-                // null. x86 writes the map at the first safepoint instead.
+                // Homes are still recycled nursery bytes. Null the callee
+                // home range from the dispatch snapshot and publish that
+                // snapshot's gcmap before `call_indirect`. A minor
+                // collection can fire in the callee
+                // (`recursive_call_frame_relocation`) while this frame is
+                // already on the shadow stack. Key-0 still skips unmarked
+                // frozen padding.
                 sink.local_get(ca_target_local);
                 sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HOME_SLOTS_OFS));
                 sink.if_(BlockType::Empty);
