@@ -5251,21 +5251,6 @@ impl majit_backend::Backend for WasmBackend {
                     if !outside_labels_initialized {
                         diag_bump(48);
                         decline("uninitialized_label");
-                    } else if has_invalidation_guard && outside_loop {
-                        // A quasi-immutable fold's dependencies are registered
-                        // once, against whatever flag the token names when this
-                        // compile returns — the bridge's own, because deferring
-                        // takes the out-of-line path below. The merge cannot
-                        // move a registration that has already happened, so
-                        // merged, the region would read the owner's root flag
-                        // while its dependencies still hold the bridge's: a
-                        // field mutated before the trip would be forgotten, and
-                        // one mutated after would leave the fold in place. The
-                        // eager invalidation arm below has no such window — it
-                        // merges before this compile returns, so the flag it
-                        // records is the one the dependencies then attach to.
-                        diag_bump(56);
-                        decline("defer_invalidation_guard");
                     } else if !has_invalidation_guard {
                         // Eligible, but not yet worth its owner re-emission:
                         // arm the bridge's entry counter and merge when it
@@ -5303,10 +5288,14 @@ impl majit_backend::Backend for WasmBackend {
                         decline("eager_too_large");
                     } else {
                         // Deferral would register this region's dependencies
-                        // against its temporary bridge flag. A header region
-                        // can instead merge before this compile returns, so
-                        // its dependencies attach to the owner's flag from the
-                        // outset. The outside-loop case was declined above.
+                        // against its temporary bridge flag. Merge before this
+                        // compile returns so they attach to the owner's flag
+                        // from the outset — the same moment
+                        // `patch_jump_for_descr` rewrites the guard. A
+                        // preamble / outside-loop region takes this arm too:
+                        // it cannot defer (the flag would be the temporary
+                        // bridge's) and leaving it out of line makes the
+                        // peel the hot crossing.
                         let region = codegen::InlinedBridge {
                             source_fail_index: merged_fail_index,
                             external_jump: region_external.clone(),
