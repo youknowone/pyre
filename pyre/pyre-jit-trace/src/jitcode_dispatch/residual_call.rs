@@ -10020,6 +10020,53 @@ fn cond_record_pure_result(concrete: ConcreteValue) -> Option<majit_ir::Value> {
     }
 }
 
+/// `MIFrame.execute_varargs` exception bookkeeping after a recorded
+/// `COND_CALL` / `COND_CALL_VALUE`. Consumes `BH_LAST_EXC_VALUE` the way
+/// `try_execute_residual_call_via_executor` does, then emits
+/// `GUARD_EXCEPTION` + `SubRaise` or `GUARD_NO_EXCEPTION`.
+fn cond_record_handle_exception<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    ei: &majit_ir::descr::EffectInfo,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let can_raise = ei.check_can_raise(false);
+    let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    if bh_exc != 0 {
+        let bh_exc_box = ctx.trace_ctx.const_ref(bh_exc);
+        ctx.set_last_exc_value(
+            bh_exc_box,
+            ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef),
+        );
+        ctx.fbw_mode.class_of_last_exc_is_const = false;
+        if let Some(cb) = crate::callbacks::try_get() {
+            (cb.drain_backend_jit_exc)();
+        }
+        debug_assert!(
+            can_raise,
+            "conditional_call helper raised on a !can_raise EffectInfo"
+        );
+        if can_raise {
+            walker_record_guard_exception(ctx, op.pc);
+            let exc = ctx
+                .last_exc_value()
+                .expect("cond_record_handle_exception seeded last_exc_value");
+            let exc_concrete = ctx.last_exc_value_concrete();
+            return Ok(Some((
+                DispatchOutcome::SubRaise { exc, exc_concrete },
+                op.next_pc,
+            )));
+        }
+    } else if can_raise {
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    Ok(None)
+}
+
 fn concrete_from_box_value(value: Option<majit_ir::Value>) -> ConcreteValue {
     match value {
         Some(majit_ir::Value::Int(n)) => ConcreteValue::Int(n),
@@ -10093,17 +10140,19 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
             _ => false,
         },
     };
+    ctx.clear_last_exc_value();
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     if cond_true && ctx.is_authoritative_executor {
-        let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr) else {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        };
-        if func_addr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr) {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+        if let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr)
+            && func_addr != 0
+            && !majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr)
+            && let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes)
+        {
+            majit_metainterp::call_void_function(func_addr as *const (), &concrete_args);
         }
-        let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes) else {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        };
-        majit_metainterp::call_void_function(func_addr as *const (), &concrete_args);
+    }
+    if let Some(out) = cond_record_handle_exception(ctx, op, &ei)? {
+        return Ok(out);
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
@@ -10179,34 +10228,14 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
             _ => false,
         },
     };
-    let (result, concrete) = if should_call {
-        if !ctx.is_authoritative_executor {
-            (recorded, ConcreteValue::Null)
-        } else {
-            let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr) else {
-                match dst_bank {
-                    'i' => write_int_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                    'r' => write_ref_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                    _ => {}
-                }
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            };
-            if func_addr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr) {
-                match dst_bank {
-                    'i' => write_int_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                    'r' => write_ref_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                    _ => {}
-                }
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes) else {
-                match dst_bank {
-                    'i' => write_int_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                    'r' => write_ref_reg(ctx, op.pc, dst, recorded, ConcreteValue::Null)?,
-                    _ => {}
-                }
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            };
+    ctx.clear_last_exc_value();
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let (result, concrete) = if should_call && ctx.is_authoritative_executor {
+        if let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr)
+            && func_addr != 0
+            && !majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr)
+            && let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes)
+        {
             match dst_bank {
                 'i' => {
                     let n =
@@ -10223,7 +10252,11 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
                 }
                 _ => (recorded, ConcreteValue::Null),
             }
+        } else {
+            (recorded, ConcreteValue::Null)
         }
+    } else if should_call {
+        (recorded, ConcreteValue::Null)
     } else {
         (
             first,
@@ -10233,28 +10266,37 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
     // `execute_varargs(..., pure=True)` then `record_result_of_call_pure`.
     // Skip when the walk had no concrete result (non-authoritative /
     // symbolic target): folding a Null would invent a constant.
-    let result = match cond_record_pure_result(concrete) {
-        Some(result_value) => {
-            if let Some(arg_values) = cond_record_arg_values(ctx, &allboxes) {
-                ctx.trace_ctx.record_result_of_call_pure(
-                    recorded,
-                    &allboxes,
-                    &arg_values,
-                    descr_for_pure,
-                    patch_pos,
-                    opcode,
-                    result_value,
-                )
-            } else {
-                result
+    // Also skip when the helper raised (`not last_exc_value`).
+    let raised = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0;
+    let result = if raised {
+        result
+    } else {
+        match cond_record_pure_result(concrete) {
+            Some(result_value) => {
+                if let Some(arg_values) = cond_record_arg_values(ctx, &allboxes) {
+                    ctx.trace_ctx.record_result_of_call_pure(
+                        recorded,
+                        &allboxes,
+                        &arg_values,
+                        descr_for_pure,
+                        patch_pos,
+                        opcode,
+                        result_value,
+                    )
+                } else {
+                    result
+                }
             }
+            None => result,
         }
-        None => result,
     };
     match dst_bank {
         'i' => write_int_reg(ctx, op.pc, dst, result, concrete)?,
         'r' => write_ref_reg(ctx, op.pc, dst, result, concrete)?,
         _ => unreachable!("cond_call_value dst bank is i or r"),
+    }
+    if let Some(out) = cond_record_handle_exception(ctx, op, &ei)? {
+        return Ok(out);
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
