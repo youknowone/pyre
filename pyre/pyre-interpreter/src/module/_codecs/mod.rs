@@ -1646,7 +1646,7 @@ fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// The `errors` argument the code page entry points share: `None` is
 /// `strict`, a `str` is itself, and nothing else is accepted.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 fn code_page_errors(
     name: &str,
     position: usize,
@@ -1657,7 +1657,7 @@ fn code_page_errors(
 
 /// The code page number argument.  A negative number names no code page and
 /// is rejected before any conversion is attempted.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 fn code_page_number(w_code_page: PyObjectRef) -> Result<u32, crate::PyError> {
     let code_page = crate::baseobjspace::c_int_w(w_code_page)?;
     if code_page < 0 {
@@ -1668,7 +1668,7 @@ fn code_page_number(w_code_page: PyObjectRef) -> Result<u32, crate::PyError> {
 
 /// `_codecs.code_page_encode` - `(bytes, characters consumed)`, where the
 /// count is the whole string whatever the error handler did inside it.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 fn code_page_encode_impl(
     name: &str,
     position: usize,
@@ -1688,7 +1688,7 @@ fn code_page_encode_impl(
 }
 
 /// `_codecs.code_page_decode` - `(str, bytes consumed)`.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 fn code_page_decode_impl(
     name: &str,
     position: usize,
@@ -1715,7 +1715,7 @@ fn code_page_decode_impl(
 /// A variadic builtin is handed the raw slice, with a keyword call's marker
 /// dict as its last element; left in place it reads as one more positional
 /// argument.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 fn code_page_positional<'a>(
     name: &str,
     args: &'a [PyObjectRef],
@@ -1730,7 +1730,7 @@ fn code_page_positional<'a>(
 }
 
 /// Split `(str[, errors])` for the two encoders that name their own code page.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 fn fixed_code_page_encode(
     name: &str,
     code_page: u32,
@@ -1746,7 +1746,7 @@ fn fixed_code_page_encode(
 
 /// Split `(data[, errors[, final]])` for the two decoders that name their own
 /// code page.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 fn fixed_code_page_decode(
     name: &str,
     code_page: u32,
@@ -1769,7 +1769,7 @@ fn fixed_code_page_decode(
 
 /// `_PyArg_CheckPositional` wording for a positional-only entry point whose
 /// trailing arguments carry defaults.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 fn code_page_arity_error(name: &str, least: usize, most: usize, given: usize) -> crate::PyError {
     let bound = if given < least {
         let plural = if least == 1 { "" } else { "s" };
@@ -2064,7 +2064,7 @@ crate::py_module! {
         // The code page codecs exist only where the code pages do; their
         // absence elsewhere is what makes `encodings/mbcs.py` an ImportError
         // rather than a codec that answers with the wrong bytes.
-        #[cfg(windows)]
+        #[cfg(all(windows, feature = "host_env"))]
         {
             use windows_sys::Win32::Globalization::{CP_ACP, CP_OEMCP};
 

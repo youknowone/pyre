@@ -48,35 +48,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         fields.push(mem_list);
         crate::_structseq::new_instance(struct_group_type(), fields.take())
     }
-    // `lib_pypy/grp.py:21-34 _group_from_gstruct` libc backend, used when
-    // the host_env abstraction layer is disabled.
-    #[cfg(not(feature = "host_env"))]
-    unsafe fn make_struct_group_libc(g: *const libc::group) -> pyre_object::PyObjectRef {
-        unsafe fn cstr(p: *const libc::c_char) -> String {
-            if p.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-            }
-        }
-        let mem_list = {
-            let mut mem = pyre_object::gc_roots::RootedItems::new();
-            let mut p = (*g).gr_mem;
-            if !p.is_null() {
-                while !(*p).is_null() {
-                    mem.push(pyre_object::w_str_new_managed(&cstr(*p)));
-                    p = p.add(1);
-                }
-            }
-            pyre_object::w_list_new(mem.take())
-        };
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::w_str_new_managed(&cstr((*g).gr_name)));
-        fields.push(pyre_object::w_str_new_managed(&cstr((*g).gr_passwd)));
-        fields.push(pyre_object::w_int_new((*g).gr_gid as i64));
-        fields.push(mem_list);
-        crate::_structseq::new_instance(struct_group_type(), fields.take())
-    }
+
     // `lib_pypy/grp.py:14-20 class struct_group` — exposed as
     // `grp.struct_group`; every result type uses this same class.
     crate::module_ns_store(ns, "struct_group", struct_group_type());
@@ -106,30 +78,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         "getgrgid: gid is out of range",
                     ));
                 };
-                #[cfg(feature = "host_env")]
-                {
-                    match rustpython_host_env::grp::getgrgid(gid) {
-                        Ok(Some(g)) => Ok(make_struct_group(&g)),
-                        Ok(None) => Err(crate::PyError::key_error(format!(
-                            "getgrgid(): gid not found: {}",
-                            gid
-                        ))),
-                        Err(e) => Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getgrgid: {e}"),
-                        )),
-                    }
-                }
-                #[cfg(not(feature = "host_env"))]
-                unsafe {
-                    let g = libc::getgrgid(gid);
-                    if g.is_null() {
-                        return Err(crate::PyError::key_error(format!(
-                            "getgrgid(): gid not found: {}",
-                            gid
-                        )));
-                    }
-                    return Ok(make_struct_group_libc(g));
+                match rustpython_host_env::grp::getgrgid(gid) {
+                    Ok(Some(g)) => Ok(make_struct_group(&g)),
+                    Ok(None) => Err(crate::PyError::key_error(format!(
+                        "getgrgid(): gid not found: {}",
+                        gid
+                    ))),
+                    Err(e) => Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("getgrgid: {e}"),
+                    )),
                 }
             },
             1,
@@ -152,33 +110,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let name = crate::baseobjspace::str_utf8_w(args[0])?;
                 // Reject embedded NULs (parity with PyPy's @unwrap_spec
                 // text0 used for similar lookup APIs).
-                let c_name = std::ffi::CString::new(name).map_err(|_| {
-                    crate::PyError::value_error("getgrnam: name must not contain NUL bytes")
-                })?;
-                #[cfg(feature = "host_env")]
-                {
-                    match rustpython_host_env::grp::getgrnam(name) {
-                        Ok(Some(g)) => Ok(make_struct_group(&g)),
-                        Ok(None) => Err(crate::PyError::key_error(format!(
-                            "getgrnam(): name not found: {}",
-                            name
-                        ))),
-                        Err(e) => Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getgrnam: {e}"),
-                        )),
-                    }
+                if name.as_bytes().contains(&0) {
+                    return Err(crate::PyError::value_error(
+                        "getgrnam: name must not contain NUL bytes",
+                    ));
                 }
-                #[cfg(not(feature = "host_env"))]
-                unsafe {
-                    let g = libc::getgrnam(c_name.as_ptr());
-                    if g.is_null() {
-                        return Err(crate::PyError::key_error(format!(
-                            "getgrnam(): name not found: {}",
-                            name
-                        )));
-                    }
-                    return Ok(make_struct_group_libc(g));
+                match rustpython_host_env::grp::getgrnam(name) {
+                    Ok(Some(g)) => Ok(make_struct_group(&g)),
+                    Ok(None) => Err(crate::PyError::key_error(format!(
+                        "getgrnam(): name not found: {}",
+                        name
+                    ))),
+                    Err(e) => Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("getgrnam: {e}"),
+                    )),
                 }
             },
             1,
@@ -190,35 +136,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "getgrall",
             |_| {
-                #[cfg(feature = "host_env")]
-                {
-                    // Each struct_group is freshly allocated and building the
-                    // next one allocates again, so they are pinned as they
-                    // arrive.
-                    let groups = rustpython_host_env::grp::getgrall();
-                    let mut items = pyre_object::gc_roots::RootedItems::new();
-                    for g in groups.iter() {
-                        items.push(make_struct_group(g));
-                    }
-                    Ok(pyre_object::w_list_new(items.take()))
+                // Each struct_group is freshly allocated and building the
+                // next one allocates again, so they are pinned as they
+                // arrive.
+                let groups = rustpython_host_env::grp::getgrall();
+                let mut items = pyre_object::gc_roots::RootedItems::new();
+                for g in groups.iter() {
+                    items.push(make_struct_group(g));
                 }
-                #[cfg(not(feature = "host_env"))]
-                unsafe {
-                    // Each struct_group is freshly allocated and the next
-                    // `getgrent` entry allocates again, so they are pinned as
-                    // they arrive.
-                    let mut items = pyre_object::gc_roots::RootedItems::new();
-                    libc::setgrent();
-                    loop {
-                        let g = libc::getgrent();
-                        if g.is_null() {
-                            break;
-                        }
-                        items.push(make_struct_group_libc(g));
-                    }
-                    libc::endgrent();
-                    return Ok(pyre_object::w_list_new(items.take()));
-                }
+                Ok(pyre_object::w_list_new(items.take()))
             },
             0,
         ),

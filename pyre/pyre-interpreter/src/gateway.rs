@@ -2134,7 +2134,7 @@ pub fn fsencode_os_str(name: &std::ffi::OsStr) -> Vec<u8> {
 /// spelling a `str` argument already arrives in.  The two spellings coincide
 /// outside that mode, where the bytes are their own answer.
 pub fn fs_arg_bytes(data: Vec<u8>) -> Result<Vec<u8>, crate::PyError> {
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "host_env"))]
     if crate::typedef::legacy_windows_fs_encoding() {
         return crate::unicodehelper_win32::decode_code_page(
             windows_sys::Win32::Globalization::CP_ACP,
@@ -2168,7 +2168,7 @@ pub fn fs_result_bytes(data: &[u8]) -> Vec<u8> {
 /// filesystem decode, so each escape in it folds back to the byte it stood
 /// for and no code point is left that the codec cannot spell.
 pub fn fsencode_wtf8_total(text: &rustpython_wtf8::Wtf8) -> Vec<u8> {
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "host_env"))]
     if crate::typedef::legacy_windows_fs_encoding()
         && let Ok(bytes) = crate::unicodehelper_win32::encode_code_page_replace(
             windows_sys::Win32::Globalization::CP_ACP,

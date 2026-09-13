@@ -676,12 +676,12 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_winapi);
     // CPython's private `_wmi` module reaches the local WMI service through
     // COM and is therefore present only on an unsandboxed Windows host.
-    #[cfg(all(windows, not(feature = "sandbox")))]
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_install_module!(_wmi);
     // `_uuidmodule.c` is built from rpcrt4 on Windows and libuuid elsewhere;
     // only the Windows half is ported, and it reads the host's network card,
     // so it belongs with the other host-access modules.
-    #[cfg(all(windows, not(feature = "sandbox")))]
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_install_module!(_uuid);
     // PyPy's `lib_pypy/_overlapped.py`: asyncio's proactor backend owns one
     // OVERLAPPED record per operation and reaches the Win32/WinSock calls
@@ -787,9 +787,9 @@ pub fn install_builtin_modules() {
         // callers depend on that: `posixpath.expanduser`, `pathlib` and
         // `tarfile` all reach for the module inside `try/except ImportError`
         // and take a fallback when it is missing.
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(pwd);
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(grp);
         // `host_env` as well as `unix`: both are wholly gated on that pair, so
         // without it `sys.builtin_module_names` would advertise a module whose

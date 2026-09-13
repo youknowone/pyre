@@ -717,33 +717,39 @@ crate::py_module! {
                 return Err(crate::PyError::value_error("embedded null character"));
             }
             exe_name_w.push(0);
+            #[cfg(not(feature = "host_env"))]
+            {
+                let _ = exe_name_w;
+                return Err(crate::PyError::not_implemented(
+                    "_winapi.NeedCurrentDirectoryForExePath requires host_env",
+                ));
+            }
             #[cfg(feature = "host_env")]
             {
                 let exe_name = widestring::WideCStr::from_slice(&exe_name_w)
                     .expect("validated NUL-terminated executable name");
                 return Ok(host_winapi::need_current_directory_for_exe_path_w(exe_name));
             }
-            #[cfg(not(feature = "host_env"))]
-            Ok(unsafe {
-                windows_sys::Win32::System::Environment::NeedCurrentDirectoryForExePathW(
-                    exe_name_w.as_ptr(),
-                ) != 0
-            })
         }
         // `subprocess.Handle.Close` captures `_winapi.CloseHandle` as a default
         // argument at class-definition time, so the attribute must exist for
         // `import subprocess` to succeed.
         fn CloseHandle(handle: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
             let handle = handle_w(handle, IntArg::Only("CloseHandle"))?;
+            #[cfg(not(feature = "host_env"))]
+            {
+                let _ = handle;
+                return Err(crate::PyError::not_implemented(
+                    "_winapi.CloseHandle requires host_env",
+                ));
+            }
             #[cfg(feature = "host_env")]
             let ok = host_winapi::close_handle(handle);
-            #[cfg(not(feature = "host_env"))]
-            let ok = unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(handle)
-            };
+            #[cfg(feature = "host_env")]
             if ok == 0 {
                 return Err(last_os_error());
             }
+            #[cfg(feature = "host_env")]
             Ok(())
         }
         // `subprocess.Popen._wait`/`poll` also capture these as default
@@ -765,32 +771,24 @@ crate::py_module! {
             // what `save_err=rffi.RFFI_SAVE_LASTERROR` does — reacquiring goes
             // through `mutex2_lock_timeout`, whose timed wait leaves
             // `ERROR_TIMEOUT` behind on a poll that expired.
+            #[cfg(not(feature = "host_env"))]
+            {
+                let _ = (handle, milliseconds);
+                return Err(crate::PyError::not_implemented(
+                    "_winapi.WaitForSingleObject requires host_env",
+                ));
+            }
+            #[cfg(feature = "host_env")]
             let (result, error) = {
                 let _blocked = crate::module::thread::before_external_block();
-                #[cfg(feature = "host_env")]
                 let result = host_winapi::wait_for_single_object(handle, milliseconds);
-                #[cfg(not(feature = "host_env"))]
-                let result = unsafe {
-                    windows_sys::Win32::System::Threading::WaitForSingleObject(
-                        handle,
-                        milliseconds,
-                    )
-                };
-                #[cfg(feature = "host_env")]
-                let (result, error) = match result {
+                match result {
                     Ok(result) => (result, 0),
                     Err(error) => (
                         windows_sys::Win32::Foundation::WAIT_FAILED,
                         error.raw_os_error().unwrap_or(0) as u32,
                     ),
-                };
-                #[cfg(not(feature = "host_env"))]
-                let error = if result == windows_sys::Win32::Foundation::WAIT_FAILED {
-                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
-                } else {
-                    0
-                };
-                (result, error)
+                }
             };
             if result == windows_sys::Win32::Foundation::WAIT_FAILED {
                 return Err(win32_code(error));
@@ -799,24 +797,17 @@ crate::py_module! {
         }
         fn GetExitCodeProcess(handle: pyre_object::PyObjectRef) -> Result<i64, crate::PyError> {
             let handle = handle_w(handle, IntArg::Only("GetExitCodeProcess"))?;
-            #[cfg(feature = "host_env")]
+            #[cfg(not(feature = "host_env"))]
             {
-                return host_winapi::get_exit_code_process(handle)
-                    .map(i64::from)
-                    .map_err(win32_err);
+                let _ = handle;
+                return Err(crate::PyError::not_implemented(
+                    "_winapi.GetExitCodeProcess requires host_env",
+                ));
             }
-            #[cfg(not(feature = "host_env"))]
-            let mut code: u32 = 0;
-            #[cfg(not(feature = "host_env"))]
-            let ok = unsafe {
-                windows_sys::Win32::System::Threading::GetExitCodeProcess(handle, &mut code)
-            };
-            #[cfg(not(feature = "host_env"))]
-            if ok == 0 {
-                return Err(last_os_error());
-            }
-            #[cfg(not(feature = "host_env"))]
-            Ok(code as i64)
+            #[cfg(feature = "host_env")]
+            host_winapi::get_exit_code_process(handle)
+                .map(i64::from)
+                .map_err(win32_err)
         }
     },
     extra_init: |ns| {

@@ -110,7 +110,7 @@ pub mod _types;
 pub mod _typing;
 // `uuid.py` reaches a MAC-derived node only through this module; a build
 // without it answers `getnode()` from `os.urandom`.
-#[cfg(all(windows, not(feature = "sandbox")))]
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 #[allow(non_snake_case)]
 pub mod _uuid;
 pub mod _warnings;
@@ -118,7 +118,7 @@ pub mod _weakref;
 #[allow(non_snake_case)]
 #[cfg(windows)]
 pub mod _winapi;
-#[cfg(all(windows, not(feature = "sandbox")))]
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _wmi;
 pub mod array;
 pub mod atexit;
@@ -137,7 +137,7 @@ pub mod faulthandler;
 #[cfg(all(not(feature = "sandbox"), feature = "host_env"))]
 pub mod fcntl;
 pub mod gc;
-#[cfg(all(unix, not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod grp;
 #[allow(non_snake_case)]
 pub mod imp;
@@ -151,7 +151,7 @@ pub mod mmap;
 pub mod msvcrt;
 pub mod operator;
 pub mod posix;
-#[cfg(all(unix, not(feature = "sandbox")))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod pwd;
 pub mod pyexpat;
 pub mod pypyjit;

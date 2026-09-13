@@ -88,28 +88,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         fields.push(pyre_object::w_str_new_managed(&pw.shell));
         crate::_structseq::new_instance(struct_passwd_type(), fields.take())
     }
-    // `interp_pwd.py make_struct_passwd` libc backend, used when
-    // the host_env abstraction layer is disabled.  Mirrors the same
-    // rffi.charp2str / int construction PyPy uses.
-    #[cfg(not(feature = "host_env"))]
-    unsafe fn make_struct_passwd_libc(pw: *const libc::passwd) -> pyre_object::PyObjectRef {
-        unsafe fn cstr(p: *const libc::c_char) -> String {
-            if p.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-            }
-        }
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_name)));
-        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_passwd)));
-        fields.push(pyre_object::w_int_new((*pw).pw_uid as i64));
-        fields.push(pyre_object::w_int_new((*pw).pw_gid as i64));
-        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_gecos)));
-        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_dir)));
-        fields.push(pyre_object::w_str_new_managed(&cstr((*pw).pw_shell)));
-        crate::_structseq::new_instance(struct_passwd_type(), fields.take())
-    }
+
     // `app_pwd.py class struct_passwd(metaclass=structseqtype)`.
     crate::module_ns_store(ns, "struct_passwd", struct_passwd_type());
     crate::module_ns_store(ns, "struct_pwent", struct_passwd_type());
@@ -135,33 +114,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     Err(e) => return Err(e),
                 };
-                #[cfg(feature = "host_env")]
-                {
-                    match rustpython_host_env::pwd::getpwuid(uid) {
-                        Ok(Some(pw)) => Ok(make_struct_passwd(&pw)),
-                        Ok(None) => Err(crate::PyError::key_error(format!(
-                            "getpwuid(): uid not found: {}",
-                            uid as i64
-                        ))),
-                        Err(e) => Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("getpwuid: {e}"),
-                        )),
-                    }
-                }
-                // `interp_pwd.py:90-108` — libc fallback path; host_env
-                // is a pyre-only abstraction layer over the same
-                // getpwuid() call PyPy makes via rffi.llexternal.
-                #[cfg(not(feature = "host_env"))]
-                unsafe {
-                    let pw = libc::getpwuid(uid);
-                    if pw.is_null() {
-                        return Err(crate::PyError::key_error(format!(
-                            "getpwuid(): uid not found: {}",
-                            uid as i64
-                        )));
-                    }
-                    return Ok(make_struct_passwd_libc(pw));
+                match rustpython_host_env::pwd::getpwuid(uid) {
+                    Ok(Some(pw)) => Ok(make_struct_passwd(&pw)),
+                    Ok(None) => Err(crate::PyError::key_error(format!(
+                        "getpwuid(): uid not found: {}",
+                        uid as i64
+                    ))),
+                    Err(e) => Err(crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        format!("getpwuid: {e}"),
+                    )),
                 }
             },
             1,
@@ -183,30 +145,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 let name = crate::baseobjspace::str_utf8_w(args[0])?;
                 // `interp_pwd.py @unwrap_spec(name='text0')` rejects
-                // embedded NULs.  CString::new() enforces that here.
-                let c_name = std::ffi::CString::new(name).map_err(|_| {
-                    crate::PyError::value_error("getpwnam: name must not contain NUL bytes")
-                })?;
-                #[cfg(feature = "host_env")]
-                {
-                    match rustpython_host_env::pwd::getpwnam(name) {
-                        Some(pw) => Ok(make_struct_passwd(&pw)),
-                        None => Err(crate::PyError::key_error(format!(
-                            "getpwnam(): name not found: {}",
-                            name
-                        ))),
-                    }
+                // embedded NULs.
+                if name.as_bytes().contains(&0) {
+                    return Err(crate::PyError::value_error(
+                        "getpwnam: name must not contain NUL bytes",
+                    ));
                 }
-                #[cfg(not(feature = "host_env"))]
-                unsafe {
-                    let pw = libc::getpwnam(c_name.as_ptr());
-                    if pw.is_null() {
-                        return Err(crate::PyError::key_error(format!(
-                            "getpwnam(): name not found: {}",
-                            name
-                        )));
-                    }
-                    return Ok(make_struct_passwd_libc(pw));
+                match rustpython_host_env::pwd::getpwnam(name) {
+                    Some(pw) => Ok(make_struct_passwd(&pw)),
+                    None => Err(crate::PyError::key_error(format!(
+                        "getpwnam(): name not found: {}",
+                        name
+                    ))),
                 }
             },
             1,
@@ -218,35 +168,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "getpwall",
             |_| {
-                #[cfg(feature = "host_env")]
-                {
-                    // Every entry is freshly allocated and the next one allocates
-                    // again, so they are pinned as they arrive (`build_list_storage`).
-                    let mut items = pyre_object::gc_roots::RootedItems::new();
-                    for pw in rustpython_host_env::pwd::getpwall().iter() {
-                        items.push(make_struct_passwd(pw));
-                    }
-                    Ok(pyre_object::w_list_new(items.take()))
+                // Every entry is freshly allocated and the next one allocates
+                // again, so they are pinned as they arrive (`build_list_storage`).
+                let mut items = pyre_object::gc_roots::RootedItems::new();
+                for pw in rustpython_host_env::pwd::getpwall().iter() {
+                    items.push(make_struct_passwd(pw));
                 }
-                // `interp_pwd.py:123-134` — setpwent / loop getpwent /
-                // endpwent.
-                #[cfg(not(feature = "host_env"))]
-                unsafe {
-                    // Every entry is freshly allocated and the next `getpwent`
-                    // entry allocates again, so they are pinned as they arrive
-                    // (`build_list_storage`).
-                    let mut items = pyre_object::gc_roots::RootedItems::new();
-                    libc::setpwent();
-                    loop {
-                        let pw = libc::getpwent();
-                        if pw.is_null() {
-                            break;
-                        }
-                        items.push(make_struct_passwd_libc(pw));
-                    }
-                    libc::endpwent();
-                    return Ok(pyre_object::w_list_new(items.take()));
-                }
+                Ok(pyre_object::w_list_new(items.take()))
             },
             0,
         ),

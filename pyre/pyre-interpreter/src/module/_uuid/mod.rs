@@ -14,50 +14,19 @@
 
 use pyre_object::{PY_NULL, PyObjectRef};
 
-#[cfg(feature = "host_env")]
 fn sequential_uuid() -> ([u8; 16], i32) {
     let uuid = rustpython_host_env::uuid::create_sequential();
     (uuid.bytes, uuid.status)
 }
 
-#[cfg(not(feature = "host_env"))]
-fn sequential_uuid() -> ([u8; 16], i32) {
-    use windows_sys::Win32::System::Rpc::UuidCreateSequential;
-    use windows_sys::core::GUID;
-    let mut uuid = GUID::from_u128(0);
-    // SAFETY: `uuid` is a live, aligned `GUID` the callee only writes into.
-    let status = unsafe { UuidCreateSequential(&raw mut uuid) };
-    let mut bytes = [0u8; 16];
-    bytes[0..4].copy_from_slice(&uuid.data1.to_le_bytes());
-    bytes[4..6].copy_from_slice(&uuid.data2.to_le_bytes());
-    bytes[6..8].copy_from_slice(&uuid.data3.to_le_bytes());
-    bytes[8..16].copy_from_slice(&uuid.data4);
-    (bytes, status)
-}
-
-#[cfg(feature = "host_env")]
 fn status_ok() -> i32 {
     rustpython_host_env::uuid::STATUS_OK
 }
-#[cfg(feature = "host_env")]
 fn status_local_only() -> i32 {
     rustpython_host_env::uuid::STATUS_LOCAL_ONLY
 }
-#[cfg(feature = "host_env")]
 fn status_no_address() -> i32 {
     rustpython_host_env::uuid::STATUS_NO_ADDRESS
-}
-#[cfg(not(feature = "host_env"))]
-fn status_ok() -> i32 {
-    windows_sys::Win32::System::Rpc::RPC_S_OK
-}
-#[cfg(not(feature = "host_env"))]
-fn status_local_only() -> i32 {
-    windows_sys::Win32::System::Rpc::RPC_S_UUID_LOCAL_ONLY
-}
-#[cfg(not(feature = "host_env"))]
-fn status_no_address() -> i32 {
-    windows_sys::Win32::System::Rpc::RPC_S_UUID_NO_ADDRESS
 }
 
 /// `py_windows_has_stable_node`: only `RPC_S_OK` means the node came from a

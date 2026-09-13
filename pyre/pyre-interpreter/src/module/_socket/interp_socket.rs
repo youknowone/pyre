@@ -1710,18 +1710,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let name = crate::gateway::fsencode_bytes_w(args[0])?;
                     let c_name = std::ffi::CString::new(name)
                         .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
-                    #[cfg(feature = "host_env")]
-                    let idx = rustpython_host_env::socket::if_nametoindex_checked(&c_name)
-                        .map_err(socket_io_err)?;
                     #[cfg(not(feature = "host_env"))]
-                    let idx = {
-                        let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-                        if idx == 0 {
-                            return Err(socket_last_error());
-                        }
-                        idx
-                    };
-                    Ok(pyre_object::w_int_new(idx as i64))
+                    {
+                        let _ = c_name;
+                        return Err(crate::PyError::not_implemented(
+                            "socket.if_nametoindex requires host_env",
+                        ));
+                    }
+                    #[cfg(feature = "host_env")]
+                    {
+                        let idx = rustpython_host_env::socket::if_nametoindex_checked(&c_name)
+                            .map_err(socket_io_err)?;
+                        Ok(pyre_object::w_int_new(idx as i64))
+                    }
                 },
                 1,
             ),
@@ -1748,20 +1749,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             "Python int too large for C unsigned int",
                         )
                     })?;
-                    #[cfg(feature = "host_env")]
-                    let name = rustpython_host_env::socket::if_indextoname_checked(idx)
-                        .map_err(socket_io_err)?
-                        .into_bytes();
                     #[cfg(not(feature = "host_env"))]
-                    let name = {
-                        let mut buf = [0u8; libc::IF_NAMESIZE];
-                        let p = unsafe { libc::if_indextoname(idx, buf.as_mut_ptr().cast()) };
-                        if p.is_null() {
-                            return Err(socket_last_error());
-                        }
-                        unsafe { std::ffi::CStr::from_ptr(p).to_bytes().to_vec() }
-                    };
-                    Ok(crate::gateway::fsdecode_filename_bytes(&name))
+                    {
+                        let _ = idx;
+                        return Err(crate::PyError::not_implemented(
+                            "socket.if_indextoname requires host_env",
+                        ));
+                    }
+                    #[cfg(feature = "host_env")]
+                    {
+                        let name = rustpython_host_env::socket::if_indextoname_checked(idx)
+                            .map_err(socket_io_err)?
+                            .into_bytes();
+                        Ok(crate::gateway::fsdecode_filename_bytes(&name))
+                    }
                 },
                 1,
             ),

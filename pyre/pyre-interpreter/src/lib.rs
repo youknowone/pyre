@@ -163,7 +163,7 @@ pub mod stack_check;
 pub mod syntax_warnings;
 pub mod type_methods;
 pub mod typedef;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 pub mod unicodehelper_win32;
 pub mod warn;
 

@@ -4671,14 +4671,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .map_err(|e| errno_err(e.raw_os_error().unwrap_or(0), ""))?;
                 Ok(make_terminal_size(columns as i64, lines as i64))
             }
-            #[cfg(all(unix, not(feature = "host_env")))]
-            {
-                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                if crate::builtins::crt_call!(libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws)) != 0 {
-                    return Err(errno_err(crate::builtins::crt_errno(), ""));
-                }
-                Ok(make_terminal_size(ws.ws_col as i64, ws.ws_row as i64))
-            }
             #[cfg(all(windows, feature = "host_env"))]
             {
                 let handle = rustpython_host_env::nt::handle_from_fd(fd);
@@ -4687,7 +4679,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(make_terminal_size(columns as i64, lines as i64))
             }
             // A target with neither call has no terminal to measure.
-            #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
+            #[cfg(not(any(
+                all(unix, feature = "host_env"),
+                all(windows, feature = "host_env")
+            )))]
             {
                 let _ = fd;
                 Ok(make_terminal_size(80, 24))
@@ -8677,25 +8672,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         //
         // Which filename the caller then reports is its own: `os.ftruncate` was
         // given no name to report, while `os.truncate` names the one it opened.
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         fn ftruncate_retry(
             fd: libc::c_int,
             length: libc::off_t,
             wrap: impl Fn(i32) -> crate::PyError,
         ) -> Result<(), crate::PyError> {
             loop {
-                #[cfg(feature = "host_env")]
                 let result = {
                     let fd = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
                     rustpython_host_env::crt_fd::ftruncate(fd, length)
-                };
-                #[cfg(not(feature = "host_env"))]
-                let result = if crate::builtins::crt_call!(libc::ftruncate(fd, length)) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::from_raw_os_error(
-                        crate::builtins::crt_errno(),
-                    ))
                 };
                 if result.is_ok() {
                     return Ok(());
@@ -8713,7 +8699,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // name write-only, truncates whichever it ended up with, and closes
         // only the one it opened itself. The descriptor form is what
         // HAVE_FTRUNCATE advertises through `os.py:149`.
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         crate::module_ns_store(
             ns,
             "truncate",
@@ -8784,7 +8770,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // real fd mutation whenever HAVE_FTRUNCATE is advertised.  Shared
         // memory sizes its newly-created object through this call before
         // mapping it.
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         crate::module_ns_store(
             ns,
             "ftruncate",

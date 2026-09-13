@@ -15,9 +15,6 @@ use windows_sys::Win32::Globalization::{
     CP_ACP, CP_UTF7, CP_UTF8, MB_ERR_INVALID_CHARS, WC_ERR_INVALID_CHARS, WC_NO_BEST_FIT_CHARS,
 };
 
-#[cfg(not(feature = "host_env"))]
-use windows_sys::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte};
-
 /// The Windows 2000 English message the decoder reports, which
 /// `decode_code_page_errors` hardcodes rather than asking `FormatMessage` for.
 const DECODE_REASON: &str = "No mapping for the Unicode character exists in the target code page.";
@@ -63,66 +60,18 @@ fn encode_code_page_flags(code_page: u32, errors: Option<&str>) -> u32 {
     }
 }
 
-#[cfg(not(feature = "host_env"))]
-fn last_win32_error() -> u32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32
-}
-
-#[cfg(feature = "host_env")]
 fn os_err_code(err: &std::io::Error) -> u32 {
     err.raw_os_error().unwrap_or(0) as u32
 }
 
 fn mb_to_wide_len(code_page: u32, flags: u32, data: &[u8]) -> Result<usize, u32> {
-    #[cfg(feature = "host_env")]
-    {
-        rustpython_host_env::windows::multi_byte_to_wide_len(code_page, flags, data)
-            .map_err(|e| os_err_code(&e))
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        let size = unsafe {
-            MultiByteToWideChar(
-                code_page,
-                flags,
-                data.as_ptr(),
-                data.len() as i32,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if size > 0 {
-            Ok(size as usize)
-        } else {
-            Err(last_win32_error())
-        }
-    }
+    rustpython_host_env::windows::multi_byte_to_wide_len(code_page, flags, data)
+        .map_err(|e| os_err_code(&e))
 }
 
 fn mb_to_wide(code_page: u32, flags: u32, data: &[u8], out: &mut [u16]) -> Result<usize, u32> {
-    #[cfg(feature = "host_env")]
-    {
-        rustpython_host_env::windows::multi_byte_to_wide(code_page, flags, data, out)
-            .map_err(|e| os_err_code(&e))
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        let size = unsafe {
-            MultiByteToWideChar(
-                code_page,
-                flags,
-                data.as_ptr(),
-                data.len() as i32,
-                out.as_mut_ptr(),
-                out.len() as i32,
-            )
-        };
-        if size > 0 {
-            Ok(size as usize)
-        } else {
-            Err(last_win32_error())
-        }
-    }
+    rustpython_host_env::windows::multi_byte_to_wide(code_page, flags, data, out)
+        .map_err(|e| os_err_code(&e))
 }
 
 fn wide_to_mb_len(
@@ -131,42 +80,8 @@ fn wide_to_mb_len(
     wide: &[u16],
     track_default: bool,
 ) -> Result<(usize, bool), u32> {
-    #[cfg(feature = "host_env")]
-    {
-        rustpython_host_env::windows::wide_char_to_multi_byte_len(
-            code_page,
-            flags,
-            wide,
-            track_default,
-        )
+    rustpython_host_env::windows::wide_char_to_multi_byte_len(code_page, flags, wide, track_default)
         .map_err(|e| os_err_code(&e))
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        let mut used_default = 0i32;
-        let used_default_ptr = if track_default {
-            &raw mut used_default
-        } else {
-            std::ptr::null_mut()
-        };
-        let size = unsafe {
-            WideCharToMultiByte(
-                code_page,
-                flags,
-                wide.as_ptr(),
-                wide.len() as i32,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-                used_default_ptr,
-            )
-        };
-        if size > 0 {
-            Ok((size as usize, used_default != 0))
-        } else {
-            Err(last_win32_error())
-        }
-    }
 }
 
 fn wide_to_mb(
@@ -176,43 +91,14 @@ fn wide_to_mb(
     out: &mut [u8],
     track_default: bool,
 ) -> Result<(usize, bool), u32> {
-    #[cfg(feature = "host_env")]
-    {
-        rustpython_host_env::windows::wide_char_to_multi_byte(
-            code_page,
-            flags,
-            wide,
-            out,
-            track_default,
-        )
-        .map_err(|e| os_err_code(&e))
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        let mut used_default = 0i32;
-        let used_default_ptr = if track_default {
-            &raw mut used_default
-        } else {
-            std::ptr::null_mut()
-        };
-        let size = unsafe {
-            WideCharToMultiByte(
-                code_page,
-                flags,
-                wide.as_ptr(),
-                wide.len() as i32,
-                out.as_mut_ptr(),
-                out.len() as i32,
-                std::ptr::null(),
-                used_default_ptr,
-            )
-        };
-        if size > 0 {
-            Ok((size as usize, used_default != 0))
-        } else {
-            Err(last_win32_error())
-        }
-    }
+    rustpython_host_env::windows::wide_char_to_multi_byte(
+        code_page,
+        flags,
+        wide,
+        out,
+        track_default,
+    )
+    .map_err(|e| os_err_code(&e))
 }
 
 /// The outcome of a conversion the caller retries through an error handler.
