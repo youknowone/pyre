@@ -1414,6 +1414,136 @@ pub extern "C" fn jit_str_endswith(s: i64, suffix: i64) -> i64 {
     }
 }
 
+/// `unicodeobject.py _unwrap_and_search` / `descr_find` with default
+/// bounds.  The search is `_utf8.find` after `_index_to_byte`; the
+/// result comes back through `_byte_to_index`.  Index-table memoization
+/// is the same write `jit_str_getitem` already admits as elidable.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_find(s: i64, sub: i64) -> i64 {
+    jit_str_search_bounds(s, sub, 0, i64::MAX, true)
+}
+
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_rfind(s: i64, sub: i64) -> i64 {
+    jit_str_search_bounds(s, sub, 0, i64::MAX, false)
+}
+
+/// `descr_find` / `descr_rfind` / `descr_count` with already-unboxed
+/// code-point bounds (`sliceobject.py adapt_lower_bound`).
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_find_bounds(s: i64, sub: i64, start: i64, end: i64) -> i64 {
+    jit_str_search_bounds(s, sub, start, end, true)
+}
+
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_rfind_bounds(s: i64, sub: i64, start: i64, end: i64) -> i64 {
+    jit_str_search_bounds(s, sub, start, end, false)
+}
+
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_count_bounds(s: i64, sub: i64, start: i64, end: i64) -> i64 {
+    let s = s as PyObjectRef;
+    let sub = sub as PyObjectRef;
+    unsafe {
+        let Some((lo, hi)) = str_byte_window(s, start, end) else {
+            return 0;
+        };
+        let hay = w_str_get_wtf8(s).as_bytes();
+        let needle = w_str_get_wtf8(sub).as_bytes();
+        if needle.is_empty() {
+            return w_str_byte_to_index(s, hi) as i64 - w_str_byte_to_index(s, lo) as i64 + 1;
+        }
+        let mut count = 0i64;
+        let mut pos = lo;
+        while let Some(found) = find_bytes(hay, needle, pos, hi) {
+            count += 1;
+            pos = found + needle.len();
+        }
+        count
+    }
+}
+
+fn adapt_cp_bound(length: i64, index: i64) -> i64 {
+    if index >= 0 {
+        index
+    } else {
+        index.saturating_add(length).max(0)
+    }
+}
+
+fn str_byte_window(s: PyObjectRef, start: i64, end: i64) -> Option<(usize, usize)> {
+    unsafe {
+        let length = w_str_len(s) as i64;
+        let start = adapt_cp_bound(length, start);
+        let end = adapt_cp_bound(length, end);
+        if start > length {
+            return None;
+        }
+        let start_index = if start == 0 {
+            0
+        } else {
+            w_str_index_to_byte(s, start as usize)
+        };
+        let hay_len = w_str_get_wtf8(s).as_bytes().len();
+        let end_index = if end >= length {
+            hay_len
+        } else {
+            w_str_index_to_byte(s, end as usize)
+        };
+        if start_index > end_index {
+            return None;
+        }
+        Some((start_index, end_index))
+    }
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(lo.min(hi));
+    }
+    if lo > hi || hi > hay.len() {
+        return None;
+    }
+    hay[lo..hi]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| lo + p)
+}
+
+fn rfind_bytes(hay: &[u8], needle: &[u8], lo: usize, hi: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(hi.min(hay.len()).max(lo));
+    }
+    if lo > hi || hi > hay.len() {
+        return None;
+    }
+    hay[lo..hi]
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .map(|p| lo + p)
+}
+
+fn jit_str_search_bounds(s: i64, sub: i64, start: i64, end: i64, forward: bool) -> i64 {
+    let s = s as PyObjectRef;
+    let sub = sub as PyObjectRef;
+    unsafe {
+        let Some((lo, hi)) = str_byte_window(s, start, end) else {
+            return -1;
+        };
+        let hay = w_str_get_wtf8(s).as_bytes();
+        let needle = w_str_get_wtf8(sub).as_bytes();
+        let res = if forward {
+            find_bytes(hay, needle, lo, hi)
+        } else {
+            rfind_bytes(hay, needle, lo, hi)
+        };
+        match res {
+            Some(ri) => w_str_byte_to_index(s, ri) as i64,
+            None => -1,
+        }
+    }
+}
+
 /// `str(i)` over an unboxed integer: `ll_int2dec` + `newutf8`.
 /// The argument is a raw machine integer (the `'i'` argcode operand).
 ///
@@ -1577,6 +1707,20 @@ mod tests {
             assert_eq!(at(wide, 4), Some(u32::from('一')));
             assert_eq!(at(wide, 5), None);
         }
+    }
+
+    #[test]
+    fn test_jit_str_find_rfind_count_code_point_bounds() {
+        let hay = w_str_new("一二三四一二");
+        let needle = w_str_new("二");
+        assert_eq!(jit_str_find(hay as i64, needle as i64), 1);
+        assert_eq!(jit_str_rfind(hay as i64, needle as i64), 5);
+        assert_eq!(
+            jit_str_count_bounds(hay as i64, needle as i64, 0, i64::MAX),
+            2
+        );
+        assert_eq!(jit_str_count_bounds(hay as i64, needle as i64, 2, 6), 1);
+        assert_eq!(jit_str_find_bounds(hay as i64, needle as i64, 2, 6), 5);
     }
 
     #[test]

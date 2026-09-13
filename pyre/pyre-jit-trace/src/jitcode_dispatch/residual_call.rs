@@ -7966,6 +7966,60 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrFind, || {
+            try_walker_specialize_str_search(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                dst_bank,
+                StrSearchKind::Find,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrRfind, || {
+            try_walker_specialize_str_search(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                dst_bank,
+                StrSearchKind::RFind,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrCount, || {
+            try_walker_specialize_str_search(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                dst_bank,
+                StrSearchKind::Count,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
 
     // `divmod(a, b)` on two exact ints: inline the guarded
     // `OS_INT_PY_DIV` / `OS_INT_PY_MOD` pair into a virtual `Cls_ii`
