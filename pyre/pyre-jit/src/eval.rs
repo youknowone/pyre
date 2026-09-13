@@ -5722,9 +5722,19 @@ fn build_jit_driver_pair() -> JitDriverPair {
         for addr in pyre_jit_trace::helpers::walker_void_word_helper_addrs() {
             majit_backend_wasm::vouch_residual_call_addr(addr);
         }
+        for addr in [
+            list::jit_drain_list_append as *const () as usize as i64,
+            pyre_object::object_array::jit_ll_arraymove as *const () as usize as i64,
+        ] {
+            majit_backend_wasm::vouch_residual_call_addr(addr);
+        }
         use pyre_interpreter::module::math::interp_math as math;
         use pyre_interpreter::objspace::descroperation as desc;
+        use pyre_object::floatobject as flt;
+        use pyre_object::intobject as intobj;
+        use pyre_object::listobject as list;
         use pyre_object::longobject as long;
+        use pyre_object::tupleobject as tup;
         use pyre_object::unicodeobject as uni;
         for addr in [
             desc::jit_bigint_add_int_int as *const () as usize as i64,
@@ -5780,10 +5790,20 @@ fn build_jit_driver_pair() -> JitDriverPair {
             long::jit_w_long_xor_raw as *const () as usize as i64,
             long::jit_w_long_fits_int as *const () as usize as i64,
             long::jit_w_long_toint as *const () as usize as i64,
+            list::jit_list_append as *const () as usize as i64,
+            list::jit_list_getitem as *const () as usize as i64,
+            list::jit_list_setitem as *const () as usize as i64,
+            list::jit_list_reverse as *const () as usize as i64,
+            tup::jit_tuple_getitem as *const () as usize as i64,
+            intobj::jit_w_int_new as *const () as usize as i64,
+            flt::jit_w_float_new as *const () as usize as i64,
+            pyre_object::functional::jit_range_iter_new as *const () as usize as i64,
             uni::jit_str_concat as *const () as usize as i64,
             uni::jit_str_compare as *const () as usize as i64,
             uni::jit_str_startswith as *const () as usize as i64,
             uni::jit_str_endswith as *const () as usize as i64,
+            uni::jit_str_repeat as *const () as usize as i64,
+            uni::jit_str_is_true as *const () as usize as i64,
             uni::jit_int_str as *const () as usize as i64,
             uni::jit_str_getitem as *const () as usize as i64,
             majit_metainterp::blackhole::ll_int_py_div as *const () as usize as i64,
