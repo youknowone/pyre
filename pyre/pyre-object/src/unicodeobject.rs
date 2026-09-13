@@ -577,7 +577,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         W_UNICODE_USER_GC_TYPE_ID.get(),
         W_UNICODE_USER_OBJECT_SIZE,
     );
-    let unicode = W_UnicodeObjectUser {
+    let mut unicode = W_UnicodeObjectUser {
         base: W_UnicodeObject {
             ob_header: PyObject {
                 ob_type: &STR_TYPE as *const PyType,
@@ -594,11 +594,16 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
-        // An immortal header cannot grey a GC value box. Rebuild a
-        // fully immortal string rather than leave `value` dangling
-        // after the next major collection.
-        let recovered = unsafe { (*unicode.base.value).clone() };
-        return w_str_from_wtf8_immortal(recovered);
+        // Keep the subclass header. An immortal holder cannot grey a
+        // GC value box, so copy the bytes into `malloc_raw` first.
+        // Unit tests have no GC hook: `gc_alloc_storage_box` already
+        // fell back to `malloc_raw`, and `try_gc_owns_object` is false.
+        let value_ptr = unicode.base.value;
+        if crate::gc_hook::try_gc_owns_object(value_ptr as *mut u8) {
+            let recovered = unsafe { (*value_ptr).clone() };
+            unicode.base.value = crate::lltype::malloc_raw(recovered);
+        }
+        crate::lltype::malloc_typed(unicode) as PyObjectRef
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_UnicodeObjectUser, unicode);
