@@ -10249,6 +10249,9 @@ impl<'a> Lowering<'a> {
                 on_unwind,
             } => {
                 let _ = on_unwind;
+                if tyref_is_frame_anchor(&place.ty, self.llbc) {
+                    return self.lower_frame_anchor_drop(mir_bb, place, target as usize);
+                }
                 if drop_lowers_as_glue_call(&place, &fn_ptr, self.llbc) {
                     self.emit_root_scope_close(mir_bb, &place);
                 }
@@ -10261,6 +10264,44 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: unknown TermKind"
             ))),
         }
+    }
+
+    /// Close a [`FrameAnchor`] through the bound word-ABI residual.
+    /// Charon's `drop_in_place` fn_ptr does not contain `FrameAnchor` in
+    /// the path, so routing through that name left the residual unbound
+    /// and compiled loops leaked a shadow-stack slot per `new`.
+    fn lower_frame_anchor_drop(
+        &mut self,
+        mir_bb: usize,
+        place: Place,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        let PlaceKind::Local(local) = place.kind else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: FrameAnchor Drop over a projection place"
+            )));
+        };
+        let bb_id = self.block_id[mir_bb];
+        if let Some(arg) = self.local_var[local as usize].clone() {
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "eval".to_string(),
+                            "FrameAnchor".to_string(),
+                            "drop".to_string(),
+                        ],
+                    },
+                    args: crate::model::call_args(vec![arg]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        }
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
     }
 
     /// Lower a local `Drop` as the glue call named by its MIR terminator.
@@ -24969,14 +25010,27 @@ fn frame_anchor_drop_glue_path(name: &str) -> bool {
         && segments.iter().any(|s| *s == "FrameAnchor")
 }
 
+fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| td.item_meta.name_path().contains("FrameAnchor"))
+}
+
 /// Drops supported by both lowering and its liveness analysis.
 fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) -> bool {
-    matches!(place.kind, PlaceKind::Local(_))
-        && regular_call_name_path(fn_ptr, llbc)
-            .as_deref()
-            .is_some_and(|name| {
-                gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name)
-            })
+    if !matches!(place.kind, PlaceKind::Local(_)) {
+        return false;
+    }
+    if tyref_is_frame_anchor(&place.ty, llbc) {
+        return true;
+    }
+    regular_call_name_path(fn_ptr, llbc)
+        .as_deref()
+        .is_some_and(|name| {
+            gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name)
+        })
 }
 
 /// Match the lowered RootScope close used by result/exception rewrites.
