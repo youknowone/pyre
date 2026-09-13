@@ -270,6 +270,59 @@ pub fn void_skip_residual() -> Option<&'static VoidSkipResidual> {
     VOID_SKIP_RESIDUAL.get()
 }
 
+/// Residual `Ref -> Ref` helpers whose result is a process-constant
+/// object (`w_code_const` / `PyCode.co_consts_w[idx]`). `pyopcode.py`
+/// `LOAD_CONST` reads the green constant array; record the traced
+/// `ConstPtr` instead of `CallR`.
+#[derive(Clone, Default)]
+pub struct ElidableRefResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl ElidableRefResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static ELIDABLE_REF_RESIDUAL: std::sync::OnceLock<ElidableRefResidual> = std::sync::OnceLock::new();
+
+pub fn register_elidable_ref_residual(spec: ElidableRefResidual) {
+    let _ = ELIDABLE_REF_RESIDUAL.set(spec);
+}
+
+pub fn elidable_ref_residual() -> Option<&'static ElidableRefResidual> {
+    ELIDABLE_REF_RESIDUAL.get()
+}
+
+/// Residual `Ref, Ref, Int -> Int` override gates that are false for
+/// exact builtin ints (`needs_numeric_binop_dispatch`).
+/// `descroperation.py _call_binop_impl` looks inside; the exact-int
+/// path is a constant false. Fold only when both operands are exact
+/// ints and the helper answered 0.
+#[derive(Clone)]
+pub struct ExactIntFalseResidual {
+    pub fnaddrs: Vec<i64>,
+    pub is_exact_int: fn(i64) -> bool,
+}
+
+impl ExactIntFalseResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static EXACT_INT_FALSE_RESIDUAL: std::sync::OnceLock<ExactIntFalseResidual> =
+    std::sync::OnceLock::new();
+
+pub fn register_exact_int_false_residual(spec: ExactIntFalseResidual) {
+    let _ = EXACT_INT_FALSE_RESIDUAL.set(spec);
+}
+
+pub fn exact_int_false_residual() -> Option<&'static ExactIntFalseResidual> {
+    EXACT_INT_FALSE_RESIDUAL.get()
+}
+
 /// Host-registered rewrite of a residual int COMPARE_OP.
 ///
 /// `compare_slot` residualizes through `compare_slot_jit_abi` (the
