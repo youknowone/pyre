@@ -139,6 +139,7 @@ mod recursion_depth_policy_tests {
 
     fn frame(w_code: usize, recursion_greenkey: bool) -> InlineFrame {
         InlineFrame {
+            is_portal: false,
             w_code,
             recursion_greenkey,
             call_id: 0,

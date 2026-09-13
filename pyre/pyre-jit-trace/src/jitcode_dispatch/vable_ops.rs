@@ -17,7 +17,7 @@ use super::*;
 /// All register banks share the frame's owned slots, so replacement follows
 /// `MIFrame.replace_active_box_in_frame` without a retained mutable slice or
 /// delayed replay. A paused Python caller stores those lists on
-/// `InlineParentFrame`; the portal uses `WalkSession.portal_live`; a
+/// `InlineParentFrame`; the portal is `WalkSession.framestack[0]`; a
 /// transparent helper uses `WalkSession.helper_live`.
 fn replace_slots(slots: &mut [OpRef], oldbox: OpRef, newbox: OpRef) {
     for slot in slots {
@@ -50,11 +50,14 @@ pub(super) fn bind_paused_caller_regs(
 ) {
     let live = LiveFrameRegs::new(registers_r, registers_i, registers_f, frame_state);
     let mut session = session.borrow_mut();
-    if let Some(top) = session.framestack.last_mut() {
-        top.live = Some(live);
-    } else {
-        session.portal_live = Some(live);
+    if session.framestack.is_empty() {
+        session.framestack.push(InlineFrame::portal());
     }
+    session
+        .framestack
+        .last_mut()
+        .expect("portal occupies framestack[0]")
+        .live = Some(live);
 }
 
 pub(super) fn push_helper_live(
@@ -77,9 +80,6 @@ pub(super) fn pop_helper_live(session: &std::cell::RefCell<WalkSession>) {
 }
 
 fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox: OpRef) {
-    if let Some(live) = session.portal_live.as_ref() {
-        replace_live_regs(live, oldbox, newbox);
-    }
     for live in &session.helper_live {
         replace_live_regs(live, oldbox, newbox);
     }
@@ -109,16 +109,6 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
                 }
             }
         }
-    }
-    if session.last_exc_value == Some(oldbox) {
-        session.last_exc_value = Some(newbox);
-    }
-    for slot in [
-        &mut session.tmpreg_r,
-        &mut session.tmpreg_i,
-        &mut session.tmpreg_f,
-    ] {
-        replace_slots(std::slice::from_mut(slot), oldbox, newbox);
     }
 }
 
@@ -225,6 +215,7 @@ mod frame_replacement_tests {
             &suspended_state,
         );
         session.borrow_mut().framestack.push(InlineFrame {
+            is_portal: false,
             w_code: 1,
             recursion_greenkey: true,
             call_id: 1,
@@ -255,7 +246,7 @@ mod frame_replacement_tests {
         assert_eq!(active_state.borrow().vstack_boxes, [old]);
         // Guard capture in the child already sees the rewritten caller.
         assert_eq!(
-            session.borrow().framestack[0].parents[0].boxes,
+            session.borrow().framestack.last().unwrap().parents[0].boxes,
             vec![standard]
         );
         // Both frames have already changed before either continuation runs.
@@ -322,7 +313,10 @@ mod frame_replacement_tests {
             // nonstandard virtualizable promotion, not just this Ref bank.
             walker_replace_box(&mut ctx, standard, middle);
             assert_eq!(ctx.frame_state.borrow().vstack_boxes, [middle]);
-            assert_eq!(session.borrow().framestack[0].parents[0].boxes, [middle]);
+            assert_eq!(
+                session.borrow().framestack.last().unwrap().parents[0].boxes,
+                [middle]
+            );
             walker_replace_box(&mut ctx, middle, standard);
             ctx.registers_r.set(0, old);
             ctx.frame_state.borrow_mut().vstack_boxes[0] = old;
@@ -374,6 +368,7 @@ mod frame_replacement_tests {
             ..Default::default()
         });
         session.borrow_mut().framestack.push(InlineFrame {
+            is_portal: false,
             w_code: 1,
             recursion_greenkey: true,
             call_id: 1,
@@ -399,7 +394,10 @@ mod frame_replacement_tests {
         assert_eq!(parent_regs.get(0), Some(new));
         assert_eq!(parent_state.borrow().vstack_boxes, [new]);
         assert_eq!(parent_state.borrow().vstack_last_ref, new);
-        assert_eq!(session.borrow().framestack[0].parents[0].boxes, vec![new]);
+        assert_eq!(
+            session.borrow().framestack.last().unwrap().parents[0].boxes,
+            vec![new]
+        );
     }
 
     #[test]
@@ -419,11 +417,35 @@ mod frame_replacement_tests {
             &RegisterBank::default(),
             &state,
         );
-        assert!(session.borrow().framestack.is_empty());
-        assert!(session.borrow().portal_live.is_some());
+        assert!(session.borrow().at_portal());
+        assert!(session.borrow().framestack[0].is_portal);
+        assert!(session.borrow().framestack[0].live.is_some());
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
         assert_eq!(regs.get(0), Some(new));
         assert_eq!(state.borrow().vstack_boxes, [new]);
+    }
+
+    #[test]
+    fn replace_box_does_not_walk_last_exc_or_tmpreg() {
+        // `pyjitpl.py MetaInterp.replace_box` walks framestack only.
+        // `last_exc_value` is a MetaInterp concrete pointer, `tmpreg_*`
+        // belong to the blackhole interpreter.
+        let old = OpRef::input_arg_ref(0);
+        let new = OpRef::input_arg_ref(1);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        {
+            let mut session = session.borrow_mut();
+            session.last_exc_value = Some(old);
+            session.tmpreg_r = old;
+            session.tmpreg_i = OpRef::input_arg_int(0);
+            session.tmpreg_f = OpRef::input_arg_float(0);
+        }
+        replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
+        let session = session.borrow();
+        assert_eq!(session.last_exc_value, Some(old));
+        assert_eq!(session.tmpreg_r, old);
+        assert_eq!(session.tmpreg_i, OpRef::input_arg_int(0));
+        assert_eq!(session.tmpreg_f, OpRef::input_arg_float(0));
     }
 
     #[test]
@@ -472,8 +494,12 @@ mod frame_replacement_tests {
             assert_eq!(banks[i].to_vec(), [new[i], new[i]]);
         }
         drop(banks);
-        // portal_live owns the storage, not a pointer into the dropped owner.
-        let live = session.borrow().portal_live.as_ref().unwrap().clone();
+        // The portal frame owns the storage, not a pointer into the dropped owner.
+        let live = session.borrow().framestack[0]
+            .live
+            .as_ref()
+            .expect("portal live")
+            .clone();
         for (bank, (old, new)) in [&live.registers_r, &live.registers_i, &live.registers_f]
             .into_iter()
             .zip(old.into_iter().zip(new))

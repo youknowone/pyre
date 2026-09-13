@@ -18,7 +18,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 /// The rest of the production path follows the same division as upstream:
 /// the annotator stores `access_directly` / `fresh_virtualizable` on
 /// `Variable.annotation` as `SomeInstance.flags`; the codewriter's
-/// `rematerialize_vable_flags_for_access` performs the
+/// `Transformer.hook_access_field` performs the
 /// `VirtualizableInstanceRepr.hook_access_field` step for every configured
 /// redirected access; and `rewrite_op_jit_force_virtualizable` deletes the
 /// residual force marker from looked-inside graphs. The compiled interpreter

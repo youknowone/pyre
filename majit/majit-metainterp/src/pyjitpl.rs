@@ -4905,9 +4905,10 @@ impl<M: Clone> MetaInterp<M> {
         // expanded-tail path still uses live_values directly; the short
         // path drives the `vable_ptr` heap read below to mint inputargs
         // for each vable static field + array item.
-        if total_vable == 0 {
-            return;
-        }
+        //
+        // `total_vable == 0` is still a live virtualizable: PyPy
+        // `initialize_virtualizable` always `read_boxes` (possibly empty)
+        // and `virtualizable_boxes.append(virtualizable_box)`.
         let _has_expanded_tail_outer = live_values.len() >= num_reds + total_vable;
         if !_has_expanded_tail_outer && self.vable_ptr.is_null() {
             return;
@@ -27397,6 +27398,41 @@ mod tests {
         assert_eq!(
             ctx.virtualizable_entry_at(0),
             Some((OpRef::input_arg_int(1), Value::Int(41)))
+        );
+    }
+
+    #[test]
+    fn initialize_virtualizable_appends_identity_when_there_are_no_static_fields() {
+        // `pyjitpl.py initialize_virtualizable` still
+        // `virtualizable_boxes.append(virtualizable_box)` when
+        // `read_boxes` is empty.
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let mut info = VirtualizableInfo::new(0);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(8));
+        info.set_clear_vable(
+            test_clear_vable_token as *const (),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
+        meta.set_virtualizable_info(std::sync::Arc::new(info));
+
+        let mut obj = ResidualCallVableObj::new(0, 0);
+        meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
+        let descriptor = JitDriverStaticData::with_virtualizable(
+            vec![],
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        );
+        let frame = Value::Ref(majit_ir::GcRef(
+            (&mut obj as *mut ResidualCallVableObj) as usize,
+        ));
+        let action = meta.force_start_tracing(780, (0, 0), Some(descriptor), &[frame]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let ctx = meta.trace_ctx().expect("expected active trace context");
+        assert_eq!(
+            ctx.collect_virtualizable_boxes().unwrap(),
+            vec![OpRef::input_arg_ref(0)]
         );
     }
 

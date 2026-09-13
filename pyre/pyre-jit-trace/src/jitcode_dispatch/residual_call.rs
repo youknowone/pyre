@@ -482,7 +482,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         _ => 0,
     };
 
-    if ctx.session.borrow().framestack.is_empty() && !ctx.fbw_mode.inline_subwalk {
+    if ctx.session.borrow().at_portal() && !ctx.fbw_mode.inline_subwalk {
         let Some((jitcode, cf_addr, live_root_addr)) = (unsafe {
             if ctx.fbw_mode.snapshot_sym.is_null() {
                 None
@@ -604,7 +604,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     } else {
         latchdbg!(
             "origin={origin} no-arm framestack_empty={} inline_subwalk={}",
-            ctx.session.borrow().framestack.is_empty(),
+            ctx.session.borrow().at_portal(),
             ctx.fbw_mode.inline_subwalk
         );
         false
@@ -1114,7 +1114,7 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         };
     }
     let session = ctx.session.borrow();
-    if session.framestack.is_empty() {
+    if session.at_portal() {
         s2dbg!(
             "origin={origin} framestack empty depth={} transparent_helper_subwalk={}",
             session.framestack.len(),
@@ -4644,7 +4644,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // Same non-bridge latch as the escape-flush commit above:
                 // a bridge walk never adopts this image (`run_perfn_walk`
                 // epilogue is skipped).
-                if ctx.session.borrow().framestack.is_empty()
+                if ctx.session.borrow().at_portal()
                     && !ctx.fbw_mode.inline_subwalk
                     && !ctx.trace_ctx.is_bridge_trace
                 {

@@ -526,6 +526,9 @@ impl CalleeLocalsShadow {
 
 /// One inlined-callee level of the walk's framestack.
 pub struct InlineFrame {
+    /// `true` for the portal `MIFrame` at `framestack[0]`.
+    /// `pyjitpl.py initialize_state_from_start` / `newframe(mainjitcode)`.
+    pub is_portal: bool,
     /// Callee `w_code`, used by the recursion-depth scan. Once the same code
     /// reaches the live `max_unroll_recursion`, the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py`).
@@ -572,11 +575,27 @@ pub struct InlineFrame {
     live: Option<LiveFrameRegs>,
 }
 
+impl InlineFrame {
+    /// Portal frame `pyjitpl.py newframe(mainjitcode)` leaves at
+    /// `framestack[0]`.
+    pub(crate) fn portal() -> Self {
+        Self {
+            is_portal: true,
+            w_code: 0,
+            recursion_greenkey: false,
+            call_id: 0,
+            debug_merge_point_py_pc: None,
+            parents: Vec::new(),
+            entry_executed_effects: 0,
+            live: None,
+        }
+    }
+}
+
 /// The live register banks of one paused `MIFrame`.
 ///
 /// `MetaInterp.replace_box` writes `framestack` frames in place. The portal
-/// is not an `InlineFrame` (depth scans treat `framestack.len()` as the
-/// inlined-callee count), so it lives on [`WalkSession::portal_live`].
+/// is `framestack[0]`; inlined callees follow.
 #[derive(Clone)]
 pub(crate) struct LiveFrameRegs {
     pub(crate) registers_r: RegisterBank,
@@ -619,11 +638,8 @@ pub struct WalkSession {
     /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
     /// borrowed register banks. Resume snapshots are updated synchronously.
 
-    /// Portal `MIFrame` registers while a child runs. Not on `framestack`
-    /// because `framestack.len()` is the inlined-callee depth.
-    pub(crate) portal_live: Option<LiveFrameRegs>,
     /// Paused transparent-helper `SubWalkFrame` banks. Helpers are not
-    /// Python `MIFrame`s and must not overwrite `portal_live`.
+    /// Python `MIFrame`s and must not sit on `framestack`.
     pub(crate) helper_live: Vec<LiveFrameRegs>,
     /// The root frame's `is_being_profiled` portal green for this walk.
     pub is_being_profiled: bool,
@@ -759,9 +775,8 @@ impl Default for WalkSession {
         Self {
             is_being_profiled: false,
 
-            portal_live: None,
             helper_live: Vec::new(),
-            framestack: Vec::new(),
+            framestack: vec![InlineFrame::portal()],
             next_call_id: 1,
             open_inline_activations: 0,
             root_debug_merge_point_py_pc: None,
@@ -784,6 +799,19 @@ impl Default for WalkSession {
 }
 
 impl WalkSession {
+    /// `pyjitpl.py` portal is `framestack[0]`; inlined callees follow.
+    pub(crate) fn at_portal(&self) -> bool {
+        self.framestack.iter().all(|frame| frame.is_portal)
+    }
+
+    /// Inlined-callee depth, excluding the portal at `framestack[0]`.
+    pub(crate) fn inline_depth(&self) -> usize {
+        self.framestack
+            .iter()
+            .filter(|frame| !frame.is_portal)
+            .count()
+    }
+
     /// Claim an abort coordinate for the frame whose `walk()` observed it.
     ///
     /// The first inline sub-walk to see the error owns its `pc` and may build
@@ -6823,6 +6851,7 @@ impl<'a> InlineFrameGuard<'a> {
             call_id
         };
         walk.framestack.push(InlineFrame {
+            is_portal: false,
             w_code,
             recursion_greenkey,
             call_id,
@@ -11114,7 +11143,7 @@ fn guarded_branch_core<Sym: WalkSym>(
                 .iter()
                 .filter(|frame| !frame.parents.is_empty())
                 .count();
-            let n_callees = session.framestack.len();
+            let n_callees = session.inline_depth();
             !(n_parents > 0 && n_parents == n_callees)
         };
         // A canonical helper body (`run_sub_jitcode_walk`) walks its OWN

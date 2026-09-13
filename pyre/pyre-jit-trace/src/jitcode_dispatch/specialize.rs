@@ -4944,7 +4944,7 @@ fn try_walker_orthodox_load_super_attr<Sym: WalkSym>(
     // than answering wrongly.  The two spaces coincide only when the walk is
     // executing the framestack frame's own jitcode, which is what an empty
     // framestack witnesses here.
-    if !ctx.session.borrow().framestack.is_empty() {
+    if !ctx.session.borrow().at_portal() {
         return Ok(None);
     }
     let Some(jc_arc) = crate::jitcode_runtime::load_super_attr_value_jitcode() else {

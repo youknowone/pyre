@@ -61,7 +61,7 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     // Bridge reconstruction stores frame guards in a Vec; their drop order
     // must not control the session owner's root registration lifetime.
     drop(frames);
-    assert!(outer.borrow().framestack.is_empty());
+    assert!(outer.borrow().at_portal());
     outer.borrow_mut().tmpreg_r = OpRef::const_ptr(majit_ir::GcRef(0x4000));
     assert_eq!(forward(), [0x4000]);
     assert_eq!(
@@ -958,6 +958,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     mode.inline_subwalk = true;
     let session = std::cell::RefCell::new(WalkSession::default());
     session.borrow_mut().framestack.push(InlineFrame {
+        is_portal: false,
         w_code: w_code as usize,
         // What `InlineFrameGuard::new` stamps on the first Python portal frame
         // pushed onto an empty framestack: `MetaInterp.newframe` consumes

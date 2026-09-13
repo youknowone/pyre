@@ -647,6 +647,25 @@ impl VableFlags {
             fresh_virtualizable: self.fresh_virtualizable || other.fresh_virtualizable,
         }
     }
+
+    /// `inputconst(lltype.Void, flags)` for
+    /// `hook_access_field`'s third genop argument.
+    fn to_const(self) -> crate::flowspace::model::ConstValue {
+        let mut items = std::collections::HashMap::new();
+        if self.access_directly {
+            items.insert(
+                crate::flowspace::model::ConstValue::byte_str("access_directly"),
+                crate::flowspace::model::ConstValue::Bool(true),
+            );
+        }
+        if self.fresh_virtualizable {
+            items.insert(
+                crate::flowspace::model::ConstValue::byte_str("fresh_virtualizable"),
+                crate::flowspace::model::ConstValue::Bool(true),
+            );
+        }
+        crate::flowspace::model::ConstValue::Dict(items)
+    }
 }
 
 /// `jtransform.py is_virtualizable_getset` result: `False`, `True`, or
@@ -1648,7 +1667,7 @@ impl<'a> Transformer<'a> {
         let mut count_before_last_operation = None;
         for original_op in &original_ops {
             let op = remap_op(original_op, &self.aliases);
-            self.rematerialize_vable_flags_for_access(original_op, &op);
+            self.hook_access_field(original_op, &op, graph_name, graph);
             // `jtransform.py` binds `_rewrite_symmetric` as the whole
             // `rewrite_op_<name>` for the symmetric ops, so it runs before
             // any other rewriting can look at the operands.
@@ -1792,10 +1811,10 @@ impl<'a> Transformer<'a> {
     /// lower to `getfield_vable_*` / `setfield_vable_*`, and an array
     /// field read must not enter `vable_array_vars`.
     ///
-    /// `rematerialize_vable_flags_for_access` is the
-    /// `VirtualizableInstanceRepr.hook_access_field` step: it reads the
-    /// base Variable's `SomeInstance.flags` annotation and repopulates this
-    /// per-block table immediately before every redirected access.
+    /// `hook_access_field` is the
+    /// `VirtualizableInstanceRepr.hook_access_field` step: it emits the
+    /// 3-arg `jit_force_virtualizable` genop and lets
+    /// `rewrite_op_jit_force_virtualizable` file this per-block table.
     ///
     /// The two frame constructors call the hint (`pyre-interpreter`
     /// `pyframe.rs` `PyFrame::new` and `createframe_obj`, mirroring
@@ -1869,7 +1888,7 @@ impl<'a> Transformer<'a> {
         if field.suppresses_virtualizable() || field.base_is_local_aggregate() {
             return VirtualizableGetset::No;
         }
-        // `if res: flags = self.vable_flags[op.args[0]]`. rematerialize
+        // `if res: flags = self.vable_flags[op.args[0]]`. hook_access_field
         // files the key for every redirected access; missing key after that
         // is empty flags (still lower), not a translator crash.
         if self.is_fresh_virtualizable(base) {
@@ -1882,15 +1901,23 @@ impl<'a> Transformer<'a> {
         }
     }
 
-    /// The codewriter half of
-    /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`.
-    /// Consult the pre-renaming SSA value for its annotator flags, then file
-    /// them under the renamed operand exactly as
-    /// `rewrite_op_jit_force_virtualizable` does upstream.
-    fn rematerialize_vable_flags_for_access(
+    /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`:
+    ///
+    /// ```text
+    /// if self.my_redirected_fields.get(cname.value):
+    ///     cflags = inputconst(lltype.Void, flags)
+    ///     llops.genop('jit_force_virtualizable', [vinst, cname, cflags])
+    /// ```
+    ///
+    /// PyFrame is not an RPython ClassDesc, so the genop is minted here
+    /// at each redirected access. `rewrite_op_jit_force_virtualizable`
+    /// files `vable_flags` from args[2] and deletes the op.
+    fn hook_access_field(
         &mut self,
         original_op: &SpaceOperation,
         renamed_op: &SpaceOperation,
+        graph_name: &str,
+        graph: &mut crate::model::FunctionGraph,
     ) {
         let (original_base, field) = match &original_op.kind {
             OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
@@ -1917,7 +1944,23 @@ impl<'a> Transformer<'a> {
             .copied()
             .unwrap_or_default()
             .merge(VableFlags::from_annotation(original_base));
-        self.vable_flags.insert(renamed_base.clone(), flags);
+        let force = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["jit_force_virtualizable"]),
+                args: vec![
+                    crate::model::LinkArg::from(renamed_base.clone()),
+                    crate::model::LinkArg::Const(crate::flowspace::model::Constant::new(
+                        crate::flowspace::model::ConstValue::byte_str(&field.name),
+                    )),
+                    crate::model::LinkArg::Const(crate::flowspace::model::Constant::new(
+                        flags.to_const(),
+                    )),
+                ],
+                result_ty: ValueType::Void,
+            },
+        };
+        let _ = self.rewrite_operation(&force, graph_name, graph);
     }
 
     /// `jtransform.py _check_no_vable_array`.
@@ -3881,20 +3924,25 @@ impl<'a> Transformer<'a> {
     /// Production residual is the 1-arg `jit_force_virtualizable(frame)`
     /// marker. The 3-arg hook form carries `[vinst, cname, cflags]`. File
     /// flags from `args[2]` when present, otherwise from the instance
-    /// annotation — the same source `rematerialize_vable_flags_for_access`
-    /// reads at each redirected access.
+    /// annotation — the same source `hook_access_field` reads at each
+    /// redirected access.
     fn rewrite_op_jit_force_virtualizable(
         &mut self,
         args: &[crate::model::LinkArg],
         graph_name: &str,
     ) -> RewriteResult {
         if let Some(base) = args.first().and_then(crate::model::LinkArg::as_variable) {
-            let mut flags = VableFlags::from_annotation(base);
+            let key = resolve_alias(base, &self.aliases);
+            let mut flags = self
+                .vable_flags
+                .get(&key)
+                .copied()
+                .unwrap_or_default()
+                .merge(VableFlags::from_annotation(base));
             if let Some(crate::model::LinkArg::Const(c)) = args.get(2) {
                 flags = flags.merge(VableFlags::from_const(&c.value));
             }
-            self.vable_flags
-                .insert(resolve_alias(base, &self.aliases), flags);
+            self.vable_flags.insert(key, flags);
         }
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),

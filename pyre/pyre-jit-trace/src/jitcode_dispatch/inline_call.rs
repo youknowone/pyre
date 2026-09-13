@@ -6112,7 +6112,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     } else {
         u16::MAX
     };
-    let inline_depth = ctx.session.borrow().framestack.len();
+    let inline_depth = ctx.session.borrow().inline_depth();
 
     // A strict straight-line callee is seeded with its own frame red so guards
     // carry a real two-frame snapshot.  A callee beyond the currently-supported

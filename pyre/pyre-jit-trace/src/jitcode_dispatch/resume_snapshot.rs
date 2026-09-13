@@ -265,7 +265,7 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
                 .iter()
                 .filter(|frame| !frame.parents.is_empty())
                 .count(),
-            session.framestack.len(),
+            session.inline_depth(),
             session
                 .framestack
                 .iter()
@@ -348,7 +348,7 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
         .iter()
         .filter(|frame| !frame.parents.is_empty())
         .count();
-    inline_snapshot_has_complete_parent_chain(n_parents, session.framestack.len())
+    inline_snapshot_has_complete_parent_chain(n_parents, session.inline_depth())
 }
 
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
