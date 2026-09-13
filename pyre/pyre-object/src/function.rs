@@ -254,7 +254,7 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob_type: &STATICMETHOD_TYPE as *const PyType,
         w_class: get_instantiate(&STATICMETHOD_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         W_STATICMETHOD_GC_TYPE_ID,
         W_STATICMETHOD_OBJECT_SIZE,
     );
@@ -439,7 +439,7 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob_type: &CLASSMETHOD_TYPE as *const PyType,
         w_class: get_instantiate(&CLASSMETHOD_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         W_CLASSMETHOD_GC_TYPE_ID,
         W_CLASSMETHOD_OBJECT_SIZE,
     );
