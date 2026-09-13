@@ -1900,11 +1900,13 @@ where
                     ctx.standard_virtualizable_ptr(),
                 ) && ctx.vable_heap_static_diverged(&info, ptr as *const u8)
                 {
-                    // Residual wrote the frame (exception push / vsd)
-                    // without forcing the token. Reload only when the
-                    // heap actually moved; a blanket reload breaks the
-                    // peel (shadow_stack / FrameAnchor).
-                    ctx.load_fields_from_virtualizable(&info, ptr as *const u8);
+                    // Residual wrote vsd/stack without forcing the token
+                    // (`dispatch_exception_handler`). Sync only those
+                    // slots — `load_fields_from_virtualizable` would
+                    // replace resume Virtuals with heap ConstPtrs and
+                    // fold immutable `intval` to the recording-time
+                    // counter (exception-bridge hang).
+                    ctx.reload_vable_stack_if_heap_moved();
                 } else {
                     ctx.reload_tokenless_virtualizable_after_residual_call();
                 }

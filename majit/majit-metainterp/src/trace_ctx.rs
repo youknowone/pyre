@@ -3981,10 +3981,11 @@ impl TraceCtx {
 
     /// After `dispatch_exception_handler` (`dont_look_inside_cannot_raise`)
     /// `frame.push`es the caught exception, the heap vsd/stack have moved
-    /// and the vable shadow has not. Copy only those slots. A full
+    /// and the vable shadow has not. Copy only `valuestackdepth` and the
+    /// newly pushed slots (`old_vsd..new_vsd`). Locals stay as the resume
+    /// Virtuals (`virtualizable.py load_list_of_boxes`). A full
     /// [`Self::load_fields_from_virtualizable`] also reloads `last_instr`
-    /// from the heap (often 0) and runs after every cannot_raise CallI
-    /// whose last_instr shadow is newer than the heap.
+    /// from the heap (often 0) and replaces those Virtuals with ConstPtrs.
     pub fn reload_vable_stack_if_heap_moved(&mut self) {
         let (Some(info), Some(ptr)) = (
             self.virtualizable_info().cloned(),
@@ -4016,33 +4017,50 @@ impl TraceCtx {
         if shadow == heap {
             return;
         }
+        let old_vsd = match shadow {
+            Value::Int(n) if n >= 0 => n as usize,
+            _ => return,
+        };
+        let new_vsd = match bits {
+            n if n >= 0 => n as usize,
+            _ => return,
+        };
         let vsd_box = self.const_int(bits);
         self.set_virtualizable_entry_at(vsd_idx, vsd_box, heap);
+        // `valuestackdepth` is the absolute index into
+        // `locals_cells_stack_w` (pyframe.py `push` / pyframe.rs). A
+        // cannot_raise handler only `frame.push`es, so the new slots are
+        // `old_vsd..new_vsd`. Locals and the previous stack stay as the
+        // resume Virtuals (`virtualizable.py load_list_of_boxes` /
+        // `pyjitpl.py _opimpl_getarrayitem_vable`). Replacing those with
+        // heap ConstPtrs folds immutable `intval` to the recording-time
+        // counter and the compiled bridge hangs.
+        if new_vsd <= old_vsd {
+            return;
+        }
         let lengths = self
             .virtualizable_array_lengths()
             .map(|lengths| lengths.to_vec())
             .unwrap_or_default();
-        let mut cursor = info.num_static_extra_boxes;
-        for (a_idx, &length) in lengths.iter().enumerate() {
-            if a_idx >= info.array_fields.len() {
-                break;
-            }
-            let ty = info.array_fields[a_idx].item_type;
-            for item_idx in 0..length {
-                let item_bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
-                let item_val = crate::pyjitpl::heap_value_for_pub(ty, item_bits);
-                let item_box = match ty {
-                    majit_ir::Type::Int => self.const_int(item_bits),
-                    majit_ir::Type::Ref => self.const_ref(item_bits),
-                    majit_ir::Type::Float => self.const_float(item_bits),
-                    majit_ir::Type::Void => {
-                        cursor += 1;
-                        continue;
-                    }
-                };
-                self.set_virtualizable_entry_at(cursor, item_box, item_val);
-                cursor += 1;
-            }
+        let Some(&length) = lengths.first() else {
+            return;
+        };
+        let ty = match info.array_fields.first() {
+            Some(field) => field.item_type,
+            None => return,
+        };
+        let array_base = info.num_static_extra_boxes;
+        let end = new_vsd.min(length);
+        for item_idx in old_vsd..end {
+            let item_bits = unsafe { info.read_array_item(heap_ptr, 0, item_idx) };
+            let item_val = crate::pyjitpl::heap_value_for_pub(ty, item_bits);
+            let item_box = match ty {
+                majit_ir::Type::Int => self.const_int(item_bits),
+                majit_ir::Type::Ref => self.const_ref(item_bits),
+                majit_ir::Type::Float => self.const_float(item_bits),
+                majit_ir::Type::Void => continue,
+            };
+            self.set_virtualizable_entry_at(array_base + item_idx, item_box, item_val);
         }
     }
 
@@ -7249,6 +7267,22 @@ mod tests {
         info
     }
 
+    fn make_test_vable_info_with_vsd_array() -> crate::virtualizable::VirtualizableInfo {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("valuestackdepth", Type::Int, 8);
+        info.add_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Ref),
+        );
+        let parent = majit_ir::descr::make_size_descr(0);
+        info.set_parent_descr(parent);
+        info
+    }
+
     // Test helper: typed placeholder matching each slot's declared type so
     // the Box's (OpRef, concrete) pair stays internally consistent — the
     // RPython `virtualizable_boxes[index] = valuebox` invariant.  Tests
@@ -7789,6 +7823,66 @@ mod tests {
         assert!(
             ops.is_empty(),
             "standard vable getarrayitem should not emit ops"
+        );
+    }
+
+    #[test]
+    fn reload_vable_stack_keeps_resume_virtuals() {
+        let info = make_test_vable_info_with_vsd_array();
+        let fd24 = info.array_pointer_field_descr(0);
+        let adesc = info.array_item_descr(0);
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let vsd = recorder.record_input_arg(Type::Int);
+        let local0 = recorder.record_input_arg(Type::Ref);
+        let local1 = recorder.record_input_arg(Type::Ref);
+        let stack0 = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+
+        #[repr(C)]
+        struct Heap {
+            _pad: usize,
+            vsd: isize,
+            _pad2: usize,
+            array: *mut usize,
+        }
+        let mut items = [0x1000usize, 0x2000, 0x3000, 0];
+        let heap = Heap {
+            _pad: 0,
+            vsd: 3,
+            _pad2: 0,
+            array: items.as_mut_ptr(),
+        };
+        let heap_ptr = &heap as *const Heap as *const u8;
+
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            Value::Ref(majit_ir::GcRef(heap_ptr as usize)),
+            &[vsd, local0, local1, stack0],
+            &[
+                Value::Int(2),
+                Value::Ref(majit_ir::GcRef(0x10)),
+                Value::Ref(majit_ir::GcRef(0x20)),
+                Value::Ref(majit_ir::GcRef(0x30)),
+            ],
+            &[3],
+        );
+
+        ctx.reload_vable_stack_if_heap_moved();
+
+        let (r0, _) = ctx.vable_getarrayitem_ref_vable(vable, &fd24, 0, adesc.clone());
+        let (r1, _) = ctx.vable_getarrayitem_ref_vable(vable, &fd24, 1, adesc.clone());
+        assert_eq!(r0, local0, "local 0 must stay the resume Virtual");
+        assert_eq!(r1, local1, "local 1 must stay the resume Virtual");
+        let (r2, _) = ctx.vable_getarrayitem_ref_vable(vable, &fd24, 2, adesc);
+        assert!(
+            r2.is_constant(),
+            "newly pushed slot comes from the heap ConstPtr"
         );
     }
 
