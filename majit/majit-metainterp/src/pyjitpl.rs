@@ -27523,22 +27523,15 @@ mod tests {
             majit_ir::descr::make_field_descr(8, 8, Type::Int, majit_ir::descr::ArrayFlag::Signed);
         let _result = meta.opimpl_getfield_vable_int(0, nonstandard_vable, 0, fd8);
 
-        // pyjitpl.py _nonstandard_virtualizable falls through
-        // to Step 4 (PTR_EQ + implement_guard_value) and Step 5a
-        // (emit_force_virtualizable: GETFIELD_GC_R(token_descr) +
-        // PTR_NE(CONST_NULL) + COND_CALL) before Step 5b marks the box
-        // known. The COND_CALL tail is currently a TODO; the observable
-        // prefix is the four ops emitted by `nonstandard_virtualizable`,
-        // followed by the caller's GETFIELD_GC_I (the actual non-vable
-        // field read).
+        // `vinfo is fielddescr.get_vinfo()` is false for a plain FieldDescr,
+        // so Step 4 PTR_EQ is skipped. Step 5a still emits force, then the
+        // caller records GETFIELD_GC_I.
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 6);
-        assert_eq!(ops[0].opcode, OpCode::PtrEq); // Step 4: PTR_EQ
-        assert_eq!(ops[1].opcode, OpCode::GuardValue); // Step 4: implement_guard_value
-        assert_eq!(ops[2].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
-        assert_eq!(ops[3].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
-        assert_eq!(ops[4].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
-        assert_eq!(ops[5].opcode, OpCode::GetfieldGcI); // caller fallback
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
+        assert_eq!(ops[1].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
+        assert_eq!(ops[2].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
+        assert_eq!(ops[3].opcode, OpCode::GetfieldGcI); // caller fallback
     }
 
     #[test]
@@ -27562,21 +27555,15 @@ mod tests {
         let _result =
             meta.opimpl_getarrayitem_vable_int(0, nonstandard_vable, index, 1, fd24, adesc);
 
-        // pyjitpl.py _opimpl_getarrayitem_vable falls back to
-        // GETFIELD_GC_R(arraydescr) + GETARRAYITEM_GC_I(arraybox) when
-        // _nonstandard_virtualizable returns True. The four ops emitted
-        // by `_nonstandard_virtualizable` (Step 4 PTR_EQ + GUARD_VALUE
-        // and Step 5a GETFIELD_GC_R(token_descr) + PTR_NE) precede the
-        // caller's two-op fallback, totalling 6 ops.
+        // A descr with no vinfo skips Step 4. Step 5a plus the two-op
+        // heap fallback remain.
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 7);
-        assert_eq!(ops[0].opcode, OpCode::PtrEq); // Step 4: PTR_EQ
-        assert_eq!(ops[1].opcode, OpCode::GuardValue); // Step 4: implement_guard_value
-        assert_eq!(ops[2].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
-        assert_eq!(ops[3].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
-        assert_eq!(ops[4].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
-        assert_eq!(ops[5].opcode, OpCode::GetfieldGcR); // caller fallback: arraybox
-        assert_eq!(ops[6].opcode, OpCode::GetarrayitemGcI); // caller fallback: item read
+        assert_eq!(ops.len(), 5);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
+        assert_eq!(ops[1].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
+        assert_eq!(ops[2].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
+        assert_eq!(ops[3].opcode, OpCode::GetfieldGcR); // caller fallback: arraybox
+        assert_eq!(ops[4].opcode, OpCode::GetarrayitemGcI); // caller fallback: item read
     }
 
     #[test]

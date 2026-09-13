@@ -4346,11 +4346,11 @@ impl TraceCtx {
                 // vinfo; this is the structural mirror of upstream's Python
                 // `vinfo is fielddescr.get_vinfo()` identity check.
                 Some(ref m) => m.as_any().is::<VirtualizableInfo>(),
-                // Legacy by-value descriptor → no backref to compare
-                // against.  Treat as "matching" so the PTR_EQ/replace_box
-                // block still runs for test harnesses that pre-date
-                // `finalize_arc`.  Production pyre always stamps backrefs.
-                None => true,
+                // `vinfo is fielddescr.get_vinfo()` is false when the
+                // descr has no vinfo. Skip the PTR_EQ / replace_box arm
+                // and fall through to emit_force, same as a foreign
+                // jitdriver's fielddescr.
+                None => false,
             };
             if descriptor_has_matching_vinfo {
                 let standard_concrete = self.standard_virtualizable_concrete();
@@ -6945,6 +6945,32 @@ mod tests {
     /// `pyjitpl.py _nonstandard_virtualizable`: empty `virtualizable_boxes`
     /// is the `vinfo is None` arm of the standard-box gate. Step 5 still
     /// emits `emit_force_virtualizable` before returning True.
+    /// `pyjitpl.py _nonstandard_virtualizable`: `if vinfo is fielddescr.get_vinfo()`
+    /// is false when the descr has no vinfo. Do not PTR_EQ / replace_box.
+    #[test]
+    fn foreign_fielddescr_skips_standard_ptr_eq() {
+        let mut recorder = Trace::new();
+        let standard = recorder.record_input_arg(Type::Ref);
+        let other = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.virtualizable_boxes = Some(vec![standard]);
+        let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
+        let _ = ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, other, 0, fd8);
+        let ops = take_all_ops(ctx);
+        assert!(
+            ops.iter().all(|op| op.opcode != OpCode::PtrEq),
+            "a descr with no vinfo must not enter the PTR_EQ arm, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
+            "nonstandard getfield still records the heap load, got {ops:?}"
+        );
+    }
+
     #[test]
     fn empty_boxes_still_emits_force_virtualizable() {
         extern "C" fn clear_vable_noop(_vable: *mut u8) {}
