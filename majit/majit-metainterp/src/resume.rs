@@ -5829,20 +5829,20 @@ mod tests {
                 self.inner.get_box_replacement_not_const(opref)
             }
 
-            fn is_const(&self, opref: OpRef) -> bool {
-                self.inner.is_const(opref)
+            fn is_const(&self, box_: &majit_ir::operand::Operand) -> bool {
+                self.inner.is_const(box_)
             }
-            fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
-                self.inner.get_const(opref)
+            fn get_const(&self, box_: &majit_ir::operand::Operand) -> (i64, majit_ir::Type) {
+                self.inner.get_const(box_)
             }
             fn get_type(&self, opref: OpRef) -> majit_ir::Type {
                 self.inner.get_type(opref)
             }
-            fn is_virtual_ref(&self, opref: OpRef) -> bool {
-                self.inner.is_virtual_ref(opref)
+            fn is_virtual_ref(&self, box_: &majit_ir::operand::Operand) -> bool {
+                self.inner.is_virtual_ref(box_)
             }
-            fn is_virtual_raw(&self, opref: OpRef) -> bool {
-                self.inner.is_virtual_raw(opref)
+            fn is_virtual_raw(&self, box_: &majit_ir::operand::Operand) -> bool {
+                self.inner.is_virtual_raw(box_)
             }
             fn get_virtual_fields(&self, opref: OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
                 self.inner.get_virtual_fields(opref)

@@ -1058,7 +1058,8 @@ mod byte_snapshot_map_tests {
         }
         let decoded = rec.decode_captured_snapshots().unwrap();
         let actual = snapshot_map_from_byte_recorder(&rec, &mut Default::default());
-        let expected = snapshot_map_from_trace_snapshots(&decoded, &mut Default::default());
+        let expected =
+            snapshot_map_from_trace_snapshots(&decoded, &mut Default::default(), rec.inputargs());
         let values = |maps: &SnapshotBoxes| {
             maps.iter()
                 .map(|entry| {
