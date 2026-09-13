@@ -669,8 +669,8 @@ fn lower_result_exc_returns_inner(
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
         // call otherwise. RootScope closes (`drop_in_place` or the named
-        // `root_scope_close` residual) are re-emitted at the raise site rather
-        // than left in a tail the rewrite bypasses.
+        // `root_scope_close` residual) and FrameAnchor closes are re-emitted
+        // at the raise site rather than left in a tail the rewrite bypasses.
         let (forward_err, root_scope_closes): (Option<String>, Vec<OpKind>) = if is_err {
             match root_scope_closes_to_returnblock(graph, bi, &ctor_var) {
                 Ok(closes) => (None, closes),
@@ -3708,7 +3708,7 @@ fn remap_root_scope_close_through_links(
         result_ty,
     } = close
     else {
-        return Err(format!("{name}: expected a RootScope close call"));
+        return Err(format!("{name}: expected a shadow-stack bracket close"));
     };
     let mut remapped = Vec::with_capacity(args.len());
     for arg in args {
@@ -3780,7 +3780,7 @@ fn forwards_to_returnblock_inner(
             let carries_work = if past_bracket_closes {
                 !b.operations
                     .iter()
-                    .all(|op| crate::front::mir::is_root_scope_drop_glue_call(&op.kind))
+                    .all(|op| crate::front::mir::is_shadow_stack_bracket_close(&op.kind))
             } else {
                 !b.operations.is_empty()
             };
