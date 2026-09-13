@@ -30,7 +30,32 @@ mod jit_interp;
 mod jit_struct;
 mod virtualizable;
 
+fn gate_generated_items(
+    tokens: proc_macro2::TokenStream,
+    condition: &syn::Meta,
+) -> proc_macro2::TokenStream {
+    let mut file: syn::File = syn::parse2(tokens).expect("generated JIT items");
+    for item in &mut file.items {
+        let attrs = match item {
+            syn::Item::Fn(item) => &mut item.attrs,
+            syn::Item::Static(item) => &mut item.attrs,
+            syn::Item::Const(item) => &mut item.attrs,
+            syn::Item::Impl(item) => &mut item.attrs,
+            syn::Item::Struct(item) => &mut item.attrs,
+            syn::Item::Enum(item) => &mut item.attrs,
+            syn::Item::Type(item) => &mut item.attrs,
+            syn::Item::Use(item) => &mut item.attrs,
+            syn::Item::Macro(item) => &mut item.attrs,
+            syn::Item::Mod(item) => &mut item.attrs,
+            _ => unreachable!("unexpected generated JIT item"),
+        };
+        attrs.push(syn::parse_quote!(#[cfg(#condition)]));
+    }
+    quote!(#file)
+}
+
 struct JitInlineArgs {
+    trace_cfg: Option<syn::Meta>,
     calls: Vec<jit_interp::CallEntry>,
     ref_params: Vec<(Ident, Path)>,
     ref_fields: Vec<jit_interp::RefFieldEntry>,
@@ -46,6 +71,7 @@ struct JitInlineArgs {
 
 impl Parse for JitInlineArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut trace_cfg = None;
         let mut calls: Vec<jit_interp::CallEntry> = Vec::new();
         let mut ref_params: Vec<(Ident, Path)> = Vec::new();
         let mut ref_fields: Vec<jit_interp::RefFieldEntry> = Vec::new();
@@ -61,6 +87,11 @@ impl Parse for JitInlineArgs {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
+                "trace_cfg" => {
+                    let content;
+                    parenthesized!(content in input);
+                    trace_cfg = Some(content.parse()?);
+                }
                 "calls" => {
                     let content;
                     syn::braced!(content in input);
@@ -150,6 +181,7 @@ impl Parse for JitInlineArgs {
         )?;
 
         Ok(Self {
+            trace_cfg,
             calls,
             ref_params,
             ref_fields,
@@ -2943,7 +2975,43 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    expanded.into()
+    // rlib/jit.py hints leave ordinary interpreter execution intact without
+    // JIT translation. Keep the concrete helper in both builds; only its
+    // generated JitCode/ABI metadata requires the consumer's JIT feature.
+    if let Some(condition) = args.trace_cfg {
+        let mut file: syn::File = syn::parse2(expanded).expect("generated inline helper items");
+        for item in file.items.iter_mut().skip(1) {
+            let attrs = match item {
+                syn::Item::Fn(item) => &mut item.attrs,
+                syn::Item::Static(item) => &mut item.attrs,
+                _ => unreachable!("unexpected inline helper metadata item"),
+            };
+            attrs.push(syn::parse_quote!(#[cfg(#condition)]));
+        }
+        // `#[jit_module]` always emits `__majit_helper_trace_fnaddrs`,
+        // which calls `__majit_call_policy_<helper>`. Keep a stub when
+        // tracing is compiled out so a non-JIT build still resolves.
+        let unsupported = jit_interp::call_policy_byte::UNSUPPORTED;
+        quote! {
+            #file
+            #[cfg(not(#condition))]
+            #[doc(hidden)]
+            #[allow(non_snake_case)]
+            #vis fn #policy_name() -> (u8, *const (), *const (), *const (), *const (), i32) {
+                (
+                    #unsupported,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0i32,
+                )
+            }
+        }
+        .into()
+    } else {
+        expanded.into()
+    }
 }
 
 /// Auto-generate trace_instruction and JitState from an interpreter's dispatch loop.

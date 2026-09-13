@@ -559,6 +559,9 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let member_name = named_member(&field.member)?;
+        if config.vable_fields.contains_key(&member_name) {
+            return self.lower_vable_field_write(expr);
+        }
         if let Some(&field_index) = config.state_scalars.get(&member_name) {
             let fi = field_index as u16;
             let binding = self.lower_value_expr(&assign.right)?;
@@ -635,10 +638,27 @@ impl<'c> Lowerer<'c> {
                 binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
             );
             let fi = field_index as u16;
-            self.emit_op(
-                OpMeta::linear(OpKind::StateField, vec![Register::int(dst)], vec![]),
-                quote! { __builder.store_state_field(#fi, #dst); },
-            );
+            if let Some(&(index, _)) = config.vable_fields.get(&member_name) {
+                let base = self.vable_base_reg()?;
+                let index = index as u16;
+                self.emit_op(
+                    OpMeta::live_marker(),
+                    quote! { let _ = __builder.live_placeholder(); },
+                );
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::Vable,
+                        vec![Register::ref_(base), Register::int(dst)],
+                        vec![],
+                    ),
+                    quote! { __builder.vable_setfield_int_with_base(#base, #index, #dst); },
+                );
+            } else {
+                self.emit_op(
+                    OpMeta::linear(OpKind::StateField, vec![Register::int(dst)], vec![]),
+                    quote! { __builder.store_state_field(#fi, #dst); },
+                );
+            }
             return Some(());
         }
 
@@ -661,10 +681,27 @@ impl<'c> Lowerer<'c> {
             binop_f_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
         );
         let fi = field_index as u16;
-        self.emit_op(
-            OpMeta::linear(OpKind::StateField, vec![Register::float(dst)], vec![]),
-            quote! { __builder.store_state_field_float(#fi, #dst); },
-        );
+        if let Some(&(index, _)) = config.vable_fields.get(&member_name) {
+            let base = self.vable_base_reg()?;
+            let index = index as u16;
+            self.emit_op(
+                OpMeta::live_marker(),
+                quote! { let _ = __builder.live_placeholder(); },
+            );
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(base), Register::float(dst)],
+                    vec![],
+                ),
+                quote! { __builder.vable_setfield_float_with_base(#base, #index, #dst); },
+            );
+        } else {
+            self.emit_op(
+                OpMeta::linear(OpKind::StateField, vec![Register::float(dst)], vec![]),
+                quote! { __builder.store_state_field_float(#fi, #dst); },
+            );
+        }
         Some(())
     }
 
@@ -892,7 +929,10 @@ impl<'c> Lowerer<'c> {
                     reg,
                     kind,
                     depends_on_stack: false,
-                    struct_type: None,
+                    struct_type: config
+                        .state_ref_scalars
+                        .get(&member_name)
+                        .map(|(_, path)| path.clone()),
                 });
             }
         }
@@ -1039,6 +1079,9 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let member_name = named_member(&field.member)?;
+        if config.vable_fields.contains_key(&member_name) {
+            return self.lower_vable_field_read(expr);
+        }
         if let Some(&field_index) = config.state_scalars.get(&member_name) {
             let fi = field_index as u16;
             let reg = self.alloc_reg();
@@ -2223,6 +2266,50 @@ mod tests {
         let struct_path: syn::Path = syn::parse_str("Stack").expect("struct path");
         let member: syn::Member = syn::parse_str("head").expect("member");
         ref_field_witness_tokens(&map, key, &struct_path, &member).to_string()
+    }
+
+    #[test]
+    fn a_void_dispatch_callee_has_an_explicit_return() {
+        let body: Expr = syn::parse_quote!({
+            let value = 1;
+        });
+        let (generated, _) =
+            try_generate_jitcode_body_parts_with_caller_bindings(&body, None, &[]).unwrap();
+        assert!(
+            generated
+                .body
+                .to_string()
+                .ends_with("__builder . void_return () ;")
+        );
+    }
+
+    #[test]
+    fn state_scalar_liveness_uses_the_callee_frame() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("state".to_string());
+        config.vable_input_ref_reg = Some(0);
+        config
+            .state_ref_scalars
+            .insert("selected_ref".into(), (0, syn::parse_quote!(ListBase)));
+        config
+            .vable_fields
+            .insert("selected_ref".into(), (0, ValueKind::Ref));
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.install_vable_input_binding();
+        let expr: Expr = syn::parse_quote!(state.selected_ref);
+        let binding = lowerer.lower_state_field_read(&expr).unwrap();
+        assert_eq!(binding.kind, BindingKind::Ref);
+        assert_eq!(binding.struct_type.unwrap(), syn::parse_quote!(ListBase));
+        let read = lowerer.op_metadata.last().unwrap();
+        assert_eq!(read.reads, vec![Register::ref_(0)]);
+        let live = compute_per_marker_liveness(&lowerer.op_metadata);
+        assert_eq!(live[0], BTreeSet::from([Register::ref_(0)]));
+        assert!(
+            !lowerer
+                .statements
+                .iter()
+                .any(|op| op.to_string().contains("load_state_field_ref"))
+        );
     }
 
     #[test]

@@ -243,6 +243,12 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
         }
     }
 
+    // flatten.py GraphFlattener.make_return emits void_return for a void
+    // return block. Reaching the end of the bytecode is not a frame return.
+    lowerer.emit_op(
+        OpMeta::terminal(Vec::new()),
+        quote! { __builder.void_return(); },
+    );
     annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
     remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
     rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);

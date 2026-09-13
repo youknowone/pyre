@@ -241,7 +241,7 @@ pub enum RuntimeBhDescr {
     Descr(Box<CanonicalBhDescr>),
     /// Ordinary blackhole descriptor paired with the optimizer descriptor
     /// that the same `d` operand denotes while tracing.  RPython stores the
-    /// `FieldDescr` object itself in `Assembler.descrs`; its blackhole and
+    /// descriptor object itself in `Assembler.descrs`; its blackhole and
     /// metainterp consumers therefore reuse one object.  Pyre's serialized
     /// [`CanonicalBhDescr`] is the blackhole-facing half, so resolve the
     /// optimizer-facing object once when the runtime pool is finalized and
@@ -300,15 +300,17 @@ impl RuntimeBhDescr {
             Self::ResolvedDescr {
                 canonical,
                 optimizer,
-            } => Some(
-                optimizer
-                    .get_or_init(|| crate::pyjitpl::dispatch::field_descr_ref_from_bh(canonical).1),
-            ),
+            } => Some(optimizer.get_or_init(|| match canonical.as_ref() {
+                CanonicalBhDescr::Call { calldescr } => {
+                    crate::call_descr::call_descr_from_bh(calldescr)
+                }
+                _ => crate::pyjitpl::dispatch::field_descr_ref_from_bh(canonical).1,
+            })),
             _ => None,
         }
     }
 
-    /// Finalize a field entry after its canonical parent layout has been
+    /// Finalize a descriptor entry after its canonical parent layout has been
     /// patched.  Mirrors `Assembler.descrs` in RPython: resolution happens
     /// once per descriptor object, not once per executed field opcode.
     ///
@@ -319,7 +321,10 @@ impl RuntimeBhDescr {
     pub(crate) fn into_resolved(self) -> Self {
         match self {
             Self::Descr(canonical)
-                if matches!(canonical.as_ref(), CanonicalBhDescr::Field { .. }) =>
+                if matches!(
+                    canonical.as_ref(),
+                    CanonicalBhDescr::Field { .. } | CanonicalBhDescr::Call { .. }
+                ) =>
             {
                 Self::ResolvedDescr {
                     canonical,
@@ -1156,6 +1161,46 @@ pub(crate) fn read_u16(code: &[u8], cursor: &mut usize) -> u16 {
 mod tests {
     use super::*;
     use majit_translate::jitcode::{JitCode as BuildJitCode, JitCodeBody as BuildJitCodeBody};
+
+    #[test]
+    fn resolved_call_entry_reuses_its_descriptor_and_preserves_result_abi() {
+        for result_class in ['i', 'r', 'f', 'S', 'L', 'v'] {
+            let bh = CanonicalBhCallDescr::from_arg_classes(
+                "ir".to_owned(),
+                result_class,
+                crate::call_descr::default_effect_info(),
+            );
+            let signed = bh.result_signed;
+            let size = bh.result_size;
+            let entry = RuntimeBhDescr::Descr(Box::new(CanonicalBhDescr::Call { calldescr: bh }))
+                .into_resolved();
+            let first = entry
+                .as_optimizer_descr()
+                .expect("call pool entry must be resolved");
+            let again = entry.as_optimizer_descr().unwrap();
+            assert!(std::sync::Arc::ptr_eq(first, again));
+            let cd = first.as_call_descr().unwrap();
+            assert_eq!(cd.arg_classes(), "ir");
+            assert_eq!(cd.result_class(), result_class);
+            assert_eq!(cd.is_result_signed(), signed);
+            assert_eq!(cd.result_size(), size);
+        }
+    }
+
+    #[test]
+    fn resolved_void_call_keeps_the_ignored_word_return_abi() {
+        let mut bh = CanonicalBhCallDescr::from_arg_classes(
+            "i".to_owned(),
+            'v',
+            crate::call_descr::default_effect_info(),
+        );
+        bh.void_word_abi = true;
+        let entry = RuntimeBhDescr::Descr(Box::new(CanonicalBhDescr::Call { calldescr: bh }))
+            .into_resolved();
+        let cd = entry.as_optimizer_descr().unwrap().as_call_descr().unwrap();
+        assert_eq!(cd.result_class(), 'v');
+        assert_eq!(cd.result_size(), 8);
+    }
 
     /// `register_dispatch_jitcode` refuses a portal whose `exec` does not say
     /// where its marker is, and only the encoder can say: an operand byte may

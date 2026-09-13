@@ -1612,9 +1612,8 @@ impl ProducedShortOp {
             .collect::<Option<Vec<_>>>()?;
         // shortpreamble.py: PureOp.produce_op routes through
         // `optpure.pure(...)` (or `extra_call_pure` for calls). majit's
-        // single-table `imported_short_pure_ops` covers both because
-        // `pure.rs` consults it for both arms during `optimize_pure_op` and
-        // `optimize_call_pure_*`.
+        // staging list `imported_short_pure_ops` covers both; the optimizer
+        // installs them in OptPure's respective caches before propagation.
         // shortpreamble.py `PreambleOp(op, preamble_op, ...)` — the
         // replay op is the SAME object ShortPreambleBuilder.__init__
         // seeded (one ResOperation per short box, threaded end to end).

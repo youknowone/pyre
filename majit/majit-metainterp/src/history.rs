@@ -3709,7 +3709,7 @@ impl TraceCtx {
     /// per call.  The previous escape-only path
     /// (`_escape_argboxes + invalidate_caches_for_escaped`) skipped
     /// those branches.
-    fn record_call_with_descr(
+    pub(crate) fn record_call_with_descr(
         &mut self,
         opcode: OpCode,
         func_ptr: *const (),

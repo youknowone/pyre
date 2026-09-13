@@ -25,9 +25,10 @@ fn expected(limit: i64) -> i64 {
 }
 
 /// A fixed `[int]` array between the loop-dead `int` scalar and the
-/// `[int; virt]` array. `extract_live` emits `[ret, cells[0], cells[1],
-/// identity]`, so the identity is at flat slot 3 — not at `num_scalars` (1),
-/// and not at 0.
+/// `[int; virt]` array. `ret` sits on the virtualizable with `iregs`
+/// (`virtualizable.py VirtualizableInfo.__init__`), so `extract_live`
+/// emits `[cells[0], cells[1], identity]`. The identity is at flat slot
+/// 2 — not at 0.
 mod fixed_array_before_virt_array {
     use super::{AtomicU32, Bytecode, OP_ACC, OP_INC, OP_JUMP_BACK, OP_RETURN, Ordering};
     use majit_metainterp::JitState as _;
@@ -104,11 +105,9 @@ mod fixed_array_before_virt_array {
         state.ret
     }
 
-    /// Ground truth for the slot the identity occupies, in the same shape
-    /// `jit_interp_float_state_field.rs`
-    /// `the_entry_contract_carries_no_element_in_its_red_block` pins: int
-    /// scalars, then every fixed array's cells, then the identity. No `iregs`
-    /// element belongs in the red block.
+    /// Ground truth for the slot the identity occupies. `ret` is a
+    /// virtualizable static, so the red block is the fixed array's cells
+    /// then the identity. No `iregs` element belongs in the red block.
     #[test]
     fn the_identity_sits_past_the_fixed_array_cells() {
         let state = FixedAndVirt {
@@ -122,16 +121,14 @@ mod fixed_array_before_virt_array {
         assert_eq!(
             state.live_value_types(&meta),
             vec![
-                majit_ir::Type::Int, // ret
                 majit_ir::Type::Int, // cells[0]
                 majit_ir::Type::Int, // cells[1]
                 majit_ir::Type::Ref, // __vable_identity
             ],
             "the identity must follow the fixed array's cells, so its flat slot \
-             is `num_scalars + cells.len()` = 3 — neither `num_scalars` (1) nor \
-             the legacy frame-first 0",
+             is `cells.len()` = 2 — not the legacy frame-first 0",
         );
-        assert_eq!(state.extract_live(&meta).len(), 4);
+        assert_eq!(state.extract_live(&meta).len(), 3);
     }
 
     #[test]

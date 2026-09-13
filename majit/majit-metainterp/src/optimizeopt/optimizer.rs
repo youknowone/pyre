@@ -200,7 +200,7 @@ pub trait Optimization {
     /// Transfer imported PreambleOp entries from OptContext to this pass.
     /// RPython calls `opt.optimizer.optpure` directly during produce_op.
     /// In majit, the Optimization trait mediates this transfer.
-    fn install_preamble_pure_ops(&mut self, _ctx: &OptContext) {}
+    fn install_preamble_pure_ops(&mut self, _ctx: &mut OptContext) {}
 
     /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
     fn export_arg_int_bounds(
@@ -1951,7 +1951,11 @@ impl Optimizer {
     /// Mirrors force_box_inline (mod.rs) contract.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // optimizer.py: op = get_box_replacement(op)
-        let resolved = ctx.get_replacement_opref(opref);
+        if opref.is_constant() {
+            return opref;
+        }
+        let resolved_op = ctx.get_box_replacement_operand_opt(opref);
+        let resolved = resolved_op.as_ref().map_or(opref, |op| op.to_opref());
         // optimizer.py:351-359: potential_extra_ops.pop(op) → sb.add_preamble_op.
         // The pool is keyed by the pure op's result Box. When that result
         // folded to an inline Const, the Const can never be a pool key (the
@@ -1991,15 +1995,14 @@ impl Optimizer {
         // A forced operand whose IntBound is already constant materializes as a
         // ConstInt before the virtual-force branch. Read the bound without
         // installing one (peek), so a plain int box keeps flowing unchanged.
-        if let Some(rb) = ctx.get_box_replacement_operand_opt(resolved)
+        if let Some(rb) = resolved_op.as_ref()
             && rb.const_value().is_none()
             && rb.type_() == majit_ir::Type::Int
-            && let Some(bound) = ctx.peek_intbound_box(&rb)
+            && let Some(bound) = ctx.peek_intbound_box(rb)
             && bound.is_constant()
         {
             return ctx.make_constant_int(bound.get_constant_int());
         }
-        let resolved_op = ctx.get_box_replacement_operand_opt(opref);
         if resolved_op.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
             // Virtualizable represents an existing heap object with tracked
             // fields — not a deferred allocation. force_box must not take
@@ -2951,7 +2954,7 @@ impl Optimizer {
         // to the OptPure pass here (matching RPython's produce_op timing).
         if !ctx.imported_short_pure_ops.is_empty() {
             for pass in &mut self.passes {
-                pass.install_preamble_pure_ops(&ctx);
+                pass.install_preamble_pure_ops(&mut ctx);
             }
         }
 
@@ -5129,7 +5132,7 @@ impl Optimizer {
         // ops and get_producing_op consumers can read info off op.arg(i) —
         // the same canonicalization the pass-entry resolver applies.
         for i in 0..op.num_args() {
-            let original_arg = op.arg(i).clone();
+            let original_arg = op.arg(i);
             let forced = self.force_box(original_arg.to_opref(), ctx);
             self.flush_queued_producer(forced, ctx)?;
             let resolved = if original_arg.is_constant() && original_arg.to_opref() == forced {
@@ -5711,7 +5714,17 @@ impl Optimizer {
                     && let Some(resolved) =
                         ctx.get_box_replacement_not_const_operand(&fail_args[fa_idx])
                 {
-                    fail_args[fa_idx] = resolved;
+                    // optimizer.py:768-774: finish() must not hand
+                    // store_final_boxes the same box twice. Two fail_args
+                    // can forward to one InputArg after identity
+                    // unification; keep the later slot's original so the
+                    // list stays unique.
+                    let collides = fail_args.iter().enumerate().any(|(j, other)| {
+                        j != fa_idx && !other.is_none() && other.same_box(&resolved)
+                    });
+                    if !collides {
+                        fail_args[fa_idx] = resolved;
+                    }
                 }
             }
         }

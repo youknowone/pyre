@@ -273,7 +273,7 @@ impl CachedField {
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
         // info.py:212-214: return self._fields[fielddescr.get_index()]
         let struct_box = ctx.get_box_replacement_operand_opt(struct_opref);
-        if let Some(info) = struct_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
+        if let Some(info) = struct_box.as_ref().and_then(Operand::ptr_info)
             && let Some(entry) = info.getfield(field_idx)
         {
             return Some(entry);
@@ -340,8 +340,8 @@ impl CachedField {
         let b1 = ctx.get_box_replacement_operand_opt(opref1);
         let b2 = ctx.get_box_replacement_operand_opt(opref2);
         let (Some(info1), Some(info2)) = (
-            b1.as_ref().and_then(|b| ctx.peek_ptr_info(b)),
-            b2.as_ref().and_then(|b| ctx.peek_ptr_info(b)),
+            b1.as_ref().and_then(Operand::ptr_info),
+            b2.as_ref().and_then(Operand::ptr_info),
         ) else {
             return false;
         };
@@ -427,7 +427,7 @@ impl CachedField {
             }
             let cached_val = match structbox_box
                 .as_ref()
-                .and_then(|b| ctx.peek_ptr_info(b))
+                .and_then(Operand::ptr_info)
                 .and_then(|info| info.getfield(descr_idx))
                 .map(|entry| entry.as_seen_opref())
                 .or_else(|| {
@@ -518,11 +518,11 @@ impl ArrayCachedItem {
         // heap.py:269-274: both must be ArrayPtrInfo with known_ne lenbounds
         let b1 = ctx.get_box_replacement_operand_opt(opref1);
         let b2 = ctx.get_box_replacement_operand_opt(opref2);
-        let len1 = match b1.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        let len1 = match b1.as_ref().and_then(Operand::ptr_info).as_deref() {
             Some(PtrInfo::Array(v)) => v.lenbound.clone(),
             _ => return false,
         };
-        let len2 = match b2.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+        let len2 = match b2.as_ref().and_then(Operand::ptr_info).as_deref() {
             Some(PtrInfo::Array(v)) => v.lenbound.clone(),
             _ => return false,
         };
@@ -531,20 +531,23 @@ impl ArrayCachedItem {
 
     /// heap.py ArrayCachedItem._cannot_alias_via_content
     fn _cannot_alias_via_content(opref1: OpRef, opref2: OpRef, ctx: &mut OptContext) -> bool {
-        use crate::optimizeopt::info::{FieldEntry, PtrInfo};
+        use crate::optimizeopt::info::PtrInfo;
         // heap.py:279-282: isinstance(opinfo, ArrayPtrInfo)
         // info.py all_items() returns _items (the dense list, None slots included).
-        // Clone to avoid borrow conflict with ctx below.
+        // The comparisons only read forwarding, so retain the info borrows
+        // instead of copying both arrays before reading their items.
         let b1 = ctx.get_box_replacement_operand_opt(opref1);
         let b2 = ctx.get_box_replacement_operand_opt(opref2);
-        let items1: Vec<FieldEntry> = match b1.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
-            Some(PtrInfo::Array(a)) => a.items.clone(),
-            _ => return false,
+        let (Some(info1), Some(info2)) = (
+            b1.as_ref().and_then(Operand::ptr_info),
+            b2.as_ref().and_then(Operand::ptr_info),
+        ) else {
+            return false;
         };
-        let items2: Vec<FieldEntry> = match b2.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
-            Some(PtrInfo::Array(a)) => a.items.clone(),
-            _ => return false,
+        let (PtrInfo::Array(a1), PtrInfo::Array(a2)) = (&*info1, &*info2) else {
+            return false;
         };
+        let (items1, items2) = (&a1.items, &a2.items);
         // heap.py:288-298: slot-by-slot comparison preserving index alignment.
         // None/Preamble slots are kept at their original positions.
         let len = items1.len().min(items2.len());
@@ -618,7 +621,7 @@ impl ArrayCachedItem {
         }
         let idx = self.index as usize;
         let array_box = ctx.get_box_replacement_operand_opt(array_opref);
-        if let Some(info) = array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
+        if let Some(info) = array_box.as_ref().and_then(Operand::ptr_info)
             && let Some(entry) = info.getitem(idx)
         {
             return Some(entry);
@@ -682,7 +685,7 @@ impl ArrayCachedItem {
             }
             let cached_val = match arraybox_box
                 .as_ref()
-                .and_then(|b| ctx.peek_ptr_info(b))
+                .and_then(Operand::ptr_info)
                 .and_then(|info| info.getitem(self.index as usize))
                 .map(|entry| entry.as_seen_opref())
                 .or_else(|| {
@@ -3852,7 +3855,7 @@ impl Optimization for OptHeap {
                 let resolved_box = ctx.resolve_operand_operand_opt(obj);
                 let Some(val) = resolved_box
                     .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b))
+                    .and_then(Operand::ptr_info)
                     .and_then(|info| info.getfield(*field_idx))
                     .map(|entry| entry.as_seen_opref())
                     .or_else(|| {
@@ -3917,7 +3920,7 @@ impl Optimization for OptHeap {
             let resolved_has_info = ctx
                 .get_box_replacement_operand_opt(*box1)
                 .as_ref()
-                .and_then(|b| ctx.peek_ptr_info(b))
+                .and_then(Operand::ptr_info)
                 .is_some_and(|info| info.is_abstract_virtual_ptr_info());
             let needs_install = ctx
                 .get_box_replacement_operand_opt(resolved)
@@ -3983,7 +3986,7 @@ impl Optimization for OptHeap {
                     // heap.py:860: box2 = arrayinfo.getitem(descr, index)
                     let Some(val) = resolved_box
                         .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b))
+                        .and_then(Operand::ptr_info)
                         .and_then(|info| info.getitem(index as usize))
                         .map(|entry| entry.as_seen_opref())
                         .or_else(|| {
@@ -4037,7 +4040,7 @@ impl Optimization for OptHeap {
             let resolved_has_info = ctx
                 .get_box_replacement_operand_opt(*box1)
                 .as_ref()
-                .and_then(|b| ctx.peek_ptr_info(b))
+                .and_then(Operand::ptr_info)
                 .is_some_and(|info| info.is_abstract_virtual_ptr_info());
             let needs_install = ctx
                 .get_box_replacement_operand_opt(resolved)
@@ -7908,14 +7911,15 @@ mod tests {
     #[test]
     fn test_arraylen_caching_via_optpure() {
         let d = descr(42);
+        let array = rooted_inputarg_operand(Type::Ref, 100);
         let mut ops = vec![
             {
-                let mut op = Op::new(OpCode::ArraylenGc, &[rooted_resop_operand(Type::Int, 100)]);
+                let mut op = Op::new(OpCode::ArraylenGc, &[array.clone()]);
                 op.setdescr(d.clone());
                 op
             },
             {
-                let mut op = Op::new(OpCode::ArraylenGc, &[rooted_resop_operand(Type::Int, 100)]);
+                let mut op = Op::new(OpCode::ArraylenGc, &[array]);
                 op.setdescr(d);
                 op
             },

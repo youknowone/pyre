@@ -359,6 +359,20 @@ cover the condition they diagnose.
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_LOG_OPS`
+
+- Read sites: 1 — `majit/majit-backend-dynasm/src/lib.rs`
+- Accessor: `majit_ops_log_enabled()`
+- What it does: Logs backend emission events (`[dynasm] emit/discard/guard`) without enabling per-execution `MAJIT_LOG` diagnostics. The version marker lets census consumers reject an older binary rather than treating a missing option as zero ops.
+- Retirement condition: Remove when ordinary tests cover emission-shape checks without an env-gated log.
+
+### `MAJIT_LOG_TEST_CHILD`
+
+- Read sites: 1 — `majit/majit-backend-dynasm/tests/ops_log.rs`
+- Accessor: read inline in `log_probe` / `emission_logging_is_independent_and_announces_its_version_once`
+- What it does: Marks the child process that `ops_log.rs` respawns so the probe can set `MAJIT_LOG_OPS` / `MAJIT_LOG` without the parent test inheriting them.
+- Retirement condition: Remove with the `ops_log` isolation test.
+
 ### `MAJIT_MACRO_DEBUG`
 
 - Read sites: 8 — `majit/majit-macros/src/jit_interp/jitcode_lower/dispatch.rs`, `majit/majit-macros/src/jit_interp/jitcode_lower/lower_stmt.rs`

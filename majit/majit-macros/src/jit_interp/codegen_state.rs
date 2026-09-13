@@ -79,7 +79,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
     // Separate int scalars, flattened arrays, virtualizable arrays, float scalars,
     // and ref scalars.
-    let scalars: Vec<_> = sf
+    let mut scalars: Vec<_> = sf
         .fields
         .iter()
         .enumerate()
@@ -112,13 +112,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .enumerate()
         .filter(|(_, f)| matches!(f.kind, StateFieldKind::VirtArray(_)))
         .collect();
-    let ref_scalars: Vec<_> = sf
+    let mut ref_scalars: Vec<_> = sf
         .fields
         .iter()
         .enumerate()
         .filter(|(_, f)| matches!(f.kind, StateFieldKind::Ref(_)))
         .collect();
-    let float_scalars: Vec<_> = sf
+    let mut float_scalars: Vec<_> = sf
         .fields
         .iter()
         .enumerate()
@@ -126,6 +126,29 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             matches!(&f.kind, StateFieldKind::Scalar { ir_type, .. } if ir_type == "float")
         })
         .collect();
+    // virtualizable.py VirtualizableInfo.__init__: scalar fields belong to
+    // the same object as its arrays, not to an independent set of JitDriver reds.
+    let declared_scalars = scalars.clone();
+    let declared_ref_count = ref_scalars.len();
+    let declared_float_count = float_scalars.len();
+    let vable_scalars: Vec<_> = if virt_arrays.is_empty() {
+        Vec::new()
+    } else {
+        sf.fields
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.kind,
+                    StateFieldKind::Scalar { .. } | StateFieldKind::Ref(_)
+                )
+            })
+            .collect()
+    };
+    if !virt_arrays.is_empty() {
+        scalars.clear();
+        ref_scalars.clear();
+        float_scalars.clear();
+    }
     // opaque(T) fields are pass-through carriers the JIT never enumerates as
     // inputargs and never reconstructs.  A fresh recursive-portal frame cannot
     // synthesize an arbitrary `T` generically, so any state shape carrying one
@@ -751,7 +774,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // `<arr>_len_value` (seeded at `JitState::initialize_sym`).  The whole
     // struct equals `state_fields`, so these inits build a complete fresh
     // `#state_type`.
-    let fresh_entry_scalar_inits: Vec<TokenStream> = scalars
+    let fresh_entry_scalar_inits: Vec<TokenStream> = declared_scalars
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
@@ -826,7 +849,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // opaque fields).  Other shapes fall back to the `JitCodeSym` default
     // (`None`) and the recursive dispatcher aborts to the interpreter.
     let recursive_fresh_entry_reds_override: TokenStream =
-        if num_ref_scalars == 0 && num_float_scalars == 0 && opaque_fields.is_empty() {
+        if declared_ref_count == 0 && declared_float_count == 0 && opaque_fields.is_empty() {
             quote! {
                 fn recursive_fresh_entry_reds(
                     &self,
@@ -855,7 +878,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
     let recursive_fresh_entry_vable_capacities_override: TokenStream =
-        if num_ref_scalars == 0 && num_float_scalars == 0 && opaque_fields.is_empty() {
+        if declared_ref_count == 0 && declared_float_count == 0 && opaque_fields.is_empty() {
             quote! {
                 fn recursive_fresh_entry_vable_capacities(&self) -> Option<Vec<i64>> {
                     let mut __capacities = Vec::new();
@@ -877,11 +900,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // opaque carriers, no fixed arrays, exactly one virt array (the `tl`
     // storage shape).  Other shapes leave `recursive_fresh_alloc_free_targets`
     // at its `None` default so the dispatcher aborts.
-    let supports_fresh_alloc = num_ref_scalars == 0
+    let supports_fresh_alloc = declared_ref_count == 0
         && opaque_fields.is_empty()
         && arrays.is_empty()
         && num_virt_arrays == 1;
-    if supports_fresh_alloc && num_float_scalars > 0 {
+    if supports_fresh_alloc && declared_float_count > 0 {
         return quote! {
             compile_error!(
                 "state_fields float scalars are not supported with recursive portal fresh allocation yet"
@@ -2111,10 +2134,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     };
 
     // ── VirtualizableInfo / heap-ptr overrides for `[int; virt]` arrays ──
-    // Each virt array becomes a standard-virtualizable array field on a
-    // zero-static-field vinfo, so `state.<arr>[i]` lowers through the
-    // `virtualizable_boxes` devirt path. Scalars stay in the state-field
-    // scalar resume mechanism (disjoint from the array restore).
+    // Scalars and arrays share one standard virtualizable. Its field boxes
+    // follow the identity red in the resume stream (virtualizable.py read_boxes).
     //
     // Which storage the field registers as is the declared field type's to say,
     // not this expansion's: `register_virt_array_field` resolves it from the
@@ -2123,6 +2144,46 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // fixed payload offset can be reloaded by `compile.py:441-457`, and a `Vec`
     // embedded by value is not one.
     let build_vinfo_override: TokenStream = if num_virt_arrays > 0 {
+        let scalar_field_parts: Vec<_> = vable_scalars
+            .iter()
+            .map(|f| {
+                let name = &f.name;
+                let (kind, ty, signed) = match &f.kind {
+                    StateFieldKind::Ref(_) => {
+                        (quote!(majit_ir::Type::Ref), quote!(usize), quote!(false))
+                    }
+                    StateFieldKind::Scalar { ir_type, .. } if ir_type == "float" => {
+                        let ty = scalar_rust_type(&f.kind);
+                        (quote!(majit_ir::Type::Float), ty, quote!(false))
+                    }
+                    _ => {
+                        let ty = scalar_rust_type(&f.kind);
+                        (
+                            quote!(majit_ir::Type::Int),
+                            ty.clone(),
+                            quote!(<#ty>::MIN != 0),
+                        )
+                    }
+                };
+                quote! {
+                    __info.add_field_sized(stringify!(#name), #kind,
+                        ::std::mem::offset_of!(#state_type, #name),
+                        ::std::mem::size_of::<#ty>(), #signed);
+                }
+            })
+            .collect();
+        let scalar_export_parts: Vec<_> = vable_scalars
+            .iter()
+            .map(|f| {
+                let name = &f.name;
+                match &f.kind {
+                    StateFieldKind::Scalar { ir_type, .. } if ir_type == "float" => {
+                        quote!((self.#name as f64).to_bits() as i64)
+                    }
+                    _ => quote!(self.#name as i64),
+                }
+            })
+            .collect();
         // Per virt array: nested data-ptr/len extractor fns + a registration
         // keyed on the field byte offset.
         let virt_array_field_parts: Vec<TokenStream> = virt_arrays
@@ -2249,6 +2310,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // resolve to 0, the slot the green ref occupies).
                 __info.identity_ref_bank_index = Some(1);
                 #identity_live_index_stmt
+                #(#scalar_field_parts)*
                 #(#virt_array_field_parts)*
                 Some(__info.finalize_arc(
                     majit_ir::descr::make_size_descr(::std::mem::size_of::<#state_type>()),
@@ -2337,20 +2399,15 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // `initialize_virtualizable` at trace start and carried as
                 // loop inputargs; re-entry must re-supply them in
                 // `flatten_virtualizable_values` order (statics then arrays,
-                // each array ascending). Static boxes is empty: scalars stay
-                // in the state-field scalar resume mechanism — only
-                // `[int; virt]` arrays are virtualized via the vable.
-                let __static_boxes: ::std::vec::Vec<i64> = ::std::vec::Vec::new();
+                // each array ascending).
+                let __static_boxes = ::std::vec![#(#scalar_export_parts),*];
                 let __array_boxes: ::std::vec::Vec<::std::vec::Vec<i64>> = ::std::vec![
                     #( #virt_array_export_parts ),*
                 ];
                 Some((__static_boxes, __array_boxes))
             }
 
-            // Same export into buffers the driver reuses. Statics stays empty
-            // for the reason above, so only the arrays are written; the outer
-            // `Vec` is resized rather than rebuilt so the inner element
-            // storage survives across entries.
+            // Export into driver-owned buffers, preserving their capacity.
             fn export_virtualizable_boxes_into(
                 &self,
                 _meta: &Self::Meta,
@@ -2359,6 +2416,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 _statics: &mut ::std::vec::Vec<i64>,
                 arrays: &mut ::std::vec::Vec<::std::vec::Vec<i64>>,
             ) -> bool {
+                // A virt-array-only state has no static boxes, so this
+                // slice is empty. `extend([])` cannot pick `Extend<i64>`
+                // over `Extend<&i64>`; `extend_from_slice` names `&[i64]`.
+                _statics.extend_from_slice(&[#(#scalar_export_parts),*]);
                 arrays.resize_with(#num_virt_arrays, ::std::vec::Vec::new);
                 #( #virt_array_export_into_parts )*
                 true

@@ -2757,7 +2757,7 @@ impl<'a> Assembler386<'a> {
 
         let mut fail_index = 0u32;
 
-        if crate::majit_log_enabled() {
+        if crate::majit_ops_log_enabled() {
             eprintln!(
                 "[dynasm] _assemble: {} ops → {} ra_ops, frame_depth={}",
                 ops.len(),
@@ -2790,7 +2790,7 @@ impl<'a> Assembler386<'a> {
                     gcmap,
                 } => {
                     let op = &ops[*op_index];
-                    if crate::majit_log_enabled() {
+                    if crate::majit_ops_log_enabled() {
                         let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
                         eprintln!(
                             "[dynasm] emit[{}]: {:?} args=[{}] result={:?}",
@@ -2850,7 +2850,7 @@ impl<'a> Assembler386<'a> {
                 } => {
                     let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
                     let op = &ops[*op_index];
-                    if crate::majit_log_enabled() {
+                    if crate::majit_ops_log_enabled() {
                         eprintln!(
                             "[dynasm] guard[{}]: {:?} args=[{}] faillocs={}",
                             op_index,
@@ -2967,7 +2967,7 @@ impl<'a> Assembler386<'a> {
 
     fn emit_discard(&mut self, op_index: usize, arglocs: &[Loc], fail_index: u32, ops: &[OpRc]) {
         let op = &ops[op_index];
-        if crate::majit_log_enabled() {
+        if crate::majit_ops_log_enabled() {
             let al: Vec<String> = arglocs.iter().map(|l| format!("{l:?}")).collect();
             eprintln!(
                 "[dynasm] discard[{}]: {:?} args=[{}]",

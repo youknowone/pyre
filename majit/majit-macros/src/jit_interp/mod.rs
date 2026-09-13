@@ -52,6 +52,7 @@ use syn::{
 /// `__MAJIT_HELPER_POLICIES`). Alternatively, use `helpers` or `calls`
 /// to explicitly list the functions that need JIT integration.
 pub struct JitInterpConfig {
+    pub trace_cfg: Option<syn::Meta>,
     /// The interpreter state type (e.g., `InterpState`).
     pub state_type: Ident,
     /// The environment type (e.g., `Program`).
@@ -749,6 +750,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
 
 impl Parse for JitInterpConfig {
     fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut trace_cfg = None;
         let mut state_type = None;
         let mut env_type = None;
         let mut io_shims = None;
@@ -794,6 +796,11 @@ impl Parse for JitInterpConfig {
                 }
                 "helpers" => {
                     calls.extend(parse_helpers_list(input)?);
+                }
+                "trace_cfg" => {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    trace_cfg = Some(content.parse()?);
                 }
                 "auto_calls" => {
                     auto_calls = Some(input.parse::<LitBool>()?.value);
@@ -905,6 +912,7 @@ impl Parse for JitInterpConfig {
         )?;
 
         Ok(JitInterpConfig {
+            trace_cfg,
             state_type,
             env_type,
             io_shims: io_shims.unwrap_or_default(),
@@ -1786,14 +1794,25 @@ pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStrea
     let state_impl = codegen_state::generate_jit_state(&config, &func);
     let merge_wrapper = generate_merge_wrapper(&config, &func);
     let green_key_fn = generate_green_key_fn(&config, &func);
-    let transformed_fn = transform_function(&config, &func);
+    let transformed_fn = transform_function(&config, &func, true);
 
-    quote! {
+    let generated = quote! {
         #state_impl
         #trace_fn
         #merge_wrapper
         #green_key_fn
         #transformed_fn
+    };
+    if let Some(condition) = &config.trace_cfg {
+        let concrete = transform_function(&config, &func, false);
+        let generated = crate::gate_generated_items(generated, condition);
+        quote! {
+            #generated
+            #[cfg(not(#condition))]
+            #concrete
+        }
+    } else {
+        generated
     }
 }
 
@@ -2119,7 +2138,56 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
 }
 
 /// Transform the original function: replace jit_merge_point!() and can_enter_jit!() markers.
-fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+/// Concrete (non-trace) path: rewrite `recursive_portal_call!` onto the
+/// declared `recursive_entry`. `jit_merge_point!` / `can_enter_jit!` stay
+/// as the exported no-ops.
+fn rewrite_recursive_portal_calls(block: &mut syn::Block, recursive_entry: Option<&syn::Path>) {
+    use syn::visit_mut::VisitMut;
+    struct Visitor<'a> {
+        recursive_entry: Option<&'a syn::Path>,
+    }
+    impl VisitMut for Visitor<'_> {
+        fn visit_expr_mut(&mut self, expr: &mut Expr) {
+            syn::visit_mut::visit_expr_mut(self, expr);
+            let Expr::Macro(em) = expr else {
+                return;
+            };
+            let path_str = em
+                .mac
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            if path_str != "recursive_portal_call" && !path_str.ends_with("::recursive_portal_call")
+            {
+                return;
+            }
+            let args = em
+                .mac
+                .parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                .expect("recursive_portal_call! takes `driver, green0, green1, ...`");
+            let mut iter = args.into_iter();
+            let _driver = iter
+                .next()
+                .expect("recursive_portal_call! requires a driver argument");
+            let greens: Vec<Expr> = iter.collect();
+            let entry = self.recursive_entry.unwrap_or_else(|| {
+                panic!(
+                    "recursive_portal_call! used but `#[jit_interp(..)]` declares no \
+                     `recursive_entry = <fn path>` for the concrete fallback"
+                )
+            });
+            let new_tokens = quote! { #entry(#(#greens),*) };
+            *expr = syn::parse2(new_tokens)
+                .expect("failed to parse recursive_portal_call concrete fallback");
+        }
+    }
+    Visitor { recursive_entry }.visit_block_mut(block);
+}
+
+fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> TokenStream {
     use syn::visit_mut::VisitMut;
 
     let vis = &func.vis;
@@ -2621,16 +2689,22 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         .into_iter()
         .map(|(name, _, _)| syn::parse_quote!(#name))
         .collect();
-    let body = rewrite_body(
-        &block,
-        &merge_fn_name,
-        &portal_green_args,
-        &config.greens,
-        config.greens_declared,
-        &config.green_type_tags,
-        config.recursive_entry.as_ref(),
-        finish_return.as_ref(),
-    );
+    let body = if trace {
+        rewrite_body(
+            &block,
+            &merge_fn_name,
+            &portal_green_args,
+            &config.greens,
+            config.greens_declared,
+            &config.green_type_tags,
+            config.recursive_entry.as_ref(),
+            finish_return.as_ref(),
+        )
+    } else {
+        let mut block = block;
+        rewrite_recursive_portal_calls(&mut block, config.recursive_entry.as_ref());
+        quote!(#block)
+    };
 
     quote! {
         #(#attrs)*

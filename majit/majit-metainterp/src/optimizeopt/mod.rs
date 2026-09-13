@@ -1496,55 +1496,28 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         self.ctx.get_box_replacement_impl(opref, true)
     }
 
-    fn is_const(&self, opref: OpRef) -> bool {
-        // `ResumeDataLoopMemo._number_boxes` in resume.py tests
-        // `isinstance(box, Const)` on the object it already holds.  An inline
-        // Const OpRef is that complete object on pyre's flattened boundary;
-        // rebuilding an `Operand::Const` merely to ask its class allocated an
-        // Rc for every live constant in every guard.
-        if opref.is_constant() {
-            return true;
-        }
-        // One chain walk answers both tests below; `get_box_replacement`
-        // materializes the terminal as an `Operand`, so walking twice built
-        // it twice for every live box in every guard.
-        let Some(replacement) = self.ctx.get_box_replacement_operand_opt(opref) else {
-            return false;
-        };
-        if replacement.const_value().is_some() {
-            return true;
-        }
-        matches!(
-            self.ctx.peek_ptr_info(&replacement),
-            Some(crate::optimizeopt::info::PtrInfo::Constant(_))
-        )
+    fn is_const(&self, box_: &Operand) -> bool {
+        // resume.py _number_boxes classifies the already resolved object.
+        debug_assert!(box_.same_box(&box_.get_box_replacement(false)));
+        box_.is_constant()
+            || matches!(
+                box_.ptr_info().as_deref(),
+                Some(crate::optimizeopt::info::PtrInfo::Constant(_))
+            )
     }
 
-    fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
-        // resume.py `getconst` reads the carried Const directly. Preserve that
-        // zero-allocation path for the inline representation just recognized
-        // by `is_const` above.
-        if let Some(value) = self.ctx.get_constant(opref) {
+    fn get_const(&self, box_: &Operand) -> (i64, majit_ir::Type) {
+        debug_assert!(box_.same_box(&box_.get_box_replacement(false)));
+        if let Some(value) = box_.const_value() {
             return const_value_as_word(value);
         }
-        match self
-            .ctx
-            .get_box_replacement_operand_opt(opref)
-            .and_then(|cb| cb.const_value())
-        {
-            Some(value) => const_value_as_word(value),
-            None => {
-                if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) = self
-                    .ctx
-                    .get_box_replacement_operand_opt(opref)
-                    .as_ref()
-                    .and_then(|b| self.ctx.peek_ptr_info(b))
-                {
-                    (gcref.0 as i64, majit_ir::Type::Ref)
-                } else {
-                    (0, majit_ir::Type::Int)
-                }
+        match box_.ptr_info().as_deref() {
+            Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) => {
+                (gcref.0 as i64, majit_ir::Type::Ref)
             }
+            // resume.py getconst is only called after is_const. Keep the
+            // existing unrecognized-box contract instead of panicking.
+            _ => (0, majit_ir::Type::Int),
         }
     }
 
@@ -1563,36 +1536,21 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         }
     }
 
-    fn is_virtual_ref(&self, opref: OpRef) -> bool {
-        // info.py getptrinfo(op) first applies get_box_replacement(op)
-        // before reading PtrInfo. Guard resume numbering walks ORIGINAL
-        // snapshot boxes, so virtual classification must follow the same
-        // replacement chain or forwarded virtual boxes get mis-tagged as
-        // ordinary liveboxes.
-        let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
-        resolved_box
-            .as_ref()
-            .and_then(|b| self.ctx.peek_ptr_info(b))
-            .is_some_and(|info| info.is_virtual())
+    fn is_virtual_ref(&self, box_: &Operand) -> bool {
+        // resume.py _number_boxes reads getptrinfo on its resolved box.
+        debug_assert!(box_.same_box(&box_.get_box_replacement(false)));
+        box_.ptr_info().is_some_and(|info| info.is_virtual())
     }
 
-    fn is_virtual_raw(&self, opref: OpRef) -> bool {
-        // info.py `RawBufferPtrInfo` / RawSlicePtrInfo — Int-typed
-        // virtuals.  `get_type()` already classifies these as Int; mirror
-        // the classification here so resume encoding
-        // (`ResumeDataLoopMemo::_number_boxes`, whose `Type::Int` arm calls
-        // `is_virtual_raw`) picks them up via TAGVIRTUAL instead of TAGBOX.
-        let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
-        resolved_box
-            .as_ref()
-            .and_then(|b| self.ctx.peek_ptr_info(b))
-            .is_some_and(|info| {
-                matches!(
-                    info,
-                    crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
-                        | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_)
-                )
-            })
+    fn is_virtual_raw(&self, box_: &Operand) -> bool {
+        debug_assert!(box_.same_box(&box_.get_box_replacement(false)));
+        box_.ptr_info().is_some_and(|info| {
+            matches!(
+                &*info,
+                crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
+                    | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_)
+            )
+        })
     }
 
     fn has_known_class(&self, opref: OpRef) -> bool {
@@ -1600,18 +1558,16 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
         resolved_box
             .as_ref()
-            .and_then(|b| self.ctx.peek_ptr_info(b))
+            .and_then(Operand::ptr_info)
             .and_then(|info| info.get_known_class(self.ctx.cpu.as_ref()))
             .is_some()
     }
 
     fn get_virtual_fields(&self, opref: OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
         let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
-        let info = resolved_box
-            .as_ref()
-            .and_then(|b| self.ctx.peek_ptr_info(b))?;
+        let info = resolved_box.as_ref().and_then(Operand::ptr_info)?;
         let fielddescrs = info.all_fielddescrs_from_descr();
-        match info {
+        match &*info {
             PtrInfo::Virtual(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
                 known_class: vi.known_class,
@@ -1769,9 +1725,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         fieldnums: Vec<i16>,
     ) -> Option<std::rc::Rc<majit_ir::RdVirtualInfo>> {
         let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
-        let info = resolved_box
-            .as_ref()
-            .and_then(|b| self.ctx.peek_ptr_info(b))?;
+        let info = resolved_box.as_ref().and_then(Operand::ptr_info)?;
         // resume.py `ResumeDataVirtualAdder.make_virtual_info`:
         //
         //     vinfo = info._cached_vinfo
@@ -1784,7 +1738,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         //
         // The cache stores an `Rc<RdVirtualInfo>` so that cache hits return
         // the same shared handle (matching RPython's Python object identity
-        // on cache hit, info.py:124-128). Downstream storage in
+        // on cache hit in ResumeDataVirtualAdder.make_virtual_info). Downstream storage in
         // `storage.rd_virtuals` keeps the shared handle so two guards that
         // reference the same virtual with the same fieldnums end up pointing
         // at the same `RdVirtualInfo` object.
@@ -1799,35 +1753,18 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // resume.py: vinfo.set_content(fieldnums)
         vinfo.set_content(fieldnums);
         let shared = std::rc::Rc::new(vinfo);
-        // resume.py:314: info._cached_vinfo = vinfo — store the shared handle
+        // ResumeDataVirtualAdder.make_virtual_info stores the shared handle
         // so a later equals-hit returns the SAME object.
         if let Some(cache) = info.cached_vinfo() {
             *cache.borrow_mut() = Some(std::rc::Rc::clone(&shared));
-            // `info` is a clone returned from `peek_ptr_info`;
-            // mutating its independent `cached_vinfo` RefCell does not feed
-            // back into the operand's canonical forwarding slot. Project the cached Rc
-            // handle directly onto the operand's PtrInfo so subsequent
-            // operand-path readers (`virtual_info_would_be_reused`)
-            // observe the cached vinfo.
-            if let Some(b) = resolved_box.as_ref()
-                && let Some(pi) = b.ptr_info_mut()
-                && let Some(c) = pi.cached_vinfo()
-            {
-                *c.borrow_mut() = Some(std::rc::Rc::clone(&shared));
-            }
         }
         Some(shared)
     }
 
     fn virtual_info_would_be_reused(&self, opref: OpRef, fieldnums: &[i16]) -> bool {
-        // operand-path reader; cached_vinfo's RefCell clones shallowly so the
-        // inner Rc<RdVirtualInfo> is shared with the canonical PtrInfo — read of
-        // .borrow() yields the same content as the original cache.
+        // resume.py reads the same info._cached_vinfo written above.
         let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
-        let Some(info) = resolved_box
-            .as_ref()
-            .and_then(|b| self.ctx.peek_ptr_info(b))
-        else {
+        let Some(info) = resolved_box.as_ref().and_then(Operand::ptr_info) else {
             return false;
         };
         let Some(cache) = info.cached_vinfo() else {
@@ -2388,6 +2325,14 @@ impl OptContext {
     /// `OpRef::none()`.
     pub(crate) fn find_producer_op(&self, opref: OpRef) -> Option<majit_ir::OpRc> {
         if opref.is_none() || opref.is_constant() {
+            return None;
+        }
+        // resoperation.py AbstractInputArg is not an AbstractResOp.
+        // Its canonical owner is inputarg_refs, not any result-op store.
+        if matches!(
+            opref,
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+        ) {
             return None;
         }
         if let Some(op) = self.new_operations_index.get(&opref).cloned() {
@@ -3425,11 +3370,11 @@ impl OptContext {
                  monotonic above all raw trace positions.",
                 op.pos().get(),
             );
-            let has_op_fwd = self
-                .get_box_replacement_operand_opt(op.pos().get())
-                .is_some_and(|b| self.has_op_forwarding(&b));
             debug_assert!(
-                !(has_op_fwd && op.result_type() != majit_ir::Type::Void),
+                !(self
+                    .get_box_replacement_operand_opt(op.pos().get())
+                    .is_some_and(|b| self.has_op_forwarding(&b))
+                    && op.result_type() != majit_ir::Type::Void),
                 "emit: op-forwarding redirect set on non-void result position {:?} — \
                  import_state should only forward inputarg slots in \
                  [inputarg_base..inputarg_base + num_inputs), and body op results \
@@ -5631,7 +5576,9 @@ impl OptContext {
     }
 
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
-        self.heal_arg_to_canonical(arg);
+        if let Some(resolved) = self.heal_arg_to_canonical(arg) {
+            return resolved;
+        }
 
         // `Const.get_box_replacement()` is identity in resoperation.py: a
         // Const has no `_forwarded` slot and cannot have a different
@@ -5669,7 +5616,9 @@ impl OptContext {
     /// `materialize_*` mint) instead of tripping the position-only panic in the
     /// total `get_box_replacement_operand`.
     pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
-        self.heal_arg_to_canonical(arg);
+        if let Some(resolved) = self.heal_arg_to_canonical(arg) {
+            return Some(resolved);
+        }
 
         if arg.is_constant() {
             return Some(arg.clone());
@@ -5733,25 +5682,25 @@ impl OptContext {
     /// `get_box_replacement_operand` terminal (`Forwarded::None`/`Info`, never a
     /// bound op chained on), so once a genuinely distinct op is linked no chain
     /// cycle forms.
-    fn heal_arg_to_canonical(&self, arg: &Operand) {
+    /// Return the terminal already found by the heal so the caller need not
+    /// perform the same positional lookup a second time.
+    fn heal_arg_to_canonical(&self, arg: &Operand) -> Option<Operand> {
         if arg.bound_op().is_none() {
-            return;
+            return None;
         }
         if !matches!(arg.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
-            return;
+            return None;
         }
-        let Some(canon) = self.get_box_replacement_operand_opt(arg.to_opref()) else {
-            return;
-        };
+        let canon = self.get_box_replacement_operand_opt(arg.to_opref())?;
         if arg.same_box(&canon) {
-            return;
+            return Some(canon);
         }
         // Skip when `canon` wraps the same bound `Op` as `arg` under a distinct
         // host — linking would be a one-node self-cycle.
         if let (Some(ao), Some(co)) = (arg.bound_op(), canon.bound_op())
             && OpRc::ptr_eq(&ao, &co)
         {
-            return;
+            return Some(canon);
         }
         if let Some(value) = canon.const_value() {
             arg.set_forwarded_const(majit_ir::Const::from_value(value));
@@ -5760,6 +5709,9 @@ impl OptContext {
         } else if let Some(canon_ia) = canon.bound_inputarg() {
             arg.set_forwarded_inputarg(&canon_ia);
         }
+        // A constant link mints its own Const box; return that carried object,
+        // just as the caller's subsequent native walk did before this reuse.
+        Some(arg.get_box_replacement(false))
     }
 
     /// `not_const=True` operand resolver (resoperation.py:64-65): walk the
@@ -5963,7 +5915,7 @@ impl OptContext {
         // here so callers of `has_ptr_info` can pass any typed operand
         // without first guarding on the type.
         match op.type_() {
-            majit_ir::Type::Int | majit_ir::Type::Ref => self.getptrinfo(op).is_some(),
+            majit_ir::Type::Int | majit_ir::Type::Ref => self.getptrinfo_handle(op).is_some(),
             majit_ir::Type::Float | majit_ir::Type::Void => false,
         }
     }
@@ -6524,7 +6476,9 @@ impl OptContext {
             return Some((raw, tp));
         }
         // info.py: ConstPtrInfo — GcRef constant stored in PtrInfo.
-        if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) = self.peek_ptr_info(op) {
+        if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
+            resolved.ptr_info().as_deref()
+        {
             return Some((gcref.0 as i64, majit_ir::Type::Ref));
         }
         None
@@ -6919,7 +6873,11 @@ impl OptContext {
     /// source directly, so the prior reverse-lookup 3rd key is no longer
     /// needed.
     fn force_box_inline(&mut self, opref: OpRef) -> OpRef {
-        let resolved = self.get_replacement_opref(opref);
+        if opref.is_constant() {
+            return opref;
+        }
+        let resolved_op = self.get_box_replacement_operand_opt(opref);
+        let resolved = resolved_op.as_ref().map_or(opref, |op| op.to_opref());
         // optimizer.py:351-359: a result that folded to an inline Const can
         // never be a `potential_extra_ops` key (the pool is keyed by the pure
         // op's result Box; the Const inlines at use sites instead of being
@@ -6948,18 +6906,22 @@ impl OptContext {
         //     return ConstInt(info.get_constant_int())
         // Mirrors Optimizer::force_box — a forced operand with an already-constant
         // IntBound materializes as ConstInt; peek the bound without installing.
-        if let Some(rb) = self.get_box_replacement_operand_opt(resolved)
+        if let Some(rb) = resolved_op.as_ref()
             && rb.const_value().is_none()
             && rb.type_() == Type::Int
-            && let Some(bound) = self.peek_intbound_box(&rb)
+            && let Some(bound) = self.peek_intbound_box(rb)
             && bound.is_constant()
         {
             return self.make_constant_int(bound.get_constant_int());
         }
-        let resolved_op = self.get_box_replacement_operand_opt(opref);
-        if let Some(mut info) = resolved_op.as_ref().and_then(|b| self.peek_ptr_info(b))
-            && info.is_virtual()
-        {
+        // optimizer.py force_box reads the live info. Only the recursive
+        // materialization path needs an owned snapshot across &mut self.
+        let virtual_info = resolved_op
+            .as_ref()
+            .and_then(Operand::ptr_info)
+            .filter(|info| info.is_virtual())
+            .map(|info| info.clone());
+        if let Some(mut info) = virtual_info {
             let resolved_op = resolved_op
                 .clone()
                 .expect("is_virtual implies resolved_op is Some");
@@ -6967,6 +6929,32 @@ impl OptContext {
             return self.get_replacement_opref(forced);
         }
         resolved
+    }
+
+    /// finish() liveboxes are unique. Two numbering positions can still
+    /// resolve to one InputArg after identity unification. Keep the failarg
+    /// arity and punch a hole in the later slot (`rd_locs = 0xFFFF`); resume
+    /// reads the first slot via rd_numb, and
+    /// `initialize_state_from_guard_failure` drops None holes.
+    fn uniquify_resolved_fail_args(operands: Vec<Operand>) -> (Vec<Operand>, majit_ir::RdLocs) {
+        let mut out: Vec<Operand> = Vec::with_capacity(operands.len());
+        let mut locs = Vec::with_capacity(operands.len());
+        for operand in operands {
+            if operand.is_none()
+                || out
+                    .iter()
+                    .any(|seen| !seen.is_none() && seen.same_box(&operand))
+            {
+                out.push(Operand::none());
+                locs.push(0xFFFF);
+            } else {
+                locs.push(
+                    u16::try_from(out.len()).expect("resume failarg position must fit in rd_locs"),
+                );
+                out.push(operand);
+            }
+        }
+        (out, locs.into())
     }
 
     /// RPython optimizer.py store_final_boxes_in_guard inline.
@@ -7347,25 +7335,24 @@ impl OptContext {
         // non-Const position has no operand to bind and panics at
         // `Operand::from_opref` — the same contract the operand-union
         // `_args` model enforces (#9).
-        let final_operands: Vec<Operand> = liveboxes
+        let resolved: Vec<Operand> = liveboxes
             .iter()
+            .copied()
             .map(|a| {
-                self.resolve_to_operand(*a)
-                    .unwrap_or_else(|| Operand::from_opref(*a))
+                self.resolve_to_operand(a)
+                    .unwrap_or_else(|| Operand::from_opref(a))
             })
             .collect();
         memo.recycle_ordered_liveboxes(liveboxes);
-        let logical_rd_locs: majit_ir::RdLocs = final_operands
-            .iter()
-            .enumerate()
-            .map(|(index, operand)| {
-                if operand.is_none() {
-                    0xFFFF
-                } else {
-                    u16::try_from(index).expect("resume failarg position must fit in rd_locs")
-                }
-            })
-            .collect();
+        // optimizer.py:768-774 `assert box not in seen`. Two numbering
+        // positions can resolve to one InputArg after identity unification;
+        // finish() would not emit that box twice. Keep the failarg arity
+        // and punch a hole in the later slot (`rd_locs = 0xFFFF`). Resume
+        // reads the first slot via rd_numb; `initialize_state_from_guard_failure`
+        // drops None holes. Mapping the later slot onto the first index
+        // instead left `store_final_boxes` with a duplicate and panicked
+        // under nursery poison.
+        let (final_operands, logical_rd_locs) = Self::uniquify_resolved_fail_args(resolved);
         if crate::callee_rca_enabled() {
             let final_oprefs: Vec<_> = final_operands
                 .iter()
@@ -7999,8 +7986,8 @@ impl OptContext {
         //    (info.py RawBufferPtrInfo + getrawptrinfo() — these
         //    describe raw pointers stored in 'i' Boxes).
         let resolved_box = self.get_box_replacement_operand_opt(opref);
-        if let Some(info) = resolved_box.as_ref().and_then(|b| self.peek_ptr_info(b)) {
-            return Some(match info {
+        if let Some(info) = resolved_box.as_ref().and_then(Operand::ptr_info) {
+            return Some(match &*info {
                 crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
                 | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_) => majit_ir::Type::Int,
                 _ => majit_ir::Type::Ref,
@@ -9294,25 +9281,11 @@ impl OptContext {
         //         vstring.StrPtrInfo                 ← Str
         //       ConstPtrInfo                         ← Constant (handled before)
         //
-        // The early-return path uses a `&'s mut PtrInfo` whose lifetime
-        // matches the function return. Once that mutable borrow is taken,
-        // the borrow checker conservatively prevents any further write to
-        // the same `_forwarded` slot even on the construction branch (which
-        // never executes when we early-returned). To stay close to PyPy's
-        // single-`opinfo` shape we read the slot immutably with
-        // `get_ptr_info` to compute `last_guard_pos`, drop that read, and
-        // then either re-borrow mutably for the early return or fall
-        // through to the upgrade.
-        // operand-path read. Owned PtrInfo from `peek_ptr_info` is
-        // consumed by `matches!` so no borrow is held when the mutable
-        // re-borrow of the forwarding slot runs below for the early return.
-        // optimizer.py:467 opinfo = arg0.get_forwarded(): resolve op.arg(0)
-        // box-native to the position's canonical (the info-host
-        // `find_producer_op` returns). The Phase-1 heal links the operand's
-        // input op to that canonical even at a shared position, so the
-        // box-native terminal now carries the PtrInfo `heap`/`virtualize` set.
+        // optimizer.py `ensure_ptr_info_arg0` reads the forwarded info itself,
+        // not a copy of its cached fields/items. End the immutable borrow
+        // before returning the owner or installing the upgraded info.
         if matches!(
-            self.peek_ptr_info(&arg0_box),
+            arg0_box.ptr_info().as_deref(),
             Some(
                 PtrInfo::Instance(_)
                     | PtrInfo::Virtual(_)
@@ -9332,11 +9305,11 @@ impl OptContext {
             // operand is already resolved — reuse it instead of re-minting.
             return EnsuredPtrInfo::Forwarded(arg0_box);
         }
-        let last_guard_pos = if let Some(opinfo) = self.peek_ptr_info(&arg0_box) {
+        let last_guard_pos = if let Some(opinfo) = arg0_box.ptr_info() {
             // optimizer.py:474:
             //     assert opinfo is None or opinfo.__class__ is info.NonNullPtrInfo
             debug_assert!(
-                matches!(opinfo, PtrInfo::NonNull { .. }),
+                matches!(&*opinfo, PtrInfo::NonNull { .. }),
                 "ensure_ptr_info_arg0: existing non-virtual PtrInfo must be NonNullPtrInfo before upgrade, got {:?}",
                 opinfo
             );
@@ -11836,6 +11809,7 @@ mod opt_box_env_tests {
         let source_box = ctx.materialize_operand_at(source);
         let target_box = ctx.materialize_operand_at(target);
         ctx.make_equal_to(&source_box, &target_box);
+        let resolved = OptBoxEnv { ctx: &ctx }.get_box_replacement_operand(source);
         ctx.set_ptr_info(
             &target_box,
             PtrInfo::Virtual(VirtualInfo {
@@ -11850,9 +11824,65 @@ mod opt_box_env_tests {
 
         let env = OptBoxEnv { ctx: &ctx };
         assert!(
-            env.is_virtual_ref(source),
+            env.is_virtual_ref(&resolved),
             "forwarded snapshot boxes must classify as virtual via replacement"
         );
+    }
+
+    #[test]
+    fn native_box_env_reads_live_constant_info_and_typed_constants() {
+        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let producer = ctx.materialize_operand_at(OpRef::ref_op(21));
+        let env = OptBoxEnv { ctx: &ctx };
+        let resolved = env.get_box_replacement_operand(producer.to_opref());
+        assert!(!env.is_const(&resolved));
+        ctx.set_ptr_info(&producer, PtrInfo::Constant(GcRef(0x1234)));
+        assert!(env.is_const(&resolved));
+        assert_eq!(env.get_const(&resolved), (0x1234, Type::Ref));
+        for value in [
+            Value::Int(i64::MAX),
+            Value::Float(-0.0),
+            Value::Ref(GcRef::NULL),
+        ] {
+            let constant = Operand::const_from_value(value);
+            assert!(env.is_const(&constant));
+            assert_eq!(env.get_const(&constant), const_value_as_word(value));
+        }
+    }
+
+    #[test]
+    fn virtual_resume_cache_lives_on_the_forwarded_info() {
+        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let source = OpRef::ref_op(12);
+        let target = OpRef::ref_op(21);
+        let source_box = ctx.materialize_operand_at(source);
+        let target_box = ctx.materialize_operand_at(target);
+        ctx.make_equal_to(&source_box, &target_box);
+        ctx.set_ptr_info(
+            &target_box,
+            PtrInfo::Virtual(VirtualInfo {
+                descr: Arc::new(DummySizeDescr),
+                known_class: Some(0x1234),
+                ob_type_descr: None,
+                fields: Default::default(),
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+        let env = OptBoxEnv { ctx: &ctx };
+        let first = env.make_virtual_info(source, vec![1, 2]).unwrap();
+        assert!(env.virtual_info_would_be_reused(target, &[1, 2]));
+        let same = env.make_virtual_info(target, vec![1, 2]).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&first, &same));
+        {
+            let info = target_box.ptr_info().unwrap();
+            let cached = info.cached_vinfo().unwrap().borrow();
+            assert!(std::rc::Rc::ptr_eq(cached.as_ref().unwrap(), &first));
+        }
+        let changed = env.make_virtual_info(source, vec![2, 1]).unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&first, &changed));
+        assert!(first.equals(&[1, 2]));
+        assert!(env.virtual_info_would_be_reused(target, &[2, 1]));
     }
 
     #[test]
@@ -11904,5 +11934,21 @@ mod opt_box_env_tests {
             .bound_op()
             .expect("empty ResOp slot lazy-materialised the wrong host kind");
         assert_eq!(op.pos().get(), result);
+    }
+
+    #[test]
+    fn uniquify_resolved_fail_args_holes_a_later_duplicate() {
+        let first = Operand::bound_from_opref(OpRef::input_arg_typed(9, majit_ir::Type::Int));
+        let dup = first.clone();
+        assert!(
+            first.same_box(&dup),
+            "clone must keep the InputArg host so same_box sees a duplicate"
+        );
+        let (out, locs) =
+            OptContext::uniquify_resolved_fail_args(vec![first.clone(), Operand::none(), dup]);
+        assert!(out[0].same_box(&first));
+        assert!(out[1].is_none());
+        assert!(out[2].is_none());
+        assert_eq!(&*locs, &[0, 0xFFFF, 0xFFFF]);
     }
 }

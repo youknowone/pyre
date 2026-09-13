@@ -893,10 +893,11 @@ mod tests {
         let (values, owner) = sym
             .recursive_fresh_entry_reds()
             .expect("ref-scalar-free state-field interp must support portal entry");
-        // tl extract_live order: [stackpos (Int), &state (Ref)].
-        assert_eq!(values.len(), 2, "stackpos + the one vable identity");
-        assert_eq!(values[0], majit_ir::Value::Int(0), "fresh stackpos zeroed");
-        match values[1] {
+        // `stackpos` sits on the virtualizable with `stack`, so the red
+        // block is the one identity. Fresh stackpos is zeroed on the
+        // owner below, not carried as a red.
+        assert_eq!(values.len(), 1, "the one vable identity");
+        match values[0] {
             majit_ir::Value::Ref(majit_ir::GcRef(p)) => {
                 assert_ne!(p, 0, "fresh vable base must be non-null");
                 assert_ne!(
@@ -904,7 +905,7 @@ mod tests {
                     "fresh base must differ from the caller's state",
                 );
             }
-            ref other => panic!("slot 1 must be the vable identity Ref, got {other:?}"),
+            ref other => panic!("slot 0 must be the vable identity Ref, got {other:?}"),
         }
         let fresh = owner
             .downcast_ref::<TlState>()

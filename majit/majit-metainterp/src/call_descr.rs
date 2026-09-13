@@ -712,6 +712,7 @@ pub fn make_call_descr_with_effect(
     make_call_descr_sized(
         arg_types,
         result_type,
+        majit_ir::descr::result_class_of(result_type),
         result_signed,
         result_size,
         effect_info,
@@ -729,7 +730,7 @@ pub fn make_call_descr_with_effect(
 /// participates in the interning key, so word-ABI descrs never collapse
 /// with plain void descrs of the same shape.
 pub fn make_call_descr_void_word_abi(arg_types: &[Type], effect_info: EffectInfo) -> DescrRef {
-    make_call_descr_sized(arg_types, Type::Void, false, 8, effect_info)
+    make_call_descr_sized(arg_types, Type::Void, 'v', false, 8, effect_info)
 }
 
 /// Sized variant of [`make_call_descr_with_effect`] for deserialized
@@ -745,6 +746,7 @@ pub fn make_call_descr_sized_with_effect(
     make_call_descr_sized(
         arg_types,
         result_type,
+        majit_ir::descr::result_class_of(result_type),
         result_signed,
         result_size,
         effect_info,
@@ -781,6 +783,7 @@ pub fn make_call_descr_sized_with_translated_effect(
 fn make_call_descr_sized(
     arg_types: &[Type],
     result_type: Type,
+    result_class: char,
     result_signed: bool,
     result_size: usize,
     effect_info: EffectInfo,
@@ -816,11 +819,47 @@ fn make_call_descr_sized(
     make_call_descr_sized_with_cell(
         arg_types,
         result_type,
-        majit_ir::descr::result_class_of(result_type),
+        result_class,
         result_signed,
         result_size,
         effect_info,
     )
+}
+
+/// Resolve the serialized half of an Assembler.descrs call entry once.
+/// pyjitpl.py do_residual_call records that same descriptor on every use.
+pub(crate) fn call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> DescrRef {
+    let type_of = |class| match class {
+        'i' => Type::Int,
+        'r' => Type::Ref,
+        // 'S' is singlefloat, 'L' is long-float. Both are float-bank
+        // values; collapsing 'S' to Int would take the integer ABI.
+        'f' | 'L' | 'S' => Type::Float,
+        'v' => Type::Void,
+        _ => panic!("invalid call descriptor class {class:?}"),
+    };
+    let arg_types: Vec<_> = bh.arg_classes.chars().map(type_of).collect();
+    let result_type = type_of(bh.result_type);
+    let result_size = if bh.void_word_abi { 8 } else { bh.result_size };
+    if let Some(id) = bh.translated_effect_info_id {
+        make_call_descr_sized_with_translated_effect(
+            &arg_types,
+            result_type,
+            bh.result_type,
+            bh.result_signed,
+            result_size,
+            id,
+        )
+    } else {
+        make_call_descr_sized(
+            &arg_types,
+            result_type,
+            bh.result_type,
+            bh.result_signed,
+            result_size,
+            bh.extra_info.clone(),
+        )
+    }
 }
 
 fn make_call_descr_sized_with_cell(

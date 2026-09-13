@@ -7492,6 +7492,52 @@ mod tests {
     }
 
     #[test]
+    fn unroll_keeps_retry_source_operations_unchanged() {
+        for reject in [false, true] {
+            let input = rooted_inputarg_operand(Type::Int, 0);
+            let mut recorded = vec![Op::new(OpCode::IntAdd, &[input.clone(), input.clone()])];
+            if reject {
+                recorded.push(Op::new(
+                    OpCode::GuardTrue,
+                    &[Operand::const_from_value(Value::Int(0))],
+                ));
+            }
+            recorded.push(Op::new(OpCode::Jump, &[input]));
+            assign_positions(&mut recorded, 1);
+            let canonical: Vec<_> = recorded.into_iter().map(OpRc::new).collect();
+            let source: Vec<_> = canonical.iter().map(|op| (**op).clone()).collect();
+            let backup = source.clone();
+            let mut unroll = UnrollOptimizer::new();
+            unroll.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[Type::Int]);
+            unroll.phase2_input_ops_seed = Some(canonical);
+            let result = unroll.optimize_trace_with_constants_and_inputs_vable_out(
+                &source,
+                &mut majit_ir::ConstMap::default(),
+                1,
+                None,
+                None,
+            );
+            assert_eq!(result.is_err(), reject);
+            // opencoder.py TraceIterator.next creates each phase's operation;
+            // neither successful peeling nor InvalidLoop writes to its source.
+            for (op, saved) in source.iter().zip(&backup) {
+                assert_eq!(op.opcode, saved.opcode);
+                assert_eq!(op.pos().get(), saved.pos().get());
+                assert_eq!(op.rd_resume_position(), saved.rd_resume_position());
+                assert_eq!(op.get_value(), saved.get_value());
+                assert!(matches!(
+                    op.forwarded().borrow(),
+                    majit_ir::forwarding::Forwarded::None
+                ));
+                assert_eq!(op.num_args(), saved.num_args());
+                for i in 0..op.num_args() {
+                    assert!(op.arg(i).same_box(&saved.arg(i)));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_recorded_jump_inputarg_keeps_observed_runtime_value() {
         let mut unroll_opt = UnrollOptimizer::new();
         unroll_opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[Type::Int]);

@@ -61,6 +61,7 @@ pub fn encode_varint_signed(buf: &mut Vec<u8>, value: i64) {
 }
 
 /// opencoder.py decode_varint_signed. Returns (value, bytes_consumed).
+#[inline(always)] // opencoder.py decode_varint_signed: @always_inline.
 pub fn decode_varint_signed(buf: &[u8]) -> (i64, usize) {
     let byte0 = buf[0];
     let byte1 = buf[1];
@@ -77,9 +78,7 @@ pub fn decode_varint_signed(buf: &[u8]) -> (i64, usize) {
         lastbyte = byte3;
     }
     // sign-extend: top bit of the last written byte is the sign bit.
-    if lastbyte & 0b1000_0000 != 0 {
-        res |= -1i64 << shift;
-    }
+    res |= -i64::from(lastbyte & 0b1000_0000 != 0) << shift;
     (res, index)
 }
 
@@ -1078,6 +1077,13 @@ impl<'a> BoxArrayIter<'a> {
 
 impl<'a> Iterator for BoxArrayIter<'a> {
     type Item = i64;
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // opencoder.py BoxArrayIter.length already tracks the remaining
+        // elements; expose it so snapshot consumers allocate only once.
+        let remaining = self.remaining.max(0) as usize;
+        (remaining, Some(remaining))
+    }
+
     fn next(&mut self) -> Option<i64> {
         if self.remaining <= 0 {
             return None;
@@ -1088,6 +1094,8 @@ impl<'a> Iterator for BoxArrayIter<'a> {
         Some(tagged)
     }
 }
+
+impl ExactSizeIterator for BoxArrayIter<'_> {}
 
 /// opencoder.py `class TopDownSnapshotIterator` — walks the
 /// snapshot chain encoded into `_snapshot_data` in outermost-to-
@@ -2215,8 +2223,8 @@ impl Trace {
     pub(crate) fn create_top_snapshot_from_frame(
         &mut self,
         frame: &mut crate::pyjitpl::MIFrame,
-        vable_boxes: &[Box],
-        vref_boxes: &[Box],
+        vable_boxes: impl ExactSizeIterator<Item = Box> + DoubleEndedIterator,
+        vref_boxes: impl ExactSizeIterator<Item = Box>,
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
@@ -2321,8 +2329,8 @@ impl Trace {
     ) -> i64 {
         self.capture_resumedata_mapped(
             framestack,
-            virtualizable_boxes,
-            virtualref_boxes,
+            virtualizable_boxes.iter().copied(),
+            virtualref_boxes.iter().copied(),
             clear_result_register,
             op_live,
             all_liveness,
@@ -2339,8 +2347,8 @@ impl Trace {
     pub(crate) fn capture_resumedata_mapped(
         &mut self,
         framestack: &mut [crate::pyjitpl::MIFrame],
-        virtualizable_boxes: &[Box],
-        virtualref_boxes: &[Box],
+        virtualizable_boxes: impl ExactSizeIterator<Item = Box> + DoubleEndedIterator,
+        virtualref_boxes: impl ExactSizeIterator<Item = Box>,
         clear_result_register: bool,
         op_live: u8,
         all_liveness: &[u8],
@@ -2443,9 +2451,9 @@ impl Trace {
     /// opencoder.py `_list_of_boxes(boxes)` — Box-taking
     /// sibling of the tagged-int `_list_of_boxes`. Used by
     /// `capture_resumedata` and friends which hold `Box` values.
-    fn _list_of_boxes_from_boxes(&mut self, boxes: &[Box]) -> i64 {
+    fn _list_of_boxes_from_boxes(&mut self, boxes: impl ExactSizeIterator<Item = Box>) -> i64 {
         let res = self.new_array(boxes.len());
-        for &b in boxes {
+        for b in boxes {
             self._add_box_to_storage_box(b);
         }
         res
@@ -2454,13 +2462,15 @@ impl Trace {
     /// opencoder.py `_list_of_boxes_virtualizable(boxes)` —
     /// Box-taking sibling; reorders `[a, b, c, vable]` to
     /// `[vable, a, b, c]` at encode time.
-    fn _list_of_boxes_virtualizable_from_boxes(&mut self, boxes: &[Box]) -> i64 {
-        if boxes.is_empty() {
-            return self.new_array(0);
-        }
+    fn _list_of_boxes_virtualizable_from_boxes(
+        &mut self,
+        mut boxes: impl ExactSizeIterator<Item = Box> + DoubleEndedIterator,
+    ) -> i64 {
         let res = self.new_array(boxes.len());
-        self._add_box_to_storage_box(*boxes.last().unwrap());
-        for &b in &boxes[..boxes.len() - 1] {
+        if let Some(last) = boxes.next_back() {
+            self._add_box_to_storage_box(last);
+        }
+        for b in boxes {
             self._add_box_to_storage_box(b);
         }
         res
@@ -2472,13 +2482,13 @@ impl Trace {
     #[allow(dead_code)]
     fn create_empty_top_snapshot_from_boxes(
         &mut self,
-        vable_boxes: &[Box],
-        vref_boxes: &[Box],
+        vable_boxes: impl ExactSizeIterator<Item = Box> + DoubleEndedIterator,
+        vref_boxes: impl ExactSizeIterator<Item = Box>,
         patch_guard_descr: bool,
     ) -> i64 {
         self._total_snapshots += 1;
         let s = self._snapshot_data.len() as i64;
-        let empty_array = self._list_of_boxes_from_boxes(&[]);
+        let empty_array = self._list_of_boxes_from_boxes(std::iter::empty());
         let vable_array = self._list_of_boxes_virtualizable_from_boxes(vable_boxes);
         let vref_array = self._list_of_boxes_from_boxes(vref_boxes);
         self.append_snapshot_data_int(vable_array);
@@ -2803,11 +2813,6 @@ impl Trace {
     /// Writes a signed varint into `_snapshot_array_data`; values outside
     /// [MIN_VALUE, MAX_VALUE] trip `tag_overflow` (and encode 0 to keep
     /// the stream parseable).
-    ///
-    /// Phase B1 keeps this on the zigzag-based `encode_varint_signed`
-    /// currently in this file so the constructor's reserve-index-0 call
-    /// succeeds. Phase B2 replaces the encoder with RPython's 2/4-byte
-    /// format, which will make this method fully parity-compliant.
     pub(crate) fn append_snapshot_array_data_int(&mut self, i: i64) {
         if !(MIN_VALUE..=MAX_VALUE).contains(&i) {
             self.tag_overflow = true;
@@ -3911,6 +3916,25 @@ mod tests {
         let arr = BoxArrayIter::new(&buf._snapshot_array_data, array_idx);
         let unpacked = snap_it.unpack_array(arr, &mut main_iter);
         assert_eq!(unpacked, vec![expected_0, expected_1]);
+    }
+
+    #[test]
+    fn snapshot_box_array_reports_its_remaining_length() {
+        let mut buf = TraceRecordBuffer::new(2, empty_sd());
+        let array_idx = buf.new_array(3);
+        for i in 0..3 {
+            buf._add_box_to_storage_box(Box::ResOp(i));
+        }
+        let mut array = BoxArrayIter::new(&buf._snapshot_array_data, array_idx);
+        for remaining in (1..=3).rev() {
+            assert_eq!(array.len(), remaining);
+            assert_eq!(array.size_hint(), (remaining, Some(remaining)));
+            assert!(array.next().is_some());
+        }
+        assert_eq!(array.len(), 0);
+        assert_eq!(array.next(), None);
+        assert_eq!(array.size_hint(), (0, Some(0)));
+        assert_eq!(BoxArrayIter::new(&[], 0).len(), 0);
     }
 
     /// `_encode_smallint` must preserve the sign bit so TAGINT decode
