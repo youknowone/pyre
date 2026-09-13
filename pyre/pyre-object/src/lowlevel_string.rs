@@ -215,6 +215,16 @@ pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
     if s1 == 0 || s2 == 0 {
         return 0;
     }
+    // Nursery operands can move during `bh_alloc_lowlevel_string`.
+    // Pin both, then reload the slots after the allocation — the same
+    // bracket `w_str_from_storage_and_length` uses.
+    let _roots = crate::gc_roots::push_roots();
+    let s1_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(s1 as crate::PyObjectRef);
+    let s2_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(s2 as crate::PyObjectRef);
+    let s1 = crate::gc_roots::shadow_stack_get(s1_slot) as i64;
+    let s2 = crate::gc_roots::shadow_stack_get(s2_slot) as i64;
     let n1 = bh_lowlevel_string_len(s1);
     let n2 = bh_lowlevel_string_len(s2);
     let Some(total) = n1.checked_add(n2) else {
@@ -224,6 +234,8 @@ pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
     if out == 0 {
         return 0;
     }
+    let s1 = crate::gc_roots::shadow_stack_get(s1_slot) as i64;
+    let s2 = crate::gc_roots::shadow_stack_get(s2_slot) as i64;
     unsafe {
         let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
         std::ptr::copy_nonoverlapping((s1 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET), dst, n1);
