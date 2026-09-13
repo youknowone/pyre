@@ -1,4 +1,8 @@
 # pyre-check: max-pypy-ratio=10.4
+# pyre-check: max-wasm-ratio=5.5
+# Ubuntu run 34705838874: wasm/dynasm 4.7x. The oracle compiles 2 loops / 2
+# bridges; pyre matches. wasm materializes each as its own module. 5.5x is
+# 4.7x plus WASM_RATIO_FIT_HEADROOM (15%).
 # Ubuntu run 33279264115: 2-5.2x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython

@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=11.8
+# No max-wasm-ratio: pyre compiles 5 bridges against the oracle's 4, so an
+# allowance would hide the extra trace. Ubuntu run 34705838874 read 4.8x.
 # Ubuntu run 33279264115: 2.2-5.9x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython
