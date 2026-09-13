@@ -5552,6 +5552,42 @@ fn build_jit_driver_pair() -> JitDriverPair {
             intval_descr: pyre_jit_trace::descr::int_intval_descr(),
             int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
         });
+        majit_metainterp::register_compare_op_residual(majit_metainterp::CompareOpResidual {
+            fnaddrs: {
+                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .filter_map(|(name, addr)| {
+                        (name.contains("compare_slot")
+                            || name.contains("jit_compare_value_from_tag")
+                            || name.contains("bh_compare_fn"))
+                        .then_some(addr)
+                    })
+                    .collect();
+                addrs.push(
+                    pyre_interpreter::objspace::descroperation::compare_slot_jit_abi as *const ()
+                        as i64,
+                );
+                addrs.push(
+                    pyre_interpreter::opcode_ops::jit_compare_value_from_tag as *const () as i64,
+                );
+                addrs.push(crate::call_jit::bh_compare_fn as *const () as i64);
+                addrs.push(
+                    pyre_interpreter::opcode_ops::__majit_call_target_jit_compare_value_from_tag
+                        as *const () as i64,
+                );
+                addrs
+            },
+            intval_descr: pyre_jit_trace::descr::int_intval_descr(),
+            int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
+            w_true: pyre_object::w_bool_from(true) as i64,
+            w_false: pyre_object::w_bool_from(false) as i64,
+            newbool_fnaddr: pyre_interpreter::opcode_ops::jit_bool_value_from_truth as *const ()
+                as i64,
+            is_exact_int: |ptr| {
+                let obj = ptr as pyre_object::PyObjectRef;
+                !obj.is_null() && unsafe { pyre_object::is_int(obj) && !pyre_object::is_bool(obj) }
+            },
+        });
     }
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);

@@ -1586,6 +1586,96 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
+    /// Specialise residual `compare_slot_jit_abi` of two ints to unbox +
+    /// `int_OP` + `newbool`, before `ForceToken` escapes the boxes.
+    /// FBW `try_walker_specialize_compare_op_int` uses a snapshot
+    /// `newbool` guard; interpret cannot — a `GuardTrue`/`GuardFalse`
+    /// here sits mid-caller jitcode and fail-resumes with a desynced
+    /// shadow stack. Emit `jit_bool_value_from_truth` (`EF_CANNOT_RAISE`)
+    /// so the existing `w_class`/`intval` checks still see a bool and
+    /// keep their own branch guard.
+    fn try_record_int_compare(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        args: &[OpRef],
+        arg_types: &[majit_ir::Type],
+        raw_i: &[i64],
+        raw_r: &[i64],
+        arg_classes: &str,
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::compare_op_residual()?;
+        if !spec.matches(concrete_ptr) && !spec.matches(trace_ptr) {
+            return None;
+        }
+        if arg_types
+            != [
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+            ]
+        {
+            return None;
+        }
+        if args.len() < 3 || raw_r.len() < 2 {
+            return None;
+        }
+        if !(spec.is_exact_int)(raw_r[0]) || !(spec.is_exact_int)(raw_r[1]) {
+            return None;
+        }
+        let tag = if let Some(majit_ir::Value::Int(t)) = ctx.box_value(args[2]) {
+            t
+        } else {
+            *raw_i.last().unwrap_or(&i64::MIN)
+        };
+        let opcode = crate::box_trace::int_compare_op_kind(tag)?;
+        if concrete_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr)
+        {
+            return None;
+        }
+        self.clear_exception();
+        let boxed_ptr = unsafe {
+            majit_backend::call_stub::bh_call_i_by_classes(
+                concrete_ptr as usize,
+                arg_classes,
+                Some(raw_i),
+                Some(raw_r),
+                Some(&[]),
+            )
+        };
+        if crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0 || boxed_ptr == 0 {
+            return None;
+        }
+        if boxed_ptr != spec.w_true && boxed_ptr != spec.w_false {
+            return None;
+        }
+        let truth = crate::box_trace::trace_int_compare(
+            ctx,
+            args[0],
+            args[1],
+            opcode,
+            spec.int_type_addr,
+            spec.intval_descr.clone(),
+        );
+        let boxed = ctx.call_ref_typed_with_effect(
+            spec.newbool_fnaddr as *const (),
+            &[truth],
+            &[majit_ir::Type::Int],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        );
+        ctx.set_opref_concrete(
+            boxed,
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
+        );
+        self.set_ref_reg(dst, Some(boxed), Some(boxed_ptr));
+        Some(TraceAction::Continue)
+    }
+
     fn active_standard_virtualizable(&self, ctx: &TraceCtx) -> Option<ActiveStandardVirtualizable> {
         let vable_opref = ctx.standard_virtualizable_box()?;
         let info = ctx.virtualizable_info()?.clone();
@@ -8695,6 +8785,27 @@ where
                     {
                         self.set_ref_reg(dst, Some(cached_traced), Some(cached_concrete));
                         return TraceAction::Continue;
+                    }
+
+                    // Int COMPARE_OP (`jit_compare_value_from_tag`):
+                    // specialise before `ForceToken`. FBW
+                    // `try_walker_specialize_compare_op_int` emits unbox +
+                    // int_OP + newbool so the call does not escape virtual
+                    // int boxes. Matching wrapint (an int `NewWithVtable`)
+                    // here made the following `GUARD_ISNULL(w_class)` an
+                    // InvalidLoop — bools have a null `w_class`.
+                    if let Some(action) = self.try_record_int_compare(
+                        ctx,
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        &args,
+                        &arg_types,
+                        &raw_i,
+                        &raw_r,
+                        &calldescr.arg_classes,
+                        dst,
+                    ) {
+                        return action;
                     }
 
                     // pyjitpl.py:2005-2010 MAY_FORCE_R branch parity:

@@ -195,6 +195,62 @@ pub fn wrapint_residual() -> Option<&'static WrapintResidual> {
     WRAPINT_RESIDUAL.get()
 }
 
+/// Host-registered rewrite of a residual int COMPARE_OP.
+///
+/// `compare_slot` residualizes through `compare_slot_jit_abi` (the
+/// word-ABI bridge `jit_fnaddr.rs` publishes). The call is may-force, so
+/// portal interpret records `ForceToken` + `CallMayForceR`. That escapes
+/// virtual int boxes; the compiled exception bridge then const-folds
+/// `W_IntObject.intval` (`heap.py` always-pure getfield on ConstPtr).
+///
+/// FBW `try_walker_specialize_compare_op_int` already emits unbox +
+/// `int_OP` + `space.newbool` (`baseobjspace.py:895-900`) for the same
+/// helper. Interpret records that shape here so the call does not force:
+/// `GuardTrue`/`GuardFalse` on the live compare, then the immortal
+/// `w_True`/`w_False` singleton. The following `w_class`/`ob_type`/
+/// `intval` checks see a bool, not a `NewWithVtable` int — specialising
+/// the same residual as wrapint made `GUARD_ISNULL(w_class)` an
+/// `InvalidLoop`.
+#[derive(Clone)]
+pub struct CompareOpResidual {
+    pub fnaddrs: Vec<i64>,
+    pub intval_descr: majit_ir::DescrRef,
+    pub int_type_addr: i64,
+    pub w_true: i64,
+    pub w_false: i64,
+    pub newbool_fnaddr: i64,
+    pub is_exact_int: fn(i64) -> bool,
+}
+
+impl CompareOpResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static COMPARE_OP_RESIDUAL: std::sync::OnceLock<CompareOpResidual> = std::sync::OnceLock::new();
+
+pub fn register_compare_op_residual(spec: CompareOpResidual) {
+    let _ = COMPARE_OP_RESIDUAL.set(spec);
+}
+
+pub fn compare_op_residual() -> Option<&'static CompareOpResidual> {
+    COMPARE_OP_RESIDUAL.get()
+}
+
+/// `compare_op_from_tag` 0..=5 → `IntLt`/`IntLe`/`IntGt`/`IntGe`/`IntEq`/`IntNe`.
+pub fn int_compare_op_kind(tag: i64) -> Option<majit_ir::OpCode> {
+    Some(match tag {
+        0 => majit_ir::OpCode::IntLt,
+        1 => majit_ir::OpCode::IntLe,
+        2 => majit_ir::OpCode::IntGt,
+        3 => majit_ir::OpCode::IntGe,
+        4 => majit_ir::OpCode::IntEq,
+        5 => majit_ir::OpCode::IntNe,
+        _ => return None,
+    })
+}
+
 /// Emit an overflow-checked binary int operation.
 ///
 /// Auto-generated: unbox a, unbox b, emit ovf op, guard no overflow, box result.
