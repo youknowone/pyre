@@ -12304,17 +12304,12 @@ impl CraneliftBackend {
 
                     // assembler.py:1971-1974 read the bounds from the
                     // expected class pointer at codegen time.
+                    // An unbound type constant arrives as classptr 0.
+                    // An empty range makes the unsigned compare always fail.
                     let (check_min, check_max) = with_cranelift_gc_required(|gc| {
                         gc.subclass_range(loc_check_against_class as usize)
                     })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "x86/assembler.py:1973-1974 vtable_ptr.\
-                             subclassrange_min/max: GcAllocator has no \
-                             rclass.CLASSTYPE entry for classptr {:#x}",
-                            loc_check_against_class
-                        )
-                    });
+                    .unwrap_or((0, 0));
 
                     // assembler.py:1976-1978 unsigned comparison:
                     //     (loc_tmp - check_min) <u (check_max - check_min)

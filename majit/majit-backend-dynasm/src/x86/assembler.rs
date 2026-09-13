@@ -5199,12 +5199,7 @@ impl<'a> Assembler386<'a> {
         };
         let (check_min, check_max) = self
             .lookup_subclass_range(classptr.value as usize)
-            .unwrap_or_else(|| {
-                panic!(
-                    "GUARD_SUBCLASS missing subclassrange_min/max for classptr {:#x}",
-                    classptr.value
-                )
-            });
+            .unwrap_or((0, 0));
         if let Some(vtable_offset) = self.vtable_offset {
             let offset = vtable_offset as i32;
             let offset2 = info.subclassrange_min_offset as i32;

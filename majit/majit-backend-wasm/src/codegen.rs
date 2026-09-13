@@ -8047,14 +8047,7 @@ fn build_function(
                     .subclass_ranges
                     .get(&loc_check_against_class)
                     .copied()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "x86/assembler.py:1973-1974 vtable_ptr.\
-                             subclassrange_min/max: GcAllocator has no \
-                             rclass.CLASSTYPE entry for classptr {:#x}",
-                            loc_check_against_class
-                        )
-                    });
+                    .unwrap_or((0, 0));
 
                 // assembler.py:1950-1951 offset / offset2.
                 let offset2 = guard_gc_type_info.subclassrange_min_offset;
