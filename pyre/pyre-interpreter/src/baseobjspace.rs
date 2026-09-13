@@ -15722,6 +15722,10 @@ pub fn unpackiterable_portal(
     let _ = pyre_object::gc_roots::pin_root(items);
     let items_slot = root_base + 1;
     loop {
+        // Named `shadow_stack_get`, not `||` closures: a lambda residual is
+        // `target:closure.call`, which `refuse_reachable_symbolic_residuals`
+        // aborts before the jd1 walk can compile the drain. The helper is
+        // already in `jit_trace_fnaddrs` (`rlib/jit.py` `@dont_look_inside`).
         unpackiterable_driver.jit_merge_point(
             greenkey,
             pyre_object::gc_roots::shadow_stack_get(root_base),
